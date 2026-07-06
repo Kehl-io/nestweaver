@@ -85,6 +85,7 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
             .map(|k| k.to_string())
             .unwrap_or_default();
         let fh = encode_framework_hint(s);
+        let canonical = s.canonical_id.clone().unwrap_or_default();
         wtr.write_record([
             &s.uid,
             &s.name,
@@ -100,6 +101,7 @@ fn write_symbols_csv(symbols: &[Symbol], path: &Path) -> Result<(), StoreError> 
             is_ep,
             &epk,
             &fh,
+            &canonical,
         ])
         .map_err(|e| StoreError::Query(format!("write symbol row: {e}")))?;
     }
@@ -202,7 +204,8 @@ impl GraphStore {
         exec_params(
             &conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
-             staleness_commits_behind: $scb, instance_id: $iid, name: $name})",
+             staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
+             root_path: $root_path})",
             vec![
                 ("uid", lbug::Value::String(repo.uid.clone())),
                 ("url", lbug::Value::String(repo.url.clone())),
@@ -216,15 +219,29 @@ impl GraphStore {
                     "name",
                     lbug::Value::String(repo.name.clone().unwrap_or_default()),
                 ),
+                (
+                    "root_path",
+                    lbug::Value::String(repo.root_path.clone().unwrap_or_default()),
+                ),
             ],
         )
     }
 
     pub fn insert_file(&self, file: &File) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::insert_file_on(&conn, file)
+    }
+
+    /// Insert a File node using an externally-provided connection (for transaction batching).
+    ///
+    /// Uses `MERGE` so that re-indexing a modified file upserts the node
+    /// instead of failing with a duplicate primary-key error.
+    pub fn insert_file_on(conn: &lbug::Connection<'_>, file: &File) -> Result<(), StoreError> {
         exec_params(
-            &conn,
-            "CREATE (:File {uid: $uid, path: $path, repo_uid: $repo, content_hash: $hash})",
+            conn,
+            "MERGE (f:File {uid: $uid}) \
+             ON CREATE SET f.path = $path, f.repo_uid = $repo, f.content_hash = $hash \
+             ON MATCH SET f.path = $path, f.repo_uid = $repo, f.content_hash = $hash",
             vec![
                 ("uid", lbug::Value::String(file.uid.clone())),
                 ("path", lbug::Value::String(file.path.clone())),
@@ -266,13 +283,21 @@ impl GraphStore {
         conn: &lbug::Connection<'_>,
         symbol: &Symbol,
     ) -> Result<(), StoreError> {
+        Self::insert_symbol_with_conn_static(conn, symbol)
+    }
+
+    /// Static version of `insert_symbol_with_conn` for use without `&self`.
+    pub(crate) fn insert_symbol_with_conn_static(
+        conn: &lbug::Connection<'_>,
+        symbol: &Symbol,
+    ) -> Result<(), StoreError> {
         exec_params(
             conn,
             "CREATE (:Symbol {uid: $uid, name: $name, kind: $kind, \
              repo_uid: $repo, file_path: $fp, start_line: $sl, end_line: $el, \
              signature: $sig, summary: $summary, content_hash: $hash, \
              pagerank_score: $pr, is_entry_point: $iep, entry_point_kind: $epk, \
-             framework_hint: $fh})",
+             framework_hint: $fh, canonical_id: $cid})",
             vec![
                 ("uid", lbug::Value::String(symbol.uid.clone())),
                 ("name", lbug::Value::String(symbol.name.clone())),
@@ -312,6 +337,10 @@ impl GraphStore {
                     ),
                 ),
                 ("fh", lbug::Value::String(encode_framework_hint(symbol))),
+                (
+                    "cid",
+                    lbug::Value::String(symbol.canonical_id.clone().unwrap_or_default()),
+                ),
             ],
         )
     }
@@ -418,8 +447,17 @@ impl GraphStore {
 
     pub fn insert_repo_file_edge(&self, repo_uid: &str, file_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::insert_repo_file_edge_on(&conn, repo_uid, file_uid)
+    }
+
+    /// Insert a single repo-file edge using an externally-provided connection.
+    pub fn insert_repo_file_edge_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        file_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (r:Repo {uid: $repo}), (f:File {uid: $file}) \
              CREATE (r)-[:REPO_HAS_FILE]->(f)",
             vec![
@@ -612,18 +650,42 @@ impl GraphStore {
         service_symbol_edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
+        Self::bulk_index_write_on(
+            &conn,
+            files,
+            symbols,
+            repo_file_edges,
+            file_symbol_edges,
+            services,
+            service_symbol_edges,
+        )?;
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
 
+    /// Like [`bulk_index_write`](Self::bulk_index_write) but operates on an
+    /// existing connection/transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_index_write_on(
+        conn: &lbug::Connection<'_>,
+        files: &[File],
+        symbols: &[Symbol],
+        repo_file_edges: &[(&str, &str)],
+        file_symbol_edges: &[(&str, &str)],
+        services: &[Service],
+        service_symbol_edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         // Insert file nodes.
-        Self::batch_insert_files_on(&conn, files)?;
+        Self::batch_insert_files_on(conn, files)?;
 
         // Insert symbol nodes.
-        Self::batch_insert_symbols_on(&conn, symbols)?;
+        Self::batch_insert_symbols_on(conn, symbols)?;
 
         // Insert REPO_HAS_FILE edges.
-        Self::batch_insert_repo_file_edges_on(&conn, repo_file_edges)?;
+        Self::batch_insert_repo_file_edges_on(conn, repo_file_edges)?;
 
         // Insert FILE_HAS_SYMBOL edges.
-        Self::batch_insert_file_symbol_edges_on(&conn, file_symbol_edges)?;
+        Self::batch_insert_file_symbol_edges_on(conn, file_symbol_edges)?;
 
         // Insert service nodes.
         if !services.is_empty() {
@@ -637,10 +699,45 @@ impl GraphStore {
         }
 
         // Insert SERVICE_HAS_SYMBOL edges.
-        Self::batch_insert_service_symbol_edges_on(&conn, service_symbol_edges)?;
+        Self::batch_insert_service_symbol_edges_on(conn, service_symbol_edges)?;
+
+        Ok(())
+    }
+
+    /// Atomically delete old repo data and insert the replacement in a single
+    /// transaction. This prevents concurrent readers from seeing an empty repo
+    /// between the delete and the insert (the concurrency bug where the
+    /// `write_mutex` serialises writes but does not block reads).
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_reindex_write(
+        &self,
+        repo_uid: &str,
+        files: &[File],
+        symbols: &[Symbol],
+        repo_file_edges: &[(&str, &str)],
+        file_symbol_edges: &[(&str, &str)],
+        services: &[Service],
+        service_symbol_edges: &[(&str, &str)],
+    ) -> Result<(usize, usize), StoreError> {
+        let conn = self.begin_transaction()?;
+
+        // Delete old data within the transaction.
+        let counts = Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid)?;
+        Self::clear_repo_derived_nodes_on(&conn, repo_uid)?;
+
+        // Insert replacement data in the same transaction.
+        Self::bulk_index_write_on(
+            &conn,
+            files,
+            symbols,
+            repo_file_edges,
+            file_symbol_edges,
+            services,
+            service_symbol_edges,
+        )?;
 
         self.commit_transaction(&conn)?;
-        Ok(())
+        Ok(counts)
     }
 
     /// Wrap all markdown vault inserts in a single transaction.
@@ -666,32 +763,146 @@ impl GraphStore {
         wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
+        Self::bulk_vault_write_on(
+            &conn,
+            notes,
+            headings,
+            sections,
+            vault_note_edges,
+            note_heading_edges,
+            note_section_edges,
+            heading_section_edges,
+            heading_parent_edges,
+            tags,
+            note_tag_edges,
+            section_tag_edges,
+            wikilink_to_note_edges,
+            wikilink_to_heading_edges,
+        )?;
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
 
+    /// Write all vault nodes and edges on an externally-provided transaction
+    /// connection, without opening or committing a transaction of its own.
+    /// This lets the caller fold the writes into a larger transaction (e.g.
+    /// [`Self::bulk_vault_reindex_write`], which pairs it with the cascade
+    /// delete so the two are atomic for concurrent readers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_vault_write_on(
+        conn: &lbug::Connection<'_>,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+    ) -> Result<(), StoreError> {
         // Insert node tables first so edge MATCH clauses find their endpoints.
-        Self::batch_insert_notes_on(&conn, notes)?;
-        Self::batch_insert_headings_on(&conn, headings)?;
-        Self::batch_insert_sections_on(&conn, sections)?;
+        Self::batch_insert_notes_on(conn, notes)?;
+        Self::batch_insert_headings_on(conn, headings)?;
+        Self::batch_insert_sections_on(conn, sections)?;
 
         // Structural containment edges.
-        Self::batch_insert_vault_note_edges_on(&conn, vault_note_edges)?;
-        Self::batch_insert_note_heading_edges_on(&conn, note_heading_edges)?;
-        Self::batch_insert_note_section_edges_on(&conn, note_section_edges)?;
-        Self::batch_insert_heading_section_edges_on(&conn, heading_section_edges)?;
-        Self::batch_insert_heading_parent_edges_on(&conn, heading_parent_edges)?;
+        Self::batch_insert_vault_note_edges_on(conn, vault_note_edges)?;
+        Self::batch_insert_note_heading_edges_on(conn, note_heading_edges)?;
+        Self::batch_insert_note_section_edges_on(conn, note_section_edges)?;
+        Self::batch_insert_heading_section_edges_on(conn, heading_section_edges)?;
+        Self::batch_insert_heading_parent_edges_on(conn, heading_parent_edges)?;
 
         // Tags (nodes + edges). Tags may already exist from a previous index
         // run; the caller is responsible for deduplicating `tags` by uid before
         // passing them in.
-        Self::batch_insert_tags_on(&conn, tags)?;
-        Self::batch_insert_note_tag_edges_on(&conn, note_tag_edges)?;
-        Self::batch_insert_section_tag_edges_on(&conn, section_tag_edges)?;
+        Self::batch_insert_tags_on(conn, tags)?;
+        Self::batch_insert_note_tag_edges_on(conn, note_tag_edges)?;
+        Self::batch_insert_section_tag_edges_on(conn, section_tag_edges)?;
 
         // Cross-reference wikilink edges.
-        Self::batch_insert_wikilink_to_note_edges_on(&conn, wikilink_to_note_edges)?;
-        Self::batch_insert_wikilink_to_heading_edges_on(&conn, wikilink_to_heading_edges)?;
+        Self::batch_insert_wikilink_to_note_edges_on(conn, wikilink_to_note_edges)?;
+        Self::batch_insert_wikilink_to_heading_edges_on(conn, wikilink_to_heading_edges)?;
+
+        Ok(())
+    }
+
+    /// Atomically cascade-delete a vault's old data and insert the replacement
+    /// in a SINGLE transaction. This prevents concurrent readers from seeing an
+    /// empty vault between the delete and the insert — the vault-side analogue
+    /// of [`Self::bulk_reindex_write`] for code repos.
+    ///
+    /// When `vault_existed` is true the old vault is cascade-deleted first
+    /// (in the same transaction); otherwise the delete is skipped. The Vault
+    /// node is then (re-)created and all nodes/edges written. Because delete,
+    /// vault upsert, and inserts share one transaction, a reader always
+    /// observes either the complete old vault or the complete new vault — never
+    /// the empty intermediate — and any mid-write failure rolls the delete back
+    /// so the old vault survives intact. Returns the number of notes deleted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_vault_reindex_write(
+        &self,
+        vault: &Vault,
+        vault_existed: bool,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+    ) -> Result<usize, StoreError> {
+        let conn = self.begin_transaction()?;
+
+        // Delete old vault data within the transaction (if it existed).
+        let deleted = if vault_existed {
+            Self::delete_vault_cascade_on(&conn, &vault.uid)?
+        } else {
+            0
+        };
+
+        // (Re-)create the Vault node before its edges MATCH it.
+        exec_params(
+            &conn,
+            "CREATE (:Vault {uid: $uid, name: $name, root_path: $rp, instance_id: $iid})",
+            vec![
+                ("uid", lbug::Value::String(vault.uid.clone())),
+                ("name", lbug::Value::String(vault.name.clone())),
+                ("rp", lbug::Value::String(vault.root_path.clone())),
+                ("iid", lbug::Value::String(vault.instance_id.clone())),
+            ],
+        )?;
+
+        // Insert replacement data in the same transaction.
+        Self::bulk_vault_write_on(
+            &conn,
+            notes,
+            headings,
+            sections,
+            vault_note_edges,
+            note_heading_edges,
+            note_section_edges,
+            heading_section_edges,
+            heading_parent_edges,
+            tags,
+            note_tag_edges,
+            section_tag_edges,
+            wikilink_to_note_edges,
+            wikilink_to_heading_edges,
+        )?;
 
         self.commit_transaction(&conn)?;
-        Ok(())
+        Ok(deleted)
     }
 
     pub fn batch_insert_edges(&self, edges: &[ResolvedEdge]) -> Result<(), StoreError> {
@@ -1320,6 +1531,51 @@ impl GraphStore {
         )
     }
 
+    /// Batch-insert unresolved wikilinks, reusing ONE connection and prepared
+    /// statements. The per-row `insert_unresolved_wikilink` opened a fresh
+    /// connection and ran two separate queries per row (~ms each), so a note with
+    /// thousands of unresolved links (a big index/MOC note, or a note whose
+    /// targets don't exist yet) took ~20ms/link — seconds to a hang. Records are
+    /// `(uid, source_note_uid, source_path, source_title, wikilink_text)`.
+    pub fn batch_insert_unresolved_wikilinks(
+        &self,
+        records: &[(String, String, String, String, String)],
+    ) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        // One explicit transaction for all rows: KuzuDB auto-commits (WAL fsync)
+        // per statement otherwise, which is what made the per-row insert take
+        // ~ms/link. Prepared statements are reused across the batch.
+        let conn = self.begin_transaction()?;
+        let mut del = conn
+            .prepare("MATCH (u:UnresolvedWikilink {uid: $uid}) DETACH DELETE u")
+            .map_err(|e| StoreError::Query(format!("prepare delete unresolved: {e}")))?;
+        let mut cre = conn
+            .prepare(
+                "CREATE (:UnresolvedWikilink {uid: $uid, source_note_uid: $snu, \
+                 source_path: $sp, source_title: $st, wikilink_text: $wt})",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare create unresolved: {e}")))?;
+        for (uid, snu, sp, st, wt) in records {
+            conn.execute(&mut del, vec![("uid", lbug::Value::String(uid.clone()))])
+                .map_err(|e| StoreError::Query(format!("delete unresolved: {e}")))?;
+            conn.execute(
+                &mut cre,
+                vec![
+                    ("uid", lbug::Value::String(uid.clone())),
+                    ("snu", lbug::Value::String(snu.clone())),
+                    ("sp", lbug::Value::String(sp.clone())),
+                    ("st", lbug::Value::String(st.clone())),
+                    ("wt", lbug::Value::String(wt.clone())),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("create unresolved: {e}")))?;
+        }
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
+
     /// Remove all recorded unresolved wikilinks originating from `note_uid`.
     /// Called from `delete_note_cascade` so stale rows do not linger after a
     /// note is re-indexed (e.g. once its target note appears). Best-effort:
@@ -1692,14 +1948,33 @@ impl GraphStore {
     ///
     /// `delete_note_cascade` is kept as-is for incremental single-note deletions.
     pub fn delete_vault_cascade(&self, vault_uid: &str) -> Result<usize, StoreError> {
+        let conn = self.begin_transaction()?;
+        let count = Self::delete_vault_cascade_on(&conn, vault_uid)?;
+        self.commit_transaction(&conn)?;
+        Ok(count)
+    }
+
+    /// Cascade-delete a vault's data using an externally-provided transaction
+    /// connection, without opening or committing a transaction of its own.
+    ///
+    /// This lets the caller fold the delete into the SAME transaction as the
+    /// re-insert (see [`Self::bulk_vault_reindex_write`]) so concurrent readers
+    /// never observe the empty intermediate between the delete and the insert.
+    /// Returns the number of notes that were present before the delete.
+    pub fn delete_vault_cascade_on(
+        conn: &lbug::Connection<'_>,
+        vault_uid: &str,
+    ) -> Result<usize, StoreError> {
         // Count notes before deletion so we can return the count.
         let count = {
-            let conn = self.conn()?;
-            let safe_vid = vault_uid.replace('\'', "\\'");
+            let mut stmt = conn
+                .prepare("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)")
+                .map_err(|e| StoreError::Query(format!("prepare count: {e}")))?;
             let rows = conn
-                .query(&format!(
-                    "MATCH (n:Note) WHERE n.vault_uid = '{safe_vid}' RETURN count(n)"
-                ))
+                .execute(
+                    &mut stmt,
+                    vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+                )
                 .map_err(|e| StoreError::Query(format!("count notes: {e}")))?;
             rows.filter_map(|row| {
                 row.first().and_then(|v| match v {
@@ -1711,18 +1986,16 @@ impl GraphStore {
             .unwrap_or(0)
         };
 
-        let conn = self.begin_transaction()?;
-
         // 1. Delete all Sections under notes in this vault.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_SECTION]->(s:Section) DETACH DELETE s",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
         // 2. Delete all Headings under notes in this vault.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
@@ -1731,12 +2004,22 @@ impl GraphStore {
         //    Uses a cross-node join: LadybugDB supports `MATCH (a), (b) WHERE a.prop = b.prop`.
         //    Best-effort: silently skip if the table does not exist on older DBs.
         {
-            let safe_vid = vault_uid.replace('\'', "\\'");
-            if let Err(e) = conn.query(&format!(
-                "MATCH (n:Note), (u:UnresolvedWikilink) \
-                 WHERE n.vault_uid = '{safe_vid}' AND u.source_note_uid = n.uid \
-                 DELETE u"
-            )) {
+            let uwl_result = (|| -> Result<(), StoreError> {
+                let mut stmt = conn
+                    .prepare(
+                        "MATCH (n:Note), (u:UnresolvedWikilink) \
+                         WHERE n.vault_uid = $vid AND u.source_note_uid = n.uid \
+                         DELETE u",
+                    )
+                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+                conn.execute(
+                    &mut stmt,
+                    vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+                )
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+                Ok(())
+            })();
+            if let Err(e) = uwl_result {
                 tracing::trace!("delete_vault_cascade: UnresolvedWikilink delete skipped: {e}");
             }
         }
@@ -1744,26 +2027,25 @@ impl GraphStore {
         // 4. Delete all Note nodes (DETACH removes VAULT_HAS_NOTE, NOTE_TAGGED_WITH,
         //    PROJECT_INCLUDES_NOTE, and any incoming/outgoing wikilink edges).
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {vault_uid: $vid}) DETACH DELETE n",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
         // 5. Delete Tag nodes belonging to this vault.
         exec_params(
-            &conn,
+            conn,
             "MATCH (t:Tag {vault_uid: $vid}) DETACH DELETE t",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
         // 6. Delete the Vault node itself.
         exec_params(
-            &conn,
+            conn,
             "MATCH (v:Vault {uid: $vid}) DETACH DELETE v",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
-        self.commit_transaction(&conn)?;
         Ok(count)
     }
 
@@ -1909,6 +2191,15 @@ impl GraphStore {
         file_path: &str,
     ) -> Result<usize, StoreError> {
         let conn = self.conn()?;
+        Self::delete_symbols_in_file_on(&conn, repo_uid, file_path)
+    }
+
+    /// Delete symbols in a file using an externally-provided connection (for transaction batching).
+    pub fn delete_symbols_in_file_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        file_path: &str,
+    ) -> Result<usize, StoreError> {
         // LadybugDB does not support parameterized compound WHERE clauses.
         // Sanitize user-derived values by escaping single quotes.
         let safe_repo_uid = repo_uid.replace('\'', "\\'");
@@ -1993,8 +2284,16 @@ impl GraphStore {
     /// incident edges (REPO_HAS_FILE, FILE_HAS_SYMBOL) automatically.
     pub fn delete_file_node(&self, file_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_file_node_on(&conn, file_uid)
+    }
+
+    /// Delete a File node using an externally-provided connection (for transaction batching).
+    pub fn delete_file_node_on(
+        conn: &lbug::Connection<'_>,
+        file_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (f:File {uid: $uid}) DETACH DELETE f",
             vec![("uid", lbug::Value::String(file_uid.to_string()))],
         )
@@ -2010,9 +2309,18 @@ impl GraphStore {
         old_path: &str,
         new_path: &str,
     ) -> Result<(), StoreError> {
-        use crate::read::row_to_symbol;
-
         let conn = self.conn()?;
+        Self::update_symbol_file_paths_on(&conn, repo_uid, old_path, new_path)
+    }
+
+    /// Update symbol file paths using an externally-provided connection (for transaction batching).
+    pub fn update_symbol_file_paths_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(), StoreError> {
+        use crate::read::row_to_symbol;
 
         let rows: Vec<_> = {
             let r = conn
@@ -2033,12 +2341,12 @@ impl GraphStore {
             sym.file_path = new_path.to_string();
 
             exec_params(
-                &conn,
+                conn,
                 "MATCH (s:Symbol {uid: $uid}) DETACH DELETE s",
                 vec![("uid", lbug::Value::String(old_uid))],
             )?;
 
-            self.insert_symbol_with_conn(&conn, &sym)?;
+            Self::insert_symbol_with_conn_static(conn, &sym)?;
         }
 
         Ok(())
@@ -2046,9 +2354,21 @@ impl GraphStore {
 
     /// Update the `indexed_sha` field of a Repo node.
     pub fn update_repo_sha(&self, repo_uid: &str, new_sha: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
+        let txn = self.begin_transaction()?;
+        Self::update_repo_sha_on(&txn, repo_uid, new_sha)?;
+        self.commit_transaction(&txn)?;
+        Ok(())
+    }
 
-        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, r.name";
+    /// Update the `indexed_sha` field using an externally-provided connection
+    /// (for transaction batching). Does NOT begin/commit its own transaction.
+    pub fn update_repo_sha_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+        new_sha: &str,
+    ) -> Result<(), StoreError> {
+        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, \
+                    r.name, r.root_path";
         let rows: Vec<_> = conn
             .query(&format!(
                 "MATCH (r:Repo {{uid: '{}'}}) RETURN {cols}",
@@ -2079,19 +2399,22 @@ impl GraphStore {
             Some(lbug::Value::String(s)) if !s.is_empty() => s.clone(),
             _ => String::new(),
         };
-
-        let txn = self.begin_transaction()?;
+        let root_path = match row.get(6) {
+            Some(lbug::Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => String::new(),
+        };
 
         exec_params(
-            &txn,
+            conn,
             "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
             vec![("uid", lbug::Value::String(uid.clone()))],
         )?;
 
         exec_params(
-            &txn,
+            conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
-             staleness_commits_behind: $scb, instance_id: $iid, name: $name})",
+             staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
+             root_path: $root_path})",
             vec![
                 ("uid", lbug::Value::String(uid)),
                 ("url", lbug::Value::String(url)),
@@ -2099,9 +2422,82 @@ impl GraphStore {
                 ("scb", lbug::Value::Int64(staleness)),
                 ("iid", lbug::Value::String(instance_id)),
                 ("name", lbug::Value::String(name)),
+                ("root_path", lbug::Value::String(root_path)),
             ],
         )?;
 
+        Ok(())
+    }
+
+    /// Update the `root_path` field of a Repo node, leaving every other
+    /// field (including the identity `url`) untouched. Used at index time
+    /// to keep the on-disk location current for pre-existing rows.
+    ///
+    /// Follows the established read → DETACH DELETE → CREATE pattern
+    /// (see `update_repo_sha`).
+    pub fn update_repo_root_path(&self, repo_uid: &str, root_path: &str) -> Result<(), StoreError> {
+        let txn = self.begin_transaction()?;
+        {
+            let conn = &txn;
+            let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, \
+                        r.instance_id, r.name";
+            let rows: Vec<_> = conn
+                .query(&format!(
+                    "MATCH (r:Repo {{uid: '{}'}}) RETURN {cols}",
+                    repo_uid.replace('\'', "''"),
+                ))
+                .map_err(|e| StoreError::Query(format!("query repo: {e}")))?
+                .collect();
+
+            let row = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+
+            let uid = match row.first() {
+                Some(lbug::Value::String(s)) => s.clone(),
+                _ => return Err(StoreError::Query("repo uid missing".to_string())),
+            };
+            let url = match row.get(1) {
+                Some(lbug::Value::String(s)) => s.clone(),
+                _ => return Err(StoreError::Query("repo url missing".to_string())),
+            };
+            let sha = match row.get(2) {
+                Some(lbug::Value::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let staleness = match row.get(3) {
+                Some(lbug::Value::Int64(n)) => *n,
+                _ => 0,
+            };
+            let instance_id = match row.get(4) {
+                Some(lbug::Value::String(s)) => s.clone(),
+                _ => return Err(StoreError::Query("repo instance_id missing".to_string())),
+            };
+            let name = match row.get(5) {
+                Some(lbug::Value::String(s)) if !s.is_empty() => s.clone(),
+                _ => String::new(),
+            };
+
+            exec_params(
+                conn,
+                "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
+                vec![("uid", lbug::Value::String(uid.clone()))],
+            )?;
+
+            exec_params(
+                conn,
+                "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
+                 staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
+                 root_path: $root_path})",
+                vec![
+                    ("uid", lbug::Value::String(uid)),
+                    ("url", lbug::Value::String(url)),
+                    ("sha", lbug::Value::String(sha)),
+                    ("scb", lbug::Value::Int64(staleness)),
+                    ("iid", lbug::Value::String(instance_id)),
+                    ("name", lbug::Value::String(name)),
+                    ("root_path", lbug::Value::String(root_path.to_string())),
+                ],
+            )?;
+        }
         self.commit_transaction(&txn)?;
         Ok(())
     }
@@ -2148,9 +2544,19 @@ impl GraphStore {
         &self,
         repo_uid: &str,
     ) -> Result<(usize, usize), StoreError> {
-        let rid = lbug::Value::String(repo_uid.to_string());
-
         let conn = self.begin_transaction()?;
+        let counts = Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid)?;
+        self.commit_transaction(&conn)?;
+        Ok(counts)
+    }
+
+    /// Like [`bulk_delete_repo_files_and_symbols`](Self::bulk_delete_repo_files_and_symbols)
+    /// but operates on an existing connection/transaction.
+    pub fn bulk_delete_repo_files_and_symbols_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(usize, usize), StoreError> {
+        let rid = lbug::Value::String(repo_uid.to_string());
 
         // Count before deleting so the caller can log what was removed.
         let sym_count: usize = {
@@ -2198,7 +2604,6 @@ impl GraphStore {
         conn.execute(&mut stmt, vec![("rid", rid)])
             .map_err(|e| StoreError::Query(format!("bulk delete files: {e}")))?;
 
-        self.commit_transaction(&conn)?;
         Ok((file_count, sym_count))
     }
 
@@ -2229,15 +2634,24 @@ impl GraphStore {
     /// a no-op for repos with no services/contracts.
     pub fn clear_repo_derived_nodes(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::clear_repo_derived_nodes_on(&conn, repo_uid)
+    }
+
+    /// Like [`clear_repo_derived_nodes`](Self::clear_repo_derived_nodes) but
+    /// operates on an existing connection/transaction.
+    pub fn clear_repo_derived_nodes_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
         // Service nodes for this repo.
         exec_params(
-            &conn,
+            conn,
             "MATCH (s:Service {repo_uid: $uid}) DETACH DELETE s",
             vec![("uid", lbug::Value::String(repo_uid.to_string()))],
         )?;
         // Contract nodes for this repo (table may not exist on older DBs).
         if let Err(e) = exec_params(
-            &conn,
+            conn,
             "MATCH (c:Contract {repo_uid: $uid}) DETACH DELETE c",
             vec![("uid", lbug::Value::String(repo_uid.to_string()))],
         ) {
@@ -2795,8 +3209,10 @@ impl GraphStore {
         let conn = self.conn()?;
 
         // Encode both fields into a single JSON string so we can use the
-        // two-column Meta table without widening it.
-        let value = format!(r#"{{"model_id":"{model_id}","dimension":{dimension}}}"#);
+        // two-column Meta table without widening it. Serialize via serde so a
+        // model_id containing quotes/backslashes/newlines (e.g. a local model
+        // path) can't produce invalid JSON that fails to parse on read.
+        let value = serde_json::json!({ "model_id": model_id, "dimension": dimension }).to_string();
 
         // Delete the existing singleton, if any. Best-effort: silently
         // ignore errors from tables that were never created (old DBs).
@@ -2847,14 +3263,14 @@ mod copy_from_tests {
                 f,
                 "uid,name,kind,repo_uid,file_path,start_line,end_line,\
                  signature,summary,content_hash,pagerank_score,is_entry_point,\
-                 entry_point_kind,framework_hint"
+                 entry_point_kind,framework_hint,canonical_id"
             )
             .unwrap();
             for i in 0..100 {
                 writeln!(
                     f,
                     "sym:{i},sym_name_{i},function,repo:test,src/lib.rs,{i},{i},\
-                     \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,",
+                     \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,,",
                 )
                 .unwrap();
             }
@@ -2901,7 +3317,7 @@ mod copy_from_tests {
                     writeln!(
                         f,
                         "sym:{i},sym_name_{i},function,repo:test,src/lib.rs,{i},{i},\
-                         \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,",
+                         \"fn sym_{i}()\",\"summary {i}\",hash{i:04},0.0,false,,,",
                     )
                     .unwrap();
                 }
@@ -3030,6 +3446,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedding_metadata_round_trips_including_special_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("emb_meta.lbug")).unwrap();
+
+        // Absent by default.
+        assert_eq!(store.get_embedding_metadata().unwrap(), None);
+
+        // Normal HuggingFace id round-trips, and the singleton is replaced on re-set.
+        store
+            .set_embedding_metadata("thenlper/gte-base", 768)
+            .unwrap();
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("thenlper/gte-base".to_string(), 768))
+        );
+
+        // A model_id containing quotes/backslashes (e.g. a local model path) must still
+        // round-trip. Naive JSON string interpolation would produce invalid JSON here, which
+        // get_embedding_metadata would fail to parse → the daemon would fall back to the
+        // default model and silently disable semantic search on a dimension mismatch.
+        let weird = r#"/models/my "local"\model"#;
+        store.set_embedding_metadata(weird, 384).unwrap();
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some((weird.to_string(), 384))
+        );
+    }
+
+    #[test]
     fn test_update_repo_sha_is_atomic() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test_sha.lbug");
@@ -3042,6 +3487,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "default".to_string(),
             name: Some("test-repo".to_string()),
+            root_path: None,
         };
         store.insert_repo(&repo).unwrap();
 

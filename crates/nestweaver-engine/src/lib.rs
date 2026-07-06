@@ -42,24 +42,32 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
 pub mod admin;
 pub mod affected_tests;
 pub mod agent_guide;
+pub mod atomic_changes;
+pub mod backup;
+pub mod bare_clone;
 pub mod blast_radius;
 pub mod brain_docgraph;
 pub mod brain_memory;
 pub mod brainignore;
 pub mod bridges;
+pub mod circuit_breaker;
 pub mod cluster_dispatch;
 pub mod clustering;
 pub mod cochange;
 pub mod config;
+pub mod content_reader;
 pub mod contracts;
 pub mod cross_domain;
 pub mod dead_code;
+pub mod diff_impact;
 pub mod embedding;
 pub mod eval;
 pub mod export;
 pub mod export_graph;
 pub mod extensions;
+pub mod format_comment;
 pub mod git_activity;
+pub mod git_cmd;
 pub mod git_diff;
 pub mod guide_rules;
 pub mod hash;
@@ -69,6 +77,7 @@ pub mod index;
 pub mod index_md;
 pub mod interactions;
 pub mod investigate;
+pub mod jobs;
 pub mod manifest;
 pub mod mcp_client;
 pub mod parsed_cache;
@@ -81,13 +90,17 @@ pub mod recency;
 pub mod registry;
 pub mod rerank;
 pub mod resolution_cache;
+pub mod scheduler;
 pub mod snapshot;
+pub mod ssrf;
 pub mod suggest;
 pub mod summaries;
 pub mod summary;
+pub mod tls;
 pub mod vector_search;
 pub mod watch_code;
 pub mod watcher;
+pub mod worker;
 
 pub use affected_tests::{
     AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
@@ -98,6 +111,12 @@ pub use agent_guide::{
     generate_guide, generate_guide_with_rules, generate_skill, generate_skill_with_rules,
     generate_skill_with_tools,
 };
+pub use backup::{
+    BackupConfig, BackupManifest, BackupRepoInfo, BackupResult, BackupSizes, RestoreConfig,
+    RestoreResult, StagedBackup, backup_inspect, backup_list, backup_restore, backup_save,
+    package_staged, stage_backup_from_store,
+};
+pub use bare_clone::{mint_repo_identity, read_origin_url};
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
     analyze_blast_radius, changed_files_from_git,
@@ -120,17 +139,22 @@ pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_
 pub use config::{
     CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule, InferenceConfig,
     InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig, RepoConfig,
-    ResponseConfig, SchemaExtensions, SeedResolutionConfig, StorageConfig, WikiSourceConfig,
-    WorkspaceConfig, default_kind_priority, default_test_path_patterns,
+    RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig, StorageConfig, UpstreamEntry,
+    WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file, default_kind_priority,
+    default_test_path_patterns, remove_repo_from_config_file,
 };
 pub use cross_domain::{
-    CrossDomainResult, SymbolIndex, build_symbol_index, build_symbol_index_with_config,
-    discover_cross_domain_links, discover_cross_domain_links_for_note,
-    discover_cross_domain_links_for_note_with_index, discover_cross_domain_links_with_config,
+    CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index,
+    build_symbol_index_with_config, discover_cross_domain_links,
+    discover_cross_domain_links_for_note, discover_cross_domain_links_for_note_with_index,
+    discover_cross_domain_links_for_note_with_index_and_readers,
+    discover_cross_domain_links_with_config, discover_cross_domain_links_with_readers,
 };
 pub use dead_code::{
     DeadCodeConfidence, DeadCodeResult, UnreachableSymbol, detect_dead_code,
-    detect_dead_code_with_confidence, detect_dead_code_with_manifests,
+    detect_dead_code_cancellable, detect_dead_code_with_confidence,
+    detect_dead_code_with_confidence_cancellable, detect_dead_code_with_manifests,
+    detect_dead_code_with_manifests_cancellable,
 };
 pub use eval::{
     EvalComparison, EvalReport, JudgedQuery, PerQueryRow, compare_reports, load_judged_queries,
@@ -150,14 +174,16 @@ pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
     CachedFileMeta, FileMetaCache, IncrementalResult, IndexResult, incremental_index,
     incremental_index_with_name, index_directory, index_directory_in_memory,
-    index_directory_with_options, index_directory_with_store, load_filemeta_cache,
-    save_filemeta_cache,
+    index_directory_with_options, index_directory_with_store,
+    index_directory_with_store_cancellable, index_with_reader, index_with_reader_and_write_gate,
+    load_filemeta_cache, save_filemeta_cache,
 };
 pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,
     index_markdown_directory_in_memory, index_markdown_directory_since,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore,
-    index_markdown_directory_with_store, load_alias_sidecar,
+    index_markdown_directory_with_store, index_markdown_with_reader,
+    index_markdown_with_reader_and_write_gate, load_alias_sidecar,
 };
 pub use interactions::{
     EventType, InteractionData, InteractionStore, InteractionTracker, NodeScore,
@@ -201,7 +227,7 @@ pub use suggest::{
 };
 pub use summaries::{
     Summary, SummaryLevel, SummaryStore, filter_by_target, generate_summaries, load_summaries,
-    render_text, save_summaries, truncate_to_budget,
+    merge_and_save_summaries, render_text, save_summaries, truncate_to_budget,
 };
 pub use watch_code::CodeWatcher;
 pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};

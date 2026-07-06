@@ -27,16 +27,26 @@ openapiv3 = "2"
 protox-parse = "0.9"
 prost-types = "0.14"
 apollo-parser = "0.8"
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "query"] }
 walkdir = "2"
 ignore = "0.4"
 indicatif = "0.17"
 notify = "8"
 notify-debouncer-mini = { version = "0.7", default-features = false }
 rand = "0.10"
+rusqlite = { workspace = true }
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 rayon = "1.10"
 globset = "0.4"
+url = "2"
 html2md = "0.2"
+sha2 = { workspace = true }
+tar = "0.4"
+tempfile = "3"
+zstd = "0.13"
+rcgen = "0.14"
+time = "0.3"
 nestweaver-embed = { path = "../nestweaver-embed", optional = true }
 
 [features]

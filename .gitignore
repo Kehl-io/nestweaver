@@ -44,12 +44,18 @@ docs/superpowers/
 docs/plans/
 docs/specs/
 
-# Generated setup configs (created by `nestweaver setup`)
+# Generated setup configs (created by `nestweaver setup` / `generate-guide`).
+# These mirror the LOCAL brain's repo set, so committing them can leak private
+# repo/client names and home paths — keep them untracked.
 .claude/
 .codex/
 .cursor/
 .junie/
 AGENTS.md
+.github/copilot-instructions.md
+GEMINI.md
+.clinerules
+.windsurfrules
 
 # Competitor skills (not part of this project)
 .claude/skills/gitnexus/

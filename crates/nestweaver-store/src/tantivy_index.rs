@@ -186,6 +186,12 @@ impl TantivyIndex {
     /// Drop every document and rebuild from the current state of `store`.
     /// Use after a fresh `index_markdown_directory` or as a manual escape
     /// hatch (`nestweaver brain reindex-search`).
+    ///
+    /// Atomicity invariant: the `delete_all_documents` and the re-adds MUST
+    /// land in a SINGLE commit. Tantivy commits are atomic per generation, so
+    /// a concurrent reader then sees the old-or-new full corpus and never an
+    /// empty window. Do NOT add an intermediate `commit()` after the delete —
+    /// see `reindex_from_store_is_atomic_for_readers`.
     pub fn reindex_from_store(&self, store: &GraphStore) -> Result<usize, TantivyError> {
         let writer_mutex = self
             .writer
@@ -375,12 +381,24 @@ impl TantivyIndex {
         Ok(())
     }
 
+    /// Reload the reader so subsequent searches see any newly committed
+    /// segments. This is cheap: it just checks for new segment metadata
+    /// and opens any new segment readers. A no-op when nothing changed.
+    pub fn reload(&self) -> Result<(), TantivyError> {
+        self.reader.reload()?;
+        Ok(())
+    }
+
     /// BM25 search across title + body fields. Returns up to `limit`
     /// hits ranked by Tantivy's default BM25 scoring.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, TantivyError> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        // Ensure the reader sees the latest committed segments (cheap no-op
+        // when nothing changed). Covers the case where a background worker
+        // committed new documents since the reader was last opened.
+        let _ = self.reader.reload();
         let searcher = self.reader.searcher();
         let mut parser =
             QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
@@ -392,9 +410,22 @@ impl TantivyIndex {
                 // chars by quoting — handles common user input like
                 // `auth/v2` or `path:foo` that breaks the parser.
                 let escaped = escape_query(query);
-                parser
-                    .parse_query(&escaped)
-                    .map_err(|e| TantivyError::Tantivy(e.to_string()))?
+                match parser.parse_query(&escaped) {
+                    Ok(q) => q,
+                    // Last resort: a bare boolean keyword (`a AND`), an unbalanced
+                    // quote, or other residual syntax that escape_query doesn't
+                    // neutralize (it only quotes tokens with special *chars*, not
+                    // keywords) must not hard-error a plain search. Treat the whole
+                    // input as a literal phrase; if even that won't parse, return no
+                    // hits rather than an error.
+                    Err(_) => {
+                        let phrase = format!("\"{}\"", query.replace('"', " "));
+                        match parser.parse_query(&phrase) {
+                            Ok(q) => q,
+                            Err(_) => return Ok(Vec::new()),
+                        }
+                    }
+                }
             }
         };
         let top = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;
@@ -936,6 +967,57 @@ mod tests {
         assert!(
             titles.contains(&"Auth Service Design") || hits.iter().any(|h| h.kind == "tag"),
             "expected an auth hit; got {titles:?}"
+        );
+    }
+
+    /// A `reindex_from_store` must rebuild the Tantivy index atomically: the
+    /// `delete_all_documents` and the re-adds land in ONE commit, so a
+    /// concurrent reader querying a non-empty corpus always sees the old-or-new
+    /// full corpus and NEVER an empty window. A delete-commit-then-add sequence
+    /// (two commits) would expose an empty index between the two commits.
+    #[test]
+    fn reindex_from_store_is_atomic_for_readers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempdir().unwrap();
+        let idx = Arc::new(TantivyIndex::open_or_create(dir.path()).unwrap());
+        let store = make_store_with_notes();
+
+        // Prime a non-empty corpus and confirm it is searchable.
+        idx.reindex_from_store(&store).unwrap();
+        assert!(
+            !idx.search("auth", 10).unwrap().is_empty(),
+            "corpus should be non-empty after the priming reindex"
+        );
+
+        // A reader hammers the index while the writer reindexes repeatedly.
+        // With a single atomic commit the reader can only observe the old or
+        // the new full corpus — never the empty window a two-commit rebuild
+        // would expose.
+        let reader_idx = Arc::clone(&idx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let saw_empty = Arc::new(AtomicBool::new(false));
+        let saw_empty_reader = Arc::clone(&saw_empty);
+        let reader = std::thread::spawn(move || {
+            while !stop_reader.load(Ordering::Relaxed) {
+                if reader_idx.search("auth", 10).unwrap().is_empty() {
+                    saw_empty_reader.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+
+        for _ in 0..50 {
+            idx.reindex_from_store(&store).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert!(
+            !saw_empty.load(Ordering::Relaxed),
+            "a concurrent reader must never see an empty index during reindex"
         );
     }
 

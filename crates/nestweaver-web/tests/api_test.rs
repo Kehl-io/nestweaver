@@ -90,6 +90,7 @@ fn setup_test_store() -> GraphStore {
         staleness_commits_behind: 0,
         instance_id: String::new(),
         name: None,
+        root_path: None,
     };
     store.insert_repo(&repo).unwrap();
 
@@ -111,6 +112,7 @@ fn setup_test_store() -> GraphStore {
         visibility: Visibility::Inferred,
         type_info: None,
         framework_hint: None,
+        canonical_id: None,
     };
     store.insert_symbol(&symbol).unwrap();
 
@@ -246,6 +248,7 @@ async fn overview_keeps_symbol_when_repos_exceed_limit() {
             staleness_commits_behind: 0,
             instance_id: String::new(),
             name: None,
+            root_path: None,
         };
         store.insert_repo(&repo).unwrap();
     }

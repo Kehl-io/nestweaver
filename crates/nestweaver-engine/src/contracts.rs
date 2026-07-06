@@ -14,6 +14,15 @@
 //! edge records match quality (1.0 exact verb+path, 0.8 base-path-inferred),
 //! and [`compute_drift`] surfaces the declared-vs-implemented set difference.
 //!
+//! Two distinct comparisons live here — don't confuse them:
+//! * [`drift_for_store`] compares, within ONE snapshot, which endpoints are
+//!   *declared* (in a spec) vs *implemented* (by a handler). It is **endpoint
+//!   presence only** — it does NOT look at request/response fields or types.
+//! * [`diff_openapi`] compares TWO OpenAPI specs (base vs head) at the endpoint
+//!   AND request/response **field/type** level, classifying each change as
+//!   BREAKING or INFO. This is the "did this change break the API?" check
+//!   (exposed as `nestweaver contracts diff`).
+//!
 //! Scope (per the F2-core adversarial review) is deliberately the trustworthy
 //! lanes only: same-repo Spring/NestJS handler matching. Cross-repo
 //! `CONSUMES` via fetch/axios/HTTP literals and GraphQL *consumers* are
@@ -283,15 +292,73 @@ pub struct HandlerSymbol {
 /// before any method, so the first match is the class base. Returns `""` when
 /// no base path is declared.
 pub fn extract_base_path(framework: &str, source: &str) -> String {
-    let anno = match framework {
-        "spring" => "@RequestMapping",
-        "nestjs" => "@Controller",
-        _ => return String::new(),
-    };
-    source
-        .find(anno)
-        .and_then(|i| first_string_arg(&source[i..]))
-        .unwrap_or_default()
+    match framework {
+        "spring" => {
+            // A Spring class base path is `@RequestMapping` ABOVE the class
+            // declaration. Restricting the search to the pre-class region avoids
+            // mistaking a method-level `@RequestMapping(method=..., path="/foo")`
+            // in a `@RestController` (no class-level mapping) for the base path —
+            // which would prepend `/foo` to every route and corrupt their UIDs.
+            let region_end = class_decl_byte_pos(source).unwrap_or(source.len());
+            source[..region_end]
+                .rfind("@RequestMapping")
+                .and_then(|i| first_string_arg(&source[i..]))
+                .unwrap_or_default()
+        }
+        // `@Controller` is only ever class-level in NestJS, so the first one is
+        // the controller decorator.
+        "nestjs" => source
+            .find("@Controller")
+            .and_then(|i| first_string_arg(&source[i..]))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Byte offset of the first `class` declaration in `source`, or `None`.
+///
+/// Scans line by line and only accepts a `class` token whose preceding tokens on
+/// that line are all Java/Kotlin modifiers or `@annotations`. This deliberately
+/// rejects the word "class" inside a comment ("This class provides…", which
+/// starts with `/**`/`*`/`//`) — a raw substring scan matched those and cut the
+/// base-path search region short, losing the class `@RequestMapping`.
+fn class_decl_byte_pos(source: &str) -> Option<usize> {
+    const MODIFIERS: &[&str] = &[
+        "public",
+        "private",
+        "protected",
+        "final",
+        "abstract",
+        "sealed",
+        "static",
+        "open",
+        "data",
+        "inner",
+        "internal",
+    ];
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let mut found = false;
+        let mut only_modifiers = true;
+        for tok in line.split_whitespace() {
+            if tok == "class" {
+                found = true;
+                break;
+            }
+            if !(MODIFIERS.contains(&tok) || tok.starts_with('@')) {
+                only_modifiers = false;
+                break;
+            }
+        }
+        if found && only_modifiers {
+            // Byte offset of the `class` keyword within the full source.
+            if let Some(rel) = line.find("class") {
+                return Some(offset + rel);
+            }
+        }
+        offset += line.len();
+    }
+    None
 }
 
 /// Find the NestJS controller class among `class_starts` (each `(symbol_index,
@@ -385,14 +452,28 @@ fn first_string_arg(after: &str) -> Option<String> {
     let rest = &after[open + 1..];
     let close = rest.find(')')?;
     let inner = &rest[..close];
-    let inner = inner.trim();
-    // Strip a single layer of quotes (single, double, or backtick).
-    for q in ['"', '\'', '`'] {
-        if let Some(stripped) = inner.strip_prefix(q)
-            && let Some(val) = stripped.strip_suffix(q)
-        {
-            return Some(val.to_string());
+    // Return the FIRST quoted literal inside the annotation args. The old code
+    // required the ENTIRE paren body to be a single quoted string, so it missed
+    // the most common Spring forms — `@GetMapping(value = "/x")`,
+    // `@RequestMapping(path="/x", method=...)`, and array literals
+    // `@GetMapping({"/a","/b"})` — losing the path and manufacturing false drift
+    // (declared-not-implemented AND implemented-not-declared on the same route).
+    first_quoted_literal(inner)
+}
+
+/// Extract the contents of the first `"…"`, `'…'`, or `` `…` `` literal in `s`.
+/// UTF-8 safe: the quote chars are ASCII so all slice boundaries are valid.
+fn first_quoted_literal(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' || c == b'\'' || c == b'`' {
+            let after = &s[i + 1..];
+            let rel = after.find(c as char)?; // unterminated → None
+            return Some(after[..rel].to_string());
         }
+        i += 1;
     }
     None
 }
@@ -654,11 +735,39 @@ pub fn compute_drift(
 /// the rest are **code-derived**. A declared contract with no incident
 /// `IMPLEMENTS_CONTRACT` edge is *declared-not-implemented*; a code-derived
 /// contract is *implemented-not-declared*.
+/// Resolve a repo filter (an exact repo UID **or** a case-insensitive display
+/// name) to its repo UID. `list_contracts` filters by exact UID, and repo UIDs
+/// are hashed — so an MCP client passing the natural human name (`payments-svc`)
+/// would match nothing and get a false "clean" report. Resolve names here so the
+/// MCP and CLI front-ends agree. An unmatched value is passed through unchanged
+/// (an explicit unknown UID still yields an empty result, as before).
+fn resolve_repo_uid(
+    store: &nestweaver_store::GraphStore,
+    filter: Option<&str>,
+) -> Result<Option<String>, nestweaver_store::StoreError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let repos = store.list_repos(None)?;
+    if let Some(r) = repos.iter().find(|r| r.uid == filter) {
+        return Ok(Some(r.uid.clone()));
+    }
+    let needle = filter.to_lowercase();
+    if let Some(r) = repos
+        .iter()
+        .find(|r| crate::repo_display_name(r).to_lowercase() == needle)
+    {
+        return Ok(Some(r.uid.clone()));
+    }
+    Ok(Some(filter.to_string()))
+}
+
 pub fn drift_for_store(
     store: &nestweaver_store::GraphStore,
     repo_uid: Option<&str>,
 ) -> Result<DriftReport, nestweaver_store::StoreError> {
-    let all = store.list_contracts(repo_uid)?;
+    let repo_uid = resolve_repo_uid(store, repo_uid)?;
+    let all = store.list_contracts(repo_uid.as_deref())?;
     let implemented: std::collections::HashSet<String> = store
         .list_implemented_contract_uids()?
         .into_iter()
@@ -670,10 +779,556 @@ pub fn drift_for_store(
     Ok(compute_drift(&declared, &code_derived, &implemented))
 }
 
+// ── Field-level spec-vs-spec breaking-change diff (F2) ──────────────────────
+//
+// `drift_for_store` only compares endpoint *presence*. This compares two
+// versions of an OpenAPI spec (base vs head) at the endpoint AND request/response
+// FIELD/TYPE level, classifying each difference as BREAKING or INFO — the "did
+// this change break the API?" check. Scope: OpenAPI (yaml/json), application/json
+// bodies, object root schemas; `$ref`s are resolved against components.schemas
+// (depth-capped for cycles). Non-object / composed (oneOf/allOf) schemas are
+// treated opaquely (empty field set), a conservative choice that avoids false
+// breakage.
+//
+// Known limitations (top-level fields only, by design — keeps verdicts trustworthy
+// rather than clever): nested-object and array-item field changes are NOT recursed
+// (a false negative — conservative), and a property's type is a coarse name (a
+// `$ref` is named by its target), so refactoring an inline object into a named
+// `$ref` of the same shape reads as a type change (a benign false positive a human
+// reviews). It is not a full OpenAPI diff engine — it catches the common,
+// high-value top-level breaks.
+
+/// Severity of a spec change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SpecChangeSeverity {
+    Breaking,
+    Info,
+}
+
+/// One classified difference between a base and head spec.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SpecChange {
+    pub severity: SpecChangeSeverity,
+    pub verb: String,
+    pub path: String,
+    pub detail: String,
+}
+
+/// Request/response shape of one operation, used for the field-level diff.
+#[derive(Default, PartialEq, Eq)]
+struct OpShape {
+    /// request-body field name → type string
+    req_fields: std::collections::BTreeMap<String, String>,
+    /// request-body required field names
+    req_required: std::collections::BTreeSet<String>,
+    /// success-response field name → type string
+    resp_fields: std::collections::BTreeMap<String, String>,
+}
+
+const REF_DEPTH_CAP: usize = 8;
+
+/// Resolve a `ReferenceOr<Schema>` to a concrete `Schema`, following
+/// `#/components/schemas/*` refs up to `REF_DEPTH_CAP` (guards ref cycles).
+fn resolve_schema<'a>(
+    spec: &'a openapiv3::OpenAPI,
+    mut sref: &'a openapiv3::ReferenceOr<openapiv3::Schema>,
+    mut depth: usize,
+) -> Option<&'a openapiv3::Schema> {
+    loop {
+        match sref {
+            openapiv3::ReferenceOr::Item(s) => return Some(s),
+            openapiv3::ReferenceOr::Reference { reference } => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                let name = reference.rsplit('/').next()?;
+                let comps = spec.components.as_ref()?;
+                sref = comps.schemas.get(name)?;
+            }
+        }
+    }
+}
+
+/// A short type name for a property schema. A `$ref` property yields its target
+/// name, so changing the referenced type is detected as a type change.
+fn prop_type_name(prop: &openapiv3::ReferenceOr<Box<openapiv3::Schema>>) -> String {
+    match prop {
+        openapiv3::ReferenceOr::Reference { reference } => reference
+            .rsplit('/')
+            .next()
+            .unwrap_or(reference)
+            .to_string(),
+        openapiv3::ReferenceOr::Item(s) => match &s.schema_kind {
+            openapiv3::SchemaKind::Type(t) => match t {
+                openapiv3::Type::String(_) => "string",
+                openapiv3::Type::Number(_) => "number",
+                openapiv3::Type::Integer(_) => "integer",
+                openapiv3::Type::Object(_) => "object",
+                openapiv3::Type::Array(_) => "array",
+                openapiv3::Type::Boolean(_) => "boolean",
+            }
+            .to_string(),
+            openapiv3::SchemaKind::OneOf { .. } => "oneOf".to_string(),
+            openapiv3::SchemaKind::AllOf { .. } => "allOf".to_string(),
+            openapiv3::SchemaKind::AnyOf { .. } => "anyOf".to_string(),
+            _ => "any".to_string(),
+        },
+    }
+}
+
+/// Extract (field→type, required) from an object schema; empty for non-objects.
+fn object_fields(
+    spec: &openapiv3::OpenAPI,
+    sref: &openapiv3::ReferenceOr<openapiv3::Schema>,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut fields = std::collections::BTreeMap::new();
+    let mut required = std::collections::BTreeSet::new();
+    if let Some(schema) = resolve_schema(spec, sref, REF_DEPTH_CAP)
+        && let openapiv3::SchemaKind::Type(openapiv3::Type::Object(obj)) = &schema.schema_kind
+    {
+        for (name, prop) in &obj.properties {
+            fields.insert(name.clone(), prop_type_name(prop));
+        }
+        required.extend(obj.required.iter().cloned());
+    }
+    (fields, required)
+}
+
+/// Pull the application/json object shape from a request/response content map.
+/// Generic over the map so we don't need to name `indexmap::IndexMap` directly.
+fn json_shape<'a>(
+    spec: &openapiv3::OpenAPI,
+    content: impl IntoIterator<Item = (&'a String, &'a openapiv3::MediaType)>,
+) -> Option<(
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeSet<String>,
+)> {
+    let mut chosen: Option<&openapiv3::MediaType> = None;
+    for (ct, media) in content {
+        if ct == "application/json" {
+            chosen = Some(media);
+            break;
+        }
+        chosen.get_or_insert(media);
+    }
+    let schema = chosen?.schema.as_ref()?;
+    Some(object_fields(spec, schema))
+}
+
+/// Per-operation shapes for a parsed OpenAPI spec, plus the set of normalized
+/// paths whose path-item is a `$ref` we cannot inspect (openapiv3 doesn't model
+/// `components.pathItems`). Those are tracked so the diff can SUPPRESS a false
+/// "endpoint removed/added" when one side inlines a path the other side `$ref`s.
+#[derive(Default)]
+struct SpecShapes {
+    ops: std::collections::BTreeMap<(String, String), OpShape>,
+    ref_paths: std::collections::BTreeSet<String>,
+}
+
+/// Build the per-operation shapes for a parsed OpenAPI spec.
+fn spec_shapes(spec: &openapiv3::OpenAPI) -> SpecShapes {
+    let mut out = SpecShapes::default();
+    for (raw_path, item) in spec.paths.iter() {
+        let norm = normalize_http_path(raw_path);
+        let openapiv3::ReferenceOr::Item(pi) = item else {
+            // Unresolvable $ref path-item — record the path so the diff doesn't
+            // treat it as absent on this side.
+            out.ref_paths.insert(norm);
+            continue;
+        };
+        let ops: [(&str, &Option<openapiv3::Operation>); 5] = [
+            ("GET", &pi.get),
+            ("PUT", &pi.put),
+            ("POST", &pi.post),
+            ("DELETE", &pi.delete),
+            ("PATCH", &pi.patch),
+        ];
+        for (verb, op) in ops {
+            let Some(op) = op else { continue };
+            let mut shape = OpShape::default();
+            // Request body.
+            if let Some(openapiv3::ReferenceOr::Item(rb)) = &op.request_body
+                && let Some((f, r)) = json_shape(spec, &rb.content)
+            {
+                shape.req_fields = f;
+                shape.req_required = r;
+            }
+            // First 2xx response with a JSON body.
+            for (code, resp) in &op.responses.responses {
+                let is_2xx = matches!(code, openapiv3::StatusCode::Code(c) if (200..300).contains(c))
+                    || matches!(code, openapiv3::StatusCode::Range(2));
+                if is_2xx
+                    && let openapiv3::ReferenceOr::Item(r) = resp
+                    && let Some((f, _)) = json_shape(spec, &r.content)
+                {
+                    shape.resp_fields = f;
+                    break;
+                }
+            }
+            out.ops.insert((verb.to_string(), norm.clone()), shape);
+        }
+    }
+    out
+}
+
+fn parse_openapi(path: &str, source: &str) -> Option<openapiv3::OpenAPI> {
+    match spec_kind(path) {
+        Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str(source).ok(),
+        Some(SpecFileKind::OpenApiJson) => serde_json::from_str(source).ok(),
+        _ => None,
+    }
+}
+
+/// Compare a base and head OpenAPI spec, classifying each operation/field/type
+/// difference. Returns `None` if either file is not a parseable OpenAPI spec.
+pub fn diff_openapi(
+    base_path: &str,
+    base_src: &str,
+    head_path: &str,
+    head_src: &str,
+) -> Option<Vec<SpecChange>> {
+    let base = parse_openapi(base_path, base_src)?;
+    let head = parse_openapi(head_path, head_src)?;
+    let base_shapes = spec_shapes(&base);
+    let head_shapes = spec_shapes(&head);
+    let base_ops = &base_shapes.ops;
+    let head_ops = &head_shapes.ops;
+    let mut changes = Vec::new();
+
+    for (key, b) in base_ops {
+        let (verb, path) = key;
+        let push = |changes: &mut Vec<SpecChange>, sev, detail: String| {
+            changes.push(SpecChange {
+                severity: sev,
+                verb: verb.clone(),
+                path: path.clone(),
+                detail,
+            });
+        };
+        let Some(h) = head_ops.get(key) else {
+            // Suppress a false "removed" when head expresses this path as a $ref
+            // path-item we couldn't inspect — we can't prove it's gone.
+            if !head_shapes.ref_paths.contains(path) {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    "endpoint removed".to_string(),
+                );
+            }
+            continue;
+        };
+        // Response fields: removal or type change breaks consumers.
+        for (name, btype) in &b.resp_fields {
+            match h.resp_fields.get(name) {
+                None => push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    format!("response field '{name}' removed"),
+                ),
+                Some(htype) if htype != btype => push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    format!("response field '{name}' type changed ({btype} -> {htype})"),
+                ),
+                _ => {}
+            }
+        }
+        for name in h.resp_fields.keys() {
+            if !b.resp_fields.contains_key(name) {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Info,
+                    format!("response field '{name}' added"),
+                );
+            }
+        }
+        // Request fields: a type change or a NEWLY-required field breaks callers.
+        for (name, btype) in &b.req_fields {
+            if let Some(htype) = h.req_fields.get(name)
+                && htype != btype
+            {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    format!("request field '{name}' type changed ({btype} -> {htype})"),
+                );
+            }
+        }
+        for name in &h.req_required {
+            let newly_required = !b.req_required.contains(name);
+            if newly_required {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Breaking,
+                    format!("request field '{name}' is now required"),
+                );
+            }
+        }
+        for name in h.req_fields.keys() {
+            if !b.req_fields.contains_key(name) && !h.req_required.contains(name) {
+                push(
+                    &mut changes,
+                    SpecChangeSeverity::Info,
+                    format!("optional request field '{name}' added"),
+                );
+            }
+        }
+    }
+    // Added endpoints (INFO). Suppress when base expresses the path as a $ref
+    // path-item we couldn't inspect — we can't prove it's genuinely new.
+    for key in head_ops.keys() {
+        if !base_ops.contains_key(key) && !base_shapes.ref_paths.contains(&key.1) {
+            changes.push(SpecChange {
+                severity: SpecChangeSeverity::Info,
+                verb: key.0.clone(),
+                path: key.1.clone(),
+                detail: "endpoint added".to_string(),
+            });
+        }
+    }
+    changes.sort_by(|a, b| {
+        (a.severity as u8, &a.path, &a.verb, &a.detail).cmp(&(
+            b.severity as u8,
+            &b.path,
+            &b.verb,
+            &b.detail,
+        ))
+    });
+    Some(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn first_string_arg_handles_common_spring_forms() {
+        // Bare (the only form the old code handled).
+        assert_eq!(
+            first_string_arg("@GetMapping(\"/x\")").as_deref(),
+            Some("/x")
+        );
+        // Named arg — the common form the old code missed.
+        assert_eq!(
+            first_string_arg("@GetMapping(value = \"/x\")").as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            first_string_arg("@RequestMapping(path=\"/v1\", method=RequestMethod.GET)").as_deref(),
+            Some("/v1")
+        );
+        // Array literal — takes the first path.
+        assert_eq!(
+            first_string_arg("@GetMapping({\"/a\", \"/b\"})").as_deref(),
+            Some("/a")
+        );
+        // No string literal (e.g. only method= ...) → None, not a wrong path.
+        assert_eq!(
+            first_string_arg("@RequestMapping(method = RequestMethod.GET)"),
+            None
+        );
+        // Unicode inside quotes survives.
+        assert_eq!(
+            first_string_arg("@GetMapping(\"/café\")").as_deref(),
+            Some("/café")
+        );
+    }
+
+    #[test]
+    fn extract_base_path_ignores_method_level_request_mapping() {
+        // Class-level @RequestMapping → that's the base path.
+        let with_class = "@RestController\n@RequestMapping(\"/v1\")\npublic class C {\n  @GetMapping(\"/x\") void x() {}\n}";
+        assert_eq!(extract_base_path("spring", with_class), "/v1");
+
+        // No class-level mapping; a method-level @RequestMapping must NOT become
+        // the base path.
+        let method_only = "@RestController\npublic class C {\n  @RequestMapping(method = RequestMethod.GET, path = \"/foo\")\n  void foo() {}\n}";
+        assert_eq!(extract_base_path("spring", method_only), "");
+
+        // A Javadoc/line comment mentioning "class" above the controller must not
+        // fool the class-declaration scan into cutting off the @RequestMapping.
+        let javadoc = "/** This class provides the v1 API. */\n@RestController\n@RequestMapping(\"/v1\")\npublic class C {\n  @GetMapping(\"/x\") void x(){}\n}";
+        assert_eq!(extract_base_path("spring", javadoc), "/v1");
+        let line_comment = "// base class controller\n@RequestMapping(\"/api\")\nclass C {\n  @GetMapping(\"/x\") void x(){}\n}";
+        assert_eq!(extract_base_path("spring", line_comment), "/api");
+    }
+
+    #[test]
+    fn diff_openapi_classifies_field_level_changes() {
+        let base = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /pay:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: {type: integer}
+                note: {type: string}
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  status: {type: string}
+  /old:
+    get:
+      responses: {'200': {description: ok}}
+"#;
+        let head = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /pay:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, currency]
+              properties:
+                amount: {type: string}
+                currency: {type: string}
+                note: {type: string}
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  extra: {type: string}
+  /new:
+    get:
+      responses: {'200': {description: ok}}
+"#;
+        let changes = diff_openapi("openapi.yaml", base, "openapi.yaml", head).expect("parses");
+        let breaking: Vec<&str> = changes
+            .iter()
+            .filter(|c| c.severity == SpecChangeSeverity::Breaking)
+            .map(|c| c.detail.as_str())
+            .collect();
+        let info: Vec<&str> = changes
+            .iter()
+            .filter(|c| c.severity == SpecChangeSeverity::Info)
+            .map(|c| c.detail.as_str())
+            .collect();
+
+        // Four genuine breaks.
+        assert!(
+            breaking
+                .iter()
+                .any(|d| d.contains("'amount' type changed (integer -> string)")),
+            "{breaking:?}"
+        );
+        assert!(
+            breaking
+                .iter()
+                .any(|d| d.contains("'currency' is now required")),
+            "{breaking:?}"
+        );
+        assert!(
+            breaking
+                .iter()
+                .any(|d| d.contains("response field 'status' removed")),
+            "{breaking:?}"
+        );
+        assert!(
+            breaking.iter().any(|d| d.contains("endpoint removed")),
+            "{breaking:?}"
+        );
+        assert_eq!(breaking.len(), 4, "unexpected breaking set: {breaking:?}");
+
+        // Compatible additions are INFO, not breaking.
+        assert!(
+            info.iter()
+                .any(|d| d.contains("response field 'extra' added"))
+        );
+        assert!(info.iter().any(|d| d.contains("endpoint added")));
+        // A new required field must NOT also be double-reported as "optional added".
+        assert!(!info.iter().any(|d| d.contains("'currency'")), "{info:?}");
+    }
+
+    #[test]
+    fn diff_openapi_no_changes_is_empty() {
+        let spec = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /x:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: {type: object, properties: {id: {type: string}}}
+"#;
+        let changes = diff_openapi("openapi.yaml", spec, "openapi.yaml", spec).expect("parses");
+        assert!(
+            changes.is_empty(),
+            "identical specs should have no changes: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn diff_openapi_returns_none_for_non_openapi() {
+        assert!(diff_openapi("notes.md", "# hi", "notes.md", "# hi").is_none());
+    }
+
+    #[test]
+    fn diff_openapi_suppresses_ref_pathitem_false_breaking() {
+        // Base inlines /x; head expresses /x as a $ref path-item we can't inspect.
+        // Must NOT report "/x endpoint removed" (we can't prove it's gone).
+        let base = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /x:
+    get:
+      responses: {'200': {description: ok}}
+"#;
+        let head = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /x:
+    $ref: '#/components/pathItems/X'
+"#;
+        let changes = diff_openapi("openapi.yaml", base, "openapi.yaml", head).expect("parses");
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.detail.contains("endpoint removed")),
+            "must not false-flag a $ref path-item as removed: {changes:?}"
+        );
+        // And the reverse direction must not report a false "added".
+        let changes_rev = diff_openapi("openapi.yaml", head, "openapi.yaml", base).expect("parses");
+        assert!(
+            !changes_rev
+                .iter()
+                .any(|c| c.detail.contains("endpoint added")),
+            "must not false-flag a $ref path-item as added: {changes_rev:?}"
+        );
+    }
 
     #[test]
     fn detects_spec_files_by_name() {

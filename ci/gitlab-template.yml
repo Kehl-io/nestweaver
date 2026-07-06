@@ -1,0 +1,96 @@
+# NestWeaver Impact Analysis — GitLab CI Template
+#
+# Include in your .gitlab-ci.yml, then add a concrete job that extends the
+# hidden `.nestweaver-impact` template (including alone runs nothing):
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/Kehl-io/nestweaver/main/ci/gitlab-template.yml'
+#
+#   nestweaver-impact:
+#     extends: .nestweaver-impact
+#
+# Required CI/CD variables (set in Settings > CI/CD > Variables):
+#   NESTWEAVER_URL:   NestWeaver server gRPC URL (e.g. https://nestweaver.internal:9378)
+#   NESTWEAVER_TOKEN: NestWeaver API bearer token
+#   GITLAB_TOKEN:     Project Access Token with 'api' scope
+#
+# IMPORTANT: GITLAB_TOKEN must be a Project Access Token — NOT CI_JOB_TOKEN.
+# GitLab's CI_JOB_TOKEN cannot post merge request comments (the Notes API
+# is explicitly out of scope for job tokens; see GitLab issue #464591).
+# To create a Project Access Token:
+#   1. Go to Settings > Access Tokens
+#   2. Create a token with 'api' scope and 'Developer' or higher role
+#   3. Add it as a masked CI/CD variable named GITLAB_TOKEN
+#
+# Optional variables (override in your .gitlab-ci.yml):
+#   NESTWEAVER_MIN_SEVERITY:      Minimum severity to report: breaking, warning, info (default: info)
+#   NESTWEAVER_FAIL_ON_BREAKING:  Fail the job if breaking changes detected (default: false)
+#   NESTWEAVER_FAIL_ON_ERROR:     Fail the job if the NestWeaver server is unreachable (default: false)
+
+.nestweaver-impact:
+  stage: test
+  image: ghcr.io/kehl-io/nestweaver:latest
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    NESTWEAVER_MIN_SEVERITY: "info"
+    NESTWEAVER_FAIL_ON_BREAKING: "false"
+    NESTWEAVER_FAIL_ON_ERROR: "false"
+  script:
+    - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - |
+      set +e
+      nestweaver pre-push-impact \
+        --diff "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME..HEAD" \
+        --server "$NESTWEAVER_URL" \
+        --token "$NESTWEAVER_TOKEN" \
+        --min-severity "$NESTWEAVER_MIN_SEVERITY" \
+        --format json \
+        > impact.json 2> impact-stderr.txt
+      EXIT_CODE=$?
+      set -e
+
+      if [ $EXIT_CODE -ne 0 ]; then
+        echo "WARNING: NestWeaver impact analysis failed: $(cat impact-stderr.txt)"
+        if [ "$NESTWEAVER_FAIL_ON_ERROR" = "true" ]; then
+          echo "ERROR: fail-on-error is enabled — failing the job"
+          exit 1
+        fi
+        echo '{"impacts":[],"error":"server_unavailable"}' > impact.json
+      fi
+    - |
+      # Skip the comment if the server was unavailable — there's no
+      # useful data to post and "No impact" would be misleading.
+      if jq -e '.error // empty | select(type == "string" and . != "")' impact.json > /dev/null 2>&1; then
+        ERROR_MSG=$(jq -r '.error' impact.json)
+        echo "WARNING: Skipping MR comment — impact analysis unavailable: ${ERROR_MSG}"
+      else
+        nestweaver format-comment \
+          --input impact.json \
+          --gitlab-project "$CI_PROJECT_ID" \
+          --mr "$CI_MERGE_REQUEST_IID" \
+          --gitlab-token "$GITLAB_TOKEN" \
+          --marker "nestweaver-impact" || true
+      fi
+    - |
+      # GitLab Code Quality report (MR-widget annotations). Generated from
+      # impact.json, which always exists here (even the empty error stub), so
+      # the reports:codequality reference below never dangles.
+      nestweaver format-comment \
+        --input impact.json \
+        --codequality-out gl-code-quality-report.json > /dev/null 2>&1 \
+        || echo '[]' > gl-code-quality-report.json
+    - |
+      if [ "$NESTWEAVER_FAIL_ON_BREAKING" = "true" ]; then
+        if jq -e '.impacts[] | select(.severity == "Breaking")' impact.json > /dev/null 2>&1; then
+          echo "ERROR: Breaking changes detected across downstream repos — see MR comment for details"
+          exit 1
+        fi
+      fi
+  artifacts:
+    when: always
+    paths:
+      - impact.json
+      - gl-code-quality-report.json
+    reports:
+      codequality: gl-code-quality-report.json
+    expire_in: 30 days

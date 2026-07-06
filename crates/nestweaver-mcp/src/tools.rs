@@ -16,20 +16,20 @@ use nestweaver_engine::{
     BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig, SummaryLevel,
     affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities, broken_links,
     build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
-    detect_dead_code, doc_stats, expand_query_with_aliases, filter_by_target, find_bridge_nodes,
-    find_hub_nodes, generate_guide, generate_summaries, get_all_properties, get_last_indexed_at,
-    investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
-    load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text,
-    save_extensions, search_symbols, set_property, tag_graph, tag_graph_all, topic_clusters,
-    truncate_to_budget,
+    detect_dead_code_cancellable, doc_stats, expand_query_with_aliases, filter_by_target,
+    find_bridge_nodes, find_hub_nodes, generate_guide, generate_summaries, get_all_properties,
+    get_last_indexed_at, investigate, investigate_expand, investigate_hydrate, load_alias_sidecar,
+    load_clusters, load_extensions, memory_consolidate, memory_lint, memory_related,
+    orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies, query_by_property,
+    render_text, search_symbols, tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
-// In non-daemon builds, brain_add_source writes directly using these primitives.
+// In non-daemon builds, brain_add_source and set_extension write directly using
+// these primitives; in daemon builds those writes route through the daemon.
 #[cfg(not(feature = "daemon"))]
-use nestweaver_engine::{index_directory, index_markdown_directory};
+use nestweaver_engine::{index_directory, index_markdown_directory, save_extensions, set_property};
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -259,6 +259,21 @@ pub fn dispatch(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
+    dispatch_cancellable(store, tantivy, name, args, embed_model, None)
+}
+
+/// Like [`dispatch`], but threads a cooperative cancellation flag into the
+/// heavy traversals (e.g. `brain_context`/`project_context` vector fan-out) so a
+/// query timeout or client disconnect can stop the work. `cancel = None` is the
+/// original behavior.
+pub fn dispatch_cancellable(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    name: &str,
+    args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     // Enforce tool allowlist when configured.
     let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
     if let Some(ref names) = allowed
@@ -273,10 +288,10 @@ pub fn dispatch(
     // F16: serve cacheable read tools from (or populate) the response cache.
     // Correctness rests on the cache KEY — see `maybe_cached`.
     if is_cacheable_tool(name) && !cache_bypassed(&args) {
-        return maybe_cached(store, tantivy, name, args, embed_model);
+        return maybe_cached(store, tantivy, name, args, embed_model, cancel);
     }
 
-    dispatch_uncached(store, tantivy, name, args, embed_model)
+    dispatch_uncached(store, tantivy, name, args, embed_model, cancel)
 }
 
 /// The actual tool dispatch table, after cache handling.
@@ -286,9 +301,10 @@ fn dispatch_uncached(
     name: &str,
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
     match name {
-        "brain_context" => tool_brain_context(store, tantivy, args, embed_model),
+        "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel),
         "brain_search" => tool_brain_search(store, tantivy, args),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
@@ -297,17 +313,17 @@ fn dispatch_uncached(
         "brain_remove_source" => tool_brain_remove_source(store, args),
         "prune_stale" => tool_prune_stale(store),
         "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
-        "brain_impact" => tool_brain_impact(store, args),
+        "brain_impact" => tool_brain_impact(store, args, cancel),
         "brain_guide" => tool_brain_guide(store, args),
-        "flow_trace" => tool_flow_trace(store, args),
+        "flow_trace" => tool_flow_trace(store, args, cancel),
         "detect_changes" => tool_detect_changes(store, args),
         "clusters" => tool_clusters(store, args),
         "stale_check" => tool_stale_check(store),
         "set_extension" => tool_set_extension(args),
         "query_extensions" => tool_query_extensions(args),
         "brain_diff" => tool_brain_diff(store, args),
-        "project_context" => tool_project_context(store, tantivy, args, embed_model),
-        "dead_code" => tool_dead_code(store, args),
+        "project_context" => tool_project_context(store, tantivy, args, embed_model, cancel),
+        "dead_code" => tool_dead_code(store, args, cancel),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
         "blast_radius" => tool_blast_radius(store, args),
@@ -433,9 +449,10 @@ fn maybe_cached(
     name: &str,
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
     let Ok(db_path) = current_db_path(store) else {
-        return dispatch_uncached(store, tantivy, name, args, embed_model);
+        return dispatch_uncached(store, tantivy, name, args, embed_model, cancel);
     };
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
@@ -461,7 +478,7 @@ fn maybe_cached(
     }
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let result = dispatch_uncached(store, tantivy, name, args, embed_model)?;
+    let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel)?;
     match serde_json::to_vec(&result) {
         Ok(bytes) => {
             // Insert into the in-process cache, then decide whether to flush.
@@ -534,17 +551,40 @@ fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
 
 /// F5: read a symbol's source span (not the whole file). Resolves UIDs/names/
 /// FQNs, optionally includes adjacent symbols, and respects a token budget.
+/// Bound a list of client-supplied identifiers (symbol UIDs/names/FQNs, repo-
+/// relative paths) so an oversized entry or an over-long list can't be echoed
+/// back verbatim (a response-amplification lever) or waste work. A real
+/// identifier is at most a few hundred bytes, so truncating a huge one keeps it
+/// non-matching (→ not_found) while capping the response. Truncation is
+/// char-boundary safe.
+fn bound_identifiers(mut v: Vec<String>) -> Vec<String> {
+    const MAX_LEN: usize = 512;
+    const MAX_COUNT: usize = 1000;
+    v.truncate(MAX_COUNT);
+    for s in &mut v {
+        if s.len() > MAX_LEN {
+            let mut end = MAX_LEN;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+        }
+    }
+    v
+}
+
 fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let targets: Vec<String> = args
-        .get("targets")
-        .or_else(|| args.get("uids_or_fqns"))
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let targets: Vec<String> = bound_identifiers(
+        args.get("targets")
+            .or_else(|| args.get("uids_or_fqns"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
     if targets.is_empty() {
         return Err(anyhow!(
             "'targets' must be a non-empty array of symbol UIDs, names, or FQNs"
@@ -564,20 +604,229 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_str())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let res = nestweaver_engine::read_symbols::read_symbols(
-        store,
-        &targets,
-        &root,
-        neighbors,
-        token_budget,
-    );
-    Ok(serde_json::to_value(res)?)
+
+    // In server mode, try to read source spans from bare clones via
+    // GitBareReader instead of the filesystem (which has no checkout tree).
+    let value = if is_server_mode() {
+        let bare_result = try_read_symbols_from_bare(store, &targets, neighbors, token_budget);
+        match bare_result {
+            Some(res) => serde_json::to_value(res)?,
+            None => {
+                let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
+                let res = nestweaver_engine::read_symbols::read_symbols(
+                    store,
+                    &targets,
+                    &reader,
+                    neighbors,
+                    token_budget,
+                );
+                serde_json::to_value(res)?
+            }
+        }
+    } else {
+        let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
+        let res = nestweaver_engine::read_symbols::read_symbols(
+            store,
+            &targets,
+            &reader,
+            neighbors,
+            token_budget,
+        );
+        serde_json::to_value(res)?
+    };
+    let mut value = value;
+
+    // If we're in server mode and the result has no symbols with bodies,
+    // add a diagnostic note for AI agents.
+    if is_server_mode() {
+        let has_empty_bodies = value
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                arr.iter().all(|s| {
+                    s.get("body")
+                        .and_then(|b| b.as_str())
+                        .is_none_or(|b| b.is_empty())
+                })
+            });
+        if has_empty_bodies {
+            value["server_note"] = serde_json::json!(
+                "Running in server mode — source files are in bare clones without \
+                 checkout trees. The bare clone workspace could not be located \
+                 (expected at <db_parent>/workspace/). Symbol metadata (name, kind, \
+                 location, edges) is available but source spans are empty. \
+                 Alternatives: use brain_search or brain_context for content lookup, \
+                 or connect a local client with filesystem access for full source spans."
+            );
+        }
+    }
+
+    Ok(value)
+}
+
+/// Attempt to read symbol source spans from bare git clones in server mode.
+///
+/// Derives the bare clone workspace root from the current DB path
+/// (convention: `<db_parent>/workspace/`). Groups targets by repo so that
+/// symbols from different repos each get their own `GitBareReader`.
+/// Returns `None` if the workspace directory doesn't exist or if no repo
+/// can be resolved for any target.
+fn try_read_symbols_from_bare(
+    store: &GraphStore,
+    targets: &[String],
+    neighbors: u8,
+    token_budget: Option<usize>,
+) -> Option<nestweaver_engine::read_symbols::ReadSymbolsResult> {
+    use std::collections::HashMap;
+
+    // Derive workspace root from the thread-local db_path.
+    let db_path = current_db_path(store).ok()?;
+    let workspace_root = db_path.parent()?.join("workspace");
+    if !workspace_root.is_dir() {
+        return None;
+    }
+
+    // Group targets by repo_uid, preserving input order within each group.
+    // Targets that cannot be resolved go into a special "unresolved" bucket
+    // so they appear in the final not_found list.
+    let mut repo_groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut repo_index: HashMap<String, usize> = HashMap::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for spec in targets {
+        if let Some(repo_uid) = resolve_repo_for_spec(store, spec) {
+            if let Some(&idx) = repo_index.get(&repo_uid) {
+                repo_groups[idx].1.push(spec.clone());
+            } else {
+                let idx = repo_groups.len();
+                repo_index.insert(repo_uid.clone(), idx);
+                repo_groups.push((repo_uid, vec![spec.clone()]));
+            }
+        } else {
+            unresolved.push(spec.clone());
+        }
+    }
+
+    if repo_groups.is_empty() {
+        return None;
+    }
+
+    // Read symbols per repo group and merge results.
+    let mut merged = nestweaver_engine::read_symbols::ReadSymbolsResult::default();
+    merged.not_found.extend(unresolved);
+    let mut remaining_budget = token_budget;
+
+    for (repo_uid, group_targets) in &repo_groups {
+        let reader = match bare_reader_for_repo(store, &workspace_root, repo_uid) {
+            Some(r) => r,
+            None => {
+                // Cannot open this repo's bare clone — mark all targets as not_found.
+                merged.not_found.extend(group_targets.iter().cloned());
+                continue;
+            }
+        };
+
+        let partial = nestweaver_engine::read_symbols::read_symbols(
+            store,
+            group_targets,
+            &reader,
+            neighbors,
+            remaining_budget,
+        );
+
+        // Subtract consumed budget.
+        if let Some(budget) = remaining_budget {
+            let used: usize = partial.symbols.iter().map(|s| s.body.len() / 4 + 16).sum();
+            remaining_budget = Some(budget.saturating_sub(used));
+        }
+
+        merged.symbols.extend(partial.symbols);
+        merged.not_found.extend(partial.not_found);
+        merged.ambiguous.extend(partial.ambiguous);
+        merged.dropped.extend(partial.dropped);
+        merged.truncated = merged.truncated || partial.truncated;
+    }
+
+    Some(merged)
+}
+
+/// Build a `GitBareReader` for the given repo_uid.
+fn bare_reader_for_repo(
+    store: &GraphStore,
+    workspace_root: &std::path::Path,
+    repo_uid: &str,
+) -> Option<nestweaver_engine::content_reader::GitBareReader> {
+    let repo = store.lookup_repo(repo_uid).ok().flatten()?;
+    // The bare clone is named solely from the URL by `ensure_clone` (it never
+    // sees the explicit repo name), so resolve the on-disk dir the same way —
+    // via the URL-hashed clone-dir name, not the display/identity basename.
+    let clone_dir = nestweaver_engine::pull::clone_dir_name_from_url(&repo.url);
+    let bare_path = workspace_root.join(format!("{clone_dir}.git"));
+    if !bare_path.is_dir() {
+        return None;
+    }
+    // Read source at the repo's recorded indexed_sha — symbol spans come from the
+    // graph indexed at that commit, and the bare clone's HEAD may have been
+    // fetched past it. Fall back to HEAD only when no server sha is recorded
+    // (local repos store "local" or an empty sha).
+    if repo.indexed_sha.is_empty() || repo.indexed_sha == "local" {
+        nestweaver_engine::content_reader::GitBareReader::from_head(&bare_path).ok()
+    } else {
+        Some(nestweaver_engine::content_reader::GitBareReader::new(
+            &bare_path,
+            &repo.indexed_sha,
+        ))
+    }
+}
+
+/// Build an inline-body reader resolver for the current mode.
+///
+/// In server mode this yields a `GitBareReader` per `repo_uid` (mirroring how
+/// `read_symbols` selects a reader per repo), so opt-in inline symbol bodies are
+/// read from the bare clone instead of a non-existent working tree. In local
+/// mode it returns `None`, so `populate_inline_bodies` falls back to a
+/// `FilesystemReader` and behavior is unchanged.
+type BoxedInlineBodyResolver<'a> =
+    Box<dyn Fn(&str) -> Option<Box<dyn nestweaver_engine::content_reader::ContentReader>> + 'a>;
+
+fn inline_body_reader_resolver(store: &GraphStore) -> Option<BoxedInlineBodyResolver<'_>> {
+    if !is_server_mode() {
+        return None;
+    }
+    let db_path = current_db_path(store).ok()?;
+    let workspace_root = db_path.parent()?.join("workspace");
+    if !workspace_root.is_dir() {
+        return None;
+    }
+    Some(Box::new(move |repo_uid: &str| {
+        bare_reader_for_repo(store, &workspace_root, repo_uid)
+            .map(|r| Box::new(r) as Box<dyn nestweaver_engine::content_reader::ContentReader>)
+    }))
+}
+
+/// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
+fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
+    if spec.starts_with("sym:") {
+        return store.lookup_symbol(spec).ok().map(|s| s.repo_uid);
+    }
+    let name = spec
+        .rsplit("::")
+        .next()
+        .unwrap_or(spec)
+        .rsplit('.')
+        .next()
+        .unwrap_or(spec);
+    store
+        .lookup_symbols_by_name(name)
+        .ok()
+        .and_then(|syms| syms.into_iter().next())
+        .map(|s| s.repo_uid)
 }
 
 fn tool_schema_read_symbols() -> Value {
     json!({
         "name": "read_symbols",
-        "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- Requires the repo root to resolve file paths (defaults to server working directory)",
+        "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- Requires the repo root to resolve file paths (defaults to server working directory)\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -613,6 +862,10 @@ fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .or_else(|| args.get("query"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'pattern' must be a string"))?;
+
+    // Note: regex_search works in server mode — GraphStore::regex_search
+    // searches over indexed symbol text, not raw source files on disk.
+
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let kinds = parse_string_array(&args, "kinds");
     let limit = args
@@ -666,9 +919,21 @@ fn tool_schema_regex_search() -> Value {
 /// F4: counts-only companion to regex_search. Counts matches per pattern across
 /// indexed text and reports the busiest files.
 fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    const MAX_PATTERNS: usize = 64;
     let patterns = parse_string_array(&args, "patterns")
         .filter(|p| !p.is_empty())
         .ok_or_else(|| anyhow!("'patterns' must be a non-empty array of regex strings"))?;
+    // Each pattern is a full O(corpus) scan, so an unbounded array is a cheap
+    // CPU/response-amplification lever; an empty-string pattern matches everything.
+    if patterns.len() > MAX_PATTERNS {
+        anyhow::bail!(
+            "too many patterns ({}); maximum is {MAX_PATTERNS}",
+            patterns.len()
+        );
+    }
+    if patterns.iter().any(|p| p.trim().is_empty()) {
+        anyhow::bail!("empty pattern strings are not allowed");
+    }
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let kinds = parse_string_array(&args, "kinds");
 
@@ -1190,6 +1455,7 @@ fn tool_brain_context(
     tantivy: Option<&TantivyIndex>,
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
     let seeds: Vec<String> = args
         .get("seeds")
@@ -1309,6 +1575,7 @@ fn tool_brain_context(
         Some(&db_path),
         intent,
         embed_model,
+        cancel,
     )?;
 
     // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
@@ -1499,6 +1766,16 @@ fn tool_brain_context(
         );
     }
 
+    if result.connected.is_empty() && !result.seeds.is_empty() {
+        let mut present: std::collections::HashSet<String> =
+            result.connected.iter().map(|n| n.uid.clone()).collect();
+        for seed in result.seeds.iter().cloned() {
+            if present.insert(seed.uid.clone()) {
+                result.connected.push(seed);
+            }
+        }
+    }
+
     // Feature F8: embed high-relevance bodies inline when the caller opted in
     // via `include_bodies: true`. Off by default → output unchanged. Threshold
     // and per-body cap come from [response] config when supplied, else defaults.
@@ -1535,6 +1812,7 @@ fn tool_brain_context(
             .unwrap_or_else(|| {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
+        let reader_resolver = inline_body_reader_resolver(store);
         populate_inline_bodies(
             store,
             &mut result.connected,
@@ -1542,6 +1820,7 @@ fn tool_brain_context(
             response_config.inline_body_threshold,
             response_config.inline_max_body_tokens,
             Some(token_budget),
+            reader_resolver.as_deref(),
         );
     }
 
@@ -1767,7 +2046,11 @@ fn tool_brain_search(
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(20);
+        .unwrap_or(20)
+        // Clamp to >=1: `limit:0` flows into `limit * 5` → `TopDocs::with_limit(0)`,
+        // which Tantivy asserts against ("Limit must be greater than 0") — a panic
+        // on a plausible client input.
+        .max(1);
     let concise = is_concise(&args);
 
     // Expand the query with taxonomy aliases for better recall.
@@ -2154,6 +2437,7 @@ fn tool_brain_search(
                 })
             })
             .collect();
+        let reader_resolver = inline_body_reader_resolver(store);
         populate_inline_bodies(
             store,
             &mut nodes,
@@ -2161,6 +2445,7 @@ fn tool_brain_search(
             response_config.inline_body_threshold,
             response_config.inline_max_body_tokens,
             None,
+            reader_resolver.as_deref(),
         );
         let bodies: std::collections::HashMap<String, String> = nodes
             .into_iter()
@@ -2356,11 +2641,13 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         });
 
     let note = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        store.lookup_note(uid).context("lookup_note")?
+        store
+            .lookup_note(uid)
+            .with_context(|| format!("failed to look up note with uid '{uid}'"))?
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         let mut matches = store
             .lookup_notes_by_title(title)
-            .context("lookup_notes_by_title")?;
+            .with_context(|| format!("failed to look up notes with title '{title}'"))?;
         // Slug-tolerant fallback: case-insensitive + slug normalization.
         // Uses list_notes_lite to avoid loading full note bodies during scan.
         if matches.is_empty() {
@@ -2384,8 +2671,12 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     };
 
     // Load all headings and sections (needed for both outline and section filter).
-    let headings_raw = store.headings_in_note(&note.uid).unwrap_or_default();
-    let sections_raw = store.sections_in_note(&note.uid).unwrap_or_default();
+    let headings_raw = store
+        .headings_in_note(&note.uid)
+        .map_err(|e| anyhow!("headings_in_note: {e}"))?;
+    let sections_raw = store
+        .sections_in_note(&note.uid)
+        .map_err(|e| anyhow!("sections_in_note: {e}"))?;
 
     // Resolve body: either filtered sections or full file contents.
     let body = if let Some(ref names) = section_filter {
@@ -2565,7 +2856,7 @@ fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
 fn tool_schema_brain_status() -> Value {
     json!({
         "name": "brain_status",
-        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check",
+        "description": "Show what knowledge sources are indexed: vault/repo counts, note/tag/wikilink totals, staleness warnings, and search engine availability. No parameters required.\n\nGuidelines:\n- Call at session start to verify expected vaults and repos are loaded\n- Surfaces staleness warnings when repos are behind git HEAD\n- If counts are zero, use brain_add_source to index content\n\nLimitations:\n- Metadata-only — does not search content (use brain_search for that)\n- For detailed per-repo staleness, use stale_check\n\nIn server mode, includes additional fields: server_mode, indexing_active, indexing_repo, queue_depth.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -2746,7 +3037,11 @@ fn tool_brain_status(
             }));
             continue;
         }
-        let path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
+        // Disk checks only apply to repos with a known local working tree;
+        // remote-identity repos without one (root_path: None) are skipped.
+        let Some(path) = repo.local_root() else {
+            continue;
+        };
         let repo_path = std::path::Path::new(path);
         if !repo_path.exists() {
             staleness_warnings.push(json!({
@@ -2809,6 +3104,7 @@ fn tool_brain_status(
         "wikilinks": wikilinks,
         "repos": repos_json,
         "repo_count": repos.len(),
+        "server_mode": is_server_mode(),
         "tantivy_available": tantivy_available,
         "tantivy_doc_count": tantivy_doc_count,
         "watcher_pid": watcher_pid,
@@ -2914,7 +3210,9 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
         }
 
         let has_obsidian = path.join(".obsidian").is_dir();
-        let has_git = path.join(".git").is_dir();
+        // `.exists()`, not `.is_dir()`: in a git worktree `.git` is a FILE
+        // pointing at the real gitdir — consistent with every other guard.
+        let has_git = path.join(".git").exists();
         let has_any_md = walk_has_markdown(path);
 
         // Detection priority: Obsidian vault > markdown folder > git repo.
@@ -2960,7 +3258,11 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
 
         if has_git {
             let db_path = current_db_path(store)?;
-            let url = format!("file://{}", path.display());
+            // Identity: prefer the git origin remote when configured (used
+            // only as an identity string — never fetched); fall back to a
+            // file:// URL. The engine persists the disk location as
+            // `root_path` on the Repo node.
+            let url = nestweaver_engine::mint_repo_identity(path);
             let result =
                 index_directory(path, &db_path, "default", &url, "local").context("index repo")?;
             return Ok(json!({
@@ -3033,6 +3335,19 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         String::new()
     };
 
+    // When the target is a filesystem path, the repo it refers to may be
+    // identified by its git origin remote rather than a file:// URL — try
+    // that identity too (read from git config; never fetched).
+    let origin_target = std::fs::canonicalize(expand(&target))
+        .ok()
+        .filter(|p| p.join(".git").exists())
+        .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
+        .unwrap_or_default();
+    let canonical_path = canonical_target
+        .strip_prefix("file://")
+        .unwrap_or_default()
+        .to_string();
+
     let target_trimmed = target.trim_end_matches('/');
     let matched_repo: Vec<&nestweaver_schema::Repo> = repos
         .iter()
@@ -3042,6 +3357,10 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
                 || r.name.as_deref() == Some(target_trimmed)
                 || r_url == url_target.trim_end_matches('/')
                 || r_url == canonical_target.trim_end_matches('/')
+                || (!origin_target.is_empty() && r_url == origin_target.trim_end_matches('/'))
+                || (!canonical_path.is_empty()
+                    && r.local_root().map(|p| p.trim_end_matches('/'))
+                        == Some(canonical_path.trim_end_matches('/')))
                 || r_url.ends_with(&format!("/{target_trimmed}"))
         })
         .collect();
@@ -3213,14 +3532,25 @@ async fn inline_connect_daemon(
 // TODO: deduplicate with nestweaver_daemon::lifecycle::socket_path()
 #[cfg(feature = "daemon")]
 fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
-    // Compute the 8-char hex instance ID (same algorithm as lifecycle.rs).
-    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
-    let mut hasher = DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    let instance_id = format!("{:08x}", hasher.finish() & 0xFFFF_FFFF);
+    // Compute the 8-char hex instance ID (same SHA-256 algorithm as lifecycle.rs).
+    let canonical = if let Ok(c) = std::fs::canonicalize(db_path) {
+        c
+    } else if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
+        && let Ok(cp) = std::fs::canonicalize(parent)
+    {
+        cp.join(file_name)
+    } else {
+        db_path.to_path_buf()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    let instance_id = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    );
 
     // Must match nestweaver_daemon::lifecycle::runtime_dir() exactly.
     // $TMPDIR is deliberately NOT consulted: on macOS, different launchers
@@ -3285,7 +3615,7 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting",
+        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3367,7 +3697,7 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
 fn tool_schema_contract_drift() -> Value {
     json!({
         "name": "contract_drift",
-        "description": "Audit API contract drift: routes declared in specs (OpenAPI, .proto, GraphQL) but not implemented, and routes implemented but not declared in any spec.\n\nGuidelines:\n- Use to spot missing endpoints or undocumented APIs\n- Optional repo filter scopes to a single repository\n- Returns two buckets: declared_not_implemented and implemented_not_declared\n\nLimitations:\n- Contract links are hypotheses derived from spec parsing and handler heuristics (same-repo only)\n- Only supports OpenAPI/Swagger, .proto, and GraphQL spec formats",
+        "description": "Audit API contract drift: routes declared in specs (OpenAPI, .proto, GraphQL) but not implemented, and routes implemented but not declared in any spec.\n\nGuidelines:\n- Use to spot missing endpoints or undocumented APIs\n- Optional repo filter scopes to a single repository\n- Returns two buckets: declared_not_implemented and implemented_not_declared\n\nLimitations:\n- Contract links are hypotheses derived from spec parsing and handler heuristics (same-repo only)\n- Only supports OpenAPI/Swagger, .proto, and GraphQL spec formats\n\nIn server mode, the server has the full org-wide view of contract drift. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3419,7 +3749,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3442,7 +3772,11 @@ fn tool_schema_brain_impact() -> Value {
     })
 }
 
-fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_brain_impact(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     let symbol = args
         .get("symbol")
         .and_then(|v| v.as_str())
@@ -3455,9 +3789,48 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .unwrap_or_else(configured_result_limit);
     let concise = is_concise(&args);
 
-    let uid = resolve_symbol_uid(store, symbol)?;
+    // Resolve with an explicit status so the CLI can honor the not-found/ambiguous exit-code
+    // contract in daemon mode, instead of the daemon path silently returning the best of
+    // several matches (which diverged from the direct path).
+    let uid = if symbol.contains(':') {
+        symbol.to_string()
+    } else {
+        let matches = store
+            .lookup_symbols_by_name(symbol)
+            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+        match matches.len() {
+            0 => {
+                return Ok(json!({
+                    "status": "not_found",
+                    "symbol": symbol,
+                    "impact_nodes": [],
+                    "total": 0,
+                    "returned": 0,
+                }));
+            }
+            1 => matches.into_iter().next().unwrap().uid,
+            _ => {
+                let candidates: Vec<Value> = matches
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "uid": s.uid,
+                            "name": s.name,
+                            "file_path": s.file_path,
+                            "start_line": s.start_line,
+                        })
+                    })
+                    .collect();
+                return Ok(json!({
+                    "status": "ambiguous",
+                    "symbol": symbol,
+                    "candidates": candidates,
+                }));
+            }
+        }
+    };
 
-    let nodes = store.impact(&uid, depth, 0.0)?;
+    let nodes = store.impact_cancellable(&uid, depth, 0.0, cancel)?;
     let total = nodes.len();
 
     let rows: Vec<Value> = nodes
@@ -3486,6 +3859,7 @@ fn tool_brain_impact(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .collect();
 
     Ok(json!({
+        "status": "ok",
         "target": uid,
         "impact_nodes": rows,
         "total": total,
@@ -3540,7 +3914,11 @@ fn tool_schema_flow_trace() -> Value {
     })
 }
 
-fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_flow_trace(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     let symbol = args
         .get("symbol")
         .and_then(|v| v.as_str())
@@ -3561,15 +3939,23 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
     let mut visited = HashSet::new();
     visited.insert(root.uid.clone());
 
-    let opts = FlowTraceOpts { max_depth, concise };
+    let opts = FlowTraceOpts {
+        max_depth,
+        concise,
+        cancel,
+    };
 
     // Classes don't have CALLS edges — only their methods do. When the root
     // symbol is a class, expand to its methods and return a flow tree per method.
     if root.kind == SymbolKind::Class {
-        let direct_callees = store.callees_of(&root.uid).unwrap_or_default();
+        let direct_callees = store
+            .callees_of(&root.uid)
+            .map_err(|e| anyhow!("callees_of: {e}"))?;
         if direct_callees.is_empty() {
             // Prefer MEMBER_OF edges — these correctly scope inner-class methods.
-            let members = store.members_of(&root.uid).unwrap_or_default();
+            let members = store
+                .members_of(&root.uid)
+                .map_err(|e| anyhow!("members_of: {e}"))?;
 
             let is_method = |s: &nestweaver_schema::Symbol| {
                 s.kind == SymbolKind::Method || s.kind == SymbolKind::Function
@@ -3586,10 +3972,12 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
                         v.insert(s.uid.clone());
                         build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
                     })
-                    .collect()
+                    .collect::<Result<Vec<Value>, _>>()?
             } else {
                 // Fallback: line-range heuristic excluding methods inside nested classes.
-                let file_symbols = store.symbols_in_file(&root.file_path).unwrap_or_default();
+                let file_symbols = store
+                    .symbols_in_file(&root.file_path)
+                    .map_err(|e| anyhow!("symbols_in_file: {e}"))?;
                 let nested_class_ranges: Vec<(u32, u32)> = file_symbols
                     .iter()
                     .filter(|s| {
@@ -3617,7 +4005,7 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
                         v.insert(s.uid.clone());
                         build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &mut v, &opts)
                     })
-                    .collect()
+                    .collect::<Result<Vec<Value>, _>>()?
             };
 
             return Ok(json!({
@@ -3639,7 +4027,7 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         0,
         &mut visited,
         &opts,
-    );
+    )?;
 
     Ok(json!({
         "root_uid": root.uid,
@@ -3651,9 +4039,12 @@ fn tool_flow_trace(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
 
 /// Configuration for `build_flow_tree` to keep the argument count under
 /// the clippy `too_many_arguments` threshold.
-struct FlowTraceOpts {
+struct FlowTraceOpts<'a> {
     max_depth: usize,
     concise: bool,
+    /// Cooperative cancellation flag, checked once per recursion level. See
+    /// [`nestweaver_store::StoreError::Cancelled`] for the contract.
+    cancel: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 fn build_flow_tree(
@@ -3663,8 +4054,20 @@ fn build_flow_tree(
     file_path: &str,
     depth: usize,
     visited: &mut HashSet<String>,
-    opts: &FlowTraceOpts,
-) -> Value {
+    opts: &FlowTraceOpts<'_>,
+) -> Result<Value, anyhow::Error> {
+    if opts
+        .cancel
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        // A cancelled trace is incomplete — propagate the store's typed
+        // cancellation error so the boundary never serves (or caches) a
+        // truncated tree as a real answer.
+        return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
+            nestweaver_store::CancelReason::Timeout,
+        )));
+    }
+
     let mut children = Vec::new();
 
     if depth < opts.max_depth
@@ -3683,24 +4086,37 @@ fn build_flow_tree(
                 depth + 1,
                 visited,
                 opts,
-            );
+            )?;
             children.push(child);
         }
     }
 
     if opts.concise {
-        json!({
+        Ok(json!({
             "name": name,
             "children": children,
-        })
+        }))
     } else {
-        json!({
+        // Look up repo_uid and canonical_id for boundary detection.
+        let (repo_uid, canonical_id) = store
+            .lookup_symbol(uid)
+            .ok()
+            .map(|s| {
+                (
+                    s.repo_uid.clone(),
+                    s.canonical_id.clone().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        Ok(json!({
             "uid": uid,
             "name": name,
             "file_path": file_path,
             "depth": depth,
+            "repo_uid": repo_uid,
+            "canonical_id": canonical_id,
             "children": children,
-        })
+        }))
     }
 }
 
@@ -3786,7 +4202,7 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3806,15 +4222,16 @@ fn tool_schema_affected_tests() -> Value {
 
 fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
-    let mut changed_files: Vec<String> = args
-        .get("changed_files")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut changed_files: Vec<String> = bound_identifiers(
+        args.get("changed_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
 
     if changed_files.is_empty()
         && let Some(base_ref) = args.get("base_ref").and_then(|v| v.as_str())
@@ -3839,12 +4256,16 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     Ok(serde_json::to_value(&result)?)
 }
 
-/// Return the filesystem path of the first locally-indexed repo (file:// URL).
+/// Return the filesystem path of the first locally-indexed repo (a repo
+/// with a known local working tree — see [`nestweaver_schema::Repo::local_root`]).
 fn first_local_repo_path(store: &GraphStore) -> Option<String> {
-    let repos = store.list_repos(None).unwrap_or_default();
-    repos
-        .iter()
-        .find_map(|r| r.url.strip_prefix("file://").map(|p| p.to_string()))
+    // Option return can't propagate; surface a DB error in the log rather than
+    // silently reporting "no local repo".
+    let repos = store.list_repos(None).unwrap_or_else(|e| {
+        tracing::warn!("first_local_repo_path: list_repos failed: {e}");
+        Vec::new()
+    });
+    repos.iter().find_map(|r| r.local_root().map(String::from))
 }
 
 // ── 12. clusters ───────────────────────────────────────────────────────────
@@ -3927,14 +4348,16 @@ fn tool_schema_stale_check() -> Value {
 }
 
 fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
-    let repos = store.list_repos(None).unwrap_or_default();
+    let repos = store
+        .list_repos(None)
+        .map_err(|e| anyhow!("list_repos: {e}"))?;
 
     let mut results = Vec::new();
     let mut any_stale = false;
 
     for repo in &repos {
-        // Try to determine current HEAD from the repo's URL.
-        let current_head = if let Some(path) = repo.url.strip_prefix("file://") {
+        // Local working tree → read HEAD from disk; otherwise ask the remote.
+        let current_head = if let Some(path) = repo.local_root() {
             get_git_head(path)
         } else {
             get_remote_head(&repo.url)
@@ -3943,7 +4366,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         // Compute commits behind for local repos when HEAD differs from indexed SHA.
         let is_valid_sha =
             repo.indexed_sha.len() == 40 && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
-        let commits_behind = match (&current_head, repo.url.strip_prefix("file://")) {
+        let commits_behind = match (&current_head, repo.local_root()) {
             (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
                 count_commits_between(path, &repo.indexed_sha, head).unwrap_or(0)
             }
@@ -4057,33 +4480,75 @@ fn tool_schema_set_extension() -> Value {
 }
 
 fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
-    let uid = args
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'uid' must be a string"))?;
-    let key = args
-        .get("key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'key' must be a string"))?;
-    let value = args
-        .get("value")
-        .cloned()
-        .ok_or_else(|| anyhow!("'value' is required"))?;
-
     let db_path = CURRENT_DB_PATH
         .with(|c| c.borrow().clone())
         .ok_or_else(|| anyhow!("database path not set on server"))?;
 
-    let mut store = load_extensions(&db_path);
-    set_property(&mut store, uid, key, value.clone());
-    save_extensions(&db_path, &store)?;
+    // Always route through the daemon (starting it if needed) so the sidecar
+    // read-modify-write runs under the daemon write gate — serialized against a
+    // backup's sidecar staging, visible to the shutdown drain, and safe from
+    // two concurrent callers losing updates (last-writer-wins). Mirrors
+    // `tool_brain_add_source`. The daemon's gRPC `set_extension` handler
+    // validates and performs the actual mutation directly (never back through
+    // this function), so there is no routing recursion.
+    #[cfg(feature = "daemon")]
+    {
+        let db_path_buf = std::path::PathBuf::from(&db_path);
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+        let sock_path = inline_ensure_daemon(&db_path_buf)
+            .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+        let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+        dispatch_set_extension_via_daemon(&mut client, &rt, args)
+    }
 
-    Ok(json!({
-        "uid": uid,
-        "key": key,
-        "value": value,
-        "status": "saved",
-    }))
+    // Non-daemon fallback (daemon feature not compiled in): single-process, so
+    // a direct write is the only writer and needs no cross-process gate.
+    #[cfg(not(feature = "daemon"))]
+    {
+        let uid = args
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("'uid' must be a string"))?;
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("'key' must be a string"))?;
+        let value = args
+            .get("value")
+            .cloned()
+            .ok_or_else(|| anyhow!("'value' is required"))?;
+
+        let mut store = load_extensions(&db_path);
+        set_property(&mut store, uid, key, value.clone());
+        save_extensions(&db_path, &store)?;
+
+        Ok(json!({
+            "uid": uid,
+            "key": key,
+            "value": value,
+            "status": "saved",
+        }))
+    }
+}
+
+/// Route a `set_extension` call to the daemon's gated gRPC handler so the
+/// `.extensions.json` write holds the daemon write gate. Mirrors
+/// `dispatch_add_source_via_daemon`.
+#[cfg(feature = "daemon")]
+fn dispatch_set_extension_via_daemon(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    args: Value,
+) -> Result<Value, anyhow::Error> {
+    use nestweaver_proto::JsonRequest;
+
+    let args_json = serde_json::to_string(&args)?;
+    let resp = rt
+        .block_on(client.set_extension(JsonRequest { args_json }))
+        .map_err(|e| anyhow::anyhow!("set_extension RPC failed: {}", e.message()))?;
+    let result_json = resp.into_inner().result_json;
+    serde_json::from_str(&result_json).map_err(Into::into)
 }
 
 // ── 15. query_extensions ───────────────────────────────────────────────────
@@ -4212,14 +4677,13 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         })
         .ok_or_else(|| anyhow!("repo '{}' not found in graph", repo_name))?;
 
-    if !repo.url.starts_with("file://") {
+    let Some(repo_path) = repo.local_root() else {
         anyhow::bail!(
-            "brain_diff only works with locally-indexed repositories (file:// URLs); \
-             '{}' is not a local repo",
+            "brain_diff only works with locally-indexed repositories \
+             (repos with a local working tree); '{}' is not a local repo",
             repo.url
         );
-    }
-    let repo_path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
+    };
 
     let base_sha = since_sha_arg.unwrap_or(&repo.indexed_sha);
 
@@ -4313,7 +4777,7 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Retrieve all context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Filter with kinds (e.g. ['Symbol'] for code only), since, and recency_weight\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first",
+        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within the project's subgraph, bounded by token budget.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4359,6 +4823,30 @@ fn tool_schema_project_context() -> Value {
                     "type": "string",
                     "enum": ["find-definition", "understand-architecture", "analyze-impact", "general-context"],
                     "description": "Optional query intent hint that adjusts ranking strategy. 'find-definition' boosts exact name matches; 'understand-architecture' broadens to structural neighbors (default for project_context); 'analyze-impact' follows dependency edges; 'general-context' uses balanced defaults."
+                },
+                "response_format": {
+                    "type": "string",
+                    "enum": ["concise", "detailed"],
+                    "description": "'concise' (default) returns kind/title/location per node at a ~1000-token budget — right for orienting at session start, then narrow with brain_context. 'detailed' adds uid + relevance and uses a ~3000-token budget."
+                },
+                "repos": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Scope results to these repos (display name, uid, or path substring). Use on a returning session to skip the broad load."
+                },
+                "path_prefix": {
+                    "type": "string",
+                    "description": "Keep only nodes whose location starts with this path prefix (e.g. \"crates/nestweaver-daemon/\")."
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes are always kept."
+                },
+                "exclude_tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Drop note/section nodes tagged with any of these tags."
                 }
             },
             "required": ["project"]
@@ -4371,20 +4859,47 @@ fn tool_project_context(
     tantivy: Option<&TantivyIndex>,
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Value, anyhow::Error> {
+    // Reject an empty/whitespace project — otherwise the UID-substring fallback below
+    // (`uid.contains(project_str)`) matches EVERY project on "" and silently resolves to the
+    // first one. Reachable via the daemon path, where the proto `project` field defaults to "".
     let project_str = args
         .get("project")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'project' must be a string"))?;
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("'project' must be a non-empty string"))?;
+    // response_format: "concise" (default) trims per-node fields and uses a smaller default
+    // token budget; "detailed" returns full metadata at the larger budget. A session-opener
+    // wants orientation, not payload — the agent then narrows. See ADR
+    // server-mode-remainder-decisions (evidence: Anthropic response_format, Aider 1k map,
+    // Lost-in-the-Middle / Context Rot). Anything but "detailed" (incl. empty) → concise.
+    let concise = args
+        .get("response_format")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.eq_ignore_ascii_case("detailed"))
+        .unwrap_or(true);
     let token_budget = args
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or(3000);
+        .unwrap_or(if concise { 1000 } else { 3000 });
     let include_components = args
         .get("include_components")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let filter_repos: Option<Vec<String>> =
+        args.get("repos").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+    let path_prefix: Option<String> = args
+        .get("path_prefix")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     let filter_kinds: Option<Vec<String>> =
         args.get("kinds").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
@@ -4464,10 +4979,14 @@ fn tool_project_context(
         vec![]
     };
     for comp_uid in &component_uids {
-        let comp_notes = store.list_project_note_uids(comp_uid).unwrap_or_default();
+        let comp_notes = store
+            .list_project_note_uids(comp_uid)
+            .map_err(|e| anyhow!("list_project_note_uids: {e}"))?;
         member_note_uids.extend(comp_notes.iter().cloned());
         member_uids.extend(comp_notes);
-        let comp_syms = store.list_project_symbol_uids(comp_uid).unwrap_or_default();
+        let comp_syms = store
+            .list_project_symbol_uids(comp_uid)
+            .map_err(|e| anyhow!("list_project_symbol_uids: {e}"))?;
         member_uids.extend(comp_syms);
     }
 
@@ -4550,6 +5069,7 @@ fn tool_project_context(
         Some(&db_path),
         Some(intent),
         embed_model,
+        cancel,
     )?;
 
     // 4b. Surface the project's curated member notes into `connected`. They
@@ -4592,6 +5112,94 @@ fn tool_project_context(
         };
         apply_kinds(&mut result.seeds);
         apply_kinds(&mut result.connected);
+    }
+
+    // 5b. repos + path_prefix scope filters (mirror brain_context so the two tools scope
+    //     identically — the "load project_context, then narrow" handoff keeps the same params).
+    let repo_names = if filter_repos.is_some() {
+        build_repo_name_map(store)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let apply_scope = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+        if let Some(ref repos) = filter_repos {
+            let filter_lower: Vec<String> = repos.iter().map(|r| r.to_lowercase()).collect();
+            nodes.retain(|n| {
+                let node_repo_uid = if n.uid.starts_with("sym:") {
+                    let parts: Vec<&str> = n.uid[4..].splitn(4, ':').collect();
+                    if parts.len() >= 3 {
+                        Some(format!("{}:{}:{}", parts[0], parts[1], parts[2]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                filter_lower.iter().any(|r| {
+                    if let Some(ref repo_uid) = node_repo_uid
+                        && let Some(name) = repo_names.get(repo_uid)
+                        && name.to_lowercase().contains(r)
+                    {
+                        return true;
+                    }
+                    n.uid.to_lowercase().contains(r) || n.location.to_lowercase().contains(r)
+                })
+            });
+        }
+        if let Some(ref prefix) = path_prefix {
+            nodes.retain(|n| n.location.starts_with(prefix.as_str()));
+        }
+    };
+    apply_scope(&mut result.seeds);
+    apply_scope(&mut result.connected);
+
+    // 5c. tags filter: keep only note/section nodes tagged with any of these (symbols kept).
+    if let Some(tags) = args.get("tags").and_then(|v| v.as_array()) {
+        let tag_names: Vec<String> = tags
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect();
+        if !tag_names.is_empty() {
+            let tagged_notes = store
+                .list_note_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_note_uids_with_tags: {e}"))?;
+            let tagged_sections = store
+                .list_section_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
+            let filter_tagged = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                nodes.retain(|item| {
+                    if item.kind.to_lowercase().contains("symbol") {
+                        return true;
+                    }
+                    tagged_notes.contains(&item.uid) || tagged_sections.contains(&item.uid)
+                });
+            };
+            filter_tagged(&mut result.seeds);
+            filter_tagged(&mut result.connected);
+        }
+    }
+
+    // 5d. exclude_tags filter: drop note/section nodes tagged with any of these.
+    if let Some(exclude_tags) = args.get("exclude_tags").and_then(|v| v.as_array()) {
+        let tag_names: Vec<String> = exclude_tags
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect();
+        if !tag_names.is_empty() {
+            let excluded_notes = store
+                .list_note_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_note_uids_with_tags: {e}"))?;
+            let excluded_sections = store
+                .list_section_uids_with_tags(&tag_names)
+                .map_err(|e| anyhow!("list_section_uids_with_tags: {e}"))?;
+            let filter_excluded = |nodes: &mut Vec<nestweaver_engine::BrainNode>| {
+                nodes.retain(|item| {
+                    !excluded_notes.contains(&item.uid) && !excluded_sections.contains(&item.uid)
+                });
+            };
+            filter_excluded(&mut result.seeds);
+            filter_excluded(&mut result.connected);
+        }
     }
 
     // 6a. since filter: hard filter Note/Section nodes by modified_at.
@@ -4661,11 +5269,16 @@ fn tool_project_context(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let mut connected_json: Vec<Value> = result
-        .connected
-        .iter()
-        .take(cut)
-        .map(|n| {
+    // concise drops the machine id (uid) and the relevance score in favor of the semantic
+    // fields an agent orients with (kind/title/location); detailed keeps the full record.
+    let render_node = |n: &nestweaver_engine::BrainNode| -> Value {
+        if concise {
+            json!({
+                "kind": n.kind,
+                "title": n.title,
+                "location": n.location,
+            })
+        } else {
             json!({
                 "uid": n.uid,
                 "kind": n.kind,
@@ -4673,8 +5286,11 @@ fn tool_project_context(
                 "location": n.location,
                 "relevance": n.relevance,
             })
-        })
-        .collect();
+        }
+    };
+
+    let mut connected_json: Vec<Value> =
+        result.connected.iter().take(cut).map(render_node).collect();
 
     let include_seeds = args
         .get("include_seeds")
@@ -4682,21 +5298,7 @@ fn tool_project_context(
         .unwrap_or(false);
 
     let seeds_json: Option<Vec<Value>> = if include_seeds {
-        Some(
-            result
-                .seeds
-                .iter()
-                .map(|n| {
-                    json!({
-                        "uid": n.uid,
-                        "kind": n.kind,
-                        "title": n.title,
-                        "location": n.location,
-                        "relevance": n.relevance,
-                    })
-                })
-                .collect(),
-        )
+        Some(result.seeds.iter().map(render_node).collect())
     } else {
         None
     };
@@ -4781,13 +5383,21 @@ fn tool_schema_dead_code() -> Value {
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
                     "description": "\"concise\" returns name + confidence only; \"detailed\" (default) adds UIDs, file paths, kinds, and visibility."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max unreachable symbols to return (defaults to the configured result limit). The response reports the true total in 'unreachable_count' and sets 'truncated' when the cap applied."
                 }
             }
         }
     })
 }
 
-fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_dead_code(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     let min_conf_str = args
         .get("min_confidence")
         .and_then(|v| v.as_str())
@@ -4795,13 +5405,27 @@ fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
     let min_conf =
         DeadCodeConfidence::from_str_loose(min_conf_str).unwrap_or(DeadCodeConfidence::Low);
     let concise = is_concise(&args);
+    // Cap the returned symbols so a large codebase can't return a multi-MB
+    // payload that blows an agent's context window (the HTTP boundary caps via
+    // add_limit_metadata, but the stdio path had no bound). `unreachable_count`
+    // still reports the true total; `returned`/`truncated` disclose the cap.
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(configured_result_limit);
 
-    let result = detect_dead_code(store).context("detect_dead_code")?;
+    let result = detect_dead_code_cancellable(store, cancel).context("detect_dead_code")?;
 
-    let filtered: Vec<Value> = result
+    let all_matching: Vec<_> = result
         .unreachable_symbols
         .iter()
         .filter(|s| s.confidence >= min_conf)
+        .collect();
+    let total_unreachable = all_matching.len();
+    let filtered: Vec<Value> = all_matching
+        .into_iter()
+        .take(limit)
         .map(|s| {
             if concise {
                 json!({
@@ -4824,7 +5448,9 @@ fn tool_dead_code(store: &GraphStore, args: Value) -> Result<Value, anyhow::Erro
     Ok(json!({
         "total_symbols": result.total_symbols,
         "reachable_symbols": result.reachable_symbols,
-        "unreachable_count": filtered.len(),
+        "unreachable_count": total_unreachable,
+        "returned": filtered.len(),
+        "truncated": total_unreachable > filtered.len(),
         "excluded_count": result.excluded_count,
         "dead_percentage": result.dead_percentage,
         "min_confidence": min_conf_str,
@@ -4987,7 +5613,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection\n- Response size scales with number of changed files and graph density",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5105,8 +5731,8 @@ fn tool_schema_get_summary() -> Value {
             "properties": {
                 "level": {
                     "type": "string",
-                    "enum": ["symbol", "file", "cluster"],
-                    "description": "Summary granularity. 'symbol' = per-function/class, 'file' = per-file exports, 'cluster' = per-community architecture.",
+                    "enum": ["symbol", "file", "cluster", "hub"],
+                    "description": "Summary granularity. 'symbol' = per-function/class, 'file' = per-file exports, 'cluster' = per-community architecture, 'hub' = top hub nodes with call-graph shape + role (architectural orientation).",
                     "default": "file"
                 },
                 "target": {
@@ -5123,7 +5749,7 @@ fn tool_schema_get_summary() -> Value {
 }
 
 fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    use nestweaver_engine::{load_summaries, save_summaries};
+    use nestweaver_engine::{load_summaries, merge_and_save_summaries};
 
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
@@ -5143,7 +5769,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         }
     };
     let (summaries, from_cache) = if let Some(ref db) = db_path
-        && let Ok(Some(cached)) = load_summaries(db)
+        && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
     {
         let level_filtered: Vec<nestweaver_engine::Summary> =
             cached.into_iter().filter(|s| s.level == level).collect();
@@ -5162,22 +5788,10 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         (fresh, false)
     };
 
-    // Persist freshly generated summaries so subsequent calls hit the cache.
+    // Persist freshly generated summaries so subsequent calls hit the cache,
+    // preserving cached entries at other levels (shared invariant).
     if !from_cache && let Some(ref db) = db_path {
-        // Merge with any existing cached summaries at other levels.
-        let mut all = if let Ok(Some(existing)) = load_summaries(db) {
-            existing
-                .into_iter()
-                .filter(|s| s.level != level)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        all.extend(summaries.iter().cloned());
-        // Best-effort save; don't fail the tool call on I/O error.
-        if let Err(e) = save_summaries(db, &all) {
-            tracing::warn!("failed to save summaries sidecar: {e}");
-        }
+        merge_and_save_summaries(db, store.graph_generation(), level, &summaries);
     }
 
     let total_available = summaries.len();
@@ -5277,6 +5891,7 @@ thread_local! {
     static ALLOWED_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
     static TRACK_INTERACTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SERVER_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // F16 response cache: size cap (MiB) and per-session hit/miss counters.
     static CACHE_MAX_SIZE_MB: std::cell::Cell<u64> =
         const { std::cell::Cell::new(nestweaver_store::cache::DEFAULT_MAX_SIZE_MB) };
@@ -5352,6 +5967,17 @@ pub fn set_track_interactions(track: bool) {
 
 pub fn is_track_interactions() -> bool {
     TRACK_INTERACTIONS.with(|c| c.get())
+}
+
+/// Mark this dispatch context as running in server mode (no local source files).
+/// When set, tools like `read_symbols` add a note explaining that source spans
+/// may be empty because the server indexes bare clones without checkout trees.
+pub fn set_server_mode(server: bool) {
+    SERVER_MODE.with(|c| c.set(server));
+}
+
+pub fn is_server_mode() -> bool {
+    SERVER_MODE.with(|c| c.get())
 }
 
 // ── Daemon proxy dispatch ─────────────────────────────────────────────────
@@ -5573,6 +6199,11 @@ pub fn dispatch_via_daemon(
                     since: str_field("since"),
                     recency_weight: f64_field("recency_weight"),
                     recency_half_life_days: f64_field("recency_half_life_days"),
+                    response_format: str_field("response_format"),
+                    repos: str_array("repos"),
+                    path_prefix: str_field("path_prefix"),
+                    tags: str_array("tags"),
+                    exclude_tags: str_array("exclude_tags"),
                 });
                 let resp = client
                     .get_project_context(req)
@@ -5919,6 +6550,116 @@ fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Er
 }
 
 #[cfg(test)]
+mod server_mode_tests {
+    use super::*;
+
+    // read_symbols in server mode must read source at the repo's recorded
+    // indexed_sha, NOT the bare clone's HEAD — the daemon may have fetched past
+    // the indexed commit, so HEAD would return the wrong commit's source for
+    // symbol spans taken from the indexed graph. Build a bare repo whose HEAD
+    // (v2) differs from indexed_sha (v1) and assert the reader returns v1.
+    #[test]
+    fn bare_reader_reads_indexed_sha_not_head() {
+        use nestweaver_engine::content_reader::ContentReader;
+        use std::process::Command;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(src.join("a.txt"), "v1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "c1"]);
+        let sha1 = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&src)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::fs::write(src.join("a.txt"), "v2").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "c2"]);
+
+        // Bare clone at the URL-hashed path bare_reader_for_repo resolves to.
+        let url = "https://github.com/example/twocommit";
+        let workspace_root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let clone_dir = nestweaver_engine::pull::clone_dir_name_from_url(url);
+        let bare = workspace_root.join(format!("{clone_dir}.git"));
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &src.display().to_string(),
+                &bare.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo-tc".to_string(),
+                url: url.to_string(),
+                indexed_sha: sha1.clone(),
+                staleness_commits_behind: 1,
+                instance_id: "inst".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        let reader = bare_reader_for_repo(&store, &workspace_root, "repo-tc")
+            .expect("reader for indexed repo");
+        let content = reader.read_file(std::path::Path::new("a.txt")).unwrap();
+        assert_eq!(
+            content, "v1",
+            "read_symbols must read source at indexed_sha (v1), not bare HEAD (v2)"
+        );
+    }
+
+    // brain_status must report the ACTUAL server mode (the thread-local set by
+    // the transport handler), not a hardcoded value. Regression guard for the
+    // MCP-over-HTTP path reporting server_mode: false even when running
+    // --server, which also masked the read_symbols empty-body bug.
+    #[test]
+    fn brain_status_reflects_server_mode_flag() {
+        let store = GraphStore::in_memory().unwrap();
+
+        set_server_mode(true);
+        let status = tool_brain_status(&store, None).unwrap();
+        assert_eq!(
+            status["server_mode"],
+            serde_json::json!(true),
+            "brain_status should report server_mode=true when the flag is set"
+        );
+
+        set_server_mode(false);
+        let status = tool_brain_status(&store, None).unwrap();
+        assert_eq!(
+            status["server_mode"],
+            serde_json::json!(false),
+            "brain_status should report server_mode=false when the flag is unset"
+        );
+    }
+}
+
+#[cfg(test)]
 mod project_context_bug12_tests {
     use super::*;
     use nestweaver_schema::{Note, NoteKind, Project, Symbol, SymbolKind, Vault, Visibility};
@@ -5959,6 +6700,7 @@ mod project_context_bug12_tests {
             visibility: Visibility::Public,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }
     }
 
@@ -6025,7 +6767,10 @@ mod project_context_bug12_tests {
         let resp = tool_project_context(
             &store,
             None,
-            json!({ "project": "Parallel Paths", "token_budget": 5000 }),
+            // response_format "detailed" so `connected` nodes carry `uid` (concise, the new
+            // default, returns only kind/title/location); this test identifies notes by uid.
+            json!({ "project": "Parallel Paths", "token_budget": 5000, "response_format": "detailed" }),
+            None,
             None,
         )
         .unwrap();
@@ -6039,6 +6784,37 @@ mod project_context_bug12_tests {
             "all {} member notes must surface in connected; got {uids:?}",
             note_uids.len()
         );
+    }
+
+    #[test]
+    fn brain_context_surfaces_resolved_seed_when_no_neighbors() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&mk_symbol(
+                "sym:repo:t:abc:leaf",
+                "repo:t:abc",
+                "src/leaf.rs",
+                "LeafOnlySymbol",
+            ))
+            .unwrap();
+
+        let resp = tool_brain_context(
+            &store,
+            None,
+            json!({ "seeds": ["LeafOnlySymbol"], "token_budget": 5000 }),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let connected = resp["connected"].as_array().expect("connected array");
+        assert!(
+            connected
+                .iter()
+                .any(|n| n["title"].as_str() == Some("LeafOnlySymbol")),
+            "resolved seed should be visible when it has no connected neighbors: {connected:?}"
+        );
+        assert_eq!(resp["seeds_expanded"].as_u64(), Some(1));
     }
 
     // Feature F8: brain_context with include_bodies embeds the source span of
@@ -6067,6 +6843,7 @@ mod project_context_bug12_tests {
             None,
             json!({ "seeds": ["greet"], "token_budget": 5000, "include_seeds": true }),
             None,
+            None,
         )
         .unwrap();
         let any_body_off = off["connected"]
@@ -6087,6 +6864,7 @@ mod project_context_bug12_tests {
                 "include_bodies": true,
                 "root": root,
             }),
+            None,
             None,
         )
         .unwrap();
@@ -6287,6 +7065,100 @@ mod cache_dispatch_tests {
             cache.is_empty(),
             "write tools must never populate the cache"
         );
+    }
+
+    /// A deterministic embed model so `brain_context` runs its semantic (vector)
+    /// leg — the leg that observes the cancellation flag.
+    struct FixedEmbed(Vec<f32>);
+    impl EmbedQueryFn for FixedEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn cancelled_query_is_not_cached() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+
+        let embed = FixedEmbed(vec![1.0, 0.0, 0.0]);
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+
+        // Pre-cancelled: the vector leg trips the flag mid-flight, so the whole
+        // query must error rather than return a truncated "complete" Ok.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled = dispatch_cancellable(
+            &store,
+            None,
+            "brain_context",
+            args.clone(),
+            Some(&embed),
+            Some(&cancel),
+        );
+        assert!(
+            cancelled.is_err(),
+            "a cancelled brain_context must return Err, not a truncated Ok"
+        );
+
+        // …and it must NOT have populated the response cache.
+        flush_response_cache();
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(
+            cache.is_empty(),
+            "a cancelled query must never populate the response cache"
+        );
+
+        // A subsequent uncancelled call must RECOMPUTE (a MISS), never serve a
+        // cached truncated/empty result.
+        reset_session();
+        let ok = dispatch_cancellable(&store, None, "brain_context", args, Some(&embed), None);
+        assert!(ok.is_ok(), "uncancelled recompute must succeed");
+        assert_eq!(
+            CACHE_MISSES.with(|c| c.get()),
+            1,
+            "recompute must be a MISS, not a cached-empty HIT"
+        );
+    }
+
+    /// A pre-tripped cancel flag must make the flow_trace recursion return
+    /// `Cancelled` at its first level — never a truncated Ok tree.
+    #[test]
+    fn flow_trace_cancellable_bails_when_flag_is_set() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let args = json!({ "symbol": "greet" });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled = dispatch_cancellable(
+            &store,
+            None,
+            "flow_trace",
+            args.clone(),
+            None,
+            Some(&cancel),
+        );
+        let err =
+            cancelled.expect_err("a cancelled flow_trace must return Err, not a truncated tree");
+        assert!(
+            err.downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(nestweaver_store::StoreError::is_cancelled),
+            "the error must be StoreError::Cancelled, got: {err:#}"
+        );
+
+        // Untripped flag: the trace completes as before.
+        let untripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ok = dispatch_cancellable(&store, None, "flow_trace", args, None, Some(&untripped));
+        assert!(ok.is_ok(), "uncancelled flow_trace must succeed");
     }
 }
 

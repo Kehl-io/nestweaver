@@ -13,6 +13,9 @@ use anyhow::Context;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
 
+#[cfg(feature = "daemon")]
+pub mod federation;
+pub mod http;
 pub mod protocol;
 pub mod tools;
 
@@ -42,7 +45,15 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 ## Do NOT
 - grep or find in indexed repos — use brain_search or regex_search
 - Read entire files — use read_symbols for specific symbol spans
-- Re-index manually — use stale_check to verify, the daemon handles re-indexing";
+- Re-index manually — use stale_check to verify, the daemon handles re-indexing
+
+## Server Mode
+When connected to a NestWeaver server (not a local daemon):
+- brain_status includes indexing_active, indexing_repo, queue_depth, and server_mode fields
+- read_symbols may return empty bodies with a server_note explaining the bare-clone limitation
+- regex_search runs trigram-accelerated exact regex over the graph store — identical locally and on the server (it does NOT use Tantivy)
+- blast_radius returns two-tier results (local_impact + org_wide_impact) when upstream is available
+- Results include _meta.sources indicating which data sources contributed";
 
 /// Canonical sidecar location for the Tantivy index. Lives next to the
 /// LadybugDB file: `<db>.tantivy/`.
@@ -471,14 +482,23 @@ fn dispatch_method_daemon(
                 ));
             };
 
-            match tools::dispatch_via_daemon(client, rt, &name, arguments.clone()) {
-                Ok(result) => {
+            // Isolate a panicking tool so one bad call can't unwind the stdio
+            // read loop and kill the session (mirrors the HTTP path).
+            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tools::dispatch_via_daemon(client, rt, &name, arguments.clone())
+            }));
+            match dispatched {
+                Ok(Ok(result)) => {
                     if let Some(tracker) = tracker {
                         record_interaction(tracker, &name, &arguments, &result);
                     }
                     Frame::Success(success(id, tools::wrap_tool_result(result)))
                 }
-                Err(e) => Frame::Success(success(id, tools::wrap_tool_error(&e.to_string()))),
+                Ok(Err(e)) => Frame::Success(success(id, tools::wrap_tool_error(&e.to_string()))),
+                Err(_) => Frame::Success(success(
+                    id,
+                    tools::wrap_tool_error(&format!("tool '{name}' panicked")),
+                )),
             }
         }
 
@@ -562,20 +582,35 @@ fn dispatch_method(
                 ));
             };
 
-            match tools::dispatch(store, tantivy, &name, arguments.clone(), None) {
-                Ok(result) => {
+            // The stdio MCP server runs outside daemon context and has no
+            // access to the lazily-loaded embedding model. Semantic search
+            // falls back to keyword-only when embed_model is None.
+            //
+            // Isolate a panicking tool: catch_unwind so one bad call returns an
+            // error result for THIS request instead of unwinding the stdio read
+            // loop and killing the whole session (mirrors the HTTP path, which
+            // maps a dispatch panic to an isError result via spawn_blocking).
+            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tools::dispatch(store, tantivy, &name, arguments.clone(), None)
+            }));
+            match dispatched {
+                Ok(Ok(result)) => {
                     if let Some(tracker) = tracker {
                         record_interaction(tracker, &name, &arguments, &result);
                     }
                     Frame::Success(success(id, tools::wrap_tool_result(result)))
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Tool errors come back inside the result envelope with
                     // isError=true — not as JSON-RPC errors — so the client
                     // can surface them to Claude rather than aborting the
                     // call sequence.
                     Frame::Success(success(id, tools::wrap_tool_error(&e.to_string())))
                 }
+                Err(_) => Frame::Success(success(
+                    id,
+                    tools::wrap_tool_error(&format!("tool '{name}' panicked")),
+                )),
             }
         }
 
@@ -781,7 +816,7 @@ mod tests {
                 ] {
                     assert!(names.contains(&expected), "missing tool: {expected}");
                 }
-                assert_eq!(tools.len(), 38, "expected 38 tools, got {}", tools.len());
+                assert_eq!(tools.len(), 40, "expected 40 tools, got {}", tools.len());
                 // Every tool has a description leading with usage guidance.
                 for tool in tools {
                     let desc = tool["description"].as_str().expect("description");

@@ -54,21 +54,38 @@ pub async fn generate_embeddings_batch(
     #[derive(serde::Deserialize)]
     struct RespData {
         embedding: Vec<f32>,
+        // OpenAI does NOT guarantee `data` is returned in input order; realign by
+        // this field. Providers that omit it (e.g. Ollama, which is in-order)
+        // default to 0, so the stable sort is a no-op and preserves order.
+        #[serde(default)]
+        index: usize,
     }
 
-    let resp: Resp = client
-        .post(&url)
-        .json(&Req {
-            model,
-            input: texts.to_vec(),
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let mut builder = client.post(&url).json(&Req {
+        model,
+        input: texts.to_vec(),
+    });
+    // Optional bearer auth (keyed gateways like OpenAI). From an env var only, so
+    // the key is never persisted to config/graph/snapshot.
+    if let Ok(key) = std::env::var("NESTWEAVER_EMBED_API_KEY")
+        && !key.is_empty()
+    {
+        builder = builder.bearer_auth(key);
+    }
+    let resp: Resp = builder.send().await?.error_for_status()?.json().await?;
 
-    Ok(resp.data.into_iter().map(|d| d.embedding).collect())
+    // A short/long response would silently misalign every embedding with the
+    // wrong input (or drop some), corrupting the index. Fail loudly instead.
+    if resp.data.len() != texts.len() {
+        anyhow::bail!(
+            "embedding API returned {} vectors for {} inputs",
+            resp.data.len(),
+            texts.len()
+        );
+    }
+    let mut data = resp.data;
+    data.sort_by_key(|d| d.index);
+    Ok(data.into_iter().map(|d| d.embedding).collect())
 }
 
 pub fn cache_embedding(

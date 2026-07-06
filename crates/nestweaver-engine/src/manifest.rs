@@ -3,6 +3,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::content_reader::ContentReader;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestInfo {
     pub package_name: Option<String>,
@@ -16,41 +18,41 @@ pub struct ManifestInfo {
 
 /// Parse the manifest file(s) found in `repo_path` and return extracted
 /// package name and dependency list. The first recognized manifest format wins.
-pub fn parse_manifest(repo_path: &Path) -> ManifestInfo {
-    if let Some(info) = parse_package_json(repo_path) {
+pub fn parse_manifest(reader: &dyn ContentReader) -> ManifestInfo {
+    if let Some(info) = parse_package_json(reader) {
         return info;
     }
-    if let Some(info) = parse_go_mod(repo_path) {
+    if let Some(info) = parse_go_mod(reader) {
         return info;
     }
-    if let Some(info) = parse_cargo_toml(repo_path) {
+    if let Some(info) = parse_cargo_toml(reader) {
         return info;
     }
-    if let Some(info) = parse_pyproject_toml(repo_path) {
+    if let Some(info) = parse_pyproject_toml(reader) {
         return info;
     }
-    if let Some(info) = parse_requirements_txt(repo_path) {
+    if let Some(info) = parse_requirements_txt(reader) {
         return info;
     }
-    if let Some(info) = parse_composer_json(repo_path) {
+    if let Some(info) = parse_composer_json(reader) {
         return info;
     }
-    if let Some(info) = parse_gemfile(repo_path) {
+    if let Some(info) = parse_gemfile(reader) {
         return info;
     }
-    if let Some(info) = parse_pubspec_yaml(repo_path) {
+    if let Some(info) = parse_pubspec_yaml(reader) {
         return info;
     }
-    if let Some(info) = parse_package_swift(repo_path) {
+    if let Some(info) = parse_package_swift(reader) {
         return info;
     }
-    if let Some(info) = parse_csproj(repo_path) {
+    if let Some(info) = parse_csproj(reader) {
         return info;
     }
-    if let Some(info) = parse_build_gradle_kts(repo_path) {
+    if let Some(info) = parse_build_gradle_kts(reader) {
         return info;
     }
-    if let Some(info) = parse_cmake(repo_path) {
+    if let Some(info) = parse_cmake(reader) {
         return info;
     }
     ManifestInfo::default()
@@ -80,9 +82,8 @@ pub fn load_manifest_cache(path: &Path) -> Result<HashMap<String, ManifestInfo>,
 
 // ── per-format parsers ────────────────────────────────────────────────────────
 
-fn parse_package_json(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("package.json");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_package_json(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let package_name = json.get("name")?.as_str().map(String::from);
@@ -138,9 +139,8 @@ fn collect_export_paths(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-fn parse_go_mod(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("go.mod");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_go_mod(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("go.mod")).ok()?;
 
     let mut package_name = None;
     let mut deps = Vec::new();
@@ -174,9 +174,8 @@ fn parse_go_mod(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_cargo_toml(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("Cargo.toml");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_cargo_toml(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("Cargo.toml")).ok()?;
     let toml: toml::Value = toml::from_str(&content).ok()?;
 
     let package_name = toml.get("package")?.get("name")?.as_str().map(String::from);
@@ -195,9 +194,8 @@ fn parse_cargo_toml(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_pyproject_toml(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("pyproject.toml");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_pyproject_toml(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("pyproject.toml")).ok()?;
     let toml: toml::Value = toml::from_str(&content).ok()?;
 
     let package_name = toml.get("project")?.get("name")?.as_str().map(String::from);
@@ -227,9 +225,8 @@ fn parse_pyproject_toml(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_requirements_txt(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("requirements.txt");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_requirements_txt(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("requirements.txt")).ok()?;
 
     let mut deps = Vec::new();
     for line in content.lines() {
@@ -256,9 +253,8 @@ fn parse_requirements_txt(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_composer_json(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("composer.json");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_composer_json(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("composer.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let package_name = json.get("name").and_then(|v| v.as_str()).map(String::from);
@@ -281,9 +277,8 @@ fn parse_composer_json(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_gemfile(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("Gemfile");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_gemfile(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("Gemfile")).ok()?;
 
     let mut deps = Vec::new();
     for line in content.lines() {
@@ -313,9 +308,8 @@ fn parse_gemfile(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_pubspec_yaml(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("pubspec.yaml");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_pubspec_yaml(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("pubspec.yaml")).ok()?;
     let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
 
     let package_name = yaml.get("name").and_then(|v| v.as_str()).map(String::from);
@@ -341,9 +335,8 @@ fn parse_pubspec_yaml(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_package_swift(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("Package.swift");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_package_swift(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("Package.swift")).ok()?;
 
     let package_name = content.lines().find_map(|line| {
         let trimmed = line.trim();
@@ -387,35 +380,29 @@ fn parse_package_swift(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn scan_dir_for_csproj(dir: &Path) -> Option<std::path::PathBuf> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .find(|e| e.path().extension().is_some_and(|ext| ext == "csproj"))
-        .map(|e| e.path())
-}
-
-fn find_csproj(repo_path: &Path) -> Option<std::path::PathBuf> {
-    // Check root
-    if let Some(path) = scan_dir_for_csproj(repo_path) {
-        return Some(path);
-    }
-    // Check one level of subdirectories
-    if let Ok(entries) = std::fs::read_dir(repo_path) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Some(path) = scan_dir_for_csproj(&entry.path())
-            {
-                return Some(path);
+/// Find the first `.csproj` file in the repo root or one level of
+/// subdirectories, using the reader's file listing instead of `read_dir`.
+fn find_csproj(reader: &dyn ContentReader) -> Option<std::path::PathBuf> {
+    let files = reader.list_files().ok()?;
+    // Prefer root-level csproj files, then one-level subdirectory files.
+    let mut root_level: Option<std::path::PathBuf> = None;
+    let mut subdir_level: Option<std::path::PathBuf> = None;
+    for f in &files {
+        if f.extension().is_some_and(|ext| ext == "csproj") {
+            let depth = f.components().count();
+            if depth == 1 && root_level.is_none() {
+                root_level = Some(f.clone());
+            } else if depth == 2 && subdir_level.is_none() {
+                subdir_level = Some(f.clone());
             }
         }
     }
-    None
+    root_level.or(subdir_level)
 }
 
-fn parse_csproj(repo_path: &Path) -> Option<ManifestInfo> {
-    let csproj_path = find_csproj(repo_path)?;
-    let content = std::fs::read_to_string(&csproj_path).ok()?;
+fn parse_csproj(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let csproj_rel = find_csproj(reader)?;
+    let content = reader.read_file(&csproj_rel).ok()?;
 
     let mut deps = Vec::new();
     for line in content.lines() {
@@ -443,9 +430,8 @@ fn parse_csproj(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_build_gradle_kts(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("build.gradle.kts");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_build_gradle_kts(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("build.gradle.kts")).ok()?;
 
     let mut deps = Vec::new();
     for line in content.lines() {
@@ -482,9 +468,8 @@ fn parse_build_gradle_kts(repo_path: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_cmake(repo_path: &Path) -> Option<ManifestInfo> {
-    let path = repo_path.join("CMakeLists.txt");
-    let content = std::fs::read_to_string(&path).ok()?;
+fn parse_cmake(reader: &dyn ContentReader) -> Option<ManifestInfo> {
+    let content = reader.read_file(Path::new("CMakeLists.txt")).ok()?;
 
     let mut package_name = None;
     let mut deps = Vec::new();
@@ -517,6 +502,7 @@ fn parse_cmake(repo_path: &Path) -> Option<ManifestInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_reader::FilesystemReader;
 
     #[test]
     fn parse_package_json_extracts_name_and_deps() {
@@ -530,7 +516,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert_eq!(info.package_name.as_deref(), Some("@myorg/api-client"));
         assert!(info.dependencies.contains(&"axios".to_string()));
         assert!(
@@ -548,7 +534,7 @@ mod tests {
             "module github.com/myorg/service\n\ngo 1.21\n\nrequire (\n\tgithub.com/myorg/shared v1.0.0\n\tgithub.com/pkg/errors v0.9.1\n)\n",
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert_eq!(
             info.package_name.as_deref(),
             Some("github.com/myorg/service")
@@ -575,7 +561,7 @@ my-shared = { path = "../shared" }
 "#,
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert_eq!(info.package_name.as_deref(), Some("my-crate"));
         assert!(info.dependencies.contains(&"serde".to_string()));
         assert!(info.dependencies.contains(&"my-shared".to_string()));
@@ -584,7 +570,7 @@ my-shared = { path = "../shared" }
     #[test]
     fn parse_returns_default_for_no_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.package_name.is_none());
         assert!(info.dependencies.is_empty());
     }
@@ -601,7 +587,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
 "#,
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert_eq!(info.package_name.as_deref(), Some("myservice"));
         assert!(info.dependencies.contains(&"requests".to_string()));
         assert!(info.dependencies.contains(&"pydantic".to_string()));
@@ -615,7 +601,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             "# comment\nrequests==2.28.0\npydantic>=2.0\n-r other.txt\n",
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.package_name.is_none());
         assert!(info.dependencies.contains(&"requests".to_string()));
         assert!(info.dependencies.contains(&"pydantic".to_string()));
@@ -659,7 +645,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             r#"{"name":"myorg/api","require":{"laravel/framework":"^10.0"},"require-dev":{"phpunit/phpunit":"^10.0"}}"#,
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert_eq!(info.package_name.as_deref(), Some("myorg/api"));
         assert!(info.dependencies.contains(&"laravel/framework".to_string()));
         assert!(info.dependencies.contains(&"phpunit/phpunit".to_string()));
@@ -673,7 +659,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             "source 'https://rubygems.org'\n\ngem 'rails', '~> 7.0'\ngem 'pg'\n",
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.dependencies.contains(&"rails".to_string()));
         assert!(info.dependencies.contains(&"pg".to_string()));
     }
@@ -686,7 +672,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             "name: my_app\ndependencies:\n  http: ^0.13.0\n",
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert_eq!(info.package_name.as_deref(), Some("my_app"));
         assert!(info.dependencies.contains(&"http".to_string()));
     }
@@ -699,7 +685,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             "import PackageDescription\nlet package = Package(\n    name: \"MyPkg\",\n    dependencies: [\n        .package(url: \"https://github.com/apple/swift-argument-parser.git\", from: \"1.0.0\"),\n    ]\n)\n",
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert_eq!(info.package_name.as_deref(), Some("MyPkg"));
         assert!(
             info.dependencies
@@ -715,7 +701,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.1\" />\n  </ItemGroup>\n</Project>",
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.dependencies.contains(&"Newtonsoft.Json".to_string()));
     }
 
@@ -727,7 +713,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             "dependencies {\n    implementation(\"org.springframework.boot:spring-boot-starter-web:3.1.0\")\n}\n",
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(
             info.dependencies
                 .contains(&"org.springframework.boot:spring-boot-starter-web".to_string())
@@ -742,7 +728,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             "cmake_minimum_required(VERSION 3.20)\nproject(MyApp)\nfind_package(Boost REQUIRED)\nfind_package(OpenSSL REQUIRED)\n",
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert_eq!(info.package_name.as_deref(), Some("MyApp"));
         assert!(info.dependencies.contains(&"Boost".to_string()));
         assert!(info.dependencies.contains(&"OpenSSL".to_string()));
@@ -770,7 +756,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             }"#,
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.entry_files.contains(&"./dist/index.js".to_string()));
         assert!(info.entry_files.contains(&"./bin/cli.js".to_string()));
         assert!(
@@ -796,7 +782,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             }"#,
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.entry_files.contains(&"./bin/main.js".to_string()));
     }
 
@@ -811,7 +797,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             }"#,
         )
         .unwrap();
-        let info = parse_manifest(dir.path());
+        let info = parse_manifest(&FilesystemReader::new(dir.path()));
         assert!(info.entry_files.is_empty());
     }
 }

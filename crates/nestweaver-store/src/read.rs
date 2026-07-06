@@ -192,6 +192,11 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         .get(13)
         .and_then(|_| extract_opt_string(row, 13).ok().flatten())
         .and_then(|s| parse_framework_hint(&s));
+    // Column 14 (canonical_id) is optional: added in Phase 4 migration.
+    let canonical_id = row
+        .get(14)
+        .and_then(|_| extract_opt_string(row, 14).ok().flatten())
+        .filter(|s| !s.is_empty());
 
     Ok(Symbol {
         uid,
@@ -211,6 +216,7 @@ pub(crate) fn row_to_symbol(row: &[Value]) -> Result<Symbol, StoreError> {
         visibility: Visibility::Inferred,
         type_info: None,
         framework_hint,
+        canonical_id,
     })
 }
 
@@ -229,7 +235,7 @@ fn parse_framework_hint(s: &str) -> Option<nestweaver_schema::FrameworkHint> {
 
 pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, s.end_line, \
      s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind, \
-     s.framework_hint";
+     s.framework_hint, s.canonical_id";
 
 pub(crate) const NOTE_COLUMNS: &str = "n.uid, n.vault_uid, n.file_path, n.title, n.note_kind, \
      n.word_count, n.content_hash, n.frontmatter, n.created_at, n.modified_at, n.pagerank_score";
@@ -399,7 +405,8 @@ impl GraphStore {
 
     pub fn list_repos(&self, instance_id: Option<&str>) -> Result<Vec<Repo>, StoreError> {
         let conn = self.conn()?;
-        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, r.name";
+        let cols = "r.uid, r.url, r.indexed_sha, r.staleness_commits_behind, r.instance_id, \
+                    r.name, r.root_path";
         let result = if let Some(iid) = instance_id {
             let q = format!("MATCH (r:Repo) WHERE r.instance_id = $iid RETURN {cols}");
             let mut stmt = conn
@@ -420,6 +427,8 @@ impl GraphStore {
                 let staleness = u32::try_from(extract_i64(&row, 3)?).unwrap_or(0);
                 let instance_id = extract_string(&row, 4)?;
                 let name = extract_opt_string(&row, 5).unwrap_or(None);
+                // Rows predating the migration hold '' — mapped to None.
+                let root_path = extract_opt_string(&row, 6).unwrap_or(None);
                 Ok(Repo {
                     uid,
                     url,
@@ -427,6 +436,7 @@ impl GraphStore {
                     staleness_commits_behind: staleness,
                     instance_id,
                     name,
+                    root_path,
                 })
             })
             .collect()
@@ -475,6 +485,194 @@ impl GraphStore {
         let conn = self.conn()?;
         let q = format!(
             "MATCH (s:Symbol)-[:CALLS]->(t:Symbol {{uid: $uid}}) RETURN {}",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
+    }
+
+    /// Look up a symbol by its canonical_id (Phase 4 cross-boundary matching).
+    /// Returns `None` if no symbol has this canonical_id.
+    pub fn symbol_by_canonical_id(&self, canonical_id: &str) -> Result<Option<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol) WHERE s.canonical_id = $cid RETURN {} LIMIT 1",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("cid", Value::String(canonical_id.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => Ok(Some(row_to_symbol(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Return ALL symbols matching a canonical_id (not just the first).
+    /// Used by cross-repo impact analysis where the same canonical_id
+    /// appears in multiple repos (e.g., a shared interface).
+    pub fn find_symbols_by_canonical_id(
+        &self,
+        canonical_id: &str,
+    ) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol) WHERE s.canonical_id = $cid RETURN {}",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("cid", Value::String(canonical_id.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
+    }
+
+    /// Find a symbol by name and file path. Used as a fallback when
+    /// canonical_id lookup fails (e.g., repo URL mismatch between the
+    /// diff analysis and the indexed graph).
+    pub fn find_symbol_by_name_and_file(
+        &self,
+        name: &str,
+        file_path: &str,
+    ) -> Result<Option<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol) WHERE s.name = $name AND s.file_path = $fp RETURN {} LIMIT 1",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![
+                    ("name", Value::String(name.to_string())),
+                    ("fp", Value::String(file_path.to_string())),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        match result.next() {
+            Some(row) => Ok(Some(row_to_symbol(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns all Symbol nodes that have any incoming edge (CALLS, IMPORTS,
+    /// EXTENDS_SYM, IMPLEMENTS_SYM, INCLUDES_SYM) pointing TO `uid`.
+    /// Used by impact analysis for SymbolRemoved/ExportRemoved changes.
+    pub fn references_to(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let edge_types = [
+            "CALLS",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+            // Cross-repo consumers must surface in impact analysis so pre-push /
+            // ImpactAnalysis reports breaking changes across repo boundaries.
+            "CROSS_REPO_LINK",
+        ];
+        let mut all: Vec<Symbol> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for et in &edge_types {
+            let q = format!(
+                "MATCH (s:Symbol)-[:{}]->(t:Symbol {{uid: $uid}}) RETURN {}",
+                et, SYMBOL_COLUMNS
+            );
+            let mut stmt = conn
+                .prepare(&q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let result = conn
+                .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in result {
+                let sym = row_to_symbol(&row)?;
+                if seen.insert(sym.uid.clone()) {
+                    all.push(sym);
+                }
+            }
+        }
+        Ok(all)
+    }
+
+    /// Returns the set of file paths (within `repo_uid`) that contain at least
+    /// one symbol with a cross-file resolved edge pointing INTO a symbol in
+    /// `file_path`. In other words, the 1-hop reverse-dependents of `file_path`.
+    ///
+    /// Only cross-file edges are considered: edges whose source and target live
+    /// in the same file are excluded (`s.file_path <> $fp`), so the result never
+    /// contains `file_path` itself. `MEMBER_OF` (structural, intra-file) and
+    /// `CROSS_REPO_LINK` (cross-repo, handled separately) are not traversed.
+    ///
+    /// Used by incremental re-resolution to find files whose resolved edges may
+    /// need to be rebuilt after `file_path` changes.
+    pub fn files_referencing_file(
+        &self,
+        repo_uid: &str,
+        file_path: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let edge_types = [
+            "CALLS",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+            "USES",
+            "ACCESSES",
+        ];
+        let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for et in &edge_types {
+            let q = format!(
+                "MATCH (s:Symbol)-[:{et}]->(t:Symbol) \
+                 WHERE t.repo_uid = $repo AND t.file_path = $fp AND s.file_path <> $fp \
+                 RETURN DISTINCT s.file_path"
+            );
+            let mut stmt = conn
+                .prepare(&q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let result = conn
+                .execute(
+                    &mut stmt,
+                    vec![
+                        ("repo", Value::String(repo_uid.to_string())),
+                        ("fp", Value::String(file_path.to_string())),
+                    ],
+                )
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in result {
+                let path = extract_string(&row, 0)?;
+                if !path.is_empty() {
+                    files.insert(path);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    /// Returns all Symbol nodes that have an IMPORTS edge pointing TO `uid`.
+    /// Used by impact analysis for SymbolRenamed changes.
+    pub fn importers_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol)-[:IMPORTS]->(t:Symbol {{uid: $uid}}) RETURN {}",
             SYMBOL_COLUMNS
         );
         let mut stmt = conn
@@ -660,6 +858,21 @@ impl GraphStore {
             )
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         result.map(|row| row_to_symbol(&row)).collect()
+    }
+
+    /// Like [`lookup_symbols_by_repo`] but on an externally-provided connection
+    /// (for use inside an open transaction).
+    pub fn lookup_symbols_by_repo_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<Vec<Symbol>, StoreError> {
+        let safe_repo = repo_uid.replace('\'', "\\'");
+        let rows = conn
+            .query(&format!(
+                "MATCH (s:Symbol) WHERE s.repo_uid = '{safe_repo}' RETURN {SYMBOL_COLUMNS}"
+            ))
+            .map_err(|e| StoreError::Query(format!("lookup_symbols_by_repo_on: {e}")))?;
+        rows.map(|row| row_to_symbol(&row)).collect()
     }
 
     /// Returns all Symbol nodes whose `file_path` property matches `file_path`.
@@ -918,6 +1131,25 @@ impl GraphStore {
             .query("MATCH (s:Symbol) RETURN s.uid")
             .map_err(|e| StoreError::Query(e.to_string()))?;
         Ok(result.count())
+    }
+
+    /// Count symbols grouped by their owning repo (`repo_uid` -> count).
+    /// Used by backup manifests to report per-repo symbol totals without
+    /// loading full symbol rows.
+    pub fn count_symbols_by_repo(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, StoreError> {
+        let conn = self.conn()?;
+        let result = conn
+            .query("MATCH (s:Symbol) RETURN s.repo_uid, count(s.uid)")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut counts = std::collections::HashMap::new();
+        for row in result {
+            let repo_uid = extract_string(&row, 0)?;
+            let count = extract_i64(&row, 1).unwrap_or(0).max(0) as usize;
+            counts.insert(repo_uid, count);
+        }
+        Ok(counts)
     }
 
     /// Returns the dimension of stored embeddings, or 0 if none exist.
@@ -1188,6 +1420,12 @@ impl GraphStore {
         Ok(repos.into_iter().find(|r| r.uid == repo_uid))
     }
 
+    /// Returns the repo URL for a given repo UID, or an empty string if
+    /// the repo is not found.
+    pub fn repo_url_for_uid(&self, repo_uid: &str) -> Option<String> {
+        self.lookup_repo(repo_uid).ok().flatten().map(|r| r.url)
+    }
+
     /// Returns all Symbol nodes and code-level edges for clustering.
     pub fn load_code_symbols_and_edges(&self) -> Result<CodeGraph, StoreError> {
         let conn = self.conn()?;
@@ -1285,18 +1523,33 @@ impl GraphStore {
         Ok(edges)
     }
 
-    /// Returns all Symbol nodes that `uid` calls (outgoing CALLS edges).
+    /// Returns all Symbol nodes that `uid` calls or imports (outgoing edges).
+    ///
+    /// Follows CALLS, IMPORTS, and CROSS_REPO_LINK edges so that
+    /// `flow_trace` can traverse function calls, import relationships,
+    /// and cross-repo boundaries.
     pub fn callees_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
         let conn = self.conn()?;
         let cols = SYMBOL_COLUMNS.replace("s.", "t.");
-        let q = format!("MATCH (s:Symbol {{uid: $uid}})-[:CALLS]->(t:Symbol) RETURN {cols}");
-        let mut stmt = conn
-            .prepare(&q)
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let result = conn
-            .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        result.map(|row| row_to_symbol(&row)).collect()
+        let edge_types = ["CALLS", "IMPORTS", "CROSS_REPO_LINK"];
+        let mut all: Vec<Symbol> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for et in &edge_types {
+            let q = format!("MATCH (s:Symbol {{uid: $uid}})-[:{et}]->(t:Symbol) RETURN {cols}");
+            let mut stmt = conn
+                .prepare(&q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let result = conn
+                .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in result {
+                let sym = row_to_symbol(&row)?;
+                if seen.insert(sym.uid.clone()) {
+                    all.push(sym);
+                }
+            }
+        }
+        Ok(all)
     }
 
     /// Returns direct members of a class/container via MEMBER_OF edges.

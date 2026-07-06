@@ -128,11 +128,12 @@ fn verify_checksums(snapshot_dir: &Path) -> Result<(), anyhow::Error> {
     let checksum_path = if !checksum_path.exists() {
         let legacy = snapshot_dir.join("checksum.sha256");
         if legacy.exists() {
-            tracing::info!(
-                "using legacy checksum.sha256 — skipping verification for pre-BLAKE3 snapshot"
+            tracing::warn!(
+                "legacy checksum.sha256 found at {} — integrity verification is SKIPPED \
+                 because these hashes use SHA-256 while current snapshots use BLAKE3. \
+                 The snapshot will be re-created with BLAKE3 checksums on the next build.",
+                legacy.display()
             );
-            // Legacy checksums used SHA-256, which won't match BLAKE3 verification.
-            // Skip verification; the snapshot will be re-created on the next build.
             return Ok(());
         } else {
             checksum_path
@@ -341,6 +342,98 @@ pub fn load_snapshot(
     Ok((stamp, snapshot_dir.join(GRAPH_FILE)))
 }
 
+/// Materialize a verified snapshot into a private `working_dir`, laid out the way
+/// the store expects (sidecars as `<db>.pagerank.json`, `<db>.manifests.json`,
+/// `<db>.tantivy/`), and return the working graph DB path to open **read-only**.
+///
+/// The snapshot directory is never mutated. The compat gate runs FIRST via
+/// [`load_snapshot`] (semver / schema / embedding) — if the snapshot is
+/// incompatible this fails before copying anything, so a replica refuses to boot
+/// on an incompatible artifact rather than serving wrong results.
+pub fn materialize_snapshot(
+    snapshot_dir: &Path,
+    working_dir: &Path,
+    engine_version: &str,
+    expected_schema_hash: &str,
+    expected_embedding_model: &str,
+) -> Result<PathBuf, anyhow::Error> {
+    // Compat gate first — refuse an incompatible snapshot before touching disk.
+    load_snapshot(
+        snapshot_dir,
+        engine_version,
+        expected_schema_hash,
+        expected_embedding_model,
+    )?;
+
+    std::fs::create_dir_all(working_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create working dir {}: {e}",
+            working_dir.display()
+        )
+    })?;
+    let db_path = working_dir.join(GRAPH_FILE);
+    std::fs::copy(snapshot_dir.join(GRAPH_FILE), &db_path)
+        .map_err(|e| anyhow::anyhow!("failed to copy snapshot graph file: {e}"))?;
+
+    // Relocate JSON sidecars into the store's `<db><suffix>` convention.
+    for (src_name, suffix) in [
+        (SIDECAR_PAGERANK, ".pagerank.json"),
+        (SIDECAR_MANIFESTS, ".manifests.json"),
+    ] {
+        let src = snapshot_dir.join(src_name);
+        if src.exists() {
+            let dst = crate::sidecar_path(&db_path, suffix);
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                tracing::warn!(src = %src.display(), "materialize_snapshot: sidecar relocate failed: {e}");
+            }
+        }
+    }
+
+    // Relocate the Tantivy index directory into `<db>.tantivy`.
+    let tantivy_src = snapshot_dir.join(SIDECAR_TANTIVY_DIR);
+    if tantivy_src.is_dir() {
+        let tantivy_dst = crate::sidecar_path(&db_path, ".tantivy");
+        if let Err(e) = nestweaver_storage::copy_dir_all(&tantivy_src, &tantivy_dst) {
+            tracing::warn!("materialize_snapshot: tantivy relocate failed: {e}");
+        }
+    }
+
+    Ok(db_path)
+}
+
+/// Compute `(core, extensions, effective)` schema hashes for `cfg`. This MUST
+/// match the values a snapshot's stamp is built with so a replica's compat gate
+/// agrees — both the `snapshot build` CLI and a replica boot call this.
+pub fn schema_hashes(cfg: Option<&crate::config::InstanceConfig>) -> (String, String, String) {
+    let core = nestweaver_schema::core_schema_hash();
+    let ext = match cfg.and_then(|c| c.schema_extensions.as_ref()) {
+        Some(ext) => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(ref props) = ext.extra_node_properties {
+                let mut labels: Vec<&String> = props.keys().collect();
+                labels.sort();
+                for label in labels {
+                    let inner = &props[label];
+                    let mut keys: Vec<&String> = inner.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        parts.push(format!("{label}.{key}={}", inner[key]));
+                    }
+                }
+            }
+            let joined = parts.join("\n");
+            use sha2::Digest;
+            sha2::Sha256::digest(joined.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        }
+        None => "none".to_string(),
+    };
+    let effective = nestweaver_schema::effective_schema_hash(&core, &ext);
+    (core, ext, effective)
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -433,6 +526,62 @@ mod tests {
         let loaded = verify_snapshot(&snap_dir).unwrap();
         assert_eq!(loaded.instance_id, "test-instance");
         assert_eq!(loaded.schema_hash_effective, "schema-hash-abc");
+    }
+
+    #[test]
+    fn materialize_relocates_sidecars_and_gates_compat() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_fake_db(dir.path());
+        // Give the source DB sidecars so build_snapshot captures them.
+        std::fs::write(crate::sidecar_path(&db, ".pagerank.json"), b"{}").unwrap();
+        std::fs::write(crate::sidecar_path(&db, ".manifests.json"), b"{}").unwrap();
+
+        let stamp = make_stamp(
+            "0.1.0",
+            "0.1.0",
+            "schema-hash-abc",
+            "text-embedding-3-small",
+        );
+        let manifest = make_manifest();
+        build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
+
+        // Compatible args → materialize into a private working dir with the
+        // store's `<db><suffix>` sidecar layout.
+        let work = dir.path().join("work");
+        let db_path = materialize_snapshot(
+            &snap_dir,
+            &work,
+            "0.1.0",
+            "schema-hash-abc",
+            "text-embedding-3-small",
+        )
+        .unwrap();
+        assert!(db_path.exists(), "working graph db must exist");
+        assert!(
+            crate::sidecar_path(&db_path, ".pagerank.json").exists(),
+            "pagerank sidecar must be relocated to <db>.pagerank.json"
+        );
+        assert!(
+            crate::sidecar_path(&db_path, ".manifests.json").exists(),
+            "manifests sidecar must be relocated"
+        );
+        // The source snapshot dir is never mutated.
+        assert!(snap_dir.join(GRAPH_FILE).exists());
+
+        // Incompatible schema hash → refuse (compat gate runs before any copy).
+        let work2 = dir.path().join("work2");
+        assert!(
+            materialize_snapshot(
+                &snap_dir,
+                &work2,
+                "0.1.0",
+                "WRONG-schema-hash",
+                "text-embedding-3-small",
+            )
+            .is_err(),
+            "an incompatible snapshot must refuse to materialize"
+        );
     }
 
     #[test]

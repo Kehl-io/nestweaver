@@ -12,6 +12,8 @@ use nestweaver_schema::Symbol;
 use nestweaver_store::GraphStore;
 use serde::Serialize;
 
+use crate::content_reader::ContentReader;
+
 /// One returned symbol window.
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolWindow {
@@ -45,9 +47,9 @@ pub struct ReadSymbolsResult {
     pub truncated: bool,
 }
 
-/// Read lines `start..=end` (1-based, inclusive) from `root/file_path`.
-fn read_span(root: &Path, file_path: &str, start: u32, end: u32) -> Option<String> {
-    let text = std::fs::read_to_string(root.join(file_path)).ok()?;
+/// Read lines `start..=end` (1-based, inclusive) from `file_path` via the reader.
+fn read_span(reader: &dyn ContentReader, file_path: &str, start: u32, end: u32) -> Option<String> {
+    let text = reader.read_file(Path::new(file_path)).ok()?;
     let lines: Vec<&str> = text.lines().collect();
     if start == 0 || start as usize > lines.len() {
         return None;
@@ -83,7 +85,7 @@ fn window_cost(body: &str) -> usize {
 pub fn read_symbols(
     store: &GraphStore,
     specs: &[String],
-    root: &Path,
+    reader: &dyn ContentReader,
     neighbors: u8,
     token_budget: Option<usize>,
 ) -> ReadSymbolsResult {
@@ -134,7 +136,7 @@ pub fn read_symbols(
     let mut used = 0usize;
     for (sym, is_neighbor) in ordered {
         let body =
-            read_span(root, &sym.file_path, sym.start_line, sym.end_line).unwrap_or_default();
+            read_span(reader, &sym.file_path, sym.start_line, sym.end_line).unwrap_or_default();
         let cost = window_cost(&body);
         if let Some(budget) = token_budget
             && !result.symbols.is_empty()
@@ -163,6 +165,7 @@ pub fn read_symbols(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_reader::FilesystemReader;
     use crate::index::index_directory_in_memory;
     use std::fs;
 
@@ -183,7 +186,8 @@ mod tests {
     #[test]
     fn read_symbols_returns_the_symbol_span_body() {
         let (_dir, src, store) = test_repo();
-        let res = read_symbols(&store, &["greet".to_string()], &src, 0, None);
+        let reader = FilesystemReader::new(&src);
+        let res = read_symbols(&store, &["greet".to_string()], &reader, 0, None);
         assert_eq!(res.symbols.len(), 1, "should resolve 'greet'");
         let w = &res.symbols[0];
         assert!(

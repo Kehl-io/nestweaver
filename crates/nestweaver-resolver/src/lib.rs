@@ -13,4 +13,5 @@ pub use cross_repo::*;
 pub use resolve::*;
 pub use workspace::{
     TsconfigAlias, WorkspaceContext, WorkspacePackage, discover_workspace_context,
+    discover_workspace_context_with,
 };

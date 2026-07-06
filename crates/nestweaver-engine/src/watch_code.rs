@@ -89,8 +89,11 @@ impl CodeWatcher {
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
-        let repo_url = format!("file://{}", self.repo_root.display());
-        let r_uid = nestweaver_schema::repo_uid(&self.instance_id, &repo_url);
+        // Identity decision (see `resolve_watch_identity`): adopt an existing
+        // `file://` graph rather than re-identifying+pruning, so a watch-first
+        // start over a legacy DB never empties the graph.
+        let root_path = self.repo_root.display().to_string();
+        let (repo_url, r_uid) = resolve_watch_identity(&store, &self.instance_id, &self.repo_root)?;
 
         // Ensure the Repo node exists so incremental updates can attach
         // File and Symbol nodes. If there's no prior index we create a
@@ -104,6 +107,7 @@ impl CodeWatcher {
                     staleness_commits_behind: 0,
                     instance_id: self.instance_id.clone(),
                     name: None,
+                    root_path: Some(root_path.clone()),
                 })
                 .context("insert initial Repo node")?;
         }
@@ -283,6 +287,55 @@ impl CodeWatcher {
 /// The debouncer callback type.
 type DebounceResult = Result<Vec<DebouncedEvent>, notify::Error>;
 
+/// Decide the repo identity `(url, uid)` the watcher indexes under.
+///
+/// The watcher does incremental updates ONLY — it never cold-indexes — so it
+/// must NEVER prune-and-empty an existing graph: unlike `nw index`, it cannot
+/// repopulate, so a prune would leave the graph empty until individual files
+/// happen to change (data loss on a watch-first start over a legacy DB).
+///
+/// Therefore, when this working tree already has a graph under its legacy
+/// `file://` identity, ADOPT that identity — no git-origin read, no prune — so
+/// incremental updates land on the existing graph. Adopting (rather than
+/// minting a second origin uid) is also what avoids the duplicate-row problem
+/// the re-identify logic was originally added to solve. Re-identification to
+/// the git origin remote is correctly deferred to the next `nw index`, which
+/// cold-indexes properly.
+///
+/// Only when NO existing repo row is found for this path (a genuinely fresh
+/// watch) do we mint the git origin identity: prefer the origin remote when
+/// configured, else the `file://` URL. Guard on `.git` at the watched root —
+/// `git config` walks up to an enclosing repo, and watching a subdirectory
+/// must not capture its parent repo's identity.
+fn resolve_watch_identity(
+    store: &GraphStore,
+    instance_id: &str,
+    repo_root: &Path,
+) -> Result<(String, String), anyhow::Error> {
+    let root_path = repo_root.display().to_string();
+    let file_url = format!("file://{root_path}");
+    let file_uid = nestweaver_schema::repo_uid(instance_id, &file_url);
+
+    if store.lookup_repo(&file_uid)?.is_some() {
+        // Existing legacy graph for this path: adopt it untouched.
+        tracing::info!(
+            uid = %file_uid,
+            root_path = %root_path,
+            "watched repo already indexed under its file:// identity; adopting it (re-identify deferred to next `nw index`)"
+        );
+        return Ok((file_url, file_uid));
+    }
+
+    // Fresh watch: mint the git origin identity when configured.
+    let repo_url = if repo_root.join(".git").exists() {
+        crate::bare_clone::read_origin_url(repo_root).unwrap_or_else(|_| file_url.clone())
+    } else {
+        file_url.clone()
+    };
+    let r_uid = nestweaver_schema::repo_uid(instance_id, &repo_url);
+    Ok((repo_url, r_uid))
+}
+
 /// Returns true if the file is a supported source language.
 fn is_supported_source(path: &Path) -> bool {
     detect_language(path).is_some()
@@ -393,6 +446,7 @@ fn reindex_file(
             visibility: raw_sym.visibility,
             type_info: raw_sym.type_info.clone(),
             framework_hint: hint_by_index.remove(&sym_idx),
+            canonical_id: None,
         };
         symbols.push(sym);
         file_sym_pairs.push((f_uid.clone(), s_uid));
@@ -482,5 +536,150 @@ mod tests {
         assert!(is_minified_or_bundled(Path::new("main.chunk.js")));
         assert!(!is_minified_or_bundled(Path::new("app.js")));
         assert!(!is_minified_or_bundled(Path::new("src/main.rs")));
+    }
+
+    /// Regression (data loss on watch-first over a legacy DB): a repo whose
+    /// full graph already lives under its `file://` identity must be ADOPTED by
+    /// the watcher — not re-identified to an origin remote and pruned. Before
+    /// this fix the watcher called `delete_repo_all_data(old_file_uid)` on
+    /// startup and only inserted a minimal empty Repo node, silently emptying
+    /// the graph until individual files happened to change.
+    #[test]
+    fn watcher_adopts_existing_file_identity_and_graph_survives() {
+        use nestweaver_schema::{File, Symbol, SymbolKind, Visibility, repo_uid};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        // Give the working tree a git origin remote. Pre-fix this is exactly
+        // what tripped the re-identify+prune path; post-fix the existing
+        // file:// row must short-circuit BEFORE the origin is ever read.
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_root)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/acme/demo.git",
+            ])
+            .current_dir(&repo_root)
+            .status();
+
+        let instance = "test";
+        let root_path = repo_root.display().to_string();
+        let file_url = format!("file://{root_path}");
+        let file_uid = repo_uid(instance, &file_url);
+        let origin_uid = repo_uid(instance, "https://example.com/acme/demo.git");
+        assert_ne!(file_uid, origin_uid);
+
+        // Seed a full graph under the LEGACY file:// identity.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: file_uid.clone(),
+                url: file_url.clone(),
+                indexed_sha: "sha-legacy".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: instance.to_string(),
+                name: None,
+                root_path: Some(root_path.clone()),
+            })
+            .unwrap();
+        let f_uid = nestweaver_schema::file_uid(&file_uid, "src/lib.rs");
+        store
+            .insert_file(&File {
+                uid: f_uid.clone(),
+                path: "src/lib.rs".to_string(),
+                repo_uid: file_uid.clone(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        store.insert_repo_file_edge(&file_uid, &f_uid).unwrap();
+        let s_uid = nestweaver_schema::symbol_uid(&file_uid, "src/lib.rs", "legacy_fn", 1);
+        store
+            .insert_symbol(&Symbol {
+                uid: s_uid.clone(),
+                name: "legacy_fn".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: file_uid.clone(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 3,
+                signature: "fn legacy_fn()".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        store.insert_file_symbol_edge(&f_uid, &s_uid).unwrap();
+
+        // Sanity: the symbol exists under the file:// uid before the watcher runs.
+        let before = store.symbol_names_by_repo(&file_uid).unwrap();
+        assert!(before.iter().any(|n| n == "legacy_fn"));
+
+        // The watcher's identity decision must ADOPT the file:// identity.
+        let (url, uid) = resolve_watch_identity(&store, instance, &repo_root).unwrap();
+        assert_eq!(uid, file_uid, "watcher must adopt the existing file:// uid");
+        assert_eq!(url, file_url);
+        assert_ne!(
+            uid, origin_uid,
+            "watcher must NOT re-identify to the origin remote when a legacy graph exists"
+        );
+
+        // The existing graph SURVIVES — no prune happened.
+        let after = store.symbol_names_by_repo(&file_uid).unwrap();
+        assert!(
+            after.iter().any(|n| n == "legacy_fn"),
+            "the legacy graph must survive adoption, got {after:?}"
+        );
+        assert!(
+            store.lookup_repo(&origin_uid).unwrap().is_none(),
+            "no second (origin) Repo row must be minted"
+        );
+    }
+
+    /// A genuinely fresh watch (no prior graph) with a `.git` origin mints the
+    /// origin identity, as before — adoption only kicks in for existing rows.
+    #[test]
+    fn watcher_mints_origin_identity_on_fresh_watch() {
+        use nestweaver_schema::repo_uid;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_root)
+            .status();
+        let added = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/acme/fresh.git",
+            ])
+            .current_dir(&repo_root)
+            .status();
+
+        let store = GraphStore::in_memory().unwrap();
+        let (url, uid) = resolve_watch_identity(&store, "test", &repo_root).unwrap();
+
+        // Only assert the origin path when git actually configured the remote
+        // (keeps the test hermetic if git is unavailable in the environment).
+        if matches!(added, Ok(s) if s.success()) {
+            assert_eq!(url, "https://example.com/acme/fresh.git");
+            assert_eq!(uid, repo_uid("test", "https://example.com/acme/fresh.git"));
+        }
     }
 }

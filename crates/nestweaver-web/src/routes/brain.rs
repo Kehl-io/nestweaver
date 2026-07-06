@@ -9,6 +9,22 @@ use serde_json::json;
 use crate::error::ApiError;
 use crate::state::AppState;
 
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
 pub async fn brain_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let vault_count = state.store.list_vaults(None)?.len();
     let note_count = state.store.count_notes()?;
@@ -150,9 +166,8 @@ pub async fn unlinked_mentions(
         if let Some(pos) = content_lower.find(&title_lower) {
             let start = pos.saturating_sub(50);
             let end = (pos + title.len() + 50).min(content.len());
-            // Ensure we slice on char boundaries
-            let start = content.floor_char_boundary(start);
-            let end = content.ceil_char_boundary(end);
+            let start = floor_char_boundary(&content, start);
+            let end = ceil_char_boundary(&content, end);
             let snippet = content[start..end].to_string();
 
             mentions.push(UnlinkedMention {

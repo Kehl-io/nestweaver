@@ -29,9 +29,17 @@ pub fn embed_via_api(endpoint: &str, model: &str, texts: &[&str]) -> Result<Vec<
         input: texts.to_vec(),
     };
 
-    let response: EmbeddingResponse = client
-        .post(&url)
-        .json(&request)
+    let mut builder = client.post(&url).json(&request);
+    // Optional bearer auth for keyed gateways (OpenAI, Azure, etc.). Read from an
+    // env var, never from config/graph/snapshot, so the key can't be persisted or
+    // leaked. Absent → no header (fine for a local Ollama endpoint).
+    if let Ok(key) = std::env::var("NESTWEAVER_EMBED_API_KEY")
+        && !key.is_empty()
+    {
+        builder = builder.bearer_auth(key);
+    }
+
+    let response: EmbeddingResponse = builder
         .send()
         .context("Failed to reach embedding API")?
         .error_for_status()

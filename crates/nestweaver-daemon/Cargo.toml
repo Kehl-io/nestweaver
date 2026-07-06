@@ -6,26 +6,50 @@ license.workspace = true
 description = "gRPC daemon for NestWeaver — serves read RPCs over a Unix domain socket"
 
 [dependencies]
+subtle = { workspace = true }
 nestweaver-proto = { workspace = true }
 nestweaver-engine = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-schema = { workspace = true }
-nestweaver-mcp = { workspace = true }
+nestweaver-mcp = { workspace = true, features = ["daemon"] }
 nestweaver-web = { workspace = true }
 nestweaver-embed = { workspace = true, optional = true }
+axum = "0.8"
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 tokio-stream = { workspace = true, features = ["net"] }
 tower = "0.5"
+tower-http = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
 libc = "0.2"
 dirs = "6"
+governor = { version = "0.8", features = ["dashmap"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+futures = { workspace = true }
+hyper-util = { workspace = true }
+# ACME (Let's Encrypt) auto-TLS. n0-computer fork, 0.9.x: ring backend, pins
+# rustls ^0.23 + tokio-rustls ^0.26 (the exact stack tonic 0.14 uses). Optional
+# and gated behind the `acme` feature so the default build pulls nothing extra.
+tokio-rustls-acme = { version = "0.9.1", optional = true }
+# Needed to implement the ACME `Cache` traits for AtomicDirCache. Gated behind
+# `acme` so the default build pulls nothing extra.
+async-trait = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 embed = ["dep:nestweaver-embed", "nestweaver-engine/embed", "nestweaver-mcp/embed"]
+acme = ["dep:tokio-rustls-acme", "dep:async-trait"]

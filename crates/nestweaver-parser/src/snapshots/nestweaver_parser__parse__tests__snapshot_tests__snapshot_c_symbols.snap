@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: id
   kind: Property
   start_line: 5
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: SensorType
   kind: Enum
   start_line: 9
@@ -35,6 +37,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: TEMPERATURE
   kind: Constant
   start_line: 10
@@ -46,6 +49,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: HUMIDITY
   kind: Constant
   start_line: 11
@@ -57,6 +61,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: PRESSURE
   kind: Constant
   start_line: 12
@@ -68,6 +73,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: SensorManager
   kind: Class
   start_line: 15
@@ -79,6 +85,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: count
   kind: Property
   start_line: 16
@@ -90,6 +97,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: SensorManager
 - name: SensorManager
   kind: Class
   start_line: 20
@@ -101,6 +109,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: initialize
   kind: Function
   start_line: 20
@@ -112,6 +121,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: calibrate
   kind: Function
   start_line: 24
@@ -123,6 +133,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: main
   kind: Function
   start_line: 28
@@ -134,6 +145,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: SensorManager
   kind: Class
   start_line: 29
@@ -145,6 +157,7 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: val
   kind: Variable
   start_line: 31
@@ -156,3 +169,4 @@ expression: "parsed_symbols(\"simple.c\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~

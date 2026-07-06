@@ -9,12 +9,11 @@ use axum::{
     extract::Request,
     http::{self, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use rust_embed::RustEmbed;
-use tower_http::cors::CorsLayer;
 
-use crate::state::AppState;
+use crate::state::{AdminState, AppState};
 
 #[derive(RustEmbed, Clone)]
 #[folder = "frontend/dist/"]
@@ -75,6 +74,10 @@ async fn spa_fallback(request: Request) -> Response {
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
+    // Touch all lazy metric statics so the /metrics endpoint always reports
+    // the full set of metric names, even before any events occur.
+    routes::metrics::init_metrics();
+
     Router::new()
         .route("/api/v1/health", get(routes::health::health))
         .route("/api/v1/version", get(routes::version::version))
@@ -174,6 +177,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/export/svg", post(routes::export::export_svg))
         .route("/api/v1/export/png", post(routes::export::export_png))
         .route("/api/v1/export/html", post(routes::export::export_html))
+        // Metrics (Prometheus text format, no auth)
+        .route("/metrics", get(routes::metrics::metrics_handler))
         // Snapshot
         .route(
             "/api/v1/snapshot.msgpack",
@@ -182,7 +187,77 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Events (SSE)
         .route("/api/v1/events", get(routes::events::events))
         .fallback(get(spa_fallback))
-        .layer(CorsLayer::permissive())
+        // No CORS layer: the SPA is served same-origin (serve_ui) in production
+        // and via Vite's same-origin dev proxy in development, so no
+        // cross-origin access is needed. Sending `Access-Control-Allow-Origin: *`
+        // here would let any website `fetch()` these UNAUTHENTICATED `/api/v1/*`
+        // read endpoints on the victim's loopback daemon and exfiltrate their
+        // indexed code cross-origin (localhost-CORS leak). Same-origin policy
+        // blocks that when no ACAO header is present.
+        .with_state(state)
+}
+
+/// Creates the admin API router for server-mode deployments.
+/// All routes require admin token authentication via the `AdminAuth` extractor.
+pub fn create_admin_router(state: Arc<AdminState>) -> Router {
+    use routes::admin;
+
+    Router::new()
+        .route("/repos", get(admin::list_repos).post(admin::add_repo))
+        .route("/repos/{id}", delete(admin::remove_repo))
+        .route("/repos/{id}/reindex", post(admin::trigger_reindex))
+        .route("/queue", get(admin::get_queue))
+        .route("/drain", post(admin::drain))
+        .route("/resume", post(admin::resume))
+        .route("/drain/status", get(admin::drain_status))
+        .route("/dead-letter", get(admin::list_dead_letter))
+        .route("/dead-letter/{id}/retry", post(admin::retry_dead_letter))
+        .route("/dead-letter/{id}", delete(admin::dismiss_dead_letter))
+        .route("/reload", post(admin::reload_config))
+        .route("/status", get(admin::get_status))
+        // Expose /metrics on the admin port as well so Prometheus can scrape
+        // a single endpoint regardless of which port it targets. Gated behind
+        // the admin token (S.5) — the admin router is nested onto the
+        // network-facing MCP listener, so an unauthenticated /admin/api/metrics
+        // would leak operational counters.
+        .route("/metrics", get(admin::metrics))
+        .with_state(state)
+}
+
+/// Creates the device-flow auth router (OAuth 2.0 Device Authorization Grant,
+/// RFC 8628). Mounted at `/auth` on the MCP/admin HTTP listener.
+///
+/// `/device` and `/token` are public (developers without a token reach them);
+/// `/device/approve` is guarded by the `AdminAuth` extractor inside the handler.
+pub fn create_device_flow_router(state: Arc<AdminState>) -> Router {
+    use axum::extract::{DefaultBodyLimit, Request};
+    use axum::middleware::{Next, from_fn};
+    use routes::admin;
+
+    // Shared, bounded per-IP rate limiter for the two public endpoints. These
+    // are unauthenticated and the MCP limiter lives inside the /mcp handler, so
+    // without this /auth would have no throttle at all.
+    let limiter = Arc::new(admin::AuthRateLimiter::new(
+        admin::AUTH_RATE_PER_MIN,
+        admin::AUTH_RATE_MAX_KEYS,
+    ));
+
+    // Rate limit only the unauthenticated endpoints; /device/approve is admin
+    // authenticated and IP-throttling it could lock an operator out.
+    let public = Router::new()
+        .route("/device", post(admin::device_authorize))
+        .route("/token", post(admin::device_token))
+        .layer(from_fn(move |req: Request, next: Next| {
+            let limiter = limiter.clone();
+            admin::auth_rate_limit(limiter, req, next)
+        }));
+
+    Router::new()
+        .merge(public)
+        .route("/device/approve", post(admin::device_approve))
+        // Cap request bodies on the whole /auth router so an unauthenticated
+        // caller can't stream a large body before any handler runs.
+        .layer(DefaultBodyLimit::max(admin::AUTH_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
@@ -192,6 +267,18 @@ pub async fn start_server(
     open_browser: bool,
 ) -> anyhow::Result<()> {
     let app = create_router(state);
+    start_server_with_router(app, port, open_browser).await
+}
+
+/// Start the web UI server with a pre-built router.
+///
+/// This allows callers (e.g. the daemon's `serve_ui` RPC) to customise the
+/// router — for instance by nesting the admin API — before starting.
+pub async fn start_server_with_router(
+    app: Router,
+    port: u16,
+    open_browser: bool,
+) -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("nestweaver-web listening on http://{addr}");
@@ -203,6 +290,52 @@ pub async fn start_server(
         }
     }
 
-    axum::serve(listener, app).await?;
+    // Serve with peer-address info so IP-keyed middleware (e.g. the device-flow
+    // rate limiter on the nested /auth router) can read the direct client IP via
+    // `ConnectInfo`. Purely additive for routers that don't use it.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod frontend_assets_tests {
+    use super::*;
+
+    /// Every asset referenced by the embedded `index.html` must itself be
+    /// embedded. `rust_embed` pulls from `frontend/dist/` on disk at build time,
+    /// so on a clean git checkout this fails if a rebuilt, content-hashed bundle
+    /// was not git-tracked — the release-breaking "index.html points at a missing
+    /// /assets/* file" class. The `dist/` folder is gitignored and force-added,
+    /// so a forgotten `git add -f` after a `vite build` is the exact failure mode.
+    #[test]
+    fn embedded_index_references_only_embedded_assets() {
+        let index = FrontendAssets::get("index.html").expect("index.html must be embedded");
+        let html = std::str::from_utf8(index.data.as_ref()).expect("index.html is utf8");
+
+        let mut checked = 0;
+        let mut rest = html;
+        while let Some(pos) = rest.find("/assets/") {
+            // Drop the leading '/', keep the embed-relative "assets/<file>".
+            let tail = &rest[pos + 1..];
+            let end = tail
+                .find(|c: char| c == '"' || c == '\'' || c == ')' || c == '?' || c.is_whitespace())
+                .unwrap_or(tail.len());
+            let asset_path = &tail[..end];
+            assert!(
+                FrontendAssets::get(asset_path).is_some(),
+                "index.html references /{asset_path} but it is not embedded \
+                 (rebuilt frontend bundle not git-tracked?)"
+            );
+            checked += 1;
+            rest = &tail[end..];
+        }
+        assert!(
+            checked > 0,
+            "expected index.html to reference at least one /assets/* file"
+        );
+    }
 }

@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 6
@@ -27,6 +28,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
     parameter_types: []
     return_type: String
   parent_name: ~
+  scope_chain: Greeter
 - name: SimpleGreeter
   kind: Class
   start_line: 9
@@ -38,6 +40,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Method
   start_line: 10
@@ -52,6 +55,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
     parameter_types: []
     return_type: String
   parent_name: ~
+  scope_chain: SimpleGreeter
 - name: logGreeting
   kind: Method
   start_line: 14
@@ -63,6 +67,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: SimpleGreeter
 - name: AppConfig
   kind: Module
   start_line: 19
@@ -74,6 +79,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: defaultName
   kind: Property
   start_line: 20
@@ -85,6 +91,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: AppConfig
 - name: main
   kind: Function
   start_line: 23
@@ -96,6 +103,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greeter
   kind: Property
   start_line: 24
@@ -107,6 +115,7 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: result
   kind: Property
   start_line: 25
@@ -118,3 +127,4 @@ expression: "parsed_symbols(\"Simple.kt\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~

@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -14,11 +14,63 @@ use nestweaver_proto::nest_weaver_daemon_server::{NestWeaverDaemon, NestWeaverDa
 use nestweaver_proto::*;
 use nestweaver_store::{GraphStore, TantivyIndex};
 use tokio::sync::Notify;
+use tonic::codegen::http;
 use tonic::{Request, Response, Status};
 
 use crate::lifecycle;
+use crate::safeguards::{
+    ClientRateLimiters, QuerySafeguards, RateLimitConfig, with_safeguard_cancellable,
+};
 
 // ── State ───────────────────────────────────────────────────────────
+
+/// Map a dispatch error to a gRPC `Status`, preserving cancellation semantics:
+/// a cancelled query surfaces as `deadline_exceeded` rather than an opaque
+/// `internal`. Non-cancel errors keep the `internal` mapping. This is
+/// defense-in-depth: on timeout the safeguard's `select!` already returns
+/// `deadline_exceeded` and drops this future, but a query that finishes with a
+/// cancel error just before that race is mapped consistently here too.
+///
+/// The only cancel reason that can reach here is `Timeout`: the cooperative
+/// flag is a bare `AtomicBool` that cannot carry a reason, so the leaf always
+/// reports `Timeout`. On a client disconnect the request future is dropped
+/// before any `Status` is returned, so that path never surfaces here.
+fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
+    if let Some(reason) = e
+        .downcast_ref::<nestweaver_store::StoreError>()
+        .and_then(|s| s.cancel_reason())
+    {
+        return match reason {
+            nestweaver_store::CancelReason::Timeout => {
+                Status::deadline_exceeded(format!("{tool_name} query cancelled: timeout"))
+            }
+        };
+    }
+    Status::internal(format!("tool {tool_name} failed: {e}"))
+}
+
+/// Trip `cancel` when the request future is dropped (client cancel /
+/// disconnect), reusing the same cooperative flag the timeout path sets.
+///
+/// Returns a `DropGuard` that MUST be held for the lifetime of the request
+/// future: when that future is dropped, the guard cancels a token, and a small
+/// listener task then stores `true` into the shared flag so the in-flight
+/// `spawn_blocking` dispatch bails cheaply instead of running to completion and
+/// caching a result no client is waiting for. On normal completion the guard
+/// still fires, but the dispatch has already returned, so the late store is a
+/// harmless no-op on a per-request flag.
+fn arm_disconnect_cancel(cancel: Arc<AtomicBool>) -> tokio_util::sync::DropGuard {
+    let token = tokio_util::sync::CancellationToken::new();
+    let child = token.clone();
+    tokio::spawn(async move {
+        child.cancelled().await;
+        // Release to pair with the Acquire load in the cooperative reader
+        // (nestweaver-store `vector_search_cancellable`), matching the timeout
+        // writer in `safeguards::with_safeguard_cancellable`.
+        cancel.store(true, Ordering::Release);
+    });
+    token.drop_guard()
+}
 
 /// RAII guard that decrements a connection counter on drop.
 /// Fixes cancellation-safety: if a client disconnects mid-RPC or
@@ -73,6 +125,33 @@ pub struct DaemonState {
     /// Serializes write RPCs so only one runs at a time (KùzuDB allows a
     /// single write transaction).
     pub write_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Whether this daemon is running in server mode (TCP, no local source files).
+    pub server_mode: bool,
+    /// Whether this daemon serves a read-only snapshot replica. When true, all
+    /// write RPCs (index/add/remove/merge/watch) are rejected with
+    /// `FAILED_PRECONDITION` and the write machinery (worker, scheduler,
+    /// webhook) is never started.
+    pub read_only: bool,
+    /// Whether the server-side worker pool is currently indexing a repo.
+    pub indexing_active: Arc<AtomicBool>,
+    /// The repo currently being indexed (empty string when idle).
+    pub indexing_repo: Arc<tokio::sync::RwLock<String>>,
+    /// Number of pending + running jobs in the server-side job queue.
+    pub indexing_queue_depth: Arc<AtomicU32>,
+    /// Per-tool query safeguards (timeouts, depth limits, result caps).
+    pub safeguards: QuerySafeguards,
+    /// Per-client rate limiters (token bucket via governor).
+    pub rate_limiters: Option<Arc<ClientRateLimiters>>,
+    /// Whether the server-side worker pool is drained (not picking new jobs).
+    pub drained: Arc<AtomicBool>,
+    /// Admin token for admin API authentication (separate from query token).
+    pub admin_token: Option<String>,
+    /// Shared admin state, set once after construction. Used by `serve_ui`
+    /// to mount the admin API on the web UI server as well.
+    pub admin_state: std::sync::OnceLock<Arc<nestweaver_web::state::AdminState>>,
+    /// Handle to the server-mode worker-pool task. Awaited on shutdown so an
+    /// in-flight index write is allowed to finish rather than being abandoned.
+    pub worker_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -89,13 +168,64 @@ impl DaemonService {
     /// corresponding MCP tool via `nestweaver_mcp::tools::dispatch`.
     /// Runs the blocking dispatch on a dedicated thread to avoid
     /// starving the tokio runtime.
+    ///
+    /// In server mode, the dispatch is wrapped with a per-tool timeout
+    /// via `with_safeguard`.
     async fn dispatch_json_tool(
         &self,
         tool_name: &str,
         args_json: &str,
     ) -> Result<Response<JsonResponse>, Status> {
+        let started = std::time::Instant::now();
+        // Increment gRPC request counter for this tool/method.
+        nestweaver_web::routes::metrics::GRPC_REQUESTS
+            .with_label_values(&[tool_name])
+            .inc();
+
+        let safeguards = &self.state.safeguards;
+        let tool = tool_name.to_string();
+        let timeout = safeguards.effective_timeout(&tool, None);
+        // Cooperative cancellation: the flag is tripped by
+        // `with_safeguard_cancellable` on timeout and observed by the
+        // `spawn_blocking` dispatch (e.g. brain_context's vector fan-out).
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = self.dispatch_json_tool_inner(tool_name, args_json, cancel.clone());
+
+        let response = if self.state.server_mode {
+            with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
+        } else {
+            handler.await
+        };
+
+        let elapsed = started.elapsed();
+        nestweaver_web::routes::metrics::QUERY_DURATION
+            .with_label_values(&[tool.as_str()])
+            .observe(elapsed.as_secs_f64());
+        if elapsed >= timeout.mul_f64(0.8) {
+            nestweaver_web::routes::metrics::SLOW_QUERIES.inc();
+        }
+        if response.is_err() {
+            nestweaver_web::routes::metrics::QUERY_ERRORS
+                .with_label_values(&[tool.as_str()])
+                .inc();
+        }
+
+        response
+    }
+
+    /// Inner dispatch without safeguard wrapper. Extracted so
+    /// `with_safeguard` can race it against a timeout.
+    async fn dispatch_json_tool_inner(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Response<JsonResponse>, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
+        // Trip the cancel flag if this request future is dropped (client cancel
+        // / disconnect), the same flag the timeout path sets.
+        let _disconnect_guard = arm_disconnect_cancel(cancel.clone());
 
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
@@ -124,6 +254,45 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
+            nestweaver_mcp::tools::set_server_mode(state.server_mode);
+
+            // In server mode, clamp depth and result limits per safeguard config
+            // before passing to the tool handler.
+            let mut args = args;
+            // Hard-cap traversal depth in ALL modes (local + server) before dispatch — a huge
+            // client-supplied depth can overflow the stack in recursive traces (build_flow_tree /
+            // walk_trace) or run the graph away in impact BFS. Server mode further tightens this
+            // via the safeguard config below.
+            clamp_traversal_depth(&mut args);
+            let depth_result = if state.server_mode {
+                // Clamp depth parameter.
+                let client_depth = args
+                    .get("depth")
+                    .or_else(|| args.get("max_depth"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let dr = state.safeguards.effective_depth(&tool_name, client_depth);
+                if args.get("depth").is_some() {
+                    args["depth"] = serde_json::json!(dr.depth);
+                } else if args.get("max_depth").is_some() {
+                    args["max_depth"] = serde_json::json!(dr.depth);
+                }
+
+                // Clamp result limit parameter.
+                let client_limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let effective_limit = state
+                    .safeguards
+                    .effective_result_limit(&tool_name, client_limit);
+                if args.get("limit").is_some() {
+                    args["limit"] = serde_json::json!(effective_limit);
+                }
+                Some(dr)
+            } else {
+                None
+            };
 
             let embed_ref = embed_arc.as_deref();
             tracing::debug!(
@@ -132,19 +301,35 @@ impl DaemonService {
             );
 
             let t_dispatch = std::time::Instant::now();
-            let value = nestweaver_mcp::tools::dispatch(
+            let mut value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
+                Some(&cancel),
             )
-            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
             tracing::debug!(
                 tool = %tool_name,
                 elapsed_ms = t_dispatch.elapsed().as_millis(),
                 "dispatch completed"
             );
+
+            // Communicate depth clamping in response metadata.
+            if let Some(ref dr) = depth_result
+                && dr.clamped
+                && let Some(obj) = value.as_object_mut()
+            {
+                let meta = obj.entry("_meta").or_insert_with(|| serde_json::json!({}));
+                if let Some(meta_obj) = meta.as_object_mut() {
+                    meta_obj.insert("_clamped".to_string(), serde_json::json!(true));
+                    meta_obj.insert(
+                        "_original_depth".to_string(),
+                        serde_json::json!(dr.original_depth),
+                    );
+                }
+            }
 
             let t_ser = std::time::Instant::now();
             let json = serde_json::to_string(&value)
@@ -172,13 +357,59 @@ impl DaemonService {
     /// Dispatch a tool by name with a pre-built JSON args value, returning the
     /// raw `serde_json::Value` result. Used by typed RPC handlers that convert
     /// protobuf → JSON on input and JSON → protobuf on output.
+    ///
+    /// In server mode, the dispatch is wrapped with a per-tool timeout.
     async fn dispatch_tool_json(
         &self,
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, Status> {
+        let started = std::time::Instant::now();
+        // Increment gRPC request counter for this tool/method.
+        nestweaver_web::routes::metrics::GRPC_REQUESTS
+            .with_label_values(&[tool_name])
+            .inc();
+
+        let safeguards = &self.state.safeguards;
+        let tool = tool_name.to_string();
+        let timeout = safeguards.effective_timeout(&tool, None);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = self.dispatch_tool_json_inner(tool_name, args, cancel.clone());
+
+        let response = if self.state.server_mode {
+            with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
+        } else {
+            handler.await
+        };
+
+        let elapsed = started.elapsed();
+        nestweaver_web::routes::metrics::QUERY_DURATION
+            .with_label_values(&[tool.as_str()])
+            .observe(elapsed.as_secs_f64());
+        if elapsed >= timeout.mul_f64(0.8) {
+            nestweaver_web::routes::metrics::SLOW_QUERIES.inc();
+        }
+        if response.is_err() {
+            nestweaver_web::routes::metrics::QUERY_ERRORS
+                .with_label_values(&[tool.as_str()])
+                .inc();
+        }
+
+        response
+    }
+
+    /// Inner dispatch without safeguard wrapper.
+    async fn dispatch_tool_json_inner(
+        &self,
+        tool_name: &str,
+        args: serde_json::Value,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<serde_json::Value, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
+        // Trip the cancel flag if this request future is dropped (client cancel
+        // / disconnect), the same flag the timeout path sets.
+        let _disconnect_guard = arm_disconnect_cancel(cancel.clone());
 
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
@@ -197,18 +428,20 @@ impl DaemonService {
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
+            nestweaver_mcp::tools::set_server_mode(state.server_mode);
 
             let embed_ref = embed_arc.as_deref();
 
             let t_dispatch = std::time::Instant::now();
-            let value = nestweaver_mcp::tools::dispatch(
+            let value = nestweaver_mcp::tools::dispatch_cancellable(
                 &state.store,
                 state.tantivy.as_deref(),
                 &tool_name,
                 args,
                 embed_ref,
+                Some(&cancel),
             )
-            .map_err(|e| Status::internal(format!("tool {tool_name} failed: {e}")))?;
+            .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
             tracing::debug!(
                 tool = %tool_name,
                 elapsed_ms = t_dispatch.elapsed().as_millis(),
@@ -228,9 +461,29 @@ impl DaemonService {
         result
     }
 
-    /// Build an `on_change` callback that queues un-embedded nodes for
-    /// background embedding after every watcher batch.  Returns `None`
-    /// when the `embed` feature is disabled or the model is not yet loaded.
+    /// Build an `on_change` callback that embeds un-embedded nodes after every
+    /// watcher batch.  Returns `None` when the `embed` feature is disabled or
+    /// the model is not yet loaded.
+    ///
+    /// The embed writes run **inline** on the watcher thread. That thread holds
+    /// `write_mutex` + a `ConnectionGuard::write` for the watcher's whole run
+    /// (see `watch_vault`/`watch_code` wiring) and invokes this callback within
+    /// that hold, so executing the `add_embedding`/`flush_embedding_index`
+    /// writes here keeps them under the same write gate every other daemon
+    /// mutation uses:
+    ///  - **backup-safe:** the write runs while the watcher holds `write_mutex`,
+    ///    so a backup's `.embeddings` sidecar copy (which also takes
+    ///    `write_mutex` in `stage_backup_from_store`) cannot run concurrently,
+    ///    and no detached task outlives the lock to race the copy;
+    ///  - **drain-visible:** the write completes before the watcher thread drops
+    ///    its `ConnectionGuard::write`, so `active_writes` stays > 0 until the
+    ///    embed finishes and the shutdown drain waits for it.
+    ///
+    /// It must NOT be moved to a detached `spawn_blocking` task: that escapes
+    /// both guarantees. It also must NOT re-acquire `write_mutex` itself — the
+    /// watcher thread already holds it for the whole run, so a fresh
+    /// `blocking_lock()` here would deadlock. Inheriting the existing hold is
+    /// the correct single-writer discipline.
     #[cfg(feature = "embed")]
     fn make_embed_on_change(
         embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
@@ -238,96 +491,90 @@ impl DaemonService {
     ) -> Option<Box<dyn Fn() + Send>> {
         Some(Box::new(move || {
             // Peek at the model without blocking async code — we are already
-            // in a blocking thread (inside spawn_blocking).
+            // in a blocking thread (the watcher thread, inside spawn_blocking).
             let model = {
                 let guard = embed_model.blocking_read();
                 guard.clone()
             };
             let Some(model) = model else { return };
 
-            let store = store.clone();
-            // Fire-and-forget a new blocking task so the watcher callback
-            // returns quickly and the watcher loop is not stalled.
-            drop(tokio::task::spawn_blocking(move || {
-                let mut embedded = 0u32;
-                let limit: usize = 64; // Max nodes per watcher cycle
+            let mut embedded = 0u32;
+            let limit: usize = 64; // Max nodes per watcher cycle
 
-                // Symbols
-                if let Ok(symbols) = store.list_all_symbols() {
-                    for sym in symbols.iter().filter(|s| s.embedding.is_none()).take(limit) {
-                        let text = nestweaver_embed::preprocess::symbol_embed_text(
-                            &sym.kind.to_string(),
-                            &sym.name,
-                            None,
-                        );
-                        match model.embed_query(&text) {
-                            Ok(emb) => {
-                                store.add_embedding(&sym.uid, emb);
-                                embedded += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
-                            }
+            // Symbols
+            if let Ok(symbols) = store.list_all_symbols() {
+                for sym in symbols.iter().filter(|s| s.embedding.is_none()).take(limit) {
+                    let text = nestweaver_embed::preprocess::symbol_embed_text(
+                        &sym.kind.to_string(),
+                        &sym.name,
+                        None,
+                    );
+                    match model.embed_query(&text) {
+                        Ok(emb) => {
+                            store.add_embedding(&sym.uid, emb);
+                            embedded += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
                         }
                     }
                 }
+            }
 
-                let remaining = limit.saturating_sub(embedded as usize);
+            let remaining = limit.saturating_sub(embedded as usize);
 
-                // Notes
-                if remaining > 0
-                    && let Ok(notes) = store.list_notes(None)
+            // Notes
+            if remaining > 0
+                && let Ok(notes) = store.list_notes(None)
+            {
+                for note in notes
+                    .iter()
+                    .filter(|n| n.embedding.is_none())
+                    .take(remaining)
                 {
-                    for note in notes
-                        .iter()
-                        .filter(|n| n.embedding.is_none())
-                        .take(remaining)
-                    {
-                        let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
-                        match model.embed_query(&text) {
-                            Ok(emb) => {
-                                store.add_embedding(&note.uid, emb);
-                                embedded += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!(uid = %note.uid, "embedding failed: {e}");
-                            }
+                    let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                    match model.embed_query(&text) {
+                        Ok(emb) => {
+                            store.add_embedding(&note.uid, emb);
+                            embedded += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(uid = %note.uid, "embedding failed: {e}");
                         }
                     }
                 }
+            }
 
-                let remaining = limit.saturating_sub(embedded as usize);
+            let remaining = limit.saturating_sub(embedded as usize);
 
-                // Headings
-                if remaining > 0
-                    && let Ok(headings) = store.list_all_headings()
+            // Headings
+            if remaining > 0
+                && let Ok(headings) = store.list_all_headings()
+            {
+                for heading in headings
+                    .iter()
+                    .filter(|h| h.embedding.is_none())
+                    .take(remaining)
                 {
-                    for heading in headings
-                        .iter()
-                        .filter(|h| h.embedding.is_none())
-                        .take(remaining)
-                    {
-                        let text =
-                            nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
-                        match model.embed_query(&text) {
-                            Ok(emb) => {
-                                store.add_embedding(&heading.uid, emb);
-                                embedded += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
-                            }
+                    let text = nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
+                    match model.embed_query(&text) {
+                        Ok(emb) => {
+                            store.add_embedding(&heading.uid, emb);
+                            embedded += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
                         }
                     }
                 }
+            }
 
-                if embedded > 0 {
-                    if let Err(e) = store.flush_embedding_index() {
-                        tracing::warn!("failed to flush embedding index: {e}");
-                    }
-                    tracing::debug!(count = embedded, "embedded new nodes from watcher");
+            if embedded > 0 {
+                if let Err(e) = store.flush_embedding_index() {
+                    tracing::warn!("failed to flush embedding index: {e}");
                 }
-            }));
+                tracing::debug!(count = embedded, "embedded new nodes from watcher");
+            }
         }))
     }
 
@@ -342,15 +589,76 @@ impl DaemonService {
 
 // ── Trait impl ──────────────────────────────────────────────────────
 
+/// Tools that mutate server state and require admin-level auth via gRPC.
+///
+/// The gRPC gate and the HTTP/MCP gate share ONE list — the canonical
+/// [`nestweaver_mcp::http::MUTATING_TOOLS`] — so the two surfaces can never
+/// drift (a new mutating tool guarded on one gate but not the other). Re-export
+/// it under the module-local name the `json_rpc!` gate reads.
+use nestweaver_mcp::http::MUTATING_TOOLS;
+
 /// Maps each gRPC RPC name to the MCP tool name it dispatches to.
 macro_rules! json_rpc {
     ($self:ident, $request:ident, $tool:expr) => {{
+        // Gate mutating tools behind admin auth, matching the HTTP layer.
+        if MUTATING_TOOLS.contains(&$tool) {
+            if let Some(crate::auth::IsAdmin(false)) | None =
+                $request.extensions().get::<crate::auth::IsAdmin>()
+            {
+                return Err(Status::permission_denied(format!(
+                    "tool '{}' is mutating and requires the admin token",
+                    $tool
+                )));
+            }
+        }
         let req = $request.into_inner();
         $self.dispatch_json_tool($tool, &req.args_json).await
     }};
 }
 
 type ProgressStream = tokio_stream::wrappers::ReceiverStream<Result<IndexProgress, Status>>;
+
+/// Delete every repo whose KNOWN local working tree no longer exists on disk.
+///
+/// Safety contract (data-loss guard): a repo is prunable only when
+/// [`nestweaver_schema::Repo::local_root`] yields a path — i.e. it has a
+/// recorded `root_path`, or a legacy `file://` identity url. Repos with a
+/// remote identity and no working tree (server-side bare-clone repos,
+/// `root_path: None`) are skipped entirely: a disk-existence check cannot
+/// apply to them, and bulk-deleting them here would destroy server data.
+///
+/// Returns the display names of the removed repos.
+fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<Vec<String>, anyhow::Error> {
+    let mut removed_repos = Vec::new();
+    let repos = store
+        .list_repos(None)
+        .map_err(|e| anyhow::anyhow!("list_repos failed: {e:#}"))?;
+
+    for repo in &repos {
+        let Some(path) = repo.local_root() else {
+            continue;
+        };
+        if !Path::new(path).exists() {
+            tracing::info!(
+                uid = %repo.uid,
+                url = %repo.url,
+                root = path,
+                "pruning stale repo: local working tree no longer exists"
+            );
+            store
+                .bulk_delete_repo_files_and_symbols(&repo.uid)
+                .map_err(|e| anyhow::anyhow!("bulk_delete_repo_files_and_symbols failed: {e:#}"))?;
+            store
+                .clear_repo_derived_nodes(&repo.uid)
+                .map_err(|e| anyhow::anyhow!("clear_repo_derived_nodes failed: {e:#}"))?;
+            store
+                .delete_repo_node(&repo.uid)
+                .map_err(|e| anyhow::anyhow!("delete_repo_node failed: {e:#}"))?;
+            removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
+        }
+    }
+    Ok(removed_repos)
+}
 
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
@@ -374,9 +682,21 @@ impl NestWeaverDaemon for DaemonService {
 
     async fn shutdown(
         &self,
-        _request: Request<ShutdownRequest>,
+        request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         tracing::info!("shutdown requested via gRPC — draining active writes");
+
+        // T6.2: mark the pool drained BEFORE the drain wait loop so the worker
+        // stops claiming NEW jobs immediately and only finishes in-flight work.
+        // Without this the worker keeps claiming new jobs during the drain, so
+        // under continuous webhook enqueue `indexing_active` never clears and
+        // shutdown burns the full drain ceiling doing work it will abandon.
+        self.state.drained.store(true, Ordering::Relaxed);
 
         if let Ok(mut guard) = self.state.watcher_stop.lock()
             && let Some(handle) = guard.take()
@@ -387,10 +707,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let state = self.state.clone();
         tokio::spawn(async move {
-            let ceiling = std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(660);
+            let ceiling = nestweaver_schema::drain_ceiling_from_env();
 
             let timeout = std::time::Duration::from_secs(ceiling);
             let half = std::time::Duration::from_secs(ceiling / 2);
@@ -401,8 +718,12 @@ impl NestWeaverDaemon for DaemonService {
 
             loop {
                 let writes = state.active_writes.load(Ordering::Relaxed);
-                if writes == 0 {
-                    tracing::info!("no active writes — shutting down");
+                // Index jobs bump `indexing_active`, not `active_writes`, so the
+                // drain must wait on both — otherwise a shutdown could proceed
+                // while the worker is mid-write.
+                let indexing = state.indexing_active.load(Ordering::Relaxed);
+                if writes == 0 && !indexing {
+                    tracing::info!("no active writes or indexing — shutting down");
                     break;
                 }
 
@@ -439,12 +760,82 @@ impl NestWeaverDaemon for DaemonService {
         Ok(Response::new(ShutdownResponse { ok: true }))
     }
 
+    // ── Backup ──────────────────────────────────────────────────────
+
+    async fn backup(
+        &self,
+        request: Request<BackupRequest>,
+    ) -> Result<Response<BackupResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
+        let req = request.into_inner();
+        if req.output_path.trim().is_empty() {
+            return Err(Status::invalid_argument("output_path is required"));
+        }
+        let config = nestweaver_engine::BackupConfig {
+            db_path: self.state.db_path.clone(),
+            output_path: std::path::PathBuf::from(&req.output_path),
+            include_clones: req.include_clones,
+            instance_id: self.state.instance_id.clone(),
+            workspace_path: if req.include_clones {
+                self.state.db_path.parent().map(|p| p.join("workspace"))
+            } else {
+                None
+            },
+        };
+
+        // Stage the backup while HOLDING the write lock. Quiesce == lock-held:
+        // no writer touches the files mid-copy, and the RAII guard releases the
+        // lock on drop/panic — there is no persistent quiesce flag to leak.
+        let staged = {
+            let _write_lock = self.state.write_mutex.lock().await;
+            let _guard = ConnectionGuard::write(&self.state);
+            let store = self.state.store.clone();
+            let cfg = config.clone();
+            tracing::info!("backup: staging under write lock");
+            tokio::task::spawn_blocking(move || {
+                nestweaver_engine::stage_backup_from_store(&store, &cfg)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("backup staging panicked: {e}")))?
+            .map_err(|e| Status::internal(format!("backup staging failed: {e}")))?
+        }; // write lock released here — writers resume while we package below
+
+        let cfg = config.clone();
+        let result =
+            tokio::task::spawn_blocking(move || nestweaver_engine::package_staged(&cfg, staged))
+                .await
+                .map_err(|e| Status::internal(format!("backup packaging panicked: {e}")))?
+                .map_err(|e| Status::internal(format!("backup packaging failed: {e}")))?;
+
+        let m = &result.manifest;
+        tracing::info!(output = %result.output_path.display(), "backup complete");
+        Ok(Response::new(BackupResponse {
+            output_path: result.output_path.to_string_lossy().into_owned(),
+            instance_id: m.instance_id.clone(),
+            tier: m.tier.clone(),
+            nestweaver_version: m.nestweaver_version.clone(),
+            repo_count: m.repo_count as u64,
+            symbol_count: m.symbol_count as u64,
+            db_size_bytes: m.sizes.db,
+            total_compressed: m.sizes.total_compressed,
+        }))
+    }
+
     // ── Watching ─────────────────────────────────────────────────────
 
     async fn watch_vault(
         &self,
         request: Request<WatchVaultRequest>,
     ) -> Result<Response<WatchVaultResponse>, Status> {
+        if self.state.server_mode {
+            return Err(Status::unimplemented(
+                "watchers are server-managed in server mode",
+            ));
+        }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -460,6 +851,34 @@ impl NestWeaverDaemon for DaemonService {
                 ok: false,
                 message: format!("vault path is not a directory: {}", vault_path.display()),
             }));
+        }
+
+        let vault_path = vault_path.canonicalize().map_err(|e| {
+            Status::invalid_argument(format!("cannot canonicalize vault path: {e}"))
+        })?;
+
+        // Only allow paths registered in the instance config.
+        if let Some(ref cfg) = self.state.instance_cfg {
+            let allowed: Vec<PathBuf> = cfg
+                .repos
+                .iter()
+                .filter(|r| r.repo_type == Some(nestweaver_engine::config::RepoType::Vault))
+                .filter_map(|r| {
+                    let p = PathBuf::from(&r.url);
+                    p.canonicalize().ok()
+                })
+                .collect();
+            if !allowed.iter().any(|a| vault_path.starts_with(a)) {
+                return Err(Status::invalid_argument(format!(
+                    "vault path {} is not in the instance's registered sources",
+                    vault_path.display()
+                )));
+            }
+        } else {
+            return Err(Status::failed_precondition(
+                "watch_vault requires an instance config (--config); \
+                 path validation cannot be performed without one",
+            ));
         }
 
         let db_path = self.state.db_path.clone();
@@ -544,6 +963,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<WatchCodeRequest>,
     ) -> Result<Response<WatchCodeResponse>, Status> {
+        if self.state.server_mode {
+            return Err(Status::unimplemented(
+                "watchers are server-managed in server mode",
+            ));
+        }
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
         let instance_id = if req.instance_id.is_empty() {
@@ -557,6 +981,33 @@ impl NestWeaverDaemon for DaemonService {
                 ok: false,
                 message: format!("repo path is not a directory: {}", repo_path.display()),
             }));
+        }
+
+        let repo_path = repo_path
+            .canonicalize()
+            .map_err(|e| Status::invalid_argument(format!("cannot canonicalize repo path: {e}")))?;
+
+        // Only allow paths registered in the instance config.
+        if let Some(ref cfg) = self.state.instance_cfg {
+            let allowed: Vec<PathBuf> = cfg
+                .repos
+                .iter()
+                .filter_map(|r| {
+                    let p = PathBuf::from(&r.url);
+                    p.canonicalize().ok()
+                })
+                .collect();
+            if !allowed.iter().any(|a| repo_path.starts_with(a)) {
+                return Err(Status::invalid_argument(format!(
+                    "repo path {} is not in the instance's registered sources",
+                    repo_path.display()
+                )));
+            }
+        } else {
+            return Err(Status::failed_precondition(
+                "watch_code requires an instance config (--config); \
+                 path validation cannot be performed without one",
+            ));
         }
 
         let db_path = self.state.db_path.clone();
@@ -618,6 +1069,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         _request: Request<StopWatchRequest>,
     ) -> Result<Response<StopWatchResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            _request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let mut guard = self
             .state
             .watcher_stop
@@ -642,8 +1098,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let format = args
@@ -668,6 +1124,11 @@ impl NestWeaverDaemon for DaemonService {
                         .map_err(|e| Status::internal(format!("export produced non-UTF-8: {e}")))?;
 
                     if let Some(path) = output_path {
+                        if state.server_mode {
+                            return Err(Status::permission_denied(
+                                "file output is disabled in server mode; use the returned text field",
+                            ));
+                        }
                         std::fs::write(path, &text).map_err(|e| {
                             Status::internal(format!("failed to write {path}: {e}"))
                         })?;
@@ -682,6 +1143,12 @@ impl NestWeaverDaemon for DaemonService {
                     .map_err(|e| Status::internal(format!("json serialize failed: {e:#}")))
                 }
                 "msgpack" => {
+                    if state.server_mode {
+                        return Err(Status::permission_denied(
+                            "msgpack export writes to disk and is disabled in server mode; export locally",
+                        ));
+                    }
+
                     let graph = nestweaver_engine::export_in_memory_graph(&state.store)
                         .map_err(|e| Status::internal(format!("export failed: {e:#}")))?;
                     let bytes = rmp_serde::to_vec(&graph).map_err(|e| {
@@ -738,6 +1205,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<ServeUiRequest>,
     ) -> Result<Response<ServeUiResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let state = self.state.clone();
 
@@ -750,9 +1222,22 @@ impl NestWeaverDaemon for DaemonService {
         let port = if req.port > 0 { req.port as u16 } else { 3000 };
         let open_browser = req.open_browser;
 
+        // Build web UI router, mounting the admin API when available so the
+        // admin dashboard SPA can reach its backend on the same origin.
+        let mut web_router = nestweaver_web::create_router(app_state);
+        if let Some(admin_state) = state.admin_state.get() {
+            let device_router = nestweaver_web::create_device_flow_router(admin_state.clone());
+            web_router = web_router.nest("/auth", device_router);
+            let admin_router = nestweaver_web::create_admin_router(admin_state.clone());
+            web_router = web_router.nest("/admin/api", admin_router);
+            tracing::info!("admin API also mounted on web UI server");
+        }
+
         // Spawn web server as a background task inside the daemon.
         tokio::spawn(async move {
-            if let Err(e) = nestweaver_web::start_server(app_state, port, open_browser).await {
+            if let Err(e) =
+                nestweaver_web::start_server_with_router(web_router, port, open_browser).await
+            {
                 tracing::error!("UI server error: {e}");
             }
         });
@@ -791,8 +1276,24 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexRepoRequest>,
     ) -> Result<Response<Self::IndexRepoStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
+        // Canonicalize so a relative or `.` repo path (which a detached daemon
+        // resolves against CWD=/) is caught before it walks the whole filesystem,
+        // then refuse a system root outright.
         let repo_path = PathBuf::from(&req.repo_path);
+        let repo_path = repo_path.canonicalize().unwrap_or(repo_path);
+        if is_unsafe_index_root(&repo_path) {
+            return Err(Status::invalid_argument(format!(
+                "refusing to index '{}': a system root would walk the entire filesystem — \
+                 pass an absolute path to a specific repository",
+                repo_path.display()
+            )));
+        }
         let state = self.state.clone();
         let force = req.force;
         let with_trigrams = req.with_trigrams;
@@ -807,10 +1308,57 @@ impl NestWeaverDaemon for DaemonService {
 
         let guard = ConnectionGuard::write(&self.state);
         let write_lock = self.state.write_mutex.clone();
+
+        // Cooperative cancellation for the otherwise-uncancelable spawn_blocking
+        // index. A watchdog trips this flag when the index exceeds an overall
+        // timeout OR when the requesting client disconnects; the engine observes
+        // it at the pre-write boundary and aborts without a partial write. The
+        // `done` oneshot lets the watchdog tear down as soon as the index
+        // finishes — otherwise its extra stream sender would keep the client's
+        // response stream open forever.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let index_timeout = std::time::Duration::from_secs(
+            std::env::var("NESTWEAVER_INDEX_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|s| *s > 0)
+                .unwrap_or(1800),
+        );
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let cancel = cancel.clone();
+            let watch_tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(index_timeout) => {
+                        tracing::warn!(?index_timeout, "index exceeded timeout; cancelling");
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ = watch_tx.closed() => {
+                        // Client dropped the progress stream — stop wasting CPU.
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ = done_rx => { /* index finished on its own; nothing to cancel */ }
+                }
+            });
+        }
+        let cancel_for_index = cancel;
+
         tokio::task::spawn_blocking(move || {
             let _write_lock = write_lock.blocking_lock();
             let _guard = guard;
-            let repo_url = format!("file://{}", repo_path.display());
+            // Dropped when the index task ends → fires the watchdog's `done_rx`
+            // so it releases its stream sender and the response can terminate.
+            let _done = done_tx;
+            // Identity: prefer the git origin remote when configured (the
+            // returned URL is only an identity string — never fetched);
+            // fall back to a file:// URL. The engine records the on-disk
+            // location separately as `root_path` and prunes a prior
+            // file://-identified node for the same working tree by uid.
+            // Guard on `.git` at the indexed root: `git config` walks up to
+            // an enclosing repo, and a subdirectory index must not capture
+            // (and collide with) its parent repo's identity.
+            let repo_url = nestweaver_engine::mint_repo_identity(&repo_path);
 
             let indexed_sha = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
@@ -836,7 +1384,7 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            match nestweaver_engine::index_directory_with_store(
+            match nestweaver_engine::index_directory_with_store_cancellable(
                 &state.store,
                 &repo_path,
                 &state.db_path,
@@ -845,6 +1393,7 @@ impl NestWeaverDaemon for DaemonService {
                 &indexed_sha,
                 force,
                 name.as_deref(),
+                &cancel_for_index,
             ) {
                 Ok(result) => {
                     let _ = tx.blocking_send(Ok(IndexProgress {
@@ -863,6 +1412,16 @@ impl NestWeaverDaemon for DaemonService {
 
                     // Tantivy indexes notes/markdown only, not code symbols.
                     // No Tantivy update needed after code repo indexing.
+
+                    // If the request was cancelled after the index committed
+                    // (client disconnect or overall timeout), skip the expensive
+                    // post-index phases — git activity mines up to 500 commits
+                    // and the trigram rebuild scans the whole index — since
+                    // nobody is waiting on the result. The graph itself is
+                    // already indexed; these sidecars rebuild on the next index.
+                    if cancel_for_index.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
 
                     // Git activity (churn sidecar + co-changes) — runs on
                     // the repo, writes sidecar files next to the DB.
@@ -978,6 +1537,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<IndexVaultRequest>,
     ) -> Result<Response<Self::IndexVaultStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
@@ -1079,6 +1643,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MaterializeProjectsRequest>,
     ) -> Result<Response<Self::MaterializeProjectsStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
         let instance_id = if req.instance_id.is_empty() {
@@ -1167,6 +1736,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveVaultRequest>,
     ) -> Result<Response<RemoveVaultResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1205,6 +1779,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveRepoRequest>,
     ) -> Result<Response<RemoveRepoResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1256,6 +1835,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<RemoveProjectRequest>,
     ) -> Result<Response<RemoveProjectResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1297,6 +1881,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<PruneStaleRequest>,
     ) -> Result<Response<PruneStaleResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1305,39 +1894,11 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let mut removed_repos = Vec::new();
             let mut removed_vaults = Vec::new();
 
-            // Prune stale repos (path no longer exists on disk).
-            let repos = state
-                .store
-                .list_repos(None)
-                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
-
-            for repo in &repos {
-                let path = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
-                if !Path::new(path).exists() {
-                    state
-                        .store
-                        .bulk_delete_repo_files_and_symbols(&repo.uid)
-                        .map_err(|e| {
-                            Status::internal(format!(
-                                "bulk_delete_repo_files_and_symbols failed: {e:#}"
-                            ))
-                        })?;
-                    state
-                        .store
-                        .clear_repo_derived_nodes(&repo.uid)
-                        .map_err(|e| {
-                            Status::internal(format!("clear_repo_derived_nodes failed: {e:#}"))
-                        })?;
-                    state
-                        .store
-                        .delete_repo_node(&repo.uid)
-                        .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
-                    removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
-                }
-            }
+            // Prune stale repos (local working tree no longer exists on disk).
+            let removed_repos = prune_stale_repos(&state.store)
+                .map_err(|e| Status::internal(format!("prune stale repos failed: {e:#}")))?;
 
             // Prune stale vaults (root_path no longer exists on disk).
             let vaults = state
@@ -1382,6 +1943,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<MergeInstanceRequest>,
     ) -> Result<Response<MergeInstanceResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -1420,6 +1986,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<PurgeInstanceRequest>,
     ) -> Result<Response<Self::PurgeInstanceStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let req = request.into_inner();
         let instance_id = req.instance_id.clone();
         let state = self.state.clone();
@@ -1502,20 +2073,40 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         _request: Request<ReindexSearchRequest>,
     ) -> Result<Response<ReindexSearchResponse>, Status> {
-        let tantivy = self
-            .state
-            .tantivy
-            .as_ref()
-            .filter(|t| t.has_writer())
-            .ok_or_else(|| {
-                Status::failed_precondition("daemon has no writer-mode Tantivy index")
-            })?;
-        let count = tantivy
-            .reindex_from_store(&self.state.store)
-            .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
-        Ok(Response::new(ReindexSearchResponse {
-            document_count: count as i32,
-        }))
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            _request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
+        // Rebuilding the Tantivy index is a mutation: it must run under the
+        // write gate so it serializes against a `backup`'s sidecar staging
+        // (which copies under the same lock) and is visible to the shutdown
+        // drain / idle timeout via `active_writes` — mirroring `prune_stale`
+        // and `purge_instance`.
+        let _write_lock = self.state.write_mutex.lock().await;
+        let _guard = ConnectionGuard::write(&self.state);
+
+        let state = self.state.clone();
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            let tantivy = state
+                .tantivy
+                .as_ref()
+                .filter(|t| t.has_writer())
+                .ok_or_else(|| {
+                    Status::failed_precondition("daemon has no writer-mode Tantivy index")
+                })?;
+            let count = tantivy
+                .reindex_from_store(&state.store)
+                .map_err(|e| Status::internal(format!("reindex failed: {e:#}")))?;
+            Ok::<_, Status>(ReindexSearchResponse {
+                document_count: count as i32,
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        result.map(Response::new)
     }
 
     // ── Read RPCs — typed hot-path ─────────────────────────────────
@@ -1720,6 +2311,21 @@ impl NestWeaverDaemon for DaemonService {
         if req.recency_half_life_days > 0.0 {
             args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
         }
+        if !req.response_format.is_empty() {
+            args["response_format"] = serde_json::json!(req.response_format);
+        }
+        if !req.repos.is_empty() {
+            args["repos"] = serde_json::json!(req.repos);
+        }
+        if !req.path_prefix.is_empty() {
+            args["path_prefix"] = serde_json::json!(req.path_prefix);
+        }
+        if !req.tags.is_empty() {
+            args["tags"] = serde_json::json!(req.tags);
+        }
+        if !req.exclude_tags.is_empty() {
+            args["exclude_tags"] = serde_json::json!(req.exclude_tags);
+        }
 
         let value = self.dispatch_tool_json("project_context", args).await?;
         let result_json = serde_json::to_string(&value)
@@ -1792,6 +2398,14 @@ impl NestWeaverDaemon for DaemonService {
         let args = serde_json::json!({});
         let value = self.dispatch_tool_json("brain_status", args).await?;
 
+        let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
+        let indexing_repo = if indexing_active {
+            self.state.indexing_repo.read().await.clone()
+        } else {
+            String::new()
+        };
+        let queue_depth = self.state.indexing_queue_depth.load(Ordering::Relaxed) as i32;
+
         Ok(Response::new(BrainStatusResponse {
             vault_count: value
                 .get("vault_count")
@@ -1814,6 +2428,9 @@ impl NestWeaverDaemon for DaemonService {
                 .get("tantivy_doc_count")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0) as i32,
+            indexing_active,
+            indexing_repo,
+            queue_depth,
         }))
     }
 
@@ -1841,7 +2458,101 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "brain_status")
+        let req = r.into_inner();
+        let resp = self
+            .dispatch_json_tool("brain_status", &req.args_json)
+            .await?;
+        // Inject server-side indexing status into the JSON response so
+        // AI agents see it via the MCP tool path as well.
+        let mut json_resp = resp.into_inner();
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
+            value["server_mode"] = serde_json::json!(self.state.server_mode);
+            let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
+            value["indexing_active"] = serde_json::json!(indexing_active);
+            if indexing_active {
+                value["indexing_repo"] = serde_json::json!(*self.state.indexing_repo.read().await);
+            }
+            value["queue_depth"] =
+                serde_json::json!(self.state.indexing_queue_depth.load(Ordering::Relaxed));
+            if let Ok(s) = serde_json::to_string(&value) {
+                json_resp.result_json = s;
+            }
+        }
+        Ok(Response::new(json_resp))
+    }
+
+    async fn repo_states(
+        &self,
+        _request: Request<RepoStatesRequest>,
+    ) -> Result<Response<RepoStatesResponse>, Status> {
+        let _guard = ConnectionGuard::read(&self.state);
+        let state = self.state.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let repos = state
+                .store
+                .list_repos(None)
+                .map_err(|e| Status::internal(format!("list_repos failed: {e:#}")))?;
+
+            let repo_states: Vec<RepoState> = repos
+                .into_iter()
+                .map(|r| {
+                    let symbol_count = state
+                        .store
+                        .symbol_names_by_repo(&r.uid)
+                        .map(|v| v.len() as i64)
+                        .unwrap_or(0);
+                    RepoState {
+                        repo_uid: r.uid,
+                        repo_url: r.url.clone(),
+                        repo_name: r.name.clone().unwrap_or_else(|| {
+                            nestweaver_schema::repo_name(&r.url).unwrap_or_else(|| r.url.clone())
+                        }),
+                        indexed_sha: r.indexed_sha,
+                        symbol_count,
+                    }
+                })
+                .collect();
+
+            Ok::<_, Status>(RepoStatesResponse { repos: repo_states })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+
+        result.map(Response::new)
+    }
+
+    // ── Phase 4 — typed RPCs ───────────────────────────────────────
+
+    async fn flow_trace_continue(
+        &self,
+        request: Request<FlowTraceContinueRequest>,
+    ) -> Result<Response<FlowTraceContinueResponse>, Status> {
+        let _guard = ConnectionGuard::read(&self.state);
+        let req = request.into_inner();
+        let state = self.state.clone();
+
+        let result =
+            tokio::task::spawn_blocking(move || flow_trace_continue_impl(&state.store, req))
+                .await
+                .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
+
+        result.map(Response::new)
+    }
+
+    async fn impact_analysis(
+        &self,
+        request: Request<ImpactAnalysisRequest>,
+    ) -> Result<Response<ImpactAnalysisResponse>, Status> {
+        let _guard = ConnectionGuard::read(&self.state);
+        let req = request.into_inner();
+        let state = self.state.clone();
+
+        let result = tokio::task::spawn_blocking(move || impact_analysis_impl(&state.store, req))
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
+
+        result.map(Response::new)
     }
 
     // ── Read RPCs — JSON pass-through ───────────────────────────────
@@ -2026,7 +2737,62 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "set_extension")
+        // set_extension is a mutating tool — require admin, matching json_rpc!.
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            r.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied(
+                "tool 'set_extension' is mutating and requires the admin token",
+            ));
+        }
+        // Read-modify-write of the `.extensions.json` sidecar, which is part of
+        // the backup sidecar set. It must run under the write gate — write_mutex
+        // + ConnectionGuard::write — so it serializes against a `backup`'s
+        // sidecar staging (which copies under the same lock), is visible to the
+        // shutdown drain / idle timeout, and two concurrent callers cannot lose
+        // updates (last-writer-wins). This is the single gated write path: the
+        // MCP `tool_set_extension` routes here rather than mutating directly.
+        let _write_lock = self.state.write_mutex.lock().await;
+        let _guard = ConnectionGuard::write(&self.state);
+
+        let req = r.into_inner();
+        let db_path = self.state.db_path.clone();
+
+        #[allow(clippy::result_large_err)]
+        let result = tokio::task::spawn_blocking(move || {
+            let args: serde_json::Value = serde_json::from_str(&req.args_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
+            let uid = args
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Status::invalid_argument("'uid' must be a string"))?;
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Status::invalid_argument("'key' must be a string"))?;
+            let value = args
+                .get("value")
+                .cloned()
+                .ok_or_else(|| Status::invalid_argument("'value' is required"))?;
+
+            let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
+            nestweaver_engine::extensions::set_property(&mut store, uid, key, value.clone());
+            nestweaver_engine::extensions::save_extensions(&db_path, &store)
+                .map_err(|e| Status::internal(format!("save_extensions failed: {e:#}")))?;
+
+            let result_json = serde_json::json!({
+                "uid": uid,
+                "key": key,
+                "value": value,
+                "status": "saved",
+            })
+            .to_string();
+            Ok::<_, Status>(JsonResponse { result_json })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+
+        result.map(Response::new)
     }
 
     async fn query_extensions(
@@ -2045,8 +2811,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2070,8 +2836,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2095,8 +2861,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let dim = state
@@ -2119,8 +2885,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let instance = args.get("instance").and_then(|v| v.as_str());
@@ -2144,8 +2910,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2174,8 +2940,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let projects = state
@@ -2198,8 +2964,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -2222,15 +2988,17 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let name_or_uid = args
                 .get("name_or_uid")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let lookup = nestweaver_engine::lookup_symbol(&state.store, name_or_uid)
+            let instance = args.get("instance").and_then(|v| v.as_str());
+            // An unknown --instance surfaces here with a message listing valid instances.
+            let lookup = nestweaver_engine::lookup_symbol(&state.store, name_or_uid, instance)
                 .map_err(|e| Status::internal(format!("lookup_symbol failed: {e:#}")))?;
             // Serialize the LookupResult as a tagged JSON value.
             let value = match lookup {
@@ -2262,8 +3030,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let token_budget = args
@@ -2292,8 +3060,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let _args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let _args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let cache_path = state.db_path.with_extension("manifests.json");
@@ -2316,8 +3084,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let vault_path = args
@@ -2351,8 +3119,8 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value =
-            serde_json::from_str(&r.into_inner().args_json).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
             let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
@@ -2393,6 +3161,11 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         request: Request<EmbedRequest>,
     ) -> Result<Response<EmbedResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
@@ -2540,20 +3313,834 @@ impl NestWeaverDaemon for DaemonService {
 ///
 /// `idle_timeout` controls how long the daemon stays alive with no
 /// active requests before self-terminating. Pass `None` to disable.
+/// Options for TCP server mode (passed when `--server` is set).
+#[derive(Debug, Clone)]
+pub struct ServerOpts {
+    /// TCP bind address, e.g. `"127.0.0.1:9378"` or `"127.0.0.1:0"` for OS-assigned.
+    pub bind_addr: String,
+    /// When set, the actual bound port is written here (useful for tests with port 0).
+    pub port_file: Option<PathBuf>,
+    /// Optional bearer token for TCP authentication. When set, TCP clients
+    /// must send `Authorization: Bearer <token>` or receive UNAUTHENTICATED.
+    pub auth_token: Option<String>,
+    /// Path to a PEM-encoded TLS certificate. When both `tls_cert` and
+    /// `tls_key` are set, the TCP listener uses TLS via rustls and plain
+    /// TCP connections are refused.
+    pub tls_cert: Option<PathBuf>,
+    /// Path to a PEM-encoded TLS private key.
+    pub tls_key: Option<PathBuf>,
+    /// Webhook HMAC secret for verifying push event signatures.
+    pub webhook_secret: Option<String>,
+    /// Previous webhook secret, checked as fallback during secret rotation.
+    pub webhook_secret_old: Option<String>,
+    /// Admin token for admin API endpoints (separate from query auth token).
+    pub admin_token: Option<String>,
+    /// When set, boot as a read-only snapshot replica: materialize this snapshot
+    /// directory into a private working copy, open it read-only, reject write
+    /// RPCs, and never start the write machinery (flock/worker/scheduler/webhook).
+    pub snapshot: Option<PathBuf>,
+    /// ACME (Let's Encrypt) domain. When set, TLS is auto-provisioned at runtime
+    /// via TLS-ALPN-01 (opt-in; default off). Counts as TLS for the non-loopback
+    /// bind gate. Requires the `acme` build feature to actually provision.
+    pub acme_domain: Option<String>,
+    /// Contact email for the ACME account (optional, recommended for expiry
+    /// notifications).
+    pub acme_email: Option<String>,
+    /// Use the Let's Encrypt STAGING directory (untrusted certs, high rate
+    /// limits). Defaults to true — production issuance is an explicit opt-in to
+    /// avoid rate-limit bans during setup / on a launchd respawn loop.
+    pub acme_staging: bool,
+}
+
+/// Minimum byte length for auth/admin tokens supplied via [`ServerOpts`].
+/// Short tokens are trivially brute-forceable, so startup rejects them.
+const MIN_TOKEN_LEN: usize = 32;
+
+/// Minimum byte length for webhook HMAC secrets supplied via [`ServerOpts`].
+/// Webhook secrets key an HMAC over the request body rather than acting as a
+/// bearer token, so the bar is lower than [`MIN_TOKEN_LEN`], but trivially
+/// short secrets still weaken the signature, so startup rejects them.
+const MIN_WEBHOOK_SECRET_LEN: usize = 16;
+
+/// Reject any present auth/admin token shorter than [`MIN_TOKEN_LEN`] bytes.
+/// `None` tokens (auth disabled) are accepted. The error names which token is
+/// too short and the required minimum.
+fn validate_token_lengths(
+    auth_token: &Option<String>,
+    admin_token: &Option<String>,
+) -> anyhow::Result<()> {
+    for (name, token) in [("auth", auth_token), ("admin", admin_token)] {
+        if let Some(t) = token
+            && t.len() < MIN_TOKEN_LEN
+        {
+            anyhow::bail!(
+                "{name} token is too short ({} bytes); minimum is {MIN_TOKEN_LEN} bytes",
+                t.len()
+            );
+        }
+    }
+    // An admin token WITHOUT a query (auth) token is a footgun that silently
+    // disables authentication: the auth layer (McpHttpState::with_auth, the gRPC
+    // interceptor's expected_token) is only installed when the query token is set,
+    // and the mutating-tool gate keys off `auth_token.is_some()` — so admin-only
+    // leaves BOTH reads and every mutating tool completely uncredentialed. (A
+    // non-loopback bind is already refused without a query token; this catches the
+    // loopback case where the operator believes the server is locked down.)
+    if admin_token.is_some() && auth_token.is_none() {
+        anyhow::bail!(
+            "--admin-token requires --auth-token: an admin token alone leaves the \
+             server unauthenticated, because the auth layer is only enabled when a \
+             query token is set. Set --auth-token as well (a different value)."
+        );
+    }
+    // The admin token must differ from the query (auth) token. Admin privilege is
+    // granted on an admin-token match, so an identical query token would silently
+    // make every query-token holder an admin.
+    if let (Some(auth), Some(admin)) = (auth_token, admin_token)
+        && auth == admin
+    {
+        anyhow::bail!(
+            "admin token must differ from the query (auth) token; identical tokens \
+             grant admin access to every query-token holder"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to index a path that is almost certainly a mistake — a system root or
+/// the user's home directory — which would recursively walk the entire disk
+/// (pegging every core, hammering TCC-protected paths, and looping on symlinks
+/// like `/dev/fd` and Time Machine). A repository to index is always a specific
+/// project directory, never a top-level root. This guards the case where a
+/// detached daemon (whose CWD is `/`) receives a relative or `.` repo path.
+fn is_unsafe_index_root(path: &std::path::Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return true;
+    }
+    // Case-insensitive, exact-match denylist. macOS APFS is case-insensitive by
+    // default and `canonicalize` does NOT normalize case, so wrong-case roots
+    // (`/users`, `/SYSTEM`) would slip past a case-sensitive match.
+    // `/System/Volumes/Data` is the real data-volume firmlink root on modern
+    // macOS — indexing it (or `/System/Volumes`) walks the entire disk.
+    let p = path.to_string_lossy();
+    let p = p.trim_end_matches('/').to_ascii_lowercase();
+    if p.is_empty() {
+        return true; // "" and "/"
+    }
+    let dangerous = [
+        "/users",
+        "/system",
+        "/system/volumes",
+        "/system/volumes/data",
+        "/library",
+        "/private",
+        "/var",
+        "/etc",
+        "/home",
+        "/opt",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/tmp",
+        "/volumes",
+        "/dev",
+    ];
+    if dangerous.iter().any(|d| p == *d) {
+        return true;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if p == home.trim_end_matches('/').to_ascii_lowercase() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The daemon is idle only when there is no active read/write AND no index job
+/// in flight. Index jobs bump `indexing_active` (not `active_writes`), so an
+/// idle-timeout check that ignores it could fire mid-index — the same footgun
+/// the shutdown drain already guards against.
+fn is_idle(active_readwrite: u32, indexing_active: bool) -> bool {
+    active_readwrite == 0 && !indexing_active
+}
+
+/// gRPC methods that only READ graph/store state. On a read-only snapshot
+/// replica every method NOT in this set is rejected at the single
+/// [`ReadOnlyGuard`] chokepoint (default-deny) — mirroring how PostgreSQL hot
+/// standby, Datasette `--immutable`, and LiteFS reject the entire write class
+/// at one node-level gate instead of a per-operation allowlist that silently
+/// misses a newly-added mutating path (the exact bug this replaces).
+///
+/// Keep this in sync with the proto service definition: the
+/// `read_only_method_partition_is_exhaustive` test fails if a new RPC is added
+/// without classifying it here or as mutating, forcing a deliberate
+/// (fail-closed) read/write decision.
+const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
+    "AffectedTests",
+    "BlastRadius",
+    "BrainBrokenLinks",
+    "BrainDiff",
+    "BrainDocStats",
+    "BrainGuide",
+    "BrainMemoryLint",
+    "BrainMemoryRelated",
+    "BrainOrphanDocuments",
+    "BrainStatus",
+    "BrainStatusJson",
+    "BrainTagGraph",
+    "BrainTopicClusters",
+    "BridgeNodes",
+    "Clusters",
+    "ContractDrift",
+    "CountPatterns",
+    "CrossRepoContracts",
+    "DeadCode",
+    "DetectChanges",
+    "DetectImplicitProjectsJson",
+    "EmbeddingDimension",
+    "ExportGraph",
+    "FlowTrace",
+    "FlowTraceContinue",
+    "GetBacklinks",
+    "GetContext",
+    "GetNote",
+    "GetProjectContext",
+    "GetSummary",
+    "HealthCheck",
+    "HubNodes",
+    "Impact",
+    "ImpactAnalysis",
+    "Investigate",
+    "InvestigateExpand",
+    "InvestigateHydrate",
+    "ListProjectsJson",
+    "ListReposJson",
+    "ListServicesJson",
+    "ListVaultsJson",
+    "PrImpactJson",
+    "QueryExtensions",
+    "ReadSymbols",
+    "RegexSearch",
+    "RepoMapJson",
+    "RepoStates",
+    "Search",
+    "SearchSymbols",
+    "ServeUi",
+    "ServiceSummaryJson",
+    "Shutdown",
+    "StaleCheck",
+    "StopWatch",
+    "SuggestLinksJson",
+    "SymbolLookup",
+];
+
+/// Decide whether a gRPC request must be rejected because this daemon serves a
+/// read-only snapshot replica. `path` is the full gRPC path
+/// (`/package.Service/Method`). Default-deny: any method not known to be a pure
+/// read is rejected with `FAILED_PRECONDITION` (a permanent condition for this
+/// daemon, not a transient error the client should retry).
+fn read_only_rejection(read_only: bool, path: &str) -> Option<Status> {
+    if !read_only {
+        return None;
+    }
+    let method = path.rsplit('/').next().unwrap_or(path);
+    if READ_ONLY_ALLOWED_METHODS.contains(&method) {
+        None
+    } else {
+        Some(Status::failed_precondition(format!(
+            "this daemon serves a read-only snapshot replica; {method} is not available"
+        )))
+    }
+}
+
+/// Single read-only enforcement chokepoint for the whole gRPC surface. Wraps
+/// the generated `NestWeaverDaemonServer` and, on a read-only replica, rejects
+/// every mutating RPC (typed hot-path handlers AND `json_rpc!`-dispatched ones
+/// alike) at the transport layer BEFORE it reaches a handler — so no mutating
+/// handler can do partial work and surface a mid-stream `internal` error, and
+/// the "replica rejects writes with FAILED_PRECONDITION" contract holds for
+/// ALL mutating methods. This guard is the ONLY read-only enforcement point:
+/// the per-handler `reject_if_read_only` calls it superseded have been
+/// removed. On a read-write daemon it is a transparent
+/// pass-through. Applied once to the shared service so BOTH the TCP and UDS
+/// transports inherit the same gate.
+#[derive(Clone)]
+struct ReadOnlyGuard<S> {
+    inner: S,
+    read_only: bool,
+}
+
+impl<S> ReadOnlyGuard<S> {
+    fn new(read_only: bool, inner: S) -> Self {
+        Self { inner, read_only }
+    }
+}
+
+impl<S, ReqBody> tower::Service<http::Request<ReqBody>> for ReadOnlyGuard<S>
+where
+    S: tower::Service<http::Request<ReqBody>, Response = http::Response<tonic::body::Body>>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        if let Some(status) = read_only_rejection(self.read_only, req.uri().path()) {
+            // Trailers-only gRPC error response carrying grpc-status =
+            // FAILED_PRECONDITION; identical shape to what tonic emits for an
+            // interceptor-level rejection.
+            let resp = status.into_http::<tonic::body::Body>();
+            return Box::pin(std::future::ready(Ok(resp)));
+        }
+        Box::pin(self.inner.call(req))
+    }
+}
+
+impl<S: tonic::server::NamedService> tonic::server::NamedService for ReadOnlyGuard<S> {
+    const NAME: &'static str = S::NAME;
+}
+
+/// Whether to mount the `/webhook` endpoint. A read-only replica must NEVER
+/// accept a webhook: its worker pool and poll scheduler are gated out, so an
+/// accepted push would enqueue an index job into a queue that no worker drains
+/// — a silent blackhole with unbounded growth. Only a read-write daemon with a
+/// configured secret mounts it.
+fn replica_mounts_webhook(read_only: bool, webhook_secret_configured: bool) -> bool {
+    !read_only && webhook_secret_configured
+}
+
+/// Whether to enqueue config-declared repos for initial indexing at startup.
+/// A read-only replica serves a pre-built snapshot and has no worker to index,
+/// so it must not enqueue anything (the same blackhole as the webhook path).
+fn replica_enqueues_config_repos(read_only: bool) -> bool {
+    !read_only
+}
+
+/// Whether to mount the admin write API (`/admin/api/*` + device-flow auth).
+/// A read-only replica exposes no mutating admin surface (add/remove repo,
+/// reindex, reload, drain/resume, dead-letter retry); it must not mount these.
+/// `/metrics` is mounted separately and stays available for replica
+/// monitoring.
+fn replica_mounts_admin_api(read_only: bool, admin_token_configured: bool) -> bool {
+    !read_only && admin_token_configured
+}
+
+/// Enforce the bind-scope security invariants for a server-mode listener:
+/// a non-loopback bind must be both authenticated (`--auth-token`) and
+/// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
+/// that cannot be parsed as a socket address (e.g. `localhost:9378`), retain
+/// the pre-existing auth-only requirement. Returns the first violated invariant.
+fn validate_bind_security(
+    bind_addr: &str,
+    auth_token: &Option<String>,
+    tls_cert: &Option<PathBuf>,
+    tls_key: &Option<PathBuf>,
+    acme_enabled: bool,
+) -> anyhow::Result<()> {
+    // ACME (Let's Encrypt) provisions a publicly-trusted cert at runtime, so an
+    // ACME-enabled bind is encrypted even without a static --tls-cert/--tls-key.
+    let tls_enabled = (tls_cert.is_some() && tls_key.is_some()) || acme_enabled;
+    match bind_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_loopback() => { /* safe — loopback is process-local */ }
+        Ok(addr) => {
+            // Non-loopback bind: the listener is reachable from the network, so it
+            // must be both authenticated and encrypted.
+            if auth_token.is_none() {
+                anyhow::bail!(
+                    "Cannot bind to non-loopback address {addr} without --auth-token; \
+                     the server would be fully open to the network"
+                );
+            }
+            if !tls_enabled {
+                anyhow::bail!(
+                    "Cannot bind to non-loopback address {addr} without TLS; bearer \
+                     tokens and source data would be sent in cleartext. Provide \
+                     --tls-cert and --tls-key (or bind to a loopback address)."
+                );
+            }
+        }
+        Err(_) => {
+            // Bind string isn't a socket address (e.g. `localhost:9378`); we cannot
+            // confirm it is loopback. Preserve the auth-only requirement.
+            if auth_token.is_none() {
+                anyhow::bail!(
+                    "Cannot determine if bind address '{bind_addr}' is loopback. \
+                     Use --auth-token or specify an IP address."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an `--acme-domain` request can ACTUALLY provide TLS in THIS build.
+/// ACME is feature-gated; a binary compiled without `acme` cannot provision a
+/// certificate, so an ACME request must NOT count as TLS for the bind-security
+/// gate — otherwise a non-loopback bind would pass the gate and then serve
+/// cleartext. Returns `true` only when a domain was requested AND the `acme`
+/// feature is compiled in.
+fn acme_provides_tls(acme_domain_present: bool) -> bool {
+    acme_domain_present && cfg!(feature = "acme")
+}
+
+/// Whether `bind_addr` resolves to a loopback socket address. A string we
+/// cannot parse as a `SocketAddr` (e.g. `localhost:9378`) is treated as
+/// NON-loopback — the safe default, so an ambiguous bind is never assumed to be
+/// process-local when deciding whether cleartext is acceptable.
+///
+/// Only wired into the live path under the `acme` feature; always exercised by
+/// tests, so `dead_code` is allowed only when ACME is compiled out.
+#[cfg_attr(not(feature = "acme"), allow(dead_code))]
+fn bind_addr_is_loopback(bind_addr: &str) -> bool {
+    matches!(bind_addr.parse::<std::net::SocketAddr>(), Ok(addr) if addr.ip().is_loopback())
+}
+
+/// Private per-replica working directory for a materialized snapshot.
+///
+/// Keyed on `instance_id` (the SHA-256-derived id of the canonical `--db`
+/// path — see [`lifecycle::instance_id_from_db_path`]) rather than only on the
+/// parent directory. Two co-located replicas started with distinct `--db`
+/// paths under a shared parent (`/data/a.lbug` + `/data/b.lbug`) get distinct
+/// instance ids and therefore distinct working dirs, so one replica's
+/// `materialize_snapshot` (an in-place `fs::copy` that truncates the target)
+/// can never clobber a sibling's open, running working copy. This mirrors how
+/// every read-replica system (LiteFS per-node dir, a PostgreSQL standby's own
+/// data dir, Litestream) gives each replica private local state; the only
+/// shared artifact is the immutable snapshot.
+///
+/// Two replicas sharing the *same* `--db` on one host collapse to the same
+/// `instance_id` and thus the same `replica-work-<id>`; that duplicate is
+/// rejected by [`claim_instance_lock`], which is acquired **before**
+/// materialization — so the second boot never truncates a live sibling's copy.
+/// (Horizontal scale is still separate hosts/containers.)
+fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
+    let name = format!("replica-work-{instance_id}");
+    db_path
+        .parent()
+        .map(|p| p.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Claim the exclusive per-instance lock — the pidfile flock that makes an
+/// `instance_id` single-owner on this host — and return the pidfile handle
+/// whose lifetime holds the lock (dropping it releases the lock). `None` in
+/// fork mode, where `daemonize2` already holds the flock (acquired pre-fork).
+///
+/// Acquired **before** snapshot materialization so a duplicate replica started
+/// with the identical `--db` (hence identical `instance_id` and
+/// `replica-work-<id>`) is rejected here, before its `materialize_snapshot`
+/// `fs::copy` can truncate a live sibling's open working copy. Two opens of the
+/// same pidfile hold independent open-file descriptions, so `flock(LOCK_EX)`
+/// from a second process fails even though the first holder is also us-shaped.
+fn claim_instance_lock(instance_id: &str) -> Result<Option<std::fs::File>, anyhow::Error> {
+    // Fork mode: the flock is already held by daemonize2 (acquired pre-fork).
+    if std::env::var("NESTWEAVER_DAEMON_FORK").is_ok() {
+        return Ok(None);
+    }
+    // The pidfile lives in the per-instance runtime dir (created on demand).
+    Ok(Some(claim_pidfile_lock(&lifecycle::pidfile_path(
+        instance_id,
+    ))?))
+}
+
+/// Create `pid_path` (and its parent dir), write our pid, and take an exclusive
+/// non-blocking `flock`, returning the handle whose lifetime holds the lock.
+/// Fails if another open file description already holds the lock. Split out from
+/// [`claim_instance_lock`] so the flock semantics are unit-testable against a
+/// plain temp path, without touching the per-instance runtime dir or env.
+fn claim_pidfile_lock(pid_path: &Path) -> Result<std::fs::File, anyhow::Error> {
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create runtime dir: {}", parent.display()))?;
+    }
+
+    let pid_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(pid_path)
+        .with_context(|| format!("open pidfile: {}", pid_path.display()))?;
+
+    {
+        use std::io::Write;
+        write!(&pid_file, "{}", std::process::id())
+            .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = pid_file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            anyhow::bail!("Another daemon instance is already running (pidfile locked)");
+        }
+    }
+
+    Ok(pid_file)
+}
+
+/// Build a rustls TLS acceptor backed by an in-memory self-signed certificate
+/// for the given SANs. Used both as the ACME provisioning-failure fallback
+/// (encryption preserved even though the cert is untrusted) and as a hermetic
+/// acceptor in tests. Advertises `h2` + `http/1.1` so gRPC and MCP HTTP both
+/// negotiate over it. Does NO network I/O.
+#[cfg_attr(not(feature = "acme"), allow(dead_code))]
+fn build_self_signed_acceptor(
+    server_names: &[String],
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    // ACME's directory client and rustls both need an installed default crypto
+    // provider; installing ring here is idempotent with the manual/ACME paths.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Short-lived (self-signed, interim only); ACME's `drive()` swaps in a
+    // trusted cert on the next successful renewal without a restart.
+    let bundle = nestweaver_engine::tls::generate_tls_bundle(server_names, 397, false)
+        .context("generate interim self-signed certificate")?;
+
+    let certs = rustls_pemfile::certs(&mut bundle.server_cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parse interim self-signed certificate PEM")?;
+    let key = rustls_pemfile::private_key(&mut bundle.server_key_pem.as_bytes())
+        .context("parse interim self-signed key PEM")?
+        .context("no private key in generated self-signed bundle")?;
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("configure rustls protocol versions for self-signed fallback")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("build rustls ServerConfig for self-signed fallback")?;
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+        server_config,
+    )))
+}
+
+/// Decide the TLS acceptor after ACME bootstrap has FAILED. This is the
+/// security-critical fallback: a public (non-loopback) listener must NEVER be
+/// downgraded to cleartext because provisioning failed.
+///
+/// - **Loopback bind** → `Ok(None)`: plaintext is acceptable (process-local),
+///   matching the pre-existing loopback fast path.
+/// - **Non-loopback bind** → `Ok(Some(acceptor))`: an interim self-signed TLS
+///   acceptor so bearer tokens and source stay encrypted (the client sees a
+///   trust error, but nothing travels in the clear). ACME keeps retrying in the
+///   background via `drive()` and swaps in a trusted cert without a restart.
+/// - If even the self-signed acceptor cannot be built on a non-loopback bind,
+///   the error propagates so the caller **fails closed** (refuses to bind)
+///   rather than serving plaintext.
+///
+/// No mature ACME server downgrades to plaintext on failure; this mirrors
+/// CertMagic/Caddy and cert-manager behaviour.
+#[cfg_attr(not(feature = "acme"), allow(dead_code))]
+fn acme_failure_fallback_acceptor(
+    domain: &str,
+    bind_is_loopback: bool,
+) -> anyhow::Result<Option<tokio_rustls::TlsAcceptor>> {
+    if bind_is_loopback {
+        return Ok(None);
+    }
+    Ok(Some(build_self_signed_acceptor(&[domain.to_string()])?))
+}
+
+/// Per-connection TLS handshake budget. A client that opens a TCP connection
+/// but never sends a ClientHello must not stall the accept loop, so each
+/// handshake runs in its own task under this timeout (B3 — serial-handshake DoS).
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run a single TLS handshake under [`TLS_HANDSHAKE_TIMEOUT`].
+///
+/// - `Ok(Some(tls))` — handshake completed.
+/// - `Ok(None)` — the handshake timed out; the caller drops the connection.
+/// - `Err(e)` — the handshake failed (bad ClientHello, etc.).
+///
+/// This isolates a slow/stalled peer to its own task+timeout so it cannot block
+/// new connections on a public listener.
+async fn accept_tls_with_timeout(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: tokio::net::TcpStream,
+    timeout: Duration,
+) -> std::io::Result<Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>> {
+    match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+        Ok(Ok(tls)) => Ok(Some(tls)),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Ok(None),
+    }
+}
+
+/// Ceiling on TLS handshakes in flight at once per public listener. The
+/// per-connection handshake tasks (B3) each hold a `TcpStream` + acceptor Arc
+/// for up to [`TLS_HANDSHAKE_TIMEOUT`]; without a cap, a flood of
+/// connecting-but-silent clients would spawn unbounded tasks and exhaust
+/// memory/FDs. A semaphore with this many permits backpressures the accept
+/// loop instead.
+const MAX_INFLIGHT_HANDSHAKES: usize = 256;
+
+/// Run one TLS handshake while holding `permit` for its whole duration, so the
+/// caller's semaphore bounds how many handshakes run concurrently (the permit
+/// is released when this future completes — on success, timeout, or error). A
+/// completed stream is forwarded to `tx`; a timeout/error drops the connection.
+async fn drive_capped_handshake(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    acceptor: tokio_rustls::TlsAcceptor,
+    stream: tokio::net::TcpStream,
+    timeout: Duration,
+    tx: tokio::sync::mpsc::Sender<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    label: &'static str,
+) {
+    // Held until this future returns, then dropped → permit returned to the pool.
+    let _permit = permit;
+    match accept_tls_with_timeout(&acceptor, stream, timeout).await {
+        Ok(Some(tls)) => {
+            let _ = tx.send(tls).await;
+        }
+        Ok(None) => {
+            tracing::debug!("{label} TLS handshake timed out; dropping connection")
+        }
+        Err(e) => tracing::debug!("{label} TLS handshake failed: {e}"),
+    }
+}
+
+/// Reject any present webhook secret shorter than [`MIN_WEBHOOK_SECRET_LEN`]
+/// bytes. Both the active secret and the rotation fallback are checked. `None`
+/// secrets (webhook signature verification disabled) are accepted. The error
+/// names which secret is too short and the required minimum.
+fn validate_webhook_secret_lengths(
+    webhook_secret: &Option<String>,
+    webhook_secret_old: &Option<String>,
+) -> anyhow::Result<()> {
+    for (name, secret) in [
+        ("webhook", webhook_secret),
+        ("webhook-old", webhook_secret_old),
+    ] {
+        if let Some(s) = secret
+            && s.len() < MIN_WEBHOOK_SECRET_LEN
+        {
+            anyhow::bail!(
+                "{name} secret is too short ({} bytes); minimum is {MIN_WEBHOOK_SECRET_LEN} bytes",
+                s.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build the per-repo index-strategy map consumed by
+/// [`nestweaver_engine::worker::WorkerPool::with_repo_types`]. Keyed by the same
+/// [`canonical_repo_id`](nestweaver_engine::jobs::canonical_repo_id) the worker
+/// uses for lookup so vault repos index as markdown; untyped repos default to
+/// [`RepoType::Code`](nestweaver_engine::RepoType::Code).
+fn build_repo_types(
+    repos: &[nestweaver_engine::RepoConfig],
+) -> std::collections::HashMap<String, nestweaver_engine::RepoType> {
+    repos
+        .iter()
+        .map(|repo| {
+            (
+                nestweaver_engine::jobs::canonical_repo_id(&repo.url),
+                repo.repo_type
+                    .clone()
+                    .unwrap_or(nestweaver_engine::RepoType::Code),
+            )
+        })
+        .collect()
+}
+
+/// Hard upper bound on client/peer-supplied traversal depth, enforced in ALL modes.
+const HARD_MAX_DEPTH: u64 = 64;
+
+/// Clamp the `depth`/`max_depth` args at [`HARD_MAX_DEPTH`] before dispatch. A huge depth can
+/// overflow the stack in the recursive trace builders (build_flow_tree / walk_trace) or run the
+/// graph away in impact BFS. Values under the cap, missing keys, and non-numeric values are
+/// left untouched.
+fn clamp_traversal_depth(args: &mut serde_json::Value) {
+    for key in ["depth", "max_depth"] {
+        if let Some(n) = args.get(key).and_then(|v| v.as_u64())
+            && n > HARD_MAX_DEPTH
+        {
+            args[key] = serde_json::json!(HARD_MAX_DEPTH);
+        }
+    }
+}
+
+#[cfg(test)]
+mod depth_clamp_tests {
+    use super::*;
+
+    #[test]
+    fn clamps_huge_depth_leaves_small_and_nonnumeric_alone() {
+        let mut a = serde_json::json!({ "depth": 2_000_000_000u64, "max_depth": 5, "other": 1 });
+        clamp_traversal_depth(&mut a);
+        assert_eq!(a["depth"], serde_json::json!(HARD_MAX_DEPTH));
+        assert_eq!(a["max_depth"], serde_json::json!(5)); // under the cap → untouched
+        assert_eq!(a["other"], serde_json::json!(1)); // unrelated key → untouched
+
+        let mut b = serde_json::json!({ "depth": "not-a-number" });
+        clamp_traversal_depth(&mut b);
+        assert_eq!(b["depth"], serde_json::json!("not-a-number"));
+    }
+}
+
+/// Load the embedding model into `state.embed_model`. MUST be called on the daemon's main
+/// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
+/// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
+/// thread (there it silently falls back to CPU). Called AFTER the UDS server is spawned so a
+/// cold-cache download can't delay the socket bind; the download is bounded by a 180s prefetch
+/// timeout so it can't hang. During the load, non-semantic RPCs are served normally and
+/// semantic search returns "model not loaded" until it completes.
+#[cfg(feature = "embed")]
+async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
+    #[cfg(target_os = "macos")]
+    {
+        // MTLCompilerService is only reachable from the process main thread;
+        // loading elsewhere silently falls back to CPU embeddings.
+        let on_main = unsafe { libc::pthread_main_np() } != 0;
+        debug_assert!(
+            on_main,
+            "load_embedding_model must run on the main (block_on) thread"
+        );
+        if !on_main {
+            tracing::warn!(
+                "embedding model loading off the main thread; Metal GPU will be unavailable"
+            );
+        }
+    }
+    let mut cfg = state
+        .instance_cfg
+        .as_ref()
+        .map(|c| c.embedding.clone())
+        .unwrap_or_default();
+    // The DB records which model generated the stored embeddings (set on embed). Load THAT
+    // model regardless of the compiled default or config — it must match the stored vectors,
+    // or semantic search is disabled on a dimension mismatch. This lets the shipped default
+    // stay light while a given instance uses whatever it was actually embedded with.
+    if let Ok(Some((stored_model_id, _))) = state.store.get_embedding_metadata()
+        && !stored_model_id.is_empty()
+    {
+        if stored_model_id != cfg.model_id {
+            tracing::info!(
+                stored = %stored_model_id,
+                configured = %cfg.model_id,
+                "Loading the embedding model recorded in the DB (matches stored embeddings)"
+            );
+        }
+        cfg.model_id = stored_model_id;
+    }
+    // Expand tilde in cache_dir using the home directory.
+    let cache_dir = if cfg.cache_dir.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(&cfg.cache_dir[2..])
+        } else {
+            std::path::PathBuf::from(&cfg.cache_dir)
+        }
+    } else {
+        std::path::PathBuf::from(&cfg.cache_dir)
+    };
+    let config = nestweaver_embed::EmbedConfig {
+        model_id: cfg.model_id.clone(),
+        cache_dir,
+        external_endpoint: cfg.external_endpoint.clone(),
+        external_model: cfg.external_model.clone(),
+    };
+    // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't hang the
+    // load. On a warm cache this is instant; only the local-model path downloads.
+    //
+    // NOTE on cancellation: when the 180s timeout fires, the `spawn_blocking` download keeps
+    // running detached — hf-hub's blocking (ureq) `repo.get` exposes no abort hook, and the
+    // dominant cost is a single indivisible `model.safetensors` GET, so there is no useful
+    // point to inject a cooperative check. Accepted: the daemon's wait is bounded by this
+    // timeout plus the shutdown `select!` around the caller; the orphaned thread only writes
+    // into the HF cache dir and exits on its own when the transfer finishes or errors.
+    let loaded = if config.external_endpoint.is_some() {
+        Some(nestweaver_embed::EmbedModel::load(&config))
+    } else {
+        let model_id = config.model_id.clone();
+        let prefetch =
+            tokio::task::spawn_blocking(move || nestweaver_embed::local::prefetch_model(&model_id));
+        match tokio::time::timeout(std::time::Duration::from_secs(180), prefetch).await {
+            Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load(&config)),
+            _ => {
+                tracing::warn!(
+                    "embedding model download timed out or failed — semantic search disabled \
+                     until the daemon restarts with the model available"
+                );
+                None
+            }
+        }
+    };
+    match loaded {
+        Some(Ok(model)) => {
+            tracing::info!(dim = model.dimension(), "Embedding model loaded");
+            // Only the LOCAL model's dimension is comparable to the stored index.
+            // With an external endpoint, queries are embedded by the remote model
+            // (whatever dimension built the index), so the local dim is irrelevant
+            // — comparing it would falsely disable semantic search for every
+            // remote-embedded index. Any real remote/index dimension mismatch is
+            // handled gracefully at query time by the cosine length guard.
+            if !model.uses_external_endpoint()
+                && let Some(stored_dim) = state.store.embedding_index_dimension()
+                && stored_dim != model.dimension()
+            {
+                tracing::warn!(
+                    model_dim = model.dimension(),
+                    stored_dim,
+                    "Embedding model dimension ({}) does not match stored embeddings ({}). \
+                     Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
+                    model.dimension(),
+                    stored_dim
+                );
+            } else {
+                *state.embed_model.write().await = Some(std::sync::Arc::new(model)
+                    as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
+            }
+        }
+        Some(Err(e)) => {
+            tracing::warn!("Failed to load embedding model: {e}");
+        }
+        None => {}
+    }
+}
+
 pub async fn run_server(
     db_path: &Path,
-    idle_timeout: Option<Duration>,
+    mut idle_timeout: Option<Duration>,
     config_path: Option<&Path>,
+    server_opts: Option<ServerOpts>,
 ) -> Result<(), anyhow::Error> {
+    // Idle-timeout counts only gRPC/UDS reads+writes (active_reads/active_writes)
+    // and indexing — the MCP-over-HTTP path (server mode only) does NOT bump them,
+    // so an idle timer would treat an actively-querying MCP client as idle and
+    // shut the server down mid-use. Force it off in server mode. Today the two are
+    // already mutually exclusive (the idle-enabled Start path is UDS-only), so this
+    // is a guard against a future regression, not a live bug.
+    if server_opts.is_some() && idle_timeout.is_some() {
+        tracing::warn!(
+            "idle_timeout is ignored in server mode (MCP-HTTP activity is not \
+             counted); forcing it off"
+        );
+        idle_timeout = None;
+    }
+
     // Canonicalize if possible, but don't fail if the DB doesn't exist yet.
     // The DB will be created by GraphStore::open_or_create below.
-    let db_path = std::fs::canonicalize(db_path).unwrap_or_else(|_| {
-        // Ensure parent directory exists so the DB can be created
-        if let Some(parent) = db_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        db_path.to_path_buf()
-    });
+    if let Some(parent) = db_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let db_path = lifecycle::canonical_db_path(db_path);
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
@@ -2582,17 +4169,65 @@ pub async fn run_server(
         db_path.display()
     );
 
-    // Open the graph store with write access — the daemon is the sole DB owner.
-    let store = match GraphStore::open_or_create(&db_path) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "failed to open database with write access at {}; \
-                     another process may hold the write lock",
-                    db_path.display()
-                )
-            });
+    // Claim the single-owner instance lock BEFORE materializing a snapshot. A
+    // duplicate replica on the identical `--db` shares this instance id (and its
+    // `replica-work-<id>` dir), so rejecting it here stops its materialize copy
+    // from truncating a live sibling's working copy. Held for the process
+    // lifetime; released on drop. (In fork mode daemonize2 already holds it.)
+    let _pid_guard = claim_instance_lock(&instance_id)?;
+
+    // Snapshot replica: materialize the snapshot into a private working copy and
+    // serve it read-only. `read_only` gates out the write RPCs (via the
+    // `ReadOnlyGuard` transport layer) and the write machinery
+    // (worker/scheduler/webhook) below. Default (`snapshot: None`) keeps the
+    // read-write path unchanged.
+    let read_only = server_opts
+        .as_ref()
+        .and_then(|o| o.snapshot.as_ref())
+        .is_some();
+    let db_path = if let Some(snapshot_dir) = server_opts.as_ref().and_then(|o| o.snapshot.clone())
+    {
+        let cfg = config_path.and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok());
+        let (_, _, schema_hash) = nestweaver_engine::schema_hashes(cfg.as_ref());
+        let embedding_model = cfg
+            .as_ref()
+            .map(|c| c.embedding.model_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        // Private per-replica working dir keyed on the instance id so two
+        // co-located replicas (distinct `--db` under one parent) never share a
+        // mutable path and clobber each other's materialized copy.
+        let working_dir = replica_working_dir(&db_path, &instance_id);
+        tracing::info!(snapshot = %snapshot_dir.display(), "booting as read-only snapshot replica");
+        nestweaver_engine::materialize_snapshot(
+            &snapshot_dir,
+            &working_dir,
+            env!("CARGO_PKG_VERSION"),
+            &schema_hash,
+            &embedding_model,
+        )
+        .with_context(|| format!("failed to materialize snapshot {}", snapshot_dir.display()))?
+    } else {
+        db_path
+    };
+
+    // Open the graph store: read-only for a snapshot replica, read-write
+    // otherwise (the daemon is the sole DB owner).
+    let store = if read_only {
+        GraphStore::open_read_only(&db_path).with_context(|| {
+            format!("failed to open snapshot read-only at {}", db_path.display())
+        })?
+    } else {
+        match GraphStore::open_or_create(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to open database with write access at {}; \
+                         another process may hold the write lock",
+                        db_path.display()
+                    )
+                });
+            }
         }
     };
 
@@ -2605,38 +4240,61 @@ pub async fn run_server(
         store.load_interaction_cache(scores);
     }
 
-    // Open Tantivy index with a writer so the daemon can update the
-    // search index after indexing operations (vault/repo).  Fall back to
-    // reader-only when the writer lock is held by another process (e.g. a
-    // running brain watcher), and finally to None when the index doesn't
-    // exist at all.
+    // Open the Tantivy index. A read-only snapshot replica never mutates its
+    // index, so it opens reader-only and never acquires a writer lock — this
+    // matches the read-only store open and keeps a replica from holding a
+    // writer on its (private) materialized copy. The read-write daemon opens
+    // with a writer so it can update the index after indexing operations
+    // (vault/repo), falling back to reader-only when the writer lock is held by
+    // another process (e.g. a running brain watcher), and finally to None when
+    // the index doesn't exist at all.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
-    let tantivy = match TantivyIndex::open_or_create(&tantivy_path) {
-        Ok(idx) => {
-            tracing::info!(
-                docs = idx.doc_count(),
-                path = %tantivy_path.display(),
-                "Tantivy index open (read-write)"
-            );
-            Some(Arc::new(idx))
-        }
-        Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
+    let tantivy = if read_only {
+        match TantivyIndex::open_reader_only(&tantivy_path) {
             Ok(idx) => {
                 tracing::info!(
                     docs = idx.doc_count(),
                     path = %tantivy_path.display(),
-                    "Tantivy index open (reader-only fallback)"
+                    "Tantivy index open (replica, reader-only)"
                 );
                 Some(Arc::new(idx))
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "could not open Tantivy index — search will use substring fallback"
+                    "could not open Tantivy index reader — search will use substring fallback"
                 );
                 None
             }
-        },
+        }
+    } else {
+        match TantivyIndex::open_or_create(&tantivy_path) {
+            Ok(idx) => {
+                tracing::info!(
+                    docs = idx.doc_count(),
+                    path = %tantivy_path.display(),
+                    "Tantivy index open (read-write)"
+                );
+                Some(Arc::new(idx))
+            }
+            Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
+                Ok(idx) => {
+                    tracing::info!(
+                        docs = idx.doc_count(),
+                        path = %tantivy_path.display(),
+                        "Tantivy index open (reader-only fallback)"
+                    );
+                    Some(Arc::new(idx))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not open Tantivy index — search will use substring fallback"
+                    );
+                    None
+                }
+            },
+        }
     };
 
     let idle_notify = Arc::new(Notify::new());
@@ -2644,10 +4302,16 @@ pub async fn run_server(
 
     // Load the InstanceConfig once at start if `--config` was supplied so
     // tool dispatch (e.g. F6 `[ranking]` priors in `brain_search`) can apply
-    // it without re-parsing the file per RPC. A missing/unreadable file is
-    // logged but non-fatal — the daemon still serves with built-in defaults.
-    let instance_cfg =
-        config_path.and_then(|p| match nestweaver_engine::InstanceConfig::from_file(p) {
+    // it without re-parsing the file per RPC.
+    //
+    // Distinguish a MISSING file (non-fatal — the daemon serves with built-in
+    // defaults) from a file that is PRESENT but unparseable. In server mode a
+    // malformed config means the server would silently index nothing and have no
+    // webhook secret; that failure must be loud (stderr) and fatal rather than a
+    // warning buried in the rotating log file.
+    let instance_cfg = match config_path {
+        None => None,
+        Some(p) => match nestweaver_engine::InstanceConfig::from_file(p) {
             Ok(c) => {
                 tracing::info!(
                     config = %p.display(),
@@ -2655,21 +4319,111 @@ pub async fn run_server(
                 );
                 Some(Arc::new(c))
             }
+            Err(e) if p.exists() => {
+                // Present but broken. Surface to the console (docker/foreground
+                // operators never see the rotating log) and fail fast in server
+                // mode so a typo can't masquerade as a healthy-but-empty server.
+                eprintln!("[daemon] failed to parse --config {}: {e}", p.display());
+                tracing::error!(config = %p.display(), error = %e, "failed to parse --config");
+                if server_opts.is_some() {
+                    anyhow::bail!(
+                        "invalid --config {}: {e} (server mode requires a parseable config)",
+                        p.display()
+                    );
+                }
+                None
+            }
             Err(e) => {
                 tracing::warn!(
                     config = %p.display(),
                     error = %e,
-                    "failed to load instance config — ranking/response settings will use defaults"
+                    "instance config not found — using built-in defaults"
                 );
                 None
             }
-        });
+        },
+    };
+
+    let is_server_mode = server_opts.is_some();
+
+    // Build safeguards and rate limiters for server mode.
+    let safeguards = if is_server_mode {
+        QuerySafeguards::default_server()
+    } else {
+        QuerySafeguards::disabled()
+    };
+
+    let rate_limiters = if is_server_mode {
+        let config = RateLimitConfig::default();
+        Some(Arc::new(ClientRateLimiters::new(&config)))
+    } else {
+        None
+    };
+
+    // Extract admin token from server opts (if present).
+    let admin_token = server_opts
+        .as_ref()
+        .and_then(|opts| opts.admin_token.clone());
+
+    // Reject any present auth/admin token that is too short to be safe.
+    validate_token_lengths(
+        &server_opts
+            .as_ref()
+            .and_then(|opts| opts.auth_token.clone()),
+        &admin_token,
+    )?;
+
+    // A binary built WITHOUT the `acme` feature cannot provision certs. Reject
+    // --acme-domain up front rather than binding a non-loopback listener with no
+    // certificate behind it. Checked BEFORE the bind gate so the operator gets
+    // this actionable message. The passthrough in the root Cargo.toml makes
+    // `--features acme` a valid build of the top-level binary, so the
+    // instruction is now correct (B2).
+    #[cfg(not(feature = "acme"))]
+    if server_opts
+        .as_ref()
+        .and_then(|o| o.acme_domain.as_ref())
+        .is_some()
+    {
+        anyhow::bail!(
+            "--acme-domain requires a binary built with `--features acme`, but this \
+             binary was compiled without it. Rebuild with `cargo build --release \
+             --features acme` (or `cargo install --features acme`), or use \
+             --tls-cert/--tls-key for manual TLS instead."
+        );
+    }
+
+    // Enforce bind-scope security. ACME only counts as TLS when the feature is
+    // actually compiled in (`acme_provides_tls`); on a no-feature build the
+    // guard above has already bailed, so here a non-loopback ACME-only bind
+    // would fail closed rather than being waved through as "TLS" and then
+    // serving cleartext.
+    if let Some(ref opts) = server_opts {
+        validate_bind_security(
+            &opts.bind_addr,
+            &opts.auth_token,
+            &opts.tls_cert,
+            &opts.tls_key,
+            acme_provides_tls(opts.acme_domain.is_some()),
+        )?;
+    }
+
+    // Reject any present webhook secret that is too short to be safe.
+    validate_webhook_secret_lengths(
+        &server_opts
+            .as_ref()
+            .and_then(|opts| opts.webhook_secret.clone()),
+        &server_opts
+            .as_ref()
+            .and_then(|opts| opts.webhook_secret_old.clone()),
+    )?;
 
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
         tantivy,
         db_path: db_path.clone(),
+        read_only,
         instance_id: instance_id.clone(),
         start_time: Instant::now(),
         active_reads: Arc::new(AtomicU32::new(0)),
@@ -2680,6 +4434,16 @@ pub async fn run_server(
         instance_cfg,
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
         write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        server_mode: is_server_mode,
+        indexing_active: Arc::new(AtomicBool::new(false)),
+        indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
+        indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+        safeguards,
+        rate_limiters: rate_limiters.clone(),
+        drained: Arc::new(AtomicBool::new(false)),
+        admin_token,
+        admin_state: std::sync::OnceLock::new(),
+        worker_handle: std::sync::Mutex::new(None),
     });
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
@@ -2692,66 +4456,45 @@ pub async fn run_server(
         });
     }
 
-    // Spawn background embedding model loading when the `embed` feature is on.
-    tracing::debug!("embed feature compiled in: {}", cfg!(feature = "embed"));
-    #[cfg(feature = "embed")]
-    {
-        let embed_state = state.embed_model.clone();
-        let embedding_cfg = state.instance_cfg.as_ref().map(|c| c.embedding.clone());
-        let store_for_dim_check = state.store.clone();
+    // Spawn periodic rate limiter cleanup (every 10 minutes).
+    if let Some(ref rl) = state.rate_limiters {
+        let rl = rl.clone();
+        let mut sweep_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            let cfg = embedding_cfg.unwrap_or_default();
-            // Expand tilde in cache_dir using the home directory.
-            let cache_dir = if cfg.cache_dir.starts_with("~/") {
-                if let Some(home) = dirs::home_dir() {
-                    home.join(&cfg.cache_dir[2..])
-                } else {
-                    std::path::PathBuf::from(&cfg.cache_dir)
-                }
-            } else {
-                std::path::PathBuf::from(&cfg.cache_dir)
-            };
-            let config = nestweaver_embed::EmbedConfig {
-                model_id: cfg.model_id.clone(),
-                cache_dir,
-                external_endpoint: cfg.external_endpoint.clone(),
-                external_model: cfg.external_model.clone(),
-            };
-            match tokio::task::spawn_blocking(move || nestweaver_embed::EmbedModel::load(&config))
-                .await
-            {
-                Ok(Ok(model)) => {
-                    tracing::info!(dim = model.dimension(), "Embedding model loaded");
-                    // Check dimension compatibility with existing embeddings
-                    if let Some(stored_dim) = store_for_dim_check.embedding_index_dimension()
-                        && stored_dim != model.dimension()
-                    {
-                        tracing::warn!(
-                            model_dim = model.dimension(),
-                            stored_dim,
-                            "Embedding model dimension ({}) does not match stored embeddings ({}). \
-                             Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
-                            model.dimension(),
-                            stored_dim
-                        );
-                        return;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(600)) => {
+                        rl.sweep_stale();
+                        tracing::debug!("rate limiter stale entries swept");
                     }
-                    *embed_state.write().await = Some(std::sync::Arc::new(model)
-                        as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to load embedding model: {e}");
-                }
-                Err(e) => {
-                    tracing::warn!("Embedding model load task panicked: {e}");
+                    _ = sweep_shutdown.changed() => break,
                 }
             }
         });
     }
 
-    let svc = NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
-        .max_decoding_message_size(256 * 1024 * 1024)
-        .max_encoding_message_size(256 * 1024 * 1024);
+    // The embedding model is loaded on the MAIN thread near the end of run_server — AFTER the
+    // UDS server is spawned and the socket is bound + serving. candle needs the main thread to
+    // reach Metal, but the socket must not wait on a cold-cache model download. See the serve
+    // spawn + `load_embedding_model(&state)` below.
+    tracing::debug!("embed feature compiled in: {}", cfg!(feature = "embed"));
+
+    // Wrap the generated service in the single read-only chokepoint. On a
+    // read-only snapshot replica this rejects EVERY mutating RPC (typed + JSON)
+    // with FAILED_PRECONDITION before it reaches a handler; on a read-write
+    // daemon it is a transparent pass-through. Applied once here so both the
+    // TCP and UDS transports below inherit the same gate.
+    //
+    // NOTE: this guard covers the gRPC transport ONLY. The `/mcp` HTTP surface
+    // does NOT flow through it — its replica safety comes from the read-only
+    // store open plus the `MUTATING_TOOLS` permission gate in the MCP handler
+    // (see http.rs). Don't assume this guard wraps `/mcp`.
+    let svc = ReadOnlyGuard::new(
+        read_only,
+        NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024),
+    );
 
     // Prepare the socket path.
     let sock_dir = lifecycle::runtime_dir(&instance_id);
@@ -2761,38 +4504,8 @@ pub async fn run_server(
     let sock_path = lifecycle::socket_path(&instance_id);
     let _ = std::fs::remove_file(&sock_path);
 
-    // Write PID file and optionally acquire flock.
-    // In fork mode (daemonize2), the flock is already held by daemonize2.
-    // In foreground mode (launchd / daemon run), we acquire it ourselves.
-    let pid_path = lifecycle::pidfile_path(&instance_id);
-    let _pid_guard: Option<std::fs::File> = if std::env::var("NESTWEAVER_DAEMON_FORK").is_err() {
-        let pid_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&pid_path)
-            .with_context(|| format!("open pidfile: {}", pid_path.display()))?;
-
-        {
-            use std::io::Write;
-            write!(&pid_file, "{}", std::process::id())
-                .with_context(|| format!("write pidfile: {}", pid_path.display()))?;
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = pid_file.as_raw_fd();
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
-                anyhow::bail!("Another daemon instance is already running (pidfile locked)");
-            }
-        }
-
-        Some(pid_file)
-    } else {
-        None
-    };
+    // The single-owner instance lock (pidfile flock) was already claimed above,
+    // before snapshot materialization — see `claim_instance_lock`.
 
     tracing::info!(
         socket = %sock_path.display(),
@@ -2810,7 +4523,11 @@ pub async fn run_server(
                 tokio::select! {
                     _ = notify.notified() => continue,
                     _ = tokio::time::sleep(timeout) => {
-                        if active.active_reads.load(Ordering::Relaxed) + active.active_writes.load(Ordering::Relaxed) == 0 {
+                        if is_idle(
+                            active.active_reads.load(Ordering::Relaxed)
+                                + active.active_writes.load(Ordering::Relaxed),
+                            active.indexing_active.load(Ordering::Relaxed),
+                        ) {
                             tracing::info!(
                                 timeout_secs = timeout.as_secs(),
                                 "idle timeout reached — shutting down"
@@ -2827,11 +4544,16 @@ pub async fn run_server(
     // Catch SIGTERM for graceful shutdown (sent by `daemon stop`).
     {
         let tx = shutdown_tx.clone();
+        let drained = Arc::clone(&state.drained);
         tokio::spawn(async move {
             let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("register SIGTERM handler");
             sig.recv().await;
             tracing::info!("received SIGTERM — shutting down");
+            // T6.2: stop the worker claiming new jobs BEFORE broadcasting
+            // shutdown, mirroring the gRPC Shutdown handler. In-flight jobs
+            // still drain via the worker loop's JoinSet; only NEW claims stop.
+            drained.store(true, Ordering::Relaxed);
             let _ = tx.send(true);
         });
     }
@@ -2840,23 +4562,1341 @@ pub async fn run_server(
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
 
+    // Create scheduler command channel. The sender goes into AdminState
+    // so the reload endpoint can push commands; the receiver is consumed
+    // by the scheduler task below.
+    let (scheduler_tx, scheduler_rx) =
+        tokio::sync::mpsc::channel::<nestweaver_engine::scheduler::SchedulerCommand>(64);
+
+    // Shared job queue Arc — created once and shared across webhook handler,
+    // worker pool, and poll scheduler to avoid concurrent SQLite opens.
+    let mut shared_job_queue_opt: Option<
+        std::sync::Arc<std::sync::Mutex<nestweaver_engine::jobs::JobQueue>>,
+    > = None;
+
+    // Live MCP session-count handle, shared from the MCP HTTP state into the
+    // admin API (dashboard "connected clients") and the metrics task
+    // (`MCP_SESSIONS` gauge). `None` outside server mode.
+    let mut mcp_session_gauge_opt: Option<std::sync::Arc<std::sync::atomic::AtomicU32>> = None;
+
+    // MCP-over-HTTP server — spawned alongside the gRPC servers.
+    // Binds to grpc_port + 1 when server mode is active, or a separate OS-assigned
+    // port when grpc_port is 0.
+    if let Some(ref opts) = server_opts {
+        let mcp_state = {
+            let mut s = if let Some(ref token) = opts.auth_token {
+                nestweaver_mcp::http::McpHttpState::with_auth(
+                    false,
+                    state.store.clone(),
+                    state.tantivy.clone(),
+                    state.db_path.clone(),
+                    state.instance_cfg.clone(),
+                    state.server_mode,
+                    token.clone(),
+                    opts.admin_token.clone(),
+                )
+            } else {
+                nestweaver_mcp::http::McpHttpState::new(
+                    false,
+                    state.store.clone(),
+                    state.tantivy.clone(),
+                    state.db_path.clone(),
+                    state.instance_cfg.clone(),
+                    state.server_mode,
+                )
+            };
+            // Share the daemon's embed model so HTTP dispatch has parity with gRPC.
+            s.embed_model = state.embed_model.clone();
+            // A read-only replica must reject mutating MCP tools before dispatch,
+            // just as the gRPC ReadOnlyGuard rejects mutating RPCs.
+            s.read_only = read_only;
+            // Build the daemon-side federation coordinator from the instance
+            // config's `[[upstream]]` entries. `None` for the common
+            // single-node case (no upstreams) — the `/mcp` boundary then stamps
+            // the honest single-node provenance.
+            s.federation = state.instance_cfg.as_ref().and_then(|cfg| {
+                nestweaver_mcp::federation::FederationState::from_instance_config(cfg)
+            });
+            if let Some(ref fed) = s.federation {
+                tracing::info!(
+                    upstreams = fed.upstream_count(),
+                    "MCP /mcp boundary: federation coordinator active"
+                );
+            }
+            std::sync::Arc::new(s)
+        };
+        // Spawn the background staleness/health-recovery task, mirroring the
+        // hybrid client's maintenance loop. Only when an upstream is configured;
+        // aborts on shutdown via the same watch channel as the other sweepers.
+        if let Some(ref fed) = mcp_state.federation {
+            nestweaver_mcp::federation::spawn_staleness_refresher(
+                state.store.clone(),
+                fed.clone(),
+                shutdown_tx.subscribe(),
+            );
+        }
+        // Share the live session-count handle with the admin API and metrics.
+        mcp_session_gauge_opt = Some(mcp_state.mcp_session_gauge.clone());
+        nestweaver_mcp::http::spawn_session_sweeper(
+            mcp_state.sessions.clone(),
+            mcp_state.mcp_session_gauge.clone(),
+            shutdown_tx.subscribe(),
+        );
+        nestweaver_mcp::http::spawn_bucket_sweeper(
+            mcp_state.client_rate_limiter.clone(),
+            shutdown_tx.subscribe(),
+        );
+        // Captured before `mcp_state` is moved into `router()` — used for the
+        // T5.1 bind-time auth assertion below and to decide whether the network
+        // `/metrics` route is gated (S.5).
+        let mcp_auth_token = mcp_state.auth_token.clone();
+        let mut mcp_router = nestweaver_mcp::http::router(mcp_state);
+
+        // Shared webhook state Arcs — populated inside the webhook block,
+        // then passed to AdminState so /admin/api/reload can update them.
+        let mut webhook_allowed_repos: Option<
+            std::sync::Arc<std::sync::RwLock<Option<std::collections::HashSet<String>>>>,
+        > = None;
+        let mut webhook_repo_branches: Option<
+            std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+        > = None;
+
+        // Single shared job queue for webhook handler, worker pool, and
+        // poll scheduler.  Opening the same SQLite file from multiple
+        // independent connections caused Bus errors (SIGBUS) on macOS
+        // when WAL checkpointing raced with a concurrent open.
+        let jobs_db_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+        let shared_job_queue: std::sync::Arc<std::sync::Mutex<nestweaver_engine::jobs::JobQueue>> = {
+            let jq = nestweaver_engine::jobs::JobQueue::open(&jobs_db_path)
+                .with_context(|| format!("open shared job queue: {}", jobs_db_path.display()))?;
+            std::sync::Arc::new(std::sync::Mutex::new(jq))
+        };
+        shared_job_queue_opt = Some(std::sync::Arc::clone(&shared_job_queue));
+
+        if replica_enqueues_config_repos(read_only)
+            && let Some(ref cfg) = state.instance_cfg
+            && let Ok(queue) = shared_job_queue.lock()
+        {
+            for repo_cfg in &cfg.repos {
+                let repo_uid = nestweaver_schema::repo_uid(&instance_id, &repo_cfg.url);
+                let needs_initial_index = state
+                    .store
+                    .lookup_repo(&repo_uid)
+                    .ok()
+                    .flatten()
+                    .map(|repo| repo.indexed_sha.is_empty())
+                    .unwrap_or(true);
+                if needs_initial_index {
+                    // SSRF guard: repos declared in instance.toml bypass the
+                    // add_repo API and its validation, so a hostile config could
+                    // otherwise smuggle an internal/private target that gets
+                    // cloned at startup (the clone/worker path has no SSRF guard
+                    // of its own). Run the same synchronous checks add_repo and
+                    // reload_config use and refuse to enqueue rejected URLs.
+                    // DNS resolution is intentionally skipped here (matching
+                    // reload_config) to keep startup non-blocking; only
+                    // scheme/literal-IP/localhost checks apply at this stage.
+                    if !nestweaver_web::routes::admin::config_repo_url_allowed(&repo_cfg.url) {
+                        tracing::warn!(
+                            repo = %repo_cfg.url,
+                            "startup: skipping config repo — URL rejected by SSRF guard"
+                        );
+                        continue;
+                    }
+                    let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&repo_cfg.url);
+                    if let Err(e) = queue.upsert(
+                        &canonical_id,
+                        &repo_cfg.url,
+                        nestweaver_engine::jobs::JobTrigger::Unindexed,
+                        repo_cfg.branch.as_deref(),
+                    ) {
+                        tracing::warn!(
+                            repo = %repo_cfg.url,
+                            error = %e,
+                            "failed to enqueue config repo for initial indexing"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Mount webhook endpoint when a secret is configured — but never on a
+        // read-only replica, which has no worker to drain enqueued jobs.
+        if replica_mounts_webhook(read_only, opts.webhook_secret.is_some())
+            && let Some(ref secret) = opts.webhook_secret
+        {
+            let allowed_repos: Option<std::collections::HashSet<String>> =
+                state.instance_cfg.as_ref().map(|cfg| {
+                    cfg.repos
+                        .iter()
+                        .filter(|r| r.poll.as_deref() != Some("manual"))
+                        .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
+                        .collect()
+                });
+            let repo_branches: std::collections::HashMap<String, String> = state
+                .instance_cfg
+                .as_ref()
+                .map(|cfg| {
+                    cfg.repos
+                        .iter()
+                        .filter_map(|r| {
+                            r.branch.as_ref().map(|b| {
+                                (
+                                    nestweaver_engine::jobs::canonical_repo_id(&r.url),
+                                    b.clone(),
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let shared_allowed = std::sync::Arc::new(std::sync::RwLock::new(allowed_repos));
+            let shared_branches = std::sync::Arc::new(std::sync::RwLock::new(repo_branches));
+            webhook_allowed_repos = Some(std::sync::Arc::clone(&shared_allowed));
+            webhook_repo_branches = Some(std::sync::Arc::clone(&shared_branches));
+            let webhook_state = std::sync::Arc::new(crate::webhook::WebhookState {
+                config: crate::webhook::WebhookConfig {
+                    secret: secret.clone(),
+                    secret_old: opts.webhook_secret_old.clone(),
+                },
+                job_queue: std::sync::Arc::clone(&shared_job_queue),
+                allowed_repos: shared_allowed,
+                repo_branches: shared_branches,
+            });
+            mcp_router = mcp_router.route(
+                "/webhook",
+                axum::routing::post(crate::webhook::handle_webhook)
+                    .with_state(webhook_state)
+                    .layer(axum::extract::DefaultBodyLimit::max(5_242_880)),
+            );
+            tracing::info!("webhook endpoint enabled at /webhook");
+        }
+
+        // Mount admin API routes when an admin token is configured — but not on
+        // a read-only replica, which exposes no mutating admin surface.
+        // `/metrics` (mounted below) stays available for replica monitoring.
+        if replica_mounts_admin_api(read_only, opts.admin_token.is_some())
+            && let Some(ref admin_tok) = opts.admin_token
+        {
+            let admin_state = std::sync::Arc::new(nestweaver_web::state::AdminState {
+                admin_token: admin_tok.clone(),
+                auth_token: opts.auth_token.clone(),
+                device_flow: std::sync::Arc::new(tokio::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
+                daemon_store: state.store.clone(),
+                instance_id: state.instance_id.clone(),
+                start_time: state.start_time,
+                active_reads: state.active_reads.clone(),
+                active_writes: state.active_writes.clone(),
+                mcp_sessions: mcp_session_gauge_opt
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+                drained: state.drained.clone(),
+                indexing_queue_depth: state.indexing_queue_depth.clone(),
+                db_path: db_path.clone(),
+                config_path: config_path.map(|p| p.to_path_buf()),
+                scheduler_tx: Some(scheduler_tx.clone()),
+                webhook_allowed_repos: webhook_allowed_repos.clone(),
+                webhook_repo_branches: webhook_repo_branches.clone(),
+                write_mutex: Some(Arc::clone(&state.write_mutex)),
+                // Share the daemon's single job-queue connection. Opening a
+                // second connection from admin routes races the worker's WAL
+                // checkpoint and crashes with SIGBUS on macOS.
+                job_queue: shared_job_queue_opt.clone(),
+            });
+            // Store the admin state so serve_ui can mount the admin API on
+            // the web UI server as well (shared Arc = same state).
+            let _ = state.admin_state.set(admin_state.clone());
+
+            // Device-flow auth endpoints (RFC 8628) share the admin state so
+            // approvals can hand back the configured org query token.
+            let device_router = nestweaver_web::create_device_flow_router(admin_state.clone());
+            mcp_router = mcp_router.nest("/auth", device_router);
+
+            let admin_router = nestweaver_web::create_admin_router(admin_state);
+            mcp_router = mcp_router.nest("/admin/api", admin_router);
+            // Mount top-level /admin redirect → /admin/api/status so that
+            // hitting /admin in a browser doesn't 404.
+            mcp_router = mcp_router.route(
+                "/admin",
+                axum::routing::get(|| async {
+                    axum::response::Redirect::permanent("/admin/api/status")
+                }),
+            );
+            tracing::info!("admin API enabled at /admin/api/*");
+        }
+
+        // Mount /metrics at the top level of the MCP HTTP router so Prometheus
+        // scrapers can use the standard path without knowing the /admin/api
+        // prefix. S.5: on the network-facing listener the endpoint is gated
+        // behind a bearer token (query or admin) — operational counters are a
+        // metadata leak on a non-loopback deployment. When no auth is
+        // configured (loopback-only dev bind) it stays open for local scrape
+        // convenience; validate_bind_security forces --auth-token for any
+        // non-loopback bind, so on the network this route is always gated.
+        let metrics_auth = nestweaver_web::routes::metrics::MetricsAuthState {
+            auth_token: mcp_auth_token.clone(),
+            admin_token: opts.admin_token.clone(),
+        };
+        let metrics_route = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(nestweaver_web::routes::metrics::metrics_authenticated),
+            )
+            .with_state(metrics_auth);
+        mcp_router = mcp_router.merge(metrics_route);
+
+        // Outermost safety net: convert any unhandled panic in a handler into a
+        // 500 for that ONE request instead of dropping the connection (and, if the
+        // panic were inside a held std::Mutex, poisoning it and wedging the pool).
+        // The request surface is audited panic-free today; this guards future edits.
+        mcp_router = mcp_router.layer(tower_http::catch_panic::CatchPanicLayer::new());
+
+        // Parse the bind address to determine the MCP port.  When the gRPC
+        // bind uses port 0 (OS-assigned), the MCP server also binds to port 0
+        // and records the actual port in the port file (second line).
+        let mcp_bind_addr: std::net::SocketAddr = opts
+            .bind_addr
+            .parse()
+            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+
+        // T5.1 defense-in-depth: a non-loopback MCP HTTP listener MUST be
+        // authenticated. `validate_bind_security` already forces `--auth-token`
+        // for a non-loopback bind (so `mcp_state` is built via `with_auth`),
+        // but that guarantee is indirect. Assert it directly at bind time so a
+        // future refactor that weakens the upstream check fails loudly here
+        // rather than silently exposing an unauthenticated network surface.
+        if !mcp_bind_addr.ip().is_loopback() && mcp_auth_token.is_none() {
+            anyhow::bail!(
+                "refusing to bind MCP HTTP listener to non-loopback {} without \
+                 authentication — validate_bind_security should have required \
+                 --auth-token; this is a bug, not a config error",
+                mcp_bind_addr
+            );
+        }
+        let mcp_bind = if mcp_bind_addr.port() == 0 {
+            std::net::SocketAddr::from((mcp_bind_addr.ip(), 0))
+        } else {
+            std::net::SocketAddr::from((
+                mcp_bind_addr.ip(),
+                mcp_bind_addr.port().checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MCP port overflow: gRPC port {} + 1 exceeds u16::MAX",
+                        mcp_bind_addr.port()
+                    )
+                })?,
+            ))
+        };
+
+        // ACME auto-TLS (opt-in via --acme-domain) takes precedence over manual
+        // --tls-cert. On success both listeners share the ACME acceptor; gRPC
+        // pre-terminates TLS below since tonic's ServerTlsConfig is
+        // static-Identity only and cannot pick up runtime-renewed certs.
+        // Bootstrap is NON-FATAL: any ACME error logs and falls through — a
+        // fatal exit under launchd KeepAlive would respawn straight into a
+        // Let's Encrypt validation-failure ban.
+        #[cfg(feature = "acme")]
+        let acme_acceptor: Option<tokio_rustls::TlsAcceptor> = match opts.acme_domain {
+            Some(ref domain) => match crate::acme::build_server_config(
+                domain,
+                opts.acme_email.as_deref(),
+                opts.acme_staging,
+                lifecycle::log_dir(&instance_id).join("acme"),
+            ) {
+                Ok((server_config, acme_state)) => {
+                    // Drive provisioning + renewal forever in the background.
+                    tokio::spawn(crate::acme::drive(acme_state));
+                    tracing::info!(
+                        domain,
+                        staging = opts.acme_staging,
+                        "ACME auto-TLS enabled (TLS-ALPN-01)"
+                    );
+                    eprintln!(
+                        "[daemon] ACME auto-TLS enabled for {domain} (staging={})",
+                        opts.acme_staging
+                    );
+                    Some(tokio_rustls::TlsAcceptor::from(server_config))
+                }
+                Err(e) => {
+                    // SECURITY (B1): bootstrap failed. Never downgrade a public
+                    // listener to cleartext. `build_server_config` does NO network
+                    // I/O, so a failure here is a config/filesystem error, not a
+                    // transient network blip (those surface later in `drive()`,
+                    // which already retries with backoff and never crashes). On a
+                    // non-loopback bind we serve an interim self-signed cert
+                    // (encrypted; untrusted) so tokens/source stay off the wire; on
+                    // loopback we may fall through to plaintext.
+                    tracing::error!("ACME setup failed: {e:#}");
+                    let is_loopback = bind_addr_is_loopback(&opts.bind_addr);
+                    match acme_failure_fallback_acceptor(domain, is_loopback) {
+                        Ok(Some(acceptor)) => {
+                            tracing::warn!(
+                                domain,
+                                "serving an INTERIM SELF-SIGNED certificate (clients \
+                                 will see a trust warning) so traffic stays encrypted; \
+                                 fix the ACME error and restart to provision a trusted \
+                                 cert. Traffic is NOT in cleartext."
+                            );
+                            eprintln!(
+                                "[daemon] ACME provisioning failed; serving interim \
+                                 self-signed TLS for {domain} (untrusted, encrypted). \
+                                 Fix the cause and restart for a trusted cert."
+                            );
+                            Some(acceptor)
+                        }
+                        Ok(None) => {
+                            // Loopback: plaintext is acceptable (process-local).
+                            None
+                        }
+                        Err(fe) => {
+                            // Fail closed: refuse to bind rather than serve cleartext.
+                            anyhow::bail!(
+                                "ACME provisioning failed and the self-signed TLS \
+                                 fallback could not be built for a non-loopback bind \
+                                 ({}); refusing to bind in cleartext: {fe:#}",
+                                opts.bind_addr
+                            );
+                        }
+                    }
+                }
+            },
+            None => None,
+        };
+        #[cfg(not(feature = "acme"))]
+        let acme_acceptor: Option<tokio_rustls::TlsAcceptor> = None;
+
+        // Validate TLS config BEFORE binding any ports so we don't
+        // advertise addresses that will never serve traffic. Yields
+        // `(Option<tonic ServerTlsConfig>, TlsAcceptor)`: the tonic config is
+        // `Some` only for the manual-cert path (gRPC uses tonic's terminator);
+        // ACME leaves it `None` (gRPC pre-terminates with the shared acceptor).
+        let manual_tls_config = match (&opts.tls_cert, &opts.tls_key) {
+            (Some(cert_path), Some(key_path)) => {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+
+                let cert_pem = std::fs::read(cert_path)
+                    .with_context(|| format!("read TLS cert: {}", cert_path.display()))?;
+                let key_pem = std::fs::read(key_path)
+                    .with_context(|| format!("read TLS key: {}", key_path.display()))?;
+
+                let identity =
+                    tonic::transport::Identity::from_pem(cert_pem.clone(), key_pem.clone());
+                let tonic_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+
+                let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("parse TLS certificate PEM")?;
+                let key = rustls_pemfile::private_key(&mut &key_pem[..])
+                    .context("parse TLS private key PEM")?
+                    .context("no private key found in PEM")?;
+                let mut server_config = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .context("build rustls ServerConfig")?;
+                server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                let tls_acceptor =
+                    tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+                tracing::info!("TLS enabled for TCP server and MCP HTTP");
+                tracing::warn!(
+                    "TLS mode: MCP HTTP rate limiter uses per-token buckets instead of per-IP \
+                     because ConnectInfo is unavailable over TLS; all clients sharing the same \
+                     bearer token share one rate-limit bucket. Terminate TLS at a trusted \
+                     reverse proxy that sets X-Forwarded-For for per-IP granularity."
+                );
+                eprintln!("[daemon] TLS enabled for TCP server and MCP HTTP");
+                Some((Some(tonic_tls), tls_acceptor))
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("--tls-cert and --tls-key must both be provided for TLS");
+            }
+            (None, None) => None,
+        };
+
+        // ACME wins when enabled; otherwise use the manual-cert result.
+        let tls_config: Option<(
+            Option<tonic::transport::ServerTlsConfig>,
+            tokio_rustls::TlsAcceptor,
+        )> = if let Some(acme_acceptor) = acme_acceptor {
+            Some((None, acme_acceptor))
+        } else {
+            manual_tls_config
+        };
+
+        let mcp_listener = tokio::net::TcpListener::bind(mcp_bind)
+            .await
+            .with_context(|| format!("bind MCP HTTP: {mcp_bind}"))?;
+        let mcp_actual_addr = mcp_listener.local_addr()?;
+        let mcp_tls_label = if tls_config.is_some() { " (TLS)" } else { "" };
+        tracing::info!(%mcp_actual_addr, "MCP HTTP server listening{}", mcp_tls_label);
+        eprintln!("[daemon] MCP HTTP server listening{mcp_tls_label} on {mcp_actual_addr}");
+
+        // Store the MCP port — written alongside the gRPC port below.
+        let mcp_port_for_file = mcp_actual_addr.port();
+
+        let mcp_tls_acceptor = tls_config.as_ref().map(|(_, a)| a.clone());
+        let mut mcp_shutdown_rx = shutdown_tx.subscribe();
+        let mut mcp_accept_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            if let Some(acceptor) = mcp_tls_acceptor {
+                // B3: run each TLS handshake in its OWN task under a timeout and
+                // funnel only completed handshakes through a channel, so a peer
+                // that connects and never sends a ClientHello can't stall accepts
+                // for every other client on this public listener. A semaphore caps
+                // in-flight handshakes so a silent-client flood can't exhaust
+                // resources, and the accept task exits on shutdown so it doesn't
+                // leak the listener / spawn doomed handshakes.
+                let (handshake_tx, mut handshake_rx) = tokio::sync::mpsc::channel::<
+                    tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                >(256);
+                let handshake_sem =
+                    std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
+                tokio::spawn(async move {
+                    loop {
+                        let (stream, _addr) = tokio::select! {
+                            _ = mcp_accept_shutdown_rx.changed() => break,
+                            res = mcp_listener.accept() => match res {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::debug!("MCP TCP accept failed: {e}");
+                                    continue;
+                                }
+                            },
+                        };
+                        // Backpressure: wait for a handshake permit before spawning.
+                        let permit = tokio::select! {
+                            _ = mcp_accept_shutdown_rx.changed() => break,
+                            res = handshake_sem.clone().acquire_owned() => match res {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            },
+                        };
+                        let acceptor = acceptor.clone();
+                        let handshake_tx = handshake_tx.clone();
+                        tokio::spawn(drive_capped_handshake(
+                            permit,
+                            acceptor,
+                            stream,
+                            TLS_HANDSHAKE_TIMEOUT,
+                            handshake_tx,
+                            "MCP",
+                        ));
+                    }
+                });
+                let mut shutdown = Box::pin(mcp_shutdown_rx.changed());
+                loop {
+                    tokio::select! {
+                        Some(stream) = handshake_rx.recv() => {
+                            // Serving the router directly via hyper here does not
+                            // populate `ConnectInfo<SocketAddr>`, so the nested
+                            // device-flow `/auth` rate limiter (`auth_rate_limit_key`)
+                            // can't see the direct peer IP over TLS and falls back to
+                            // the proxy-supplied `X-Forwarded-For`/`X-Real-IP` (client
+                            // spoofable) or a single global bucket. The limiter's key
+                            // map is bounded, so a spoofed-XFF flood degrades to a
+                            // global cap rather than unbounded growth — matching the
+                            // MCP limiter's documented TLS fallback below. Terminate
+                            // TLS at a trusted proxy that sets XFF for per-IP fidelity.
+                            let svc = mcp_router.clone();
+                            tokio::spawn(async move {
+                                let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
+                                let io = hyper_util::rt::TokioIo::new(stream);
+                                let _ = hyper_util::server::conn::auto::Builder::new(
+                                    hyper_util::rt::TokioExecutor::new(),
+                                )
+                                .serve_connection(io, hyper_svc)
+                                .await;
+                            });
+                        }
+                        _ = &mut shutdown => break,
+                    }
+                }
+            } else {
+                // `into_make_service_with_connect_info` populates
+                // `ConnectInfo<SocketAddr>` so the MCP rate limiter can key
+                // pre-session requests (e.g. `initialize`) on the peer IP.
+                // The TLS branch above serves connections directly via hyper
+                // and cannot supply ConnectInfo, so over TLS the limiter falls
+                // back to the bearer identity — still a stable key, just
+                // coarser (residual: no per-IP granularity for TLS clients).
+                axum::serve(
+                    mcp_listener,
+                    mcp_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let _ = mcp_shutdown_rx.changed().await;
+                })
+                .await
+                .ok();
+            }
+        });
+
+        // TCP listener for server mode — spawned before the blocking UDS serve.
+        {
+            let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
+                .await
+                .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
+            let actual_addr = tcp_listener.local_addr()?;
+            tracing::info!(%actual_addr, "TCP server listening");
+            eprintln!("[daemon] TCP server listening on {}", actual_addr);
+
+            if let Some(ref pf) = opts.port_file {
+                // Write gRPC port on line 1, MCP HTTP port on line 2.
+                let contents = format!("{}\n{}", actual_addr.port(), mcp_port_for_file);
+                std::fs::write(pf, contents)?;
+            }
+
+            let tcp_stream = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
+            let mut tcp_shutdown_rx = shutdown_tx.subscribe();
+            let mut grpc_accept_shutdown_rx = shutdown_tx.subscribe();
+
+            // When an auth token is configured, wrap the TCP service with a
+            // bearer-token interceptor + rate limiting. UDS stays unauthenticated.
+            let interceptor = crate::auth::bearer_auth_interceptor(
+                opts.auth_token.clone(),
+                opts.admin_token.clone(),
+                rate_limiters.clone(),
+            );
+            let tcp_svc =
+                tonic::service::interceptor::InterceptedService::new(svc.clone(), interceptor);
+
+            tokio::spawn(async move {
+                let mut builder = tonic::transport::Server::builder();
+                let shutdown = async move {
+                    let _ = tcp_shutdown_rx.changed().await;
+                };
+                match tls_config {
+                    // Manual TLS: tonic's built-in terminator over a static cert.
+                    Some((Some(tonic_tls), _)) => {
+                        let mut builder = match builder.tls_config(tonic_tls) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!(error = %e, "TLS configuration failed at serve time");
+                                return;
+                            }
+                        };
+                        let _ = builder
+                            .add_service(tcp_svc)
+                            .serve_with_incoming_shutdown(tcp_stream, shutdown)
+                            .await;
+                    }
+                    // ACME: pre-terminate TLS with the shared acceptor so renewed
+                    // certs are used on new handshakes (tonic's ServerTlsConfig is
+                    // static-Identity only). The ACME resolver also serves the
+                    // acme-tls/1 challenge; those handshakes complete then close.
+                    Some((None, acme_acceptor)) => {
+                        use futures::StreamExt;
+                        // B3: spawn each handshake in its own task under a timeout
+                        // and feed completed TLS conns to tonic via a channel, so a
+                        // stalled peer can't block new gRPC connections. A semaphore
+                        // caps in-flight handshakes (silent-client flood), and the
+                        // accept task exits on shutdown rather than leaking.
+                        let (tls_tx, tls_rx) = tokio::sync::mpsc::channel::<
+                            tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                        >(256);
+                        let handshake_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                            MAX_INFLIGHT_HANDSHAKES,
+                        ));
+                        tokio::spawn(async move {
+                            let mut tcp = tcp_stream;
+                            loop {
+                                let conn = tokio::select! {
+                                    _ = grpc_accept_shutdown_rx.changed() => break,
+                                    c = tcp.next() => match c {
+                                        Some(c) => c,
+                                        None => break,
+                                    },
+                                };
+                                let tcp_conn = match conn {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        tracing::debug!("gRPC TCP accept failed: {e}");
+                                        continue;
+                                    }
+                                };
+                                let permit = tokio::select! {
+                                    _ = grpc_accept_shutdown_rx.changed() => break,
+                                    res = handshake_sem.clone().acquire_owned() => match res {
+                                        Ok(p) => p,
+                                        Err(_) => break,
+                                    },
+                                };
+                                let acme_acceptor = acme_acceptor.clone();
+                                let tls_tx = tls_tx.clone();
+                                tokio::spawn(drive_capped_handshake(
+                                    permit,
+                                    acme_acceptor,
+                                    tcp_conn,
+                                    TLS_HANDSHAKE_TIMEOUT,
+                                    tls_tx,
+                                    "gRPC",
+                                ));
+                            }
+                        });
+                        // tonic wants a stream of `Result<conn, E>`; our channel
+                        // carries only successfully-handshaked streams.
+                        let tls_incoming = tokio_stream::wrappers::ReceiverStream::new(tls_rx)
+                            .map(Ok::<_, std::io::Error>);
+                        let _ = builder
+                            .add_service(tcp_svc)
+                            .serve_with_incoming_shutdown(tls_incoming, shutdown)
+                            .await;
+                    }
+                    // Plain TCP (loopback / no TLS).
+                    None => {
+                        let _ = builder
+                            .add_service(tcp_svc)
+                            .serve_with_incoming_shutdown(tcp_stream, shutdown)
+                            .await;
+                    }
+                }
+            });
+        }
+
+        // Spawn the worker pool to consume index jobs from the SQLite queue.
+        // Skipped for a read-only snapshot replica — it serves reads only and
+        // must never write to (or re-clone against) the snapshot.
+        if !read_only {
+            let worker_store = Arc::clone(&state.store);
+            let worker_db = db_path.clone();
+            let worker_instance = instance_id.clone();
+            let mut worker_shutdown = shutdown_tx.subscribe();
+            let worker_drained = Arc::clone(&state.drained);
+            let worker_write_mutex = Arc::clone(&state.write_mutex);
+            let worker_count = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| c.server.indexing.workers)
+                .unwrap_or(8);
+            let indexing_status = nestweaver_engine::worker::IndexingStatus::from_arcs(
+                Arc::clone(&state.indexing_active),
+                state.indexing_repo.clone(),
+                Arc::clone(&state.indexing_queue_depth),
+            );
+            // Map each declared repo to its index strategy so vault repos index
+            // as markdown instead of code. Keyed by the same canonical repo id
+            // the worker uses for lookup.
+            let worker_repo_types = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| build_repo_types(&c.repos))
+                .unwrap_or_default();
+            let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
+            let worker_handle = tokio::spawn(async move {
+                let workspace_dir = worker_db
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join("workspace");
+                // Recover jobs orphaned by a previous crash. At startup no worker is
+                // alive, so EVERY `running` row is orphaned — reclaim them all
+                // immediately instead of waiting out the ~30-min lease/threshold.
+                if let Ok(guard) = worker_job_queue.lock()
+                    && let Ok(recovered) = guard.recover_all_running_at_startup()
+                    && recovered > 0
+                {
+                    tracing::info!(recovered, "recovered orphaned running jobs at startup");
+                }
+                let workspace =
+                    match nestweaver_engine::bare_clone::BareCloneWorkspace::new(&workspace_dir) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            tracing::error!("failed to create bare clone workspace: {e}");
+                            return;
+                        }
+                    };
+                let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
+                    .with_repo_types(worker_repo_types);
+                pool.run_with_drain(
+                    worker_job_queue,
+                    std::sync::Arc::new(workspace),
+                    worker_store,
+                    worker_instance,
+                    &mut worker_shutdown,
+                    Some(indexing_status),
+                    Some(worker_drained),
+                    Some(worker_write_mutex),
+                )
+                .await;
+            });
+            *state
+                .worker_handle
+                .lock()
+                .expect("worker_handle mutex poisoned") = Some(worker_handle);
+
+            // T4.2: continuous lease reaper. The once-at-startup recover_stale
+            // above only rescues jobs stale for >30min; a daemon crash seconds
+            // into an index leaves a `running` row that recover_stale never
+            // sees on restart, so the repo is never re-indexed. This periodic
+            // tick reclaims any job whose per-claim lease has expired, closing
+            // that gap. `reap_expired_leases` takes an explicit `now` so the
+            // SQL is unit-tested without sleeps.
+            const REAPER_INTERVAL_SECS: u64 = 60;
+            let reaper_queue = std::sync::Arc::clone(&shared_job_queue);
+            let mut reaper_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(REAPER_INTERVAL_SECS));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            // Two reclaim paths on the same tick: the reaper for
+                            // leased rows, and recover_stale for legacy rows that
+                            // predate the lease columns (NULL lease → invisible
+                            // to the reaper). Running recover_stale periodically
+                            // (not just once at startup) closes finding #12 for a
+                            // legacy row that was younger than the threshold at
+                            // startup but crosses it while the daemon runs.
+                            let (reclaimed, recovered) = match reaper_queue.lock() {
+                                Ok(guard) => (
+                                    guard.reap_expired_leases(now),
+                                    guard.recover_stale(
+                                        nestweaver_engine::jobs::STALE_RECOVERY_SECS,
+                                    ),
+                                ),
+                                Err(_) => {
+                                    tracing::error!("lease reaper: job queue mutex poisoned");
+                                    (Ok(0), Ok(0))
+                                }
+                            };
+                            match reclaimed {
+                                Ok(n) if n > 0 => tracing::warn!(
+                                    reclaimed = n,
+                                    "lease reaper reclaimed expired in-flight jobs"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => tracing::error!("lease reaper: {e}"),
+                            }
+                            match recovered {
+                                Ok(n) if n > 0 => tracing::warn!(
+                                    recovered = n,
+                                    "lease reaper recovered stale legacy running jobs"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => tracing::error!("stale recovery: {e}"),
+                            }
+                        }
+                        _ = reaper_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+    } // end if server_opts
+
+    // Spawn adaptive poll scheduler in server mode. Not for a read-only replica
+    // (it would poll git remotes and enqueue index jobs against the snapshot).
+    if server_opts.is_some() && !read_only {
+        let poll_store = Arc::clone(&state.store);
+        let poll_instance = instance_id.clone();
+        let poll_job_queue = shared_job_queue_opt.clone();
+        let poll_cfg = state.instance_cfg.clone();
+        let poll_drained = Arc::clone(&state.drained);
+        let mut poll_shutdown = shutdown_tx.subscribe();
+        let mut scheduler_rx = scheduler_rx; // move into the spawned task
+        tokio::spawn(async move {
+            use nestweaver_engine::scheduler::PollScheduler;
+            use std::time::Duration;
+            let indexing_cfg = poll_cfg.as_ref().map(|c| &c.server.indexing);
+            let mut min_poll = indexing_cfg
+                .and_then(|c| nestweaver_engine::config::parse_duration(&c.min_poll))
+                .unwrap_or(Duration::from_secs(45));
+            let mut max_poll = indexing_cfg
+                .and_then(|c| nestweaver_engine::config::parse_duration(&c.max_poll))
+                .unwrap_or(Duration::from_secs(8 * 3600));
+            let mut scheduler = PollScheduler::new(min_poll, max_poll);
+
+            // Seed from config repos first (includes unindexed repos).
+            let mut seeded_urls = std::collections::HashSet::new();
+            if let Some(ref cfg) = poll_cfg {
+                for repo_cfg in &cfg.repos {
+                    let repo_name = repo_cfg.name.clone().unwrap_or_else(|| {
+                        nestweaver_engine::pull::repo_name_from_url(&repo_cfg.url)
+                    });
+                    let poll_override = repo_cfg.poll.as_deref().and_then(|p| match p {
+                        "never" => Some(nestweaver_engine::scheduler::PollOverride::Never),
+                        "manual" => Some(nestweaver_engine::scheduler::PollOverride::Manual),
+                        other => nestweaver_engine::config::parse_duration(other)
+                            .map(nestweaver_engine::scheduler::PollOverride::Fixed),
+                    });
+                    scheduler.add_repo(
+                        repo_name,
+                        repo_cfg.url.clone(),
+                        poll_override,
+                        repo_cfg.branch.clone(),
+                    );
+                    seeded_urls.insert(repo_cfg.url.clone());
+                }
+            }
+
+            // Also seed any already-indexed repos not in the config (legacy).
+            if let Ok(repos) = poll_store.list_repos(Some(&poll_instance)) {
+                for repo in repos {
+                    if seeded_urls.contains(&repo.url) {
+                        continue;
+                    }
+                    let repo_name = repo
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| nestweaver_engine::pull::repo_name_from_url(&repo.url));
+                    scheduler.add_repo(repo_name, repo.url.clone(), None, None);
+                }
+            }
+
+            loop {
+                tokio::select! {
+                    _ = poll_shutdown.changed() => break,
+                    cmd = scheduler_rx.recv() => {
+                        if let Some(cmd) = cmd {
+                            match cmd {
+                                nestweaver_engine::scheduler::SchedulerCommand::AddRepo { repo_id, repo_url, poll_override, branch } => {
+                                    scheduler.add_repo(repo_id, repo_url, poll_override, branch);
+                                }
+                                nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id } => {
+                                    scheduler.remove_repo(&repo_id);
+                                }
+                                nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig { repos, min_poll: new_min, max_poll: new_max } => {
+                                    if let Some(m) = new_min { min_poll = m; }
+                                    if let Some(m) = new_max { max_poll = m; }
+                                    scheduler = PollScheduler::new(min_poll, max_poll);
+                                    for (id, url, ovr, branch) in repos {
+                                        scheduler.add_repo(id, url, ovr, branch);
+                                    }
+                                    tracing::info!(count = scheduler.repo_count(), "scheduler reloaded from config");
+                                }
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        // Skip polling when drained.
+                        if poll_drained.load(std::sync::atomic::Ordering::Relaxed) {
+                            continue;
+                        }
+                        let due = scheduler.due_repos();
+                        for (repo_id, repo_url, branch) in due {
+                            // Determine which branch ref to check. If the repo
+                            // config specifies a branch, use that ref; otherwise
+                            // fall back to HEAD (symref of the remote's default
+                            // branch) so we aren't hardcoded to "main".
+                            let url = repo_url.clone();
+                            let ref_spec = branch.as_deref().unwrap_or("HEAD").to_string();
+                            // SSRF guard the remote probe too: reject internal targets
+                            // and pin the resolved IP (closes a DNS-rebinding vector on
+                            // the ls-remote ref probe, mirroring clone/fetch).
+                            let ls_guard = match nestweaver_engine::ssrf::guard_git_url(&url) {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    tracing::warn!(url = %url, error = %e, "skipping poll: repo URL failed SSRF guard");
+                                    continue;
+                                }
+                            };
+                            // Run the ls-remote probe OFF the async runtime via
+                            // spawn_blocking, and bounded by GIT_TIMEOUT (which
+                            // kills+reaps the child): a hung remote no longer
+                            // stalls this scheduler task's runtime, and can never
+                            // block past the timeout. The status check inside
+                            // `probe_remote_sha` distinguishes a genuine failure
+                            // (Err → log+skip) from an unadvertised ref
+                            // (Ok(None) → nothing to enqueue).
+                            let probe_args = ls_guard.config_args.clone();
+                            let probe_url = url.clone();
+                            let probe_ref = ref_spec.clone();
+                            let probe = tokio::task::spawn_blocking(move || {
+                                probe_remote_sha(&probe_args, &probe_url, &probe_ref)
+                            })
+                            .await;
+                            let remote_sha = match probe {
+                                Ok(Ok(Some(sha))) => sha,
+                                Ok(Ok(None)) => continue,
+                                Ok(Err(e)) => {
+                                    tracing::warn!(url = %url, error = %e, "poll ls-remote failed");
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(url = %url, error = %e, "poll ls-remote task panicked");
+                                    continue;
+                                }
+                            };
+                            // A completed ls-remote probe.
+                            nestweaver_web::routes::metrics::POLL_CHECKS.inc();
+                            let r_uid = nestweaver_schema::repo_uid(&poll_instance, &url);
+                            let indexed_sha = poll_store.lookup_repo(&r_uid)
+                                .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
+                            if remote_sha != indexed_sha {
+                                // A new commit was observed on the remote.
+                                nestweaver_web::routes::metrics::POLL_CHANGES_DETECTED.inc();
+                            }
+                            if remote_sha != indexed_sha
+                                && let Some(ref jq) = poll_job_queue
+                                && let Ok(queue) = jq.lock()
+                            {
+                                let canonical_id =
+                                    nestweaver_engine::jobs::canonical_repo_id(&url);
+                                let _ = queue.upsert(
+                                    &canonical_id,
+                                    &url,
+                                    nestweaver_engine::jobs::JobTrigger::Poll,
+                                    branch.as_deref(),
+                                );
+                                // A new commit was just observed — record it so
+                                // the scheduler's adaptive interval shortens for
+                                // active repos. Only on new-commit detection;
+                                // calling this every poll would peg the interval
+                                // at the min_poll floor.
+                                scheduler.update_commit_time(
+                                    &repo_id,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn a periodic metrics refresh task that updates gauge-type metrics
+    // (queue depth, repo count, MCP sessions) from live state. Counter-type
+    // metrics (gRPC requests, webhooks, jobs) are incremented at their call sites.
+    {
+        let metrics_store = Arc::clone(&state.store);
+        let metrics_queue_depth = Arc::clone(&state.indexing_queue_depth);
+        let metrics_active_reads = Arc::clone(&state.active_reads);
+        let metrics_active_writes = Arc::clone(&state.active_writes);
+        let metrics_job_queue = shared_job_queue_opt.clone();
+        let metrics_instance = instance_id.clone();
+        let metrics_mcp_sessions = mcp_session_gauge_opt.clone();
+        let mut metrics_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            use nestweaver_web::routes::metrics;
+            let mut last_metric_completed_at = 0_i64;
+            loop {
+                // Update repo gauge.
+                if let Ok(repos) = metrics_store.list_repos(Some(&metrics_instance)) {
+                    metrics::REPOS_TOTAL
+                        .with_label_values(&["indexed"])
+                        .set(repos.len() as i64);
+                }
+
+                // Update queue depth gauge.
+                let depth = metrics_job_queue
+                    .as_ref()
+                    .and_then(|queue| {
+                        let guard = queue.lock().ok()?;
+                        let depth = guard.queue_depth().ok()?;
+                        Some(depth.pending + depth.running)
+                    })
+                    .unwrap_or_else(|| metrics_queue_depth.load(Ordering::Relaxed) as i64);
+                metrics::QUEUE_DEPTH
+                    .with_label_values(&["total"])
+                    .set(depth);
+                metrics::ACTIVE_READS.set(metrics_active_reads.load(Ordering::Relaxed) as i64);
+                metrics::ACTIVE_WRITES.set(metrics_active_writes.load(Ordering::Relaxed) as i64);
+                metrics::GRPC_CONNECTIONS.set(
+                    (metrics_active_reads.load(Ordering::Relaxed)
+                        + metrics_active_writes.load(Ordering::Relaxed)) as i64,
+                );
+                if let Some(ref sessions) = metrics_mcp_sessions {
+                    metrics::MCP_SESSIONS.set(sessions.load(Ordering::Relaxed) as i64);
+                }
+
+                if let Some(queue) = &metrics_job_queue
+                    && let Ok(guard) = queue.lock()
+                    && let Ok(completed) =
+                        guard.completed_job_metrics_after(last_metric_completed_at)
+                {
+                    for job in completed {
+                        last_metric_completed_at = last_metric_completed_at.max(job.completed_at);
+                        let result = match job.status {
+                            nestweaver_engine::jobs::JobStatus::Succeeded => "succeeded",
+                            nestweaver_engine::jobs::JobStatus::DeadLetter => "dead_letter",
+                            nestweaver_engine::jobs::JobStatus::Cancelled => "cancelled",
+                            _ => "failed",
+                        };
+                        metrics::JOBS_TOTAL.with_label_values(&[result]).inc();
+                        metrics::JOB_DURATION
+                            .with_label_values(&[] as &[&str])
+                            .observe(job.duration_s);
+                    }
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = metrics_shutdown.changed() => break,
+                }
+            }
+        });
+    }
+
     // Set process title for easier identification via pgrep.
     set_process_title(&format!("nestweaver-daemon-{instance_id}"));
 
-    tonic::transport::Server::builder()
-        .add_service(svc)
-        .serve_with_incoming_shutdown(uds_stream, async move {
-            let _ = shutdown_rx.changed().await;
-        })
+    // Wrap the UDS service with an interceptor that grants admin access.
+    // Local socket connections are implicitly trusted — the OS enforces
+    // file-system permissions on the socket, so any process that can connect
+    // is on the same machine and running as the same user.
+    let uds_svc = tonic::service::interceptor::InterceptedService::new(
+        svc,
+        crate::auth::uds_admin_interceptor,
+    );
+
+    // Spawn the UDS gRPC server so the socket binds and accepts immediately, THEN load the
+    // embedding model on this (main) thread concurrently — non-semantic RPCs are served during
+    // the load, and semantic search returns "model not loaded" until it completes. candle needs
+    // the main thread for Metal, and this keeps a cold-cache download from delaying the bind.
+    let uds_serve = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(uds_svc)
+            .serve_with_incoming_shutdown(uds_stream, async move {
+                let _ = shutdown_rx.changed().await;
+            }),
+    );
+
+    // Race the load against shutdown: a `daemon stop` during a cold-cache model download must
+    // not park the main flow inside the 180s prefetch (which would defer cleanup and risk a
+    // SIGKILL + stale socket). If shutdown fires first, abandon the load and proceed to drain.
+    #[cfg(feature = "embed")]
+    {
+        let mut load_shutdown = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = load_embedding_model(&state) => {}
+            _ = load_shutdown.changed() => {
+                tracing::info!("shutdown requested during embedding model load — abandoning load");
+            }
+        }
+    }
+
+    uds_serve
         .await
+        .context("UDS serve task panicked")?
         .context("gRPC server error")?;
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
     tracing::info!("daemon shutting down, cleaning up");
+
+    // Await the worker pool so an in-flight index write finishes before we exit.
+    // The worker loop sees the same shutdown signal, breaks, and drains its
+    // per-job tasks; awaiting its handle blocks until that drain completes.
+    // `spawn_blocking` work cannot be aborted, so this is the only way to avoid
+    // tearing down the runtime mid-write.
+    let worker_handle = state.worker_handle.lock().ok().and_then(|mut g| g.take());
+    if let Some(handle) = worker_handle {
+        tracing::info!("draining worker pool before exit");
+        let _ = handle.await;
+    }
+
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&pid_path);
+    // Drop the instance lock's pidfile on clean shutdown (the flock itself is
+    // released when `_pid_guard` drops at end of scope).
+    let _ = std::fs::remove_file(lifecycle::pidfile_path(&instance_id));
 
     Ok(())
+}
+
+// ── FlowTraceContinue implementation ────────────────────────────────────
+
+/// Server-side flow trace continuation: given an entry symbol's canonical_id,
+/// walk the call graph forward up to `remaining_depth`, skipping visited
+/// symbols. Returns trace spans + boundary symbols (call targets not in
+/// this database).
+fn flow_trace_continue_impl(
+    store: &nestweaver_store::GraphStore,
+    req: FlowTraceContinueRequest,
+) -> Result<FlowTraceContinueResponse, Status> {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
+
+    // Counter for generating unique span IDs within this request.
+    static SPAN_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let make_span_id = || {
+        let n = SPAN_COUNTER.fetch_add(1, AtomOrd::Relaxed);
+        format!("srv-{:016x}", n)
+    };
+
+    // Hard-cap depth: a peer daemon could send a huge remaining_depth, and the recursive
+    // walk_trace below would otherwise overflow the stack. This typed RPC bypasses the
+    // JSON-dispatch depth clamp, so it needs its own bound.
+    let max_depth = (req.remaining_depth.max(0) as usize).min(64);
+    let trace_id = req.trace_id.clone();
+
+    // Build the visited set from the request.
+    let visited: HashSet<String> = req.visited_canonical_ids.into_iter().collect();
+
+    // Look up the entry symbol by canonical_id.
+    let entry = store
+        .symbol_by_canonical_id(&req.entry_canonical_id)
+        .map_err(|e| Status::internal(format!("canonical_id lookup failed: {e}")))?;
+
+    let Some(entry) = entry else {
+        // Entry symbol not found in this database — it's a boundary from
+        // this server's perspective. Return empty response.
+        return Ok(FlowTraceContinueResponse {
+            spans: vec![],
+            boundaries: vec![BoundarySymbolProto {
+                canonical_id: req.entry_canonical_id.clone(),
+                name: String::new(),
+                parent_span_id: req.parent_span_id.clone(),
+            }],
+            truncated: false,
+        });
+    };
+
+    // Get the repo URL for source annotation.
+    let repo_url = store.repo_url_for_uid(&entry.repo_uid).unwrap_or_default();
+
+    // Recursive trace builder.
+    struct TraceCtx<'a> {
+        store: &'a nestweaver_store::GraphStore,
+        trace_id: String,
+        repo_url: String,
+        visited: HashSet<String>,
+        spans: Vec<TraceSpanProto>,
+        boundaries: Vec<BoundarySymbolProto>,
+        truncated: bool,
+        make_span_id: Box<dyn Fn() -> String>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_trace(
+        ctx: &mut TraceCtx<'_>,
+        uid: &str,
+        canonical_id: &str,
+        name: &str,
+        file_path: &str,
+        start_line: u32,
+        repo_url: &str,
+        parent_span_id: Option<&str>,
+        depth: usize,
+        max_depth: usize,
+    ) -> String {
+        let span_id = (ctx.make_span_id)();
+
+        // Mark this canonical_id as visited.
+        ctx.visited.insert(canonical_id.to_string());
+
+        let mut callee_span_ids = Vec::new();
+
+        if depth < max_depth {
+            // On a DB read error, mark the trace truncated (incomplete) rather than
+            // silently pruning this branch as if it had no callees.
+            let callees = match ctx.store.callees_of(uid) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("walk_trace: callees_of failed: {e}");
+                    ctx.truncated = true;
+                    Vec::new()
+                }
+            };
+            for callee in &callees {
+                let callee_cid = callee.canonical_id.as_deref().unwrap_or("");
+
+                // Skip visited symbols (cycle prevention).
+                if !callee_cid.is_empty() && ctx.visited.contains(callee_cid) {
+                    continue;
+                }
+
+                if callee_cid.is_empty() {
+                    // Symbol without canonical_id — skip as boundary.
+                    continue;
+                }
+
+                // Resolve the callee's repo URL from its repo_uid. If
+                // the callee belongs to a different repo than the entry
+                // symbol, this ensures the span carries the correct URL.
+                let callee_repo_url = ctx
+                    .store
+                    .repo_url_for_uid(&callee.repo_uid)
+                    .unwrap_or_else(|| ctx.repo_url.clone());
+
+                let child_span_id = walk_trace(
+                    ctx,
+                    &callee.uid,
+                    callee_cid,
+                    &callee.name,
+                    &callee.file_path,
+                    callee.start_line,
+                    &callee_repo_url,
+                    Some(&span_id),
+                    depth + 1,
+                    max_depth,
+                );
+                callee_span_ids.push(child_span_id);
+            }
+        } else if depth >= max_depth {
+            // Check if there are callees we didn't follow due to depth limit.
+            // On a DB read error, mark the trace truncated (incomplete) rather than
+            // silently pruning this branch as if it had no callees.
+            let callees = match ctx.store.callees_of(uid) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("walk_trace: callees_of failed: {e}");
+                    ctx.truncated = true;
+                    Vec::new()
+                }
+            };
+            if !callees.is_empty() {
+                ctx.truncated = true;
+            }
+        }
+
+        ctx.spans.push(TraceSpanProto {
+            trace_id: ctx.trace_id.clone(),
+            span_id: span_id.clone(),
+            parent_span_id: parent_span_id.map(String::from),
+            canonical_id: canonical_id.to_string(),
+            name: name.to_string(),
+            repo_url: repo_url.to_string(),
+            file_path: file_path.to_string(),
+            start_line: start_line as i32,
+            callee_span_ids,
+            source: "server".to_string(),
+        });
+
+        span_id
+    }
+
+    let entry_cid = entry
+        .canonical_id
+        .as_deref()
+        .unwrap_or(&req.entry_canonical_id);
+
+    let mut ctx = TraceCtx {
+        store,
+        trace_id: trace_id.clone(),
+        repo_url: repo_url.clone(),
+        visited,
+        spans: Vec::new(),
+        boundaries: Vec::new(),
+        truncated: false,
+        make_span_id: Box::new(make_span_id),
+    };
+
+    walk_trace(
+        &mut ctx,
+        &entry.uid,
+        entry_cid,
+        &entry.name,
+        &entry.file_path,
+        entry.start_line,
+        &repo_url,
+        if req.parent_span_id.is_empty() {
+            None
+        } else {
+            Some(&req.parent_span_id)
+        },
+        0,
+        max_depth,
+    );
+
+    Ok(FlowTraceContinueResponse {
+        spans: ctx.spans,
+        boundaries: ctx.boundaries,
+        truncated: ctx.truncated,
+    })
 }
 
 // ── Process title helper ────────────────────────────────────────────────
@@ -2918,5 +5958,1420 @@ fn set_process_title(title: &str) {
         // Note: macOS doesn't provide setproctitle in the C library, so the daemon
         // process title cannot be modified on macOS. Users can identify the daemon
         // via pgrep using the socket path instead.
+    }
+}
+
+// ── ImpactAnalysis implementation ───────────────────────────────────────
+
+/// Server-side impact analysis: converts proto atomic changes to engine types,
+/// runs graph queries for affected symbols, and returns classified impacts.
+fn impact_analysis_impl(
+    store: &nestweaver_store::GraphStore,
+    req: ImpactAnalysisRequest,
+) -> Result<ImpactAnalysisResponse, Status> {
+    use nestweaver_engine::atomic_changes::{AtomicChange, ImpactSeverity, analyze_impact};
+
+    // Convert proto AtomicChangeProto -> engine AtomicChange
+    let changes: Vec<AtomicChange> = req
+        .changes
+        .iter()
+        .filter_map(proto_to_atomic_change)
+        .collect();
+
+    if changes.is_empty() {
+        return Ok(ImpactAnalysisResponse {
+            impacts: vec![],
+            total_impacted_files: 0,
+            total_impacted_repos: 0,
+            impacted_repo_urls: vec![],
+        });
+    }
+
+    let max_depth = if req.max_depth > 0 {
+        req.max_depth as u32
+    } else {
+        3 // default
+    };
+
+    let results = analyze_impact(store, &changes, max_depth, req.include_tests)
+        .map_err(|e| Status::internal(format!("impact analysis failed: {e}")))?;
+
+    // Collect unique impacted files and repos
+    let mut impacted_files = std::collections::HashSet::new();
+    let mut impacted_repos = std::collections::HashSet::new();
+
+    let impacts: Vec<ImpactItem> = results
+        .iter()
+        .map(|r| {
+            impacted_files.insert(r.affected_file.clone());
+            if !r.affected_repo_url.is_empty() {
+                impacted_repos.insert(r.affected_repo_url.clone());
+            }
+
+            let severity = match r.severity {
+                ImpactSeverity::Breaking => Severity::Breaking,
+                ImpactSeverity::Warning => Severity::Warning,
+                ImpactSeverity::Info => Severity::Info,
+            };
+
+            let change_kind = match r.change_kind.as_str() {
+                "SYMBOL_REMOVED" => ChangeKind::SymbolRemoved,
+                "SIGNATURE_CHANGED" => ChangeKind::SignatureChanged,
+                "SYMBOL_RENAMED" => ChangeKind::SymbolRenamed,
+                "SYMBOL_MOVED" => ChangeKind::SymbolMoved,
+                "EXPORT_REMOVED" => ChangeKind::ExportRemoved,
+                "EXPORT_ADDED" => ChangeKind::ExportAdded,
+                "SYMBOL_ADDED" => ChangeKind::SymbolAdded,
+                _ => ChangeKind::Unspecified,
+            };
+
+            ImpactItem {
+                change_canonical_id: r.change_canonical_id.clone(),
+                change_kind: change_kind.into(),
+                affected_canonical_id: r.affected_canonical_id.clone(),
+                affected_name: r.affected_name.clone(),
+                affected_repo_url: r.affected_repo_url.clone(),
+                affected_file: r.affected_file.clone(),
+                affected_line: r.affected_line as i32,
+                affected_signature: r.affected_signature.clone(),
+                severity: severity.into(),
+                reason: r.reason.clone(),
+            }
+        })
+        .collect();
+
+    let impacted_repo_urls: Vec<String> = impacted_repos.into_iter().collect();
+
+    Ok(ImpactAnalysisResponse {
+        impacts,
+        total_impacted_files: impacted_files.len() as i32,
+        total_impacted_repos: impacted_repo_urls.len() as i32,
+        impacted_repo_urls,
+    })
+}
+
+/// Convert a proto AtomicChangeProto to an engine AtomicChange.
+fn proto_to_atomic_change(
+    proto: &AtomicChangeProto,
+) -> Option<nestweaver_engine::atomic_changes::AtomicChange> {
+    use nestweaver_engine::atomic_changes::AtomicChange;
+    use nestweaver_schema::SymbolKind;
+
+    let kind = ChangeKind::try_from(proto.kind).unwrap_or(ChangeKind::Unspecified);
+    let parse_kind = |s: &str| -> SymbolKind {
+        match s {
+            "Function" => SymbolKind::Function,
+            "Class" => SymbolKind::Class,
+            "Method" => SymbolKind::Method,
+            "Interface" => SymbolKind::Interface,
+            "Trait" => SymbolKind::Trait,
+            "Enum" => SymbolKind::Enum,
+            "Module" => SymbolKind::Module,
+            _ => SymbolKind::Function,
+        }
+    };
+
+    match kind {
+        ChangeKind::SymbolAdded => Some(AtomicChange::SymbolAdded {
+            name: proto.name.clone(),
+            kind: parse_kind(&proto.symbol_kind),
+            signature: proto.new_signature.clone().unwrap_or_default(),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::SymbolRemoved => Some(AtomicChange::SymbolRemoved {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            kind: parse_kind(&proto.symbol_kind),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::SignatureChanged => Some(AtomicChange::SignatureChanged {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            old_signature: proto.old_signature.clone().unwrap_or_default(),
+            new_signature: proto.new_signature.clone().unwrap_or_default(),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::SymbolRenamed => Some(AtomicChange::SymbolRenamed {
+            old_canonical_id: proto.canonical_id.clone(),
+            old_name: proto.old_name.clone().unwrap_or_default(),
+            new_name: proto.new_name.clone().unwrap_or_default(),
+            new_canonical_id: String::new(), // Computed client-side
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::SymbolMoved => Some(AtomicChange::SymbolMoved {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            old_file: proto.old_file.clone().unwrap_or_default(),
+            new_file: proto.new_file.clone().unwrap_or_default(),
+        }),
+        ChangeKind::ExportAdded => Some(AtomicChange::ExportAdded {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::ExportRemoved => Some(AtomicChange::ExportRemoved {
+            canonical_id: proto.canonical_id.clone(),
+            name: proto.name.clone(),
+            file_path: proto.file_path.clone(),
+        }),
+        ChangeKind::Unspecified => None,
+    }
+}
+
+/// Probe a remote's ref SHA via `git ls-remote`, with a hard timeout.
+///
+/// This is the blocking body run off the async runtime by the poll scheduler.
+/// It distinguishes three outcomes so a genuine failure is never mistaken for
+/// "no new commit":
+/// - `Ok(Some(sha))` — the remote advertises the ref.
+/// - `Ok(None)` — ls-remote succeeded but advertised nothing for `ref_spec`
+///   (e.g. an unknown branch); there is simply nothing to enqueue.
+/// - `Err(_)` — git exited non-zero or timed out (unreachable/blackholed remote,
+///   auth failure, bad URL). The caller logs and skips rather than treating the
+///   empty stdout as an up-to-date signal.
+fn probe_remote_sha(
+    config_args: &[String],
+    url: &str,
+    ref_spec: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(config_args);
+    cmd.args(["ls-remote", url, ref_spec]);
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout(
+        cmd,
+        nestweaver_engine::git_cmd::git_net_timeout(),
+    )?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git ls-remote failed for {url} ({ref_spec}): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let sha = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Ok(if sha.is_empty() { None } else { Some(sha) })
+}
+
+#[cfg(test)]
+mod startup_helper_tests {
+    use super::*;
+    use nestweaver_engine::{RepoConfig, RepoType};
+
+    /// Helper: init a git repo with one commit and return its path.
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "hi").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "init"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        }
+    }
+
+    fn test_repo(uid: &str, url: &str, root_path: Option<&str>) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: "abc".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: root_path.map(String::from),
+        }
+    }
+
+    /// DATA-LOSS REGRESSION GUARD: `prune_stale_repos` must NEVER delete a
+    /// repo with a remote identity url and no local working tree
+    /// (`root_path: None`) — e.g. a server-side bare-clone repo. The old
+    /// implementation derived a disk path from `url.strip_prefix("file://")`,
+    /// which fell back to the raw https URL, never exists on disk, and
+    /// bulk-deleted the repo's entire graph.
+    #[test]
+    fn prune_stale_repos_never_deletes_remote_identity_repos() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&test_repo(
+                "repo:server",
+                "https://github.com/acme/server-only.git",
+                None,
+            ))
+            .unwrap();
+
+        let removed = prune_stale_repos(&store).unwrap();
+
+        assert!(
+            removed.is_empty(),
+            "remote-identity repo without a working tree must be skipped, got {removed:?}"
+        );
+        assert!(
+            store.lookup_repo("repo:server").unwrap().is_some(),
+            "server-side repo must survive prune_stale"
+        );
+    }
+
+    /// Repos with a recorded root_path (or a legacy file:// identity) whose
+    /// working tree vanished ARE pruned; ones that still exist are kept.
+    #[test]
+    fn prune_stale_repos_prunes_missing_local_trees_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let existing = tmp.path().join("still-here");
+        std::fs::create_dir_all(&existing).unwrap();
+        let gone = tmp.path().join("gone");
+
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        // Origin identity + existing working tree → kept.
+        store
+            .insert_repo(&test_repo(
+                "repo:kept",
+                "https://github.com/acme/kept.git",
+                Some(existing.to_str().unwrap()),
+            ))
+            .unwrap();
+        // Origin identity + vanished working tree → pruned.
+        store
+            .insert_repo(&test_repo(
+                "repo:moved",
+                "https://github.com/acme/moved.git",
+                Some(gone.to_str().unwrap()),
+            ))
+            .unwrap();
+        // Legacy row: file:// identity, no root_path, tree vanished → pruned
+        // via the local_root() compat fallback.
+        store
+            .insert_repo(&test_repo(
+                "repo:legacy",
+                &format!("file://{}/legacy-gone", tmp.path().display()),
+                None,
+            ))
+            .unwrap();
+
+        let removed = prune_stale_repos(&store).unwrap();
+
+        assert_eq!(removed.len(), 2, "got {removed:?}");
+        assert!(store.lookup_repo("repo:kept").unwrap().is_some());
+        assert!(store.lookup_repo("repo:moved").unwrap().is_none());
+        assert!(store.lookup_repo("repo:legacy").unwrap().is_none());
+    }
+
+    /// The gRPC mutating-tool gate MUST reference the single shared
+    /// `MUTATING_TOOLS` list defined in `nestweaver-mcp`, not a private copy
+    /// that can drift from the HTTP/MCP gate. This asserts the daemon reads the
+    /// shared const (it won't compile if the daemon reintroduces a private one)
+    /// and pins the known set so adding a mutating tool is a deliberate edit.
+    #[test]
+    fn mutating_tools_gate_uses_shared_const() {
+        assert_eq!(
+            nestweaver_mcp::http::MUTATING_TOOLS,
+            &[
+                "brain_add_source",
+                "brain_remove_source",
+                "brain_memory_consolidate",
+                "set_extension",
+                "prune_stale",
+            ]
+        );
+        // The daemon's gate is this exact const, not a copy.
+        assert!(std::ptr::eq(
+            MUTATING_TOOLS.as_ptr(),
+            nestweaver_mcp::http::MUTATING_TOOLS.as_ptr(),
+        ));
+    }
+
+    /// Two co-located replicas — distinct `--db` files under a shared parent
+    /// dir — must get DISTINCT private working directories. Before the fix the
+    /// working dir was `<parent>/replica-work` (keyed only on the parent), so
+    /// both replicas shared one mutable path and the second boot's in-place
+    /// `fs::copy` truncated the first replica's open working copy.
+    #[test]
+    fn co_located_replicas_use_distinct_working_dirs() {
+        let parent = Path::new("/data");
+        let db_a = parent.join("a.lbug");
+        let db_b = parent.join("b.lbug");
+
+        let id_a = lifecycle::instance_id_from_db_path(&db_a);
+        let id_b = lifecycle::instance_id_from_db_path(&db_b);
+        assert_ne!(
+            id_a, id_b,
+            "distinct --db paths must yield distinct instance ids"
+        );
+
+        let work_a = replica_working_dir(&db_a, &id_a);
+        let work_b = replica_working_dir(&db_b, &id_b);
+
+        assert_ne!(
+            work_a, work_b,
+            "co-located replicas with distinct --db must not share a working dir"
+        );
+        // Both stay under the shared parent (the snapshot/db live there) …
+        assert_eq!(work_a.parent(), Some(parent));
+        assert_eq!(work_b.parent(), Some(parent));
+        // … but neither is the old collision-prone shared path.
+        assert_ne!(work_a, parent.join("replica-work"));
+        assert_ne!(work_b, parent.join("replica-work"));
+    }
+
+    /// The instance lock is exclusive: while one holder keeps the pidfile flock,
+    /// a second claim on the SAME pidfile is refused — this is what stops a
+    /// duplicate same-`--db` replica from proceeding to materialize (and
+    /// truncate a live sibling's working copy). Releasing the first holder frees
+    /// the lock for a fresh claim.
+    #[cfg(unix)]
+    #[test]
+    fn claim_pidfile_lock_is_exclusive_until_released() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pid_path = tmp.path().join("rt").join("daemon.pid");
+
+        let first = claim_pidfile_lock(&pid_path).expect("first claim should acquire the lock");
+
+        // A second claim on the same pidfile — a duplicate instance — is refused.
+        let err = claim_pidfile_lock(&pid_path)
+            .expect_err("a second claim must be refused while the lock is held");
+        assert!(
+            err.to_string().contains("already running"),
+            "err was: {err}"
+        );
+
+        // Release the first holder; the lock is now free to claim again.
+        drop(first);
+        claim_pidfile_lock(&pid_path).expect("claim should succeed once the lock is released");
+    }
+
+    /// A reachable ref resolves to a 40-char SHA.
+    #[test]
+    fn probe_remote_sha_returns_sha_for_existing_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("src");
+        init_repo(&repo);
+        let url = format!("file://{}", repo.display());
+
+        let sha = probe_remote_sha(&[], &url, "HEAD")
+            .expect("ls-remote against a valid repo should succeed")
+            .expect("HEAD should advertise a SHA");
+        assert_eq!(sha.len(), 40, "should be a full SHA, got {sha:?}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A ref the remote doesn't advertise is `Ok(None)` — successful probe,
+    /// nothing to enqueue — NOT an error.
+    #[test]
+    fn probe_remote_sha_returns_none_for_missing_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("src");
+        init_repo(&repo);
+        let url = format!("file://{}", repo.display());
+
+        let result = probe_remote_sha(&[], &url, "refs/heads/does-not-exist")
+            .expect("ls-remote itself should still succeed for an unknown ref");
+        assert!(
+            result.is_none(),
+            "an unadvertised ref must be None, not a SHA"
+        );
+    }
+
+    /// A failing ls-remote (non-zero exit — e.g. an unreachable repo) must be an
+    /// `Err`, NOT `Ok(None)`. This is the bug: without a status check, git's
+    /// empty stdout on failure is indistinguishable from "no new commit".
+    #[test]
+    fn probe_remote_sha_errors_on_git_failure() {
+        // A path that isn't a git repo → `git ls-remote` exits non-zero with
+        // empty stdout.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bogus = format!("file://{}/not-a-repo", tmp.path().display());
+
+        let result = probe_remote_sha(&[], &bogus, "HEAD");
+        assert!(
+            result.is_err(),
+            "a non-zero git exit must be an error, not Ok(None): {result:?}"
+        );
+    }
+
+    /// Dropping the request-future scope (client cancel / disconnect) must trip
+    /// the shared cooperative cancel flag, so in-flight `spawn_blocking` work
+    /// bails instead of running to completion for a caller that is gone.
+    #[tokio::test]
+    async fn cancelled_flag_trips_on_request_future_drop() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let _disconnect_guard = arm_disconnect_cancel(cancel.clone());
+            // Still armed: nothing has been dropped yet.
+            assert!(!cancel.load(Ordering::Relaxed), "flag must start unset");
+            // guard drops here → token cancelled → listener stores true
+        }
+        // The listener runs on a spawned task; poll briefly for it to observe.
+        for _ in 0..200 {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "dropping the request-future guard must trip the cancel flag"
+        );
+    }
+
+    #[test]
+    fn validate_token_lengths_rejects_short_token() {
+        let short = Some("abcd".to_string());
+        assert!(validate_token_lengths(&short, &None).is_err());
+        assert!(validate_token_lengths(&None, &short).is_err());
+    }
+
+    #[test]
+    fn validate_token_lengths_accepts_min_length() {
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        assert_eq!(tok.as_ref().unwrap().len(), MIN_TOKEN_LEN);
+        assert!(validate_token_lengths(&tok, &None).is_ok());
+    }
+
+    #[test]
+    fn validate_token_lengths_rejects_equal_auth_and_admin() {
+        // A query (auth) token equal to the admin token collapses the privilege
+        // boundary: admin access is granted on admin-token match, so an identical
+        // query token would make every query-token holder an admin.
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let other = Some("b".repeat(MIN_TOKEN_LEN));
+        assert!(validate_token_lengths(&tok, &tok).is_err());
+        // Distinct tokens of valid length remain acceptable.
+        assert!(validate_token_lengths(&tok, &other).is_ok());
+    }
+
+    #[test]
+    fn validate_token_lengths_accepts_none() {
+        assert!(validate_token_lengths(&None, &None).is_ok());
+    }
+
+    #[test]
+    fn validate_token_lengths_rejects_admin_without_auth() {
+        // An admin token alone disables auth entirely (the auth layer is only
+        // installed with a query token), so it must be rejected at startup.
+        let admin = Some("a".repeat(MIN_TOKEN_LEN));
+        assert!(validate_token_lengths(&None, &admin).is_err());
+        // But a query token alone (read-gated, mutations denied) is fine.
+        let auth = Some("q".repeat(MIN_TOKEN_LEN));
+        assert!(validate_token_lengths(&auth, &None).is_ok());
+    }
+
+    #[test]
+    fn is_unsafe_index_root_rejects_system_roots_but_allows_real_repos() {
+        use std::path::Path;
+        for bad in [
+            "", "/", "/Users", "/System", "/Library", "/private", "/tmp", "/Volumes", "/dev",
+            "/usr", "/etc",
+        ] {
+            assert!(
+                is_unsafe_index_root(Path::new(bad)),
+                "{bad:?} is a system root and must be refused"
+            );
+        }
+        for ok in [
+            "/home/user/dev/myrepo",
+            "/tmp/ppi2/repo",
+            "/private/tmp/abc/project",
+            "/var/folders/xx/y/T/repo",
+        ] {
+            assert!(
+                !is_unsafe_index_root(Path::new(ok)),
+                "{ok:?} is a specific repo path and must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn is_unsafe_index_root_handles_macos_firmlink_and_case() {
+        use std::path::Path;
+        for bad in [
+            // The real data-volume root on modern macOS (a firmlink) — refuse.
+            "/System/Volumes",
+            "/System/Volumes/Data",
+            // APFS is case-insensitive but `canonicalize` does NOT normalize
+            // case, so wrong-case system roots must still be refused.
+            "/users",
+            "/USERS",
+            "/system",
+            "/Var",
+            "/VOLUMES",
+            "/System/Volumes/data",
+        ] {
+            assert!(
+                is_unsafe_index_root(Path::new(bad)),
+                "{bad:?} is a system root and must be refused"
+            );
+        }
+        // A real repo whose deep path merely CONTAINS a dangerous component
+        // name must still be allowed (exact-match only, not substring).
+        for ok in [
+            "/home/user/dev/System",
+            "/home/user/dev/Volumes/app",
+            "/private/tmp/x/Data",
+        ] {
+            assert!(
+                !is_unsafe_index_root(Path::new(ok)),
+                "{ok:?} is a specific repo path and must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_requires_no_active_work_or_indexing() {
+        assert!(is_idle(0, false), "no active work and not indexing is idle");
+        assert!(!is_idle(1, false), "active read/write blocks idle");
+        // An in-flight index job bumps `indexing_active`, not `active_writes`,
+        // so it must independently block an idle shutdown.
+        assert!(!is_idle(0, true), "an in-flight index blocks idle shutdown");
+    }
+
+    #[test]
+    fn validate_bind_security_requires_tls_for_non_loopback() {
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
+
+        // Non-loopback bind with an auth token but NO TLS must be rejected:
+        // bearer tokens and source would travel in cleartext.
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &None, &None, false).is_err());
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &None, false).is_err());
+
+        // Non-loopback bind with auth token AND TLS is acceptable.
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &key, false).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_security_requires_auth_for_non_loopback() {
+        let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
+        // Preserves the pre-existing invariant: non-loopback requires auth even with TLS.
+        assert!(validate_bind_security("0.0.0.0:9378", &None, &cert, &key, false).is_err());
+    }
+
+    #[test]
+    fn acme_provides_tls_reflects_build_feature() {
+        // A domain request only counts as TLS when the `acme` feature is compiled
+        // in; without it, ACME cannot provision a cert.
+        assert_eq!(acme_provides_tls(true), cfg!(feature = "acme"));
+        // No domain requested is never TLS regardless of the build.
+        assert!(!acme_provides_tls(false));
+    }
+
+    #[test]
+    fn acme_bind_gate_fails_closed_without_feature() {
+        // B2: a non-loopback bind that relies on ACME for TLS must be REFUSED when
+        // the binary was compiled without the `acme` feature (fail closed), and
+        // ACCEPTED when the feature is present (ACME provides TLS). Drive the gate
+        // with the effective, build-aware ACME flag exactly as the call site does.
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let effective_acme = acme_provides_tls(/* domain present */ true);
+        let result = validate_bind_security("0.0.0.0:9378", &tok, &None, &None, effective_acme);
+        if cfg!(feature = "acme") {
+            assert!(
+                result.is_ok(),
+                "with the acme feature, ACME counts as TLS for a non-loopback bind"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "without the acme feature, an ACME-only non-loopback bind must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_bind_security_treats_acme_as_tls() {
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        // ACME provisions a trusted cert at runtime, so a non-loopback bind with
+        // a token and ACME enabled — but no static --tls-cert/--tls-key — is OK.
+        assert!(validate_bind_security("0.0.0.0:9378", &tok, &None, &None, true).is_ok());
+        // ...but ACME does not waive the auth requirement.
+        assert!(validate_bind_security("0.0.0.0:9378", &None, &None, &None, true).is_err());
+    }
+
+    #[test]
+    fn acme_bootstrap_failure_never_serves_plaintext() {
+        // SECURITY (B1): when ACME provisioning fails on a NON-loopback bind, the
+        // fallback decision must be a TLS acceptor (self-signed interim) — never a
+        // `None` "serve plaintext" state. Encryption is preserved even though the
+        // interim cert is untrusted.
+        let non_loopback = acme_failure_fallback_acceptor("example.com", false)
+            .expect("non-loopback ACME failure must produce a TLS acceptor, not error");
+        assert!(
+            non_loopback.is_some(),
+            "non-loopback ACME failure must fall back to TLS, never cleartext"
+        );
+
+        // Loopback is process-local, so plaintext is acceptable there (matches the
+        // pre-existing loopback fast path): the decision is `None`.
+        let loopback = acme_failure_fallback_acceptor("example.com", true)
+            .expect("loopback fallback decision must not error");
+        assert!(
+            loopback.is_none(),
+            "loopback ACME failure may serve plaintext (process-local)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_times_out_on_silent_client() {
+        // B3: a client that opens a TCP connection but never sends a ClientHello
+        // must NOT block the accept loop — the handshake times out (Ok(None)) so
+        // the connection is dropped and new connections keep flowing.
+        let acceptor = build_self_signed_acceptor(&["localhost".to_string()])
+            .expect("build self-signed acceptor");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_tls_with_timeout(&acceptor, stream, Duration::from_millis(200)).await
+        });
+
+        // Connect but send nothing — no TLS ClientHello ever arrives.
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let result = server.await.unwrap();
+        assert!(
+            matches!(result, Ok(None)),
+            "a silent client must time out (Ok(None)), got {result:?}"
+        );
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn handshake_concurrency_is_capped() {
+        // B3 follow-up: each in-flight handshake holds a semaphore permit for its
+        // whole duration, so N stalled (silent) handshakes exhaust an N-permit
+        // pool — the accept loop cannot spawn an (N+1)th until one releases. This
+        // caps the self-inflicted DoS of unbounded per-connection tasks.
+        use std::sync::Arc;
+        use tokio::sync::{Semaphore, mpsc};
+
+        let acceptor = build_self_signed_acceptor(&["localhost".to_string()]).unwrap();
+        let sem = Arc::new(Semaphore::new(2));
+        let (tx, _rx) = mpsc::channel(8);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Occupy both permits with silent clients (never send a ClientHello).
+        let mut handles = Vec::new();
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            clients.push(client);
+            let (server_stream, _) = listener.accept().await.unwrap();
+            handles.push(tokio::spawn(drive_capped_handshake(
+                permit,
+                acceptor.clone(),
+                server_stream,
+                Duration::from_millis(300),
+                tx.clone(),
+                "test",
+            )));
+        }
+
+        // Both permits are held while the handshakes are in flight: the cap is
+        // reached, so no further permit is available right now.
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "in-flight handshakes must hold the permits (cap reached)"
+        );
+
+        // Once the handshakes time out, their permits are returned to the pool.
+        for h in handles {
+            let _ = h.await;
+        }
+        assert_eq!(
+            sem.available_permits(),
+            2,
+            "permits must be released after handshakes finish"
+        );
+        drop(clients);
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_completes_for_valid_client() {
+        // Sanity: a real TLS client completes the handshake well within the
+        // timeout, so the timeout does not reject legitimate connections.
+        use tokio_rustls::TlsConnector;
+
+        let bundle =
+            nestweaver_engine::tls::generate_tls_bundle(&["localhost".to_string()], 30, false)
+                .unwrap();
+        // Build the acceptor from the SAME bundle the client trusts so cert
+        // verification succeeds (build_self_signed_acceptor mints its own CA).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certs = rustls_pemfile::certs(&mut bundle.server_cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut bundle.server_key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_tls_with_timeout(&acceptor, stream, Duration::from_secs(5)).await
+        });
+
+        // Client trusts the generated CA and connects to `localhost`.
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut bundle.ca_cert_pem.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(std::sync::Arc::new(client_config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let client_handshake = tokio::spawn(async move { connector.connect(domain, tcp).await });
+
+        let result = server.await.unwrap();
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "a valid TLS client must complete the handshake, got {result:?}"
+        );
+        assert!(client_handshake.await.unwrap().is_ok());
+    }
+
+    #[test]
+    fn bind_addr_is_loopback_classifies_safely() {
+        assert!(bind_addr_is_loopback("127.0.0.1:9378"));
+        assert!(bind_addr_is_loopback("[::1]:9378"));
+        assert!(!bind_addr_is_loopback("0.0.0.0:9378"));
+        assert!(!bind_addr_is_loopback("10.0.0.5:9378"));
+        // Unparseable → treated as non-loopback (safe default).
+        assert!(!bind_addr_is_loopback("localhost:9378"));
+    }
+
+    #[test]
+    fn validate_bind_security_allows_loopback_plaintext() {
+        // Loopback is process-local; no auth/TLS required (the fast local path).
+        assert!(validate_bind_security("127.0.0.1:9378", &None, &None, &None, false).is_ok());
+        assert!(validate_bind_security("[::1]:9378", &None, &None, &None, false).is_ok());
+    }
+
+    #[test]
+    fn validate_webhook_secret_lengths_rejects_short_secret() {
+        let short = Some("secret".to_string());
+        assert!(validate_webhook_secret_lengths(&short, &None).is_err());
+        assert!(validate_webhook_secret_lengths(&None, &short).is_err());
+    }
+
+    #[test]
+    fn validate_webhook_secret_lengths_accepts_min_length() {
+        let secret = Some("a".repeat(MIN_WEBHOOK_SECRET_LEN));
+        assert_eq!(secret.as_ref().unwrap().len(), MIN_WEBHOOK_SECRET_LEN);
+        assert!(validate_webhook_secret_lengths(&secret, &None).is_ok());
+        assert!(validate_webhook_secret_lengths(&secret, &secret).is_ok());
+    }
+
+    #[test]
+    fn validate_webhook_secret_lengths_accepts_none() {
+        assert!(validate_webhook_secret_lengths(&None, &None).is_ok());
+    }
+
+    fn repo_cfg(url: &str, repo_type: Option<RepoType>) -> RepoConfig {
+        RepoConfig {
+            url: url.to_string(),
+            repo_type,
+            name: None,
+            sparse: None,
+            pin_sha: None,
+            use_git_activity: None,
+            branch: None,
+            poll: None,
+        }
+    }
+
+    #[test]
+    fn build_repo_types_maps_vault_and_code_under_canonical_keys() {
+        let vault_url = "https://github.com/kory/notes.git";
+        let code_url = "https://github.com/kory/app.git";
+        let repos = vec![
+            repo_cfg(vault_url, Some(RepoType::Vault)),
+            // Untyped repo defaults to code.
+            repo_cfg(code_url, None),
+        ];
+        let map = build_repo_types(&repos);
+
+        let vault_key = nestweaver_engine::jobs::canonical_repo_id(vault_url);
+        assert_eq!(map.get(&vault_key), Some(&RepoType::Vault));
+
+        let code_key = nestweaver_engine::jobs::canonical_repo_id(code_url);
+        assert_eq!(map.get(&code_key), Some(&RepoType::Code));
+    }
+
+    /// A `nestweaver_engine::EmbedQueryFn` that probes the write gate from
+    /// *inside* `embed_query` — the moment the embed write actually executes.
+    /// It records whether `write_mutex` is held and the value of `active_writes`
+    /// at that instant, so a test can assert the embed write ran under the same
+    /// gate every other daemon mutation uses.
+    #[cfg(feature = "embed")]
+    struct GateProbeEmbed {
+        write_mutex: Arc<tokio::sync::Mutex<()>>,
+        active_writes: Arc<AtomicU32>,
+        observed_locked: Arc<AtomicBool>,
+        observed_writes: Arc<AtomicU32>,
+        done: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    #[cfg(feature = "embed")]
+    impl nestweaver_engine::EmbedQueryFn for GateProbeEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            // Capture the gate state at the exact point the embed write runs.
+            self.observed_locked
+                .store(self.write_mutex.try_lock().is_err(), Ordering::Relaxed);
+            self.observed_writes.store(
+                self.active_writes.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            if let Some(tx) = self.done.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            Ok(vec![0.1_f32, 0.2, 0.3])
+        }
+    }
+
+    /// The watcher's embed-on-change callback must perform its `add_embedding`
+    /// writes under the write gate the watcher thread holds (`write_mutex` +
+    /// `ConnectionGuard::write`), not on a detached fire-and-forget task that
+    /// escapes it. Escaping the gate (a) races a backup's sidecar copy and
+    /// (b) is invisible to the shutdown drain (`active_writes`).
+    ///
+    /// This mirrors the `watch_vault`/`watch_code` wiring (server.rs ~863-872):
+    /// the watcher thread takes `write_mutex.blocking_lock()` + a write guard
+    /// for its whole run and calls the callback inline within that hold.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_embed_holds_write_gate() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+
+        // One un-embedded symbol so the callback reaches exactly one embed_query.
+        let sym_uid = "sym-gate-probe".to_string();
+        store
+            .insert_symbol(&Symbol {
+                uid: sym_uid.clone(),
+                name: "gate_probe".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo-1".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn gate_probe()".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let write_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let active_writes = Arc::new(AtomicU32::new(0));
+        let observed_locked = Arc::new(AtomicBool::new(false));
+        let observed_writes = Arc::new(AtomicU32::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let probe = Arc::new(GateProbeEmbed {
+            write_mutex: write_mutex.clone(),
+            active_writes: active_writes.clone(),
+            observed_locked: observed_locked.clone(),
+            observed_writes: observed_writes.clone(),
+            done: std::sync::Mutex::new(Some(done_tx)),
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+
+        let cb = DaemonService::make_embed_on_change(embed_model, store.clone())
+            .expect("embed callback should be present when a model is loaded");
+
+        // Mirror the watcher thread: hold write_mutex + bump active_writes for
+        // the callback's whole run, exactly as watch_vault/watch_code do.
+        let wm = write_mutex.clone();
+        let aw = active_writes.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let _write_lock = wm.blocking_lock();
+            aw.fetch_add(1, Ordering::Relaxed); // == ConnectionGuard::write
+            cb();
+            aw.fetch_sub(1, Ordering::Relaxed); // == guard drop on watcher exit
+        });
+
+        // Wait for the embed write to run (or fail the test if it never does).
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("embed_query must run for the inserted symbol");
+        handle.await.unwrap();
+
+        // The whole point: while the embed write ran, the write gate was held.
+        assert!(
+            observed_locked.load(Ordering::Relaxed),
+            "embed write must run while write_mutex is held (backup-safe)"
+        );
+        assert!(
+            observed_writes.load(Ordering::Relaxed) > 0,
+            "embed write must run while active_writes > 0 (drain-visible)"
+        );
+        // And it actually wrote the embedding.
+        assert!(
+            store.has_embedding(&sym_uid),
+            "callback should have embedded the pending symbol"
+        );
+    }
+
+    /// Build a minimal `DaemonState` with a writer-mode Tantivy index for
+    /// exercising admin mutation RPCs in isolation.
+    fn test_state_with_writer() -> Arc<DaemonState> {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let tantivy = Arc::new(TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap());
+        // Keep the temp dir alive for the duration of the test process.
+        std::mem::forget(dir);
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        Arc::new(DaemonState {
+            store,
+            tantivy: Some(tantivy),
+            db_path,
+            instance_id: "default".to_string(),
+            start_time: Instant::now(),
+            active_reads: Arc::new(AtomicU32::new(0)),
+            active_writes: Arc::new(AtomicU32::new(0)),
+            idle_notify: Arc::new(Notify::new()),
+            shutdown_tx,
+            watcher_stop: std::sync::Mutex::new(None),
+            instance_cfg: None,
+            embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            server_mode: false,
+            read_only: false,
+            indexing_active: Arc::new(AtomicBool::new(false)),
+            indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
+            indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+            safeguards: QuerySafeguards::default_server(),
+            rate_limiters: None,
+            drained: Arc::new(AtomicBool::new(false)),
+            admin_token: None,
+            admin_state: std::sync::OnceLock::new(),
+            worker_handle: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The admin `reindex_search` RPC rebuilds the whole Tantivy index. Like
+    /// every other daemon mutation (`prune_stale`, `purge_instance`, the
+    /// watcher embed write) it MUST run under the write gate — `write_mutex`
+    /// plus a `ConnectionGuard::write` — so it (a) serializes against a
+    /// `backup`'s sidecar staging (which copies under the same lock) and
+    /// (b) is visible to the shutdown drain / idle timeout via `active_writes`.
+    ///
+    /// The gate is probed behaviorally: while the test holds `write_mutex`
+    /// (exactly as a concurrent backup staging would), a gated `reindex_search`
+    /// must block until the gate is released. An ungated implementation returns
+    /// immediately — the RED failure this test guards against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_search_holds_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        // Hold the write gate, standing in for a backup's sidecar staging.
+        let gate = state.write_mutex.clone().lock_owned().await;
+
+        let mut req = Request::new(ReindexSearchRequest {});
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            service.reindex_search(req),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "reindex_search must block on the write gate while it is held \
+             (drain-visible + backup-safe); it returned without waiting"
+        );
+
+        drop(gate);
+    }
+
+    /// The admin `set_extension` RPC does a read-modify-write of the
+    /// `.extensions.json` sidecar, which is part of the backup sidecar set.
+    /// Like every other daemon mutation it MUST run under the write gate
+    /// (`write_mutex` + `ConnectionGuard::write`) so two concurrent writers
+    /// cannot lose updates and a `backup`'s sidecar staging cannot race it.
+    ///
+    /// Probed the same way as `reindex_search_holds_write_gate`: while the
+    /// test holds `write_mutex`, a gated `set_extension` must block until the
+    /// gate is released. The `json_rpc!`-dispatched implementation runs under
+    /// a *read* guard and returns immediately — the RED failure this guards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_extension_holds_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        let gate = state.write_mutex.clone().lock_owned().await;
+
+        let args =
+            serde_json::json!({ "uid": "sym:x", "key": "owner", "value": "team-a" }).to_string();
+        let mut req = Request::new(JsonRequest { args_json: args });
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            service.set_extension(req),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "set_extension must block on the write gate while it is held \
+             (drain-visible + backup-safe); it returned without waiting"
+        );
+
+        drop(gate);
+    }
+
+    /// T6.2: the Shutdown RPC MUST set `state.drained` synchronously — before
+    /// it spawns the drain wait loop — so the worker pool STOPS CLAIMING new
+    /// jobs the instant shutdown begins. Otherwise, under continuous webhook
+    /// enqueue, the worker keeps claiming brand-new work during the entire
+    /// drain, `indexing_active` never clears, and shutdown burns the full
+    /// drain ceiling doing work it will then abandon-signal.
+    ///
+    /// Probed by holding the drain loop open (in-flight indexing) so it cannot
+    /// complete within the test, then asserting `drained` flipped by the time
+    /// the RPC returns. The pre-fix handler never touches `drained` — the RED
+    /// failure this guards against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_sets_drained_before_draining() {
+        let state = test_state_with_writer();
+        // Stand in for an in-flight index: the drain wait loop waits on
+        // `!indexing_active`, so with this set it never completes during the
+        // test — proving `drained` is set by the handler itself, not by the
+        // loop's completion.
+        state.indexing_active.store(true, Ordering::Relaxed);
+        assert!(
+            !state.drained.load(Ordering::Relaxed),
+            "precondition: drained starts clear"
+        );
+
+        let service = DaemonService::new(state.clone());
+        let mut req = Request::new(ShutdownRequest {});
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let resp = service.shutdown(req).await.expect("shutdown ok");
+        assert!(resp.into_inner().ok);
+
+        assert!(
+            state.drained.load(Ordering::Relaxed),
+            "shutdown must set drained immediately (before the drain wait loop) \
+             so the worker pool stops claiming new jobs the moment shutdown begins"
+        );
+    }
+
+    // ── Read-only replica: single-chokepoint mutating-RPC rejection ─────
+
+    /// The FULL set of gRPC RPCs that mutate daemon/graph state. Includes the
+    /// six that had scattered `reject_if_read_only` guards AND the nine the
+    /// snapshot/replica review flagged as unguarded (they used to reach their
+    /// handlers on a replica and fail mid-stream at the read-only storage
+    /// layer as opaque `internal` errors, or do partial work first).
+    const MUTATING_RPC_METHODS: &[&str] = &[
+        // Previously guarded by reject_if_read_only.
+        "WatchVault",
+        "WatchCode",
+        "IndexRepo",
+        "IndexVault",
+        "RemoveRepo",
+        "MergeInstance",
+        // Previously UNGUARDED — the core of finding #10.
+        "MaterializeProjects",
+        "RemoveVault",
+        "RemoveProject",
+        "PruneStale",
+        "PurgeInstance",
+        "ReindexSearch",
+        "Embed",
+        "SetExtension",
+        "Backup",
+        "BrainMemoryConsolidate",
+        "RefreshBrain",
+    ];
+
+    /// Parametrized over the FULL mutating-RPC set: on a read-only replica the
+    /// single chokepoint must reject every one with FAILED_PRECONDITION, and a
+    /// read-write daemon must reject none of them.
+    #[test]
+    fn read_only_rejects_all_mutating_rpcs() {
+        for m in MUTATING_RPC_METHODS {
+            let path = format!("/nestweaver.daemon.v1.NestWeaverDaemon/{m}");
+            let rej = read_only_rejection(true, &path);
+            assert!(
+                rej.is_some(),
+                "read-only replica must reject mutating RPC {m} at the chokepoint"
+            );
+            assert_eq!(
+                rej.unwrap().code(),
+                tonic::Code::FailedPrecondition,
+                "{m} must be rejected with FAILED_PRECONDITION, not another code"
+            );
+            assert!(
+                read_only_rejection(false, &path).is_none(),
+                "a read-write daemon must NOT reject mutating RPC {m}"
+            );
+        }
+    }
+
+    /// The replica must still serve every pure-read RPC — the chokepoint must
+    /// not over-reject and break the replica's reason for existing.
+    #[test]
+    fn read_only_allows_all_pure_read_rpcs() {
+        for m in READ_ONLY_ALLOWED_METHODS {
+            let path = format!("/nestweaver.daemon.v1.NestWeaverDaemon/{m}");
+            assert!(
+                read_only_rejection(true, &path).is_none(),
+                "read-only replica must still serve read RPC {m}"
+            );
+        }
+    }
+
+    /// Every RPC the proto service exposes is classified as EXACTLY ONE of
+    /// read-allowed or mutating — no overlap, no gaps. A new RPC that is
+    /// neither trips this test, forcing a deliberate fail-closed decision so
+    /// the default-deny chokepoint can never silently miss a mutating path.
+    #[test]
+    fn read_only_method_partition_is_exhaustive() {
+        // MAINTENANCE — this MUST list every RPC method the proto service
+        // (`NestWeaverDaemon` in nestweaver.daemon.v1) exposes. It is hand-kept:
+        // there is no runtime proto method registry to derive it from, so when
+        // you add a proto RPC you MUST add it here AND classify it in
+        // `READ_ONLY_ALLOWED_METHODS` or `MUTATING_RPC_METHODS`. Both this
+        // partition test and the runtime default-deny chokepoint
+        // (`read_only_rejection`) depend on this list being complete — a missing
+        // entry means the new RPC is untested here (runtime still fails closed:
+        // an unknown method default-denies on a replica). Regenerate/verify with:
+        //   grep -oE '/nestweaver\.daemon\.v1\.NestWeaverDaemon/[A-Za-z]+' \
+        //     $(find target -name nestweaver.daemon.v1.rs -path '*out*' | head -1) \
+        //     | sed -E 's#.*/##' | sort -u
+        const ALL_RPC_METHODS: &[&str] = &[
+            "AffectedTests",
+            "Backup",
+            "BlastRadius",
+            "BrainBrokenLinks",
+            "BrainDiff",
+            "BrainDocStats",
+            "BrainGuide",
+            "BrainMemoryConsolidate",
+            "BrainMemoryLint",
+            "BrainMemoryRelated",
+            "BrainOrphanDocuments",
+            "BrainStatus",
+            "BrainStatusJson",
+            "BrainTagGraph",
+            "BrainTopicClusters",
+            "BridgeNodes",
+            "Clusters",
+            "ContractDrift",
+            "CountPatterns",
+            "CrossRepoContracts",
+            "DeadCode",
+            "DetectChanges",
+            "DetectImplicitProjectsJson",
+            "Embed",
+            "EmbeddingDimension",
+            "ExportGraph",
+            "FlowTrace",
+            "FlowTraceContinue",
+            "GetBacklinks",
+            "GetContext",
+            "GetNote",
+            "GetProjectContext",
+            "GetSummary",
+            "HealthCheck",
+            "HubNodes",
+            "Impact",
+            "ImpactAnalysis",
+            "IndexRepo",
+            "IndexVault",
+            "Investigate",
+            "InvestigateExpand",
+            "InvestigateHydrate",
+            "ListProjectsJson",
+            "ListReposJson",
+            "ListServicesJson",
+            "ListVaultsJson",
+            "MaterializeProjects",
+            "MergeInstance",
+            "PrImpactJson",
+            "PruneStale",
+            "PurgeInstance",
+            "QueryExtensions",
+            "ReadSymbols",
+            "RefreshBrain",
+            "RegexSearch",
+            "ReindexSearch",
+            "RemoveProject",
+            "RemoveRepo",
+            "RemoveVault",
+            "RepoMapJson",
+            "RepoStates",
+            "Search",
+            "SearchSymbols",
+            "ServeUi",
+            "ServiceSummaryJson",
+            "SetExtension",
+            "Shutdown",
+            "StaleCheck",
+            "StopWatch",
+            "SuggestLinksJson",
+            "SymbolLookup",
+            "WatchCode",
+            "WatchVault",
+        ];
+        for m in ALL_RPC_METHODS {
+            let is_read = READ_ONLY_ALLOWED_METHODS.contains(m);
+            let is_mut = MUTATING_RPC_METHODS.contains(m);
+            assert!(
+                is_read ^ is_mut,
+                "RPC {m} must be classified as exactly one of read/mutating \
+                 (read={is_read}, mutating={is_mut})"
+            );
+        }
+        assert_eq!(
+            ALL_RPC_METHODS.len(),
+            READ_ONLY_ALLOWED_METHODS.len() + MUTATING_RPC_METHODS.len(),
+            "read + mutating classifications must partition the full RPC set"
+        );
+    }
+
+    /// A minimal inner service that counts how many requests reach it, so we
+    /// can prove the guard rejects a mutating RPC BEFORE the handler runs.
+    #[derive(Clone)]
+    struct CountingService(Arc<AtomicU32>);
+
+    impl tower::Service<http::Request<tonic::body::Body>> for CountingService {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: http::Request<tonic::body::Body>) -> Self::Future {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(http::Response::new(tonic::body::Body::default())) })
+        }
+    }
+
+    /// End-to-end at the actual chokepoint the server installs: a mutating RPC
+    /// is rejected with FAILED_PRECONDITION and NEVER reaches the inner
+    /// handler, while a read RPC passes straight through.
+    #[tokio::test]
+    async fn read_only_guard_service_rejects_mutating_and_passes_reads() {
+        use tower::Service as _;
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut guard = ReadOnlyGuard::new(true, CountingService(calls.clone()));
+
+        // Mutating RPC → rejected, inner handler must not run.
+        let req = http::Request::builder()
+            .uri("/nestweaver.daemon.v1.NestWeaverDaemon/PruneStale")
+            .body(tonic::body::Body::default())
+            .unwrap();
+        let resp = guard.call(req).await.unwrap();
+        let status = resp
+            .extensions()
+            .get::<Status>()
+            .expect("rejected response must carry a gRPC Status");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a mutating RPC must be rejected before reaching the handler"
+        );
+
+        // Read RPC → passes through to the inner handler.
+        let req = http::Request::builder()
+            .uri("/nestweaver.daemon.v1.NestWeaverDaemon/Search")
+            .body(tonic::body::Body::default())
+            .unwrap();
+        let _ = guard.call(req).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a read RPC must reach the handler on a read-only replica"
+        );
+    }
+
+    // ── Read-only replica: write/webhook/admin route mounting ──────────
+
+    /// A read-only replica must NOT mount `/webhook`, even with a secret
+    /// configured: no worker drains the queue, so an accepted push is a silent
+    /// blackhole. A read-write daemon still mounts it when a secret is set.
+    #[test]
+    fn read_only_does_not_mount_webhook() {
+        // Read-only replica: never mount, regardless of secret.
+        assert!(!replica_mounts_webhook(true, true));
+        assert!(!replica_mounts_webhook(true, false));
+        // Read-write daemon: mount iff a secret is configured.
+        assert!(replica_mounts_webhook(false, true));
+        assert!(!replica_mounts_webhook(false, false));
+    }
+
+    /// A read-only replica must NOT enqueue config repos for initial indexing —
+    /// it has no worker to index them, so the jobs would accumulate forever.
+    #[test]
+    fn read_only_does_not_enqueue_config_repos() {
+        assert!(!replica_enqueues_config_repos(true));
+        assert!(replica_enqueues_config_repos(false));
+    }
+
+    /// A read-only replica must NOT mount the mutating admin API, even with an
+    /// admin token configured. A read-write daemon mounts it when a token is
+    /// present.
+    #[test]
+    fn read_only_does_not_mount_admin_api() {
+        assert!(!replica_mounts_admin_api(true, true));
+        assert!(!replica_mounts_admin_api(true, false));
+        assert!(replica_mounts_admin_api(false, true));
+        assert!(!replica_mounts_admin_api(false, false));
     }
 }

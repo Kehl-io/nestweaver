@@ -110,6 +110,23 @@ impl GraphStore {
         max_depth: u32,
         min_confidence: f32,
     ) -> Result<Vec<ImpactNode>, StoreError> {
+        self.impact_cancellable(target_uid, max_depth, min_confidence, None)
+    }
+
+    /// Like [`impact`](Self::impact), but cooperatively bails when `cancel`
+    /// trips (a query timeout or client disconnect). The flag is checked once
+    /// per BFS dequeue; once tripped the walk returns
+    /// `Err(StoreError::Cancelled(_))` — a cancelled traversal is *incomplete*,
+    /// distinct from a legitimately empty result, so no caller mistakes the
+    /// truncated walk for a real answer (or caches it). `cancel = None` never
+    /// trips and is byte-for-byte the original behavior.
+    pub fn impact_cancellable(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<ImpactNode>, StoreError> {
         // Track the best impact score seen so far for each node.
         let mut scores: HashMap<String, f64> = HashMap::new();
         scores.insert(target_uid.to_string(), 1.0);
@@ -123,6 +140,12 @@ impl GraphStore {
         let mut result_map: HashMap<String, ImpactNode> = HashMap::new();
 
         while let Some((current_uid, depth)) = queue.pop_front() {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                // The shared cancel flag is a bare bool and can't carry a
+                // reason, so the leaf always reports `Timeout` (see
+                // `CancelReason`).
+                return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
+            }
             if depth >= max_depth {
                 continue;
             }
@@ -181,7 +204,8 @@ impl GraphStore {
         Ok(results)
     }
 
-    /// Internal: fetch all direct callers of `uid` across CALLS/IMPORTS/EXTENDS_SYM/IMPLEMENTS_SYM.
+    /// Internal: fetch all direct callers of `uid` across
+    /// CALLS/IMPORTS/EXTENDS_SYM/IMPLEMENTS_SYM/INCLUDES_SYM/CROSS_REPO_LINK.
     fn direct_callers_of(
         &self,
         uid: &str,
@@ -196,6 +220,10 @@ impl GraphStore {
             EdgeType::Extends.rel_table_name(),
             EdgeType::Implements.rel_table_name(),
             EdgeType::Includes.rel_table_name(),
+            // Cross-repo links carry downstream consumers in other repos. Without
+            // this, impact analysis stops at repo boundaries and misses org-wide
+            // callers in a unified multi-repo graph.
+            EdgeType::CrossRepoLink.rel_table_name(),
         ];
         let mut rows: Vec<CallerRow> = Vec::new();
 
@@ -427,7 +455,75 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }
+    }
+
+    /// Impact analysis must follow CROSS_REPO_LINK edges so that callers in
+    /// other repos (modeled as cross-repo links in a unified multi-repo graph)
+    /// are reported. Regression guard for cross-boundary intelligence: without
+    /// CROSS_REPO_LINK in the traversal, brain_impact / blast_radius silently
+    /// miss every downstream cross-repo consumer.
+    #[test]
+    fn impact_includes_cross_repo_link_callers() {
+        use nestweaver_schema::{CrossRepoLinkType, EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("target", "ApiHandler"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("consumer", "RemoteCaller"))
+            .unwrap();
+
+        // A consumer in another repo depends on `target` via a cross-repo link.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "consumer".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let impacted = store.impact("target", 5, 0.0).unwrap();
+        assert!(
+            impacted.iter().any(|n| n.uid == "consumer"),
+            "impact must surface cross-repo callers linked via CROSS_REPO_LINK; got: {:?}",
+            impacted.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A pre-tripped cancel flag must make the impact BFS return `Cancelled`
+    /// on its first dequeue — never a (truncated) Ok result.
+    #[test]
+    fn impact_cancellable_bails_when_flag_is_set() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("target", "ApiHandler"))
+            .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = store
+            .impact_cancellable("target", 5, 0.0, Some(&cancel))
+            .expect_err("pre-cancelled impact must return Err, not a truncated result");
+        assert!(
+            err.is_cancelled(),
+            "expected StoreError::Cancelled, got: {err}"
+        );
+
+        // Untripped flag: byte-for-byte the original behavior.
+        let untripped = Arc::new(AtomicBool::new(false));
+        assert!(
+            store
+                .impact_cancellable("target", 5, 0.0, Some(&untripped))
+                .is_ok()
+        );
     }
 
     /// Convenience: empty [`SeedResolutionConfig`] for legacy cache tests

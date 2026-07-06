@@ -60,6 +60,8 @@ Format: `<type>(<scope>): <description>`
 | `cli` | Binary / CLI (src/main.rs) |
 | `ci` | CI/CD workflows |
 | `deps` | Dependency updates |
+| `docs` | Documentation only |
+| `release` | Release automation |
 
 ### Examples
 

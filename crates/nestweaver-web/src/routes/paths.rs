@@ -21,8 +21,10 @@ pub async fn paths_between(
     Path((from, to)): Path<(String, String)>,
     Query(params): Query<PathsParams>,
 ) -> Result<Response, ApiError> {
-    let max_depth = params.max_depth.unwrap_or(5);
-    let limit = params.limit.unwrap_or(10);
+    // Clamp client-supplied bounds: an uncapped BFS depth/limit lets a request
+    // exhaust CPU/memory on a large graph.
+    let max_depth = params.max_depth.unwrap_or(5).min(25);
+    let limit = params.limit.unwrap_or(10).min(100);
 
     // BFS: each entry is (current_uid, path_so_far, edges_so_far)
     let mut queue: VecDeque<(String, Vec<String>, Vec<serde_json::Value>)> = VecDeque::new();

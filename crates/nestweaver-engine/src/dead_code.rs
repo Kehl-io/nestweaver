@@ -110,7 +110,21 @@ const WEAK_EDGE_THRESHOLD: f32 = 0.5;
 /// typed edges from the database (~500-700ms). This is inherent to the full-
 /// graph traversal approach and cannot be reduced without pre-computed caching.
 pub fn detect_dead_code(store: &GraphStore) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, &HashMap::new())
+    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, &HashMap::new(), None)
+}
+
+/// Like [`detect_dead_code`], but cooperatively bails when `cancel` trips (a
+/// query timeout or client disconnect). The flag is checked once per BFS
+/// dequeue; once tripped the walk returns a
+/// [`nestweaver_store::StoreError::Cancelled`] (wrapped in `anyhow`, so the
+/// boundary can downcast to distinguish cancellation from real failures) — a
+/// cancelled walk is *incomplete*, never a legitimate (cacheable) result.
+/// `cancel = None` never trips and is byte-for-byte the original behavior.
+pub fn detect_dead_code_cancellable(
+    store: &GraphStore,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<DeadCodeResult> {
+    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, &HashMap::new(), cancel)
 }
 
 /// Like [`detect_dead_code`] but with an explicit minimum edge confidence
@@ -121,7 +135,17 @@ pub fn detect_dead_code_with_confidence(
     store: &GraphStore,
     min_edge_confidence: f32,
 ) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, min_edge_confidence, &HashMap::new())
+    detect_dead_code_inner(store, min_edge_confidence, &HashMap::new(), None)
+}
+
+/// Cancellable variant of [`detect_dead_code_with_confidence`]; see
+/// [`detect_dead_code_cancellable`] for the cancellation contract.
+pub fn detect_dead_code_with_confidence_cancellable(
+    store: &GraphStore,
+    min_edge_confidence: f32,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<DeadCodeResult> {
+    detect_dead_code_inner(store, min_edge_confidence, &HashMap::new(), cancel)
 }
 
 /// Like [`detect_dead_code`] but also accepts parsed manifest data so that
@@ -131,7 +155,17 @@ pub fn detect_dead_code_with_manifests(
     store: &GraphStore,
     manifests: &HashMap<String, ManifestInfo>,
 ) -> anyhow::Result<DeadCodeResult> {
-    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, manifests)
+    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, manifests, None)
+}
+
+/// Cancellable variant of [`detect_dead_code_with_manifests`]; see
+/// [`detect_dead_code_cancellable`] for the cancellation contract.
+pub fn detect_dead_code_with_manifests_cancellable(
+    store: &GraphStore,
+    manifests: &HashMap<String, ManifestInfo>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<DeadCodeResult> {
+    detect_dead_code_inner(store, DEFAULT_MIN_EDGE_CONFIDENCE, manifests, cancel)
 }
 
 /// Core implementation combining confidence-aware BFS with type exclusion,
@@ -140,6 +174,7 @@ fn detect_dead_code_inner(
     store: &GraphStore,
     min_edge_confidence: f32,
     manifests: &HashMap<String, ManifestInfo>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<DeadCodeResult> {
     // 1. Load all symbols and partition into analysable / excluded.
     let raw_symbols = store
@@ -242,6 +277,14 @@ fn detect_dead_code_inner(
     }
 
     while let Some((current, path_conf)) = queue.pop_front() {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            // Propagate the store's typed cancellation error through anyhow so
+            // the tool boundary can downcast and distinguish "cancelled" from
+            // a real failure. A cancelled walk is incomplete, never cacheable.
+            return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
+                nestweaver_store::CancelReason::Timeout,
+            )));
+        }
         if let Some(targets) = adjacency.get(&current) {
             for (target, edge_conf) in targets {
                 // Skip edges below the minimum confidence threshold entirely.
@@ -421,6 +464,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }
     }
 
@@ -453,6 +497,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }
     }
 
@@ -464,6 +509,37 @@ mod tests {
         assert_eq!(result.reachable_symbols, 0);
         assert!(result.unreachable_symbols.is_empty());
         assert_eq!(result.excluded_count, 0);
+    }
+
+    /// A pre-tripped cancel flag must make the reachability BFS return the
+    /// store's `Cancelled` error (downcastable through anyhow) on its first
+    /// dequeue — never a (truncated) Ok result.
+    #[test]
+    fn detect_dead_code_cancellable_bails_when_flag_is_set() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let store = GraphStore::in_memory().unwrap();
+        // An entry point guarantees the BFS queue is non-empty, so the
+        // per-dequeue cancel check actually runs.
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = detect_dead_code_cancellable(&store, Some(&cancel))
+            .expect_err("pre-cancelled dead-code walk must return Err");
+        let store_err = err
+            .downcast_ref::<nestweaver_store::StoreError>()
+            .expect("boundary must be able to downcast to StoreError");
+        assert!(
+            store_err.is_cancelled(),
+            "expected StoreError::Cancelled, got: {store_err}"
+        );
+
+        // Untripped flag: byte-for-byte the original behavior.
+        let untripped = Arc::new(AtomicBool::new(false));
+        assert!(detect_dead_code_cancellable(&store, Some(&untripped)).is_ok());
     }
 
     #[test]

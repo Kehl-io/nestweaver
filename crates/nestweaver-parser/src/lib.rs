@@ -11,6 +11,7 @@ pub mod markdown;
 pub mod mermaid;
 pub mod parse;
 pub mod registry;
+pub mod scope_chain;
 pub mod svelte;
 pub mod vue;
 

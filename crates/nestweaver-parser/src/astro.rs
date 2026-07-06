@@ -99,6 +99,7 @@ pub fn parse_astro(path: &Path, source: &str) -> ParsedFile {
         visibility: Visibility::Public,
         type_info: None,
         parent_name: None,
+        scope_chain: None,
     });
 
     // Extract frontmatter block (between --- markers)
@@ -129,6 +130,7 @@ pub fn parse_astro(path: &Path, source: &str) -> ParsedFile {
                     visibility: Visibility::Public,
                     type_info: None,
                     parent_name: None,
+                    scope_chain: None,
                 });
             }
 
@@ -149,6 +151,7 @@ pub fn parse_astro(path: &Path, source: &str) -> ParsedFile {
                     visibility: Visibility::Private,
                     type_info: None,
                     parent_name: None,
+                    scope_chain: None,
                 });
             }
 

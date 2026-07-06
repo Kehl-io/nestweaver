@@ -27,6 +27,23 @@ use crate::workspace::WorkspaceContext;
 ///
 /// The optional `workspace_ctx` enables resolution of monorepo workspace
 /// package imports and tsconfig path aliases for JS/TS files.
+///
+/// # LIMITATION: Cross-repo edge resolution
+///
+/// This resolver processes a single repo at a time (`repo_uid`). Edges are
+/// only created between symbols within the same repo. Cross-repo edges (e.g.
+/// repo B calling a function exported by repo A) are **not** created because
+/// the resolver does not have access to other repos' symbol tables during a
+/// single-repo indexing pass.
+///
+/// To support cross-repo edges, a second resolution pass would need to:
+/// 1. Collect all "unresolved:{name}" targets that match package imports
+/// 2. Look up exported symbols from other indexed repos in the store
+/// 3. Create CALLS/IMPORTS edges across repo boundaries
+///
+/// Until then, cross-boundary impact analysis relies on the hybrid client's
+/// two-tier and continuation routing to stitch results at query time rather
+/// than at index time.
 pub fn resolve_references(
     files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
     language: Language,
@@ -602,6 +619,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         }
     }
 
@@ -1204,6 +1222,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
 
         // File B: class Baz with method bar (different parent)
@@ -1222,6 +1241,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
 
         // File C: caller that does foo_instance.bar()
@@ -1323,6 +1343,7 @@ mod tests {
                     visibility: Visibility::Public,
                     type_info: None,
                     parent_name: None,
+                    scope_chain: None,
                 },
                 helper,
                 do_work,
@@ -1392,6 +1413,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
 
         // ChildClass extends BaseClass (no "save" method of its own)
@@ -1407,6 +1429,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
 
         let extends_ref = RawReference {
@@ -1548,6 +1571,7 @@ mod tests {
                 visibility: Visibility::Public,
                 type_info: None,
                 parent_name: None,
+                scope_chain: None,
             }
         }
 
@@ -1564,6 +1588,7 @@ mod tests {
                 visibility: Visibility::Inferred,
                 type_info: None,
                 parent_name: Some(parent.to_string()),
+                scope_chain: None,
             }
         }
 
@@ -1692,6 +1717,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
         let mut store_query = make_symbol("query", 5);
         store_query.parent_name = Some("Store".to_string());
@@ -1709,6 +1735,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: None,
+            scope_chain: None,
         };
         let mut handle_method = make_symbol("handle", 10);
         handle_method.parent_name = Some("MyService".to_string());

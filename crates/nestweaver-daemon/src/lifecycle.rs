@@ -2,6 +2,26 @@
 
 use std::path::{Path, PathBuf};
 
+/// Canonicalize a database path even before the database file exists.
+///
+/// `std::fs::canonicalize(path)` only succeeds once the file exists. Daemon
+/// startup often receives a not-yet-created DB path, so canonicalize the parent
+/// directory and append the original filename. This keeps socket IDs stable for
+/// paths such as macOS `/tmp/...` and `/private/tmp/...`.
+pub fn canonical_db_path(db_path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(db_path) {
+        return canonical;
+    }
+
+    if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
+        && let Ok(canonical_parent) = std::fs::canonicalize(parent)
+    {
+        return canonical_parent.join(file_name);
+    }
+
+    db_path.to_path_buf()
+}
+
 /// Derive a stable, short instance ID from a database path.
 ///
 /// Returns ONLY the 8-character hex hash of the canonical path.
@@ -10,12 +30,18 @@ use std::path::{Path, PathBuf};
 /// For a human-readable label (parent-dir + hash), use
 /// [`instance_label_from_db_path`] instead.
 pub fn instance_id_from_db_path(db_path: &Path) -> String {
-    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    format!("{:08x}", hasher.finish() & 0xFFFF_FFFF)
+    let canonical = canonical_db_path(db_path);
+    // Use SHA-256 for a stable hash that won't change across Rust versions.
+    // DefaultHasher (SipHash) is explicitly documented as not portable.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    // Take the first 4 bytes (8 hex chars) for a short, stable instance ID.
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    )
 }
 
 /// Human-readable label for logging: `<parent-dir>-<hash>`.
@@ -23,7 +49,7 @@ pub fn instance_id_from_db_path(db_path: &Path) -> String {
 /// Never use this in path construction — use [`instance_id_from_db_path`]
 /// (the bare 8-char hash) to keep socket paths short.
 pub fn instance_label_from_db_path(db_path: &Path) -> String {
-    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let canonical = canonical_db_path(db_path);
     let prefix = canonical
         .parent()
         .and_then(|p| p.file_name())
@@ -104,6 +130,104 @@ pub fn launchd_plist_path(instance_id: &str) -> std::path::PathBuf {
         .join(format!("{}.plist", launchd_label(instance_id)))
 }
 
+/// Compute the legacy instance ID using `DefaultHasher` (SipHash).
+///
+/// Before the switch to SHA-256, the instance ID was derived from
+/// `DefaultHasher`, which is documented as non-portable across Rust
+/// versions. This function reproduces the old algorithm so we can
+/// detect and clean up old runtime artifacts during upgrades.
+pub fn legacy_instance_id_from_db_path(db_path: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let canonical = canonical_db_path(db_path);
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() & 0xFFFF_FFFF)
+}
+
+/// Stop a daemon running under the legacy (DefaultHasher-based) instance ID.
+///
+/// When upgrading from a version that used `DefaultHasher` to one that
+/// uses SHA-256, the instance ID changes. This leaves the old daemon
+/// orphaned — still running, still holding the DB write lock, but
+/// unreachable via the new socket path. This function detects the old
+/// daemon and shuts it down so the new daemon can start cleanly.
+pub fn stop_legacy_hash_daemon(db_path: &Path) {
+    let new_id = instance_id_from_db_path(db_path);
+    let old_id = legacy_instance_id_from_db_path(db_path);
+
+    // If the hashes happen to collide, nothing to migrate.
+    if new_id == old_id {
+        return;
+    }
+
+    let old_pid_path = pidfile_path(&old_id);
+    let old_sock_path = socket_path(&old_id);
+    let old_rt_dir = runtime_dir(&old_id);
+
+    if !old_pid_path.exists() && !old_sock_path.exists() {
+        return;
+    }
+
+    // Try to read the PID and stop the old daemon gracefully.
+    if let Ok(content) = std::fs::read_to_string(&old_pid_path)
+        && let Ok(pid) = content.trim().parse::<i32>()
+        && pid > 0
+    {
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if alive {
+            tracing::info!(
+                pid,
+                old_id = %old_id,
+                new_id = %new_id,
+                "stopping legacy daemon (hash algorithm upgrade)"
+            );
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            // Wait briefly for graceful shutdown.
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                if unsafe { libc::kill(pid, 0) != 0 } {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if unsafe { libc::kill(pid, 0) == 0 } {
+                tracing::warn!(
+                    pid,
+                    "legacy daemon did not exit after SIGTERM, sending SIGKILL"
+                );
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+
+    // Unload the old launchd plist on macOS if it exists.
+    let old_plist = launchd_plist_path(&old_id);
+    if old_plist.exists() {
+        let label = launchd_label(&old_id);
+        tracing::info!(label = %label, "unloading legacy launchd plist");
+        let _ = std::process::Command::new("launchctl")
+            .args([
+                "bootout",
+                &format!("gui/{}", unsafe { libc::getuid() }),
+                &old_plist.display().to_string(),
+            ])
+            .output();
+        let _ = std::fs::remove_file(&old_plist);
+    }
+
+    // Clean up stale runtime artifacts.
+    let _ = std::fs::remove_file(&old_sock_path);
+    let _ = std::fs::remove_file(&old_pid_path);
+    let _ = std::fs::remove_dir(&old_rt_dir);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +268,30 @@ mod tests {
         let id1 = instance_id_from_db_path(path);
         let id2 = instance_id_from_db_path(path);
         assert_eq!(id1, id2, "same path must produce same ID");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_id_canonicalizes_parent_for_missing_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real");
+        let linked_parent = tmp.path().join("linked");
+        std::fs::create_dir(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+
+        let via_real = real_parent.join("missing.lbug");
+        let via_link = linked_parent.join("missing.lbug");
+
+        assert_eq!(
+            canonical_db_path(&via_link),
+            canonical_db_path(&via_real),
+            "missing DB paths should canonicalize through their parent"
+        );
+        assert_eq!(
+            instance_id_from_db_path(&via_link),
+            instance_id_from_db_path(&via_real),
+            "socket instance ID should not depend on symlink spelling"
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub async fn symbol_by_uid(
     State(state): State<Arc<AppState>>,
     Path(uid): Path<String>,
 ) -> Result<Response, ApiError> {
-    match nestweaver_engine::lookup_symbol(&state.store, &uid)? {
+    match nestweaver_engine::lookup_symbol(&state.store, &uid, None)? {
         nestweaver_engine::LookupResult::Found(detail) => {
             let json = serde_json::to_value(&*detail)?;
             Ok(Json(json).into_response())

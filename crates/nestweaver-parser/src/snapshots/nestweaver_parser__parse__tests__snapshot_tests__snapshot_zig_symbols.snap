@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4316
 expression: "parsed_symbols(\"simple.zig\", &source)"
 ---
 - name: SensorKind
@@ -14,6 +13,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: SensorConfig
   kind: Class
   start_line: 10
@@ -25,6 +25,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: InternalState
   kind: Class
   start_line: 16
@@ -36,6 +37,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: initialize
   kind: Function
   start_line: 21
@@ -47,6 +49,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: calibrate
   kind: Function
   start_line: 26
@@ -58,6 +61,7 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: main
   kind: Function
   start_line: 30
@@ -69,3 +73,4 @@ expression: "parsed_symbols(\"simple.zig\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~

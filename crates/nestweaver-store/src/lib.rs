@@ -11,7 +11,12 @@ pub mod traverse;
 pub mod write;
 
 pub use db::GraphStore;
-pub use error::StoreError;
+pub use error::{CancelReason, StoreError};
+
+/// Re-export the LadybugDB connection type so callers can use transactional
+/// APIs (`begin_transaction` / `commit_transaction`) and `_on` method variants
+/// without depending on `lbug` directly.
+pub use lbug::Connection as DbConnection;
 pub use ranking::{
     DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
     PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN, ScopedEdgeQuery,
@@ -47,6 +52,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "inst-1".to_string(),
             name: None,
+            root_path: None,
         }
     }
 
@@ -78,6 +84,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }
     }
 
@@ -106,6 +113,69 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].uid, "repo-1");
         assert_eq!(repos[0].url, "https://github.com/example/repo-1");
+    }
+
+    /// `root_path` round-trips through insert → list_repos/lookup_repo:
+    /// `Some(path)` survives, `None` stays `None` (stored as '' and mapped
+    /// back on read).
+    #[test]
+    fn repo_root_path_round_trips_some_and_none() {
+        let store = test_store();
+
+        let with_root = Repo {
+            root_path: Some("/home/u/demo".to_string()),
+            url: "https://github.com/acme/demo.git".to_string(),
+            ..make_repo("repo-local")
+        };
+        let without_root = make_repo("repo-remote");
+        store.insert_repo(&with_root).unwrap();
+        store.insert_repo(&without_root).unwrap();
+
+        let repos = store.list_repos(None).unwrap();
+        let local = repos.iter().find(|r| r.uid == "repo-local").unwrap();
+        let remote = repos.iter().find(|r| r.uid == "repo-remote").unwrap();
+        assert_eq!(local.root_path.as_deref(), Some("/home/u/demo"));
+        assert_eq!(remote.root_path, None);
+
+        let looked_up = store.lookup_repo("repo-local").unwrap().unwrap();
+        assert_eq!(looked_up.root_path.as_deref(), Some("/home/u/demo"));
+        let looked_up = store.lookup_repo("repo-remote").unwrap().unwrap();
+        assert_eq!(looked_up.root_path, None);
+    }
+
+    /// `update_repo_sha` re-creates the Repo node — it must carry
+    /// `root_path` over, not silently drop it.
+    #[test]
+    fn update_repo_sha_preserves_root_path() {
+        let store = test_store();
+        let repo = Repo {
+            root_path: Some("/home/u/demo".to_string()),
+            ..make_repo("repo-1")
+        };
+        store.insert_repo(&repo).unwrap();
+
+        store.update_repo_sha("repo-1", "def456").unwrap();
+
+        let r = store.lookup_repo("repo-1").unwrap().unwrap();
+        assert_eq!(r.indexed_sha, "def456");
+        assert_eq!(r.root_path.as_deref(), Some("/home/u/demo"));
+    }
+
+    /// `update_repo_root_path` sets only the disk location, leaving the
+    /// identity url and every other field untouched.
+    #[test]
+    fn update_repo_root_path_sets_location_only() {
+        let store = test_store();
+        store.insert_repo(&make_repo("repo-1")).unwrap();
+
+        store
+            .update_repo_root_path("repo-1", "/moved/here")
+            .unwrap();
+
+        let r = store.lookup_repo("repo-1").unwrap().unwrap();
+        assert_eq!(r.root_path.as_deref(), Some("/moved/here"));
+        assert_eq!(r.url, "https://github.com/example/repo-1");
+        assert_eq!(r.indexed_sha, "abc123");
     }
 
     #[test]
@@ -294,6 +364,154 @@ mod tests {
             evidence: Vec::new(),
         };
         store.insert_edge(&edge).unwrap();
+    }
+
+    /// `references_to` backs the ImpactAnalysis RPC / pre-push-impact. It must
+    /// follow CROSS_REPO_LINK so that pre-push impact reports cross-repo
+    /// consumers, not just same-repo references.
+    #[test]
+    fn references_to_includes_cross_repo_link() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol("api", "ApiHandler", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("client", "RemoteClient", "repo-2", "b.rs"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "client".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(nestweaver_schema::CrossRepoLinkType::SharedImport),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let refs = store.references_to("api").unwrap();
+        assert!(
+            refs.iter().any(|s| s.uid == "client"),
+            "references_to must include cross-repo consumers via CROSS_REPO_LINK; got: {:?}",
+            refs.iter().map(|s| s.uid.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `files_referencing_file` (nw-008) returns the 1-hop reverse-dependent
+    /// files: every file with a cross-file resolved edge pointing INTO the
+    /// target file. Intra-file edges and edges into other files must be ignored.
+    #[test]
+    fn files_referencing_file_returns_cross_file_dependents() {
+        let store = test_store();
+        // b.rs imports a.rs (cross-file). c.rs has only an intra-file CALLS edge.
+        store
+            .insert_symbol(&make_symbol("a1", "exported", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("b1", "importer", "repo-1", "b.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("c1", "caller", "repo-1", "c.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("c2", "callee", "repo-1", "c.rs"))
+            .unwrap();
+        // b.rs -> a.rs : a cross-file IMPORTS edge.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b1".to_string(),
+                target_uid: "a1".to_string(),
+                edge_type: EdgeType::Imports,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        // c.rs -> c.rs : an intra-file CALLS edge (must NOT count as referencing a.rs).
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "c1".to_string(),
+                target_uid: "c2".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let refs = store.files_referencing_file("repo-1", "a.rs").unwrap();
+        assert!(
+            refs.contains("b.rs"),
+            "b.rs imports a.rs and must be a reverse-dependent; got: {refs:?}"
+        );
+        assert!(
+            !refs.contains("a.rs"),
+            "the file itself must never appear (intra-file edges excluded); got: {refs:?}"
+        );
+        assert!(
+            !refs.contains("c.rs"),
+            "c.rs has no edge into a.rs and must be excluded; got: {refs:?}"
+        );
+
+        // a.rs's own reverse-deps for a different target are empty.
+        let none = store.files_referencing_file("repo-1", "c.rs").unwrap();
+        assert!(
+            !none.contains("c.rs"),
+            "intra-file edge must not make c.rs reference itself; got: {none:?}"
+        );
+        assert!(
+            none.is_empty(),
+            "c.rs has no cross-file dependents; got: {none:?}"
+        );
+    }
+
+    #[test]
+    fn count_symbols_by_repo_groups_correctly() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol("a", "fa", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("b", "fb", "repo-1", "b.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("c", "fc", "repo-2", "c.rs"))
+            .unwrap();
+
+        let counts = store.count_symbols_by_repo().unwrap();
+        assert_eq!(counts.get("repo-1").copied(), Some(2));
+        assert_eq!(counts.get("repo-2").copied(), Some(1));
+    }
+
+    /// `callees_of` backs flow_trace's forward traversal. It must follow
+    /// CROSS_REPO_LINK so a trace can continue across a repo boundary into the
+    /// downstream symbol in another repo.
+    #[test]
+    fn callees_of_includes_cross_repo_link() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol("caller", "LocalCaller", "repo-1", "a.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("remote", "RemoteCallee", "repo-2", "b.rs"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "remote".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(nestweaver_schema::CrossRepoLinkType::SharedImport),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let callees = store.callees_of("caller").unwrap();
+        assert!(
+            callees.iter().any(|s| s.uid == "remote"),
+            "callees_of must include cross-repo callees via CROSS_REPO_LINK; got: {:?}",
+            callees.iter().map(|s| s.uid.as_str()).collect::<Vec<_>>()
+        );
     }
 
     // ── Brain extension round-trip tests ────────────────────────────────
@@ -1521,6 +1739,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "ghost".to_string(),
             name: Some("ghost-a".to_string()),
+            root_path: None,
         };
         let ghost_repo_b = Repo {
             uid: "repo:ghost:bbbb".to_string(),
@@ -1529,6 +1748,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "ghost".to_string(),
             name: Some("ghost-b".to_string()),
+            root_path: None,
         };
         store.insert_repo(&ghost_repo_a).unwrap();
         store.insert_repo(&ghost_repo_b).unwrap();
@@ -1541,6 +1761,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "keep".to_string(),
             name: Some("keep-c".to_string()),
+            root_path: None,
         };
         store.insert_repo(&keep_repo).unwrap();
 

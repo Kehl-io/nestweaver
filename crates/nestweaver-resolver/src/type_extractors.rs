@@ -648,6 +648,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: parent.map(|s| s.to_string()),
+            scope_chain: None,
         }
     }
 
@@ -664,6 +665,7 @@ mod tests {
             visibility: Visibility::Public,
             type_info: None,
             parent_name: Some(parent.to_string()),
+            scope_chain: None,
         }
     }
 

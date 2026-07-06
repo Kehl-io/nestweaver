@@ -49,10 +49,15 @@ fn build_svg(snapshot: &GraphSnapshot) -> String {
     );
     svg.push('\n');
 
-    // Background
+    // Background. Color values are user-controlled (via the POST body) so they
+    // must be escaped for the attribute context too — not just the label text —
+    // otherwise `red"/><script>…` breaks out of the attribute (stored XSS when
+    // the exported .svg is opened in a browser).
     svg.push_str(&format!(
         r#"  <rect width="{}" height="{}" fill="{}"/>"#,
-        snapshot.width, snapshot.height, snapshot.background,
+        snapshot.width,
+        snapshot.height,
+        html_escape(&snapshot.background),
     ));
     svg.push('\n');
 
@@ -63,7 +68,12 @@ fn build_svg(snapshot: &GraphSnapshot) -> String {
         if let (Some(s), Some(t)) = (src, tgt) {
             svg.push_str(&format!(
                 r#"  <line x1="{}" y1="{}" x2="{}" y2="{}" stroke="{}" stroke-width="{}"/>"#,
-                s.x, s.y, t.x, t.y, edge.color, edge.thickness,
+                s.x,
+                s.y,
+                t.x,
+                t.y,
+                html_escape(&edge.color),
+                edge.thickness,
             ));
             svg.push('\n');
         }
@@ -73,7 +83,10 @@ fn build_svg(snapshot: &GraphSnapshot) -> String {
     for node in &snapshot.nodes {
         svg.push_str(&format!(
             r#"  <circle cx="{}" cy="{}" r="{}" fill="{}"/>"#,
-            node.x, node.y, node.size, node.color,
+            node.x,
+            node.y,
+            node.size,
+            html_escape(&node.color),
         ));
         svg.push('\n');
         svg.push_str(&format!(
@@ -98,11 +111,63 @@ fn build_svg(snapshot: &GraphSnapshot) -> String {
     svg
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// Escape a JSON string for safe embedding inside an inline `<script>` element.
+/// `serde_json` does not escape `<`, `>`, or `&`, so a value like `</script>`
+/// (e.g. an indexed symbol named that) would break out of the script and run as
+/// markup (stored XSS in the exported .html). The `\uXXXX` forms are valid JSON
+/// and are un-escaped transparently by `JSON.parse`. Also escape the U+2028/2029
+/// line separators, which are raw newlines in a JS string context.
+pub(crate) fn json_for_html_script(json: &str) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Whitelist a user-supplied CSS color for embedding into a `<style>` block.
+/// HTML entities do NOT apply inside `<style>`, so escaping isn't enough — the
+/// value must match a strict color grammar. Critically we must NOT allow
+/// arbitrary parenthesized functions: a lax char-whitelist that permits `(`/`)`
+/// lets `expression(alert(1))` (CSS-expression XSS in legacy IE) and `url(...)`
+/// (fires a request → SSRF / info leak) through. Only hex, the numeric color
+/// functions, and letters-only named colors are accepted; anything else falls
+/// back to a safe default.
+fn safe_css_color(s: &str) -> String {
+    if is_safe_css_color(s.trim()) {
+        s.trim().to_string()
+    } else {
+        "#ffffff".to_string()
+    }
+}
+
+fn is_safe_css_color(s: &str) -> bool {
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    // #rgb / #rgba / #rrggbb / #rrggbbaa
+    if let Some(hex) = s.strip_prefix('#') {
+        return matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    // Only the numeric color functions — NOT arbitrary `name(...)`. Args are
+    // digits / `.` / `,` / `%` / spaces only (no `:`, letters, quotes, etc.).
+    for prefix in ["rgb(", "rgba(", "hsl(", "hsla("] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return rest.strip_suffix(')').is_some_and(|args| {
+                args.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '%' | ' '))
+            });
+        }
+    }
+    // Named color: letters only. No `(` → no expression()/url().
+    s.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 pub async fn export_svg(
@@ -130,10 +195,14 @@ pub async fn export_html(
     State(_state): State<Arc<AppState>>,
     Json(snapshot): Json<GraphSnapshot>,
 ) -> Result<Response, ApiError> {
-    let nodes_json = serde_json::to_string(&snapshot.nodes)
-        .map_err(|e| ApiError::internal(format!("failed to serialize nodes: {e}")))?;
-    let edges_json = serde_json::to_string(&snapshot.edges)
-        .map_err(|e| ApiError::internal(format!("failed to serialize edges: {e}")))?;
+    let nodes_json = json_for_html_script(
+        &serde_json::to_string(&snapshot.nodes)
+            .map_err(|e| ApiError::internal(format!("failed to serialize nodes: {e}")))?,
+    );
+    let edges_json = json_for_html_script(
+        &serde_json::to_string(&snapshot.edges)
+            .map_err(|e| ApiError::internal(format!("failed to serialize edges: {e}")))?,
+    );
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -238,7 +307,7 @@ resize();
 </script>
 </body>
 </html>"#,
-        bg = snapshot.background,
+        bg = safe_css_color(&snapshot.background),
         nodes_json = nodes_json,
         edges_json = edges_json,
     );
@@ -248,4 +317,74 @@ resize();
         html,
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_for_html_script_neutralizes_script_breakout() {
+        // A symbol named `</script>...` must not close the inline <script>.
+        let json = serde_json::to_string(
+            &serde_json::json!([{ "label": "</script><script>alert(1)</script>" }]),
+        )
+        .unwrap();
+        let out = json_for_html_script(&json);
+        assert!(
+            !out.contains("</script>"),
+            "script breakout survived: {out}"
+        );
+        assert!(
+            out.contains("\\u003c/script"),
+            "expected escaped form: {out}"
+        );
+    }
+
+    #[test]
+    fn safe_css_color_rejects_style_breakout() {
+        // Legit colors pass.
+        assert_eq!(safe_css_color("#1a1a2e"), "#1a1a2e");
+        assert_eq!(safe_css_color("#abcd"), "#abcd");
+        assert_eq!(safe_css_color("rgb(10, 20, 30)"), "rgb(10, 20, 30)");
+        assert_eq!(safe_css_color("rgba(0,0,0,0.5)"), "rgba(0,0,0,0.5)");
+        assert_eq!(safe_css_color("white"), "white");
+        // Style breakout falls back to the safe default.
+        assert_eq!(
+            safe_css_color("white;}</style><script>alert(1)</script>"),
+            "#ffffff"
+        );
+        assert_eq!(safe_css_color("<script>"), "#ffffff");
+        // CRITICAL: arbitrary CSS functions must NOT pass — expression() is XSS in
+        // legacy IE and url() fires a request. A lax char-whitelist allowed these.
+        assert_eq!(safe_css_color("expression(alert(1))"), "#ffffff");
+        assert_eq!(safe_css_color("url(x)"), "#ffffff");
+        assert_eq!(safe_css_color("url(//evil/x)"), "#ffffff");
+        assert_eq!(safe_css_color("#12"), "#ffffff"); // bad hex length
+        assert_eq!(safe_css_color("#xyz"), "#ffffff"); // non-hex
+    }
+
+    #[test]
+    fn build_svg_escapes_malicious_color_and_label() {
+        let snap = GraphSnapshot {
+            nodes: vec![SnapshotNode {
+                uid: "a".into(),
+                x: 0.0,
+                y: 0.0,
+                size: 5.0,
+                color: r#"red"/><script>alert(1)</script>"#.into(),
+                label: "<script>alert(2)</script>".into(),
+            }],
+            edges: vec![],
+            width: 100,
+            height: 100,
+            background: r#"white"/><script>alert(3)</script>"#.into(),
+            legend: false,
+        };
+        let svg = build_svg(&snap);
+        assert!(
+            !svg.contains("<script>"),
+            "unescaped <script> in SVG export: {svg}"
+        );
+    }
 }

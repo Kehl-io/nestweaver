@@ -9,7 +9,21 @@ pub fn vector_knn_all(
     query_embedding: &[f32],
     limit: usize,
 ) -> Result<Vec<(String, f64)>, anyhow::Error> {
-    Ok(store.vector_search(query_embedding, limit))
+    vector_knn_all_cancellable(store, query_embedding, limit, None)
+}
+
+/// Like [`vector_knn_all`], but threads a cooperative cancellation flag into the
+/// parallel embedding scan. `cancel = None` is the original behavior.
+pub fn vector_knn_all_cancellable(
+    store: &GraphStore,
+    query_embedding: &[f32],
+    limit: usize,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Vec<(String, f64)>, anyhow::Error> {
+    // A tripped `cancel` surfaces as `StoreError::Cancelled`, which `?` lifts
+    // into the returned `anyhow::Error` (downcastable at the cache/gRPC
+    // boundary) rather than a truncated `Ok(vec![])`.
+    Ok(store.vector_search_cancellable(query_embedding, limit, cancel)?)
 }
 
 /// Like `vector_knn_all`, but pre-filters to embeddings whose UID contains

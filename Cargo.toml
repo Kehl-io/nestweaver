@@ -12,6 +12,7 @@ members = [
     "crates/nestweaver-web",
     "crates/nestweaver-wasm",
     "crates/nestweaver-proto",
+    "crates/nestweaver-federation",
     "crates/nestweaver-daemon",
     "crates/nestweaver-client",
     "crates/nestweaver-embed",
@@ -27,6 +28,7 @@ keywords = ["code-graph", "tree-sitter", "code-analysis", "knowledge-graph", "mc
 categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
+subtle = "2"
 nestweaver-algorithms = { path = "crates/nestweaver-algorithms" }
 nestweaver-schema = { path = "crates/nestweaver-schema" }
 nestweaver-parser = { path = "crates/nestweaver-parser" }
@@ -37,10 +39,11 @@ nestweaver-engine = { path = "crates/nestweaver-engine" }
 nestweaver-mcp = { path = "crates/nestweaver-mcp" }
 nestweaver-web = { path = "crates/nestweaver-web" }
 nestweaver-proto = { path = "crates/nestweaver-proto" }
+nestweaver-federation = { path = "crates/nestweaver-federation" }
 nestweaver-daemon = { path = "crates/nestweaver-daemon" }
 nestweaver-client = { path = "crates/nestweaver-client" }
 nestweaver-embed = { path = "crates/nestweaver-embed" }
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 prost = "0.14"
 tonic-build = "0.14"
@@ -49,12 +52,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
 sha2 = "0.11"
+hmac = "0.13"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 axum = "0.8"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
-tower-http = { version = "0.7", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors", "catch-panic"] }
 tokio-stream = "0.1"
 open = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -63,6 +67,12 @@ rayon = "1"
 dirs = "6"
 rmp-serde = "1"
 bumpalo = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+async-stream = "0.3"
+futures = "0.3"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 
 [package]
 name = "nestweaver"
@@ -82,7 +92,7 @@ nestweaver-schema = { workspace = true }
 nestweaver-mcp = { workspace = true, features = ["daemon"] }
 nestweaver-web = { workspace = true }
 rmp-serde = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 miette = { version = "7", features = ["fancy"] }
 thiserror = { workspace = true }
@@ -103,12 +113,18 @@ libc = "0.2"
 sha2 = { workspace = true }
 hex = "0.4"
 tonic.workspace = true
+reqwest = { version = "0.13", features = ["json"] }
 nestweaver-embed = { workspace = true, optional = true }
 
 [features]
 default = ["embed"]
 embed = ["dep:nestweaver-embed", "nestweaver-daemon/embed"]
 metal = ["nestweaver-embed?/metal"]
+# ACME (Let's Encrypt) auto-TLS. Forwards to the daemon crate so the top-level
+# binary can be built with `--features acme` — without this passthrough the
+# runtime instruction to rebuild with that feature would fail (the binary would
+# not have it), and `--acme-domain` would be a dead runtime error.
+acme = ["nestweaver-daemon/acme"]
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -117,18 +133,27 @@ tempfile = "3"
 serde_json = { workspace = true }
 criterion = { version = "0.8", default-features = false }
 nestweaver-daemon = { workspace = true }
+nestweaver-proto = { workspace = true }
+tonic = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 libc = "0.2"
 blake3 = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
 
 [[bench]]
 name = "brain_benchmarks"
 harness = false
+test = false
 
 [[bench]]
 name = "embed_latency"
 harness = false
+test = false
 
 [[bench]]
 name = "index_benchmarks"
 harness = false
+test = false

@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: instance_type
   kind: Class
   start_line: 7
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: aws_ami
   kind: Class
   start_line: 13
@@ -35,6 +37,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: ubuntu
   kind: Class
   start_line: 13
@@ -46,6 +49,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: aws_instance
   kind: Class
   start_line: 23
@@ -57,6 +61,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: web
   kind: Class
   start_line: 23
@@ -68,6 +73,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: aws_security_group
   kind: Class
   start_line: 32
@@ -79,6 +85,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: web_sg
   kind: Class
   start_line: 32
@@ -90,6 +97,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: vpc
   kind: Class
   start_line: 44
@@ -101,6 +109,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: instance_ip
   kind: Class
   start_line: 52
@@ -112,6 +121,7 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: vpc_id
   kind: Class
   start_line: 57
@@ -123,3 +133,4 @@ expression: "parsed_symbols(\"simple.tf\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
+  scope_chain: ~

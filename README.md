@@ -114,7 +114,44 @@ nestweaver setup
 nestweaver setup --force   # regenerate skill/guide files even if customized
 ```
 
-Run `nestweaver --help` for the full command list. All commands support `--json` for machine-readable output.
+Run `nestweaver --help` for the full command list. Most commands support `--json` for machine-readable output.
+
+## Server Mode
+
+NestWeaver can run as a centralized server, indexing repos for your entire team and serving queries to AI agents via gRPC and MCP-over-HTTP.
+
+### Quick Start
+
+```bash
+# Start the server (TLS required for grpcs:// clients)
+nestweaver daemon --db ./brain.lbug run \
+  --server \
+  --bind 0.0.0.0:9378 \
+  --tls-cert ./tls/server.pem \
+  --tls-key ./tls/server-key.pem \
+  --auth-token "$NESTWEAVER_AUTH_TOKEN"
+
+# Connect from another machine
+nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TOKEN"
+```
+
+### Ports
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 3000 | HTTP | Web UI (optional, `nestweaver ui`; 9377 in the macOS .app) |
+| 9378 | gRPC | Query API (TCP + TLS) |
+| 9379 | HTTP | MCP-over-HTTP (AI agents) + `/webhook` + `/admin/api/*` + Prometheus `/metrics` |
+
+In server mode the daemon serves Prometheus `/metrics` on the MCP HTTP port (9379) — gRPC port + 1, inheriting the `--bind` IP. The same metrics are also exposed on 9377 when the web UI is running (`nestweaver ui`).
+
+### Docker
+
+```bash
+docker compose up -d
+```
+
+See [Server Mode Guide](docs/server-mode.md) for full documentation.
 
 ## Install
 
@@ -127,7 +164,7 @@ cd app && bash build.sh
 open target/release/NestWeaver.app
 ```
 
-The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x faster embeddings), automatic daemon lifecycle, web UI on port 9377, and crash recovery. See [macOS App](#macos-app) below.
+The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x faster embeddings via a launchd-managed daemon), a persistent daemon shared with the CLI/MCP, web UI on port 9377, and launchd-managed restart. See [macOS App](#macos-app) below.
 
 ### All platforms (CLI)
 
@@ -216,7 +253,9 @@ cargo build --release
 | `bridges` | Find architectural chokepoints (betweenness centrality) |
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High/Critical) |
 | `dead-code` | Detect unreachable symbols via entry point reachability |
-| `contracts` | Inspect API contract graph |
+| `contracts list` | List API contracts derived from spec files + framework handlers |
+| `contracts drift` | Routes declared in a spec but not implemented, and vice versa (presence-level) |
+| `contracts diff` | Field/type-level OpenAPI breaking-change diff between two spec versions (`--base`/`--head`, `--fail-on-breaking` for CI) |
 | `ranking` | Inspect ranking priors |
 | `eval` | Offline retrieval-quality evaluation |
 | `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format |
@@ -246,7 +285,9 @@ cargo build --release
 | Command | Description |
 |---------|-------------|
 | `mcp` | Start the MCP server (40 tools, or 6 in lite mode; auto-starts daemon) |
-| `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`) |
+| `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`; `run --server` for server mode) |
+| `connect` | Connect to an upstream NestWeaver server (federated read/impact) |
+| `server` | Server management utilities (`init-tls`, `backup`, `status`) |
 | `ui` | Launch the interactive web UI |
 | `setup` | Auto-detect and configure AI tools (16 supported). Use `--force` to regenerate customized files |
 | `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md, claude-md) |
@@ -255,6 +296,7 @@ cargo build --release
 | `pull` | Pull a snapshot from a remote storage backend |
 | `instance` | Manage instance configuration |
 | `snapshot` | Manage graph snapshots (build, verify, push) |
+| `backup` | Backup and restore the NestWeaver database |
 | `list-repos` | List all indexed repositories |
 | `remove-repo` | Remove an indexed repository and all its data (symbols, files, services, contracts) from the graph |
 | `remove-project` | Remove a materialized project and its edges from the graph |
@@ -301,13 +343,19 @@ nestweaver context "BLE bluetooth connection handling"
 nestweaver context "where does the upload pipeline start"
 ```
 
-Three retrieval signals are fused via Convex Combination: PPR (graph structure), BM25 (text match), and semantic (embedding similarity). The embedding model downloads automatically on first use (~80MB).
+Three retrieval signals are fused via Convex Combination: PPR (graph structure), BM25 (text match), and semantic (embedding similarity). The embedding model downloads automatically on first use.
 
-**Performance:** 7ms query embedding (Metal), 37ms (CPU). Forward Push PPR replaces power iteration for sub-10ms graph walks. LRU cache makes repeated queries instant (~8ms).
+**Model selection.** The default is the light, fast `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~90MB) — a good fit for most repos and CPU-only servers. For higher-quality retrieval, embed with a stronger model, e.g. `nestweaver embed --model-id thenlper/gte-base` (768-dim). NestWeaver **records which model a database was embedded with**, and the daemon automatically loads that same model at startup — so you can pick a model per-database (or override the default in `instance.toml`) without dimension mismatches.
 
-Configure weights in `instance.toml`:
+**External embedding endpoints.** Instead of a local model you can embed via an OpenAI-compatible endpoint: `nestweaver embed --endpoint http://localhost:11434 --model nomic-embed-text` (Ollama), or a hosted gateway. For **keyed** gateways (OpenAI, Azure), set `NESTWEAVER_EMBED_API_KEY` — it is sent as a bearer token and is **never** written to config, the graph, or a snapshot. Omit it for a local Ollama endpoint. NestWeaver records the index dimension and rejects vectors of a mismatched dimension, so switching models requires re-embedding with `--force`.
+
+**Performance:** 7ms query embedding (Metal), 37ms (CPU) for all-MiniLM; heavier models trade speed for quality. Query-time embedding runs on the GPU in the daemon (the model is loaded on the daemon's main thread so Metal is reachable). Forward Push PPR replaces power iteration for sub-10ms graph walks. LRU cache makes repeated queries instant (~8ms).
+
+Configure the model and fusion weights in `instance.toml`:
 ```toml
 [embedding]
+# Shipped default; the model a DB was actually embedded with is recorded and
+# auto-loaded by the daemon. Set this to override the default for fresh instances.
 model_id = "sentence-transformers/all-MiniLM-L6-v2"
 weight_ppr = 0.40
 weight_bm25 = 0.25
@@ -322,9 +370,8 @@ weight_semantic = 0.35
 NestWeaver includes a native macOS `.app` bundle — the recommended way to run on Mac. It provides:
 
 - **Menubar status icon** with quick access to the web UI and daemon status
-- **Metal GPU acceleration** — the app provides GUI session context so the daemon gets full Metal access (~5x faster embeddings: 7ms vs 37ms)
-- **Automatic daemon lifecycle** — starts the daemon on launch, terminates on quit, no orphaned processes
-- **Crash recovery** — auto-restarts the daemon up to 3 times on unexpected crashes
+- **Metal GPU acceleration** — the app launches the daemon as a launchd Aqua agent so it runs in the GUI session and can reach the Metal shader compiler for GPU embeddings (~5x faster: 7ms vs 37ms). The daemon loads the embedding model on its main thread, which is what lets a background process reach Metal.
+- **Managed daemon lifecycle** — launches the daemon via launchd (which owns crash-restart); the daemon is a shared service (MCP/CLI/UI all use it) and persists across app quits, so the app re-attaches to it on next launch
 - **Daemon coexistence** — detects if a daemon is already running (via CLI or launchd) and connects to it instead of starting a second instance
 - **Web UI** at `http://127.0.0.1:9377` — opens automatically on launch
 
@@ -396,7 +443,7 @@ NestWeaver exposes 40 tools via the [Model Context Protocol](https://modelcontex
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
-nestweaver mcp --no-daemon --db ./nestweaver.lbug                     # read-only direct mode (CI/testing)
+NESTWEAVER_NO_DAEMON=1 nestweaver mcp --no-daemon --db ./nestweaver.lbug   # read-only direct mode (CI/testing)
 ```
 
 The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers, CLI commands, and IDE integrations can share the same database concurrently without lock contention. The daemon exits after 1 hour of inactivity.
@@ -454,7 +501,9 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 - Glassmorphism panels with cursor-responsive lighting
 - Dark/light/system theme with kehl.io-inspired dark palette
 
-**WASM mode** — Append `?engine=wasm` to the URL to run graph algorithms client-side via WebAssembly. The browser downloads a MessagePack snapshot and executes PPR locally — no server round-trips for queries. Requires `wasm-pack build crates/nestweaver-wasm` first.
+**WASM mode** — Append `?engine=wasm` to the URL to run graph algorithms client-side via WebAssembly. The browser downloads a MessagePack snapshot and executes PPR locally — no server round-trips for queries. Requires building the wasm first (use `--remap-path-prefix` so the build
+machine's home path isn't baked into the artifact):
+`RUSTFLAGS="--remap-path-prefix=$HOME=/build" wasm-pack build crates/nestweaver-wasm --target web --out-dir ../../crates/nestweaver-web/frontend/src/wasm`.
 
 **Keyboard shortcuts:**
 - `Tab` / `Shift+Tab` — cycle forward/backward through nodes
@@ -465,7 +514,7 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 ## Architecture
 
 <details>
-<summary>Cargo workspace with 13 crates compiling to a single static binary + optional WASM module</summary>
+<summary>Cargo workspace with 15 crates compiling to a single static binary + optional WASM module</summary>
 
 | Crate | Description |
 |-------|-------------|
@@ -476,7 +525,9 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 | `nestweaver-storage` | Pluggable snapshot storage backends (local, S3, GitLab) |
 | `nestweaver-engine` | Indexing pipeline, query dispatch, config, snapshots, LLM integration |
 | `nestweaver-algorithms` | Pure-compute graph algorithms (PPR, impact BFS) — WASM-compatible, no I/O |
+| `nestweaver-embed` | Local embedding models (candle; Metal GPU on macOS) for vector search |
 | `nestweaver-proto` | gRPC service definition (protobuf) for daemon IPC |
+| `nestweaver-federation` | Federation coordinator — upstream routing, health/ejection, two-tier merge, staleness (leaf; used by client + daemon-mode mcp) |
 | `nestweaver-daemon` | Background daemon — owns the database, serves gRPC over Unix socket |
 | `nestweaver-client` | Daemon client with auto-start, flock-based race prevention, version check |
 | `nestweaver-mcp` | MCP server — proxies tool calls through the daemon |
@@ -492,10 +543,11 @@ algorithms          (zero internal deps — WASM target)
   <- wasm
 storage             (zero internal deps)
 proto               (generated gRPC types)
+federation          (leaf: schema + proto — upstream routing/merge/staleness)
        <- engine <- (parser, resolver, store, storage, algorithms)
             <- daemon <- (engine, store, mcp, proto)
-            <- client <- (proto, daemon)
-            <- mcp    <- (client, proto)  [daemon proxy mode]
+            <- client <- (proto, daemon, federation)
+            <- mcp    <- (engine, store, schema; proto + federation under the `daemon` feature)
             <- web
 ```
 

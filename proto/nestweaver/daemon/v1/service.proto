@@ -202,6 +202,22 @@ message BrainStatusResponse {
   int32 repo_count = 7;
   bool tantivy_available = 8;
   int32 tantivy_doc_count = 9;
+  bool indexing_active = 10;
+  string indexing_repo = 11;  // repo currently being indexed (empty if idle)
+  int32 queue_depth = 12;     // number of pending + running jobs
+}
+
+// repo_states — per-repo indexed SHA and metadata for staleness comparison
+message RepoStatesRequest {}
+message RepoState {
+  string repo_uid = 1;
+  string repo_url = 2;
+  string repo_name = 3;
+  string indexed_sha = 4;
+  int64 symbol_count = 5;
+}
+message RepoStatesResponse {
+  repeated RepoState repos = 1;
 }
 
 // note_get
@@ -262,6 +278,17 @@ message ProjectContextRequest {
   double recency_weight = 8;
   // Half-life (days) for the recency boost decay. Ignored when weight=0.
   double recency_half_life_days = 9;
+  // "concise" (default) trims per-node fields and uses a smaller default token
+  // budget; "detailed" returns full metadata at the larger budget. Empty = concise.
+  string response_format = 10;
+  // Filter connected/seed nodes to these repos (display name / uid / path substring).
+  repeated string repos = 11;
+  // Keep only nodes whose location starts with this path prefix. Empty = no filter.
+  string path_prefix = 12;
+  // Keep only note/section nodes tagged with any of these tags (symbols always kept).
+  repeated string tags = 13;
+  // Drop note/section nodes tagged with any of these tags.
+  repeated string exclude_tags = 14;
 }
 message ProjectContextResponse { string result_json = 1; }
 
@@ -298,6 +325,122 @@ message EmbedResponse {
   uint32 failed = 2;
 }
 
+// ─── Impact Analysis (Phase 4) ──────────────────────────────────────
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  SYMBOL_ADDED = 1;
+  SYMBOL_REMOVED = 2;
+  SIGNATURE_CHANGED = 3;
+  SYMBOL_RENAMED = 4;
+  SYMBOL_MOVED = 5;
+  EXPORT_ADDED = 6;
+  EXPORT_REMOVED = 7;
+}
+
+message AtomicChangeProto {
+  ChangeKind kind = 1;
+  string canonical_id = 2;
+  string name = 3;
+  optional string old_signature = 4;
+  optional string new_signature = 5;
+  optional string old_name = 6;
+  optional string new_name = 7;
+  optional string old_file = 8;
+  optional string new_file = 9;
+  string file_path = 10;
+  string symbol_kind = 11;
+}
+
+message ImpactAnalysisRequest {
+  repeated AtomicChangeProto changes = 1;
+  string source_repo_url = 2;
+  int32 max_depth = 3;
+  bool include_tests = 4;
+}
+
+enum Severity {
+  SEVERITY_BREAKING = 0;
+  SEVERITY_WARNING = 1;
+  SEVERITY_INFO = 2;
+}
+
+message ImpactItem {
+  string change_canonical_id = 1;
+  ChangeKind change_kind = 2;
+  string affected_canonical_id = 3;
+  string affected_name = 4;
+  string affected_repo_url = 5;
+  string affected_file = 6;
+  int32 affected_line = 7;
+  string affected_signature = 8;
+  Severity severity = 9;
+  string reason = 10;
+}
+
+message ImpactAnalysisResponse {
+  repeated ImpactItem impacts = 1;
+  int32 total_impacted_files = 2;
+  int32 total_impacted_repos = 3;
+  repeated string impacted_repo_urls = 4;
+}
+
+// ─── Flow Trace Continuation (Phase 4) ────────────────────────────
+
+message TraceSpanProto {
+  string trace_id = 1;
+  string span_id = 2;
+  optional string parent_span_id = 3;
+  string canonical_id = 4;
+  string name = 5;
+  string repo_url = 6;
+  string file_path = 7;
+  int32 start_line = 8;
+  repeated string callee_span_ids = 9;
+  string source = 10;  // "local" or server name
+}
+
+message BoundarySymbolProto {
+  string canonical_id = 1;
+  string name = 2;
+  string parent_span_id = 3;
+}
+
+message FlowTraceContinueRequest {
+  string trace_id = 1;
+  string entry_canonical_id = 2;
+  string parent_span_id = 3;
+  int32 remaining_depth = 4;
+  repeated string visited_canonical_ids = 5;
+}
+
+message FlowTraceContinueResponse {
+  repeated TraceSpanProto spans = 1;
+  repeated BoundarySymbolProto boundaries = 2;
+  bool truncated = 3;
+}
+
+// ─── Backup ─────────────────────────────────────────────────────────
+
+// The daemon performs the entire backup in-process: it holds its own write
+// lock (quiesce == lock-held), checkpoints, copies the on-disk files, and
+// packages the snapshot to output_path. One RPC, no cross-call quiesce state.
+message BackupRequest {
+  string output_path = 1;   // daemon-local path (or s3://…) for the .nwsnap.zst
+  bool include_clones = 2;  // full tier (include workspace/*.git)
+}
+
+message BackupResponse {
+  string output_path = 1;
+  string instance_id = 2;
+  string tier = 3;
+  string nestweaver_version = 4;
+  uint64 repo_count = 5;
+  uint64 symbol_count = 6;
+  uint64 db_size_bytes = 7;
+  uint64 total_compressed = 8;
+}
+
 // ─── Service ─────────────────────────────────────────────────────────
 
 service NestWeaverDaemon {
@@ -328,11 +471,18 @@ service NestWeaverDaemon {
   rpc WatchCode(WatchCodeRequest) returns (WatchCodeResponse);
   rpc StopWatch(StopWatchRequest) returns (StopWatchResponse);
 
+  // Backup — daemon quiesces itself (holds the write lock), checkpoints,
+  // copies, and packages the snapshot. One RPC, no cross-call quiesce state.
+  rpc Backup(BackupRequest) returns (BackupResponse);
+
   // Export
   rpc ExportGraph(JsonRequest) returns (JsonResponse);
 
   // UI
   rpc ServeUi(ServeUiRequest) returns (ServeUiResponse);
+
+  // Phase 4 — typed RPCs
+  rpc FlowTraceContinue(FlowTraceContinueRequest) returns (FlowTraceContinueResponse);
 
   // Read RPCs — typed hot-path
   rpc Search(BrainSearchRequest) returns (BrainSearchResponse);
@@ -341,6 +491,7 @@ service NestWeaverDaemon {
   rpc GetNote(NoteGetRequest) returns (NoteGetResponse);
   rpc BrainStatus(BrainStatusRequest) returns (BrainStatusResponse);
   rpc BrainStatusJson(JsonRequest) returns (JsonResponse);
+  rpc RepoStates(RepoStatesRequest) returns (RepoStatesResponse);
   rpc HubNodes(HubNodesRequest) returns (HubNodesResponse);
 
   // Read RPCs — JSON pass-through
@@ -348,6 +499,9 @@ service NestWeaverDaemon {
   rpc FlowTrace(JsonRequest) returns (JsonResponse);
   rpc BlastRadius(JsonRequest) returns (JsonResponse);
   rpc Impact(JsonRequest) returns (JsonResponse);
+
+  // Phase 4: typed impact analysis with Chianti-style atomic changes
+  rpc ImpactAnalysis(ImpactAnalysisRequest) returns (ImpactAnalysisResponse);
   rpc BrainGuide(JsonRequest) returns (JsonResponse);
   rpc BrainDiff(JsonRequest) returns (JsonResponse);
   rpc ReadSymbols(JsonRequest) returns (JsonResponse);

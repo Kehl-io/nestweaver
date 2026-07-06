@@ -1020,3 +1020,215 @@ model_id = "sentence-transformers/all-MiniLM-L6-v2"
         "embedding_model_id should NOT be the inference model"
     );
 }
+
+#[test]
+fn cli_daemon_run_server_help() {
+    nestweaver_cmd()
+        .args(["daemon", "run", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--server"))
+        .stdout(contains("--bind"))
+        .stdout(contains("--tls-cert"))
+        .stdout(contains("--tls-key"))
+        .stdout(contains("--auth-token"))
+        .stdout(contains("--admin-token"))
+        .stdout(contains("--port-file"));
+}
+
+#[test]
+fn cli_connect_help() {
+    nestweaver_cmd()
+        .args(["connect", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--token"))
+        .stdout(contains("--mode"))
+        .stdout(contains("--name"));
+}
+
+/// nw-010: a repo with a configured git origin remote indexes under the
+/// origin identity (`url` = remote URL, read from git config — no network)
+/// with its working tree recorded in `root_path`; a prior `file://` row for
+/// the same path is pruned by uid on re-index. A repo WITHOUT an origin
+/// keeps its `file://` identity, also with `root_path` set.
+#[test]
+fn cli_index_reidentifies_repo_under_origin_remote() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    for args in [
+        vec!["init"],
+        vec!["config", "user.email", "test@test.com"],
+        vec!["config", "user.name", "Test"],
+    ] {
+        StdCommand::new("git")
+            .args(&args)
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap();
+    }
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(name) { return name; }",
+    )
+    .unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-m", "init"]] {
+        StdCommand::new("git")
+            .args(&args)
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap();
+    }
+
+    // The CLI canonicalizes --repo before minting the identity.
+    let canonical = std::fs::canonicalize(&repo_dir).unwrap();
+    let file_url = format!("file://{}", canonical.display());
+
+    // 1. No origin remote → file:// identity, root_path recorded.
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let old_uid = nestweaver_schema::repo_uid("default", &file_url);
+    {
+        let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].uid, old_uid);
+        assert_eq!(repos[0].url, file_url);
+        assert_eq!(
+            repos[0].root_path.as_deref(),
+            Some(canonical.display().to_string().as_str()),
+            "root_path must be recorded for the no-origin fixture"
+        );
+    }
+
+    // 2. Configure an origin remote and re-index → origin identity wins and
+    //    the old file:// row is pruned by uid.
+    StdCommand::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/acme/demo.git",
+        ])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let new_uid = nestweaver_schema::repo_uid("default", "https://example.com/acme/demo.git");
+    assert_ne!(new_uid, old_uid);
+    {
+        let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(
+            repos.len(),
+            1,
+            "old file:// row must be pruned; repos: {:?}",
+            repos.iter().map(|r| &r.url).collect::<Vec<_>>()
+        );
+        assert_eq!(repos[0].uid, new_uid);
+        assert_eq!(repos[0].url, "https://example.com/acme/demo.git");
+        assert_eq!(
+            repos[0].root_path.as_deref(),
+            Some(canonical.display().to_string().as_str())
+        );
+        assert!(store.lookup_repo(&old_uid).unwrap().is_none());
+
+        // Regression guard: the re-index above ran WITHOUT --force through
+        // the incremental path. Files are unchanged on disk, so a trusted
+        // filemeta sidecar would skip every write under the new uid while
+        // the prune deletes the old copy — silently emptying the graph. The
+        // repo's data must exist under the NEW uid.
+        let symbols = store.symbol_names_by_repo(&new_uid).unwrap();
+        assert!(
+            symbols.iter().any(|n| n == "greet"),
+            "symbol `greet` must exist under the new uid after re-identify, got {symbols:?}"
+        );
+        let files = store.list_files_by_repo(&new_uid).unwrap();
+        assert!(
+            !files.is_empty(),
+            "files must be re-inserted under the new uid"
+        );
+    }
+
+    // And the symbol stays reachable end-to-end via CLI search.
+    nestweaver_cmd()
+        .args([
+            "search",
+            "greet",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("greet"));
+}
+
+#[test]
+fn cli_contracts_diff_flags_breaking_change() {
+    // A removed response field is a BREAKING change; --fail-on-breaking exits nonzero.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("openapi.base.yaml");
+    let head = dir.path().join("openapi.head.yaml");
+    std::fs::write(
+        &base,
+        "openapi: 3.0.0\ninfo: {title: t, version: \"1\"}\npaths:\n  /x:\n    get:\n      responses:\n        '200':\n          description: ok\n          content: {application/json: {schema: {type: object, properties: {id: {type: string}, status: {type: string}}}}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &head,
+        "openapi: 3.0.0\ninfo: {title: t, version: \"1\"}\npaths:\n  /x:\n    get:\n      responses:\n        '200':\n          description: ok\n          content: {application/json: {schema: {type: object, properties: {id: {type: string}}}}}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["contracts", "diff", "--base"])
+        .arg(&base)
+        .arg("--head")
+        .arg(&head)
+        .arg("--fail-on-breaking")
+        .assert()
+        .failure()
+        .stdout(contains("BREAKING"));
+}
+
+#[test]
+fn cli_contracts_diff_clean_on_identical_specs() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = dir.path().join("openapi.yaml");
+    std::fs::write(
+        &spec,
+        "openapi: 3.0.0\ninfo: {title: t, version: \"1\"}\npaths:\n  /x:\n    get:\n      responses:\n        '200':\n          description: ok\n          content: {application/json: {schema: {type: object, properties: {id: {type: string}}}}}\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["contracts", "diff", "--base"])
+        .arg(&spec)
+        .arg("--head")
+        .arg(&spec)
+        .arg("--fail-on-breaking")
+        .assert()
+        .success()
+        .stdout(contains("No API changes"));
+}

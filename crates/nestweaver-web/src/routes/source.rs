@@ -36,8 +36,11 @@ pub async fn source(
     let repos = nestweaver_engine::list_repos(&state.store, None)?;
 
     for repo in &repos {
-        // Strip file:// prefix if present
-        let repo_root = repo.url.strip_prefix("file://").unwrap_or(&repo.url);
+        // Only repos with a known local working tree can serve source from
+        // disk; remote-identity repos without one are skipped.
+        let Some(repo_root) = repo.local_root() else {
+            continue;
+        };
 
         let full_path = std::path::Path::new(repo_root).join(&file);
 
@@ -63,8 +66,16 @@ pub async fn source(
         let all_lines: Vec<&str> = content.lines().collect();
         let total_lines = all_lines.len();
 
-        let start = line.saturating_sub(context + 1);
-        let end = (line + context).min(total_lines);
+        // Clamp defensively: a large `line` (or `line + context` overflow) must
+        // not produce start > end or an out-of-range slice — that would panic the
+        // request task. All arithmetic is saturating (a debug build would panic on
+        // a raw `context + 1` overflow); `start.min(end)` keeps the range valid
+        // even when `line` is far past EOF.
+        let start = line
+            .saturating_sub(context.saturating_add(1))
+            .min(total_lines);
+        let end = line.saturating_add(context).min(total_lines);
+        let start = start.min(end);
 
         let extracted: Vec<&str> = all_lines[start..end].to_vec();
 

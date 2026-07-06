@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::content_reader::ContentReader;
 use anyhow::Context;
 use globset::GlobSet;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -16,11 +17,12 @@ use nestweaver_parser::{
     ParsedNote, RawTag, RawWikilink, SkippedFile, TagSource, is_markdown, parse_markdown,
 };
 use nestweaver_schema::{
-    EdgeType, Heading, Note, ResolvedEdge, Section, Tag, Vault, heading_uid, note_uid, section_uid,
-    tag_uid, vault_uid,
+    EdgeType, Heading, Note, Repo, ResolvedEdge, Section, Tag, Vault, heading_uid, note_uid,
+    repo_uid, section_uid, tag_uid, vault_uid,
 };
 use nestweaver_store::GraphStore;
-use walkdir::WalkDir;
+// walkdir replaced by ContentReader::list_files() — only sidecar/taxonomy paths
+// still use direct fs access.
 
 /// Outcome of a markdown index run.
 pub struct MarkdownIndexResult {
@@ -49,13 +51,29 @@ const SKIP_DIRS: &[&str] = &[
     "build",
 ];
 
+/// Returns true if any component of `rel_path` matches one of the vault
+/// `SKIP_DIRS`. Used to post-filter results from `ContentReader::list_files()`
+/// which may not know about vault-specific skip directories (e.g. `.obsidian`,
+/// `.trash`).
+fn path_has_vault_skip_dir(rel_path: &Path) -> bool {
+    for component in rel_path.components() {
+        if let std::path::Component::Normal(name) = component
+            && let Some(s) = name.to_str()
+            && SKIP_DIRS.contains(&s)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Cap on per-file size to avoid pathological inputs (e.g. multi-MB log dumps
 /// pasted into a note). Files above this size are skipped with a warning.
 /// Per-file cap on note size. Files larger than this are skipped with a
 /// logged warning. Architecture doc §9.7 specifies 1 MB; multi-MB markdown
 /// is almost always machine-generated (pasted logs, exported data dumps)
 /// and parsing them takes seconds while tanking ranking quality.
-const MAX_FILE_SIZE_BYTES: u64 = 1024 * 1024; // 1 MB
+pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 1024 * 1024; // 1 MB
 
 /// Index a markdown vault into a persistent `GraphStore` at `db_path`.
 ///
@@ -104,10 +122,12 @@ pub fn index_markdown_directory_with_store(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
-    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, extra_ignore_patterns);
-    let result = index_into_store(vault_root, store, instance_id, vault_name, &ignore_set)?;
+    let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    let reader = crate::content_reader::FilesystemReader::new(&canonical);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
+    let result = index_into_store(&reader, store, instance_id, vault_name, &ignore_set)?;
 
-    let aliases = load_taxonomy_aliases(vault_root);
+    let aliases = load_taxonomy_aliases(reader.root());
     if !aliases.is_empty() {
         let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
         match serde_json::to_string(&aliases) {
@@ -150,9 +170,119 @@ pub fn index_markdown_directory_in_memory(
     vault_name: &str,
 ) -> Result<(MarkdownIndexResult, GraphStore), anyhow::Error> {
     let store = GraphStore::in_memory().context("create in-memory GraphStore")?;
-    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, &[]);
-    let result = index_into_store(vault_root, &store, instance_id, vault_name, &ignore_set)?;
+    let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    let reader = crate::content_reader::FilesystemReader::new(&canonical);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, &[]);
+    let result = index_into_store(&reader, &store, instance_id, vault_name, &ignore_set)?;
     Ok((result, store))
+}
+
+/// Index markdown notes from a caller-provided [`ContentReader`] into `store`.
+///
+/// Unlike [`index_markdown_directory_with_store`], this does not assume a
+/// canonical on-disk vault directory — it indexes whatever the `reader`
+/// exposes. This is the entry point used by the server-mode worker when a repo
+/// is declared as a markdown vault (`type = "vault"`): the reader is a
+/// [`crate::content_reader::GitBareReader`] over a bare clone, which has no
+/// working tree and therefore no on-disk `.brainignore`. In that case the
+/// ignore set falls back to the built-in defaults (see
+/// [`crate::brainignore::load_brain_ignore`]).
+pub fn index_markdown_with_reader(
+    reader: &dyn ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    vault_name: &str,
+) -> Result<MarkdownIndexResult, anyhow::Error> {
+    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
+    index_into_store(reader, store, instance_id, vault_name, &ignore_set)
+}
+
+/// Server-mode vault entry point: index the markdown exposed by `reader` and
+/// record `indexed_sha` on the repo's `Repo` node, while narrowing the caller's
+/// write gate to the database-write phase only — the scan and parse passes run
+/// off-lock (nw-006).
+///
+/// `repo_url` doubles as the vault display name and the key from which the
+/// `Repo` UID is derived. Recording the SHA (nw-003) lets the worker's
+/// up-to-date short-circuit skip an unchanged vault on the next poll; without it
+/// the `Repo` row keeps an empty `indexed_sha` and the vault re-indexes every
+/// cycle. Mirrors [`crate::index_with_reader_and_write_gate`] for the code path.
+pub fn index_markdown_with_reader_and_write_gate<G, F>(
+    reader: &dyn ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+    indexed_sha: &str,
+    acquire_write_guard: F,
+) -> Result<MarkdownIndexResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
+    let result = index_into_store_with_write_gate(
+        reader,
+        store,
+        instance_id,
+        repo_url,
+        &ignore_set,
+        Some(indexed_sha),
+        acquire_write_guard,
+    )?;
+
+    // Load taxonomy aliases from the reader (server-mode equivalent of the
+    // filesystem-based loading in index_markdown_directory_with_store).
+    let aliases = load_taxonomy_aliases_from_reader(reader);
+    if !aliases.is_empty()
+        && let Some(db_path) = store.db_path()
+    {
+        let sidecar_path = crate::sidecar_path(db_path, ".aliases.json");
+        match serde_json::to_string(&aliases) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&sidecar_path, json) {
+                    tracing::warn!("failed to write aliases sidecar: {e}");
+                } else {
+                    tracing::info!(
+                        path = %sidecar_path.display(),
+                        count = aliases.len(),
+                        "wrote taxonomy alias sidecar (server-mode)"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize aliases: {e}"),
+        }
+    }
+
+    Ok(result)
+}
+
+/// Upsert the `Repo` node for `repo_url` so its `indexed_sha` equals `sha`,
+/// mirroring what the code path does inside its own gated write region
+/// (`index.rs`): insert the row when absent, otherwise update the SHA in place.
+fn record_repo_indexed_sha(
+    store: &GraphStore,
+    instance_id: &str,
+    repo_url: &str,
+    sha: &str,
+) -> Result<(), anyhow::Error> {
+    let r_uid = repo_uid(instance_id, repo_url);
+    if store.lookup_repo(&r_uid).context("lookup_repo")?.is_none() {
+        store
+            .insert_repo(&Repo {
+                uid: r_uid,
+                url: repo_url.trim_end_matches('/').to_string(),
+                indexed_sha: sha.to_string(),
+                staleness_commits_behind: 0,
+                instance_id: instance_id.to_string(),
+                name: None,
+                root_path: None,
+            })
+            .context("insert_repo")?;
+    } else {
+        store
+            .update_repo_sha(&r_uid, sha)
+            .context("update_repo_sha")?;
+    }
+    Ok(())
 }
 
 /// Outcome of an incremental (`--since`) markdown refresh run.
@@ -204,6 +334,7 @@ pub fn index_markdown_directory_since_with_ignore(
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
 
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    let reader = crate::content_reader::FilesystemReader::new(&canonical);
     let root_str = canonical.to_string_lossy().into_owned();
     let vault_root: &Path = &canonical;
     let v_uid = vault_uid(instance_id, &root_str);
@@ -218,34 +349,12 @@ pub fn index_markdown_directory_since_with_ignore(
         })
         .context("upsert_vault")?;
 
-    // Track visited directory inodes to detect symlink loops.
-    #[cfg(unix)]
-    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+    let since_secs = since
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
-    let walker = WalkDir::new(vault_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|name| SKIP_DIRS.contains(&name))
-            {
-                return false;
-            }
-            #[cfg(unix)]
-            if e.file_type().is_dir()
-                && let Ok(meta) = std::fs::metadata(e.path())
-            {
-                use std::os::unix::fs::MetadataExt;
-                let key = (meta.dev(), meta.ino());
-                if !seen_inodes.insert(key) {
-                    tracing::debug!("skipping already-visited inode: {}", e.path().display());
-                    return false;
-                }
-            }
-            true
-        });
+    let all_files = reader.list_files()?;
 
     let mut files_checked = 0usize;
     let mut notes_updated = 0usize;
@@ -255,89 +364,58 @@ pub fn index_markdown_directory_since_with_ignore(
     let mut total_tags = 0usize;
     let mut total_wikilinks = 0usize;
 
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!("walkdir error (since): {err}");
-                continue;
-            }
-        };
-        if !entry.file_type().is_file() {
+    for rel_path in all_files {
+        if !is_markdown(&rel_path) {
             continue;
         }
-        let path = entry.path();
-        if !is_markdown(path) {
+        // Skip vault-specific directories.
+        if path_has_vault_skip_dir(&rel_path) {
             continue;
         }
-        // Reject symlinks whose target is outside the vault root.
-        if entry.path_is_symlink() {
-            match std::fs::canonicalize(path) {
-                Ok(resolved) if !resolved.starts_with(vault_root) => {
-                    tracing::warn!("skipping symlink escaping vault root: {}", path.display());
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!("cannot resolve symlink: {}", path.display());
-                    continue;
-                }
-                Ok(_) => {}
-            }
-        }
-
         // Apply .brainignore patterns.
-        let rel_for_ignore = path
-            .strip_prefix(vault_root)
-            .unwrap_or(path)
-            .to_string_lossy();
-        if crate::brainignore::is_ignored(&rel_for_ignore, &ignore_set) {
-            tracing::debug!("brainignore: skipping {}", rel_for_ignore);
+        let rel_str = rel_path.to_string_lossy();
+        if crate::brainignore::is_ignored(&rel_str, &ignore_set) {
+            tracing::debug!("brainignore: skipping {}", rel_str);
             continue;
         }
 
         files_checked += 1;
 
-        // Filter by modification time.
-        let mtime = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if mtime < since {
-            continue;
-        }
+        // Filter by modification time via ContentReader metadata.
+        // Bare repos (GitBareReader) return None — skip mtime filter, always process.
+        match reader.file_meta(&rel_path) {
+            Ok(Some((mtime_secs, file_size))) => {
+                if mtime_secs < since_secs {
+                    continue;
+                }
+                if file_size > MAX_FILE_SIZE_BYTES {
+                    tracing::warn!("skipping oversized file: {}", rel_str);
+                    continue;
+                }
+            }
+            Ok(None) => {} // bare repo: no mtime, process unconditionally
+            Err(_) => continue,
+        };
 
-        // Size guard.
-        if let Ok(meta) = entry.metadata()
-            && meta.len() > MAX_FILE_SIZE_BYTES
-        {
-            tracing::warn!("skipping oversized file: {}", path.display());
-            continue;
-        }
-
-        let source = match std::fs::read_to_string(path) {
+        let source = match reader.read_file(&rel_path) {
             Ok(s) => s,
             Err(err) => {
-                tracing::warn!("read error {}: {err}", path.display());
+                tracing::warn!("read error {}: {err}", rel_str);
                 continue;
             }
         };
 
-        let rel_path = path
-            .strip_prefix(vault_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+        let rel_path_str = rel_str.into_owned();
 
-        let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
+        let parsed: ParsedNote = match parse_markdown(&rel_path_str, &source) {
             Ok(p) => p,
             Err(err) => {
-                tracing::warn!("parse error {rel_path}: {err}");
+                tracing::warn!("parse error {rel_path_str}: {err}");
                 continue;
             }
         };
 
-        let n_uid = note_uid(&v_uid, &rel_path);
+        let n_uid = note_uid(&v_uid, &rel_path_str);
 
         // Delete old note data (cascade). Safe when note doesn't exist.
         if let Err(e) = store.delete_note_cascade(&n_uid) {
@@ -346,9 +424,10 @@ pub fn index_markdown_directory_since_with_ignore(
             notes_deleted += 1;
         }
 
+        let abs_path = vault_root.join(&rel_path);
         let (h_count, s_count, wl_count, t_count) =
-            reinsert_single_note(&store, &v_uid, &n_uid, path, &rel_path, &parsed)
-                .with_context(|| format!("reinsert_single_note {rel_path}"))?;
+            reinsert_single_note(&store, &v_uid, &n_uid, &abs_path, &rel_path_str, &parsed)
+                .with_context(|| format!("reinsert_single_note {rel_path_str}"))?;
 
         total_headings += h_count;
         total_sections += s_count;
@@ -579,6 +658,9 @@ fn reinsert_single_note(
     };
     let mut wl_note_edges: Vec<(String, String, f32, String)> = Vec::new();
     let mut wl_head_edges: Vec<(String, String, f32, String)> = Vec::new();
+    // Unresolved links collected for a single batched insert — a per-row insert
+    // here made a single note with many missing-target links hang the watcher.
+    let mut unresolved: Vec<(String, String, String, String, String)> = Vec::new();
 
     for wl in &parsed.wikilinks {
         if wl.section_idx >= section_uids.len() {
@@ -594,15 +676,13 @@ fn reinsert_single_note(
                 source_section,
                 crate::hash::blake3_hex_short(&wl.target)
             );
-            if let Err(e) = store.insert_unresolved_wikilink(
-                &uw_uid,
-                n_uid,
-                rel_path,
-                &parsed.title,
-                &wl.target,
-            ) {
-                tracing::warn!("failed to record unresolved wikilink '{}': {e}", wl.target);
-            }
+            unresolved.push((
+                uw_uid,
+                n_uid.to_string(),
+                rel_path.to_string(),
+                parsed.title.clone(),
+                wl.target.clone(),
+            ));
             continue;
         };
         let n = candidates.len() as f32;
@@ -631,6 +711,13 @@ fn reinsert_single_note(
         }
     }
     let wl_resolved = wl_note_edges.len() + wl_head_edges.len();
+    {
+        let mut seen = std::collections::HashSet::new();
+        unresolved.retain(|(uid, ..)| seen.insert(uid.clone()));
+        if let Err(e) = store.batch_insert_unresolved_wikilinks(&unresolved) {
+            tracing::warn!("failed to record unresolved wikilinks: {e}");
+        }
+    }
     let wl_note_refs: Vec<(&str, &str, f32, &str)> = wl_note_edges
         .iter()
         .map(|(s, n, c, d)| (s.as_str(), n.as_str(), *c, d.as_str()))
@@ -650,35 +737,58 @@ fn reinsert_single_note(
 }
 
 fn index_into_store(
-    vault_root: &Path,
+    reader: &dyn crate::content_reader::ContentReader,
     store: &GraphStore,
     instance_id: &str,
     vault_name: &str,
     ignore_set: &GlobSet,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_into_store_with_write_gate(
+        reader,
+        store,
+        instance_id,
+        vault_name,
+        ignore_set,
+        None,
+        || Ok::<_, anyhow::Error>(()),
+    )
+}
+
+/// Core markdown indexer. The expensive scan and parse passes run *off* the
+/// caller's write gate; only the database writes — vault upsert, tag/bulk
+/// inserts, and the optional repo-SHA recording — are performed under
+/// `acquire_write_guard` (nw-006). This mirrors the code path's
+/// `index_into_store_with_write_gate` in `index.rs`, which likewise builds
+/// off-lock and acquires the gate just before its write phase.
+///
+/// `record_repo_sha` is `Some(sha)` only for the server-mode vault path, where
+/// `vault_name` is the repo URL: it upserts the repo's `Repo` node with that
+/// SHA (nw-003) so an unchanged vault is skipped on the next poll. For
+/// local-directory vaults (which have no remote SHA) it is `None`.
+fn index_into_store_with_write_gate<G, F>(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    vault_name: &str,
+    ignore_set: &GlobSet,
+    record_repo_sha: Option<&str>,
+    acquire_write_guard: F,
+) -> Result<MarkdownIndexResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
     let started = Instant::now();
 
-    // Canonicalize the root so vault_uid and note rel_paths agree with the
-    // watcher (which sees canonical paths from FSEvents on macOS).
-    let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
-    let root_str = canonical.to_string_lossy().into_owned();
-    let vault_root: &Path = &canonical;
+    // The caller canonicalizes vault_root before constructing the reader, so
+    // reader.root() is already canonical — agreeing with the watcher (which
+    // sees canonical paths from FSEvents on macOS).
+    let vault_root = reader.root();
+    let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
 
-    // 1. Insert the Vault node. If the vault was already indexed, cascade-
-    //    delete the old data first so re-indexing is idempotent.
-    if store.lookup_vault(&v_uid).is_ok() {
-        store
-            .delete_vault_cascade(&v_uid)
-            .context("delete_vault_cascade (re-index)")?;
-    }
-    let vault = Vault {
-        uid: v_uid.clone(),
-        name: vault_name.to_string(),
-        root_path: root_str.clone(),
-        instance_id: instance_id.to_string(),
-    };
-    store.insert_vault(&vault).context("insert_vault")?;
+    // The Vault node is upserted later, under the write gate, alongside the
+    // bulk commit (see "gated write region" below). Computing v_uid here is a
+    // pure operation that does not touch the store.
 
     // ── Phase 1: Scan notes ───────────────────────────────────────────────
     let scan_pb = ProgressBar::new_spinner();
@@ -690,113 +800,50 @@ fn index_into_store(
 
     /// Per-file data collected during the scan phase.
     struct ScannedNote {
-        path: PathBuf,
-        metadata: Option<std::fs::Metadata>,
+        rel_path: PathBuf,
     }
 
     let mut scanned_notes: Vec<ScannedNote> = Vec::new();
     let mut skipped: Vec<SkippedFile> = Vec::new();
 
-    // Track visited directory inodes to detect symlink loops.
-    #[cfg(unix)]
-    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
-
-    // SECURITY: do NOT follow symlinks. A vault containing a symlink to
-    // /etc/passwd (or any path outside the vault) would otherwise be
-    // indexed, and `note_get` would then exfiltrate the target file's
-    // contents through Claude. Symlinks are silently skipped.
-    let walker = WalkDir::new(vault_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.file_type().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .is_some_and(|name| SKIP_DIRS.contains(&name))
-            {
-                return false;
-            }
-            #[cfg(unix)]
-            if e.file_type().is_dir()
-                && let Ok(meta) = std::fs::metadata(e.path())
-            {
-                use std::os::unix::fs::MetadataExt;
-                let key = (meta.dev(), meta.ino());
-                if !seen_inodes.insert(key) {
-                    tracing::debug!("skipping already-visited inode: {}", e.path().display());
-                    return false;
-                }
-            }
-            true
-        });
-
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!("walkdir error: {err}");
-                continue;
-            }
-        };
-        if !entry.file_type().is_file() {
+    // SECURITY: FilesystemReader::list_files() uses follow_links(false)
+    // and only returns entries where file_type().is_file() == true,
+    // so symlinks (including those pointing outside the vault) are
+    // silently excluded — matching the old WalkDir + symlink-rejection
+    // behaviour.
+    let all_files = reader.list_files()?;
+    for rel_path in all_files {
+        if !is_markdown(&rel_path) {
             continue;
         }
-        let path = entry.path();
-        if !is_markdown(path) {
+        // Skip vault-specific directories (e.g. .obsidian, .trash).
+        if path_has_vault_skip_dir(&rel_path) {
             continue;
-        }
-
-        // Reject symlinks whose target is outside the vault root.
-        if entry.path_is_symlink() {
-            match std::fs::canonicalize(path) {
-                Ok(resolved) if !resolved.starts_with(vault_root) => {
-                    skipped.push(SkippedFile {
-                        path: path.to_string_lossy().into_owned(),
-                        reason: "symlink target outside vault root".to_string(),
-                    });
-                    continue;
-                }
-                Err(e) => {
-                    skipped.push(SkippedFile {
-                        path: path.to_string_lossy().into_owned(),
-                        reason: format!("cannot resolve symlink: {e}"),
-                    });
-                    continue;
-                }
-                Ok(_) => {}
-            }
         }
 
         // Apply .brainignore patterns.
-        let rel_for_ignore = path
-            .strip_prefix(vault_root)
-            .unwrap_or(path)
-            .to_string_lossy();
-        if crate::brainignore::is_ignored(&rel_for_ignore, ignore_set) {
-            tracing::debug!("brainignore: skipping {}", rel_for_ignore);
+        let rel_str = rel_path.to_string_lossy();
+        if crate::brainignore::is_ignored(&rel_str, ignore_set) {
+            tracing::debug!("brainignore: skipping {}", rel_str);
             skipped.push(SkippedFile {
-                path: path.to_string_lossy().into_owned(),
+                path: rel_str.into_owned(),
                 reason: "matched .brainignore pattern".to_string(),
             });
             continue;
         }
 
         // Size guard.
-        let metadata = entry.metadata().ok();
-        if let Some(ref meta) = metadata
-            && meta.len() > MAX_FILE_SIZE_BYTES
+        if let Ok(Some((_, size))) = reader.file_meta(&rel_path)
+            && size > MAX_FILE_SIZE_BYTES
         {
             skipped.push(SkippedFile {
-                path: path.to_string_lossy().into_owned(),
+                path: rel_str.into_owned(),
                 reason: format!("file exceeds {} bytes", MAX_FILE_SIZE_BYTES),
             });
             continue;
         }
 
-        scanned_notes.push(ScannedNote {
-            path: path.to_path_buf(),
-            metadata,
-        });
+        scanned_notes.push(ScannedNote { rel_path });
         scan_pb.set_message(format!("Scanning notes... {}", scanned_notes.len()));
         scan_pb.tick();
     }
@@ -845,28 +892,19 @@ fn index_into_store(
     let outcomes: Vec<NoteOutcome> = scanned_notes
         .par_iter()
         .map(|scanned| {
-            let path = &scanned.path;
+            let rel_path = scanned.rel_path.to_string_lossy().into_owned();
 
-            let display_name = path
-                .strip_prefix(vault_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .into_owned();
-
-            // Read.
-            let source = match std::fs::read_to_string(path) {
+            // Read via ContentReader.
+            let source = match reader.read_file(&scanned.rel_path) {
                 Ok(s) => s,
                 Err(err) => {
                     parse_pb.inc(1);
                     return NoteOutcome::Skipped(SkippedFile {
-                        path: path.to_string_lossy().into_owned(),
+                        path: rel_path,
                         reason: format!("read error: {err}"),
                     });
                 }
             };
-
-            // Compute relative path from vault root for stable UIDs.
-            let rel_path = display_name;
 
             let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
                 Ok(p) => p,
@@ -894,15 +932,17 @@ fn index_into_store(
                 None
             };
 
-            // File timestamps — best-effort, never fatal.
-            let (created_at, modified_at) = match &scanned.metadata {
-                Some(meta) => {
-                    let created = meta.created().ok().and_then(format_system_time);
-                    let modified = meta.modified().ok().and_then(format_system_time);
-                    (created, modified)
-                }
-                None => (None, None),
-            };
+            // File timestamps — best-effort, never fatal. Uses direct
+            // fs::metadata for created_at (not in ContentReader trait).
+            let (created_at, modified_at) =
+                match std::fs::metadata(vault_root.join(&scanned.rel_path)) {
+                    Ok(meta) => {
+                        let created = meta.created().ok().and_then(format_system_time);
+                        let modified = meta.modified().ok().and_then(format_system_time);
+                        (created, modified)
+                    }
+                    Err(_) => (None, None),
+                };
 
             let note = Note {
                 uid: n_uid.clone(),
@@ -1123,18 +1163,25 @@ fn index_into_store(
     }
     let tags_count = all_tags.len();
 
-    // Insert tag nodes outside the main transaction so that duplicate tags
-    // from earlier index runs are silently skipped rather than aborting the
-    // whole batch.
-    for tag in &all_tags {
-        if let Err(e) = store.insert_tag(tag) {
-            if e.is_duplicate() {
-                tracing::debug!("insert_tag {} skipped (already exists): {e}", tag.name);
-            } else {
-                return Err(e).context("insert_tag");
-            }
-        }
-    }
+    // ── Gated write region (nw-006) ───────────────────────────────────────
+    // Everything above (scan + parse + in-memory tag/wikilink resolution) is
+    // read-only with respect to the store, so it ran off the caller's write
+    // gate. Acquire the gate now and hold it through the final commit. The
+    // gate closure also performs the job-cancellation check in server mode, so
+    // a cancelled job returns here after the off-lock parse — matching the code
+    // path's behaviour exactly.
+    let _write_guard = acquire_write_guard()?;
+
+    // Whether this vault was already indexed. If so, the atomic reindex write
+    // below cascade-deletes the old data and re-inserts the new data in a
+    // SINGLE transaction (via `bulk_vault_reindex_write`), so concurrent
+    // readers only ever observe the complete old vault or the complete new
+    // vault — never the empty intermediate that a separate delete transaction
+    // used to expose. Tag nodes are (re-)inserted inside that same transaction;
+    // the cascade delete removes this vault's old tags first, so no duplicate
+    // handling is needed (tags are vault-scoped by uid). Captured under the
+    // gate, before the write.
+    let vault_existed = store.lookup_vault(&v_uid).is_ok();
 
     // Wikilink resolution: build lookup indices once, then 5-priority match.
     let lookup = WikilinkLookup::build(&note_contexts);
@@ -1252,7 +1299,14 @@ fn index_into_store(
             .collect();
 
         store
-            .bulk_vault_write(
+            .bulk_vault_reindex_write(
+                &Vault {
+                    uid: v_uid.clone(),
+                    name: vault_name.to_string(),
+                    root_path: root_str.clone(),
+                    instance_id: instance_id.to_string(),
+                },
+                vault_existed,
                 &all_notes,
                 &all_headings,
                 &all_sections,
@@ -1261,19 +1315,25 @@ fn index_into_store(
                 &note_section_refs,
                 &heading_section_refs,
                 &heading_parent_refs,
-                &[],
+                &all_tags,
                 &note_tag_refs,
                 &section_tag_refs,
                 &wl_note_refs,
                 &wl_head_refs,
             )
-            .context("bulk_vault_write")?;
+            .context("bulk_vault_reindex_write")?;
     }
 
     // Persist genuinely-unresolved wikilinks so broken-links surfaces them.
-    for (uid, snu, sp, st, wt) in &unresolved_records {
-        if let Err(e) = store.insert_unresolved_wikilink(uid, snu, sp, st, wt) {
-            tracing::warn!("failed to record unresolved wikilink '{wt}': {e}");
+    // Dedup by uid first (many identical `[[missing]]` links in one section share
+    // a uid), then batch-insert on a single connection — a per-row insert here
+    // opened a fresh connection per link and made a note with thousands of
+    // unresolved links take tens of seconds to a hang.
+    {
+        let mut seen = std::collections::HashSet::new();
+        unresolved_records.retain(|(uid, ..)| seen.insert(uid.clone()));
+        if let Err(e) = store.batch_insert_unresolved_wikilinks(&unresolved_records) {
+            tracing::warn!("failed to record unresolved wikilinks: {e}");
         }
     }
 
@@ -1288,6 +1348,16 @@ fn index_into_store(
         && let Err(e) = store.batch_insert_edges(&typed_edges)
     {
         tracing::warn!("failed to insert typed relationship edges: {e}");
+    }
+
+    // nw-003: record the indexed SHA on the repo's Repo node (server-mode vault
+    // path only). The markdown indexer above only writes Note/Section/Heading
+    // nodes and never touches the Repo row, so without this the row keeps an
+    // empty indexed_sha and the worker's up-to-date short-circuit never fires —
+    // re-indexing the whole vault every poll. `vault_name` is the repo URL in
+    // this path; recorded under the same write gate as the vault commit.
+    if let Some(sha) = record_repo_sha {
+        record_repo_indexed_sha(store, instance_id, vault_name, sha)?;
     }
 
     // ── Summary ───────────────────────────────────────────────────────────
@@ -1742,6 +1812,29 @@ fn secs_to_ymd_hms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 /// Candidate taxonomy file locations within a vault root, in priority order.
 const TAXONOMY_FILES: &[&str] = &["_taxonomy.md", "taxonomy.md", "_brain/taxonomy.md"];
 
+/// Parse alias mappings from a vault's taxonomy file, reading via a
+/// [`ContentReader`]. This is the reader-agnostic version used by both
+/// local-mode and server-mode indexers — server mode has no on-disk working
+/// tree, so direct `fs::read_to_string` would fail.
+fn load_taxonomy_aliases_from_reader(
+    reader: &dyn crate::content_reader::ContentReader,
+) -> HashMap<String, Vec<String>> {
+    let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+
+    for name in TAXONOMY_FILES {
+        let Ok(content) = reader.read_file(Path::new(name)) else {
+            continue;
+        };
+
+        parse_taxonomy_content(&content, &mut aliases);
+
+        // Only process the first taxonomy file found.
+        break;
+    }
+
+    aliases
+}
+
 /// Parse alias mappings from a vault's taxonomy file.
 ///
 /// Returns a map of `canonical_name → [alias1, alias2, ...]`. Two formats
@@ -1775,49 +1868,55 @@ fn load_taxonomy_aliases(vault_root: &Path) -> HashMap<String, Vec<String>> {
             continue;
         };
 
-        // Parse YAML frontmatter for `aliases:` mapping.
-        if let Some(fm) = extract_frontmatter(&content)
-            && let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(fm)
-            && let Some(mapping) = yaml.get("aliases").and_then(|v| v.as_mapping())
-        {
-            for (key, value) in mapping {
-                if let (Some(canonical), Some(alias_list)) = (key.as_str(), value.as_sequence()) {
-                    let alts: Vec<String> = alias_list
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !alts.is_empty() {
-                        aliases
-                            .entry(canonical.trim().to_string())
-                            .or_default()
-                            .extend(alts);
-                    }
-                }
-            }
-        }
-
-        // Parse inline `Alias -> CanonicalName` lines from the body.
-        let body = skip_frontmatter(&content);
-        for line in body.lines() {
-            let trimmed = line.trim();
-            if let Some((alias_part, canonical_part)) = trimmed.split_once("->") {
-                let alias = alias_part.trim();
-                let canonical = canonical_part.trim();
-                if !alias.is_empty() && !canonical.is_empty() {
-                    aliases
-                        .entry(canonical.to_string())
-                        .or_default()
-                        .push(alias.to_string());
-                }
-            }
-        }
+        parse_taxonomy_content(&content, &mut aliases);
 
         // Only process the first taxonomy file found.
         break;
     }
 
     aliases
+}
+
+/// Parse taxonomy alias content from a string, appending to `aliases`.
+/// Shared by both the filesystem and reader-based taxonomy loaders.
+fn parse_taxonomy_content(content: &str, aliases: &mut HashMap<String, Vec<String>>) {
+    // Parse YAML frontmatter for `aliases:` mapping.
+    if let Some(fm) = extract_frontmatter(content)
+        && let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(fm)
+        && let Some(mapping) = yaml.get("aliases").and_then(|v| v.as_mapping())
+    {
+        for (key, value) in mapping {
+            if let (Some(canonical), Some(alias_list)) = (key.as_str(), value.as_sequence()) {
+                let alts: Vec<String> = alias_list
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !alts.is_empty() {
+                    aliases
+                        .entry(canonical.trim().to_string())
+                        .or_default()
+                        .extend(alts);
+                }
+            }
+        }
+    }
+
+    // Parse inline `Alias -> CanonicalName` lines from the body.
+    let body = skip_frontmatter(content);
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some((alias_part, canonical_part)) = trimmed.split_once("->") {
+            let alias = alias_part.trim();
+            let canonical = canonical_part.trim();
+            if !alias.is_empty() && !canonical.is_empty() {
+                aliases
+                    .entry(canonical.to_string())
+                    .or_default()
+                    .push(alias.to_string());
+            }
+        }
+    }
 }
 
 /// Extract the YAML frontmatter string (between `---` delimiters) from a
@@ -2251,5 +2350,443 @@ sub b body
             "drafts/wip.md should be excluded by .brainignore"
         );
         assert_eq!(result.notes_count, 1);
+    }
+
+    #[test]
+    fn bare_repo_markdown_not_skipped_by_mtime() {
+        use crate::content_reader::ContentReader;
+        use std::path::{Path, PathBuf};
+
+        struct MockBareReader;
+        impl ContentReader for MockBareReader {
+            fn read_file(&self, _rel_path: &Path) -> anyhow::Result<String> {
+                Ok("# Test Note\n\nSome content.".to_string())
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("notes/test.md")])
+            }
+            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                Ok(None)
+            }
+            fn root(&self) -> &Path {
+                Path::new("/fake/bare")
+            }
+            fn version_id(&self) -> &str {
+                "abc123"
+            }
+        }
+
+        let reader = MockBareReader;
+        let files = reader.list_files().unwrap();
+        assert_eq!(files.len(), 1);
+        let meta = reader.file_meta(&files[0]).unwrap();
+        assert!(meta.is_none());
+        let content = reader.read_file(&files[0]).unwrap();
+        assert!(content.contains("# Test Note"));
+    }
+
+    /// Create a source repo with `files`, commit, and clone it as a bare repo.
+    /// Returns `(tempdir, bare_path, head_sha)`. Mirrors the helper used by the
+    /// `GitBareReader` tests in `content_reader.rs`.
+    fn setup_bare_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src_repo");
+        fs::create_dir_all(&src).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+        }
+        for (path, content) in files {
+            let full = src.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full, content).unwrap();
+        }
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+
+        let bare = tmp.path().join("repo.git");
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                &src.display().to_string(),
+                &bare.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+        let sha_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(sha_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        (tmp, bare, sha)
+    }
+
+    /// The worker's vault path: indexing a `type = "vault"` repo runs the
+    /// markdown indexer over a bare clone, producing Note/Section nodes rather
+    /// than code symbols. The bare clone has no on-disk `.brainignore`, which
+    /// `index_markdown_with_reader` must tolerate.
+    #[test]
+    fn index_markdown_with_reader_over_bare_clone_makes_notes() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("README.md", "# Readme\n\nProject overview.\n"),
+            ("docs/guide.md", "# Guide\n\n## Setup\n\ninstall steps\n"),
+            // A non-markdown source file that must NOT become a code symbol.
+            ("src/lib.rs", "pub fn greet() -> &'static str { \"hi\" }"),
+        ]);
+
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        let store = GraphStore::in_memory().unwrap();
+        let result =
+            index_markdown_with_reader(&reader, &store, "test-instance", "vault-repo").unwrap();
+
+        // Markdown nodes were produced.
+        assert_eq!(result.notes_count, 2, "both .md files should be indexed");
+        assert!(result.headings_count >= 2);
+        assert!(result.sections_count >= 2);
+        assert!(store.count_notes().unwrap() >= 2);
+        assert!(store.count_sections().unwrap() >= 2);
+
+        // Crucially, the markdown path indexes no code symbols — the .rs file
+        // is ignored by the markdown indexer.
+        assert_eq!(
+            store.count_symbols().unwrap(),
+            0,
+            "vault indexing must not produce code symbols"
+        );
+    }
+
+    /// nw-003: the gated vault entry point must upsert a `Repo` node carrying
+    /// the indexed SHA, and re-indexing must update it in place (insert when
+    /// absent, update when present — mirroring the code path). Without this the
+    /// worker's `remote_sha == indexed_sha` short-circuit never fires for vault
+    /// repos.
+    #[test]
+    fn gated_vault_index_records_repo_indexed_sha() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("README.md", "# Readme\n\nbody\n")]);
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        let store = GraphStore::in_memory().unwrap();
+
+        // The write gate is acquired exactly once and only for the commit phase.
+        let gate_calls = std::cell::Cell::new(0u32);
+        index_markdown_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test-instance",
+            "vault-repo",
+            &sha,
+            || {
+                gate_calls.set(gate_calls.get() + 1);
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(gate_calls.get(), 1, "write gate acquired exactly once");
+
+        let r_uid = repo_uid("test-instance", "vault-repo");
+        let repo = store
+            .lookup_repo(&r_uid)
+            .unwrap()
+            .expect("vault index must upsert a Repo node carrying the SHA");
+        assert_eq!(
+            repo.indexed_sha, sha,
+            "indexed_sha must equal the indexed remote SHA"
+        );
+
+        // Re-index at the same SHA: the existing Repo row is updated in place
+        // (the helper's update branch), still resolving to the same SHA.
+        index_markdown_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test-instance",
+            "vault-repo",
+            &sha,
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+        let repo = store.lookup_repo(&r_uid).unwrap().unwrap();
+        assert_eq!(repo.indexed_sha, sha);
+    }
+
+    /// nw-006: every store write — including the Vault upsert, which previously
+    /// ran at the top of `index_into_store` before the parse — now happens
+    /// inside the gated region. A failing write gate must therefore leave the
+    /// store completely untouched: no Vault node, no notes, no Repo SHA.
+    #[test]
+    fn gated_vault_index_commits_nothing_when_write_gate_fails() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[
+            ("README.md", "# Readme\n\nbody\n"),
+            ("docs/guide.md", "# Guide\n\n## Setup\n\nsteps\n"),
+        ]);
+        let reader = crate::content_reader::GitBareReader::new(&bare, &sha);
+        let store = GraphStore::in_memory().unwrap();
+
+        let result = index_markdown_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test-instance",
+            "vault-repo",
+            &sha,
+            || Err::<(), _>(anyhow::anyhow!("simulated job cancellation")),
+        );
+
+        assert!(
+            result.is_err(),
+            "a failing write gate must propagate as an error"
+        );
+        // The Vault node is upserted under the gate, so it must not exist.
+        let v_uid = vault_uid("test-instance", &reader.root().to_string_lossy());
+        assert!(
+            store.lookup_vault(&v_uid).is_err(),
+            "no Vault node may be committed when the gate fails"
+        );
+        assert_eq!(
+            store.count_notes().unwrap(),
+            0,
+            "no notes committed when the gate fails"
+        );
+        let r_uid = repo_uid("test-instance", "vault-repo");
+        assert!(
+            store.lookup_repo(&r_uid).unwrap().is_none(),
+            "no Repo SHA recorded when the gate fails"
+        );
+    }
+
+    /// Build `n` distinct notes for a vault, with `make_note(0)` reusable so a
+    /// caller can force a primary-key collision by pushing a duplicate.
+    #[cfg(test)]
+    fn atomic_test_note(v_uid: &str, i: usize) -> Note {
+        use nestweaver_schema::NoteKind;
+        Note {
+            uid: format!("note:{v_uid}:{i}"),
+            vault_uid: v_uid.to_string(),
+            file_path: format!("n{i}.md"),
+            title: format!("Note {i}"),
+            note_kind: NoteKind::General,
+            word_count: 3,
+            content_hash: format!("hash{i}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    /// T2.2: the vault reindex must fold the cascade delete and the re-insert
+    /// into ONE transaction, so a concurrent reader (a fresh connection, which
+    /// is exactly what `count_notes` opens) can never observe the empty
+    /// intermediate between the delete and the insert.
+    ///
+    /// This asserts the invariant deterministically via the transaction
+    /// boundary: a reindex whose insert phase fails midway must leave the OLD
+    /// vault fully intact — never 0 notes. With a separate-transaction delete
+    /// (the pre-fix behaviour) the delete commits before the insert runs, so a
+    /// failed insert leaves the vault empty (0 notes) → RED. With the delete
+    /// and insert sharing one transaction, the failed insert rolls the delete
+    /// back and the old vault survives → GREEN. The same single-transaction
+    /// boundary is precisely what stops a concurrent reader from ever seeing 0
+    /// during a normal (successful) reindex.
+    #[test]
+    fn vault_reindex_never_exposes_empty() {
+        let store = GraphStore::in_memory().unwrap();
+        let v_uid = "vlt:atomic";
+        let vault = Vault {
+            uid: v_uid.to_string(),
+            name: "atomic".to_string(),
+            root_path: "/tmp/atomic".to_string(),
+            instance_id: "test-instance".to_string(),
+        };
+
+        // Initial index: N notes, vault did not previously exist.
+        let n = 5usize;
+        let notes: Vec<Note> = (0..n).map(|i| atomic_test_note(v_uid, i)).collect();
+        let edges: Vec<(&str, &str)> = notes.iter().map(|nt| (v_uid, nt.uid.as_str())).collect();
+        store
+            .bulk_vault_reindex_write(
+                &vault,
+                false,
+                &notes,
+                &[],
+                &[],
+                &edges,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            store.count_notes().unwrap(),
+            n,
+            "initial index should produce N notes"
+        );
+
+        // Reindex whose insert phase FAILS: two notes share a uid, so the second
+        // CREATE violates the Note primary key — after the cascade delete has
+        // already run inside the transaction.
+        let mut bad_notes: Vec<Note> = (0..n).map(|i| atomic_test_note(v_uid, i)).collect();
+        bad_notes.push(atomic_test_note(v_uid, 0)); // duplicate uid → PK violation
+        let bad_edges: Vec<(&str, &str)> = bad_notes
+            .iter()
+            .map(|nt| (v_uid, nt.uid.as_str()))
+            .collect();
+        let result = store.bulk_vault_reindex_write(
+            &vault,
+            true,
+            &bad_notes,
+            &[],
+            &[],
+            &bad_edges,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            result.is_err(),
+            "a duplicate note uid must fail the reindex write"
+        );
+
+        // The invariant: the failed reindex must NEVER have exposed an empty
+        // vault. The old vault must survive the aborted transaction intact.
+        assert_eq!(
+            store.count_notes().unwrap(),
+            n,
+            "failed reindex exposed an EMPTY vault: the cascade delete committed \
+             without the re-insert — delete and insert must share one transaction"
+        );
+    }
+
+    /// T2.2: a background reader polling the note count throughout a series of
+    /// full vault reindexes must never sample 0. This exercises the atomic
+    /// delete+insert under real concurrency (a separate reader connection racing
+    /// the writer's transaction), complementing the deterministic
+    /// transaction-boundary assertion above.
+    #[test]
+    fn vault_reindex_concurrent_reader_never_sees_empty() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let v_uid = "vlt:concurrent";
+        let vault = Vault {
+            uid: v_uid.to_string(),
+            name: "concurrent".to_string(),
+            root_path: "/tmp/concurrent".to_string(),
+            instance_id: "test-instance".to_string(),
+        };
+
+        let n = 8usize;
+        let seed: Vec<Note> = (0..n).map(|i| atomic_test_note(v_uid, i)).collect();
+        let seed_edges: Vec<(&str, &str)> =
+            seed.iter().map(|nt| (v_uid, nt.uid.as_str())).collect();
+        store
+            .bulk_vault_reindex_write(
+                &vault,
+                false,
+                &seed,
+                &[],
+                &[],
+                &seed_edges,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        // Reader thread: poll the note count until told to stop, recording the
+        // minimum it ever observes.
+        let stop = Arc::new(AtomicBool::new(false));
+        let store_rd = Arc::clone(&store);
+        let stop_rd = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            let mut min_seen = usize::MAX;
+            while !stop_rd.load(Ordering::Relaxed) {
+                let c = store_rd.count_notes().unwrap();
+                if c < min_seen {
+                    min_seen = c;
+                }
+            }
+            min_seen
+        });
+
+        // Writer: repeatedly reindex the whole vault (existing → cascade delete
+        // + re-insert in one transaction).
+        for _ in 0..40 {
+            let notes: Vec<Note> = (0..n).map(|i| atomic_test_note(v_uid, i)).collect();
+            let edges: Vec<(&str, &str)> =
+                notes.iter().map(|nt| (v_uid, nt.uid.as_str())).collect();
+            store
+                .bulk_vault_reindex_write(
+                    &vault,
+                    true,
+                    &notes,
+                    &[],
+                    &[],
+                    &edges,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let min_seen = reader.join().unwrap();
+        assert_ne!(
+            min_seen, 0,
+            "a concurrent reader observed an EMPTY vault mid-reindex; the cascade \
+             delete and re-insert must be atomic"
+        );
+        assert_eq!(
+            store.count_notes().unwrap(),
+            n,
+            "final vault state must have all N notes"
+        );
     }
 }

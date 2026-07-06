@@ -27,6 +27,8 @@ pub enum SummaryLevel {
     Symbol,
     File,
     Cluster,
+    /// Top hub nodes with a concise structural (call-graph shape) summary.
+    Hub,
 }
 
 impl std::fmt::Display for SummaryLevel {
@@ -35,6 +37,7 @@ impl std::fmt::Display for SummaryLevel {
             SummaryLevel::Symbol => write!(f, "symbol"),
             SummaryLevel::File => write!(f, "file"),
             SummaryLevel::Cluster => write!(f, "cluster"),
+            SummaryLevel::Hub => write!(f, "hub"),
         }
     }
 }
@@ -46,8 +49,9 @@ impl std::str::FromStr for SummaryLevel {
             "symbol" => Ok(SummaryLevel::Symbol),
             "file" => Ok(SummaryLevel::File),
             "cluster" => Ok(SummaryLevel::Cluster),
+            "hub" => Ok(SummaryLevel::Hub),
             other => Err(format!(
-                "unknown summary level '{}': expected symbol, file, or cluster",
+                "unknown summary level '{}': expected symbol, file, cluster, or hub",
                 other
             )),
         }
@@ -63,12 +67,24 @@ pub struct Summary {
     pub content: String,
     /// Estimated token count (chars / 4).
     pub token_estimate: usize,
+    /// Source file path of the summarized target. Currently populated only
+    /// for `Hub` summaries (so consumers like the agent guide can render the
+    /// path without re-parsing `content`); `None` for other levels and for
+    /// sidecars written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 /// Persisted collection of summaries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryStore {
     pub summaries: Vec<Summary>,
+    /// The graph generation these summaries were built from. Loading checks this
+    /// against the store's current generation and treats a mismatch as a miss,
+    /// so a reindex never serves stale summaries. Defaults to 0 for
+    /// pre-generation sidecars (which are then always treated as stale).
+    #[serde(default)]
+    pub graph_generation: u64,
 }
 
 // ── Generation ───────────────────────────────────────────────────────────────
@@ -79,7 +95,53 @@ pub fn generate_summaries(store: &GraphStore, level: SummaryLevel) -> Result<Vec
         SummaryLevel::Symbol => generate_symbol_summaries(store),
         SummaryLevel::File => generate_file_summaries(store),
         SummaryLevel::Cluster => generate_cluster_summaries(store),
+        SummaryLevel::Hub => generate_hub_summaries(store),
     }
+}
+
+/// Coarse architectural role for a hub from its caller/callee degree balance.
+fn hub_role(in_degree: usize, out_degree: usize) -> &'static str {
+    if in_degree + out_degree == 0 {
+        "isolated"
+    } else if in_degree >= out_degree.saturating_mul(3) {
+        // Heavily called, calls little → a shared sink/utility.
+        "sink/utility"
+    } else if out_degree >= in_degree.saturating_mul(3) {
+        // Calls widely, called little → an orchestrator/entry point.
+        "orchestrator"
+    } else {
+        // High degree both ways → a bridge/coordinator.
+        "bridge"
+    }
+}
+
+/// Hub-level: one concise structural summary per top hub node — its call-graph
+/// shape (in/out degree) plus a coarse architectural role. Precomputed and
+/// cached (generation-gated via the summary sidecar), so `get_summary --level
+/// hub` gives architectural orientation without the ~500ms live hub scan.
+fn generate_hub_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
+    const HUB_COUNT: usize = 30;
+    let hubs = crate::hubs::find_hub_nodes(store, HUB_COUNT)?;
+    let summaries = hubs
+        .iter()
+        .map(|h| {
+            let role = hub_role(h.in_degree, h.out_degree);
+            let content = format!(
+                "{} ({}) — hub [{}]: {} callers, {} callees (total degree {})",
+                h.name, h.file_path, role, h.in_degree, h.out_degree, h.total_degree
+            );
+            let token_estimate = content.len() / 4;
+            Summary {
+                level: SummaryLevel::Hub,
+                target_uid: h.uid.clone(),
+                target_name: h.name.clone(),
+                content,
+                token_estimate,
+                file_path: Some(h.file_path.clone()),
+            }
+        })
+        .collect();
+    Ok(summaries)
 }
 
 /// Symbol-level: one-line summary per function/class.
@@ -117,6 +179,7 @@ fn generate_symbol_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             target_name: sym.name.clone(),
             content,
             token_estimate,
+            file_path: None,
         });
     }
 
@@ -204,6 +267,7 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             target_name: file_path.clone(),
             content,
             token_estimate,
+            file_path: None,
         });
     }
 
@@ -328,6 +392,7 @@ fn generate_cluster_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             target_name: community.name.clone(),
             content,
             token_estimate,
+            file_path: None,
         });
     }
 
@@ -345,19 +410,46 @@ pub fn sidecar_path(db_path: &Path) -> PathBuf {
 }
 
 /// Save summaries to the sidecar file.
-pub fn save_summaries(db_path: &Path, summaries: &[Summary]) -> Result<()> {
+pub fn save_summaries(db_path: &Path, graph_generation: u64, summaries: &[Summary]) -> Result<()> {
     let path = sidecar_path(db_path);
     let store = SummaryStore {
         summaries: summaries.to_vec(),
+        graph_generation,
     };
     let json = serde_json::to_string_pretty(&store).context("failed to serialize summaries")?;
     fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
-/// Load summaries from the sidecar file. Returns `Ok(None)` when the sidecar
-/// does not exist.
-pub fn load_summaries(db_path: &Path) -> Result<Option<Vec<Summary>>> {
+/// Warm the sidecar with freshly generated `fresh` summaries for `level`,
+/// preserving any cached entries at OTHER levels, then persist. Best-effort:
+/// a load miss/mismatch starts from empty and a save error is logged and
+/// swallowed so warming the cache never fails the caller.
+///
+/// Both `get_summary` (MCP) and the agent-guide Architecture section warm the
+/// cache after a cold read; centralizing the "keep other levels, replace this
+/// level, save" invariant here keeps the two from drifting.
+pub fn merge_and_save_summaries(
+    db_path: &Path,
+    generation: u64,
+    level: SummaryLevel,
+    fresh: &[Summary],
+) {
+    let mut all: Vec<Summary> = match load_summaries(db_path, generation) {
+        Ok(Some(existing)) => existing.into_iter().filter(|s| s.level != level).collect(),
+        _ => Vec::new(),
+    };
+    all.extend(fresh.iter().cloned());
+    if let Err(e) = save_summaries(db_path, generation, &all) {
+        tracing::warn!("failed to warm summaries sidecar (level {level:?}): {e}");
+    }
+}
+
+/// Load summaries from the sidecar file. Returns `Ok(None)` when the sidecar is
+/// missing OR was built from a different graph generation than
+/// `expected_generation` — a mismatch is treated as a miss so a reindex never
+/// serves stale summaries (the caller regenerates).
+pub fn load_summaries(db_path: &Path, expected_generation: u64) -> Result<Option<Vec<Summary>>> {
     crate::migrate_sidecar(db_path, "summaries.json", ".summaries.json");
     let path = sidecar_path(db_path);
     if !path.exists() {
@@ -367,6 +459,9 @@ pub fn load_summaries(db_path: &Path) -> Result<Option<Vec<Summary>>> {
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let store: SummaryStore =
         serde_json::from_str(&json).context("failed to parse summaries sidecar")?;
+    if store.graph_generation != expected_generation {
+        return Ok(None);
+    }
     Ok(Some(store.summaries))
 }
 
@@ -441,6 +536,7 @@ mod tests {
                 target_name: "fn_a".to_string(),
                 content: "x".repeat(40), // 10 tokens
                 token_estimate: 10,
+                file_path: None,
             },
             Summary {
                 level: SummaryLevel::Symbol,
@@ -448,6 +544,7 @@ mod tests {
                 target_name: "fn_b".to_string(),
                 content: "y".repeat(40),
                 token_estimate: 10,
+                file_path: None,
             },
             Summary {
                 level: SummaryLevel::Symbol,
@@ -455,6 +552,7 @@ mod tests {
                 target_name: "fn_c".to_string(),
                 content: "z".repeat(40),
                 token_estimate: 10,
+                file_path: None,
             },
         ];
 
@@ -472,6 +570,7 @@ mod tests {
             target_name: "fn_a".to_string(),
             content: "x".repeat(40),
             token_estimate: 10,
+            file_path: None,
         }];
 
         let result = truncate_to_budget(&summaries, 0);
@@ -487,6 +586,7 @@ mod tests {
                 target_name: "src/auth.rs".to_string(),
                 content: "auth stuff".to_string(),
                 token_estimate: 3,
+                file_path: None,
             },
             Summary {
                 level: SummaryLevel::File,
@@ -494,6 +594,7 @@ mod tests {
                 target_name: "src/main.rs".to_string(),
                 content: "main stuff".to_string(),
                 token_estimate: 3,
+                file_path: None,
             },
         ];
 
@@ -511,6 +612,7 @@ mod tests {
                 target_name: "a".to_string(),
                 content: "line one".to_string(),
                 token_estimate: 2,
+                file_path: None,
             },
             Summary {
                 level: SummaryLevel::Symbol,
@@ -518,6 +620,7 @@ mod tests {
                 target_name: "b".to_string(),
                 content: "line two".to_string(),
                 token_estimate: 2,
+                file_path: None,
             },
         ];
 
@@ -546,6 +649,7 @@ mod tests {
             visibility: nestweaver_schema::Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         store.insert_symbol(&sym).unwrap();
 
@@ -578,6 +682,7 @@ mod tests {
             visibility: nestweaver_schema::Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         let sym2 = nestweaver_schema::Symbol {
             uid: "sym:test:abc:20".to_string(),
@@ -597,6 +702,7 @@ mod tests {
             visibility: nestweaver_schema::Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         };
         store.insert_symbol(&sym1).unwrap();
         store.insert_symbol(&sym2).unwrap();
@@ -628,20 +734,53 @@ mod tests {
             content: "src/main.rs: exports 1 symbols: main (Function) | imports from: []"
                 .to_string(),
             token_estimate: 17,
+            file_path: None,
         }];
 
-        save_summaries(&db_path, &summaries).unwrap();
-        let loaded = load_summaries(&db_path).unwrap().unwrap();
+        save_summaries(&db_path, 1, &summaries).unwrap();
+        let loaded = load_summaries(&db_path, 1).unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].target_uid, "src/main.rs");
         assert_eq!(loaded[0].content, summaries[0].content);
     }
 
     #[test]
+    fn stale_generation_is_treated_as_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let summaries = vec![Summary {
+            level: SummaryLevel::File,
+            target_uid: "f".to_string(),
+            target_name: "f".to_string(),
+            content: "c".to_string(),
+            token_estimate: 1,
+            file_path: None,
+        }];
+
+        save_summaries(&db_path, 1, &summaries).unwrap();
+        // Same generation → hit.
+        assert!(load_summaries(&db_path, 1).unwrap().is_some());
+        // A newer generation (after a reindex) must be a MISS, never a
+        // stale-served hit — the caller regenerates.
+        assert!(
+            load_summaries(&db_path, 2).unwrap().is_none(),
+            "summaries from an older generation must not be served after a reindex"
+        );
+    }
+
+    #[test]
+    fn hub_role_classifies_by_degree_balance() {
+        assert_eq!(hub_role(0, 0), "isolated");
+        assert_eq!(hub_role(30, 2), "sink/utility"); // heavily called, calls little
+        assert_eq!(hub_role(2, 30), "orchestrator"); // calls widely, called little
+        assert_eq!(hub_role(10, 10), "bridge"); // balanced high degree
+    }
+
+    #[test]
     fn load_summaries_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nonexistent.lbug");
-        let result = load_summaries(&db_path).unwrap();
+        let result = load_summaries(&db_path, 0).unwrap();
         assert!(result.is_none());
     }
 
@@ -669,6 +808,7 @@ mod tests {
             target_name: "src/main.rs".to_string(),
             content: "file summary".to_string(),
             token_estimate: 5,
+            file_path: None,
         }];
         let symbol_summaries = [Summary {
             level: SummaryLevel::Symbol,
@@ -676,23 +816,24 @@ mod tests {
             target_name: "main".to_string(),
             content: "symbol summary".to_string(),
             token_estimate: 5,
+            file_path: None,
         }];
 
         // Save file-level summaries.
-        save_summaries(&db_path, &file_summaries).unwrap();
+        save_summaries(&db_path, 1, &file_summaries).unwrap();
 
         // Merge with symbol-level summaries (as the MCP tool does).
-        let mut all = load_summaries(&db_path)
+        let mut all = load_summaries(&db_path, 1)
             .unwrap()
             .unwrap()
             .into_iter()
             .filter(|s| s.level != SummaryLevel::Symbol)
             .collect::<Vec<_>>();
         all.extend(symbol_summaries.iter().cloned());
-        save_summaries(&db_path, &all).unwrap();
+        save_summaries(&db_path, 1, &all).unwrap();
 
         // Load back and verify both levels are present.
-        let loaded = load_summaries(&db_path).unwrap().unwrap();
+        let loaded = load_summaries(&db_path, 1).unwrap().unwrap();
         let file_count = loaded
             .iter()
             .filter(|s| s.level == SummaryLevel::File)

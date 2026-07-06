@@ -145,3 +145,17 @@ fn candidate_devices() -> Vec<Device> {
     }
     devices
 }
+
+/// Download a model's files (config, tokenizer, weights) into the HuggingFace cache
+/// WITHOUT building the model. Lets a caller bound a cold-cache download with a timeout so
+/// a slow/unreachable HuggingFace can't hang startup. A no-op (fast) when already cached.
+pub fn prefetch_model(model_id: &str) -> Result<()> {
+    let api = Api::new()?;
+    let repo = api.model(model_id.to_string());
+    repo.get("config.json").context("prefetch config.json")?;
+    repo.get("tokenizer.json")
+        .context("prefetch tokenizer.json")?;
+    repo.get("model.safetensors")
+        .context("prefetch model.safetensors")?;
+    Ok(())
+}

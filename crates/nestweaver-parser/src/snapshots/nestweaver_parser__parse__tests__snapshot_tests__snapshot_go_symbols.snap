@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4186
 expression: "parsed_symbols(\"simple.go\", &source)"
 ---
 - name: Greeter
@@ -14,6 +13,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: Greet
   kind: Method
   start_line: 9
@@ -28,6 +28,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
     parameter_types: []
     return_type: string
   parent_name: ~
+  scope_chain: ~
 - name: Farewell
   kind: Method
   start_line: 10
@@ -42,6 +43,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
     parameter_types: []
     return_type: string
   parent_name: ~
+  scope_chain: ~
 - name: ConsoleGreeter
   kind: Class
   start_line: 13
@@ -53,6 +55,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: Prefix
   kind: Property
   start_line: 14
@@ -64,6 +67,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: Greet
   kind: Method
   start_line: 17
@@ -78,6 +82,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
     parameter_types: []
     return_type: string
   parent_name: ~
+  scope_chain: ~
 - name: Farewell
   kind: Method
   start_line: 21
@@ -92,6 +97,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
     parameter_types: []
     return_type: string
   parent_name: ~
+  scope_chain: ~
 - name: NewGreeter
   kind: Function
   start_line: 25
@@ -106,6 +112,7 @@ expression: "parsed_symbols(\"simple.go\", &source)"
     parameter_types: []
     return_type: Greeter
   parent_name: ~
+  scope_chain: ~
 - name: main
   kind: Function
   start_line: 29
@@ -117,3 +124,4 @@ expression: "parsed_symbols(\"simple.go\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~

@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4568
 expression: "parsed_symbols(\"simple.sv\", &source)"
 ---
 - name: compute_checksum
@@ -14,6 +13,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: top_module
   kind: Module
   start_line: 6
@@ -25,6 +25,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: axi_if
   kind: Interface
   start_line: 32
@@ -36,6 +37,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: packet
   kind: Class
   start_line: 45
@@ -47,6 +49,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: "function new(string name = \"packet\");\n    super.new(name);\n  endfunction"
   kind: Method
   start_line: 49
@@ -58,6 +61,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: packet
+  scope_chain: packet
 - name: build
   kind: Method
   start_line: 53
@@ -69,6 +73,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: packet
+  scope_chain: packet
 - name: send
   kind: Method
   start_line: 57
@@ -80,6 +85,7 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: packet
+  scope_chain: packet
 - name: sub_module
   kind: Module
   start_line: 70
@@ -91,3 +97,4 @@ expression: "parsed_symbols(\"simple.sv\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~

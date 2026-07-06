@@ -72,7 +72,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             waitForDaemonSocket { [weak self] in
                 guard let self = self else { return }
                 self.startWebUI(dbPath: db)
-                self.restartCount = 0
+                self.scheduleHealthyReset(for: self.daemonProcess)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     self.openWebUI()
                     self.updateStatus("Running")
@@ -120,53 +120,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenuItem?.title = "Status: \(status)"
     }
 
-    func startDaemon(dbPath: String) {
-        let bundlePath = Bundle.main.bundlePath
-        let binaryPath = bundlePath + "/Contents/MacOS/nestweaver-cli"
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: binaryPath)
-        process.arguments = ["daemon", "--db", dbPath, "run"]
-        process.environment = ProcessInfo.processInfo.environment
-
-        process.terminationHandler = { [weak self] proc in
-            DispatchQueue.main.async {
-                guard let self = self, !self.isQuitting else { return }
-
-                // Only check for external daemon on normal error exits —
-                // signal-killed daemons leave stale sockets.
-                if proc.terminationReason == .exit && proc.terminationStatus != 0 && self.isDaemonSocketPresent() {
-                    self.daemonProcess = nil
-                    self.updateStatus("Running (external daemon)")
-                    self.startWebUI(dbPath: dbPath)
-                } else if (proc.terminationReason == .uncaughtSignal || proc.terminationStatus != 0) && self.restartCount < self.maxRestarts {
-                    self.restartCount += 1
-                    self.updateStatus("Restarting (\(self.restartCount)/\(self.maxRestarts))…")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        self.startDaemon(dbPath: dbPath)
-                        self.waitForDaemonSocket { [weak self] in
-                            guard let self = self else { return }
-                            self.startWebUI(dbPath: dbPath)
-                            self.restartCount = 0
-                            self.updateStatus("Running")
-                        }
-                    }
-                } else if proc.terminationStatus != 0 && self.restartCount >= self.maxRestarts {
-                    self.updateStatus("Stopped (too many crashes)")
-                }
+    /// Reset the crash-restart counter only after the daemon has stayed up for a
+    /// sustained window. A crashing daemon binds its UDS socket *before* it dies,
+    /// so resetting the counter on mere socket appearance made `maxRestarts`
+    /// unreachable and turned any crash into an endless ~1s respawn loop — one
+    /// macOS "quit unexpectedly" notification per cycle. Guard on process identity
+    /// so a daemon that crashes again before the window elapses does NOT reset.
+    private func scheduleHealthyReset(for process: Process?) {
+        let tracked = process
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60.0) { [weak self] in
+            guard let self = self else { return }
+            if self.daemonProcess === tracked, tracked?.isRunning == true {
+                self.restartCount = 0
             }
         }
+    }
 
-        do {
-            try process.run()
-            daemonProcess = process
-            childPids.append(process.processIdentifier)
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Failed to Start Daemon"
-            alert.informativeText = error.localizedDescription
-            alert.runModal()
-            NSApp.terminate(nil)
+    func startDaemon(dbPath: String) {
+        let binaryPath = Bundle.main.bundlePath + "/Contents/MacOS/nestweaver-cli"
+
+        // Start the daemon as a launchd Aqua LaunchAgent (`daemon start`), NOT as an NSTask
+        // child (`daemon run`). candle's Metal shader compilation needs MTLCompilerService,
+        // an Aqua per-session XPC service. A launchd agent runs in the user's GUI session and
+        // reaches it (device=Metal); an NSTask child of this menubar app does NOT and falls
+        // back to CPU — so the daemon must be launchd-managed to get the GPU. launchd
+        // (KeepAlive) also owns crash-restart, so the app just waits for the socket. The
+        // daemon is a shared service (MCP/CLI/UI all use it) and persists across app quits;
+        // the app re-attaches via the external-daemon path on next launch.
+        DispatchQueue.global().async { [weak self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: binaryPath)
+            process.arguments = ["daemon", "--db", dbPath, "start"]
+            process.environment = ProcessInfo.processInfo.environment
+            do {
+                try process.run()
+                process.waitUntilExit()
+                if process.terminationStatus != 0 {
+                    DispatchQueue.main.async {
+                        self?.updateStatus("Daemon failed to start (\(process.terminationStatus))")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Failed to Start Daemon"
+                    alert.informativeText = error.localizedDescription
+                    alert.runModal()
+                    NSApp.terminate(nil)
+                }
+            }
         }
     }
 

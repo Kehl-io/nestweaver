@@ -39,6 +39,36 @@ use anyhow::Context;
 use nestweaver_store::GraphStore;
 
 use crate::config::CrossDomainConfig;
+use crate::content_reader::ContentReader;
+
+/// Map from vault UID to a [`ContentReader`] that can read that vault's files.
+///
+/// In local (daemon) mode, vaults live on the filesystem and the cross-domain
+/// scanner falls back to `std::fs::read_to_string` when no reader is provided.
+/// In server mode with bare clones, the files do not exist at the vault's
+/// `root_path`, so a [`crate::content_reader::GitBareReader`] must be supplied
+/// here for each vault. Without it, all note reads fail silently and zero
+/// Note-to-Symbol edges are built.
+pub type VaultReaders<'a> = HashMap<String, &'a dyn ContentReader>;
+
+/// Read a note's body content, preferring a [`ContentReader`] from
+/// `vault_readers` when one is available for the note's vault, and falling back
+/// to direct filesystem access otherwise (local/daemon mode).
+fn read_note_body(
+    store: &GraphStore,
+    note: &nestweaver_schema::Note,
+    vault_readers: &VaultReaders<'_>,
+) -> Option<String> {
+    // Try the ContentReader first (required for bare-clone / server mode).
+    if let Some(reader) = vault_readers.get(&note.vault_uid) {
+        return reader.read_file(Path::new(&note.file_path)).ok();
+    }
+
+    // Fallback: read from the filesystem using the vault's root_path.
+    let vault = store.lookup_vault(&note.vault_uid).ok()?;
+    let path = Path::new(&vault.root_path).join(&note.file_path);
+    std::fs::read_to_string(&path).ok()
+}
 
 /// Outcome of a discovery pass — surfaces in CLI/MCP output so users
 /// can see what happened.
@@ -76,14 +106,36 @@ pub const STOPLIST: &[&str] = &[
 /// `index_markdown_directory` have populated the DB. Safe to re-run:
 /// each note's existing REFERENCES_CODE edges are deleted before
 /// re-emitting.
+///
+/// Falls back to `std::fs::read_to_string` for note content (local mode).
+/// For server mode with bare clones, use
+/// [`discover_cross_domain_links_with_readers`] instead.
 pub fn discover_cross_domain_links(store: &GraphStore) -> Result<CrossDomainResult, anyhow::Error> {
     discover_cross_domain_links_with_config(store, &CrossDomainConfig::default())
+}
+
+/// Like [`discover_cross_domain_links`] but accepts [`VaultReaders`] so
+/// note content can be read from bare clones in server mode.
+pub fn discover_cross_domain_links_with_readers(
+    store: &GraphStore,
+    vault_readers: &VaultReaders<'_>,
+) -> Result<CrossDomainResult, anyhow::Error> {
+    discover_cross_domain_links_full(store, &CrossDomainConfig::default(), vault_readers)
 }
 
 /// Like `discover_cross_domain_links` but honours the provided `CrossDomainConfig`.
 pub fn discover_cross_domain_links_with_config(
     store: &GraphStore,
     config: &CrossDomainConfig,
+) -> Result<CrossDomainResult, anyhow::Error> {
+    discover_cross_domain_links_full(store, config, &VaultReaders::new())
+}
+
+/// Full implementation accepting both config and vault readers.
+fn discover_cross_domain_links_full(
+    store: &GraphStore,
+    config: &CrossDomainConfig,
+    vault_readers: &VaultReaders<'_>,
 ) -> Result<CrossDomainResult, anyhow::Error> {
     let symbols = store
         .list_all_symbols_lite()
@@ -110,7 +162,7 @@ pub fn discover_cross_domain_links_with_config(
 
     let mut pending: Vec<ScannedNote> = Vec::with_capacity(NOTES_PER_TXN);
     for note in &notes {
-        match scan_one_note(store, note, &index)? {
+        match scan_one_note(store, note, &index, vault_readers)? {
             ScanOutcome::Scanned(scanned) => pending.push(scanned),
             ScanOutcome::Skipped => result.skipped_unreadable += 1,
         }
@@ -215,11 +267,27 @@ pub fn discover_cross_domain_links_for_note_with_index(
     note_uid: &str,
     index: &SymbolIndex,
 ) -> Result<(usize, usize), anyhow::Error> {
+    discover_cross_domain_links_for_note_with_index_and_readers(
+        store,
+        note_uid,
+        index,
+        &VaultReaders::new(),
+    )
+}
+
+/// Like [`discover_cross_domain_links_for_note_with_index`] but accepts
+/// [`VaultReaders`] for server-mode bare-clone support.
+pub fn discover_cross_domain_links_for_note_with_index_and_readers(
+    store: &GraphStore,
+    note_uid: &str,
+    index: &SymbolIndex,
+    vault_readers: &VaultReaders<'_>,
+) -> Result<(usize, usize), anyhow::Error> {
     if index.is_empty() {
         return Ok((0, 0));
     }
     let note = store.lookup_note(note_uid).context("lookup_note")?;
-    let outcome = discover_one_note(store, &note, index)?;
+    let outcome = discover_one_note(store, &note, index, vault_readers)?;
     match outcome {
         NoteOutcome::Indexed {
             note_edges,
@@ -247,7 +315,7 @@ pub fn discover_cross_domain_links_for_note(
         return Ok((0, 0));
     }
     let note = store.lookup_note(note_uid).context("lookup_note")?;
-    let outcome = discover_one_note(store, &note, &index)?;
+    let outcome = discover_one_note(store, &note, &index, &VaultReaders::new())?;
     match outcome {
         NoteOutcome::Indexed {
             note_edges,
@@ -272,14 +340,11 @@ fn scan_one_note(
     store: &GraphStore,
     note: &nestweaver_schema::Note,
     index: &SymbolIndex,
+    vault_readers: &VaultReaders<'_>,
 ) -> Result<ScanOutcome, anyhow::Error> {
-    let Ok(vault) = store.lookup_vault(&note.vault_uid) else {
-        return Ok(ScanOutcome::Skipped);
-    };
-    let path = Path::new(&vault.root_path).join(&note.file_path);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return Ok(ScanOutcome::Skipped),
+    let body = match read_note_body(store, note, vault_readers) {
+        Some(s) => s,
+        None => return Ok(ScanOutcome::Skipped),
     };
 
     // Whole-note pass.
@@ -315,15 +380,13 @@ fn discover_one_note(
     store: &GraphStore,
     note: &nestweaver_schema::Note,
     index: &SymbolIndex,
+    vault_readers: &VaultReaders<'_>,
 ) -> Result<NoteOutcome, anyhow::Error> {
-    // Load the note body from disk via its vault root.
-    let Ok(vault) = store.lookup_vault(&note.vault_uid) else {
-        return Ok(NoteOutcome::Skipped);
-    };
-    let path = Path::new(&vault.root_path).join(&note.file_path);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return Ok(NoteOutcome::Skipped),
+    // Load the note body via ContentReader (server/bare-clone mode) or
+    // filesystem fallback (local/daemon mode).
+    let body = match read_note_body(store, note, vault_readers) {
+        Some(s) => s,
+        None => return Ok(NoteOutcome::Skipped),
     };
 
     // Delete existing cross-domain edges before re-emitting (idempotency).
@@ -584,6 +647,7 @@ mod tests {
                 staleness_commits_behind: 0,
                 instance_id: "default".to_string(),
                 name: None,
+                root_path: None,
             })
             .unwrap();
         let s_uid = symbol_uid(&r_uid, "src/auth.ts", "AuthService", 1);
@@ -606,6 +670,7 @@ mod tests {
                 visibility: Visibility::Inferred,
                 type_info: None,
                 framework_hint: None,
+                canonical_id: None,
             })
             .unwrap();
 
@@ -696,6 +761,7 @@ mod tests {
                 staleness_commits_behind: 0,
                 instance_id: "default".to_string(),
                 name: None,
+                root_path: None,
             })
             .unwrap();
         let s_uid = symbol_uid(&r_uid, "src/auth.ts", "AuthService", 1);
@@ -718,6 +784,7 @@ mod tests {
                 visibility: Visibility::Inferred,
                 type_info: None,
                 framework_hint: None,
+                canonical_id: None,
             })
             .unwrap();
 

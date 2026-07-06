@@ -69,21 +69,57 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
         let _ = fs::remove_file(&sock);
     }
 
-    // Before spawning, check for a legacy daemon that may hold the DB write
-    // lock at an old $TMPDIR-based socket path (pre-v0.26.2 used $TMPDIR
-    // which varies across launchers on macOS). If found, shut it down so
-    // the new daemon can acquire the lock.
+    // Before spawning, check for a legacy daemon using the old DefaultHasher-
+    // based instance ID (pre-SHA-256 upgrade). If found, shut it down so the
+    // new daemon can acquire the DB write lock.
+    nestweaver_daemon::lifecycle::stop_legacy_hash_daemon(db_path);
+
+    // Also check for a legacy daemon that may hold the DB write lock at an
+    // old $TMPDIR-based socket path (pre-v0.26.2 used $TMPDIR which varies
+    // across launchers on macOS). If found, shut it down so the new daemon
+    // can acquire the lock.
     stop_legacy_daemon(&instance_id);
 
-    // Release the flock before spawning so the daemon can acquire it.
+    // Release the pidfile flock before spawning so the daemon can acquire it for its lifetime.
     unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(file);
+
+    // Serialize concurrent auto-starts on a SEPARATE spawn-lock. The pidfile flock had to be
+    // released above for the daemon to take it, which opens a window where a fleet of clients
+    // starting at once could each spawn a daemon (only the DB write-lock would then absorb the
+    // pile-up). Holding this blocking lock across spawn + socket-wait, with a re-check, means
+    // exactly one client spawns and the rest observe the started daemon. Acquired AFTER releasing
+    // the pidfile flock so the spawned daemon can take that flock (otherwise: deadlock).
+    let spawn_lock_path = pidfile.with_extension("spawnlock");
+    let spawn_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&spawn_lock_path)
+        .with_context(|| format!("failed to open spawn lock {}", spawn_lock_path.display()))?;
+    if unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        bail!(
+            "flock on spawn lock failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Re-check: another client may have started the daemon while we waited for the spawn-lock.
+    if sock.exists() {
+        unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
+        debug!("daemon started by a concurrent client while awaiting spawn lock");
+        return Ok(sock);
+    }
 
     // Spawn the daemon as a detached child.
     spawn_daemon(db_path, config_path)?;
 
-    // Poll for socket to appear.
-    wait_for_socket(&sock)?;
+    // Poll for socket to appear, then release the spawn-lock so the next waiter's re-check
+    // observes the running daemon (its socket) instead of spawning another.
+    let waited = wait_for_socket(&sock);
+    unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
+    waited?;
 
     info!("daemon started, socket at {}", sock.display());
     Ok(sock)
@@ -120,6 +156,13 @@ fn spawn_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<()> {
     if let Some(cfg) = config_path {
         cmd.arg("--config").arg(cfg);
     }
+    // Auto-spawned daemons are ephemeral — one per DB a client happens to touch —
+    // so they must NOT install a persistent launchd agent. Doing so leaked
+    // hundreds of `io.kehl.nestweaver.<hash>.plist` files with
+    // KeepAlive{Crashed:true}, which then crash-looped. Force the fork-based
+    // daemonization path here; launchd registration is reserved for an explicit
+    // `nestweaver daemon start` invoked by the user (or the menubar app).
+    cmd.env("NESTWEAVER_DAEMON_FORK", "1");
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

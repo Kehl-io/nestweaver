@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
-use crate::error::StoreError;
+use crate::error::{CancelReason, StoreError};
 use crate::ranking::SeedResolutionConfig;
 
 // ---------------------------------------------------------------------------
@@ -45,6 +45,25 @@ impl EmbeddingIndex {
     }
 
     pub fn add(&mut self, uid: &str, embedding: Vec<f32>) {
+        // Keep the index homogeneous. A mixed-dimension index breaks the binary
+        // sidecar (`save_binary` writes one header dim but per-vector bytes;
+        // `load_binary` reads a fixed stride) → misaligned garbage or a load
+        // failure that silently kills semantic search. A dimension mismatch here
+        // means a vector from a different model — e.g. the daemon's local-fallback
+        // (384) leaking into a remote-embedded (768/1536) index on a transient
+        // remote outage, or a model switch without `--force`. Reject it rather
+        // than corrupt the index; the caller should re-embed with `--force`.
+        if let Some(existing) = self.embeddings.values().next()
+            && embedding.len() != existing.len()
+        {
+            tracing::warn!(
+                uid,
+                got = embedding.len(),
+                expected = existing.len(),
+                "skipping embedding with mismatched dimension (re-embed with --force to switch models)"
+            );
+            return;
+        }
         self.embeddings.insert(uid.to_string(), embedding);
     }
 
@@ -157,19 +176,47 @@ impl EmbeddingIndex {
     /// Uses rayon for parallel iteration and assumes stored embeddings are
     /// L2-normalized, so cosine similarity reduces to dot-product / query_norm.
     pub fn vector_search(&self, query_vec: &[f32], limit: usize) -> Vec<(String, f64)> {
+        self.vector_search_cancellable(query_vec, limit, None)
+            .expect("vector_search with cancel=None cannot be cancelled")
+    }
+
+    /// Like [`vector_search`], but cooperatively bails when `cancel` trips (a
+    /// query timeout or client disconnect). Once tripped, per-embedding scoring
+    /// is skipped so the parallel scan drains cheaply, then the whole call
+    /// returns `Err(StoreError::Cancelled(_))` — a cancelled computation is
+    /// *incomplete*, distinct from a legitimately empty result, so no caller
+    /// mistakes the truncated scan for a real answer (or caches it).
+    /// `cancel = None` never trips and is byte-for-byte the original behavior.
+    pub fn vector_search_cancellable(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         let query_norm: f64 = query_vec
             .iter()
             .map(|x| (*x as f64) * (*x as f64))
             .sum::<f64>()
             .sqrt();
         if query_norm == 0.0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let mut scores: Vec<(String, f64)> = self
             .embeddings
             .par_iter()
             .map(|(uid, emb)| {
+                if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                    return (uid.clone(), f64::NEG_INFINITY);
+                }
+                // Exclude any stored vector whose dimension differs from the
+                // query's. `.zip()` would otherwise truncate to the shorter and
+                // return a plausible-but-wrong similarity (dot over a prefix,
+                // divided by the full query norm) — silently corrupting rankings
+                // when the index was built with a different embedding model.
+                if emb.len() != query_vec.len() {
+                    return (uid.clone(), f64::NEG_INFINITY);
+                }
                 // Stored embeddings are L2-normalized, so cosine = dot / query_norm.
                 let dot: f64 = emb
                     .iter()
@@ -181,9 +228,17 @@ impl EmbeddingIndex {
             })
             .collect();
 
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+            // The shared cancel flag is a bare bool and can't carry a reason, so
+            // the leaf always reports `Timeout` — the only reason the gRPC
+            // boundary ever observes. (A client disconnect drops the request
+            // future before any error is returned, so it never surfaces here.)
+            return Err(StoreError::Cancelled(CancelReason::Timeout));
+        }
+
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(limit);
-        scores
+        Ok(scores)
     }
 
     pub fn len(&self) -> usize {
@@ -225,6 +280,11 @@ impl EmbeddingIndex {
                 None => true,
             })
             .map(|(uid, emb)| {
+                // See vector_search_cancellable: a dimension mismatch must be
+                // excluded, not silently truncated by `.zip()`.
+                if emb.len() != query_vec.len() {
+                    return (uid.clone(), f64::NEG_INFINITY);
+                }
                 let dot: f64 = emb
                     .iter()
                     .zip(query_vec.iter())
@@ -308,12 +368,34 @@ impl GraphStore {
         limit: usize,
         seed_resolution: &SeedResolutionConfig,
     ) -> Result<Vec<SearchResult>, StoreError> {
+        self.hybrid_search_cancellable(
+            text_query,
+            query_embedding,
+            embedding_index,
+            limit,
+            seed_resolution,
+            None,
+        )
+    }
+
+    /// Like [`hybrid_search`], but threads a cooperative cancellation flag into
+    /// the parallel vector scan. `cancel = None` is the original behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search_cancellable(
+        &self,
+        text_query: &str,
+        query_embedding: Option<&[f32]>,
+        embedding_index: Option<&EmbeddingIndex>,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<SearchResult>, StoreError> {
         // 1. Text search
         let text_results = self.search_symbols_by_name(text_query, limit * 2, seed_resolution)?;
 
         // 2. Vector search (only when both embedding and index are present)
         let vec_results: Vec<(String, f64)> = match (query_embedding, embedding_index) {
-            (Some(qe), Some(idx)) => idx.vector_search(qe, limit * 2),
+            (Some(qe), Some(idx)) => idx.vector_search_cancellable(qe, limit * 2, cancel)?,
             _ => vec![],
         };
 
@@ -398,11 +480,80 @@ mod tests {
     }
 
     #[test]
+    fn add_rejects_dimension_mismatched_vector() {
+        // The index must stay homogeneous so the binary sidecar can't misalign.
+        let mut idx = EmbeddingIndex::new();
+        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0]); // establishes dim 3
+        idx.add("sym:b", vec![1.0_f32, 0.0]); // dim 2 — must be rejected
+        assert_eq!(idx.len(), 1, "mismatched-dim vector must not be added");
+        assert_eq!(idx.dimension(), Some(3));
+    }
+
+    #[test]
+    fn vector_search_excludes_dimension_mismatched_vectors() {
+        // Defense-in-depth for the query path: simulate a legacy/loaded index that
+        // somehow holds a mismatched vector (insert directly, bypassing the add
+        // guard). Before the query guard, `.zip()` truncated and returned a
+        // plausible-but-wrong score.
+        let mut idx = EmbeddingIndex::new();
+        idx.add("sym:right", vec![1.0_f32, 0.0, 0.0]);
+        idx.embeddings
+            .insert("sym:wrongdim".to_string(), vec![1.0_f32, 0.0]);
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let results = idx.vector_search(&query, 10);
+        // The matching-dim vector scores ~1.0; the mismatched one is excluded
+        // (NEG_INFINITY), so it never ranks above a real result.
+        let right = results.iter().find(|(u, _)| u == "sym:right").unwrap();
+        assert!((right.1 - 1.0).abs() < 1e-6, "got {}", right.1);
+        let wrong = results.iter().find(|(u, _)| u == "sym:wrongdim").unwrap();
+        assert!(
+            wrong.1 == f64::NEG_INFINITY,
+            "mismatched-dim vector must be excluded, got {}",
+            wrong.1
+        );
+    }
+
+    #[test]
     fn cosine_similarity_mismatched_len_returns_zero() {
         let a = vec![1.0_f32, 0.0];
         let b = vec![1.0_f32, 0.0, 0.0];
         let s = cosine_similarity(&a, &b);
         assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn vector_search_cancellable_uncancelled_returns_results() {
+        let mut idx = EmbeddingIndex::new();
+        idx.add("a", vec![1.0, 0.0, 0.0]);
+        idx.add("b", vec![0.9, 0.1, 0.0]);
+        idx.add("c", vec![0.0, 0.0, 1.0]);
+
+        // Not cancelled → normal results.
+        let live = idx
+            .vector_search_cancellable(&[1.0, 0.0, 0.0], 3, None)
+            .expect("an uncancelled search cannot be cancelled");
+        assert!(
+            !live.is_empty(),
+            "an uncancelled vector search returns results"
+        );
+    }
+
+    #[test]
+    fn vector_search_cancellable_returns_err_not_empty_on_cancel() {
+        let mut idx = EmbeddingIndex::new();
+        idx.add("a", vec![1.0, 0.0, 0.0]);
+        idx.add("b", vec![0.9, 0.1, 0.0]);
+        idx.add("c", vec![0.0, 0.0, 1.0]);
+
+        // Pre-cancelled over a NON-empty candidate set: a cancelled computation
+        // is incomplete, not empty — it must surface as a distinct error so no
+        // caller mistakes the truncated scan for a legitimate empty result.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let res = idx.vector_search_cancellable(&[1.0, 0.0, 0.0], 3, Some(&cancel));
+        assert!(
+            matches!(res, Err(StoreError::Cancelled(_))),
+            "a cancelled vector search must return Err(Cancelled), got {res:?}"
+        );
     }
 
     #[test]
@@ -472,6 +623,7 @@ mod tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
+            canonical_id: None,
         }
     }
 

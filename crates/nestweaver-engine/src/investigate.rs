@@ -256,6 +256,7 @@ pub fn investigate(
         db_path,
         None,
         embed_model,
+        None,
     );
     let mut connected: Vec<BrainNode> = match connected_result {
         Ok(ctx) => ctx.connected,
@@ -277,6 +278,7 @@ pub fn investigate(
         INLINE_THRESHOLD,
         INLINE_MAX_BODY_TOKENS,
         Some(budget),
+        None,
     );
     // Cap the number of inlined bodies (populate_inline_bodies has no count cap).
     let mut inlined = 0usize;
@@ -642,7 +644,8 @@ fn domain_label(e: &BundleEntry) -> String {
 /// section text; notes → concatenated section text.
 fn fetch_full_body(store: &GraphStore, uid: &str, root: &Path) -> Option<String> {
     if uid.starts_with("sym:") {
-        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], root, 0, None);
+        let reader = crate::content_reader::FilesystemReader::new(root);
+        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], &reader, 0, None);
         return res.symbols.into_iter().next().map(|w| w.body);
     }
     if uid.starts_with("sec:") {

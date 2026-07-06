@@ -130,11 +130,53 @@ pub enum LookupResult {
 /// - If `name_or_uid` contains `':'` it is treated as a UID and looked up exactly.
 /// - Otherwise a name lookup is performed; 0 matches → `NotFound`, 1 match → `Found`,
 ///   2+ matches → `Ambiguous`.
-pub fn lookup_symbol(store: &GraphStore, name_or_uid: &str) -> Result<LookupResult, anyhow::Error> {
+pub fn lookup_symbol(
+    store: &GraphStore,
+    name_or_uid: &str,
+    instance: Option<&str>,
+) -> Result<LookupResult, anyhow::Error> {
+    // When an instance filter is requested, validate it up front — an unknown instance is a
+    // user error (not an empty result) — and build a repo_uid -> instance_id map to scope
+    // matches. Symbols carry their instance via their repo.
+    let repo_instance = match instance {
+        Some(inst) => {
+            let repos = store
+                .list_repos(None)
+                .context("list repos for --instance filter")?;
+            let known: std::collections::HashSet<&str> =
+                repos.iter().map(|r| r.instance_id.as_str()).collect();
+            if !known.contains(inst) {
+                let mut valid: Vec<&str> = known.into_iter().collect();
+                valid.sort_unstable();
+                anyhow::bail!(
+                    "unknown instance '{inst}'; valid instances: {}",
+                    valid.join(", ")
+                );
+            }
+            Some(
+                repos
+                    .into_iter()
+                    .map(|r| (r.uid, r.instance_id))
+                    .collect::<std::collections::HashMap<String, String>>(),
+            )
+        }
+        None => None,
+    };
+    let in_instance = |repo_uid: &str| -> bool {
+        match (&repo_instance, instance) {
+            (Some(map), Some(inst)) => map.get(repo_uid).map(|i| i == inst).unwrap_or(false),
+            _ => true,
+        }
+    };
+
     if name_or_uid.contains(':') {
         // UID path
         match store.lookup_symbol(name_or_uid) {
             Ok(sym) => {
+                // A UID in another instance is "not found" under this filter.
+                if !in_instance(&sym.repo_uid) {
+                    return Ok(LookupResult::NotFound);
+                }
                 let callers = store.callers_of(&sym.uid).context("fetch callers")?;
                 let callees = store.callees_of(&sym.uid).context("fetch callees")?;
                 Ok(LookupResult::Found(Box::new(SymbolDetail {
@@ -148,9 +190,12 @@ pub fn lookup_symbol(store: &GraphStore, name_or_uid: &str) -> Result<LookupResu
         }
     } else {
         // Name path
-        let matches = store
+        let matches: Vec<_> = store
             .lookup_symbols_by_name(name_or_uid)
-            .context("name lookup")?;
+            .context("name lookup")?
+            .into_iter()
+            .filter(|s| in_instance(&s.repo_uid))
+            .collect();
 
         match matches.len() {
             0 => Ok(LookupResult::NotFound),
@@ -1039,6 +1084,7 @@ pub fn build_brain_context_hybrid(
         None,
         intent,
         embed_model,
+        None,
     )
 }
 
@@ -1063,6 +1109,7 @@ pub fn build_brain_context_hybrid_with_aliases(
     db_path: Option<&std::path::Path>,
     intent: Option<QueryIntent>,
     embed_model: Option<&dyn EmbedQueryFn>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
@@ -1242,18 +1289,36 @@ pub fn build_brain_context_hybrid_with_aliases(
         && config.weight_semantic > 0.0
     {
         let query_text = inputs.join(" ");
-        if let Ok(query_emb) = model.embed_query(&query_text)
-            && let Ok(hits) =
-                crate::vector_search::vector_knn_all(store, &query_emb, config.semantic_limit)
-        {
-            if config.always_blend_semantic {
-                for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
-                    if !seed_uids.contains(uid) {
-                        seed_uids.push(uid.clone());
+        if let Ok(query_emb) = model.embed_query(&query_text) {
+            match crate::vector_search::vector_knn_all_cancellable(
+                store,
+                &query_emb,
+                config.semantic_limit,
+                cancel,
+            ) {
+                Ok(hits) => {
+                    if config.always_blend_semantic {
+                        for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
+                            if !seed_uids.contains(uid) {
+                                seed_uids.push(uid.clone());
+                            }
+                        }
                     }
+                    semantic_hits = hits;
                 }
+                // A cancelled query (timeout / disconnect) is incomplete, not a
+                // benign miss: propagate it so the caller returns an error the
+                // cache refuses to store — never a truncated-but-"complete" Ok.
+                // Other embedding/search failures still degrade gracefully to no
+                // semantic signal (the original tolerant behavior).
+                Err(e)
+                    if e.downcast_ref::<nestweaver_store::StoreError>()
+                        .is_some_and(|s| s.is_cancelled()) =>
+                {
+                    return Err(e);
+                }
+                Err(_) => {}
             }
-            semantic_hits = hits;
         }
     }
 
@@ -1727,6 +1792,15 @@ pub fn explain_ranking_prior(
 ///
 /// Callers opt in by calling this at all; it is never invoked on the
 /// default (off) path.
+/// Resolves a symbol's `repo_uid` to a [`ContentReader`] for reading its source
+/// span. In server mode callers pass a resolver that yields a `GitBareReader`
+/// for the repo's bare clone; in local mode they pass `None` and reads fall back
+/// to a `FilesystemReader` rooted at `root`.
+///
+/// [`ContentReader`]: crate::content_reader::ContentReader
+pub type InlineBodyReaderResolver<'a> =
+    dyn Fn(&str) -> Option<Box<dyn crate::content_reader::ContentReader>> + 'a;
+
 pub fn populate_inline_bodies(
     store: &GraphStore,
     nodes: &mut [BrainNode],
@@ -1734,6 +1808,7 @@ pub fn populate_inline_bodies(
     threshold: f64,
     max_body_tokens: usize,
     token_budget: Option<usize>,
+    reader_resolver: Option<&InlineBodyReaderResolver>,
 ) {
     let max_relevance = nodes.iter().map(|n| n.relevance).fold(0.0_f64, f64::max);
     if max_relevance <= 0.0 {
@@ -1747,7 +1822,7 @@ pub fn populate_inline_bodies(
         if normalized < threshold {
             continue;
         }
-        let Some(body) = fetch_node_body(store, &node.uid, root) else {
+        let Some(body) = fetch_node_body(store, &node.uid, root, reader_resolver) else {
             continue;
         };
         if body.is_empty() {
@@ -1775,9 +1850,33 @@ pub fn populate_inline_bodies(
 
 /// Resolve a node UID to its source body for inline embedding. Returns `None`
 /// for kinds without a meaningful body (Heading, Tag) or on lookup failure.
-fn fetch_node_body(store: &GraphStore, uid: &str, root: &std::path::Path) -> Option<String> {
+fn fetch_node_body(
+    store: &GraphStore,
+    uid: &str,
+    root: &std::path::Path,
+    reader_resolver: Option<&InlineBodyReaderResolver>,
+) -> Option<String> {
     if uid.starts_with("sym:") {
-        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], root, 0, None);
+        // In server mode the source lives in a bare clone, not on disk. Resolve
+        // the symbol's repo and ask the caller-supplied resolver for the right
+        // reader (a GitBareReader); only fall back to the filesystem when no
+        // resolver is given (local mode) or the repo can't be resolved —
+        // otherwise a FilesystemReader over a bare repo returns an empty body.
+        if let Some(resolve) = reader_resolver
+            && let Ok(sym) = store.lookup_symbol(uid)
+            && let Some(reader) = resolve(&sym.repo_uid)
+        {
+            let res = crate::read_symbols::read_symbols(
+                store,
+                &[uid.to_string()],
+                reader.as_ref(),
+                0,
+                None,
+            );
+            return res.symbols.into_iter().next().map(|w| w.body);
+        }
+        let reader = crate::content_reader::FilesystemReader::new(root);
+        let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], &reader, 0, None);
         return res.symbols.into_iter().next().map(|w| w.body);
     }
     if uid.starts_with("sec:") {
@@ -2273,7 +2372,7 @@ mod inline_body_tests {
             node("sec:low", "Section", 0.5),
         ];
         let root = std::env::temp_dir();
-        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 800, None);
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 800, None, None);
         assert_eq!(
             nodes[0].inline_body.as_deref(),
             Some("THE BODY OF THE HIGH RELEVANCE SECTION"),
@@ -2304,7 +2403,7 @@ mod inline_body_tests {
         // first body (~10 tokens for 38 chars). The lower-ranked node keeps
         // its slot but gets no inline body.
         let root = std::env::temp_dir();
-        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 800, Some(11));
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 800, Some(11), None);
         assert!(nodes[0].inline_body.is_some(), "top node fits the budget");
         assert!(
             nodes[1].inline_body.is_none(),
@@ -2320,7 +2419,7 @@ mod inline_body_tests {
         let mut nodes = vec![node("sec:high", "Section", 1.0)];
         // max_body_tokens = 2 → 8 chars.
         let root = std::env::temp_dir();
-        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 2, None);
+        populate_inline_bodies(&store, &mut nodes, &root, 0.75, 2, None, None);
         let body = nodes[0].inline_body.as_deref().unwrap();
         assert!(
             body.len() <= 8,
@@ -2344,8 +2443,89 @@ mod inline_body_tests {
         let sym = store.lookup_symbols_by_name("greet").unwrap();
         let uid = sym[0].uid.clone();
         let mut nodes = vec![node(&uid, "Symbol/Function", 1.0)];
-        populate_inline_bodies(&store, &mut nodes, &src, 0.75, 800, None);
+        populate_inline_bodies(&store, &mut nodes, &src, 0.75, 800, None, None);
         let body = nodes[0].inline_body.as_deref().expect("symbol body");
+        assert!(body.contains("function greet"), "got: {body:?}");
+    }
+
+    /// In server mode the source lives in a bare clone with no working tree, so
+    /// the default `FilesystemReader` path returns an empty body. Threading a
+    /// reader resolver that yields a `GitBareReader` for the symbol's repo must
+    /// populate the body from the bare clone instead.
+    #[test]
+    fn inline_bodies_populated_in_server_mode() {
+        use crate::content_reader::{ContentReader, GitBareReader};
+        use crate::index::index_directory_in_memory;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(name) {\n  return hello(name);\n}\n",
+        )
+        .unwrap();
+
+        // Make `src` a git repo and bare-clone it — the server-mode source.
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-m", "init"]);
+        let bare = dir.path().join("repo.git");
+        Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                &src.display().to_string(),
+                &bare.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let uid = store.lookup_symbols_by_name("greet").unwrap()[0]
+            .uid
+            .clone();
+        let repo_uid = store.lookup_symbol(&uid).unwrap().repo_uid;
+
+        // Bug repro: with no resolver and a bare-clone "root" (no working tree),
+        // the FilesystemReader path cannot read the source, so the body is empty.
+        let mut nodes = vec![node(&uid, "Symbol/Function", 1.0)];
+        populate_inline_bodies(&store, &mut nodes, &bare, 0.75, 800, None, None);
+        assert!(
+            nodes[0].inline_body.is_none(),
+            "FilesystemReader over a bare clone should yield no body (the server-mode bug)"
+        );
+
+        // Fix: a resolver that yields a GitBareReader for the symbol's repo reads
+        // the span straight from the bare clone.
+        let bare_path = bare.clone();
+        let expected_repo = repo_uid.clone();
+        let resolver = move |ru: &str| -> Option<Box<dyn ContentReader>> {
+            if ru == expected_repo {
+                GitBareReader::from_head(&bare_path)
+                    .ok()
+                    .map(|r| Box::new(r) as Box<dyn ContentReader>)
+            } else {
+                None
+            }
+        };
+        let mut nodes = vec![node(&uid, "Symbol/Function", 1.0)];
+        populate_inline_bodies(&store, &mut nodes, &bare, 0.75, 800, None, Some(&resolver));
+        let body = nodes[0]
+            .inline_body
+            .as_deref()
+            .expect("server-mode symbol body should be read via GitBareReader");
         assert!(body.contains("function greet"), "got: {body:?}");
     }
 }

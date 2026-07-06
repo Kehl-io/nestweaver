@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 4302
 expression: "parsed_symbols(\"simple.rb\", &source)"
 ---
 - name: Greetings
@@ -14,6 +13,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: Greeter
   kind: Class
   start_line: 5
@@ -25,6 +25,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: Greetings
 - name: greet
   kind: Method
   start_line: 6
@@ -36,6 +37,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: "Greetings::Greeter"
 - name: format_name
   kind: Method
   start_line: 12
@@ -47,6 +49,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: "Greetings::Greeter"
 - name: FormalGreeter
   kind: Class
   start_line: 17
@@ -58,6 +61,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: Greetings
 - name: greet
   kind: Method
   start_line: 18
@@ -69,6 +73,7 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: "Greetings::FormalGreeter"
 - name: standalone_function
   kind: Method
   start_line: 24
@@ -80,3 +85,4 @@ expression: "parsed_symbols(\"simple.rb\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~

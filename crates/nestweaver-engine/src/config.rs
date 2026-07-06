@@ -181,6 +181,11 @@ pub struct InstanceConfig {
     pub workspace: WorkspaceConfig,
     pub inference: InferenceConfig,
     pub git: GitConfig,
+    /// Repos this instance indexes. Optional so an empty server needs no `repos`
+    /// line at all — avoids the shipped-template `repos = []` footgun where a
+    /// later `[[repos]]` append would collide into a duplicate key. Populated
+    /// configs use `[[repos]]` table-array blocks.
+    #[serde(default)]
     pub repos: Vec<RepoConfig>,
     pub schema_extensions: Option<SchemaExtensions>,
     pub links: Option<Vec<LinkConfig>>,
@@ -214,9 +219,17 @@ pub struct InstanceConfig {
     /// Default pagination limits for tool responses (`[limits]`).
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Server-mode configuration (`[server]`).
+    #[serde(default)]
+    pub server: ServerConfig,
     /// Local embedding model and hybrid-search blend configuration (`[embedding]`).
     #[serde(default)]
     pub embedding: EmbeddingConfig,
+    /// Upstream NestWeaver servers (`[[upstream]]`). Parsed here so the
+    /// sections are not silently ignored; the client crate re-reads them
+    /// via its own discovery layer.
+    #[serde(default)]
+    pub upstream: Vec<UpstreamEntry>,
 }
 
 /// `[embedding]` — local embedding model and hybrid-search blend configuration.
@@ -227,7 +240,8 @@ pub struct InstanceConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct EmbeddingConfig {
     /// HuggingFace model ID (or local path) for the sentence-transformer.
-    /// Default: `"sentence-transformers/all-MiniLM-L6-v2"`.
+    /// Default: `"sentence-transformers/all-MiniLM-L6-v2"` (384-dim, fast). A DB's
+    /// recorded embedding model overrides this at daemon startup.
     #[serde(default = "default_model_id")]
     pub model_id: String,
     /// Directory where downloaded model weights are stored.
@@ -262,6 +276,11 @@ pub struct EmbeddingConfig {
 }
 
 fn default_model_id() -> String {
+    // all-MiniLM-L6-v2: 384-dim, ~22MB, mean-pooled, no prefix — fast and light, the best
+    // general default for most users (many run CPU-only servers). A DB embedded with a
+    // different model records it (set_embedding_metadata) and the daemon loads that instead,
+    // so this default only applies to fresh/un-embedded instances. Override per-instance via
+    // `[embedding] model_id` (e.g. thenlper/gte-base for higher-quality 768-dim retrieval).
     "sentence-transformers/all-MiniLM-L6-v2".to_string()
 }
 fn default_embedding_cache_dir() -> String {
@@ -441,9 +460,23 @@ pub struct GitConfig {
     pub credential_method: String,
 }
 
+/// How a repo's contents are indexed. `Code` (the default) runs the language
+/// indexer producing Symbol/File nodes; `Vault` runs the markdown indexer
+/// producing Note/Section/Heading nodes. Declared via `type = "code" | "vault"`
+/// in a `[[repos]]` block — mirrors the `type` discriminator on [`LinkConfig`].
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoType {
+    Code,
+    Vault,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RepoConfig {
     pub url: String,
+    /// Index strategy for this repo. Absent → treated as [`RepoType::Code`].
+    #[serde(rename = "type", default)]
+    pub repo_type: Option<RepoType>,
     /// Optional repo display-name alias. When set, project and feature
     /// configs may refer to the repo by this name even if the DB-indexed
     /// repo is stored under a different display name (typically the
@@ -457,6 +490,10 @@ pub struct RepoConfig {
     /// `Some(false)` → this repo never has its CodeRank dampened by git
     /// activity (e.g. a vendored/generated repo where commit recency is noise).
     pub use_git_activity: Option<bool>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub poll: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -519,6 +556,104 @@ pub struct McpServerConfig {
     pub timeout_secs: Option<u64>,
 }
 
+/// A single `[[upstream]]` entry in the instance config.
+///
+/// Mirrors the `UpstreamConfig` shape from `nestweaver-client` but lives in
+/// the engine crate to avoid a circular dependency. The client crate
+/// re-reads these entries via its own discovery layer at connect time.
+#[derive(Debug, Deserialize, Clone)]
+pub struct UpstreamEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub url: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default = "default_upstream_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub repos: Vec<String>,
+    #[serde(default = "default_upstream_timeout")]
+    pub timeout: String,
+    /// Path to CA certificate PEM file for self-signed TLS.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+}
+
+fn default_upstream_mode() -> String {
+    "fallback".to_string()
+}
+fn default_upstream_timeout() -> String {
+    "1s".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ServerConfig {
+    #[serde(default)]
+    pub indexing: IndexingConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct IndexingConfig {
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+    #[serde(default = "default_min_poll", alias = "poll_min")]
+    pub min_poll: String,
+    #[serde(default = "default_max_poll", alias = "poll_max")]
+    pub max_poll: String,
+}
+
+fn default_workers() -> usize {
+    8
+}
+fn default_min_poll() -> String {
+    "45s".to_string()
+}
+fn default_max_poll() -> String {
+    "8h".to_string()
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self {
+            workers: default_workers(),
+            min_poll: default_min_poll(),
+            max_poll: default_max_poll(),
+        }
+    }
+}
+
+pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_str, unit) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, "ms")
+    } else {
+        let last = s.chars().last()?;
+        (
+            &s[..s.len() - 1],
+            if last == 's' {
+                "s"
+            } else if last == 'm' {
+                "m"
+            } else if last == 'h' {
+                "h"
+            } else {
+                return None;
+            },
+        )
+    };
+    let num: u64 = num_str.parse().ok()?;
+    match unit {
+        "ms" => Some(std::time::Duration::from_millis(num)),
+        "s" => Some(std::time::Duration::from_secs(num)),
+        "m" => Some(std::time::Duration::from_secs(num * 60)),
+        "h" => Some(std::time::Duration::from_secs(num * 3600)),
+        _ => None,
+    }
+}
+
 impl InstanceConfig {
     /// The DB path declared by this instance, if any.
     pub fn db_path(&self) -> Option<std::path::PathBuf> {
@@ -575,6 +710,160 @@ impl InstanceConfig {
         let contents = std::fs::read_to_string(path)?;
         Self::from_toml_str(&contents)
     }
+}
+
+/// Append a `[[repos]]` entry to an instance config file if it is not already
+/// present. Returns `true` when the file was changed.
+/// Remove a top-level `repos = []` (empty inline array) line so a subsequent
+/// `[[repos]]` append doesn't collide with it into a duplicate `repos` key.
+/// Only the EMPTY inline form is stripped (whitespace-insensitive: `repos=[]`,
+/// `repos = [ ]`); non-empty inline arrays and `[[repos]]` blocks are preserved.
+fn strip_empty_inline_repos(contents: &str) -> String {
+    let is_empty_repos_line = |line: &str| {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("repos") else {
+            return false;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            return false;
+        };
+        rest.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            == "[]"
+    };
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|l| !is_empty_repos_line(l))
+        .collect();
+    let mut out = kept.join("\n");
+    if contents.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+pub fn append_repo_to_config_file(
+    path: &std::path::Path,
+    url: &str,
+    branch: Option<&str>,
+) -> Result<bool, anyhow::Error> {
+    let mut contents = std::fs::read_to_string(path)?;
+    let cfg = InstanceConfig::from_toml_str(&contents)?;
+    let target = crate::jobs::canonical_repo_id(url);
+    if cfg
+        .repos
+        .iter()
+        .any(|repo| crate::jobs::canonical_repo_id(&repo.url) == target)
+    {
+        return Ok(false);
+    }
+
+    // A config may declare an empty repo set as an inline `repos = []` (the
+    // shipped template's form). Appending a `[[repos]]` table-array on top of
+    // that inline key produces a DUPLICATE `repos` key and corrupts the file, so
+    // strip the empty inline line first. `[[repos]]` blocks and non-empty inline
+    // arrays are left untouched (multiple `[[repos]]` blocks coexist fine).
+    contents = strip_empty_inline_repos(&contents);
+
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str("\n[[repos]]\n");
+    contents.push_str("url = ");
+    contents.push_str(&toml_basic_string(url)?);
+    contents.push('\n');
+    if let Some(branch) = branch {
+        contents.push_str("branch = ");
+        contents.push_str(&toml_basic_string(branch)?);
+        contents.push('\n');
+    }
+    std::fs::write(path, contents)?;
+    Ok(true)
+}
+
+/// True if `line` begins a TOML table (`[key]`) or array-of-tables (`[[key]]`)
+/// header, as opposed to a `[`-leading array-value continuation line like
+/// `[1, 2],` inside a multi-line array. A header's key starts with a letter,
+/// `_`, or a quote; an array element starts with a digit, `[`, `-`, etc.
+fn is_toml_table_header(line: &str) -> bool {
+    let t = line.trim_start();
+    let Some(after) = t.strip_prefix('[') else {
+        return false;
+    };
+    let key = after.strip_prefix('[').unwrap_or(after);
+    matches!(key.chars().next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '"' || c == '\'')
+}
+
+/// Remove a `[[repos]]` entry from an instance config file by canonical repo
+/// URL. Returns `true` when the file was changed.
+pub fn remove_repo_from_config_file(
+    path: &std::path::Path,
+    url: &str,
+) -> Result<bool, anyhow::Error> {
+    let contents = std::fs::read_to_string(path)?;
+    let target = crate::jobs::canonical_repo_id(url);
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut removed = false;
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        if lines[i].trim() == "[[repos]]" {
+            let start = i;
+            i += 1;
+            while i < lines.len() {
+                // Terminate the block at the NEXT table/table-array header of any
+                // kind. Breaking only on `[[...]]` would absorb a following
+                // `[git]` / `[inference]` / etc. into the repo block and delete
+                // those sections too when the repo is removed (config corruption).
+                // Use a header check (not a bare `[`) so a `[`-leading array
+                // continuation line (e.g. `[1, 2],` inside a multi-line array
+                // value) doesn't falsely truncate the block.
+                if is_toml_table_header(lines[i]) {
+                    break;
+                }
+                i += 1;
+            }
+            let block = lines[start..i].join("\n");
+            if repo_block_matches_url(&block, &target)? {
+                removed = true;
+            } else {
+                out.extend_from_slice(&lines[start..i]);
+            }
+        } else {
+            out.push(lines[i]);
+            i += 1;
+        }
+    }
+
+    if removed {
+        let mut next = out.join("\n");
+        if contents.ends_with('\n') {
+            next.push('\n');
+        }
+        std::fs::write(path, next)?;
+    }
+    Ok(removed)
+}
+
+fn repo_block_matches_url(block: &str, target: &str) -> Result<bool, anyhow::Error> {
+    let value: toml::Value = toml::from_str(block)?;
+    let Some(repos) = value.get("repos").and_then(|v| v.as_array()) else {
+        return Ok(false);
+    };
+    let Some(url) = repos
+        .first()
+        .and_then(|repo| repo.get("url"))
+        .and_then(|url| url.as_str())
+    else {
+        return Ok(false);
+    };
+    Ok(crate::jobs::canonical_repo_id(url) == target)
+}
+
+fn toml_basic_string(value: &str) -> Result<String, anyhow::Error> {
+    Ok(serde_json::to_string(value)?)
 }
 
 /// Set of `SymbolKind` variant names accepted by [`SeedResolutionConfig::kind_priority`].
@@ -685,6 +974,21 @@ credential_method = "ssh"
 [[repos]]
 url = "https://github.com/example/repo"
 "#;
+
+    #[test]
+    fn shipped_docker_instance_toml_is_valid() {
+        // The instance.toml committed at the repo root is mounted by
+        // docker-compose. It must parse and validate or the container fails to
+        // start. Regression guard for "Docker deployment not ready".
+        let shipped = include_str!("../../../instance.toml");
+        let cfg = InstanceConfig::from_toml_str(shipped)
+            .expect("shipped Docker instance.toml must be a valid InstanceConfig");
+        assert_eq!(cfg.instance_id, "nestweaver-server");
+        assert!(
+            !cfg.inference.endpoint.is_empty(),
+            "inference.endpoint must be set"
+        );
+    }
 
     #[test]
     fn parses_minimal_config() {
@@ -1161,5 +1465,247 @@ path_deboost = []
         // Shim translates with factor 0.3 each.
         assert!((cfg.seed_resolution.path_deboost[0].factor - 0.3).abs() < 1e-9);
         assert!((cfg.seed_resolution.path_deboost[1].factor - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_duration_variants() {
+        assert_eq!(
+            parse_duration("45s"),
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert_eq!(
+            parse_duration("5m"),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_duration("8h"),
+            Some(std::time::Duration::from_secs(28800))
+        );
+        assert_eq!(
+            parse_duration("500ms"),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("bogus"), None);
+    }
+
+    #[test]
+    fn repo_config_poll_deserializes() {
+        let toml_str = r#"
+            url = "https://github.com/org/repo"
+            branch = "develop"
+            poll = "never"
+        "#;
+        let cfg: RepoConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.branch.as_deref(), Some("develop"));
+        assert_eq!(cfg.poll.as_deref(), Some("never"));
+    }
+
+    #[test]
+    fn repo_config_defaults_without_new_fields() {
+        let toml_str = r#"url = "https://github.com/org/repo""#;
+        let cfg: RepoConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.branch.is_none());
+        assert!(cfg.poll.is_none());
+    }
+
+    #[test]
+    fn append_repo_to_config_file_adds_once_with_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+
+        let changed =
+            append_repo_to_config_file(&path, "https://github.com/example/new", Some("main"))
+                .unwrap();
+        assert!(changed);
+        let cfg = InstanceConfig::from_file(&path).unwrap();
+        assert!(cfg.repos.iter().any(|repo| {
+            repo.url == "https://github.com/example/new" && repo.branch.as_deref() == Some("main")
+        }));
+
+        let changed =
+            append_repo_to_config_file(&path, "https://github.com/example/new/", Some("main"))
+                .unwrap();
+        assert!(!changed, "canonical duplicate should not be appended");
+        let cfg = InstanceConfig::from_file(&path).unwrap();
+        assert_eq!(
+            cfg.repos
+                .iter()
+                .filter(|repo| crate::jobs::canonical_repo_id(&repo.url)
+                    == crate::jobs::canonical_repo_id("https://github.com/example/new"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn append_repo_to_config_file_replaces_inline_empty_repos() {
+        // The shipped template declares an empty repo set as inline `repos = []`.
+        // Appending a `[[repos]]` block on top of it must NOT produce a duplicate
+        // `repos` key — the file must stay parseable across repeated adds.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        let template = r#"instance_id = "t"
+repos = []
+[snapshot_storage]
+backend = "local"
+path = "/tmp/s"
+[workspace]
+backend = "local"
+path = "/tmp/w"
+[inference]
+endpoint = "http://x"
+embedding_model = "m"
+summary_model = "s"
+[git]
+credential_method = "ssh"
+"#;
+        std::fs::write(&path, template).unwrap();
+
+        // First add: must succeed AND keep the file parseable.
+        assert!(append_repo_to_config_file(&path, "https://github.com/example/one", None).unwrap());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("repos = []"),
+            "inline empty repos must be stripped, got:\n{after}"
+        );
+        let cfg = InstanceConfig::from_file(&path).expect("file must still parse after first add");
+        assert!(
+            cfg.repos
+                .iter()
+                .any(|r| r.url == "https://github.com/example/one")
+        );
+
+        // Second add: previously failed with "duplicate key"; must now work.
+        assert!(append_repo_to_config_file(&path, "https://github.com/example/two", None).unwrap());
+        let cfg = InstanceConfig::from_file(&path).expect("file must still parse after second add");
+        assert_eq!(cfg.repos.len(), 2, "both repos should be present");
+    }
+
+    #[test]
+    fn remove_repo_preserves_following_sections() {
+        // The shipped template puts `[[repos]]` BEFORE [snapshot_storage]/[git]/etc.
+        // Removing that repo must not swallow the following single-bracket sections.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        let cfg = r#"instance_id = "t"
+
+[[repos]]
+url = "https://github.com/acme/remove-me"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/s"
+[workspace]
+backend = "local"
+path = "/tmp/w"
+[inference]
+endpoint = "http://x"
+embedding_model = "m"
+summary_model = "s"
+[git]
+credential_method = "ssh"
+"#;
+        std::fs::write(&path, cfg).unwrap();
+
+        let removed =
+            remove_repo_from_config_file(&path, "https://github.com/acme/remove-me").unwrap();
+        assert!(removed);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        // The repo is gone...
+        assert!(!after.contains("remove-me"), "repo not removed:\n{after}");
+        // ...but every following section survives.
+        for section in ["[snapshot_storage]", "[workspace]", "[inference]", "[git]"] {
+            assert!(
+                after.contains(section),
+                "section {section} was swallowed by repo removal:\n{after}"
+            );
+        }
+        // And the file still parses into a valid config.
+        let parsed = InstanceConfig::from_file(&path).expect("file must parse after removal");
+        assert!(parsed.repos.is_empty());
+        assert_eq!(parsed.git.credential_method, "ssh");
+    }
+
+    #[test]
+    fn is_toml_table_header_distinguishes_headers_from_array_lines() {
+        // Real headers terminate a block...
+        assert!(is_toml_table_header("[git]"));
+        assert!(is_toml_table_header("[[repos]]"));
+        assert!(is_toml_table_header("  [inference]"));
+        assert!(is_toml_table_header("[\"quoted.key\"]"));
+        // ...but a `[`-leading array-value continuation line does NOT.
+        assert!(!is_toml_table_header("  [1, 2],"));
+        assert!(!is_toml_table_header("[0, 0, 0],"));
+        assert!(!is_toml_table_header("value = 3"));
+        assert!(!is_toml_table_header("# [commented]"));
+    }
+
+    #[test]
+    fn config_parses_without_any_repos_field() {
+        // `repos` is now optional (serde default) so an empty server needs no
+        // `repos` line at all — the clean way to avoid the inline-array footgun.
+        let no_repos = r#"instance_id = "t"
+[snapshot_storage]
+backend = "local"
+path = "/tmp/s"
+[workspace]
+backend = "local"
+path = "/tmp/w"
+[inference]
+endpoint = "http://x"
+embedding_model = "m"
+summary_model = "s"
+[git]
+credential_method = "ssh"
+"#;
+        let cfg = InstanceConfig::from_toml_str(no_repos).expect("config without repos must parse");
+        assert!(cfg.repos.is_empty());
+    }
+
+    #[test]
+    fn remove_repo_from_config_file_removes_only_matching_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{MINIMAL_TOML}
+
+[[repos]]
+url = "https://github.com/example/remove-me"
+branch = "main"
+
+[[repos]]
+url = "https://github.com/example/keep-me"
+"#
+            ),
+        )
+        .unwrap();
+
+        let removed =
+            remove_repo_from_config_file(&path, "https://github.com/example/remove-me/").unwrap();
+        assert!(removed);
+        let cfg = InstanceConfig::from_file(&path).unwrap();
+        assert!(
+            !cfg.repos
+                .iter()
+                .any(|repo| repo.url == "https://github.com/example/remove-me")
+        );
+        assert!(
+            cfg.repos
+                .iter()
+                .any(|repo| repo.url == "https://github.com/example/keep-me")
+        );
+    }
+
+    #[test]
+    fn server_indexing_config_defaults() {
+        let cfg = IndexingConfig::default();
+        assert_eq!(cfg.workers, 8);
+        assert_eq!(cfg.min_poll, "45s");
+        assert_eq!(cfg.max_poll, "8h");
     }
 }

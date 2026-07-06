@@ -24,7 +24,7 @@ use nestweaver_engine::{
     render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
     suggest_links, truncate_to_budget,
 };
-use nestweaver_schema::Symbol;
+use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
                   nestweaver search \"UserService\"\n  \
                   nestweaver symbol \"processPayment\"\n  \
                   nestweaver repo-map --token-budget 2000",
-    after_help = "Supported languages: JavaScript, TypeScript, Java, Go, Python, C, C++, Rust, C#, Kotlin, PHP, Ruby, Dart, Swift, COBOL\n\
+    after_help = "Supported languages (32): JavaScript, TypeScript, Java, Go, Python, C, C++, Rust, C#, Kotlin, PHP, Ruby, Swift, Dart, COBOL, Lua, Bash, Scala, Elixir, Zig, Objective-C, Groovy, PowerShell, Julia, SQL, HCL/Terraform, Fortran, Pascal, Vue, Svelte, Astro, SystemVerilog\n\
                   Default database: ./nestweaver.lbug\n\n\
                   Shell completions:\n  \
                   nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
@@ -401,6 +401,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to nestweaver-instance.toml")]
+        config: Option<PathBuf>,
     },
     /// Regex search over indexed text (section bodies, note titles, symbol signatures)
     ///
@@ -432,6 +434,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to nestweaver-instance.toml")]
+        config: Option<PathBuf>,
     },
     /// Count regex matches per pattern across indexed text (counts only)
     ///
@@ -459,6 +463,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to nestweaver-instance.toml")]
+        config: Option<PathBuf>,
     },
     /// Analyze blast radius: what depends on this symbol
     ///
@@ -491,6 +497,106 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
+    },
+    /// Analyze the impact of local changes against the org-wide graph
+    ///
+    /// Computes atomic changes from uncommitted modifications, sends them
+    /// to the daemon for cross-repo impact analysis, and reports which
+    /// symbols in other repos would break.
+    #[command(
+        name = "pre-push-impact",
+        visible_alias = "ppi",
+        after_help = "Alias: nestweaver ppi\n\nNote: 'nestweaver impact' is a separate single-symbol impact command.\nUse 'pre-push-impact' (or 'ppi') for multi-file change analysis.\n\nExamples:\n  nestweaver ppi --local-changes\n  nestweaver pre-push-impact --local-changes --format json\n  nestweaver pre-push-impact --local-changes --repo ./my-project\n  nestweaver pre-push-impact --diff origin/main..HEAD --server http://localhost:50051 --fail-on-breaking\n  nestweaver pre-push-impact --diff origin/main..HEAD --fail-on-error --format json"
+    )]
+    PrePushImpact {
+        /// Analyze uncommitted changes in the working tree
+        #[arg(long)]
+        local_changes: bool,
+        /// Maximum transitive depth for impact analysis (default: 3)
+        #[arg(long, default_value = "3")]
+        max_depth: u32,
+        /// Include test files in impact results
+        #[arg(long)]
+        include_tests: bool,
+        /// Output format: human (default), json
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Repository path (default: current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Path to the database file
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        /// Exit with code 1 if any impact has BREAKING severity
+        #[arg(long)]
+        fail_on_breaking: bool,
+        /// Exit with code 1 if server/store is unreachable or analysis fails
+        /// (default: exit 0 with warning)
+        #[arg(long)]
+        fail_on_error: bool,
+        /// gRPC URL to a remote NestWeaver server (uses local store if omitted)
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for server authentication
+        #[arg(long)]
+        token: Option<String>,
+        /// Git revision range for diff-based changes (e.g., origin/main..HEAD)
+        #[arg(long)]
+        diff: Option<String>,
+        /// Minimum severity to include: breaking, warning, info
+        #[arg(long, default_value = "info")]
+        min_severity: String,
+        /// Override auto-detected repo URL for canonical ID computation
+        #[arg(long)]
+        repo_url: Option<String>,
+        /// Show what would be sent without running impact analysis
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Format impact analysis results as a PR/MR comment
+    ///
+    /// Reads impact JSON (from pre-push-impact --format json) and renders
+    /// it as Markdown. Optionally posts to GitHub PR or GitLab MR.
+    #[command(
+        name = "format-comment",
+        after_help = "Examples:\n  nestweaver format-comment --input impact.json\n  nestweaver format-comment --input impact.json --repo owner/repo --pr 123\n  nestweaver format-comment --input - --gitlab-project 456 --mr 78 --gitlab-token TOKEN"
+    )]
+    FormatComment {
+        /// Input JSON file from impact analysis (use - for stdin)
+        #[arg(long)]
+        input: PathBuf,
+        /// GitHub repo (owner/repo) for posting PR comment
+        #[arg(long)]
+        repo: Option<String>,
+        /// GitHub PR number
+        #[arg(long)]
+        pr: Option<u64>,
+        /// Hidden HTML marker for comment dedup
+        #[arg(long, default_value = "nestweaver-impact")]
+        marker: String,
+        /// GitLab project ID
+        #[arg(long)]
+        gitlab_project: Option<String>,
+        /// GitLab MR IID
+        #[arg(long)]
+        mr: Option<u64>,
+        /// GitLab API token (Project Access Token with api scope)
+        #[arg(long)]
+        gitlab_token: Option<String>,
+        /// Write Markdown to file instead of posting
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// URL to link in truncation notice (e.g., CI artifact URL)
+        #[arg(long)]
+        artifact_url: Option<String>,
+        /// Also write a GitLab Code Quality (CodeClimate) report to this path,
+        /// for `artifacts.reports.codequality` (MR-widget annotations). Always
+        /// written when set — an empty `[]` when there are no impacts.
+        #[arg(long)]
+        codequality_out: Option<PathBuf>,
     },
     /// Generate a structural skeleton ranked by symbol importance
     ///
@@ -816,6 +922,11 @@ enum Commands {
         #[command(subcommand)]
         command: SnapshotCommands,
     },
+    /// Backup and restore the NestWeaver database
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
+    },
     /// Show the most connected hub nodes in the code graph
     ///
     /// Hub nodes have the highest degree centrality (most incoming + outgoing
@@ -891,7 +1002,7 @@ enum Commands {
         #[arg(
             long,
             default_value = "file",
-            help = "Summary level: symbol, file, or cluster"
+            help = "Summary level: symbol, file, cluster, or hub"
         )]
         level: String,
         #[arg(long, help = "Output as JSON")]
@@ -967,10 +1078,14 @@ enum Commands {
         name: String,
         #[arg(
             long,
-            default_value = "3000",
-            help = "Approximate token budget for the output"
+            help = "Approximate token budget for the output [default: 1000 concise / 3000 detailed]"
         )]
-        token_budget: usize,
+        token_budget: Option<usize>,
+        #[arg(
+            long,
+            help = "Return full detail (uid + relevance, larger default budget) instead of the concise orientation"
+        )]
+        detailed: bool,
         #[arg(long, help = "Also include notes/symbols from component sub-projects")]
         include_components: bool,
         #[arg(long, help = "Output as JSON")]
@@ -1129,7 +1244,10 @@ enum Commands {
             help = "Use the bundled local model (default when no --endpoint)"
         )]
         local: bool,
-        #[arg(long, help = "OpenAI-compatible embedding API endpoint")]
+        #[arg(
+            long,
+            help = "OpenAI-compatible embedding API endpoint. For keyed gateways (OpenAI, Azure) set NESTWEAVER_EMBED_API_KEY (sent as a bearer token, never persisted)"
+        )]
         endpoint: Option<String>,
         #[arg(
             long,
@@ -1174,6 +1292,11 @@ enum Commands {
         min_confidence: String,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(
+            long,
+            help = "Max unreachable symbols to report (default: all). Large codebases can produce very large output; cap it here or via a pipe."
+        )]
+        limit: Option<usize>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
@@ -1344,6 +1467,35 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Connect to an upstream NestWeaver server
+    #[command(
+        after_help = "Examples:\n  nestweaver connect localhost:9378 --token nw_abc123\n  nestweaver connect nestweaver.acme.com:9378 --token nw_abc123 --mode merge\n  nestweaver connect grpcs://nestweaver.acme.com:9378 --token nw_abc123 --name acme"
+    )]
+    Connect {
+        /// Server URL (e.g., nestweaver.acme.com:9378)
+        url: String,
+        /// Bearer token for authentication
+        #[arg(long, env = "NESTWEAVER_TOKEN")]
+        token: Option<String>,
+        /// Authenticate interactively via device flow (opens a browser).
+        /// Implied when no --token / NESTWEAVER_TOKEN is provided.
+        #[arg(long)]
+        device: bool,
+        /// Name for this upstream (default: "upstream")
+        #[arg(long)]
+        name: Option<String>,
+        /// Routing mode: fallback (default), merge, or primary
+        #[arg(long, default_value = "fallback")]
+        mode: String,
+        /// Path to CA certificate PEM for self-signed TLS
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+    },
+    /// Server management utilities
+    Server {
+        #[command(subcommand)]
+        action: ServerAction,
+    },
     /// Show hardware and configuration information
     Info {
         /// Show hardware acceleration details
@@ -1353,6 +1505,103 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum ServerAction {
+    /// Generate TLS certificates for secure server communication
+    #[command(
+        name = "init-tls",
+        after_help = "Examples:\n  nestweaver server init-tls --output-dir ./tls\n  nestweaver server init-tls --output-dir /etc/nestweaver/tls --san nestweaver.internal --san 10.0.1.50\n  nestweaver server init-tls --output-dir ./tls --client --validity-days 90"
+    )]
+    InitTls {
+        /// Directory to write certificate files
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Subject Alternative Names (hostnames and IPs)
+        #[arg(long = "san")]
+        sans: Vec<String>,
+        /// Certificate validity in days
+        #[arg(long, default_value = "365")]
+        validity_days: u32,
+        /// Generate client certificate for mTLS
+        #[arg(long)]
+        client: bool,
+    },
+    /// Backup and restore the NestWeaver database (alias for `nestweaver backup`)
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
+    },
+    /// Query a running server's status over its admin HTTP API
+    #[command(
+        after_help = "Examples:\n  nestweaver server status --url http://nestweaver.internal:9379\n  NESTWEAVER_ADMIN_TOKEN=secret nestweaver server status --url https://nestweaver.internal:9379"
+    )]
+    Status {
+        /// Admin/MCP HTTP base URL (the gRPC port + 1), e.g. http://host:9379
+        #[arg(long)]
+        url: String,
+        /// Admin bearer token (defaults to the NESTWEAVER_ADMIN_TOKEN env var)
+        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN")]
+        token: Option<String>,
+    },
+}
+
+/// Subset of the admin `GET /admin/api/status` response rendered by
+/// `nestweaver server status`.
+///
+/// Mirrors [`nestweaver_web::routes::admin::AdminStatus`], which is
+/// serialize-only, so we keep a local deserialize-side struct here. Unknown
+/// fields are ignored, letting the server payload grow without breaking the CLI.
+#[derive(serde::Deserialize)]
+struct ServerStatusResponse {
+    instance_id: String,
+    version: String,
+    server_mode: bool,
+    repo_count: usize,
+    active_reads: u32,
+    active_writes: u32,
+    queue_depth: u32,
+    #[serde(default)]
+    drained: bool,
+    #[serde(default)]
+    symbols: ServerSymbolStats,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ServerSymbolStats {
+    total: usize,
+}
+
+/// Render a concise, human-readable summary of a server's status.
+fn format_server_status(url: &str, status: &ServerStatusResponse) -> String {
+    let indexing = if status.queue_depth > 0 || status.active_writes > 0 {
+        "active"
+    } else {
+        "idle"
+    };
+    let mode = if status.server_mode {
+        "server"
+    } else {
+        "daemon"
+    };
+    let drained = if status.drained { " (drained)" } else { "" };
+    [
+        format!("Connected to {url}"),
+        format!("  Instance:      {}", status.instance_id),
+        format!("  Version:       {}", status.version),
+        format!("  Mode:          {mode}{drained}"),
+        format!("  Repos indexed: {}", status.repo_count),
+        format!("  Symbols:       {}", status.symbols.total),
+        format!("  Queue depth:   {}", status.queue_depth),
+        format!("  Indexing:      {indexing}"),
+        format!("  Active reads:  {}", status.active_reads),
+        format!("  Active writes: {}", status.active_writes),
+    ]
+    .join("\n")
+}
+
+#[derive(Subcommand)]
+// A CLI command enum parsed once at startup — variant size is irrelevant here,
+// and boxing clap arg fields would complicate the derive for no runtime benefit.
+#[allow(clippy::large_enum_variant)]
 enum DaemonAction {
     /// Start the daemon (usually auto-started on first use)
     Start {
@@ -1373,8 +1622,74 @@ enum DaemonAction {
     Stop,
     /// Show daemon status
     Status,
+    /// Remove orphaned launch agents (macOS) left by ephemeral/test daemons —
+    /// ones whose `--db` path no longer exists or lives under a temp dir.
+    Gc,
     /// Run daemon in foreground (used by launchd)
-    Run,
+    Run {
+        /// Enable server mode (TCP listener alongside UDS)
+        #[arg(long)]
+        server: bool,
+
+        /// TCP bind address for server mode
+        #[arg(long, default_value = "127.0.0.1:9378", env = "NESTWEAVER_BIND")]
+        bind: String,
+
+        /// Path to TLS certificate PEM file. Enables TLS when set.
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+
+        /// Path to TLS private key PEM file
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+
+        /// Bearer token for query auth
+        #[arg(long, env = "NESTWEAVER_AUTH_TOKEN")]
+        auth_token: Option<String>,
+
+        /// Separate admin bearer token
+        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+
+        /// Write actual bound port to this file (for test harness)
+        #[arg(long)]
+        port_file: Option<PathBuf>,
+
+        /// Webhook HMAC secret for verifying push event signatures
+        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET")]
+        webhook_secret: Option<String>,
+
+        /// Previous webhook secret (fallback during rotation)
+        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET_OLD")]
+        webhook_secret_old: Option<String>,
+
+        /// Path to instance.toml for server config (repos, polling, etc.)
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Boot as a read-only snapshot replica: materialize this snapshot
+        /// directory into a private working copy and serve it read-only
+        /// (requires --server; write RPCs and background indexing are disabled).
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+
+        /// ACME (Let's Encrypt) domain — auto-provision a publicly-trusted TLS
+        /// cert at runtime via TLS-ALPN-01 (opt-in; requires --server and the
+        /// `acme` build feature). TLS-ALPN-01 validates on port 443, so bind so
+        /// :443 reaches the daemon, e.g. `--bind 0.0.0.0:443`.
+        #[arg(long)]
+        acme_domain: Option<String>,
+
+        /// Contact email for the ACME account (recommended for expiry notices).
+        #[arg(long)]
+        acme_email: Option<String>,
+
+        /// Use the Let's Encrypt PRODUCTION directory. Default is STAGING
+        /// (untrusted certs, high rate limits) to avoid rate-limit bans during
+        /// setup; pass this only once issuance works end-to-end.
+        #[arg(long)]
+        acme_production: bool,
+    },
     /// Stop and restart the daemon
     Restart {
         /// Idle timeout in seconds
@@ -2136,6 +2451,50 @@ enum SnapshotCommands {
 }
 
 #[derive(Subcommand)]
+enum BackupCommands {
+    /// Save a backup of the database to a .nwsnap.zst archive
+    Save {
+        /// Output file path (e.g. backup.nwsnap.zst)
+        output: PathBuf,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+        #[arg(long, help = "Include git bare clones in the backup (full tier)")]
+        include_clones: bool,
+        #[arg(
+            long,
+            help = "Proceed even if the daemon is running (backup may be inconsistent)"
+        )]
+        force: bool,
+    },
+    /// Inspect a .nwsnap.zst archive and show its manifest
+    Inspect {
+        /// Path to the .nwsnap.zst file
+        path: PathBuf,
+    },
+    /// List all .nwsnap.zst backups in a directory
+    List {
+        /// Directory containing backup files
+        dir: PathBuf,
+    },
+    /// Restore a backup from a .nwsnap.zst archive
+    Restore {
+        /// Path to the .nwsnap.zst file
+        path: PathBuf,
+        /// Target directory for restored data
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Launch the daemon after restore
+        #[arg(long)]
+        start: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ContractCommands {
     /// List API contracts derived from spec files and framework handlers.
     List {
@@ -2161,6 +2520,19 @@ enum ContractCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+    },
+    /// Diff two OpenAPI spec files (base vs head) at the endpoint AND
+    /// request/response field/type level, classifying each change as
+    /// BREAKING or INFO. The "did this PR break the API?" check.
+    Diff {
+        #[arg(long, help = "Base (old) OpenAPI spec file")]
+        base: PathBuf,
+        #[arg(long, help = "Head (new) OpenAPI spec file")]
+        head: PathBuf,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(long, help = "Exit non-zero if any BREAKING change is found")]
+        fail_on_breaking: bool,
     },
 }
 
@@ -2226,6 +2598,36 @@ enum InteractionCommands {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Safety buffer added on top of the drain ceiling so the daemon has room to
+/// flush WAL and unwind after a drain that ran to the full ceiling, before the
+/// CLI escalates to SIGKILL.
+const STOP_GRACE_BUFFER_SECS: u64 = 30;
+
+/// Resolve how long `daemon stop` waits after SIGTERM before escalating to
+/// SIGKILL.
+///
+/// T6.2 reconciliation: a legitimate large in-flight index can run far longer
+/// than the old fixed 60s default, and the daemon's own shutdown drain is
+/// bounded by `NESTWEAVER_DRAIN_TIMEOUT_SECS` (default 660s) — so a 60s grace
+/// could SIGKILL mid-write of a non-atomic sidecar. When `NESTWEAVER_STOP_GRACE_SECS`
+/// is unset we derive the grace from that same drain ceiling (plus a small
+/// buffer) so the two can't drift and stop never kills a daemon that is still
+/// legitimately draining. An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins.
+///
+/// `stop_env` / `drain_env` are the raw env-var strings (passed in so this is
+/// unit-testable without touching process env).
+fn resolve_stop_grace_secs(stop_env: Option<&str>, drain_env: Option<&str>) -> u64 {
+    if let Some(v) = stop_env.and_then(|s| s.trim().parse::<u64>().ok()) {
+        return v;
+    }
+    // Share the drain-ceiling parse semantics with the daemon/client so a
+    // whitespace/format change can't make the CLI derive a different ceiling.
+    let ceiling = drain_env
+        .map(parse_drain_ceiling)
+        .unwrap_or(DEFAULT_DRAIN_CEILING_SECS);
+    ceiling.saturating_add(STOP_GRACE_BUFFER_SECS)
+}
 
 fn default_db_path() -> PathBuf {
     if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
@@ -2471,6 +2873,19 @@ fn parse_iso8601_to_system_time(s: &str) -> Result<std::time::SystemTime, anyhow
     Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(unix_secs as u64))
 }
 
+/// Resolve `p` to an ABSOLUTE path before sending it in an RPC to the daemon, which runs with
+/// CWD=`/` (launchd) and would resolve a relative path against the wrong directory. Prefer
+/// canonicalization; if that fails (e.g. a valid but uncanonicalizable path), fall back to
+/// joining the current dir — never return the original relative path, which would silently
+/// index/watch the wrong (or no) location.
+fn abs_for_daemon(p: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|d| d.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    })
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -2481,15 +2896,29 @@ fn main() {
     }))
     .ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::WARN.into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+
+    // The daemon `run` process installs its own INFO-level, file-based tracing
+    // subscriber in run_server. Installing a global stderr subscriber here first
+    // makes that set_global_default fail silently, dropping every daemon log
+    // (including the embed model's device line). Skip early init for that one
+    // path and let run_server own logging.
+    let is_daemon_run = matches!(
+        &cli.command,
+        Commands::Daemon {
+            action: DaemonAction::Run { .. },
+            ..
+        }
+    );
+    if !is_daemon_run {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::WARN.into()),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let out = OutputConfig::from_cli(&cli);
     let show_stats = cli.stats;
 
@@ -2508,6 +2937,17 @@ fn main() {
     };
 
     process::exit(exit_code);
+}
+
+/// Print the degraded impact-analysis JSON shape (`{"impacts": [], "error": …}`)
+/// when `format == "json"`, so the server-unavailable / store-unavailable /
+/// analysis-failed fallback paths all emit an identical, consumer-parseable shape.
+fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> {
+    if format == "json" {
+        let output = serde_json::json!({ "impacts": [], "error": reason });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    }
+    Ok(())
 }
 
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
@@ -2533,7 +2973,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             instance,
             json,
             db,
-            config: _,
+            config: config_opt,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -2542,7 +2982,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "list_repos", args) {
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "list_repos", args)
+                {
+                    let value = unwrap_hybrid_payload(value);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -2617,6 +3060,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 String::new()
             };
 
+            // A path target may refer to a repo identified by its git origin
+            // remote rather than a file:// URL — try that identity and the
+            // stored root_path too (the origin URL is read from git config,
+            // never fetched).
+            let origin_target = std::fs::canonicalize(target_trimmed)
+                .ok()
+                .filter(|p| p.join(".git").exists())
+                .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
+                .unwrap_or_default();
+            let canonical_path = canonical_target
+                .strip_prefix("file://")
+                .unwrap_or_default()
+                .to_string();
+
             let matched: Vec<&nestweaver_schema::Repo> = repos
                 .iter()
                 .filter(|r| {
@@ -2625,6 +3082,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         || r.name.as_deref() == Some(target_trimmed)
                         || r_url == url_target
                         || r_url == canonical_target
+                        || (!origin_target.is_empty()
+                            && r_url == origin_target.trim_end_matches('/'))
+                        || (!canonical_path.is_empty()
+                            && r.local_root().map(|p| p.trim_end_matches('/'))
+                                == Some(canonical_path.trim_end_matches('/')))
                         || r_url.ends_with(&format!("/{target_trimmed}"))
                 })
                 .collect();
@@ -2758,8 +3220,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "list_services", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "list_services", args)
                 {
+                    let value = unwrap_hybrid_payload(value);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -2818,26 +3281,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "service_summary", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "service_summary", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        let s: nestweaver_schema::Service = serde_json::from_value(value)
-                            .unwrap_or_else(|_| nestweaver_schema::Service {
-                                uid: String::new(),
-                                name: name.clone(),
-                                repo_uid: String::new(),
-                                summary: None,
-                                summary_hash: None,
-                                embedding: None,
-                            });
-                        println!("Service: {}", s.name);
-                        if let Some(ref summary) = s.summary {
-                            println!("Summary: {summary}");
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    // A real service deserializes with a non-empty uid. Do NOT fabricate an
+                    // empty Service on a not-found/error response — that would print a fake
+                    // "Service: <name>" header and exit 0. Report not found with the right code.
+                    match serde_json::from_value::<nestweaver_schema::Service>(value) {
+                        Ok(s) if !s.uid.is_empty() => {
+                            println!("Service: {}", s.name);
+                            if let Some(ref summary) = s.summary {
+                                println!("Summary: {summary}");
+                            }
+                            return Ok((EXIT_SUCCESS, None));
+                        }
+                        _ => {
+                            if !out.quiet {
+                                println!("Service not found: {name}");
+                            }
+                            return Ok((EXIT_NOT_FOUND, None));
                         }
                     }
-                    return Ok((EXIT_SUCCESS, None));
                 }
             }
 
@@ -2872,11 +3339,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "token_budget": token_budget });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "repo_map", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args) {
+                    let map = value["map"].as_str().unwrap_or("");
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        // Match the direct path's {map, token_count} shape — the daemon tool
+                        // returns only {map}, so compute token_count the same way here.
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "map": map,
+                                "token_count": map.len().div_ceil(4),
+                            }))?
+                        );
                     } else {
-                        print!("{}", value["map"].as_str().unwrap_or(""));
+                        print!("{map}");
                     }
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -2920,7 +3396,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["repo"] = serde_json::json!(rf);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, db_path, None, "cross_repo_contracts", args)
+                    try_hybrid_json_rpc(true, db_path, None, "cross_repo_contracts", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -3115,7 +3591,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--config is required when using --feature"))?;
 
-                // ── daemon guard ──────────────────────────────────
+                // ── daemon guard (routed through HybridClient for upstream merge) ──
                 if use_daemon {
                     let instance_cfg = nestweaver_engine::InstanceConfig::from_file(config_path)?;
                     if let Some(fc) = instance_cfg
@@ -3125,71 +3601,39 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     {
                         let db_default = default_db_path();
                         let db_path = db.as_deref().unwrap_or(&db_default);
-                        if let Ok(rt) = tokio::runtime::Runtime::new() {
-                            let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
-                                db_path,
-                                config.as_deref(),
-                            ));
-                            if let Ok(mut client) = connect {
-                                let req = nestweaver_proto::BrainContextRequest {
-                                    seeds: fc.entry_points.clone(),
-                                    token_budget: token_budget.unwrap_or(0) as i32,
-                                    response_format: String::new(),
-                                    repos: fc.repos.clone(),
-                                    vaults: vec![],
-                                    kinds: vec![],
-                                    path_prefix: String::new(),
-                                    tags: vec![],
-                                    exclude_tags: vec![],
-                                    weight_ppr: 0.0,
-                                    weight_bm25: 0.0,
-                                    intent: intent.clone().unwrap_or_default(),
-                                    include_seeds: true,
-                                    include_bodies: false,
-                                    root: String::new(),
-                                    prf: false,
-                                    rerank: false,
-                                    weight_semantic: 0.0,
-                                    since: String::new(),
-                                    recency_weight: 0.0,
-                                    recency_half_life_days: 0.0,
-                                };
-                                let rpc = rt.block_on(async {
-                                    client
-                                        .inner_mut()
-                                        .get_context(req)
-                                        .await
-                                        .map(|r| r.into_inner())
-                                });
-                                match rpc {
-                                    Ok(resp) => {
-                                        let result: nestweaver_engine::BrainContextResult =
-                                            serde_json::from_str(&resp.result_json)?;
-                                        let effective_limit = limit.unwrap_or(30);
-                                        let cut = match token_budget {
-                                            Some(budget) => {
-                                                token_budgeted_truncate(&result.connected, budget)
-                                            }
-                                            None => effective_limit.min(result.connected.len()),
-                                        };
-                                        if json {
-                                            print_brain_context_json(&result, cut)?;
-                                        } else {
-                                            print_brain_context_text(&result, cut, token_budget);
-                                        }
-                                        let stats = format!(
-                                            "{} seeds, {} connected nodes in {} (via daemon)",
-                                            result.seeds.len(),
-                                            cut,
-                                            format_elapsed(t0.elapsed())
-                                        );
-                                        return Ok((EXIT_SUCCESS, Some(stats)));
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Daemon RPC failed, falling back to local: {e}");
-                                    }
-                                }
+                        let hybrid_args = serde_json::json!({
+                            "seeds": fc.entry_points,
+                            "token_budget": token_budget.unwrap_or(0),
+                            "repos": fc.repos,
+                            "intent": intent.clone().unwrap_or_default(),
+                            "include_seeds": true,
+                        });
+                        if let Some(result_json) = try_hybrid_json_rpc(
+                            use_daemon,
+                            db_path,
+                            config.as_deref(),
+                            "brain_context",
+                            hybrid_args,
+                        ) {
+                            let result: nestweaver_engine::BrainContextResult =
+                                serde_json::from_value(result_json)?;
+                            let effective_limit = limit.unwrap_or(30);
+                            let cut = match token_budget {
+                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                                None => effective_limit.min(result.connected.len()),
+                            };
+                            if json {
+                                print_brain_context_json(&result, cut)?;
+                            } else {
+                                print_brain_context_text(&result, cut, token_budget);
                             }
+                            let stats = format!(
+                                "{} seeds, {} connected nodes in {} (via hybrid)",
+                                result.seeds.len(),
+                                cut,
+                                format_elapsed(t0.elapsed())
+                            );
+                            return Ok((EXIT_SUCCESS, Some(stats)));
                         }
                     }
                 }
@@ -3254,70 +3698,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_default = default_db_path();
                 let db_path = db.as_deref().unwrap_or(&db_default);
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
-                        db_path,
-                        config.as_deref(),
-                    ));
-                    if let Ok(mut client) = connect {
-                        let req = nestweaver_proto::BrainContextRequest {
-                            seeds: seeds.clone(),
-                            token_budget: token_budget.unwrap_or(0) as i32,
-                            response_format: String::new(),
-                            repos: vec![],
-                            vaults: vec![],
-                            kinds: vec![],
-                            path_prefix: String::new(),
-                            tags: vec![],
-                            exclude_tags: vec![],
-                            weight_ppr: 0.0,
-                            weight_bm25: 0.0,
-                            intent: intent.clone().unwrap_or_default(),
-                            include_seeds: true,
-                            include_bodies: false,
-                            root: String::new(),
-                            prf: false,
-                            rerank: false,
-                            weight_semantic: 0.0,
-                            since: String::new(),
-                            recency_weight: 0.0,
-                            recency_half_life_days: 0.0,
-                        };
-                        let rpc = rt.block_on(async {
-                            client
-                                .inner_mut()
-                                .get_context(req)
-                                .await
-                                .map(|r| r.into_inner())
-                        });
-                        match rpc {
-                            Ok(resp) => {
-                                let result: nestweaver_engine::BrainContextResult =
-                                    serde_json::from_str(&resp.result_json)?;
-                                let cut = match token_budget {
-                                    Some(budget) => {
-                                        token_budgeted_truncate(&result.connected, budget)
-                                    }
-                                    None => effective_limit.min(result.connected.len()),
-                                };
-                                if json {
-                                    print_brain_context_json(&result, cut)?;
-                                } else {
-                                    print_brain_context_text(&result, cut, token_budget);
-                                }
-                                let stats = format!(
-                                    "{} seeds, {} connected nodes in {} (via daemon)",
-                                    result.seeds.len(),
-                                    cut,
-                                    format_elapsed(t0.elapsed())
-                                );
-                                return Ok((EXIT_SUCCESS, Some(stats)));
-                            }
-                            Err(e) => {
-                                eprintln!("Daemon RPC failed, falling back to local: {e}");
-                            }
-                        }
+                let hybrid_args = serde_json::json!({
+                    "seeds": seeds.clone(),
+                    "token_budget": token_budget.unwrap_or(0),
+                    "intent": intent.clone().unwrap_or_default(),
+                    "include_seeds": true,
+                });
+                if let Some(result_json) = try_hybrid_json_rpc(
+                    use_daemon,
+                    db_path,
+                    config.as_deref(),
+                    "brain_context",
+                    hybrid_args,
+                ) {
+                    let result: nestweaver_engine::BrainContextResult =
+                        serde_json::from_value(result_json)?;
+                    let cut = match token_budget {
+                        Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                        None => effective_limit.min(result.connected.len()),
+                    };
+                    if json {
+                        print_brain_context_json(&result, cut)?;
+                    } else {
+                        print_brain_context_text(&result, cut, token_budget);
                     }
+                    let stats = format!(
+                        "{} seeds, {} connected nodes in {} (via hybrid)",
+                        result.seeds.len(),
+                        cut,
+                        format_elapsed(t0.elapsed())
+                    );
+                    return Ok((EXIT_SUCCESS, Some(stats)));
                 }
             }
 
@@ -3416,15 +3827,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::SuggestLinks {
             db,
             json,
-            config: _,
+            config: config_opt,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
-                if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "suggest_links", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc(
+                    true,
+                    &db_path,
+                    config_opt.as_deref(),
+                    "suggest_links",
+                    args,
+                ) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -3602,7 +4017,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["config"] = serde_json::json!(c.to_string_lossy());
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, config.as_deref(), "brain_guide", args)
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "brain_guide", args)
                 {
                     // brain_guide returns the guide text as a JSON string.
                     let text = if let Some(s) = value.as_str() {
@@ -3655,7 +4070,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &store, cfg_ref, rules_ref, &tool_docs,
                 )?,
                 "cursor-rule" => generate_cursor_rule_with_rules(&store, cfg_ref, rules_ref)?,
-                "agents-md" => generate_agents_md_with_rules(&store, cfg_ref, rules_ref, None)?,
+                "agents-md" => generate_agents_md_with_rules(
+                    &store,
+                    cfg_ref,
+                    rules_ref,
+                    Some(tool_docs.len()),
+                )?,
                 "claude-md" => generate_claude_md_with_rules(&store, cfg_ref, rules_ref)?,
                 _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
             };
@@ -3739,29 +4159,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             top,
             json,
             db,
-            config: _,
+            config,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // ── daemon guard (typed RPC) ──────────────────────────
+            // ── hybrid guard (routes through local + upstream) ────
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
-                if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::HubNodesRequest {
-                        top_n: top as i32,
-                        response_format: String::new(),
-                    };
-                    let rpc = rt.block_on(async {
-                        client
-                            .inner_mut()
-                            .hub_nodes(req)
-                            .await
-                            .map(|r| r.into_inner())
-                    });
+                let start_dir =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                    &start_dir,
+                ));
+                if let Ok(mut hybrid) = connect {
+                    let rpc = rt.block_on(hybrid.query(
+                        "hub_nodes",
+                        &serde_json::json!({
+                            "top_n": top,
+                        }),
+                    ));
                     match rpc {
-                        Ok(resp) => {
-                            let value: serde_json::Value = serde_json::from_str(&resp.result_json)
-                                .unwrap_or(serde_json::json!({}));
+                        Ok(value) => {
                             if json {
                                 println!("{}", serde_json::to_string_pretty(&value)?);
                             } else {
@@ -3791,16 +4210,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                             }
                             let stats = format!(
-                                "{} hubs in {} (via daemon)",
+                                "{} hubs in {} (via hybrid)",
                                 value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
                                 format_elapsed(t0.elapsed())
                             );
                             return Ok((EXIT_SUCCESS, Some(stats)));
                         }
-                        Err(status) => {
+                        Err(e) => {
                             eprintln!(
-                                "warning: daemon hub_nodes RPC failed ({}); falling back to direct DB read",
-                                status.message()
+                                "warning: hybrid hub_nodes query failed ({}); falling back to direct DB read",
+                                e
                             );
                         }
                     }
@@ -3846,14 +4265,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             top,
             json,
             db,
-            config: _,
+            config: config_opt,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "top": top });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "bridge_nodes", args)
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "bridge_nodes", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -3926,7 +4346,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref t) = target {
                     args["target"] = serde_json::json!(t);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "get_summary", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -3939,7 +4359,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let summaries = generate_summaries(&store, parsed_level)?;
 
             // Save to sidecar for later use.
-            save_summaries(&db_path, &summaries)?;
+            save_summaries(&db_path, store.graph_generation(), &summaries)?;
 
             // Optional target filter, then token budget truncation.
             let after_filter: Vec<Summary> = if let Some(ref t) = target {
@@ -3986,7 +4406,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             resolution,
             json,
             db,
-            config: _,
+            config: config_opt,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
@@ -3996,7 +4416,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(r) = resolution {
                     args["resolution"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "clusters", args)
+                {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -4069,7 +4491,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "id_or_name": id_or_name });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "clusters", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "clusters", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else if let Some(c) = value.as_object() {
@@ -4286,6 +4708,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Contracts { command } => run_contracts(command, use_daemon),
 
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
+        Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
         Commands::Memory { command } => run_memory(*command, t0, use_daemon),
@@ -4318,13 +4741,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::DeadCode {
             min_confidence,
             json,
+            limit,
             db,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
-                let args = serde_json::json!({ "min_confidence": min_confidence });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "dead_code", args) {
+                let mut args = serde_json::json!({ "min_confidence": min_confidence });
+                if let Some(n) = limit {
+                    args["limit"] = serde_json::json!(n);
+                }
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args) {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -4355,6 +4782,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .filter(|s| s.confidence >= min_conf)
                 .collect();
             let filtered_count = filtered.len();
+            // Optional cap (default: show all). `filtered_count` stays the true
+            // total; `shown` is the capped view rendered/serialized.
+            let truncated = limit.is_some_and(|n| n < filtered_count);
+            let shown: Vec<_> = match limit {
+                Some(n) => filtered.into_iter().take(n).collect(),
+                None => filtered,
+            };
 
             if json {
                 #[derive(serde::Serialize)]
@@ -4362,6 +4796,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     total_symbols: usize,
                     reachable_symbols: usize,
                     unreachable_count: usize,
+                    returned: usize,
+                    truncated: bool,
                     excluded_count: usize,
                     dead_percentage: f64,
                     min_confidence: String,
@@ -4373,13 +4809,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         total_symbols: result.total_symbols,
                         reachable_symbols: result.reachable_symbols,
                         unreachable_count: filtered_count,
+                        returned: shown.len(),
+                        truncated,
                         excluded_count: result.excluded_count,
                         dead_percentage: result.dead_percentage,
                         min_confidence: min_conf.to_string(),
-                        unreachable_symbols: filtered,
+                        unreachable_symbols: shown,
                     })?
                 );
-            } else if filtered.is_empty() {
+            } else if filtered_count == 0 {
                 println!(
                     "No dead code detected ({} symbols, all reachable from entry points).",
                     result.total_symbols
@@ -4406,8 +4844,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if min_conf != DeadCodeConfidence::Low {
                     println!(
                         "Showing {} symbol(s) with confidence >= {}\n",
-                        filtered.len(),
+                        shown.len(),
                         min_conf
+                    );
+                }
+                if truncated {
+                    println!(
+                        "(showing first {} of {} — pass --limit to change)\n",
+                        shown.len(),
+                        filtered_count
                     );
                 }
 
@@ -4416,7 +4861,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &str,
                     Vec<&nestweaver_engine::UnreachableSymbol>,
                 > = std::collections::BTreeMap::new();
-                for sym in &filtered {
+                for sym in &shown {
                     by_file.entry(&sym.file_path).or_default().push(sym);
                 }
 
@@ -4458,7 +4903,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 let mut args = serde_json::json!({ "format": format, "top": top });
                 if let Some(ref p) = output {
-                    args["output"] = serde_json::Value::String(p.display().to_string());
+                    // The DAEMON writes the file and runs with CWD=/, so a client-relative
+                    // --output would land in / (or fail), not the user's directory. Resolve
+                    // against the client's CWD here.
+                    let abs = if p.is_absolute() {
+                        p.clone()
+                    } else {
+                        std::env::current_dir()
+                            .map(|d| d.join(p))
+                            .unwrap_or_else(|_| p.clone())
+                    };
+                    args["output"] = serde_json::Value::String(abs.display().to_string());
                 }
 
                 let req = tonic::Request::new(nestweaver_proto::JsonRequest {
@@ -4608,7 +5063,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "files": file_strs,
                     "depth": depth,
                 });
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "pr_impact", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args) {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -4761,7 +5216,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["base_ref"] = serde_json::json!(br);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "affected_tests", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -4875,7 +5330,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if let Some(hours) = refresh_wiki_hours {
                 eprintln!(
-                    "Wiki refresh scheduled every {}h (via materialize-instance)",
+                    "Wiki refresh scheduled every {}h (via materialize-projects)",
                     hours
                 );
             }
@@ -4887,8 +5342,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &db_path,
                     config.as_deref(),
                 ))
-                && let Ok(resp) =
-                    rt.block_on(client.watch_code(&repo_path.display().to_string(), &instance_id))
+                && let Ok(resp) = rt.block_on(
+                    client.watch_code(
+                        // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
+                        &std::fs::canonicalize(&repo_path)
+                            .unwrap_or_else(|_| repo_path.clone())
+                            .to_string_lossy(),
+                        &instance_id,
+                    ),
+                )
             {
                 if !resp.ok {
                     eprintln!("Error: {}", resp.message);
@@ -5033,18 +5495,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
-                let daemon_client = rt
-                    .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
-                    .context("connect to daemon")?;
-                let grpc_client = daemon_client.into_inner();
-                nestweaver_mcp::run_stdio_server_daemon(
-                    grpc_client,
-                    rt,
-                    lite,
-                    track_interactions,
-                    &db_path,
-                )
-                .context("mcp server (daemon mode)")?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let hybrid = rt
+                    .block_on(nestweaver_client::hybrid::HybridClient::connect(
+                        &db_path,
+                        config.as_deref().map(std::path::Path::new),
+                        &cwd,
+                    ))
+                    .context("connect to daemon (hybrid)")?;
+                if hybrid.has_upstreams() {
+                    tracing::info!(
+                        upstreams = ?hybrid.upstream_info(),
+                        "MCP daemon proxy with hybrid routing"
+                    );
+                    run_mcp_hybrid(hybrid, rt, lite, track_interactions, &db_path)
+                        .context("mcp server (hybrid mode)")?;
+                } else {
+                    let grpc_client = hybrid.inner().clone();
+                    nestweaver_mcp::run_stdio_server_daemon(
+                        grpc_client,
+                        rt,
+                        lite,
+                        track_interactions,
+                        &db_path,
+                    )
+                    .context("mcp server (daemon mode)")?;
+                }
             } else {
                 nestweaver_mcp::run_stdio_server(
                     &db_path,
@@ -5144,13 +5620,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "query": query, "limit": limit });
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "search_symbols", args)
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "search_symbols", args)
                 {
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        // Normalize to the same bare-array shape the direct path emits (below):
+                        // unwrap the {results, _meta} hybrid envelope so `search --json` yields
+                        // the same JSON whether or not the daemon is up.
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&unwrap_hybrid_payload(value))?
+                        );
                     } else {
-                        let candidates: Vec<nestweaver_engine::SymbolCandidate> =
-                            serde_json::from_value(value).unwrap_or_default();
+                        let candidates = hybrid_search_candidates_from_value(value);
                         if candidates.is_empty() {
                             println!("No symbols found matching '{query}'.");
                         } else {
@@ -5191,6 +5672,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             max_millis,
             json,
             db,
+            config,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -5208,7 +5690,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ms) = max_millis {
                     args["max_millis"] = serde_json::json!(ms);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "regex_search", args)
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "regex_search", args)
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -5282,6 +5765,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             kinds,
             json,
             db,
+            config,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -5294,7 +5778,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["kinds"] = serde_json::json!(k);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "count_patterns", args)
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "count_patterns", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -5328,6 +5812,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             root,
             json,
             db,
+            config,
         } => {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
@@ -5340,7 +5825,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = root {
                     args["root"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "read_symbols", args)
+                if let Some(value) =
+                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "read_symbols", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -5349,10 +5835,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(db.as_deref())?;
             let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let reader = nestweaver_engine::content_reader::FilesystemReader::new(&root);
             let res = nestweaver_engine::read_symbols::read_symbols(
                 &store,
                 &targets,
-                &root,
+                &reader,
                 neighbors,
                 token_budget,
             );
@@ -5395,6 +5882,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
         Commands::Symbol {
             name_or_uid,
+            instance,
             json,
             db,
             ..
@@ -5402,9 +5890,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
-                let args = serde_json::json!({ "name_or_uid": name_or_uid });
+                let mut args = serde_json::json!({ "name_or_uid": name_or_uid });
+                if let Some(ref inst) = instance {
+                    args["instance"] = serde_json::json!(inst);
+                }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "symbol_lookup", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "symbol_lookup", args)
                 {
                     let status = value
                         .get("status")
@@ -5509,7 +6000,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(db.as_deref())?;
-            let result = lookup_symbol(&store, &name_or_uid)?;
+            let result = lookup_symbol(&store, &name_or_uid, instance.as_deref())?;
 
             match result {
                 LookupResult::Found(detail) => {
@@ -5589,6 +6080,459 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
         }
 
+        Commands::PrePushImpact {
+            local_changes,
+            max_depth,
+            include_tests,
+            format,
+            repo,
+            db,
+            fail_on_breaking,
+            fail_on_error,
+            server,
+            token,
+            diff,
+            min_severity,
+            repo_url: repo_url_override,
+            dry_run,
+        } => {
+            if !local_changes && diff.is_none() {
+                eprintln!("error: --local-changes or --diff is required");
+                return Ok((EXIT_ERROR, None));
+            }
+
+            let repo_path = repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            if !repo_path.join(".git").exists() {
+                eprintln!("error: {} is not a git repository", repo_path.display());
+                return Ok((EXIT_ERROR, None));
+            }
+
+            // Detect repo URL from git remote (or use override)
+            let repo_url = if let Some(url) = repo_url_override {
+                url
+            } else {
+                // Identity string only (never fetched); read via the
+                // SSRF-safe, timeout-guarded git wrapper.
+                nestweaver_engine::mint_repo_identity(&repo_path)
+            };
+
+            // Compute atomic changes — either from local working tree or from a diff range
+            use nestweaver_engine::atomic_changes::{ImpactSeverity, compute_local_changes};
+
+            let changes = if let Some(ref diff_range) = diff {
+                // Diff-based: compute changes between two revisions (CI mode)
+                nestweaver_engine::diff_impact::compute_diff_changes(
+                    &repo_path, diff_range, &repo_url,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to compute diff changes: {}", e))?
+            } else {
+                // Local changes mode (existing behavior)
+                compute_local_changes(&repo_path, &repo_url)
+                    .map_err(|e| anyhow::anyhow!("failed to compute local changes: {}", e))?
+            };
+
+            if changes.is_empty() {
+                if !out.quiet {
+                    // In JSON mode, status text must go to stderr so stdout
+                    // stays a single clean JSON document for jq / format-comment.
+                    if format == "json" {
+                        eprintln!("No local changes detected.");
+                    } else {
+                        println!("No local changes detected.");
+                    }
+                }
+                if format == "json" {
+                    let output = serde_json::json!({
+                        "changes": 0,
+                        "impacts": [],
+                        "total_impacted_files": 0,
+                        "total_impacted_repos": 0,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                }
+                return Ok((EXIT_SUCCESS, None));
+            }
+
+            // Dry-run mode: show the atomic changes without running impact analysis
+            if dry_run {
+                if format == "json" {
+                    let output = serde_json::json!({
+                        "dry_run": true,
+                        "changes": changes,
+                        "change_count": changes.len(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                } else {
+                    println!("  Dry run: {} atomic change(s) detected\n", changes.len());
+                    for change in &changes {
+                        println!("  {:?}", change);
+                    }
+                }
+                let stats = format!(
+                    "{} change(s) (dry run) in {}",
+                    changes.len(),
+                    format_elapsed(t0.elapsed())
+                );
+                return Ok((EXIT_SUCCESS, Some(stats)));
+            }
+
+            if !out.quiet {
+                // Keep stdout clean for JSON consumers; route progress to stderr.
+                if format == "json" {
+                    eprintln!("  Analyzing {} change(s)...", changes.len());
+                } else {
+                    println!("  Analyzing {} change(s)...", changes.len());
+                }
+            }
+
+            // Parse min_severity
+            let min_sev = match min_severity.to_lowercase().as_str() {
+                "breaking" => ImpactSeverity::Breaking,
+                "warning" => ImpactSeverity::Warning,
+                _ => ImpactSeverity::Info,
+            };
+
+            // Run impact analysis — either against a remote server or the local store
+            let impacts = if let Some(ref server_url) = server {
+                // Remote server mode: connect via gRPC
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| anyhow::anyhow!("failed to create runtime: {}", e))?;
+
+                match rt.block_on(async {
+                    let endpoint = tonic::transport::Channel::from_shared(server_url.clone())
+                        .map_err(|e| anyhow::anyhow!("invalid server URL: {}", e))?
+                        .timeout(std::time::Duration::from_secs(30));
+
+                    let channel = endpoint
+                        .connect()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("server unavailable: {}", e))?;
+
+                    let mut client =
+                        nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(
+                            channel,
+                        );
+
+                    // Convert engine AtomicChange -> proto AtomicChangeProto
+                    let proto_changes: Vec<nestweaver_proto::AtomicChangeProto> =
+                        changes.iter().map(atomic_change_to_proto).collect();
+
+                    let mut req = tonic::Request::new(nestweaver_proto::ImpactAnalysisRequest {
+                        changes: proto_changes,
+                        source_repo_url: repo_url.clone(),
+                        max_depth: max_depth as i32,
+                        include_tests,
+                    });
+
+                    // Attach bearer token if provided
+                    if let Some(ref tok) = token {
+                        req.metadata_mut().insert(
+                            "authorization",
+                            format!("Bearer {}", tok)
+                                .parse()
+                                .map_err(|_| anyhow::anyhow!("invalid token"))?,
+                        );
+                    }
+
+                    let resp = client
+                        .impact_analysis(req)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("impact analysis RPC failed: {}", e))?;
+
+                    // Convert proto ImpactItem -> engine ImpactResult
+                    let response = resp.into_inner();
+                    let impacts: Vec<nestweaver_engine::atomic_changes::ImpactResult> = response
+                        .impacts
+                        .into_iter()
+                        .map(impact_item_to_result)
+                        .collect();
+
+                    Ok::<_, anyhow::Error>(impacts)
+                }) {
+                    Ok(impacts) => impacts,
+                    Err(e) => {
+                        // Server unreachable / RPC failed — apply fallback
+                        if fail_on_error {
+                            eprintln!("error: {}", e);
+                            return Ok((EXIT_ERROR, None));
+                        }
+                        eprintln!(
+                            "warning: Server unavailable — skipping impact analysis ({})",
+                            e
+                        );
+                        print_impact_degraded_json(&format, "server_unavailable")?;
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                }
+            } else {
+                // Local store mode (existing behavior)
+                let store = match open_store(db.as_deref()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if fail_on_error {
+                            return Err(anyhow::anyhow!("failed to open store: {}", e));
+                        }
+                        eprintln!(
+                            "warning: failed to open store, skipping impact analysis ({})",
+                            e
+                        );
+                        print_impact_degraded_json(&format, "store_unavailable")?;
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                };
+
+                match nestweaver_engine::atomic_changes::analyze_impact(
+                    &store,
+                    &changes,
+                    max_depth,
+                    include_tests,
+                ) {
+                    Ok(impacts) => impacts,
+                    Err(e) => {
+                        if fail_on_error {
+                            return Err(anyhow::anyhow!("impact analysis failed: {}", e));
+                        }
+                        eprintln!("warning: impact analysis failed, skipping ({})", e);
+                        print_impact_degraded_json(&format, "analysis_failed")?;
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                }
+            };
+
+            // Determine if there are breaking impacts (before severity filter)
+            let has_breaking = impacts
+                .iter()
+                .any(|i| i.severity == ImpactSeverity::Breaking);
+
+            // Filter by minimum severity
+            let impacts = nestweaver_engine::diff_impact::filter_by_severity(impacts, min_sev);
+
+            if format == "json" {
+                let output = serde_json::json!({
+                    "changes": changes.len(),
+                    "impacts": impacts,
+                    "total_impacted_files": impacts.iter().map(|i| &i.affected_file).collect::<std::collections::HashSet<_>>().len(),
+                    "total_impacted_repos": impacts.iter().map(|i| &i.affected_repo_url).filter(|u| !u.is_empty()).collect::<std::collections::HashSet<_>>().len(),
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                // Human-readable output
+                if impacts.is_empty() {
+                    if !out.quiet {
+                        println!("\n  No cross-repo impact detected.");
+                    }
+                } else {
+                    // Group by severity
+                    let breaking: Vec<_> = impacts
+                        .iter()
+                        .filter(|i| i.severity == ImpactSeverity::Breaking)
+                        .collect();
+                    let warnings: Vec<_> = impacts
+                        .iter()
+                        .filter(|i| i.severity == ImpactSeverity::Warning)
+                        .collect();
+                    let info: Vec<_> = impacts
+                        .iter()
+                        .filter(|i| i.severity == ImpactSeverity::Info)
+                        .collect();
+
+                    println!();
+                    for impact in &breaking {
+                        println!(
+                            "  \x1b[31mBREAKING\x1b[0m: {} — {}",
+                            impact.affected_name, impact.reason
+                        );
+                        println!("    {}:{}", impact.affected_file, impact.affected_line);
+                    }
+                    for impact in &warnings {
+                        println!(
+                            "  \x1b[33mWARNING\x1b[0m: {} — {}",
+                            impact.affected_name, impact.reason
+                        );
+                        println!("    {}:{}", impact.affected_file, impact.affected_line);
+                    }
+                    for impact in &info {
+                        println!(
+                            "  \x1b[34mINFO\x1b[0m: {} — {}",
+                            impact.affected_name, impact.reason
+                        );
+                        println!("    {}:{}", impact.affected_file, impact.affected_line);
+                    }
+
+                    let unique_files: std::collections::HashSet<_> =
+                        impacts.iter().map(|i| &i.affected_file).collect();
+                    let unique_repos: std::collections::HashSet<_> = impacts
+                        .iter()
+                        .map(|i| &i.affected_repo_url)
+                        .filter(|u| !u.is_empty())
+                        .collect();
+
+                    println!();
+                    println!(
+                        "  {} impact(s) across {} file(s){}",
+                        impacts.len(),
+                        unique_files.len(),
+                        if unique_repos.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in {} repo(s)", unique_repos.len())
+                        },
+                    );
+                    if !breaking.is_empty() {
+                        println!(
+                            "  {} BREAKING, {} WARNING, {} INFO",
+                            breaking.len(),
+                            warnings.len(),
+                            info.len()
+                        );
+                    }
+                }
+            }
+
+            // Exit with error if --fail-on-breaking and there are breaking impacts
+            if fail_on_breaking && has_breaking {
+                let stats = format!(
+                    "{} change(s), {} impact(s) in {} — BREAKING changes detected",
+                    changes.len(),
+                    impacts.len(),
+                    format_elapsed(t0.elapsed())
+                );
+                return Ok((EXIT_ERROR, Some(stats)));
+            }
+
+            let stats = format!(
+                "{} change(s), {} impact(s) in {}",
+                changes.len(),
+                impacts.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
+        Commands::FormatComment {
+            input,
+            repo,
+            pr,
+            marker,
+            gitlab_project,
+            mr,
+            gitlab_token,
+            output,
+            artifact_url,
+            codequality_out,
+        } => {
+            use nestweaver_engine::format_comment::{
+                FormatConfig, GitHubCommentConfig, GitLabCommentConfig, read_impact_report,
+                render_codequality_json, render_impact_report_markdown,
+            };
+
+            let report = read_impact_report(&input)
+                .map_err(|e| anyhow::anyhow!("failed to read impact report: {}", e))?;
+
+            // GitLab Code Quality report (MR-widget). Written whenever requested,
+            // including an empty `[]`, so the CI `reports:codequality` reference
+            // never dangles even when there are no impacts.
+            if let Some(cq_path) = codequality_out.as_ref() {
+                let cq = render_codequality_json(&report.impacts);
+                std::fs::write(cq_path, &cq)
+                    .map_err(|e| anyhow::anyhow!("failed to write code quality report: {}", e))?;
+                if !out.quiet {
+                    println!(
+                        "  Wrote {} code-quality entries to {}",
+                        report.impacts.len(),
+                        cq_path.display()
+                    );
+                }
+            }
+
+            let config = FormatConfig {
+                marker: marker.clone(),
+                artifact_url,
+            };
+            let markdown = render_impact_report_markdown(&report, &config);
+
+            // Determine output destination
+            if let Some(output_path) = output {
+                // Write to file
+                std::fs::write(&output_path, &markdown)
+                    .map_err(|e| anyhow::anyhow!("failed to write output: {}", e))?;
+                if !out.quiet {
+                    println!(
+                        "  Wrote {} bytes to {}",
+                        markdown.len(),
+                        output_path.display()
+                    );
+                }
+            } else if let (Some(owner_repo), Some(pr_number)) = (repo.as_ref(), pr) {
+                // Post to GitHub PR
+                let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
+                if parts.len() != 2 {
+                    eprintln!("error: --repo must be in owner/repo format");
+                    return Ok((EXIT_ERROR, None));
+                }
+
+                let gh_config = GitHubCommentConfig {
+                    owner: parts[0].to_string(),
+                    repo: parts[1].to_string(),
+                    pr_number,
+                    marker: marker.clone(),
+                };
+
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| anyhow::anyhow!("failed to create runtime: {}", e))?;
+                rt.block_on(nestweaver_engine::format_comment::post_github_comment(
+                    &gh_config, &markdown,
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to post GitHub comment: {}", e))?;
+
+                if !out.quiet {
+                    println!(
+                        "  Posted impact comment to {}/pull/{}",
+                        owner_repo, pr_number
+                    );
+                }
+            } else if let (Some(project_id), Some(mr_iid), Some(gl_token)) =
+                (gitlab_project.as_ref(), mr, gitlab_token.as_ref())
+            {
+                // Post to GitLab MR
+                let api_url = std::env::var("CI_API_V4_URL")
+                    .unwrap_or_else(|_| "https://gitlab.com/api/v4".to_string());
+
+                let gl_config = GitLabCommentConfig {
+                    project_id: project_id.clone(),
+                    mr_iid,
+                    token: gl_token.clone(),
+                    api_url,
+                    marker: marker.clone(),
+                };
+
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| anyhow::anyhow!("failed to create runtime: {}", e))?;
+                rt.block_on(nestweaver_engine::format_comment::post_gitlab_comment(
+                    &gl_config, &markdown,
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to post GitLab comment: {}", e))?;
+
+                if !out.quiet {
+                    println!(
+                        "  Posted impact comment to GitLab project {} MR !{}",
+                        project_id, mr_iid
+                    );
+                }
+            } else {
+                // Default: print to stdout
+                println!("{}", markdown);
+            }
+
+            let stats = format!(
+                "{} impact(s), {} chars in {}",
+                report.impacts.len(),
+                markdown.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
+        }
+
         Commands::Impact {
             name_or_uid,
             depth,
@@ -5596,16 +6540,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             json,
             db,
             repo: repo_filter,
-            config: _,
+            config: config_opt,
             ..
         } => {
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            // The daemon brain_impact tool doesn't apply a --repo filter, so when the user
+            // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
+            // which honors it and returns the correct Found/NotFound/Ambiguous exit code. Without
+            // this guard, `impact <sym> --repo <r>` would silently resolve across ALL repos.
+            if use_daemon && repo_filter.is_none() {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
-                    None,
+                    config_opt.as_deref(),
                     "brain_impact",
                     serde_json::json!({
                         "symbol": name_or_uid,
@@ -5613,6 +6561,45 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "min_confidence": confidence,
                     }),
                 ) {
+                    // Honor the daemon tool's status so daemon mode matches the direct path's
+                    // exit-code contract (not_found=2, ambiguous=3) instead of always exit 0.
+                    match value.get("status").and_then(|v| v.as_str()) {
+                        Some("not_found") => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&value)?);
+                            } else if !out.quiet {
+                                println!("No symbol found: '{name_or_uid}'.");
+                            }
+                            return Ok((EXIT_NOT_FOUND, None));
+                        }
+                        Some("ambiguous") => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&value)?);
+                            } else if !out.quiet {
+                                println!("Ambiguous symbol '{name_or_uid}' — multiple matches:");
+                                if let Some(cands) =
+                                    value.get("candidates").and_then(|v| v.as_array())
+                                {
+                                    for c in cands {
+                                        let cname =
+                                            c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let fp = c
+                                            .get("file_path")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let ln = c
+                                            .get("start_line")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                        println!("  {cname} ({fp}:{ln})");
+                                    }
+                                }
+                                println!("Disambiguate with --repo <name> or pass a full UID.");
+                            }
+                            return Ok((EXIT_AMBIGUOUS, None));
+                        }
+                        _ => {}
+                    }
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else if let Some(arr) = value.get("impact_nodes") {
@@ -5773,11 +6760,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
-                try_daemon_json_rpc(true, &db_path, None, "list_projects", args)
-                    .and_then(|v| serde_json::from_value(v).ok())
+                try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)
+                    .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
                     .unwrap_or_else(|| {
-                        let store = open_store(db.as_deref()).expect("open_store");
-                        store.list_projects().unwrap_or_default()
+                        // Daemon unreachable / RPC failed — fall back to a direct read, but
+                        // never panic on a bad --db path; warn and return empty on error.
+                        match open_store(db.as_deref()) {
+                            Ok(store) => store.list_projects().unwrap_or_default(),
+                            Err(e) => {
+                                eprintln!("Warning: could not open store: {e}");
+                                Vec::new()
+                            }
+                        }
                     })
             } else {
                 let store = open_store(db.as_deref())?;
@@ -5847,47 +6841,56 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::ProjectContext {
             name,
             token_budget,
+            detailed,
             include_components,
             json,
             db,
-            config: _,
+            config,
             since,
             recency_weight,
             recency_half_life_days,
         } => {
+            // An empty name would fall through to the UID-substring match and silently resolve
+            // to the first project — reject it up front (guards both the daemon and direct paths).
+            if name.trim().is_empty() {
+                anyhow::bail!("project name must be non-empty");
+            }
+            // Concise orientation by default (research-backed — see ADR
+            // server-mode-remainder-decisions); --detailed opts into the full record.
+            let response_format = if detailed { "detailed" } else { "concise" };
+            let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
             let db_path = db.unwrap_or_else(default_db_path);
 
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
-                if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::ProjectContextRequest {
-                        project: name.clone(),
-                        token_budget: token_budget as i32,
-                        kinds: vec![],
-                        include_components,
-                        intent: String::new(),
-                        include_seeds: false,
-                        since: since.clone().unwrap_or_default(),
-                        recency_weight,
-                        recency_half_life_days,
-                    };
-                    let rpc = rt.block_on(async {
-                        client
-                            .inner_mut()
-                            .get_project_context(req)
-                            .await
-                            .map(|r| r.into_inner())
-                    });
+                let start_dir =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                    &start_dir,
+                ));
+                if let Ok(mut hybrid) = connect {
+                    let rpc = rt.block_on(hybrid.query(
+                        "project_context",
+                        &serde_json::json!({
+                            "project": name,
+                            "token_budget": token_budget,
+                            "response_format": response_format,
+                            "include_components": include_components,
+                            "since": since.clone().unwrap_or_default(),
+                            "recency_weight": recency_weight,
+                            "recency_half_life_days": recency_half_life_days,
+                        }),
+                    ));
                     match rpc {
-                        Ok(resp) => {
-                            let value: serde_json::Value = serde_json::from_str(&resp.result_json)?;
+                        Ok(value) => {
                             render_project_context_daemon_response(&value, json, token_budget);
                             return Ok((EXIT_SUCCESS, None));
                         }
-                        Err(status) => {
+                        Err(e) => {
                             tracing::info!(
-                                "daemon GetProjectContext failed ({}); falling back to direct mode",
-                                status.message()
+                                "hybrid project_context query failed ({}); falling back to direct mode",
+                                e
                             );
                         }
                     }
@@ -6052,6 +7055,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(&db_path),
                 Some(nestweaver_store::QueryIntent::ProjectContext),
                 None,
+                None,
             ) {
                 Ok(mut result) => {
                     // Surface the project's curated member notes into
@@ -6162,6 +7166,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             used_tokens,
                             token_budget,
                             &external_refs,
+                            !detailed,
                         )?;
                     } else {
                         println!("Project: {}  ({})", project.name, project.uid);
@@ -6202,7 +7207,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = root {
                     args["root"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_daemon_json_rpc(true, &db_path, None, "investigate", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -6301,7 +7306,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["root"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "investigate_expand", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -6359,7 +7364,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["root"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "investigate_hydrate", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -6451,13 +7456,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
+                // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
+                // a client-relative vault path against the wrong directory.
+                let vault_abs = abs_for_daemon(&vault);
                 let args = serde_json::json!({
-                    "vault": vault.to_string_lossy(),
+                    "vault": vault_abs.to_string_lossy(),
                 });
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "detect_implicit_projects", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "detect_implicit_projects", args)
                 {
-                    let detected: Vec<String> = serde_json::from_value(value).unwrap_or_default();
+                    let detected: Vec<String> =
+                        serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default();
                     if detected.is_empty() {
                         println!("No implicit projects detected in {}", vault.display());
                     } else {
@@ -6473,7 +7482,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             // Resolve vault UID the same way the indexer does.
-            let canonical = std::fs::canonicalize(&vault).unwrap_or_else(|_| vault.clone());
+            let canonical = abs_for_daemon(&vault);
             let instance_id = "default";
             let vault_uid = nestweaver_schema::vault_uid(instance_id, &canonical.to_string_lossy());
 
@@ -6505,6 +7514,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(p) => p,
                 None => detect_repo_root(),
             };
+            // Canonicalize to an absolute path in the CLIENT's working directory before
+            // anything else. The daemon runs detached (CWD=`/`), so a relative `--repo`
+            // path would resolve against the wrong directory and silently index 0 files.
+            // Failing fast here also turns a typo'd/nonexistent path into a clear error
+            // instead of a confusing no-op.
+            let repo_path = std::fs::canonicalize(&repo_path).with_context(|| {
+                format!(
+                    "repository path does not exist: {} — pass an existing path \
+                     (absolute, or run from within the repo)",
+                    repo_path.display()
+                )
+            })?;
             let db_path = resolve_index_db_path(db, &repo_path);
 
             if use_daemon {
@@ -6545,9 +7566,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let instance_id = instance.as_deref().unwrap_or("default");
 
-            let repo_url = format!("file://{}", repo_path.display())
-                .trim_end_matches('/')
-                .to_string();
+            // Identity: prefer the git origin remote when configured (used
+            // only as an identity string — never fetched); fall back to a
+            // file:// URL. The engine persists the disk location separately
+            // as root_path and prunes a prior file://-identified node for
+            // the same working tree by uid. Guard on `.git` at the indexed
+            // root: `git config` walks up to an enclosing repo, and a
+            // subdirectory index must not capture (and collide with) its
+            // parent repo's identity.
+            let repo_url = nestweaver_engine::mint_repo_identity(&repo_path);
 
             // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             out.status(&format!("Indexing {}", repo_path.display()));
@@ -6759,11 +7786,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                     // On macOS, use launchd to manage the daemon unless
                     // NESTWEAVER_DAEMON_FORK=1 is set (useful for tests and
-                    // environments where launchd is not available).
+                    // environments where launchd is not available). Also never
+                    // register a persistent launchd agent for a temp-DB daemon —
+                    // those are ephemeral (tests/repros) and leak crash-looping
+                    // plists; fall through to the fork path instead.
                     #[cfg(target_os = "macos")]
                     let use_launchd = std::env::var("NESTWEAVER_DAEMON_FORK")
                         .map(|v| v != "1")
-                        .unwrap_or(true);
+                        .unwrap_or(true)
+                        && !nestweaver_daemon::launchd::is_temp_db_path(&db_path);
                     #[cfg(not(target_os = "macos"))]
                     let use_launchd = false;
 
@@ -6931,6 +7962,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         &db_path,
                                         idle,
                                         config_path.as_deref(),
+                                        None,
                                     )
                                     .await
                                     {
@@ -6947,10 +7979,80 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                 }
 
-                DaemonAction::Run => {
+                DaemonAction::Run {
+                    server,
+                    bind,
+                    tls_cert,
+                    tls_key,
+                    auth_token,
+                    admin_token,
+                    port_file,
+                    webhook_secret,
+                    webhook_secret_old,
+                    config,
+                    snapshot,
+                    acme_domain,
+                    acme_email,
+                    acme_production,
+                } => {
+                    if snapshot.is_some() && !server {
+                        anyhow::bail!(
+                            "--snapshot requires --server (a replica serves reads over TCP)"
+                        );
+                    }
+                    if acme_domain.is_some() && !server {
+                        anyhow::bail!(
+                            "--acme-domain requires --server (TLS is for the TCP listener)"
+                        );
+                    }
+                    if !server {
+                        if bind != "127.0.0.1:9378" {
+                            tracing::warn!("--bind is ignored when --server is false");
+                        }
+                        if tls_cert.is_some() {
+                            tracing::warn!("--tls-cert is ignored when --server is false");
+                        }
+                        if tls_key.is_some() {
+                            tracing::warn!("--tls-key is ignored when --server is false");
+                        }
+                        if auth_token.is_some() {
+                            tracing::warn!("--auth-token is ignored when --server is false");
+                        }
+                        if webhook_secret.is_some() {
+                            tracing::warn!("--webhook-secret is ignored when --server is false");
+                        }
+                        if admin_token.is_some() {
+                            tracing::warn!("--admin-token is ignored when --server is false");
+                        }
+                    }
+                    let server_opts = if server {
+                        Some(nestweaver_daemon::ServerOpts {
+                            bind_addr: bind,
+                            port_file,
+                            auth_token,
+                            tls_cert,
+                            tls_key,
+                            webhook_secret,
+                            webhook_secret_old,
+                            admin_token,
+                            snapshot: snapshot.clone(),
+                            acme_domain: acme_domain.clone(),
+                            acme_email: acme_email.clone(),
+                            acme_staging: !acme_production,
+                        })
+                    } else {
+                        None
+                    };
+
                     let rt = tokio::runtime::Runtime::new()?;
                     rt.block_on(async {
-                        nestweaver_daemon::run_server(&db_path, None, None).await
+                        nestweaver_daemon::run_server(
+                            &db_path,
+                            None,
+                            config.as_deref(),
+                            server_opts,
+                        )
+                        .await
                     })?;
                     Ok((EXIT_SUCCESS, None))
                 }
@@ -6986,8 +8088,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         libc::kill(pid, libc::SIGTERM);
                     }
 
-                    // Poll for up to 5 seconds.
-                    for _ in 0..50 {
+                    // Poll for graceful exit. The daemon drains in-flight index
+                    // writes before exiting (a `spawn_blocking` write cannot be
+                    // aborted), which can take longer than a couple of seconds for
+                    // a large repo — so the grace window must exceed the max write
+                    // duration or `daemon stop` would SIGKILL mid-write. The
+                    // daemon's own drain is bounded by NESTWEAVER_DRAIN_TIMEOUT_SECS
+                    // (default 660s), so by default we derive the grace from that
+                    // ceiling rather than a fixed 60s that a real index blows past.
+                    // Override explicitly with NESTWEAVER_STOP_GRACE_SECS.
+                    let grace_secs = resolve_stop_grace_secs(
+                        std::env::var("NESTWEAVER_STOP_GRACE_SECS").ok().as_deref(),
+                        std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
+                            .ok()
+                            .as_deref(),
+                    );
+                    for _ in 0..(grace_secs * 10) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         if unsafe { libc::kill(pid, 0) } != 0 {
                             eprintln!("Daemon stopped.");
@@ -6997,8 +8113,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     }
 
-                    // Force kill.
-                    eprintln!("Daemon did not exit; sending SIGKILL...");
+                    // Force kill only after the full grace window elapses — the
+                    // daemon was still draining and did not exit in time.
+                    eprintln!("Daemon did not exit within {grace_secs}s; sending SIGKILL...");
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                     }
@@ -7036,6 +8153,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         return Ok((EXIT_SUCCESS, None));
                     }
                     println!("Daemon is not running.");
+                    Ok((EXIT_SUCCESS, None))
+                }
+                DaemonAction::Gc => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let report = nestweaver_daemon::launchd::gc_orphaned_agents()?;
+                        if report.removed.is_empty() {
+                            println!(
+                                "No orphaned launch agents found ({} kept, {} spared).",
+                                report.kept.len(),
+                                report.spared.len()
+                            );
+                        } else {
+                            println!(
+                                "Removed {} orphaned launch agent(s); kept {} live, spared {}.",
+                                report.removed.len(),
+                                report.kept.len(),
+                                report.spared.len()
+                            );
+                            for label in &report.removed {
+                                println!("  removed: {label}");
+                            }
+                        }
+                        // A live daemon still holds the pidfile lock even though its
+                        // DB path is currently missing (e.g. an unmounted volume) —
+                        // reaping it would kill a healthy daemon, so it was spared.
+                        for label in &report.spared {
+                            println!("  spared (live daemon, DB path missing): {label}");
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    println!("daemon gc is a no-op here (launchd is macOS-only).");
                     Ok((EXIT_SUCCESS, None))
                 }
 
@@ -7091,6 +8240,161 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
         }
+
+        Commands::Connect {
+            url,
+            token,
+            device,
+            name,
+            mode,
+            ca_cert,
+        } => {
+            let mode = match mode.as_str() {
+                "fallback" => nestweaver_client::discovery::RoutingMode::Fallback,
+                "merge" => nestweaver_client::discovery::RoutingMode::Merge,
+                "primary" => nestweaver_client::discovery::RoutingMode::Primary,
+                other => {
+                    eprintln!("Unknown routing mode: {other}. Use fallback, merge, or primary.");
+                    return Ok((EXIT_ERROR, None));
+                }
+            };
+            let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+            // Resolve the bearer token. Run the device flow when explicitly
+            // requested, or when no token was supplied (gh-style). The
+            // existing --token / NESTWEAVER_TOKEN path is left untouched.
+            let resolved_token: Option<String> = if device || token.is_none() {
+                match rt.block_on(nestweaver_client::connect::device_flow_authenticate(
+                    &url,
+                    ca_cert.as_deref(),
+                )) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        if device {
+                            // Explicit opt-in: a failure is fatal.
+                            eprintln!("error: device authentication failed: {e:#}");
+                            return Ok((EXIT_ERROR, None));
+                        }
+                        // No token and no explicit --device: fall back to a
+                        // token-less connect (works for servers without auth).
+                        tracing::debug!(
+                            "device flow unavailable, connecting without a token: {e:#}"
+                        );
+                        token.clone()
+                    }
+                }
+            } else {
+                token.clone()
+            };
+
+            match rt.block_on(nestweaver_client::connect::connect_upstream(
+                &url,
+                resolved_token.as_deref(),
+                name.as_deref(),
+                mode,
+                ca_cert.as_deref(),
+            )) {
+                Ok(_) => Ok((EXIT_SUCCESS, None)),
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    Ok((EXIT_ERROR, None))
+                }
+            }
+        }
+
+        Commands::Server { action } => match action {
+            ServerAction::InitTls {
+                output_dir,
+                sans,
+                validity_days,
+                client,
+            } => {
+                use nestweaver_engine::tls;
+
+                let bundle = tls::generate_tls_bundle(&sans, validity_days, client)?;
+
+                tls::write_tls_bundle(&output_dir, &bundle)?;
+
+                let dir_display = output_dir.display();
+                println!("Generated TLS certificates in {dir_display}/");
+                println!();
+                println!("  ca.pem           CA certificate");
+                println!("  ca-key.pem       CA private key");
+                println!("  server.pem       Server certificate");
+                println!("  server-key.pem   Server private key");
+                if client {
+                    println!("  client.pem       Client certificate (mTLS)");
+                    println!("  client-key.pem   Client private key (mTLS)");
+                }
+                println!();
+                println!("Start server with:");
+                println!("  nestweaver daemon run --server \\",);
+                println!("    --tls-cert {dir_display}/server.pem \\",);
+                println!("    --tls-key {dir_display}/server-key.pem",);
+                println!();
+                println!("Clients connect with:");
+                println!("  nestweaver connect <url> --ca-cert {dir_display}/ca.pem");
+                println!();
+
+                let expiry_days = validity_days;
+                println!("Certificates valid for {expiry_days} days.");
+
+                let effective_sans = if sans.is_empty() {
+                    vec!["localhost".to_string(), "127.0.0.1".to_string()]
+                } else {
+                    sans
+                };
+                println!("SANs: {}", effective_sans.join(", "));
+
+                Ok((EXIT_SUCCESS, None))
+            }
+            ServerAction::Backup { command } => run_backup(command).map(|c| (c, None)),
+            ServerAction::Status { url, token } => {
+                let base = url.trim_end_matches('/').to_string();
+                let endpoint = format!("{base}/admin/api/status");
+                let rt = tokio::runtime::Runtime::new()?;
+                let result = rt.block_on(async {
+                    let client = reqwest::Client::new();
+                    let mut req = client.get(&endpoint);
+                    if let Some(token) = token.as_deref() {
+                        // bearer_auth sets the Authorization header; the token is
+                        // never logged or echoed.
+                        req = req.bearer_auth(token);
+                    }
+                    let resp = req
+                        .send()
+                        .await
+                        .with_context(|| format!("could not reach server at {base}"))?;
+                    let http_status = resp.status();
+                    if http_status == reqwest::StatusCode::UNAUTHORIZED
+                        || http_status == reqwest::StatusCode::FORBIDDEN
+                    {
+                        anyhow::bail!(
+                            "authentication failed (HTTP {http_status}); check --token / NESTWEAVER_ADMIN_TOKEN"
+                        );
+                    }
+                    if !http_status.is_success() {
+                        anyhow::bail!("server returned HTTP {http_status}");
+                    }
+                    let status: ServerStatusResponse = resp
+                        .json()
+                        .await
+                        .context("could not parse server status response")?;
+                    Ok::<ServerStatusResponse, anyhow::Error>(status)
+                });
+
+                match result {
+                    Ok(status) => {
+                        println!("{}", format_server_status(&base, &status));
+                        Ok((EXIT_SUCCESS, None))
+                    }
+                    Err(e) => {
+                        eprintln!("error: failed to query server status: {e:#}");
+                        Ok((EXIT_ERROR, None))
+                    }
+                }
+            }
+        },
 
         Commands::Info { hardware } => {
             if hardware {
@@ -7666,7 +8970,7 @@ fn run_memory(
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({});
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
                     config.as_deref(),
@@ -7728,7 +9032,7 @@ fn run_memory(
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "apply": apply });
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
                     config.as_deref(),
@@ -7784,7 +9088,7 @@ fn run_memory(
                     "edge_types": edge_types,
                     "depth": depth,
                 });
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
                     config.as_deref(),
@@ -7821,11 +9125,12 @@ fn run_memory(
     }
 }
 
-/// Try to dispatch a read-only brain command through the daemon's JSON
-/// pass-through RPC. Returns `Some(json_value)` on success, `None` if the
-/// daemon is unavailable or the RPC fails (caller should fall through to
+/// Dispatch a read-only brain command through the `HybridClient`, which
+/// queries the local daemon **and** any configured upstream servers.
+/// Returns `Some(json_value)` on success, `None` if the daemon is
+/// unavailable or the RPC fails (caller should fall through to
 /// direct-disk mode).
-fn try_daemon_json_rpc(
+fn try_hybrid_json_rpc(
     use_daemon: bool,
     db_path: &std::path::Path,
     config: Option<&std::path::Path>,
@@ -7836,62 +9141,32 @@ fn try_daemon_json_rpc(
         return None;
     }
     let rt = tokio::runtime::Runtime::new().ok()?;
-    let mut client = rt
-        .block_on(nestweaver_client::DaemonClient::connect(db_path, config))
-        .ok()?;
-    let args_json = serde_json::to_string(&args).ok()?;
-    let req = tonic::Request::new(nestweaver_proto::JsonRequest { args_json });
-    let rpc_name_owned = rpc_name.to_string();
-    let result = rt.block_on(async {
-        // Route to the correct RPC method by name.
-        let resp = match rpc_name_owned.as_str() {
-            "brain_broken_links" => client.inner_mut().brain_broken_links(req).await,
-            "brain_orphan_documents" => client.inner_mut().brain_orphan_documents(req).await,
-            "brain_topic_clusters" => client.inner_mut().brain_topic_clusters(req).await,
-            "brain_tag_graph" => client.inner_mut().brain_tag_graph(req).await,
-            "brain_doc_stats" => client.inner_mut().brain_doc_stats(req).await,
-            "brain_impact" => client.inner_mut().impact(req).await,
-            "regex_search" => client.inner_mut().regex_search(req).await,
-            "stale_check" => client.inner_mut().stale_check(req).await,
-            "brain_status" => client.inner_mut().brain_status_json(req).await,
-            "read_symbols" => client.inner_mut().read_symbols(req).await,
-            "dead_code" => client.inner_mut().dead_code(req).await,
-            "clusters" => client.inner_mut().clusters(req).await,
-            "bridge_nodes" => client.inner_mut().bridge_nodes(req).await,
-            "blast_radius" => client.inner_mut().blast_radius(req).await,
-            "get_summary" => client.inner_mut().get_summary(req).await,
-            "count_patterns" => client.inner_mut().count_patterns(req).await,
-            "affected_tests" => client.inner_mut().affected_tests(req).await,
-            "investigate" => client.inner_mut().investigate(req).await,
-            "investigate_expand" => client.inner_mut().investigate_expand(req).await,
-            "investigate_hydrate" => client.inner_mut().investigate_hydrate(req).await,
-            "flow_trace" => client.inner_mut().flow_trace(req).await,
-            "contract_drift" => client.inner_mut().contract_drift(req).await,
-            "cross_repo_contracts" => client.inner_mut().cross_repo_contracts(req).await,
-            "brain_memory_lint" => client.inner_mut().brain_memory_lint(req).await,
-            "brain_memory_consolidate" => client.inner_mut().brain_memory_consolidate(req).await,
-            "brain_memory_related" => client.inner_mut().brain_memory_related(req).await,
-            "detect_changes" => client.inner_mut().detect_changes(req).await,
-            "brain_guide" => client.inner_mut().brain_guide(req).await,
-            "list_repos" => client.inner_mut().list_repos_json(req).await,
-            "list_vaults" => client.inner_mut().list_vaults_json(req).await,
-            "embedding_dimension" => client.inner_mut().embedding_dimension(req).await,
-            "list_services" => client.inner_mut().list_services_json(req).await,
-            "service_summary" => client.inner_mut().service_summary_json(req).await,
-            "list_projects" => client.inner_mut().list_projects_json(req).await,
-            "search_symbols" => client.inner_mut().search_symbols(req).await,
-            "symbol_lookup" => client.inner_mut().symbol_lookup(req).await,
-            "repo_map" => client.inner_mut().repo_map_json(req).await,
-            "suggest_links" => client.inner_mut().suggest_links_json(req).await,
-            "detect_implicit_projects" => {
-                client.inner_mut().detect_implicit_projects_json(req).await
-            }
-            "pr_impact" => client.inner_mut().pr_impact_json(req).await,
-            _ => return None,
-        };
-        resp.ok().map(|r| r.into_inner().result_json)
-    })?;
-    serde_json::from_str(&result).ok()
+    let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
+        db_path, config, &start_dir,
+    )) {
+        Ok(mut hybrid) => rt.block_on(hybrid.query(rpc_name, &args)).ok(),
+        Err(_) => rt
+            .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+                config, &start_dir, rpc_name, &args,
+            ))
+            .ok(),
+    }
+}
+
+/// Unwrap the `{ "results": [...], "_meta": {...} }` envelope that the hybrid
+/// JSON-RPC path wraps around bare-array tool results, returning the inner
+/// `results` value. Bare (already-unwrapped) values — e.g. a local-daemon
+/// response — pass through unchanged, so every CLI consumer that deserializes a
+/// list result can route through this regardless of which path produced it.
+fn unwrap_hybrid_payload(value: serde_json::Value) -> serde_json::Value {
+    value.get("results").cloned().unwrap_or(value)
+}
+
+fn hybrid_search_candidates_from_value(
+    value: serde_json::Value,
+) -> Vec<nestweaver_engine::SymbolCandidate> {
+    serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default()
 }
 
 fn run_brain(
@@ -7952,8 +9227,11 @@ fn run_brain(
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client =
                     rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
+                // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
+                // a client-relative vault path against the wrong directory (indexing 0).
+                let vault_abs = abs_for_daemon(&path);
                 let req = nestweaver_proto::IndexVaultRequest {
-                    vault_path: path.display().to_string(),
+                    vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),
@@ -8066,7 +9344,7 @@ fn run_brain(
 
             if use_daemon
                 && let Some(value) =
-                    try_daemon_json_rpc(true, db_path, None, "list_vaults", serde_json::json!({}))
+                    try_hybrid_json_rpc(true, db_path, None, "list_vaults", serde_json::json!({}))
             {
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 return Ok((EXIT_SUCCESS, None));
@@ -8129,7 +9407,7 @@ fn run_brain(
             let db_path = db_resolved.as_path();
 
             // ── daemon guard ──────────────────────────────────────
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 db_path,
                 config.as_deref(),
@@ -8137,6 +9415,26 @@ fn run_brain(
                 serde_json::json!({}),
             ) {
                 if json {
+                    // Inject upstream info into JSON output.
+                    let mut value = value;
+                    let upstream_configs = nestweaver_client::discovery::discover_upstreams(
+                        db_path.parent().unwrap_or(std::path::Path::new(".")),
+                    );
+                    if !upstream_configs.is_empty() {
+                        let upstreams_json: Vec<_> = upstream_configs
+                            .iter()
+                            .map(|ucfg| {
+                                serde_json::json!({
+                                    "name": ucfg.name.as_deref().unwrap_or("upstream"),
+                                    "url": ucfg.url,
+                                    "mode": format!("{:?}", ucfg.mode).to_lowercase(),
+                                })
+                            })
+                            .collect();
+                        if let Some(obj) = value.as_object_mut() {
+                            obj.insert("upstreams".to_string(), serde_json::json!(upstreams_json));
+                        }
+                    }
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
                     println!("Brain status:");
@@ -8269,6 +9567,66 @@ fn run_brain(
                                          Or sweep all rows at this path:\n      nestweaver brain remove {root}\n  \
                                          Or consolidate under one instance:\n      nestweaver instance merge --from <old-id> --to <correct-id>"
                                     );
+                                }
+                            }
+                        }
+                    }
+                    // ── Upstream server info ─────────────────────────────
+                    let upstream_configs = nestweaver_client::discovery::discover_upstreams(
+                        db_path.parent().unwrap_or(std::path::Path::new(".")),
+                    );
+                    if !upstream_configs.is_empty() {
+                        println!();
+                        for ucfg in &upstream_configs {
+                            let name = ucfg.name.as_deref().unwrap_or("upstream");
+                            let mode = format!("{:?}", ucfg.mode).to_lowercase();
+                            match nestweaver_client::upstream::UpstreamHandle::from_config(ucfg) {
+                                Ok(handle) => {
+                                    // Try a quick HealthCheck to determine reachability.
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .unwrap();
+                                    let health_result = rt.block_on(async {
+                                        let mut client = handle.client();
+                                        let mut req = tonic::Request::new(
+                                            nestweaver_proto::HealthCheckRequest {},
+                                        );
+                                        handle.inject_auth(&mut req);
+                                        tokio::time::timeout(
+                                            std::time::Duration::from_secs(2),
+                                            client.health_check(req),
+                                        )
+                                        .await
+                                    });
+
+                                    match health_result {
+                                        Ok(Ok(resp)) => {
+                                            let version = resp.into_inner().version;
+                                            // Try to get repo count.
+                                            let repo_count = rt.block_on(async {
+                                                let mut client = handle.client();
+                                                let mut req = tonic::Request::new(
+                                                    nestweaver_proto::RepoStatesRequest {},
+                                                );
+                                                handle.inject_auth(&mut req);
+                                                client
+                                                    .repo_states(req)
+                                                    .await
+                                                    .map(|r| r.into_inner().repos.len())
+                                                    .unwrap_or(0)
+                                            });
+                                            println!(
+                                                "  Server: {name} (v{version}, {mode} mode, healthy, {repo_count} repos)"
+                                            );
+                                        }
+                                        _ => {
+                                            println!("  Server: {name} ({mode} mode, unreachable)");
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    println!("  Server: {name} ({mode} mode, config error)");
                                 }
                             }
                         }
@@ -8481,7 +9839,7 @@ fn run_brain(
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 &db_path,
                 None,
@@ -8548,7 +9906,7 @@ fn run_brain(
             let mut results: Vec<serde_json::Value> = Vec::new();
 
             for repo in &repos {
-                let current_head = if let Some(path) = repo.url.strip_prefix("file://") {
+                let current_head = if let Some(path) = repo.local_root() {
                     std::process::Command::new("git")
                         .args(["-C", path, "rev-parse", "HEAD"])
                         .output()
@@ -8561,7 +9919,7 @@ fn run_brain(
 
                 let is_valid_sha = repo.indexed_sha.len() == 40
                     && repo.indexed_sha.chars().all(|c| c.is_ascii_hexdigit());
-                let commits_behind = match (&current_head, repo.url.strip_prefix("file://")) {
+                let commits_behind = match (&current_head, repo.local_root()) {
                     (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
                         std::process::Command::new("git")
                             .args([
@@ -8680,7 +10038,7 @@ fn run_brain(
 
             if let Some(hours) = refresh_wiki_hours {
                 out.status(&format!(
-                    "Wiki refresh scheduled every {}h (via materialize-instance)",
+                    "Wiki refresh scheduled every {}h (via materialize-projects)",
                     hours
                 ));
             }
@@ -8702,8 +10060,10 @@ fn run_brain(
                     &db_path,
                     config.as_deref(),
                 ))?;
+                // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
+                let vault_abs = abs_for_daemon(&path);
                 let req = nestweaver_proto::WatchVaultRequest {
-                    vault_path: path.display().to_string(),
+                    vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
                     instance_id: instance_id.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
@@ -8901,7 +10261,7 @@ fn run_brain(
             let extra_patterns = parse_ignore_flag(&ignore);
 
             // Compute vault UID for recording last_indexed_at.
-            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let canonical = abs_for_daemon(&path);
             let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
 
             if use_daemon && since.is_none() {
@@ -8910,7 +10270,9 @@ fn run_brain(
                 let mut client =
                     rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
                 let req = nestweaver_proto::IndexVaultRequest {
-                    vault_path: path.display().to_string(),
+                    // Absolute path: the daemon runs with CWD=/ and would otherwise
+                    // resolve a client-relative vault path against the wrong directory.
+                    vault_path: canonical.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),
@@ -9031,7 +10393,7 @@ fn run_brain(
             let instance_specified = instance.is_some();
             let instance_id = instance.as_deref().unwrap_or("default");
 
-            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let canonical = abs_for_daemon(&path);
             let canon_str = canonical.to_string_lossy();
             let raw_str = path.to_string_lossy();
             let v_uid_canon = nestweaver_schema::vault_uid(instance_id, &canon_str);
@@ -9044,9 +10406,9 @@ fn run_brain(
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(use_daemon, &db_path, None, "list_vaults", args)
+                    try_hybrid_json_rpc(use_daemon, &db_path, None, "list_vaults", args)
                 {
-                    serde_json::from_value(value).unwrap_or_default()
+                    serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default()
                 } else if let Ok(store) = GraphStore::open_read_only(&db_path) {
                     store.list_vaults(inst_filter).unwrap_or_default()
                 } else {
@@ -9239,41 +10601,77 @@ fn run_brain(
             // direct-disk implementation below when `--no-daemon` is set,
             // `NESTWEAVER_NO_DAEMON` is in the env, or the daemon is down.
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
                     &db_path,
                     config.as_deref(),
+                    &cwd,
                 ));
-                if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::BrainSearchRequest {
-                        query: raw_query.clone(),
-                        limit: limit as i32,
-                        response_format: None,
-                        include_bodies: false,
-                        prf,
-                        rerank: false,
-                        root: None,
-                    };
-                    let rpc = rt.block_on(async {
-                        client.inner_mut().search(req).await.map(|r| r.into_inner())
-                    });
-                    match rpc {
-                        Ok(resp) => {
-                            render_brain_search_response(&resp, json)?;
-                            let stats = format!(
-                                "{} results in {} (via daemon)",
-                                resp.results.len(),
-                                format_elapsed(t0.elapsed())
-                            );
-                            return Ok((EXIT_SUCCESS, Some(stats)));
+                if let Ok(mut hybrid) = connect {
+                    if hybrid.has_upstreams() {
+                        // Route through HybridClient::query for upstream routing.
+                        let params = serde_json::json!({
+                            "query": raw_query,
+                            "limit": limit,
+                            "prf": prf,
+                        });
+                        let rpc = rt.block_on(hybrid.query("brain_search", &params));
+                        match rpc {
+                            Ok(result) => {
+                                if json {
+                                    println!("{}", serde_json::to_string_pretty(&result)?);
+                                } else {
+                                    render_brain_search_json(&result)?;
+                                }
+                                let count = result
+                                    .get("results")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                let stats = format!(
+                                    "{} results in {} (via daemon+hybrid)",
+                                    count,
+                                    format_elapsed(t0.elapsed())
+                                );
+                                return Ok((EXIT_SUCCESS, Some(stats)));
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: hybrid search failed ({}); falling back to direct DB read",
+                                    e
+                                );
+                            }
                         }
-                        Err(status) => {
-                            // Surface a single eprintln, then fall through to
-                            // the direct-disk path so the user still gets a
-                            // result.
-                            eprintln!(
-                                "warning: daemon search RPC failed ({}); falling back to direct DB read",
-                                status.message()
-                            );
+                    } else {
+                        // No upstreams — use typed RPC for efficiency.
+                        let req = nestweaver_proto::BrainSearchRequest {
+                            query: raw_query.clone(),
+                            limit: limit as i32,
+                            response_format: None,
+                            include_bodies: false,
+                            prf,
+                            rerank: false,
+                            root: None,
+                        };
+                        let rpc = rt.block_on(async {
+                            hybrid.inner_mut().search(req).await.map(|r| r.into_inner())
+                        });
+                        match rpc {
+                            Ok(resp) => {
+                                render_brain_search_response(&resp, json)?;
+                                let stats = format!(
+                                    "{} results in {} (via daemon)",
+                                    resp.results.len(),
+                                    format_elapsed(t0.elapsed())
+                                );
+                                return Ok((EXIT_SUCCESS, Some(stats)));
+                            }
+                            Err(status) => {
+                                eprintln!(
+                                    "warning: daemon search RPC failed ({}); falling back to direct DB read",
+                                    status.message()
+                                );
+                            }
                         }
                     }
                 }
@@ -9550,55 +10948,43 @@ fn run_brain(
                 && prefer_instance.is_none()
                 && let Ok(rt) = tokio::runtime::Runtime::new()
             {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
                     &db_path,
                     config_path.as_deref(),
+                    &cwd,
                 ));
-                if let Ok(mut client) = connect {
-                    let req = nestweaver_proto::BrainContextRequest {
-                        seeds: seeds.clone(),
-                        token_budget: token_budget.unwrap_or(0) as i32,
-                        response_format: String::new(),
-                        repos: repos.clone(),
-                        vaults: vaults.clone(),
-                        kinds: kinds.clone(),
-                        path_prefix: path_prefix.clone().unwrap_or_default(),
-                        tags: tags.clone(),
-                        exclude_tags: exclude_tags.clone(),
-                        weight_ppr: weight_ppr.unwrap_or(0.0),
-                        weight_bm25: weight_bm25.unwrap_or(0.0),
-                        // Pass the parsed --intent through to the daemon
-                        // (empty string = auto-detect on the server).
-                        intent: intent.clone().unwrap_or_default(),
-                        include_seeds: true,
-                        include_bodies: inline_bodies,
-                        root: root
-                            .clone()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
-                        prf,
-                        rerank,
-                        weight_semantic: if no_embed {
-                            0.0
-                        } else {
-                            weight_semantic.unwrap_or(0.0)
-                        },
-                        since: since.as_deref().unwrap_or("").to_string(),
-                        recency_weight,
-                        recency_half_life_days,
-                    };
-                    let rpc = rt.block_on(async {
-                        client
-                            .inner_mut()
-                            .get_context(req)
-                            .await
-                            .map(|r| r.into_inner())
+                if let Ok(mut hybrid) = connect {
+                    // Build params JSON — used by both hybrid and typed paths.
+                    let context_params = serde_json::json!({
+                        "seeds": seeds,
+                        "token_budget": token_budget.unwrap_or(0),
+                        "repos": repos,
+                        "vaults": vaults,
+                        "kinds": kinds,
+                        "path_prefix": path_prefix.clone().unwrap_or_default(),
+                        "tags": tags,
+                        "exclude_tags": exclude_tags,
+                        "weight_ppr": weight_ppr.unwrap_or(0.0),
+                        "weight_bm25": weight_bm25.unwrap_or(0.0),
+                        "intent": intent.clone().unwrap_or_default(),
+                        "include_seeds": true,
+                        "include_bodies": inline_bodies,
+                        "root": root.clone().unwrap_or_default().to_string_lossy().to_string(),
+                        "prf": prf,
+                        "rerank": rerank,
+                        "weight_semantic": if no_embed { 0.0 } else { weight_semantic.unwrap_or(0.0) },
+                        "since": since.as_deref().unwrap_or(""),
+                        "recency_weight": recency_weight,
+                        "recency_half_life_days": recency_half_life_days,
                     });
+
+                    // Route through hybrid.query for upstream merge.
+                    let rpc = rt.block_on(hybrid.query("brain_context", &context_params));
                     match rpc {
-                        Ok(resp) => {
+                        Ok(result_json) => {
                             let result: nestweaver_engine::BrainContextResult =
-                                serde_json::from_str(&resp.result_json)?;
+                                serde_json::from_value(result_json)?;
                             let cut = match token_budget {
                                 Some(budget) => token_budgeted_truncate(&result.connected, budget),
                                 None => limit.min(result.connected.len()),
@@ -9608,18 +10994,24 @@ fn run_brain(
                             } else {
                                 print_brain_context_text(&result, cut, token_budget);
                             }
+                            let source = if hybrid.has_upstreams() {
+                                "daemon+hybrid"
+                            } else {
+                                "daemon"
+                            };
                             let node_count = result.seeds.len() + cut;
                             let stats = format!(
-                                "{} nodes in {} (via daemon)",
+                                "{} nodes in {} (via {})",
                                 node_count,
-                                format_elapsed(t0.elapsed())
+                                format_elapsed(t0.elapsed()),
+                                source,
                             );
                             return Ok((EXIT_SUCCESS, Some(stats)));
                         }
-                        Err(status) => {
+                        Err(e) => {
                             eprintln!(
                                 "warning: daemon context RPC failed ({}); falling back to direct DB read",
-                                status.message()
+                                e
                             );
                         }
                     }
@@ -9686,6 +11078,7 @@ fn run_brain(
                 &aliases,
                 Some(&db_path),
                 parsed_intent,
+                None,
                 None,
             ) {
                 Ok(mut result) => {
@@ -9888,6 +11281,9 @@ fn run_brain(
                             response_config.inline_body_threshold,
                             response_config.inline_max_body_tokens,
                             token_budget,
+                            // Local CLI reads from the working tree; no bare-clone
+                            // resolver, so bodies come from the FilesystemReader.
+                            None,
                         );
                     }
 
@@ -9940,7 +11336,7 @@ fn run_brain(
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -10030,7 +11426,7 @@ fn run_brain(
                     args["allowlist"] = serde_json::json!(allow);
                 }
                 args["limit"] = serde_json::json!(limit);
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
@@ -10100,7 +11496,7 @@ fn run_brain(
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -10179,7 +11575,7 @@ fn run_brain(
                 if let Some(ref t) = tag {
                     args["tag"] = serde_json::json!(t);
                 }
-                if let Some(value) = try_daemon_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
@@ -10285,7 +11681,7 @@ fn run_brain(
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
 
-            if let Some(value) = try_daemon_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -10694,6 +12090,86 @@ fn render_brain_search_response(
     Ok(())
 }
 
+/// Render a brain search response from a JSON `Value` (hybrid path).
+///
+/// The JSON shape matches the proto `BrainSearchResponse` serialized by
+/// `dispatch_typed_brain_search` in the hybrid client.
+fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
+    let results = result
+        .get("results")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let query = result.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let engine = result
+        .get("engine")
+        .and_then(|v| v.as_str())
+        .unwrap_or("bm25");
+    let expansion_terms: Vec<String> = result
+        .get("expansion_terms")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if results.is_empty() {
+        println!("No results for '{}'.", query);
+        return Ok(());
+    }
+
+    let header = if engine == "bm25" {
+        "Brain search (BM25)"
+    } else {
+        "Brain search (substring fallback)"
+    };
+    // Include provenance scope if present (hybrid/local/server).
+    let scope = result
+        .get("_meta")
+        .and_then(|m| m.get("scope"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("local");
+    println!("{}: {} result(s) [{}]", header, results.len(), scope);
+    if !expansion_terms.is_empty() {
+        println!("  PRF expansion terms: {}", expansion_terms.join(", "));
+    }
+    println!();
+    for item in &results {
+        let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let location = item.get("location").and_then(|v| v.as_str());
+        let matched_headings: Vec<&str> = item
+            .get("matched_headings")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        if kind == "note" {
+            if matched_headings.is_empty() {
+                println!("  [{:.2}] {}", score, title);
+            } else {
+                println!(
+                    "  [{:.2}] {} (matched: {})",
+                    score,
+                    title,
+                    matched_headings.join(", "),
+                );
+            }
+        } else {
+            let kind_short = kind.strip_prefix("Symbol/").unwrap_or(kind);
+            if let Some(loc) = location {
+                println!("  [{:.2}] {} [{}] @ {}", score, title, kind_short, loc);
+            } else {
+                println!("  [{:.2}] {} [{}]", score, title, kind_short);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Render the daemon's `project_context` JSON response (shape produced by
 /// `tool_project_context` in nestweaver-mcp). When `json` is true, emit the
 /// response verbatim; otherwise print a project header followed by the
@@ -10734,8 +12210,11 @@ fn render_project_context_daemon_response(
         let title = n.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let kind = n.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let location = n.get("location").and_then(|v| v.as_str()).unwrap_or("");
-        let rel = n.get("relevance").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        println!("  [{rel:.4}] {kind}  {title}  @{location}");
+        // concise responses omit `relevance` — don't print a fake [0.0000] for them.
+        match n.get("relevance").and_then(|v| v.as_f64()) {
+            Some(rel) => println!("  [{rel:.4}] {kind}  {title}  @{location}"),
+            None => println!("  {kind}  {title}  @{location}"),
+        }
     }
     println!();
     println!("Tokens used: {used} / budget: {token_budget}");
@@ -10765,6 +12244,7 @@ fn print_brain_context_json(result: &BrainContextResult, limit: usize) -> anyhow
 /// `project`, `project_uid`, `seeds_expanded`, `connected`, `tokens_used`,
 /// `token_budget`, and optional `unresolved_seeds` / `external_refs`. Agents
 /// depend on these fields, so the local and daemon paths must stay aligned.
+#[allow(clippy::too_many_arguments)]
 fn print_project_context_json(
     project: &nestweaver_schema::Project,
     result: &BrainContextResult,
@@ -10772,12 +12252,31 @@ fn print_project_context_json(
     tokens_used: usize,
     token_budget: usize,
     external_refs: &serde_json::Value,
+    concise: bool,
 ) -> anyhow::Result<()> {
+    // Match the daemon/MCP `project_context` node shape EXACTLY (tools.rs render_node): concise
+    // = {kind,title,location}; detailed adds uid + relevance. Without this the --no-daemon path
+    // emitted full nodes regardless of response_format, diverging from the daemon path.
+    let render = |n: &nestweaver_engine::BrainNode| -> serde_json::Value {
+        if concise {
+            serde_json::json!({ "kind": n.kind, "title": n.title, "location": n.location })
+        } else {
+            serde_json::json!({
+                "uid": n.uid,
+                "kind": n.kind,
+                "title": n.title,
+                "location": n.location,
+                "relevance": n.relevance,
+            })
+        }
+    };
+    let connected: Vec<serde_json::Value> =
+        result.connected.iter().take(limit).map(render).collect();
     let mut resp = serde_json::json!({
         "project": project.name,
         "project_uid": project.uid,
         "seeds_expanded": result.seeds.len(),
-        "connected": result.connected.iter().take(limit).collect::<Vec<_>>(),
+        "connected": connected,
         "tokens_used": tokens_used,
         "token_budget": token_budget,
     });
@@ -10818,8 +12317,12 @@ fn run_embed(
     let path = db.unwrap_or(&default);
 
     // ── Try the daemon path first (Metal-accelerated) ───────────
-    // Only use daemon for local-model embedding (no --endpoint, no --local).
-    if endpoint.is_none() && !local {
+    // Only use daemon for local-model embedding (no --endpoint, no --local) AND
+    // when the daemon is enabled. Under --no-daemon / NESTWEAVER_NO_DAEMON=1 we must
+    // NOT touch the daemon: connecting auto-starts one, whose held DB lock then
+    // breaks the direct fallback with a confusing "could not set lock" error (and
+    // leaks the daemon). Skip straight to the in-process path instead.
+    if use_daemon && endpoint.is_none() && !local {
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
@@ -11196,6 +12699,23 @@ fn run_embed(
         eprintln!("Warning: failed to save embedding sidecar: {e}");
     }
 
+    // Record which embedding model produced these vectors, so the daemon loads a matching
+    // model at startup regardless of the compiled default or the instance config (see
+    // run_server). This is what lets the shipped default stay light for most users while a
+    // given DB transparently uses whatever model it was embedded with.
+    if let Some(dim) = store.embedding_index_dimension() {
+        let effective_model = if endpoint.is_some() {
+            model.unwrap_or(model_id)
+        } else {
+            model_id
+        };
+        if !effective_model.is_empty()
+            && let Err(e) = store.set_embedding_metadata(effective_model, dim as u32)
+        {
+            eprintln!("Warning: failed to record embedding model metadata: {e}");
+        }
+    }
+
     if stats {
         let elapsed = t0.elapsed();
         eprintln!(
@@ -11240,6 +12760,63 @@ fn resolve_contract_repo_filter(
     anyhow::bail!("no indexed repo matches --repo '{filter}'")
 }
 
+/// Human rendering of the daemon `cross_repo_contracts` result (used by
+/// `contracts list` without `--json`), so the daemon path honors the `--json`
+/// flag instead of always dumping raw JSON like the direct-store path's table.
+fn render_cross_repo_contracts_human(value: &serde_json::Value) {
+    match value.get("contracts").and_then(|v| v.as_array()) {
+        Some(rows) if !rows.is_empty() => {
+            let total = value
+                .get("total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(rows.len() as u64);
+            println!(
+                "Cross-repo contract links ({total} total). NOTE: links are \
+                 hypotheses, not ground truth — see confidence.\n"
+            );
+            for r in rows {
+                let sn = r.get("source_name").and_then(|v| v.as_str()).unwrap_or("?");
+                let tn = r.get("target_name").and_then(|v| v.as_str()).unwrap_or("?");
+                let lt = r.get("link_type").and_then(|v| v.as_str()).unwrap_or("");
+                let conf = r.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                println!("  {sn} -> {tn}  [{lt}, confidence {conf:.2}]");
+            }
+        }
+        _ => println!("No cross-repo contract links found."),
+    }
+}
+
+/// Human rendering of the daemon `contract_drift` result (`contracts drift`
+/// without `--json`).
+fn render_contract_drift_human(value: &serde_json::Value) {
+    let dni = value
+        .get("declared_not_implemented")
+        .and_then(|v| v.as_array());
+    let ind = value
+        .get("implemented_not_declared")
+        .and_then(|v| v.as_array());
+    let empty = |a: Option<&Vec<serde_json::Value>>| a.map(|v| v.is_empty()).unwrap_or(true);
+    if empty(dni) && empty(ind) {
+        println!("No contract drift detected.");
+        return;
+    }
+    println!("Contract drift (hypotheses, not ground truth):\n");
+    for (label, arr) in [
+        ("Declared but NOT implemented", dni),
+        ("Implemented but NOT declared in any spec", ind),
+    ] {
+        if let Some(arr) = arr.filter(|a| !a.is_empty()) {
+            println!("{label} ({}):", arr.len());
+            for f in arr {
+                if let Some(uid) = f.get("uid").and_then(|v| v.as_str()) {
+                    println!("  - {uid}");
+                }
+            }
+            println!();
+        }
+    }
+}
+
 fn run_contracts(
     command: ContractCommands,
     use_daemon: bool,
@@ -11254,9 +12831,13 @@ fn run_contracts(
                     args["repo"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "cross_repo_contracts", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "cross_repo_contracts", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        render_cross_repo_contracts_human(&value);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -11308,9 +12889,13 @@ fn run_contracts(
                     args["repo"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_daemon_json_rpc(true, &db_path, None, "contract_drift", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "contract_drift", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        render_contract_drift_human(&value);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -11347,6 +12932,52 @@ fn run_contracts(
                 }
             }
             Ok((EXIT_SUCCESS, None))
+        }
+        ContractCommands::Diff {
+            base,
+            head,
+            json,
+            fail_on_breaking,
+        } => {
+            let base_src = std::fs::read_to_string(&base)
+                .with_context(|| format!("read base spec {}", base.display()))?;
+            let head_src = std::fs::read_to_string(&head)
+                .with_context(|| format!("read head spec {}", head.display()))?;
+            let changes = nestweaver_engine::contracts::diff_openapi(
+                &base.to_string_lossy(),
+                &base_src,
+                &head.to_string_lossy(),
+                &head_src,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!("both files must be parseable OpenAPI specs (yaml/json)")
+            })?;
+            let breaking = changes
+                .iter()
+                .filter(|c| {
+                    c.severity == nestweaver_engine::contracts::SpecChangeSeverity::Breaking
+                })
+                .count();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&changes)?);
+            } else if changes.is_empty() {
+                println!("No API changes detected.");
+            } else {
+                for c in &changes {
+                    let sev = match c.severity {
+                        nestweaver_engine::contracts::SpecChangeSeverity::Breaking => "BREAKING",
+                        nestweaver_engine::contracts::SpecChangeSeverity::Info => "INFO",
+                    };
+                    println!("  [{sev}] {} {} — {}", c.verb, c.path, c.detail);
+                }
+                println!("\n{breaking} breaking, {} info", changes.len() - breaking);
+            }
+            let exit = if fail_on_breaking && breaking > 0 {
+                EXIT_ERROR
+            } else {
+                EXIT_SUCCESS
+            };
+            Ok((exit, None))
         }
     }
 }
@@ -11478,7 +13109,559 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
     }
 }
 
-fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i32> {
+fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
+    match command {
+        BackupCommands::Save {
+            output,
+            db,
+            config,
+            include_clones,
+            // `--force` is obsolete: the daemon now backs up under its own write
+            // lock (there is no client-side quiesce that can fail).
+            force: _,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            if !db_path.exists() {
+                anyhow::bail!(
+                    "database not found at {}; run 'nestweaver index' first",
+                    db_path.display()
+                );
+            }
+            let db_path = std::fs::canonicalize(&db_path).unwrap_or(db_path);
+
+            let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path);
+
+            let workspace_path = if include_clones {
+                db_path.parent().map(|p| p.join("workspace"))
+            } else {
+                None
+            };
+
+            let config = nestweaver_engine::BackupConfig {
+                db_path: db_path.clone(),
+                output_path: output,
+                include_clones,
+                instance_id: instance_id.clone(),
+                workspace_path,
+            };
+
+            let rt = tokio::runtime::Runtime::new()?;
+            #[cfg(target_os = "macos")]
+            let launchd_running = nestweaver_daemon::launchd::is_running(&instance_id);
+            #[cfg(not(target_os = "macos"))]
+            let launchd_running = false;
+            let existing_daemon =
+                rt.block_on(nestweaver_client::DaemonClient::connect_existing(&db_path));
+            let daemon_running = launchd_running || existing_daemon.is_ok();
+
+            if daemon_running {
+                // The daemon owns the files and performs the whole backup
+                // in-process (holding its own write lock), so a single RPC does
+                // it — no client-side quiesce/copy, and it works even when the
+                // client does not share the daemon's filesystem.
+                eprintln!("Backing up via the running daemon...");
+                let mut client = existing_daemon
+                    .map_err(|e| anyhow::anyhow!("failed to connect to daemon: {e}"))?;
+                let resp = rt
+                    .block_on(async {
+                        client
+                            .inner_mut()
+                            .backup(nestweaver_proto::BackupRequest {
+                                output_path: config.output_path.to_string_lossy().into_owned(),
+                                include_clones,
+                            })
+                            .await
+                    })
+                    .map_err(|e| anyhow::anyhow!("Backup RPC failed: {e}"))?
+                    .into_inner();
+
+                eprintln!("Backup saved to {}", resp.output_path);
+                eprintln!("  Instance:     {}", resp.instance_id);
+                eprintln!("  Tier:         {}", resp.tier);
+                eprintln!("  Version:      {}", resp.nestweaver_version);
+                eprintln!("  Repos:        {}", resp.repo_count);
+                eprintln!("  Symbols:      {}", resp.symbol_count);
+                eprintln!("  DB size:      {}", format_bytes(resp.db_size_bytes));
+                eprintln!("  Compressed:   {}", format_bytes(resp.total_compressed));
+                return Ok(EXIT_SUCCESS);
+            }
+
+            eprintln!("Creating backup...");
+            let result = nestweaver_engine::backup_save(&config)?;
+            let m = &result.manifest;
+
+            eprintln!("Backup saved to {}", result.output_path.display());
+            eprintln!("  Instance:     {}", m.instance_id);
+            eprintln!("  Tier:         {}", m.tier);
+            eprintln!("  Version:      {}", m.nestweaver_version);
+            eprintln!("  Created:      {}", m.created_at);
+            eprintln!("  DB size:      {}", format_bytes(m.sizes.db));
+            eprintln!(
+                "  Uncompressed: {}",
+                format_bytes(m.sizes.total_uncompressed)
+            );
+            eprintln!(
+                "  Write pause:  {}ms",
+                result.write_pause_duration.as_millis()
+            );
+            eprintln!("  Total time:   {}", format_elapsed(result.duration));
+            Ok(EXIT_SUCCESS)
+        }
+        BackupCommands::Inspect { path } => {
+            let manifest = nestweaver_engine::backup_inspect(&path)?;
+            println!("NestWeaver Snapshot -- {}", path.display());
+            println!("  Instance:     {}", manifest.instance_id);
+            println!("  Created:      {}", manifest.created_at);
+            println!(
+                "  Version:      {} (schema v{})",
+                manifest.nestweaver_version, manifest.schema_version
+            );
+            println!(
+                "  Tier:         {}{}",
+                manifest.tier,
+                if manifest.tier == "standard" {
+                    " (no git clones)"
+                } else {
+                    ""
+                }
+            );
+            println!("  Repos:        {}", manifest.repo_count);
+            println!("  Symbols:      {}", manifest.symbol_count);
+            println!(
+                "  Uncompressed: {}",
+                format_bytes(manifest.sizes.total_uncompressed)
+            );
+            println!(
+                "  Compressed:   {}",
+                format_bytes(manifest.sizes.total_compressed)
+            );
+            println!("  Checksums:    {} file(s)", manifest.checksums.len());
+            Ok(EXIT_SUCCESS)
+        }
+        BackupCommands::List { dir } => {
+            let items = nestweaver_engine::backup_list(&dir)?;
+            if items.is_empty() {
+                println!("No snapshots found in {}", dir.display());
+                return Ok(EXIT_SUCCESS);
+            }
+            println!("Available snapshots in {}:", dir.display());
+            for (path, m) in &items {
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                println!(
+                    "  {}  {}  {}  {} repos  v{}  {}",
+                    m.created_at,
+                    m.tier,
+                    format_bytes(m.sizes.total_compressed),
+                    m.repo_count,
+                    m.nestweaver_version,
+                    filename,
+                );
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        BackupCommands::Restore {
+            path,
+            data_dir,
+            start,
+        } => {
+            eprintln!("Restoring backup from {}...", path.display());
+
+            // Refuse if a daemon is live on the target: restore renames the live
+            // dir aside and deletes it, so a running daemon would keep writing to
+            // unlinked inodes and the restored state would silently diverge.
+            ensure_no_live_daemon_for_restore(&data_dir)?;
+
+            let config = nestweaver_engine::RestoreConfig {
+                snapshot_path: path,
+                data_dir: data_dir.clone(),
+            };
+
+            let result = nestweaver_engine::backup_restore(&config)?;
+            let m = &result.manifest;
+
+            eprintln!("Backup restored to {}", data_dir.display());
+            eprintln!("  Instance:     {}", m.instance_id);
+            eprintln!("  Version:      {}", m.nestweaver_version);
+            eprintln!("  Tier:         {}", m.tier);
+            eprintln!("  Repos:        {}", m.repo_count);
+            eprintln!("  Symbols:      {}", m.symbol_count);
+            eprintln!("  Restored in:  {}", format_elapsed(result.duration));
+
+            if m.tier == "standard" {
+                eprintln!();
+                eprintln!(
+                    "Standard-tier restore: git clones not included. \
+                     Start the daemon to re-clone repos in the background."
+                );
+            }
+
+            if start {
+                eprintln!();
+                eprintln!("Starting daemon with restored data...");
+                let lbug = find_lbug_in_dir(&data_dir);
+                if let Some(db) = lbug {
+                    eprintln!("  Database: {}", db.display());
+                    let exe =
+                        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nestweaver"));
+                    let db_str = db.display().to_string();
+                    match std::process::Command::new(&exe)
+                        .args(["daemon", "run", "--db", &db_str])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        Ok(mut child) => {
+                            // spawn() returns as soon as the fork succeeds — before
+                            // the daemon initializes or binds. Give it a moment, then
+                            // confirm it did not immediately exit (port/socket
+                            // conflict, unreadable db, ...) before claiming success.
+                            std::thread::sleep(std::time::Duration::from_millis(700));
+                            match child.try_wait() {
+                                Ok(Some(status)) => {
+                                    eprintln!(
+                                        "  Daemon exited immediately ({status}) — it is NOT running."
+                                    );
+                                    eprintln!(
+                                        "  Run manually to see the error: nestweaver daemon run --db {}",
+                                        db.display()
+                                    );
+                                }
+                                Ok(None) => {
+                                    eprintln!("  Daemon started (pid {})", child.id());
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "  Daemon spawned (pid {}) but its status could not be \
+                                         confirmed: {e}",
+                                        child.id()
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  Failed to start daemon: {e}");
+                            eprintln!(
+                                "  Run manually: nestweaver daemon run --db {}",
+                                db.display()
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "  No .lbug file found in {}; launch manually.",
+                        data_dir.display()
+                    );
+                }
+            }
+
+            Ok(EXIT_SUCCESS)
+        }
+    }
+}
+
+/// Find the first .lbug file in a directory (non-recursive).
+fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|entry| {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("lbug") && p.is_file() {
+                Some(p)
+            } else {
+                None
+            }
+        })
+}
+
+/// Refuse a restore while a live daemon serves the target data directory.
+///
+/// Restore renames the live data dir aside and `remove_dir_all`s it. If a
+/// daemon is actively serving that dir, it keeps writing to now-unlinked inodes
+/// and the restored state silently diverges. Mirror the snapshot-build quiesce
+/// guard (commit 9a1e6fa): derive the instance from the target's `.lbug`, probe
+/// the pidfile for a live daemon, and refuse if one holds it.
+///
+/// Because restore is *destructive*, this **fails closed** — unlike the
+/// non-destructive snapshot-build guard, an unreadable/garbage pidfile refuses
+/// rather than permits. The precondition is "the daemon is provably stopped";
+/// anything we cannot confirm is treated as still-running:
+/// - no `.lbug` in `data_dir` (fresh target, nothing to serve) → **permit**
+/// - pidfile absent → **permit**
+/// - pidfile parses to a live pid → **refuse**
+/// - pidfile parses to a dead/stale pid → **permit**
+/// - pidfile present but unreadable / unparseable → **refuse**
+fn ensure_no_live_daemon_for_restore(data_dir: &Path) -> anyhow::Result<()> {
+    let Some(db) = find_lbug_in_dir(data_dir) else {
+        return Ok(());
+    };
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+
+    match std::fs::read_to_string(&pidfile) {
+        // No pidfile → nothing claims this data dir → permit.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Present but unreadable → cannot confirm the daemon is stopped, and
+        // restore is destructive → fail closed.
+        Err(e) => anyhow::bail!(
+            "a pidfile exists at {} but could not be read to confirm the daemon is stopped \
+             ({e}) — refusing a destructive restore. Stop the daemon (`nestweaver daemon stop` \
+             / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+            pidfile.display(),
+        ),
+        Ok(contents) => match contents.trim().parse::<i32>() {
+            // Present but garbage (non-numeric) → cannot confirm → fail closed.
+            Err(_) => anyhow::bail!(
+                "a pidfile exists at {} but could not be parsed to confirm the daemon is \
+                 stopped — refusing a destructive restore. Stop the daemon (`nestweaver daemon \
+                 stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+                pidfile.display(),
+            ),
+            // Live pid → daemon is running → refuse.
+            Ok(pid) if nestweaver_client::autostart::is_process_alive(pid) => anyhow::bail!(
+                "a daemon (pid {pid}) is running on the target data directory {} — restoring \
+                 would rename its live files aside and delete them while it keeps writing to the \
+                 unlinked inodes, silently diverging the restored state. Stop it with `nestweaver \
+                 daemon stop` (or `nestweaver server stop`) and retry.",
+                data_dir.display(),
+            ),
+            // Dead/stale pid → daemon is gone → permit.
+            Ok(_) => Ok(()),
+        },
+    }
+}
+
+/// Quiesce guard for `snapshot build`. A snapshot is a raw copy of the graph
+/// file; if a daemon is actively writing this DB the copy can be torn — and a
+/// torn copy still passes verify/load — so refuse unless the DB is quiesced.
+///
+/// The guarded instance id is derived from the **DB path**, never from a
+/// `--instance` flag: `snapshot build --instance <other>` would otherwise check
+/// the wrong pidfile, miss the daemon actually writing this DB, and capture a
+/// torn hot-copy. Fail CLOSED on a present-but-unreadable/garbage pidfile — we
+/// cannot confirm the daemon is stopped, so refuse rather than risk a torn
+/// snapshot. Mirrors [`ensure_no_live_daemon_for_restore`].
+fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()> {
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+
+    match std::fs::read_to_string(&pidfile) {
+        // No pidfile → nothing claims this DB → quiesced.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Present but unreadable → cannot confirm the daemon is stopped → fail closed.
+        Err(e) => anyhow::bail!(
+            "a pidfile exists at {} but could not be read to confirm the daemon is stopped \
+             ({e}) — refusing to build a possibly-torn snapshot. Stop the daemon (`nestweaver \
+             daemon stop` / `nestweaver server stop`) or remove the stale pidfile, then retry.",
+            pidfile.display(),
+        ),
+        Ok(contents) => match contents.trim().parse::<i32>() {
+            // Present but garbage (non-numeric) → cannot confirm → fail closed.
+            Err(_) => anyhow::bail!(
+                "a pidfile exists at {} but could not be parsed to confirm the daemon is \
+                 stopped — refusing to build a possibly-torn snapshot. Stop the daemon \
+                 (`nestweaver daemon stop` / `nestweaver server stop`) or remove the stale \
+                 pidfile, then retry.",
+                pidfile.display(),
+            ),
+            // Live pid → daemon is writing this DB → refuse.
+            Ok(pid) if nestweaver_client::autostart::is_process_alive(pid) => anyhow::bail!(
+                "a daemon (pid {pid}) is running on this database {} — a raw snapshot could \
+                 capture a torn, inconsistent copy. Stop it with `nestweaver daemon stop` and \
+                 retry, or use `nestweaver server backup` for a consistent in-process snapshot.",
+                db_path.display(),
+            ),
+            // Dead/stale pid → daemon is gone → quiesced.
+            Ok(_) => Ok(()),
+        },
+    }
+}
+
+/// Run the MCP stdio server using HybridClient for query routing.
+///
+/// Read-only queries are dispatched through `HybridClient::query()` which
+/// applies fallback/merge/primary routing across upstream servers. Write
+/// operations (brain_add_source, brain_remove_source, prune_stale) go
+/// through the standard gRPC path.
+fn run_mcp_hybrid(
+    mut hybrid: nestweaver_client::hybrid::HybridClient,
+    rt: tokio::runtime::Runtime,
+    lite: bool,
+    track_interactions: bool,
+    _db_path: &Path,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+
+    nestweaver_mcp::tools::set_lite_mode(lite);
+
+    // Start the background maintenance task (active upstream health recovery +
+    // off-hot-path staleness refresh). Tied to `hybrid`'s lifetime: it is
+    // cancelled when `hybrid` drops at the end of this function. Must run
+    // inside the runtime context, hence `enter()`.
+    {
+        let _guard = rt.enter();
+        hybrid.start_maintenance();
+    }
+
+    // Interaction tracking uses the MCP crate's private record_interaction
+    // helper. In hybrid mode, the HybridClient dispatches queries itself so
+    // we skip interaction tracking here. Standard MCP tools/call still tracks
+    // via the daemon proxy path.
+    let _ = track_interactions;
+
+    tracing::info!("brain MCP server ready on stdio (hybrid routing mode)");
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    let mut line = String::new();
+    let mut reader = stdin.lock();
+
+    // Write tools that must bypass hybrid routing.
+    let write_tools: std::collections::HashSet<&str> =
+        ["brain_add_source", "brain_remove_source", "prune_stale"]
+            .into_iter()
+            .collect();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            tracing::info!("client closed stdin; shutting down (hybrid)");
+            return Ok(());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32700, "message": format!("invalid JSON: {e}") }
+                });
+                serde_json::to_writer(&mut stdout, &resp)?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+
+        let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+        let response = match method {
+            "initialize" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "nestweaver-brain",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                }
+            }),
+            "notifications/initialized" | "initialized" => continue,
+            "tools/list" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": nestweaver_mcp::tools::tool_list(lite),
+            }),
+            "tools/call" => {
+                let params = parsed
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+                if name.is_empty() {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32602, "message": "tools/call: 'name' is required" }
+                    })
+                } else if write_tools.contains(name) {
+                    // Write operations go through standard gRPC dispatch.
+                    let grpc = hybrid.inner_mut();
+                    match nestweaver_mcp::tools::dispatch_via_daemon(
+                        grpc,
+                        &rt,
+                        name,
+                        arguments.clone(),
+                    ) {
+                        Ok(result) => {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": nestweaver_mcp::tools::wrap_tool_result(result),
+                            })
+                        }
+                        Err(e) => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
+                        }),
+                    }
+                } else {
+                    // Read queries go through HybridClient for routing.
+                    match rt.block_on(hybrid.query(name, &arguments)) {
+                        Ok(result) => {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": nestweaver_mcp::tools::wrap_tool_result(result),
+                            })
+                        }
+                        Err(e) => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
+                        }),
+                    }
+                }
+            }
+            "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            _ => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("method not implemented: {method}") }
+            }),
+        };
+
+        serde_json::to_writer(&mut stdout, &response)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+    }
+}
+
+/// Format a byte count as a human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+// `snapshot build` never routes through a daemon: it guards for a quiesced DB
+// and reads the store directly (autospawning a RW daemon would trip that
+// guard). `verify`/`push` operate on snapshot artifacts, not the live DB.
+fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<i32> {
     match command {
         SnapshotCommands::Build {
             instance,
@@ -11496,6 +13679,13 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 );
             }
 
+            // Quiesce guard FIRST — before touching the store — and derived from
+            // the DB path (not `--instance`) so a mismatched `--instance` can't
+            // bypass detection of a live daemon and yield a torn hot-copy. A
+            // consistent snapshot while the daemon runs is `nestweaver server
+            // backup` (copies under the daemon's write lock).
+            ensure_no_live_daemon_for_snapshot_build(&db_path)?;
+
             // Load instance config if provided
             let cfg = load_instance_config_opt(config.as_deref());
 
@@ -11505,14 +13695,18 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path)
             });
 
-            // Fetch repos via daemon RPC (preferred) or direct store open (fallback).
+            // Fetch repos by reading the store directly. The quiesce guard above
+            // guarantees no daemon is writing this DB, so a raw read is safe —
+            // and we must NOT autospawn a RW daemon here (that would itself trip
+            // the quiesce guard on retry). Passing `false` skips the daemon and
+            // takes the read-only store path.
             let repos: Vec<nestweaver_schema::Repo> = {
                 let mut args = serde_json::json!({});
                 args["instance"] = serde_json::json!(&instance_id);
                 if let Some(value) =
-                    try_daemon_json_rpc(use_daemon, &db_path, config.as_deref(), "list_repos", args)
+                    try_hybrid_json_rpc(false, &db_path, config.as_deref(), "list_repos", args)
                 {
-                    serde_json::from_value(value)
+                    serde_json::from_value(unwrap_hybrid_payload(value))
                         .context("failed to deserialize repos from daemon response")?
                 } else {
                     // No daemon: read directly from the store. The CLI `index` command
@@ -11527,8 +13721,8 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
             // Fetch embedding dimension via daemon RPC (preferred) or direct store (fallback).
             let embedding_dim: u32 = {
                 let args = serde_json::json!({});
-                if let Some(value) = try_daemon_json_rpc(
-                    use_daemon,
+                if let Some(value) = try_hybrid_json_rpc(
+                    false,
                     &db_path,
                     config.as_deref(),
                     "embedding_dimension",
@@ -11542,32 +13736,10 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
                 }
             };
 
-            // Schema hashes
-            let core_hash = nestweaver_schema::core_schema_hash();
-            let ext_hash = match cfg.as_ref().and_then(|c| c.schema_extensions.as_ref()) {
-                Some(ext) => {
-                    // Build a deterministic string from the extensions
-                    let mut parts: Vec<String> = Vec::new();
-                    if let Some(ref props) = ext.extra_node_properties {
-                        let mut labels: Vec<&String> = props.keys().collect();
-                        labels.sort();
-                        for label in labels {
-                            let inner = &props[label];
-                            let mut keys: Vec<&String> = inner.keys().collect();
-                            keys.sort();
-                            for key in keys {
-                                parts.push(format!("{label}.{key}={}", inner[key]));
-                            }
-                        }
-                    }
-                    let joined = parts.join("\n");
-                    use sha2::Digest;
-                    let hash = sha2::Sha256::digest(joined.as_bytes());
-                    hex::encode(hash)
-                }
-                None => "none".to_string(),
-            };
-            let effective_hash = nestweaver_schema::effective_schema_hash(&core_hash, &ext_hash);
+            // Schema hashes — shared with the replica compat gate (see
+            // nestweaver_engine::schema_hashes) so build and load agree exactly.
+            let (core_hash, ext_hash, effective_hash) =
+                nestweaver_engine::schema_hashes(cfg.as_ref());
 
             // Embedding info — use [embedding].model_id (local sentence-transformer),
             // not [inference].embedding_model (remote Ollama model name).
@@ -11738,5 +13910,636 @@ fn run_snapshot(command: SnapshotCommands, use_daemon: bool) -> anyhow::Result<i
             );
             Ok(EXIT_SUCCESS)
         }
+    }
+}
+
+/// Convert an engine `AtomicChange` to a proto `AtomicChangeProto` for the gRPC client.
+fn atomic_change_to_proto(
+    change: &nestweaver_engine::atomic_changes::AtomicChange,
+) -> nestweaver_proto::AtomicChangeProto {
+    use nestweaver_engine::atomic_changes::AtomicChange;
+    use nestweaver_proto::{AtomicChangeProto, ChangeKind};
+
+    match change {
+        AtomicChange::SymbolAdded {
+            name,
+            kind,
+            signature,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SymbolAdded.into(),
+            canonical_id: String::new(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: Some(signature.clone()),
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: format!("{:?}", kind),
+        },
+        AtomicChange::SymbolRemoved {
+            canonical_id,
+            name,
+            kind,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SymbolRemoved.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: format!("{:?}", kind),
+        },
+        AtomicChange::SignatureChanged {
+            canonical_id,
+            name,
+            old_signature,
+            new_signature,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SignatureChanged.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: Some(old_signature.clone()),
+            new_signature: Some(new_signature.clone()),
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: String::new(),
+        },
+        AtomicChange::SymbolRenamed {
+            old_canonical_id,
+            old_name,
+            new_name,
+            new_canonical_id: _,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SymbolRenamed.into(),
+            canonical_id: old_canonical_id.clone(),
+            name: new_name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: Some(old_name.clone()),
+            new_name: Some(new_name.clone()),
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: String::new(),
+        },
+        AtomicChange::SymbolMoved {
+            canonical_id,
+            name,
+            old_file,
+            new_file,
+        } => AtomicChangeProto {
+            kind: ChangeKind::SymbolMoved.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: None,
+            new_name: None,
+            old_file: Some(old_file.clone()),
+            new_file: Some(new_file.clone()),
+            file_path: new_file.clone(),
+            symbol_kind: String::new(),
+        },
+        AtomicChange::ExportAdded {
+            canonical_id,
+            name,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::ExportAdded.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: String::new(),
+        },
+        AtomicChange::ExportRemoved {
+            canonical_id,
+            name,
+            file_path,
+        } => AtomicChangeProto {
+            kind: ChangeKind::ExportRemoved.into(),
+            canonical_id: canonical_id.clone(),
+            name: name.clone(),
+            old_signature: None,
+            new_signature: None,
+            old_name: None,
+            new_name: None,
+            old_file: None,
+            new_file: None,
+            file_path: file_path.clone(),
+            symbol_kind: String::new(),
+        },
+    }
+}
+
+/// Convert a proto `ImpactItem` to an engine `ImpactResult` for the CLI output path.
+fn impact_item_to_result(
+    item: nestweaver_proto::ImpactItem,
+) -> nestweaver_engine::atomic_changes::ImpactResult {
+    use nestweaver_engine::atomic_changes::{ImpactResult, ImpactSeverity};
+    use nestweaver_proto::{ChangeKind, Severity};
+
+    let severity = match Severity::try_from(item.severity).unwrap_or(Severity::Info) {
+        Severity::Breaking => ImpactSeverity::Breaking,
+        Severity::Warning => ImpactSeverity::Warning,
+        Severity::Info => ImpactSeverity::Info,
+    };
+
+    let change_kind =
+        match ChangeKind::try_from(item.change_kind).unwrap_or(ChangeKind::Unspecified) {
+            ChangeKind::SymbolAdded => "SYMBOL_ADDED",
+            ChangeKind::SymbolRemoved => "SYMBOL_REMOVED",
+            ChangeKind::SignatureChanged => "SIGNATURE_CHANGED",
+            ChangeKind::SymbolRenamed => "SYMBOL_RENAMED",
+            ChangeKind::SymbolMoved => "SYMBOL_MOVED",
+            ChangeKind::ExportAdded => "EXPORT_ADDED",
+            ChangeKind::ExportRemoved => "EXPORT_REMOVED",
+            ChangeKind::Unspecified => "UNSPECIFIED",
+        };
+
+    ImpactResult {
+        change_canonical_id: item.change_canonical_id,
+        change_kind: change_kind.to_string(),
+        affected_canonical_id: item.affected_canonical_id,
+        affected_name: item.affected_name,
+        affected_repo_url: item.affected_repo_url,
+        affected_file: item.affected_file,
+        affected_line: item.affected_line as u32,
+        affected_signature: item.affected_signature,
+        severity,
+        reason: item.reason,
+    }
+}
+
+#[cfg(test)]
+mod abs_for_daemon_tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_becomes_absolute_never_bare_relative() {
+        // The daemon runs with CWD=/ (launchd), so a relative path in an RPC would resolve
+        // against the wrong directory. abs_for_daemon must ALWAYS return an absolute path —
+        // even for a nonexistent path (canonicalize fails) it must join cwd, never echo the
+        // original relative path back.
+        let rel = std::path::Path::new("some/relative/does-not-exist-xyz");
+        let out = abs_for_daemon(rel);
+        assert!(
+            out.is_absolute(),
+            "abs_for_daemon must never return a relative path, got {}",
+            out.display()
+        );
+        assert!(out.ends_with("some/relative/does-not-exist-xyz"));
+
+        // An existing path canonicalizes to an absolute path.
+        let dir = std::env::temp_dir();
+        let out = abs_for_daemon(&dir);
+        assert!(out.is_absolute());
+    }
+}
+
+/// Serializes tests that mutate the process-global `XDG_RUNTIME_DIR`. The
+/// `restore_guard_tests` and `snapshot_build_guard_tests` modules both set it
+/// via their `RuntimeDirGuard`, so without a shared lock they race under
+/// parallel test execution (the flake that intermittently reddened the suite).
+/// Poison-tolerant so a panicking holder can't wedge the rest.
+#[cfg(test)]
+static XDG_RUNTIME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod restore_guard_tests {
+    use super::*;
+
+    /// Sets `XDG_RUNTIME_DIR` for the lifetime of the guard and restores the
+    /// prior value (or unsets it) on drop — even if an assert panics — so a
+    /// failing test never leaks a dangling var to sibling tests in this binary.
+    /// Holds [`XDG_RUNTIME_ENV_LOCK`] so guard-holding tests across all modules
+    /// serialize on the shared env var; the lock releases only after the Drop
+    /// restores the var (fields drop after the Drop impl runs).
+    struct RuntimeDirGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RuntimeDirGuard {
+        fn set(path: &Path) -> Self {
+            let _lock = crate::XDG_RUNTIME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("XDG_RUNTIME_DIR");
+            // SAFETY: the shared lock guarantees no sibling test mutates
+            // XDG_RUNTIME_DIR concurrently; restored on drop.
+            unsafe {
+                std::env::set_var("XDG_RUNTIME_DIR", path);
+            }
+            Self { prev, _lock }
+        }
+    }
+
+    impl Drop for RuntimeDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with the set_var in `set`.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+            }
+        }
+    }
+
+    /// A target data dir with a db + sidecar, as a live daemon would serve, plus
+    /// the pidfile path derived from the db for the isolated runtime dir.
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db = data_dir.path().join("graph.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let sidecar = data_dir.path().join("graph.lbug.filemeta.json");
+        std::fs::write(&sidecar, b"{}").unwrap();
+
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+        let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+        std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+        let db_path = db;
+        (data_dir, db_path, sidecar, pidfile)
+    }
+
+    /// A restore against a data dir that a live daemon is serving must be
+    /// refused before any filesystem mutation, so the live dir is never renamed
+    /// aside or deleted out from under the running daemon.
+    #[test]
+    fn backup_restore_refuses_live_daemon() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+
+        let (data_dir, _db, sidecar, pidfile) = fixture();
+
+        // Simulate a live daemon: pidfile holds THIS process's pid (alive).
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let err = ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect_err("restore must refuse while a daemon is live on the target");
+        assert!(err.to_string().contains("daemon"), "err was: {err}");
+
+        // The guard must not have touched the live data dir.
+        assert!(data_dir.path().join("graph.lbug").exists(), "db untouched");
+        assert!(sidecar.exists(), "sidecar must be untouched after refusal");
+        assert!(
+            !data_dir.path().with_extension("restoring").exists(),
+            "no .restoring rename must have happened"
+        );
+
+        // A dead pid (no such process) must not block a restore.
+        std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect("a stale/dead pidfile must not block restore");
+
+        // No pidfile at all → permitted.
+        std::fs::remove_file(&pidfile).unwrap();
+        ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect("restore permitted when no daemon is live");
+    }
+
+    /// Restore is destructive, so a present-but-unreadable pidfile must fail
+    /// CLOSED: we cannot confirm the daemon is stopped, so refuse rather than
+    /// delete a possibly-live daemon's data.
+    #[test]
+    fn restore_refuses_on_unreadable_pidfile() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+
+        let (data_dir, _db, sidecar, pidfile) = fixture();
+
+        // Garbage, non-numeric pidfile → cannot parse a pid → fail closed.
+        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
+        let err = ensure_no_live_daemon_for_restore(data_dir.path())
+            .expect_err("restore must refuse when the pidfile cannot be parsed");
+        assert!(err.to_string().contains("pidfile"), "err was: {err}");
+
+        // The live data dir must be untouched.
+        assert!(data_dir.path().join("graph.lbug").exists(), "db untouched");
+        assert!(sidecar.exists(), "sidecar untouched");
+        assert!(!data_dir.path().with_extension("restoring").exists());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_build_guard_tests {
+    use super::*;
+
+    /// Sets `XDG_RUNTIME_DIR` for the lifetime of the guard and restores it on
+    /// drop so a failing test never leaks the var to sibling tests. Holds
+    /// [`XDG_RUNTIME_ENV_LOCK`] so it serializes with the other guard module.
+    struct RuntimeDirGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RuntimeDirGuard {
+        fn set(path: &Path) -> Self {
+            let _lock = crate::XDG_RUNTIME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("XDG_RUNTIME_DIR");
+            // SAFETY: the shared lock guarantees no sibling test mutates
+            // XDG_RUNTIME_DIR concurrently; restored on drop.
+            unsafe {
+                std::env::set_var("XDG_RUNTIME_DIR", path);
+            }
+            Self { prev, _lock }
+        }
+    }
+
+    impl Drop for RuntimeDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with the set_var in `set`.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+            }
+        }
+    }
+
+    /// A db file plus the pidfile path derived from it (in the isolated runtime dir).
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db = data_dir.path().join("graph.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+        let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+        std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+        (data_dir, db, pidfile)
+    }
+
+    /// The guard is keyed on the DB path, so a live daemon on that DB is refused
+    /// regardless of any `--instance` a caller might pass — the `--instance`
+    /// bypass is structurally impossible because the helper never sees it. A
+    /// dead/absent pidfile permits the build.
+    #[test]
+    fn snapshot_build_refuses_live_daemon_by_db_path() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (_data_dir, db, pidfile) = fixture();
+
+        // Live daemon: pidfile holds THIS process's pid (alive) → refuse.
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let err = ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect_err("build must refuse while a daemon is live on the DB");
+        assert!(err.to_string().contains("daemon"), "err was: {err}");
+
+        // Dead/stale pid → permitted.
+        std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("a stale/dead pidfile must not block a build");
+
+        // No pidfile at all → permitted.
+        std::fs::remove_file(&pidfile).unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("build permitted when no daemon is live");
+    }
+
+    /// A present-but-garbage pidfile must FAIL CLOSED: we can't confirm the
+    /// daemon is stopped, so refuse rather than capture a torn snapshot. (The
+    /// prior guard used `read_pid`, which returns None on garbage and would have
+    /// permitted the build — a torn-copy hole this closes.)
+    #[test]
+    fn snapshot_build_fails_closed_on_unparseable_pidfile() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (_data_dir, db, pidfile) = fixture();
+
+        std::fs::write(&pidfile, b"not-a-pid\n").unwrap();
+        let err = ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect_err("build must refuse when the pidfile cannot be parsed");
+        assert!(err.to_string().contains("pidfile"), "err was: {err}");
+    }
+}
+
+#[cfg(test)]
+mod hybrid_cli_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_search_candidates_reads_wrapped_results() {
+        let value = serde_json::json!({
+            "results": [
+                {
+                    "uid": "sym:1",
+                    "name": "processPayment",
+                    "kind": "Function",
+                    "file_path": "src/payments.rs",
+                    "start_line": 42
+                }
+            ],
+            "_meta": {
+                "sources": ["server"],
+                "stale_repos": [],
+                "scope": "server"
+            }
+        });
+
+        let candidates = hybrid_search_candidates_from_value(value);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "processPayment");
+    }
+
+    #[test]
+    fn unwrap_hybrid_payload_unwraps_results_envelope_for_list_consumers() {
+        // list-repos / list-services / detect-implicit-projects deserialize the
+        // result into a Vec, so they must strip the {results, _meta} envelope the
+        // hybrid path adds — otherwise they silently print "No ... found" against
+        // a fully populated daemon.
+        let wrapped = serde_json::json!({
+            "results": ["alpha", "beta"],
+            "_meta": { "sources": ["server"], "stale_repos": [] }
+        });
+        let items: Vec<String> =
+            serde_json::from_value(unwrap_hybrid_payload(wrapped)).unwrap_or_default();
+        assert_eq!(items, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // A bare array (local-daemon response) passes through unchanged.
+        let bare = serde_json::json!(["x"]);
+        let items: Vec<String> =
+            serde_json::from_value(unwrap_hybrid_payload(bare)).unwrap_or_default();
+        assert_eq!(items, vec!["x".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod server_status_tests {
+    use super::*;
+
+    /// A full `AdminStatus` payload (matching the admin endpoint shape) should
+    /// deserialize into our mirror struct and render a concise summary.
+    #[test]
+    fn formats_concise_summary() {
+        let json = serde_json::json!({
+            "instance_id": "my-brain",
+            "uptime_seconds": 1234,
+            "server_mode": true,
+            "repo_count": 7,
+            "active_reads": 2,
+            "active_writes": 1,
+            "queue_depth": 3,
+            "drained": false,
+            "version": "0.9.0",
+            "repos": { "total": 7, "indexed": 7, "stale": 0, "dead_letter": 0 },
+            "symbols": { "total": 4096 },
+            "queue": { "pending": 3, "running": 1, "dead_letter": 0 }
+        });
+        let status: ServerStatusResponse = serde_json::from_value(json).unwrap();
+        let out = format_server_status("http://127.0.0.1:9379", &status);
+
+        assert!(out.contains("Connected to http://127.0.0.1:9379"));
+        assert!(out.contains("Instance:      my-brain"));
+        assert!(out.contains("Version:       0.9.0"));
+        assert!(out.contains("Mode:          server"));
+        assert!(out.contains("Repos indexed: 7"));
+        assert!(out.contains("Symbols:       4096"));
+        assert!(out.contains("Queue depth:   3"));
+        // queue_depth > 0 → indexing is active
+        assert!(out.contains("Indexing:      active"));
+        assert!(out.contains("Active reads:  2"));
+        assert!(out.contains("Active writes: 1"));
+    }
+
+    /// With an empty queue and no active writes, indexing reads as idle.
+    #[test]
+    fn indexing_idle_when_queue_empty_and_no_writes() {
+        let json = serde_json::json!({
+            "instance_id": "i",
+            "uptime_seconds": 0,
+            "server_mode": true,
+            "repo_count": 1,
+            "active_reads": 0,
+            "active_writes": 0,
+            "queue_depth": 0,
+            "drained": true,
+            "version": "1.0.0",
+            "repos": { "total": 1, "indexed": 1, "stale": 0, "dead_letter": 0 },
+            "symbols": { "total": 10 },
+            "queue": { "pending": 0, "running": 0, "dead_letter": 0 }
+        });
+        let status: ServerStatusResponse = serde_json::from_value(json).unwrap();
+        let out = format_server_status("http://x", &status);
+
+        assert!(out.contains("Indexing:      idle"));
+        assert!(out.contains("Mode:          server (drained)"));
+    }
+
+    /// Contract guard: serialize the *real* `nestweaver_web` `AdminStatus` (the
+    /// server's wire shape) and deserialize it into the CLI's mirror struct. If
+    /// a future rename/removal on the server side drops a field the CLI reads,
+    /// this round-trip fails — catching drift the hand-built JSON tests above
+    /// can't, because they encode the CLI's own expectations rather than the
+    /// server's actual type.
+    #[test]
+    fn admin_status_round_trips_into_cli_mirror() {
+        use nestweaver_web::routes::admin::{
+            AdminStatus, Connections, QueueStats, RepoStats, SymbolStats,
+        };
+
+        let server = AdminStatus {
+            instance_id: "my-brain".to_string(),
+            uptime_seconds: 4321,
+            server_mode: true,
+            repo_count: 9,
+            active_reads: 5,
+            active_writes: 2,
+            queue_depth: 4,
+            drained: false,
+            version: "1.2.3".to_string(),
+            repos: RepoStats {
+                total: 9,
+                indexed: 8,
+                stale: 1,
+                dead_letter: 0,
+            },
+            db_size_bytes: 0,
+            symbols: SymbolStats { total: 8192 },
+            queue: QueueStats {
+                pending: 4,
+                running: 2,
+                dead_letter: 0,
+            },
+            connections: Connections { grpc: 7, mcp: 3 },
+        };
+
+        // Serialize the server's struct, then deserialize into the CLI mirror.
+        let wire = serde_json::to_value(&server).expect("serialize AdminStatus");
+        let mirror: ServerStatusResponse = serde_json::from_value(wire)
+            .expect("AdminStatus wire shape must deserialize into ServerStatusResponse");
+
+        // Every field the CLI reads must survive the round-trip unchanged.
+        assert_eq!(mirror.instance_id, "my-brain");
+        assert_eq!(mirror.version, "1.2.3");
+        assert!(mirror.server_mode);
+        assert_eq!(mirror.repo_count, 9);
+        assert_eq!(mirror.active_reads, 5);
+        assert_eq!(mirror.active_writes, 2);
+        assert_eq!(mirror.queue_depth, 4);
+        assert!(!mirror.drained);
+        assert_eq!(mirror.symbols.total, 8192);
+    }
+}
+
+#[cfg(test)]
+mod stop_grace_tests {
+    use super::*;
+
+    /// An explicit `NESTWEAVER_STOP_GRACE_SECS` always wins, regardless of the
+    /// drain ceiling — operators keep a hard override.
+    #[test]
+    fn explicit_override_wins() {
+        assert_eq!(resolve_stop_grace_secs(Some("15"), Some("660")), 15);
+        assert_eq!(resolve_stop_grace_secs(Some("900"), None), 900);
+    }
+
+    /// With no override, the grace is derived from the drain ceiling plus a
+    /// buffer — NOT the old fixed 60s that a legitimate large index blows past
+    /// (the T6.2 SIGKILL-mid-write bug).
+    #[test]
+    fn defaults_track_drain_ceiling() {
+        // Unset both: default ceiling (660) + buffer (30).
+        assert_eq!(
+            resolve_stop_grace_secs(None, None),
+            DEFAULT_DRAIN_CEILING_SECS + STOP_GRACE_BUFFER_SECS
+        );
+        // Ceiling raised via env: grace follows it so they can't drift.
+        assert_eq!(
+            resolve_stop_grace_secs(None, Some("1200")),
+            1200 + STOP_GRACE_BUFFER_SECS
+        );
+        // Guard the actual regression: default grace must exceed the old 60s.
+        assert!(resolve_stop_grace_secs(None, None) > 60);
+    }
+
+    /// Garbage env values fall back to the derived default rather than
+    /// panicking or collapsing to an unsafe tiny grace.
+    #[test]
+    fn garbage_env_falls_back() {
+        assert_eq!(
+            resolve_stop_grace_secs(Some("notanumber"), Some("also-bad")),
+            DEFAULT_DRAIN_CEILING_SECS + STOP_GRACE_BUFFER_SECS
+        );
     }
 }

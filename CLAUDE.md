@@ -43,7 +43,7 @@ open target/release/NestWeaver.app
 # Or download NestWeaver.app from GitHub Releases
 ```
 
-The web UI runs on port 9377 (not 3000). The app is menubar-only (no Dock icon).
+The web UI defaults to port 3000 (`nestweaver ui`); the macOS .app uses 9377. The app is menubar-only (no Dock icon).
 
 When helping users install on macOS, recommend the `.app` bundle first. Fall back to `nestweaver daemon start` only for headless/CI environments.
 
@@ -64,7 +64,7 @@ nestweaver context src/main.js           # seed from all symbols in a file
 nestweaver search "greet"
 nestweaver symbol "greet" --json
 nestweaver impact "greet" --depth 3
-nestweaver impact "fetchRegions" --repo acme  # filter impact to a specific repo
+nestweaver impact "fetchRegions" --repo my-service  # filter impact to a specific repo
 nestweaver repo-map --token-budget 2000
 nestweaver summary --level symbol        # hierarchical code summaries (symbol/file/cluster)
 
@@ -128,7 +128,7 @@ nestweaver mcp --track-interactions --db ./nestweaver.lbug    # enable usage tra
 nestweaver interactions status --db ./nestweaver.lbug          # show memory stats
 nestweaver interactions clear --db ./nestweaver.lbug           # wipe interaction data
 
-# MCP server (38 tools, or 6 in lite mode for Cursor)
+# MCP server (40 tools, or 6 in lite mode for Cursor)
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
@@ -142,8 +142,13 @@ nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlis
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080
 nestweaver ui --watch                    # live re-indexing via filesystem watcher
-# Append ?engine=wasm to run graph algorithms client-side via WASM
-# Requires: wasm-pack build crates/nestweaver-wasm --target web --out-dir ../../crates/nestweaver-web/frontend/src/wasm
+# Append ?engine=wasm to run graph algorithms client-side via WASM.
+# Build with --remap-path-prefix so the build machine's home path (and the
+# username in .cargo/registry panic-location strings) is NOT baked into the
+# committed .wasm artifact:
+#   RUSTFLAGS="--remap-path-prefix=$HOME=/build" \
+#     wasm-pack build crates/nestweaver-wasm --target web \
+#       --out-dir ../../crates/nestweaver-web/frontend/src/wasm
 
 # Web API endpoints (when ui is running)
 # GET  /api/v1/version          → {"graph_generation": N, "pagerank_generation": N}
@@ -172,7 +177,7 @@ Sidecar files written alongside the database:
 
 ## Architecture
 
-Cargo workspace with 13 crates + root binary:
+Cargo workspace with 15 crates + root binary:
 
 ```
 nestweaver/                     # CLI entry point (src/main.rs)
@@ -184,7 +189,9 @@ crates/
   nestweaver-storage/           # pluggable snapshot storage backends (local, S3, GitLab)
   nestweaver-engine/            # indexing pipeline, query dispatch, config, registry, snapshots, LLM pipelines
   nestweaver-algorithms/        # pure-compute graph algorithms (PPR, impact BFS) — WASM-compatible
+  nestweaver-embed/             # local embedding models (candle; Metal GPU on macOS) for vector search
   nestweaver-proto/             # gRPC protobuf definitions and generated Rust types
+  nestweaver-federation/        # federation coordinator: upstream routing, health/ejection, two-tier merge, staleness (leaf; used by client + daemon-mode mcp)
   nestweaver-daemon/            # background daemon process for persistent graph serving
   nestweaver-client/            # gRPC client for daemon communication
   nestweaver-mcp/               # optional MCP wrapper (feature-gated, delegates to engine)
@@ -212,8 +219,11 @@ algorithms          (zero internal deps — WASM target)
   <- wasm
 storage             (zero internal deps)
        <- engine <- (parser, resolver, store, storage, algorithms)
-            <- mcp
+            <- mcp   <- (federation, under the `daemon` feature)
             <- web
+federation          (leaf: schema + proto only)
+  <- client
+  <- mcp (daemon feature) <- daemon
 ```
 
 ## Conventions

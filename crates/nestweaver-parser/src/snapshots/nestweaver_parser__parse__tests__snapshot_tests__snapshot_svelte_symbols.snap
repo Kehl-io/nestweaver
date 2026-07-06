@@ -13,6 +13,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: greet
   kind: Function
   start_line: 5
@@ -24,6 +25,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: count
   kind: Function
   start_line: 9
@@ -35,6 +37,7 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   visibility: Public
   type_info: ~
   parent_name: ~
+  scope_chain: ~
 - name: handleClick
   kind: Function
   start_line: 11
@@ -46,3 +49,4 @@ expression: "parsed_symbols(\"simple.svelte\", &source)"
   visibility: Private
   type_info: ~
   parent_name: ~
+  scope_chain: ~

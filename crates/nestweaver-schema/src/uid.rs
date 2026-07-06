@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
 
+use crate::repo_url::normalized_repo_key;
+
 /// Returns the first 6 bytes (12 hex chars) of the SHA-256 hash of the input.
 pub fn truncated_hash(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -9,9 +11,19 @@ pub fn truncated_hash(input: &str) -> String {
 }
 
 /// "repo:{instance}:{url_hash}"
+///
+/// The URL is collapsed to a scheme/credential/suffix/case-invariant identity
+/// key via [`normalized_repo_key`] BEFORE hashing, so equivalent clone-URL
+/// forms of the same repo (ssh vs https, `.git` suffix, trailing slash,
+/// embedded credentials, host/path casing) mint the same `url_hash`. This lets
+/// a repo indexed by a LOCAL daemon (ssh remote) and a SERVER (https URL)
+/// reconcile at the root during merged-result dedup.
+///
+/// ⚠ Changing `normalized_repo_key` (or this derivation) changes every stored
+/// hash — requires a full reindex.
 pub fn repo_uid(instance: &str, url: &str) -> String {
-    let normalized = url.trim_end_matches('/');
-    format!("repo:{}:{}", instance, truncated_hash(normalized))
+    let normalized = normalized_repo_key(url);
+    format!("repo:{}:{}", instance, truncated_hash(&normalized))
 }
 
 /// "file:{repo_uid}:{path_hash}"
@@ -70,6 +82,43 @@ pub fn tag_uid(vault_uid: &str, name: &str) -> String {
 /// "proj:{instance}:{name_hash}"
 pub fn project_uid(instance: &str, name: &str) -> String {
     format!("proj:{}:{}", instance, truncated_hash(name))
+}
+
+/// Compute a canonical symbol ID that is instance-independent.
+///
+/// Format: `<repo_url_hash>:<file_path>#<name>:<scope_hash>`
+///
+/// The scope_hash is derived from the scope chain (module::class::method),
+/// NOT from the line number. This makes the ID stable across edits that
+/// shift line numbers without changing the symbol's logical position.
+///
+/// When the scope chain is empty (top-level symbols), the hash falls back to
+/// the symbol name alone — never the line number — so that inserting blank
+/// lines above a symbol does not change its identity. This stability is relied
+/// on by cross-boundary flow-trace stitching and atomic-change matching.
+///
+/// The `repo_url` is collapsed via [`normalized_repo_key`] before hashing so
+/// equivalent URL forms mint the same `repo_hash`. ⚠ Changing that
+/// normalization changes every stored canonical_id — requires a full reindex.
+pub fn canonical_symbol_id(
+    repo_url: &str,
+    file_path: &str,
+    name: &str,
+    scope_chain: &str,
+) -> String {
+    let repo_hash = truncated_hash(&normalized_repo_key(repo_url));
+    let scope_hash = scope_hash(scope_chain, name);
+    format!("{}:{}#{}:{}", repo_hash, file_path, name, scope_hash)
+}
+
+/// Hash the scope chain for a symbol, falling back to the name when no
+/// scope chain is available.
+pub fn scope_hash(scope_chain: &str, name: &str) -> String {
+    if scope_chain.is_empty() {
+        truncated_hash(name)
+    } else {
+        truncated_hash(scope_chain)
+    }
 }
 
 /// Canonical placeholder substituted for every path parameter slot when
@@ -166,6 +215,56 @@ mod tests {
         let a = truncated_hash("input one");
         let b = truncated_hash("input two");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn repo_uid_reconciles_equivalent_url_forms() {
+        // The SAME repo indexed under different clone-URL forms must mint the
+        // same url_hash (and thus the same repo_uid, modulo instance) so that
+        // local (ssh) and server (https) results dedup at the root. Before
+        // mint-time normalization, only a trailing slash was stripped, so these
+        // forms hashed differently and never reconciled.
+        let canonical = repo_uid("prod", "https://github.com/acme/api");
+        for form in [
+            "https://github.com/acme/api",
+            "https://github.com/acme/api.git",
+            "https://github.com/acme/api/",
+            "https://GitHub.com/Acme/API",
+            "https://user:token@github.com/acme/api",
+            "git@github.com:acme/api.git",
+            "git@github.com:acme/api",
+            "ssh://git@github.com/acme/api",
+            "https://github.com/acme/api?ref=main",
+        ] {
+            assert_eq!(
+                repo_uid("prod", form),
+                canonical,
+                "URL form `{form}` must mint the same repo_uid as the canonical https form"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_uid_reconciles_across_instances_modulo_instance() {
+        // Same repo, two instances, two URL forms: the url_hash suffix must
+        // match so instance-stripping dedup collapses them.
+        let local = repo_uid("local", "git@github.com:acme/api.git");
+        let server = repo_uid("server", "https://github.com/acme/api");
+        let local_hash = local.rsplit(':').next().unwrap();
+        let server_hash = server.rsplit(':').next().unwrap();
+        assert_eq!(
+            local_hash, server_hash,
+            "url_hash must match across equivalent forms; {local} vs {server}"
+        );
+    }
+
+    #[test]
+    fn canonical_id_reconciles_equivalent_url_forms() {
+        // canonical_symbol_id's repo_hash must also normalize so cross-boundary
+        // flow-trace/impact stitching reconciles ssh vs https forms.
+        let a = canonical_symbol_id("git@github.com:acme/api.git", "src/lib.rs", "foo", "foo");
+        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "foo", "foo");
+        assert_eq!(a, b, "equivalent URL forms must mint the same canonical_id");
     }
 
     #[test]
@@ -273,5 +372,98 @@ mod tests {
     fn contract_uid_graphql_scheme() {
         let uid = contract_uid("graphql", None, None, Some("Mutation.createApproval"));
         assert_eq!(uid, "contract:graphql:Mutation.createApproval");
+    }
+
+    #[test]
+    fn canonical_id_deterministic() {
+        let a = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/billing/webhook.rs",
+            "processPayment",
+            "billing::PaymentService::processPayment",
+        );
+        let b = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/billing/webhook.rs",
+            "processPayment",
+            "billing::PaymentService::processPayment",
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonical_id_same_across_trailing_slash() {
+        let a = canonical_symbol_id("https://github.com/acme/api/", "src/lib.rs", "foo", "foo");
+        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "foo", "foo");
+        assert_eq!(a, b, "trailing slash should not change canonical_id");
+    }
+
+    #[test]
+    fn canonical_id_different_for_different_scopes() {
+        let a = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "process",
+            "ModA::ClassA::process",
+        );
+        let b = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/lib.rs",
+            "process",
+            "ModB::ClassB::process",
+        );
+        assert_ne!(a, b, "different scopes should produce different IDs");
+    }
+
+    #[test]
+    fn canonical_id_format() {
+        let id = canonical_symbol_id(
+            "https://github.com/acme/api",
+            "src/billing/webhook.rs",
+            "processPayment",
+            "billing::PaymentService::processPayment",
+        );
+        assert!(id.contains("src/billing/webhook.rs"));
+        assert!(id.contains("#processPayment:"));
+        let repo_hash = id.split(':').next().unwrap();
+        assert_eq!(repo_hash.len(), 12);
+    }
+
+    #[test]
+    fn canonical_id_empty_scope_falls_back_to_name() {
+        let a = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "main", "");
+        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "main", "");
+        assert_eq!(a, b, "empty scope chain should still be deterministic");
+        // The scope hash should be the hash of the bare name — never the line.
+        assert!(a.ends_with(&format!(":{}", truncated_hash("main"))));
+    }
+
+    #[test]
+    fn canonical_id_empty_scope_stable_across_line_shifts() {
+        // Adding blank lines above a top-level symbol shifts its start line but
+        // must NOT change its canonical ID — the ID is a logical identity, not a
+        // position. This is the core stability guarantee the PRD depends on for
+        // cross-boundary flow-trace stitching and atomic-change matching.
+        // Both calls represent the same logical symbol after a line shift; the
+        // line number is no longer part of the signature, so identity is stable.
+        let a = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "helper", "");
+        let b = canonical_symbol_id("https://github.com/acme/api", "src/lib.rs", "helper", "");
+        assert_eq!(
+            a, b,
+            "line shifts must not change the canonical_id of a top-level symbol"
+        );
+    }
+
+    #[test]
+    fn scope_hash_empty_falls_back_to_name() {
+        let h = scope_hash("", "main");
+        assert_eq!(h, truncated_hash("main"));
+    }
+
+    #[test]
+    fn scope_hash_non_empty_uses_chain() {
+        let h = scope_hash("Foo::bar", "bar");
+        assert_eq!(h, truncated_hash("Foo::bar"));
+        assert_ne!(h, truncated_hash("bar"));
     }
 }
