@@ -19,8 +19,14 @@ import type { ShortcutsSlice } from "./shortcutsSlice";
 import { createShortcutsSlice } from "./shortcutsSlice";
 import type { NotificationSlice } from "./notificationSlice";
 import { createNotificationSlice } from "./notificationSlice";
+import type { SceneSlice } from "./sceneSlice";
+import { createSceneSlice } from "./sceneSlice";
+import type { WorkspaceSlice } from "./workspaceSlice";
+import { createWorkspaceSlice } from "./workspaceSlice";
 
 export type StoreState = GraphSlice &
+  WorkspaceSlice &
+  SceneSlice &
   PanelSlice &
   SearchSlice &
   AnalysisSlice &
@@ -35,6 +41,8 @@ export const useStore = create<StoreState>()(
     persist(
       immer((...a) => ({
         ...createGraphSlice(...a),
+        ...createWorkspaceSlice(...a),
+        ...createSceneSlice(...a),
         ...createPanelSlice(...a),
         ...createSearchSlice(...a),
         ...createAnalysisSlice(...a),
@@ -46,7 +54,7 @@ export const useStore = create<StoreState>()(
       })),
       {
         name: "nestweaver-ui",
-        version: 4,
+        version: 5,
         migrate: (persistedState: any, version: number) => {
           if (persistedState && typeof persistedState === "object") {
             const state = { ...persistedState };
@@ -56,6 +64,12 @@ export const useStore = create<StoreState>()(
             }
             if (version < 4) {
               state.reducedEffectsUserSet = typeof state.reducedEffects === "boolean";
+            }
+            if (version < 5) {
+              delete state.scopeRepoUid;
+              delete state.scopeVaultUid;
+              state.activeWorkspaceId = state.activeWorkspaceId ?? "all";
+              state.representationMode = state.representationMode ?? state.viewMode ?? "graph";
             }
             return state;
           }
@@ -74,6 +88,9 @@ export const useStore = create<StoreState>()(
           minimapVisible: state.minimapVisible,
           reducedEffects: state.reducedEffects,
           reducedEffectsUserSet: state.reducedEffectsUserSet,
+          activeWorkspaceId: state.activeWorkspaceId,
+          representationMode: state.representationMode,
+          viewMode: state.viewMode,
         }),
       },
     ),

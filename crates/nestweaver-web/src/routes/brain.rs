@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::ApiError;
+use crate::routes::workspaces::{self, P1Provenance, WorkspaceKind};
 use crate::state::AppState;
 
 fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
@@ -187,6 +188,8 @@ pub async fn unlinked_mentions(
 pub struct BrainSearchParams {
     pub q: Option<String>,
     pub limit: Option<usize>,
+    pub workspace: Option<String>,
+    pub scope: Option<String>,
 }
 
 pub async fn brain_search(
@@ -198,6 +201,25 @@ pub async fn brain_search(
         return Err(ApiError::bad_request("query parameter 'q' is required"));
     }
     let limit = params.limit.unwrap_or(20);
+    let workspace_param =
+        workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref());
+    if let Some(workspace_param) = workspace_param {
+        let workspace = workspaces::resolve_workspace(&state.store, Some(workspace_param))?;
+        let (results, provenance, result_state, unsupported) =
+            scoped_brain_search(&state, &workspace, &q, limit)?;
+        let meta = workspaces::p1_meta(
+            &workspace,
+            result_state,
+            unsupported,
+            vec![provenance],
+            Some(limit),
+        );
+        return Ok(Json(json!({
+            "results": results,
+            "_meta": meta,
+        }))
+        .into_response());
+    }
 
     // Use tantivy if available, otherwise fall back to lookup_notes_by_title
     if let Some(tantivy) = &state.tantivy {
@@ -215,4 +237,66 @@ pub async fn brain_search(
     let notes = state.store.lookup_notes_by_title(&q)?;
     let json = serde_json::to_value(&notes)?;
     Ok(Json(json).into_response())
+}
+
+fn scoped_brain_search(
+    state: &Arc<AppState>,
+    workspace: &workspaces::ResolvedWorkspace,
+    q: &str,
+    limit: usize,
+) -> Result<
+    (
+        Vec<serde_json::Value>,
+        P1Provenance,
+        &'static str,
+        Vec<&'static str>,
+    ),
+    ApiError,
+> {
+    if workspace.kind == WorkspaceKind::Repo {
+        return Ok((
+            Vec::new(),
+            P1Provenance::local_graph_store("repo-scoped brain search unsupported in P1"),
+            "partial",
+            vec!["note-search"],
+        ));
+    }
+
+    if let Some(tantivy) = &state.tantivy {
+        match tantivy.search(q, limit) {
+            Ok(hits) => {
+                let results: Vec<_> = hits
+                    .into_iter()
+                    .filter(|hit| {
+                        workspace.kind == WorkspaceKind::All
+                            || workspace
+                                .uid
+                                .as_deref()
+                                .is_some_and(|vault_uid| hit.vault_uid == vault_uid)
+                    })
+                    .map(|hit| serde_json::to_value(hit).unwrap_or(serde_json::Value::Null))
+                    .collect();
+                return Ok((
+                    results,
+                    P1Provenance::local_tantivy("brain search"),
+                    "complete",
+                    Vec::new(),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "tantivy search failed, falling back to scoped title lookup");
+            }
+        }
+    }
+
+    let results = workspaces::notes_for_query(&state.store, q, workspace, limit)?
+        .into_iter()
+        .map(workspaces::note_search_hit)
+        .collect();
+    Ok((
+        results,
+        P1Provenance::local_graph_store("scoped note search fallback"),
+        "complete",
+        Vec::new(),
+    ))
 }

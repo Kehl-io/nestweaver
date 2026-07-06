@@ -1,9 +1,10 @@
 import type { StateCreator } from "zustand";
+import type { RepresentationMode } from "../api/p1Types";
 import type { GraphMode, ScopeFilter } from "../api/types";
 import type { StoreState } from "./index";
 
 export type DetailFocus = "summary" | "source" | "related" | "analysis";
-export type ViewMode = "graph" | "list" | "matrix";
+export type ViewMode = Exclude<RepresentationMode, "table">;
 
 export interface GraphSlice {
   selectedNodeId: string | null;
@@ -20,8 +21,6 @@ export interface GraphSlice {
   graphMode: GraphMode;
   seeds: string[];
   scopeFilter: ScopeFilter;
-  scopeRepoUid: string | null;
-  scopeVaultUid: string | null;
   communityOverlay: boolean;
   tagsVisible: boolean;
   minimapVisible: boolean;
@@ -49,8 +48,6 @@ export interface GraphSlice {
   setSeeds: (seeds: string[]) => void;
   addSeed: (uid: string) => void;
   setScopeFilter: (filter: ScopeFilter) => void;
-  setScopeRepo: (uid: string | null) => void;
-  setScopeVault: (uid: string | null) => void;
   toggleCommunityOverlay: () => void;
   toggleTags: () => void;
   toggleMinimap: () => void;
@@ -80,23 +77,34 @@ export const createGraphSlice: StateCreator<
   graphMode: "overview",
   seeds: [],
   scopeFilter: "all",
-  scopeRepoUid: null,
-  scopeVaultUid: null,
   communityOverlay: false,
   tagsVisible: true,
   minimapVisible: true,
   nodeTypeFilter: {
-    Function: true, Class: true, Method: true, Interface: true,
-    Trait: true, Enum: true, Module: true, Note: true, Tag: true,
+    Function: true,
+    Class: true,
+    Method: true,
+    Interface: true,
+    Trait: true,
+    Enum: true,
+    Module: true,
+    Note: true,
+    Tag: true,
   },
   edgeTypeFilter: {
-    calls: true, imports: true, extends: true, implements: true, includes: true,
+    calls: true,
+    imports: true,
+    extends: true,
+    implements: true,
+    includes: true,
   },
   forceParams: { repulsion: 2, gravity: 1, settling: 10 },
   layoutMode: "zen" as const,
   activeStyleRules: {
-    colorByDir: false, sizeByCallers: false,
-    highlightEntryPoints: false, highlightHighPageRank: false,
+    colorByDir: false,
+    sizeByCallers: false,
+    highlightEntryPoints: false,
+    highlightHighPageRank: false,
   },
   reducedEffects: false,
   reducedEffectsUserSet: false,
@@ -129,12 +137,16 @@ export const createGraphSlice: StateCreator<
           ? "list"
           : s.viewMode === "list"
             ? "matrix"
-            : "graph";
+            : s.viewMode === "matrix"
+              ? "json"
+              : "graph";
+      s.representationMode = s.viewMode;
     }),
 
   setViewMode: (mode) =>
     set((s) => {
       s.viewMode = mode;
+      s.representationMode = mode;
     }),
 
   setDetailFocus: (focus) =>
@@ -222,16 +234,6 @@ export const createGraphSlice: StateCreator<
       s.scopeFilter = filter;
     }),
 
-  setScopeRepo: (uid) =>
-    set((s) => {
-      s.scopeRepoUid = uid;
-    }),
-
-  setScopeVault: (uid) =>
-    set((s) => {
-      s.scopeVaultUid = uid;
-    }),
-
   toggleCommunityOverlay: () =>
     set((s) => {
       s.communityOverlay = !s.communityOverlay;
@@ -252,6 +254,7 @@ export const createGraphSlice: StateCreator<
     set((s) => {
       s.semanticLayoutRequested = true;
     }),
+
   clearSemanticLayoutRequest: () =>
     set((s) => {
       s.semanticLayoutRequested = false;
@@ -264,7 +267,9 @@ export const createGraphSlice: StateCreator<
 
   setAllNodeTypes: (visible) =>
     set((s) => {
-      Object.keys(s.nodeTypeFilter).forEach((k) => { s.nodeTypeFilter[k] = visible; });
+      Object.keys(s.nodeTypeFilter).forEach((kind) => {
+        s.nodeTypeFilter[kind] = visible;
+      });
     }),
 
   setEdgeTypeFilter: (type, visible) =>
