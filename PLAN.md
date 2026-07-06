@@ -99,7 +99,7 @@ Acceptance criteria:
 
 ### Task 2 - Workspace Switcher, Status Chrome, and Deep Links
 
-Status: in_progress
+Status: review
 
 Owner type: implementation sub-agent
 
