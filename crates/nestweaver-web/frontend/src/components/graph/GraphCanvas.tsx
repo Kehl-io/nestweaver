@@ -32,6 +32,25 @@ function useReducedMotion(): boolean {
   return reduced;
 }
 
+function useSystemPrefersDark(): boolean {
+  const [prefersDark, setPrefersDark] = useState(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e: MediaQueryListEvent) => setPrefersDark(e.matches);
+    setPrefersDark(mq.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  return prefersDark;
+}
+
 // ---- Interaction handler (inside R3F scene) ----
 
 /**
@@ -418,15 +437,12 @@ export function GraphCanvas() {
   const reducedEffectsToggle = useStore((s) => s.reducedEffects);
   const layoutMode = useStore((s) => s.layoutMode);
   const reducedMotion = useReducedMotion() || reducedEffectsToggle;
+  const systemPrefersDark = useSystemPrefersDark();
   const focusMap = layoutMode === "zen";
   const { ref: shellRef, size: canvasSize } = useGraphCanvasSize();
 
   // Determine background color from theme
-  const isDark =
-    theme === "dark" ||
-    (theme === "system" &&
-      typeof window !== "undefined" &&
-      window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const isDark = theme === "dark" || (theme === "system" && systemPrefersDark);
   const bgColor = isDark ? "#080b11" : "#eef3f8";
   const pixelRatio =
     typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
