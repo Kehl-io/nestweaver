@@ -14,6 +14,10 @@ import { useDeepLink } from "./hooks/useDeepLink";
 import { useWasmEngine } from "./hooks/useWasmEngine";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useStore } from "./stores";
+import { ShortcutsOverlay } from "./components/ShortcutsOverlay";
+import { LiveAnnouncer } from "./components/shared/LiveAnnouncer";
+import { ToastViewport } from "./components/shared/ToastViewport";
+import { LlmQueryBar } from "./components/llm/LlmQueryBar";
 
 function ResizeHandle() {
   return (
@@ -119,6 +123,10 @@ function AppContent() {
         </Group>
       )}
       <StatusBar />
+      <LlmQueryBar />
+      <ShortcutsOverlay />
+      <LiveAnnouncer />
+      <ToastViewport />
     </div>
   );
 }

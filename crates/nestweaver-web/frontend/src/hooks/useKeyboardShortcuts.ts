@@ -1,9 +1,10 @@
+import { useEffect } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 import { useNavigationHistory } from "./useNavigationHistory";
 
-const MODES: GraphMode[] = ["context", "impact", "repos", "features"];
+const MODES: GraphMode[] = ["overview", "context", "impact", "repos", "features", "local"];
 
 export function useKeyboardShortcuts() {
   const setMode = useStore((s) => s.setGraphMode);
@@ -14,12 +15,25 @@ export function useKeyboardShortcuts() {
   const toggleTags = useStore((s) => s.toggleTags);
   const selectNode = useStore((s) => s.selectNode);
   const toggleViewMode = useStore((s) => s.toggleViewMode);
+  const toggleShortcuts = useStore((s) => s.toggleShortcuts);
+  const setReducedEffects = useStore((s) => s.setReducedEffects);
   const { undo, redo } = useNavigationHistory();
 
   useHotkeys("1", () => setMode(MODES[0]));
   useHotkeys("2", () => setMode(MODES[1]));
   useHotkeys("3", () => setMode(MODES[2]));
   useHotkeys("4", () => setMode(MODES[3]));
+  useHotkeys("5", () => setMode(MODES[4]));
+  useHotkeys("6", () => setMode(MODES[5]));
+
+  useEffect(() => {
+    const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const syncReducedEffects = () => setReducedEffects(motionQuery.matches);
+
+    syncReducedEffects();
+    motionQuery.addEventListener("change", syncReducedEffects);
+    return () => motionQuery.removeEventListener("change", syncReducedEffects);
+  }, [setReducedEffects]);
 
   useHotkeys("[", () => toggleLeft());
   useHotkeys("]", () => toggleRight());
@@ -73,6 +87,15 @@ export function useKeyboardShortcuts() {
       useStore.getState().openLlmBar();
     },
     { enableOnFormTags: ["INPUT"] },
+  );
+
+  useHotkeys(
+    "shift+/",
+    (e) => {
+      e.preventDefault();
+      toggleShortcuts();
+    },
+    { enableOnFormTags: false },
   );
 
   // mod+l — toggle between graph and list view

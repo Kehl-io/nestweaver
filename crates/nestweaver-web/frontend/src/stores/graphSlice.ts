@@ -31,6 +31,7 @@ export interface GraphSlice {
   layoutMode: "panels" | "zen";
   activeStyleRules: Record<string, boolean>;
   reducedEffects: boolean;
+  setReducedEffects: (reduced: boolean) => void;
   toggleReducedEffects: () => void;
   viewMode: ViewMode;
   detailFocus: DetailFocus;
@@ -99,6 +100,11 @@ export const createGraphSlice: StateCreator<
   viewMode: "graph" as const,
   detailFocus: "summary" as const,
   cameraZoom: 1,
+
+  setReducedEffects: (reduced) =>
+    set((s) => {
+      s.reducedEffects = reduced;
+    }),
 
   toggleReducedEffects: () =>
     set((s) => {
