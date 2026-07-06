@@ -52,6 +52,7 @@ function splitScopedSearchResults(results: ScopedSearchHit[]): {
 export function TopBar() {
   const inputRef = useRef<HTMLInputElement>(null);
   const previousWorkspaceIdRef = useRef<string | null>(null);
+  const searchGenerationRef = useRef(0);
   const [prefersDark, setPrefersDark] = useState(false);
 
   const theme = useStore((s) => s.theme);
@@ -68,28 +69,49 @@ export function TopBar() {
   const exploreNode = useStore((s) => s.exploreNode);
   const setScopeFilter = useStore((s) => s.setScopeFilter);
 
-  const debouncedSearch = useDebouncedCallback(async (q: string) => {
+  function isCurrentSearch(
+    generation: number,
+    q: string,
+    workspaceId: string | null,
+  ) {
+    const state = useStore.getState();
+    return (
+      searchGenerationRef.current === generation &&
+      state.searchQuery === q &&
+      state.activeWorkspaceId === workspaceId
+    );
+  }
+
+  const debouncedSearch = useDebouncedCallback(async (
+    q: string,
+    workspaceId: string | null,
+    generation: number,
+  ) => {
+    if (!isCurrentSearch(generation, q, workspaceId)) return;
     if (!q.trim()) {
       setSearchOpen(false);
       return;
     }
     setSearchLoading(true);
     try {
-      if (activeWorkspaceId === "all") {
+      if (workspaceId === "all") {
         const [symbols, brain] = await Promise.all([
           api.search(q, 10),
           api.brainSearch(q, 5),
         ]);
+        if (!isCurrentSearch(generation, q, workspaceId)) return;
         setSearchResults(symbols, brain);
       } else {
         const scoped = await brainSearchInWorkspace(q, {
-          workspaceId: activeWorkspaceId,
+          workspaceId,
           limit: 15,
         });
+        if (!isCurrentSearch(generation, q, workspaceId)) return;
         const { symbols, brain } = splitScopedSearchResults(scoped.results);
         setSearchResults(symbols.slice(0, 10), brain.slice(0, 5));
       }
     } catch (error) {
+      if (!isCurrentSearch(generation, q, workspaceId)) return;
       useStore.getState().notify({
         kind: "error",
         title: "Search failed",
@@ -97,23 +119,46 @@ export function TopBar() {
       });
       setSearchResults([], []);
     } finally {
-      setSearchLoading(false);
+      if (isCurrentSearch(generation, q, workspaceId)) {
+        setSearchLoading(false);
+      }
     }
   }, 200);
 
   useEffect(() => {
     if (previousWorkspaceIdRef.current === activeWorkspaceId) return;
     previousWorkspaceIdRef.current = activeWorkspaceId;
+    const generation = searchGenerationRef.current + 1;
+    searchGenerationRef.current = generation;
+    setSearchResults([], []);
+    setSearchLoading(false);
     if (!searchQuery.trim()) return;
+    setSearchLoading(true);
     setSearchOpen(true);
-    debouncedSearch(searchQuery);
-  }, [activeWorkspaceId, debouncedSearch, searchQuery, setSearchOpen]);
+    debouncedSearch(searchQuery, activeWorkspaceId, generation);
+  }, [
+    activeWorkspaceId,
+    debouncedSearch,
+    searchQuery,
+    setSearchLoading,
+    setSearchOpen,
+    setSearchResults,
+  ]);
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
     const q = e.target.value;
+    const generation = searchGenerationRef.current + 1;
+    searchGenerationRef.current = generation;
     setSearchQuery(q);
     setSearchOpen(true);
-    debouncedSearch(q);
+    setSearchResults([], []);
+    if (!q.trim()) {
+      setSearchLoading(false);
+      setSearchOpen(false);
+      return;
+    }
+    setSearchLoading(true);
+    debouncedSearch(q, activeWorkspaceId, generation);
   }
 
   function handleSelect(uid: string, kind: string) {
