@@ -1,9 +1,11 @@
 import { isSymbolKind } from "../../api/kinds";
 import type { OverviewLandmark, OverviewResponse } from "../../api/types";
+import type { SceneMetadata } from "../../api/p1Types";
 import { useStore } from "../../stores";
+import { WorkspaceScopeSummary } from "../workspace/WorkspaceScopeSummary";
 
 interface OverviewCommandShelfProps {
-  overview: OverviewResponse | null;
+  overview: (OverviewResponse & { _meta?: SceneMetadata }) | null;
   loading: boolean;
   error: string | null;
   reload: () => void;
@@ -19,7 +21,7 @@ function canExploreLandmark(item: OverviewLandmark | null): boolean {
 }
 
 function findSelectedLandmark(
-  overview: OverviewResponse | null,
+  overview: (OverviewResponse & { _meta?: SceneMetadata }) | null,
   uid: string | null,
 ): OverviewLandmark | null {
   if (!overview || !uid) return null;
@@ -31,7 +33,7 @@ function findSelectedLandmark(
 }
 
 function firstSupportedTarget(
-  overview: OverviewResponse | null,
+  overview: (OverviewResponse & { _meta?: SceneMetadata }) | null,
   predicate: (item: OverviewLandmark | null) => boolean,
 ): OverviewLandmark | null {
   return (
@@ -41,7 +43,9 @@ function firstSupportedTarget(
   );
 }
 
-function isEmptyOverview(overview: OverviewResponse | null): boolean {
+function isEmptyOverview(
+  overview: (OverviewResponse & { _meta?: SceneMetadata }) | null,
+): boolean {
   return (
     overview != null &&
     overview.counts.repo_count === 0 &&
@@ -115,6 +119,9 @@ export function OverviewCommandShelf({
                 ? "Loading overview"
                 : "Overview unavailable"}
           </p>
+          <div className="mt-1">
+            <WorkspaceScopeSummary metadata={overview?._meta} compact />
+          </div>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           <button

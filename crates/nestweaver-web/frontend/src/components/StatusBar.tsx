@@ -4,6 +4,7 @@ import { useStore } from "../stores";
 import { useLiveUpdates } from "../sse/useLiveUpdates";
 import { useWasmEngine } from "../hooks/useWasmEngine";
 import type { BrainStatus, Repo } from "../api/types";
+import { WorkspaceStatusChip } from "./workspace/WorkspaceStatusChip";
 
 export function StatusBar() {
   useLiveUpdates();
@@ -13,6 +14,8 @@ export function StatusBar() {
   const [repos, setRepos] = useState<Repo[]>([]);
   const mode = useStore((s) => s.graphMode);
   const sseConnected = useStore((s) => s.sseConnected);
+  const selectedWorkspace = useStore((s) => s.selectedWorkspace());
+  const sceneMetadata = useStore((s) => s.sceneMetadata);
 
   useEffect(() => {
     api.brainStatus().then(setStatus).catch(() => {});
@@ -20,7 +23,11 @@ export function StatusBar() {
   }, []);
 
   return (
-    <footer data-testid="status-bar" className="flex h-6 shrink-0 items-center gap-4 border-t border-[var(--color-border)] px-4 text-xs text-[var(--color-text-muted)]">
+    <footer data-testid="status-bar" className="flex h-6 shrink-0 items-center gap-3 overflow-hidden border-t border-[var(--color-border)] px-4 text-xs text-[var(--color-text-muted)]">
+      <WorkspaceStatusChip
+        workspace={selectedWorkspace}
+        metadata={sceneMetadata}
+      />
       <span>{repos.length} repo{repos.length !== 1 ? "s" : ""}</span>
       {status && (
         <>

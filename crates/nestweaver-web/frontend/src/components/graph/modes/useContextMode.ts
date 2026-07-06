@@ -3,10 +3,14 @@ import type Graph from "graphology";
 import { useStore } from "../../../stores";
 import { useForceLayout } from "../../../hooks/useForceLayout";
 import { api } from "../../../api/client";
+import type { BrainContextResult } from "../../../api/types";
+import type { SceneMetadata } from "../../../api/p1Types";
+import { workspaceContextBody } from "../../../api/workspaces";
 import { buildGraphFromContext, finalizeNodeSizes } from "../utils/buildGraphFromContext";
 import { preserveGraphLayout } from "../utils/preserveGraphLayout";
 
 const MAX_LAYOUT_MS = 10_000;
+type ScopedBrainContextResult = BrainContextResult & { _meta?: SceneMetadata };
 
 function sameSeeds(left: string[], right: string[]): boolean {
   if (left.length !== right.length) return false;
@@ -21,11 +25,31 @@ function loadErrorMessage(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback;
 }
 
+async function loadScopedBrainContext(
+  seeds: string[],
+  tokenBudget: number,
+  workspaceId: string,
+): Promise<ScopedBrainContextResult> {
+  const response = await fetch("/api/v1/brain/context", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(workspaceContextBody(seeds, tokenBudget, workspaceId)),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(body.error || response.statusText);
+  }
+  return response.json() as Promise<ScopedBrainContextResult>;
+}
+
 export function useContextMode() {
   const setGraphData = useStore((s) => s.setGraphData);
   const notify = useStore((s) => s.notify);
   const seeds = useStore((s) => s.seeds);
   const graphMode = useStore((s) => s.graphMode);
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
+  const setActiveLens = useStore((s) => s.setActiveLens);
+  const setSceneMetadata = useStore((s) => s.setSceneMetadata);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef(0);
   const previousLayoutRef = useRef<{ key: string; graph: Graph } | null>(null);
@@ -40,18 +64,24 @@ export function useContextMode() {
 
     const requestId = ++requestIdRef.current;
     const requestSeeds = [...seeds];
-    const layoutKey = contextLayoutKey(requestSeeds);
+    const requestWorkspaceId = activeWorkspaceId || "all";
+    const layoutKey = `${requestWorkspaceId}:${contextLayoutKey(requestSeeds)}`;
     const isCurrentRequest = () => {
       const state = useStore.getState();
       return (
         requestId === requestIdRef.current &&
         state.graphMode === "context" &&
+        state.activeWorkspaceId === requestWorkspaceId &&
         sameSeeds(state.seeds, requestSeeds)
       );
     };
 
     try {
-      const result = await api.brainContext(requestSeeds, 2000, "all");
+      const result = await loadScopedBrainContext(
+        requestSeeds,
+        2000,
+        requestWorkspaceId,
+      );
       if (!isCurrentRequest()) return;
 
       const graph = buildGraphFromContext(result);
@@ -102,6 +132,13 @@ export function useContextMode() {
       if (!isCurrentRequest()) return;
 
       setGraphData(graph);
+      setActiveLens({
+        lens: "context",
+        label: "Context",
+        targetUid: requestSeeds[0] ?? null,
+        workspaceId: requestWorkspaceId,
+      });
+      setSceneMetadata(result._meta ?? null);
       previousLayoutRef.current = { key: layoutKey, graph };
       start(graph);
       // Stop after MAX_LAYOUT_MS as a safety ceiling
@@ -117,7 +154,17 @@ export function useContextMode() {
         message: loadErrorMessage(err, "Failed to load context graph"),
       });
     }
-  }, [graphMode, notify, seeds, setGraphData, start, stop]);
+  }, [
+    activeWorkspaceId,
+    graphMode,
+    notify,
+    seeds,
+    setActiveLens,
+    setGraphData,
+    setSceneMetadata,
+    start,
+    stop,
+  ]);
 
   // Stop the layout automatically when isRunning goes false (convergence detected)
   useEffect(() => {

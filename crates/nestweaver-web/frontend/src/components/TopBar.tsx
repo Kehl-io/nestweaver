@@ -7,6 +7,7 @@ import { PerspectiveSelector } from "./PerspectiveSelector";
 import { SearchDropdown } from "./SearchDropdown";
 import { ScopeSelect } from "./shared/ScopeSelect";
 import { ThemeMenu } from "./shared/ThemeMenu";
+import { WorkspaceSwitcher } from "./workspace/WorkspaceSwitcher";
 
 function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
@@ -128,6 +129,8 @@ export function TopBar() {
         alt="NestWeaver"
         className="hidden h-8 shrink-0 sm:block"
       />
+
+      <WorkspaceSwitcher />
 
       <div className="relative min-w-0 flex-1 sm:max-w-md">
         <input
