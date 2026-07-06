@@ -1,7 +1,7 @@
 import { ApiError } from "./client";
-import type { SearchHit } from "./types";
 import type {
   ScopedBrainSearchResponse,
+  ScopedSearchHit,
   WorkspaceCatalogResponse,
 } from "./p1Types";
 
@@ -56,11 +56,11 @@ export function loadWorkspaces(): Promise<WorkspaceCatalogResponse> {
 export function brainSearchInWorkspace(
   q: string,
   options: WorkspaceScopedOptions = {},
-): Promise<ScopedBrainSearchResponse<SearchHit>> {
+): Promise<ScopedBrainSearchResponse<ScopedSearchHit>> {
   const params = workspaceQueryParams(options.workspaceId ?? "all");
   params.set("q", q);
   params.set("limit", String(options.limit ?? 20));
-  return request<ScopedBrainSearchResponse<SearchHit>>(
+  return request<ScopedBrainSearchResponse<ScopedSearchHit>>(
     `/api/v1/brain/search?${params.toString()}`,
   );
 }

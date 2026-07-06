@@ -145,3 +145,30 @@ export interface ScopedBrainSearchResponse<T> {
   results: T[];
   _meta: SceneMetadata;
 }
+
+export type ScopedNoteSearchKind =
+  | "Note"
+  | "note"
+  | "heading"
+  | "section"
+  | "tag";
+
+export interface ScopedNoteSearchHit {
+  uid: string;
+  kind: ScopedNoteSearchKind;
+  title: string;
+  vault_uid: string;
+  score: number;
+}
+
+export interface ScopedSymbolSearchHit {
+  uid: string;
+  kind: "Symbol";
+  name: string;
+  title: string;
+  repo_uid: string;
+  file_path: string;
+  score: number;
+}
+
+export type ScopedSearchHit = ScopedNoteSearchHit | ScopedSymbolSearchHit;

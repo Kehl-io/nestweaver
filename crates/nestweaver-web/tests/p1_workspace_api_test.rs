@@ -3,7 +3,7 @@ use axum::http::{Method, Request, StatusCode};
 use nestweaver_schema::{
     EdgeType, Note, NoteKind, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Vault, Visibility,
 };
-use nestweaver_store::{GraphScope, GraphStore};
+use nestweaver_store::{GraphScope, GraphStore, TantivyIndex};
 use nestweaver_web::create_router;
 use nestweaver_web::state::AppState;
 use serde_json::{Value, json};
@@ -192,6 +192,57 @@ fn make_app() -> axum::Router {
     let store = setup_p1_store();
     let state = AppState::new(store, None, std::path::PathBuf::from("/tmp/p1-test.lbug"));
     create_router(state)
+}
+
+fn make_app_with_tantivy_vault_scope_fixture() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let alpha_root = dir.path().join("alpha-vault");
+    let beta_root = dir.path().join("beta-vault");
+    std::fs::create_dir_all(&alpha_root).unwrap();
+    std::fs::create_dir_all(&beta_root).unwrap();
+    std::fs::write(alpha_root.join("Needle Alpha.md"), "needle").unwrap();
+    std::fs::write(beta_root.join("Needle Beta.md"), "needle ".repeat(200)).unwrap();
+
+    let store = GraphStore::in_memory().unwrap();
+    let alpha_vault = Vault {
+        uid: "vlt:alpha".to_string(),
+        name: "Alpha Vault".to_string(),
+        root_path: alpha_root.to_string_lossy().to_string(),
+        instance_id: "local".to_string(),
+    };
+    let beta_vault = Vault {
+        uid: "vlt:beta".to_string(),
+        name: "Beta Vault".to_string(),
+        root_path: beta_root.to_string_lossy().to_string(),
+        instance_id: "local".to_string(),
+    };
+    store.insert_vault(&alpha_vault).unwrap();
+    store.insert_vault(&beta_vault).unwrap();
+    store
+        .insert_note(&note(
+            "note:alpha:needle",
+            &alpha_vault.uid,
+            "Needle Alpha",
+            0.4,
+        ))
+        .unwrap();
+    store
+        .insert_note(&note(
+            "note:beta:needle",
+            &beta_vault.uid,
+            "Needle Beta",
+            0.9,
+        ))
+        .unwrap();
+
+    let tantivy = TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap();
+    tantivy.reindex_from_store(&store).unwrap();
+    let state = AppState::new(
+        store,
+        Some(tantivy),
+        dir.path().join("p1-tantivy-test.lbug"),
+    );
+    (create_router(state), dir)
 }
 
 #[tokio::test]
@@ -466,6 +517,42 @@ async fn p1_workspace_brain_search_vault_scope_filters_results_with_metadata() {
     assert!(
         results.iter().all(|item| item["vault_uid"] == "vlt:brain"),
         "vault-scoped brain search should return only notes from the selected vault"
+    );
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_search_vault_scope_limits_after_scope_with_tantivy_present() {
+    let (app, _dir) = make_app_with_tantivy_vault_scope_fixture();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let vault_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "vlt:alpha")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, json) = get_json(
+        &app,
+        &format!("/api/v1/brain/search?q=Needle&limit=1&workspace={vault_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "vault-scoped");
+    assert_eq!(
+        json["_meta"]["provenance"][0]["source"],
+        "local_graph_store"
+    );
+
+    let results = json["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["uid"], "note:alpha:needle");
+    assert!(
+        results.iter().all(|item| item["vault_uid"] == "vlt:alpha"),
+        "vault-scoped search should apply scope before limit even when Tantivy is present: {results:?}"
     );
 }
 

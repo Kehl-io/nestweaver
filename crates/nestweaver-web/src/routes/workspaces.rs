@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -472,43 +473,90 @@ pub fn symbol_search_hit(symbol: Symbol) -> serde_json::Value {
 fn workspace_entries(store: &GraphStore) -> Result<Vec<WorkspaceEntry>, ApiError> {
     let repos = store.list_repos(None)?;
     let vaults = store.list_vaults(None)?;
+    let services = store.list_services(None)?;
+    let symbols = store.list_all_symbols()?;
+    let notes = store.list_notes_lite(None)?;
+
+    let mut service_counts_by_repo = HashMap::<String, usize>::new();
+    for service in &services {
+        *service_counts_by_repo
+            .entry(service.repo_uid.clone())
+            .or_default() += 1;
+    }
+
+    let mut symbol_counts_by_repo = HashMap::<String, usize>::new();
+    for symbol in &symbols {
+        *symbol_counts_by_repo
+            .entry(symbol.repo_uid.clone())
+            .or_default() += 1;
+    }
+
+    let mut note_counts_by_vault = HashMap::<String, usize>::new();
+    for note in &notes {
+        *note_counts_by_vault
+            .entry(note.vault_uid.clone())
+            .or_default() += 1;
+    }
 
     let mut entries = Vec::with_capacity(1 + repos.len() + vaults.len());
     let all = ResolvedWorkspace::all();
-    entries.push(workspace_entry(store, all, "complete", Vec::<&str>::new())?);
+    entries.push(workspace_entry(
+        all,
+        WorkspaceCounts {
+            repo_count: repos.len(),
+            service_count: services.len(),
+            vault_count: vaults.len(),
+            note_count: notes.len(),
+            symbol_count: symbols.len(),
+        },
+        "complete",
+        Vec::<&str>::new(),
+    ));
 
     for repo in &repos {
         entries.push(workspace_entry(
-            store,
             ResolvedWorkspace::repo(repo),
+            WorkspaceCounts {
+                repo_count: 1,
+                service_count: *service_counts_by_repo.get(&repo.uid).unwrap_or(&0),
+                vault_count: 0,
+                note_count: 0,
+                symbol_count: *symbol_counts_by_repo.get(&repo.uid).unwrap_or(&0),
+            },
             "partial",
             vec!["note-landmarks", "note-search"],
-        )?);
+        ));
     }
     for vault in &vaults {
         entries.push(workspace_entry(
-            store,
             ResolvedWorkspace::vault(vault),
+            WorkspaceCounts {
+                repo_count: 0,
+                service_count: 0,
+                vault_count: 1,
+                note_count: *note_counts_by_vault.get(&vault.uid).unwrap_or(&0),
+                symbol_count: 0,
+            },
             "partial",
             vec!["code-landmarks", "code-search"],
-        )?);
+        ));
     }
 
     Ok(entries)
 }
 
 fn workspace_entry(
-    store: &GraphStore,
     workspace: ResolvedWorkspace,
+    counts: WorkspaceCounts,
     result: &str,
     unsupported: Vec<&str>,
-) -> Result<WorkspaceEntry, ApiError> {
-    Ok(WorkspaceEntry {
+) -> WorkspaceEntry {
+    WorkspaceEntry {
         id: workspace.id.clone(),
         kind: workspace.kind.as_str().to_string(),
         label: workspace.label.clone(),
         uid: workspace.uid.clone(),
-        counts: workspace_counts(store, &workspace)?,
+        counts,
         meta: p1_meta(
             &workspace,
             result,
@@ -516,7 +564,7 @@ fn workspace_entry(
             vec![P1Provenance::local_graph_store("workspace catalog")],
             None,
         ),
-    })
+    }
 }
 
 fn is_workspace_scope_value(value: &str) -> bool {

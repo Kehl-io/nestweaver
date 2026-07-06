@@ -272,19 +272,14 @@ fn scoped_brain_search(
         });
     }
 
-    if let Some(tantivy) = &state.tantivy {
+    if workspace.kind == WorkspaceKind::All
+        && let Some(tantivy) = &state.tantivy
+    {
         match tantivy.search(q, limit) {
             Ok(hits) => {
                 let saturated = limit > 0 && hits.len() >= limit;
                 let results: Vec<_> = hits
                     .into_iter()
-                    .filter(|hit| {
-                        workspace.kind == WorkspaceKind::All
-                            || workspace
-                                .uid
-                                .as_deref()
-                                .is_some_and(|vault_uid| hit.vault_uid == vault_uid)
-                    })
                     .map(|hit| serde_json::to_value(hit).unwrap_or(serde_json::Value::Null))
                     .collect();
                 let result_state = if results.is_empty() {
@@ -319,7 +314,10 @@ fn scoped_brain_search(
         .collect();
     Ok(ScopedBrainSearch {
         results,
-        provenance: P1Provenance::local_graph_store("scoped note search fallback"),
+        provenance: P1Provenance::local_graph_store(match workspace.kind {
+            WorkspaceKind::Vault => "vault-scoped note search",
+            _ => "scoped note search fallback",
+        }),
         result_state,
         unsupported: Vec::new(),
         total_count: Some(total_count),
