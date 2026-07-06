@@ -15,15 +15,16 @@ export function PathTargetSelector() {
   const handleSubmit = async () => {
     const trimmedTarget = target.trim();
     if (!trimmedTarget || !pathfindingFrom || pending) return;
-    setPathfindingTarget(trimmedTarget);
+    const request = setPathfindingTarget(trimmedTarget);
     try {
       const results = await api.paths(pathfindingFrom, trimmedTarget, 5, 10);
-      setPathResults(results);
+      setPathResults(results, request);
     } catch (error) {
       setPathError(
         error instanceof Error && error.message
           ? error.message
           : "Path query failed.",
+        request,
       );
     }
   };

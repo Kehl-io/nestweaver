@@ -166,7 +166,7 @@ async function executePath(
   const to = destination.uid ?? destination.id;
   state.selectNode(from, source.kind);
   state.startPathfinding(from);
-  state.setPathfindingTarget(to);
+  const request = state.setPathfindingTarget(to);
   state.setDetailFocus("analysis");
   state.setActiveLens({
     lens: "path",
@@ -179,13 +179,16 @@ async function executePath(
     results = await api.paths(from, to, 5, 10);
   } catch (error) {
     const message = errorMessage(error);
-    state.setPathError(message);
+    if (!isCurrent(options) || !state.isCurrentPathRequest(request)) {
+      return { status: "error", message: "Path result was superseded by a newer phrase." };
+    }
+    state.setPathError(message, request);
     return { status: "error", message };
   }
-  if (!isCurrent(options)) {
+  if (!isCurrent(options) || !state.isCurrentPathRequest(request)) {
     return { status: "error", message: "Path result was superseded by a newer phrase." };
   }
-  state.setPathResults(results);
+  state.setPathResults(results, request);
   return {
     status: "executed",
     message: results.length > 0 ? `Found ${results.length} path result(s).` : "No path results found.",

@@ -79,6 +79,8 @@ function clipboardUnavailable(): boolean {
   return typeof navigator === "undefined" || !navigator.clipboard;
 }
 
+let latestTraceActionId = 0;
+
 export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
   const selectNode = useStore((s) => s.selectNode);
   const openPreview = useStore((s) => s.openPreview);
@@ -244,17 +246,31 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
       focus: "analysis",
       run: async () => {
         if (!symbol) return;
+        const traceActionId = ++latestTraceActionId;
+        const traceTargetUid = node.uid;
+        const traceWorkspaceId = activeWorkspaceId;
         selectForLens(
           {
             lens: "trace",
             label: `Trace from ${label}`,
-            targetUid: node.uid,
-            workspaceId: activeWorkspaceId,
+            targetUid: traceTargetUid,
+            workspaceId: traceWorkspaceId,
           },
           "analysis",
           true,
         );
-        const result = await api.flow(node.uid, 10);
+        const result = await api.flow(traceTargetUid, 10);
+        const state = useStore.getState();
+        if (
+          traceActionId !== latestTraceActionId ||
+          state.selectedNodeId !== traceTargetUid ||
+          state.detailFocus !== "analysis" ||
+          state.activeLens.lens !== "trace" ||
+          state.activeLens.targetUid !== traceTargetUid ||
+          state.activeLens.workspaceId !== traceWorkspaceId
+        ) {
+          return;
+        }
         setFlowTrace(result);
       },
     },

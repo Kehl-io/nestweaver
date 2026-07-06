@@ -11,6 +11,12 @@ export interface DiffState {
   seedsB: string[];
 }
 
+export interface PathRequest {
+  from: string;
+  to: string;
+  requestId: number;
+}
+
 export interface GapItem {
   type: "undocumented" | "untested" | "disconnected";
   label: string;
@@ -28,14 +34,16 @@ export interface AnalysisSlice {
   pathfindingActive: boolean;
   pathfindingFrom: string | null;
   pathfindingTo: string | null;
+  pathRequestId: number;
   pathResults: PathResult[];
   pathStatus: "idle" | "pending" | "success" | "empty" | "error";
   pathError: string | null;
   selectedPathIndex: number;
   startPathfinding: (from: string) => void;
-  setPathfindingTarget: (to: string) => void;
-  setPathResults: (results: PathResult[]) => void;
-  setPathError: (error: string) => void;
+  setPathfindingTarget: (to: string) => PathRequest;
+  setPathResults: (results: PathResult[], request?: PathRequest) => void;
+  setPathError: (error: string, request?: PathRequest) => void;
+  isCurrentPathRequest: (request: PathRequest) => boolean;
   selectPath: (index: number) => void;
   clearPathfinding: () => void;
 
@@ -59,12 +67,22 @@ function flattenFlowTree(node: FlowNode): string[] {
   return uids;
 }
 
+function pathRequestMatches(state: StoreState, request?: PathRequest): boolean {
+  if (!request) return true;
+  return (
+    state.pathfindingActive &&
+    state.pathfindingFrom === request.from &&
+    state.pathfindingTo === request.to &&
+    state.pathRequestId === request.requestId
+  );
+}
+
 export const createAnalysisSlice: StateCreator<
   StoreState,
   [["zustand/immer", never]],
   [],
   AnalysisSlice
-> = (set) => ({
+> = (set, get) => ({
   flowTraceRoot: null,
   flowTraceNodeUids: [],
   flowTraceActive: false,
@@ -86,6 +104,7 @@ export const createAnalysisSlice: StateCreator<
   pathfindingActive: false,
   pathfindingFrom: null,
   pathfindingTo: null,
+  pathRequestId: 0,
   pathResults: [],
   pathStatus: "idle",
   pathError: null,
@@ -96,34 +115,48 @@ export const createAnalysisSlice: StateCreator<
       s.pathfindingActive = true;
       s.pathfindingFrom = from;
       s.pathfindingTo = null;
+      s.pathRequestId += 1;
       s.pathResults = [];
       s.pathStatus = "idle";
       s.pathError = null;
       s.selectedPathIndex = 0;
     }),
 
-  setPathfindingTarget: (to) =>
+  setPathfindingTarget: (to) => {
+    const requestId = get().pathRequestId + 1;
+    const from = get().pathfindingFrom ?? "";
     set((s) => {
       s.pathfindingTo = to;
+      s.pathRequestId = requestId;
       s.pathStatus = "pending";
       s.pathError = null;
-    }),
+    });
+    return {
+      from,
+      to,
+      requestId,
+    };
+  },
 
-  setPathResults: (results) =>
+  setPathResults: (results, request) =>
     set((s) => {
+      if (!pathRequestMatches(s, request)) return;
       s.pathResults = results;
       s.pathStatus = results.length > 0 ? "success" : "empty";
       s.pathError = null;
       s.selectedPathIndex = 0;
     }),
 
-  setPathError: (error) =>
+  setPathError: (error, request) =>
     set((s) => {
+      if (!pathRequestMatches(s, request)) return;
       s.pathResults = [];
       s.pathStatus = "error";
       s.pathError = error;
       s.selectedPathIndex = 0;
     }),
+
+  isCurrentPathRequest: (request) => pathRequestMatches(get(), request),
 
   selectPath: (index) =>
     set((s) => {
@@ -135,6 +168,7 @@ export const createAnalysisSlice: StateCreator<
       s.pathfindingActive = false;
       s.pathfindingFrom = null;
       s.pathfindingTo = null;
+      s.pathRequestId += 1;
       s.pathResults = [];
       s.pathStatus = "idle";
       s.pathError = null;
