@@ -103,7 +103,7 @@ export function useKeyboardShortcuts() {
       if (state.llmBarOpen || state.shortcutsOpen) return;
 
       event.preventDefault();
-      state.toggleShortcuts();
+      state.openShortcuts();
     };
 
     window.addEventListener("keydown", handleQuestionMark);

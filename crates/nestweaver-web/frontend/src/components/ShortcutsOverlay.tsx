@@ -1,5 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { useCallback } from "react";
 import { useStore } from "../stores";
 
 const shortcutGroups = [
@@ -47,19 +48,63 @@ function ShortcutKey({ children }: { children: string }) {
   );
 }
 
+function getGraphFocusFallback() {
+  if (typeof document === "undefined") return null;
+  return document.querySelector<HTMLElement>(
+    '[role="application"][aria-label="Code knowledge graph"]',
+  );
+}
+
+function restoreFocus(target: HTMLElement | null) {
+  const fallback = getGraphFocusFallback();
+  const nextTarget =
+    target &&
+    target.isConnected &&
+    target !== document.body &&
+    target !== document.documentElement
+      ? target
+      : fallback;
+
+  nextTarget?.focus({ preventScroll: true });
+
+  if (
+    fallback &&
+    nextTarget !== fallback &&
+    document.activeElement !== nextTarget
+  ) {
+    fallback.focus({ preventScroll: true });
+  }
+}
+
 export function ShortcutsOverlay() {
   const open = useStore((s) => s.shortcutsOpen);
   const close = useStore((s) => s.closeShortcuts);
+  const clearFocusReturnTarget = useStore(
+    (s) => s.clearShortcutsFocusReturnTarget,
+  );
+
+  const handleCloseAutoFocus = useCallback(
+    (event: Event) => {
+      event.preventDefault();
+      restoreFocus(useStore.getState().getShortcutsFocusReturnTarget());
+      clearFocusReturnTarget();
+    },
+    [clearFocusReturnTarget],
+  );
 
   return (
-    <Dialog.Root open={open} onOpenChange={(nextOpen) => {
-      if (!nextOpen) close();
-    }}>
+    <Dialog.Root
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) close();
+      }}
+    >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/35" />
         <Dialog.Content
           aria-describedby="shortcuts-overlay-description"
           className="fixed left-1/2 top-[12vh] z-50 flex max-h-[76vh] w-[min(42rem,calc(100vw-2rem))] -translate-x-1/2 flex-col overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text)] shadow-xl focus:outline-none"
+          onCloseAutoFocus={handleCloseAutoFocus}
         >
           <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--color-border)] px-4 py-3">
             <Dialog.Title className="text-sm font-semibold">

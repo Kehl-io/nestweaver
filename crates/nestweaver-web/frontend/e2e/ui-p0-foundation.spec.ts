@@ -220,6 +220,12 @@ test.describe("P0 foundation release gates", () => {
   }) => {
     await openGraph(page, request);
 
+    const graphApp = page.getByRole("application", {
+      name: "Code knowledge graph",
+    });
+    await graphApp.focus();
+    await expect(graphApp).toBeFocused();
+
     const askShortcut = process.platform === "darwin" ? "Meta+K" : "Control+K";
     await page.keyboard.press(askShortcut);
 
@@ -232,6 +238,7 @@ test.describe("P0 foundation release gates", () => {
 
     await page.keyboard.press("Escape");
     await expect(askDialog).toHaveCount(0);
+    await expect(graphApp).toBeFocused();
   });
 
   test("question mark opens shortcuts overlay and Escape closes it", async ({
@@ -252,6 +259,9 @@ test.describe("P0 foundation release gates", () => {
 
     await page.keyboard.press("Escape");
     await expect(shortcutsDialog).toHaveCount(0);
+    await expect(
+      page.getByRole("application", { name: "Code knowledge graph" }),
+    ).toBeFocused();
   });
 
   test("reduced effects is accessible and toggles in reduced-motion contexts", async ({

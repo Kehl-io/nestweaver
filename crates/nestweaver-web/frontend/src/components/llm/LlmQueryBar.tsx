@@ -3,15 +3,53 @@ import { useCallback, type FormEvent } from "react";
 import { useStore } from "../../stores";
 import { api } from "../../api/client";
 
+function getGraphFocusFallback() {
+  if (typeof document === "undefined") return null;
+  return document.querySelector<HTMLElement>(
+    '[role="application"][aria-label="Code knowledge graph"]',
+  );
+}
+
+function restoreFocus(target: HTMLElement | null) {
+  const fallback = getGraphFocusFallback();
+  const nextTarget =
+    target &&
+    target.isConnected &&
+    target !== document.body &&
+    target !== document.documentElement
+      ? target
+      : fallback;
+
+  nextTarget?.focus({ preventScroll: true });
+
+  if (
+    fallback &&
+    nextTarget !== fallback &&
+    document.activeElement !== nextTarget
+  ) {
+    fallback.focus({ preventScroll: true });
+  }
+}
+
 export function LlmQueryBar() {
   const open = useStore((s) => s.llmBarOpen);
   const query = useStore((s) => s.llmQuery);
   const loading = useStore((s) => s.llmLoading);
   const error = useStore((s) => s.llmError);
+  const clearFocusReturnTarget = useStore((s) => s.clearLlmFocusReturnTarget);
 
   const close = useCallback(() => {
     useStore.getState().closeLlmBar();
   }, []);
+
+  const handleCloseAutoFocus = useCallback(
+    (event: Event) => {
+      event.preventDefault();
+      restoreFocus(useStore.getState().getLlmFocusReturnTarget());
+      clearFocusReturnTarget();
+    },
+    [clearFocusReturnTarget],
+  );
 
   const handleSubmit = useCallback(
     async (e: FormEvent) => {
@@ -43,14 +81,18 @@ export function LlmQueryBar() {
   );
 
   return (
-    <Dialog.Root open={open} onOpenChange={(nextOpen) => {
-      if (!nextOpen) close();
-    }}>
+    <Dialog.Root
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) close();
+      }}
+    >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/30" />
         <Dialog.Content
           aria-describedby="llm-query-description"
           className="fixed left-1/2 top-[15vh] z-50 h-fit w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-4 text-[var(--color-text)] shadow-xl focus:outline-none"
+          onCloseAutoFocus={handleCloseAutoFocus}
         >
           <Dialog.Title className="sr-only">Ask</Dialog.Title>
           <Dialog.Description
