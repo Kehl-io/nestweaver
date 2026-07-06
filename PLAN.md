@@ -134,7 +134,7 @@ Acceptance criteria:
 
 ### Task 3 - Deterministic Search Phrases
 
-Status: in_progress
+Status: review
 
 Owner type: implementation sub-agent
 
