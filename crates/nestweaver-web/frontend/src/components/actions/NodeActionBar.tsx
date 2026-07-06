@@ -24,23 +24,32 @@ export function NodeActionBar({
   );
   const notify = useStore((s) => s.notify);
   const [pending, setPending] = useState<NodeActionId | null>(null);
+  const layoutClass = className.includes("grid") ? "" : "flex flex-wrap";
 
   if (!node || actions.length === 0) return null;
 
   return (
     <div
-      className={`flex flex-wrap gap-1.5 ${compact ? "text-[11px]" : "text-xs"} ${className}`}
+      className={`${layoutClass} gap-1.5 ${compact ? "text-[11px]" : "text-xs"} ${className}`}
       aria-label="Node actions"
     >
       {actions.map((action) => {
         const Icon = action.icon;
         const busy = pending === action.id;
+        const disabledTitle = action.disabledReason
+          ? `${action.title}. Unavailable: ${action.disabledReason}`
+          : action.title;
         return (
           <button
             key={action.id}
             type="button"
             disabled={action.disabled || busy}
-            title={action.title}
+            title={disabledTitle}
+            aria-label={
+              action.disabledReason
+                ? `${action.label}, unavailable: ${action.disabledReason}`
+                : action.label
+            }
             onClick={async (event) => {
               event.stopPropagation();
               try {
@@ -51,16 +60,14 @@ export function NodeActionBar({
                 }
               } catch (error) {
                 console.error(`${action.label} failed`, error);
-                if (action.id === "compare") {
-                  notify({
-                    kind: "error",
-                    title: "Compare failed",
-                    message:
-                      error instanceof Error && error.message
-                        ? error.message
-                        : "Context comparison request failed",
-                  });
-                }
+                notify({
+                  kind: "error",
+                  title: `${action.label} failed`,
+                  message:
+                    error instanceof Error && error.message
+                      ? error.message
+                      : `${action.label} could not complete.`,
+                });
               } finally {
                 setPending(null);
               }
@@ -71,6 +78,9 @@ export function NodeActionBar({
           >
             <Icon className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />
             <span>{busy ? "Working" : action.label}</span>
+            {action.disabledReason && (
+              <span className="sr-only">Unavailable: {action.disabledReason}</span>
+            )}
           </button>
         );
       })}
