@@ -38,7 +38,7 @@ function MenuButton({
     <button
       type="button"
       onClick={onClick}
-      aria-pressed={active ?? false}
+      aria-pressed={active}
       className={`inline-flex h-8 items-center gap-1.5 rounded border px-2 text-xs font-medium transition-colors ${
         active
           ? "border-[var(--color-graph-selection)] bg-[var(--color-surface-alt)] text-[var(--color-graph-selection)]"
