@@ -9,16 +9,18 @@ export function PresentationView() {
   const nextSlide = useStore((s) => s.nextSlide);
   const prevSlide = useStore((s) => s.prevSlide);
   const togglePlayback = useStore((s) => s.togglePlayback);
+  const modalOpen = useStore((s) => s.llmBarOpen || s.shortcutsOpen);
 
   const { slides, currentSlideIndex, isPlaying, name } = presentation;
   const currentSlide = slides[currentSlideIndex] ?? null;
 
   const goBack = useCallback(() => setActiveView("graph"), [setActiveView]);
+  const presentationHotkeyOptions = { enabled: !modalOpen };
 
-  useHotkeys("right", () => nextSlide(), [nextSlide]);
-  useHotkeys("left", () => prevSlide(), [prevSlide]);
-  useHotkeys("space", (e) => { e.preventDefault(); togglePlayback(); }, [togglePlayback]);
-  useHotkeys("escape", goBack, [goBack]);
+  useHotkeys("right", () => nextSlide(), presentationHotkeyOptions, [nextSlide]);
+  useHotkeys("left", () => prevSlide(), presentationHotkeyOptions, [prevSlide]);
+  useHotkeys("space", (e) => { e.preventDefault(); togglePlayback(); }, presentationHotkeyOptions, [togglePlayback]);
+  useHotkeys("escape", goBack, presentationHotkeyOptions, [goBack]);
 
   // Auto-advance when playing
   useEffect(() => {
