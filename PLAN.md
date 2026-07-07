@@ -258,7 +258,7 @@ Acceptance criteria:
 
 ### Task 6 - Impact Lens End to End
 
-Status: in_progress
+Status: review
 
 Owner type: implementation sub-agent
 
