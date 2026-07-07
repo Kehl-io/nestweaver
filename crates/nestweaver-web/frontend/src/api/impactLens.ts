@@ -50,18 +50,18 @@ export interface AffectedTestsResult {
 }
 
 export interface ImpactLensStates {
-  tier: "two-tier" | "local-only" | string;
-  local: "available" | "unavailable" | string;
-  org: "available" | "unavailable" | string;
-  freshness: "current" | "stale" | "unknown" | string;
-  timeout: "not-timed-out" | "timed-out" | string;
-  permission: "not-requested" | "permission-rejected" | string;
-  read_only: "not-read-only" | "read-only" | string;
+  tier: "two-tier" | "local-only" | "unsupported" | string;
+  local: "available" | "unavailable" | "unsupported" | string;
+  org: "available" | "org-unavailable" | "unknown" | "not-applicable" | string;
+  freshness: "current" | "stale" | "unknown" | "not-applicable" | string;
+  timeout: "unknown" | "timed-out" | "not-applicable" | string;
+  permission: "unknown" | "permission-rejected" | "not-applicable" | string;
+  read_only: "unknown" | "read-only" | "not-applicable" | string;
   result: string;
 }
 
 export interface ImpactLensResponse {
-  target: ImpactLensNode;
+  target: ImpactLensNode | null;
   nodes: ImpactLensNode[];
   edges: ImpactLensEdge[];
   affected_tests: AffectedTestsResult;

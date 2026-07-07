@@ -1,5 +1,9 @@
 import { useMemo } from "react";
 import { Copy, Download } from "lucide-react";
+import type {
+  AffectedTestsResult,
+  ImpactLensStates,
+} from "../../api/impactLens";
 import type { BrainContextResult } from "../../api/types";
 import { useStore } from "../../stores";
 
@@ -15,12 +19,33 @@ const JSON_CAPS = {
   diffSeeds: 100,
   diffConnected: 200,
   diffUnresolved: 100,
+  affectedTestFiles: 100,
+  changedSymbols: 100,
 };
+
+type GraphInstance = NonNullable<ReturnType<typeof useStore.getState>["graphInstance"]>;
 
 function attrsToRecord(attrs: unknown): Record<string, unknown> {
   return attrs && typeof attrs === "object"
     ? { ...(attrs as Record<string, unknown>) }
     : {};
+}
+
+function graphAttribute<T>(graph: GraphInstance, name: string): T | null {
+  const value = graph.getAttribute(name) as T | undefined;
+  return value ?? null;
+}
+
+function impactAttributes(graph: GraphInstance | null) {
+  if (!graph) return null;
+  const attributes = {
+    impact_target: graphAttribute<string | null>(graph, "impactTarget"),
+    impact_states: graphAttribute<ImpactLensStates>(graph, "impactStates"),
+    affected_tests: graphAttribute<AffectedTestsResult>(graph, "affectedTests"),
+  };
+  return Object.values(attributes).some((value) => value != null)
+    ? attributes
+    : null;
 }
 
 function buildGraphPayload() {
@@ -61,6 +86,7 @@ function buildGraphPayload() {
   return {
     nodes,
     edges,
+    attributes: impactAttributes(graph),
     _meta: {
       node_count: nodeCount,
       edge_count: edgeCount,
@@ -71,6 +97,41 @@ function buildGraphPayload() {
       omitted_nodes: Math.max(0, nodeCount - nodes.length),
       omitted_edges: Math.max(0, edgeCount - edges.length),
     },
+  };
+}
+
+function impactAnalysisPayload(graph: GraphInstance | null) {
+  const attributes = impactAttributes(graph);
+  const affectedTests = attributes?.affected_tests ?? null;
+  const tier1 = capList(affectedTests?.tier_1 ?? [], JSON_CAPS.affectedTestFiles);
+  const tier2 = capList(affectedTests?.tier_2 ?? [], JSON_CAPS.affectedTestFiles);
+  const tier3 = capList(affectedTests?.tier_3 ?? [], JSON_CAPS.affectedTestFiles);
+  const changedSymbols = capList(
+    affectedTests?.changed_symbols ?? [],
+    JSON_CAPS.changedSymbols,
+  );
+
+  return {
+    active: Boolean(attributes),
+    target_uid: attributes?.impact_target ?? null,
+    states: attributes?.impact_states ?? null,
+    affected_tests: affectedTests
+      ? {
+          changed_files: affectedTests.changed_files,
+          changed_symbols: changedSymbols.items,
+          tier_1: tier1.items,
+          tier_2: tier2.items,
+          tier_3: tier3.items,
+          summary: affectedTests.summary,
+          disclaimer: affectedTests.disclaimer,
+          _meta: {
+            changed_symbols: changedSymbols._meta,
+            tier_1: tier1._meta,
+            tier_2: tier2._meta,
+            tier_3: tier3._meta,
+          },
+        }
+      : null,
   };
 }
 
@@ -193,7 +254,9 @@ export function JsonResultView() {
 
   const payload = useMemo(() => {
     void graphVersion;
+    const graphInstance = useStore.getState().graphInstance;
     const graph = buildGraphPayload();
+    const impact = impactAnalysisPayload(graphInstance);
     const flowRows = flowToCappedList(flowTraceRoot, JSON_CAPS.flowRows);
     const cappedFlowNodeUids = capList(flowTraceNodeUids, JSON_CAPS.flowNodeUids);
     const cappedPathResults = capList(pathResults, JSON_CAPS.pathResults);
@@ -239,6 +302,7 @@ export function JsonResultView() {
       representation: representationMode,
       graph,
       analysis: {
+        impact,
         flow_trace: {
           active: Boolean(flowTraceRoot),
           node_uids: cappedFlowNodeUids.items,

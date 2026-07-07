@@ -43,7 +43,9 @@ function deterministicLayerPositions(nodes: ImpactLensNode[]): Map<string, { x: 
 export function buildGraphFromImpact(result: ImpactLensResponse): Graph {
   const graph = new Graph({ type: "directed", multi: true });
   const dedupedNodes = new Map<string, ImpactLensNode>();
-  dedupedNodes.set(result.target.uid, result.target);
+  if (result.target) {
+    dedupedNodes.set(result.target.uid, result.target);
+  }
   for (const node of result.nodes) {
     dedupedNodes.set(node.uid, node);
   }
@@ -51,7 +53,7 @@ export function buildGraphFromImpact(result: ImpactLensResponse): Graph {
   const nodes = [...dedupedNodes.values()];
   const maxLayer = Math.max(...nodes.map((node) => node.layer), 1);
   const positions = deterministicLayerPositions(nodes);
-  graph.setAttribute("impactTarget", result.target.uid);
+  graph.setAttribute("impactTarget", result.target?.uid ?? null);
   graph.setAttribute("impactStates", result.states);
   graph.setAttribute("affectedTests", result.affected_tests);
   graph.setAttribute("sceneMetadata", result._meta);
@@ -94,13 +96,15 @@ export function buildGraphFromImpact(result: ImpactLensResponse): Graph {
   }
 
   // Second pass: update node sizes based on actual degree
-  graph.setNodeAttribute(
-    result.target.uid,
-    "size",
-    nodeSize(graph.degree(result.target.uid), 0.01),
-  );
+  if (result.target && graph.hasNode(result.target.uid)) {
+    graph.setNodeAttribute(
+      result.target.uid,
+      "size",
+      nodeSize(graph.degree(result.target.uid), 0.01),
+    );
+  }
   graph.forEachNode((nodeId) => {
-    if (nodeId === result.target.uid) return;
+    if (nodeId === result.target?.uid) return;
     graph.setNodeAttribute(nodeId, "size", nodeSize(graph.degree(nodeId), 0.001));
   });
 

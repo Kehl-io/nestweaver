@@ -90,7 +90,7 @@ export function useImpactMode() {
       setGraphData(graph);
       setActiveLens({
         lens: "impact",
-        label: `Impact: ${result.target.name}`,
+        label: `Impact: ${result.target?.name ?? targetNodeId}`,
         targetUid: targetNodeId,
         workspaceId: requestWorkspaceId,
       });

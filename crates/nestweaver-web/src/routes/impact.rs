@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Json;
@@ -9,7 +10,7 @@ use nestweaver_store::ImpactNode;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::routes::workspaces::{self, P1Meta, P1Provenance};
+use crate::routes::workspaces::{self, P1Meta, P1Provenance, ResolvedWorkspace, WorkspaceKind};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -66,7 +67,7 @@ struct ImpactStates {
 
 #[derive(Serialize)]
 struct ImpactResponse {
-    target: ImpactGraphNode,
+    target: Option<ImpactGraphNode>,
     nodes: Vec<ImpactGraphNode>,
     edges: Vec<ImpactGraphEdge>,
     affected_tests: AffectedTestsResult,
@@ -88,14 +89,29 @@ pub async fn impact(
         workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref()),
     )?;
 
+    if workspace.kind == WorkspaceKind::Vault {
+        return Ok(Json(unsupported_workspace_response(&workspace, limit)).into_response());
+    }
+
     let target = state
         .store
         .lookup_symbol(&uid)
         .map_err(|_| ApiError::not_found(format!("symbol '{uid}' not found")))?;
 
-    let impact_nodes = state.store.impact(&uid, depth, confidence)?;
-    let affected_tests = affected_tests(&state.store, std::slice::from_ref(&target.file_path))
-        .map_err(ApiError::from)?;
+    let Some(scope) = ImpactScope::resolve(&state, &workspace)? else {
+        return Ok(Json(unsupported_workspace_response(&workspace, limit)).into_response());
+    };
+    if !scope.contains(&target) {
+        return Ok(Json(out_of_scope_response(&workspace, &target, limit)).into_response());
+    }
+
+    let impact_nodes: Vec<ImpactNode> = state
+        .store
+        .impact(&uid, depth, confidence)?
+        .into_iter()
+        .filter(|node| scope.contains_impact_node(node))
+        .collect();
+    let affected_tests = scoped_affected_tests(&state, &scope, &target)?;
     let total_node_count = impact_nodes.len() + 1;
     let returned_impact_nodes: Vec<ImpactNode> = impact_nodes
         .iter()
@@ -108,7 +124,7 @@ pub async fn impact(
         "truncated"
     } else if impact_nodes.is_empty() {
         "no-match"
-    } else if stale {
+    } else if stale || workspace_has_unsupported_upstream() {
         "partial"
     } else {
         "complete"
@@ -117,13 +133,7 @@ pub async fn impact(
     let mut meta = workspaces::p1_meta_for_result_set(
         &workspace,
         result_state,
-        vec![
-            "org-wide-impact",
-            "two-tier-impact",
-            "upstream-federation",
-            "permission-gated-upstream",
-            "read-only-upstream",
-        ],
+        unsupported_capabilities(),
         vec![
             P1Provenance::local_graph_store("confidence-weighted impact traversal"),
             P1Provenance::local_graph_store("static affected-test hints"),
@@ -132,19 +142,9 @@ pub async fn impact(
         returned_count,
         Some(total_node_count),
     );
-    if stale {
-        meta.trust.freshness = "stale".to_string();
-        meta.trust.partial = true;
-        meta.trust.message = format!(
-            "{} impact is local-only and stale; org-wide/two-tier continuation is unavailable in this route.",
-            workspace.label
-        );
-    } else {
-        meta.trust.message = format!(
-            "{} impact is local-only; org-wide/two-tier continuation is unavailable in this route.",
-            workspace.label
-        );
-    }
+    meta.trust.freshness = if stale { "stale" } else { "current" }.to_string();
+    meta.trust.partial = meta.trust.result == "partial" || !meta.trust.unsupported.is_empty();
+    meta.trust.message = impact_trust_message(&workspace, stale, &meta.trust.result);
 
     let target_node = target_graph_node(&target);
     let mut nodes = Vec::with_capacity(returned_count);
@@ -154,16 +154,16 @@ pub async fn impact(
     let states = ImpactStates {
         tier: "local-only",
         local: "available",
-        org: "unavailable",
+        org: "org-unavailable",
         freshness: if stale { "stale" } else { "current" },
-        timeout: "not-timed-out",
-        permission: "not-requested",
-        read_only: "not-read-only",
+        timeout: "unknown",
+        permission: "unknown",
+        read_only: "unknown",
         result: meta.trust.result.clone(),
     };
 
     Ok(Json(ImpactResponse {
-        target: target_node,
+        target: Some(target_node),
         nodes,
         edges,
         affected_tests,
@@ -171,6 +171,244 @@ pub async fn impact(
         meta,
     })
     .into_response())
+}
+
+struct ImpactScope {
+    allowed_symbol_uids: Option<HashSet<String>>,
+}
+
+impl ImpactScope {
+    fn resolve(
+        state: &Arc<AppState>,
+        workspace: &ResolvedWorkspace,
+    ) -> Result<Option<Self>, ApiError> {
+        match workspace.kind {
+            WorkspaceKind::All => Ok(Some(Self {
+                allowed_symbol_uids: None,
+            })),
+            WorkspaceKind::Repo => {
+                let repo_uid = workspace.uid.as_deref().unwrap_or_default();
+                Ok(Some(Self {
+                    allowed_symbol_uids: Some(
+                        workspaces::symbols_for_repo(&state.store, repo_uid)?
+                            .into_iter()
+                            .map(|symbol| symbol.uid)
+                            .collect(),
+                    ),
+                }))
+            }
+            WorkspaceKind::Project => {
+                let project_uid = workspace.uid.as_deref().unwrap_or_default();
+                Ok(Some(Self {
+                    allowed_symbol_uids: Some(
+                        workspaces::symbols_for_project(&state.store, project_uid)?
+                            .into_iter()
+                            .map(|symbol| symbol.uid)
+                            .collect(),
+                    ),
+                }))
+            }
+            WorkspaceKind::Vault => Ok(None),
+        }
+    }
+
+    fn contains(&self, symbol: &Symbol) -> bool {
+        self.allowed_symbol_uids
+            .as_ref()
+            .is_none_or(|uids| uids.contains(&symbol.uid))
+    }
+
+    fn contains_uid(&self, uid: &str) -> bool {
+        self.allowed_symbol_uids
+            .as_ref()
+            .is_none_or(|uids| uids.contains(uid))
+    }
+
+    fn contains_impact_node(&self, node: &ImpactNode) -> bool {
+        self.contains_uid(&node.uid)
+    }
+}
+
+fn workspace_has_unsupported_upstream() -> bool {
+    true
+}
+
+fn unsupported_capabilities() -> Vec<&'static str> {
+    vec![
+        "org-wide-impact",
+        "two-tier-impact",
+        "upstream-federation",
+        "timeout-state",
+        "permission-state",
+        "read-only-state",
+    ]
+}
+
+fn impact_trust_message(workspace: &ResolvedWorkspace, stale: bool, result: &str) -> String {
+    match result {
+        "no-match" => format!(
+            "{} impact has no scoped reverse-dependency matches. Org-wide/two-tier continuation and upstream timeout/permission/read-only states are unavailable in this route.",
+            workspace.label
+        ),
+        "truncated" => format!(
+            "{} impact is truncated to the requested limit and local-only. Org-wide/two-tier continuation and upstream timeout/permission/read-only states are unavailable in this route.",
+            workspace.label
+        ),
+        _ if stale => format!(
+            "{} impact is local-only and stale. Org-wide/two-tier continuation and upstream timeout/permission/read-only states are unavailable in this route.",
+            workspace.label
+        ),
+        _ => format!(
+            "{} impact is local-only and partial. Org-wide/two-tier continuation and upstream timeout/permission/read-only states are unavailable in this route.",
+            workspace.label
+        ),
+    }
+}
+
+fn empty_affected_tests(
+    changed_files: Vec<String>,
+    summary: impl Into<String>,
+) -> AffectedTestsResult {
+    AffectedTestsResult {
+        changed_files,
+        changed_symbols: Vec::new(),
+        tier_1: Vec::new(),
+        tier_2: Vec::new(),
+        tier_3: Vec::new(),
+        summary: summary.into(),
+        disclaimer: "Static affected-test hints are unavailable for this scoped impact response."
+            .to_string(),
+    }
+}
+
+fn scoped_affected_tests(
+    state: &Arc<AppState>,
+    scope: &ImpactScope,
+    target: &Symbol,
+) -> Result<AffectedTestsResult, ApiError> {
+    let mut result = affected_tests(&state.store, std::slice::from_ref(&target.file_path))
+        .map_err(ApiError::from)?;
+    if scope.allowed_symbol_uids.is_none() {
+        return Ok(result);
+    }
+
+    result
+        .changed_symbols
+        .retain(|symbol| scope.contains_uid(&symbol.uid));
+    result
+        .tier_1
+        .retain(|test| scope.contains_uid(&test.symbol_uid));
+    result
+        .tier_2
+        .retain(|test| scope.contains_uid(&test.symbol_uid));
+    result
+        .tier_3
+        .retain(|test| scope.contains_uid(&test.symbol_uid));
+    result.summary = format!(
+        "{} tier-1, {} tier-2, {} tier-3 tests affected in the selected workspace",
+        result
+            .tier_1
+            .iter()
+            .map(|file| file.tests.len())
+            .sum::<usize>(),
+        result
+            .tier_2
+            .iter()
+            .map(|file| file.tests.len())
+            .sum::<usize>(),
+        result
+            .tier_3
+            .iter()
+            .map(|file| file.tests.len())
+            .sum::<usize>(),
+    );
+    Ok(result)
+}
+
+fn unsupported_workspace_response(workspace: &ResolvedWorkspace, limit: usize) -> ImpactResponse {
+    let mut meta = workspaces::p1_meta_for_result_set(
+        workspace,
+        "unsupported",
+        unsupported_capabilities(),
+        vec![P1Provenance::local_graph_store(
+            "vault workspaces contain notes, not symbol impact traversals",
+        )],
+        Some(limit),
+        0,
+        Some(0),
+    );
+    meta.trust.freshness = "unknown".to_string();
+    meta.trust.partial = true;
+    meta.trust.message = format!(
+        "{} is a vault workspace; symbol impact traversal is unsupported for vault-scoped results.",
+        workspace.label
+    );
+
+    ImpactResponse {
+        target: None,
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        affected_tests: empty_affected_tests(
+            Vec::new(),
+            "No affected-test hints: vault workspaces have no scoped symbols.",
+        ),
+        states: ImpactStates {
+            tier: "unsupported",
+            local: "unsupported",
+            org: "not-applicable",
+            freshness: "unknown",
+            timeout: "not-applicable",
+            permission: "not-applicable",
+            read_only: "not-applicable",
+            result: meta.trust.result.clone(),
+        },
+        meta,
+    }
+}
+
+fn out_of_scope_response(
+    workspace: &ResolvedWorkspace,
+    target: &Symbol,
+    limit: usize,
+) -> ImpactResponse {
+    let mut meta = workspaces::p1_meta_for_result_set(
+        workspace,
+        "no-match",
+        unsupported_capabilities(),
+        vec![P1Provenance::local_graph_store(
+            "workspace-scoped symbol membership validation",
+        )],
+        Some(limit),
+        0,
+        Some(0),
+    );
+    meta.trust.freshness = "current".to_string();
+    meta.trust.partial = true;
+    meta.trust.message = format!(
+        "{} impact has no match for symbol '{}' in the selected workspace; no out-of-scope impact data was returned.",
+        workspace.label, target.uid
+    );
+
+    ImpactResponse {
+        target: None,
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        affected_tests: empty_affected_tests(
+            vec![target.file_path.clone()],
+            "No affected-test hints: target symbol is outside the selected workspace.",
+        ),
+        states: ImpactStates {
+            tier: "local-only",
+            local: "available",
+            org: "org-unavailable",
+            freshness: "current",
+            timeout: "unknown",
+            permission: "unknown",
+            read_only: "unknown",
+            result: meta.trust.result.clone(),
+        },
+        meta,
+    }
 }
 
 fn target_graph_node(symbol: &Symbol) -> ImpactGraphNode {

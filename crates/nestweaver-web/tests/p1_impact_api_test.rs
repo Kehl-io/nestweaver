@@ -1,6 +1,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+use nestweaver_schema::{
+    EdgeType, Project, Repo, ResolvedEdge, Symbol, SymbolKind, Vault, Visibility,
+};
 use nestweaver_store::{GraphScope, GraphStore};
 use nestweaver_web::create_router;
 use nestweaver_web::state::AppState;
@@ -30,6 +32,15 @@ fn repo(uid: &str, name: &str, behind: u32) -> Repo {
         instance_id: "local".to_string(),
         name: Some(name.to_string()),
         root_path: Some(format!("/tmp/{name}")),
+    }
+}
+
+fn project(uid: &str, name: &str) -> Project {
+    Project {
+        uid: uid.to_string(),
+        name: name.to_string(),
+        summary: Some(format!("{name} workspace")),
+        instance_id: "local".to_string(),
     }
 }
 
@@ -69,13 +80,15 @@ fn calls_edge(source_uid: &str, target_uid: &str, confidence: f32) -> ResolvedEd
 
 fn make_app() -> axum::Router {
     let store = GraphStore::in_memory().unwrap();
-    let repo = repo("repo:impact", "impact", 2);
-    store.insert_repo(&repo).unwrap();
+    let impact_repo = repo("repo:impact", "impact", 2);
+    let other_repo = repo("repo:other", "other", 0);
+    store.insert_repo(&impact_repo).unwrap();
+    store.insert_repo(&other_repo).unwrap();
 
     store
         .insert_symbol(&symbol(
             "sym:impact:target",
-            &repo.uid,
+            &impact_repo.uid,
             "target_logic",
             "src/target.rs",
             10,
@@ -84,7 +97,7 @@ fn make_app() -> axum::Router {
     store
         .insert_symbol(&symbol(
             "sym:impact:caller",
-            &repo.uid,
+            &impact_repo.uid,
             "caller_logic",
             "src/caller.rs",
             20,
@@ -93,10 +106,19 @@ fn make_app() -> axum::Router {
     store
         .insert_symbol(&symbol(
             "sym:impact:test",
-            &repo.uid,
+            &impact_repo.uid,
             "target_logic_test",
             "tests/target_logic_test.rs",
             30,
+        ))
+        .unwrap();
+    store
+        .insert_symbol(&symbol(
+            "sym:other:caller",
+            &other_repo.uid,
+            "other_caller",
+            "src/other_caller.rs",
+            40,
         ))
         .unwrap();
     store
@@ -104,6 +126,30 @@ fn make_app() -> axum::Router {
         .unwrap();
     store
         .insert_edge(&calls_edge("sym:impact:test", "sym:impact:caller", 0.8))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge("sym:other:caller", "sym:impact:target", 0.95))
+        .unwrap();
+
+    let project = project("proj:impact-core", "Impact Core");
+    store.insert_project(&project).unwrap();
+    store
+        .batch_insert_project_symbol_edges(
+            &project.uid,
+            &[
+                "sym:impact:target".to_string(),
+                "sym:impact:caller".to_string(),
+            ],
+            1.0,
+        )
+        .unwrap();
+    store
+        .insert_vault(&Vault {
+            uid: "vlt:impact-notes".to_string(),
+            name: "Impact Notes".to_string(),
+            root_path: "/tmp/impact-notes".to_string(),
+            instance_id: "local".to_string(),
+        })
         .unwrap();
     store
         .compute_pagerank(0.85, 20, &GraphScope::code_only())
@@ -188,15 +234,17 @@ async fn p1_impact_returns_layered_envelope_with_tests_evidence_and_meta() {
     );
 
     assert_eq!(json["states"]["tier"], "local-only");
-    assert_eq!(json["states"]["org"], "unavailable");
+    assert_eq!(json["states"]["org"], "org-unavailable");
     assert_eq!(json["states"]["freshness"], "stale");
-    assert_eq!(json["states"]["timeout"], "not-timed-out");
-    assert_eq!(json["states"]["permission"], "not-requested");
-    assert_eq!(json["states"]["read_only"], "not-read-only");
+    assert_eq!(json["states"]["timeout"], "unknown");
+    assert_eq!(json["states"]["permission"], "unknown");
+    assert_eq!(json["states"]["read_only"], "unknown");
+    assert_eq!(json["states"]["result"], "partial");
 
     assert_eq!(json["_meta"]["workspace_type"], "repo");
     assert_eq!(json["_meta"]["trust"]["federation"], "local-only");
     assert_eq!(json["_meta"]["trust"]["freshness"], "stale");
+    assert_eq!(json["_meta"]["trust"]["result"], "partial");
     assert!(
         json["_meta"]["trust"]["unsupported"]
             .as_array()
@@ -204,5 +252,92 @@ async fn p1_impact_returns_layered_envelope_with_tests_evidence_and_meta() {
             .iter()
             .any(|item| item == "org-wide-impact"),
         "meta should disclose unavailable org-wide/two-tier impact"
+    );
+    assert!(
+        !nodes.iter().any(|node| node["uid"] == "sym:other:caller"),
+        "repo-scoped impact should not include callers from another repo"
+    );
+}
+
+#[tokio::test]
+async fn p1_impact_project_scope_filters_symbols_and_affected_tests() {
+    let app = make_app();
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/impact/sym:impact:target?depth=3&confidence=0.3&workspace=project:proj:impact-core",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["_meta"]["workspace_type"], "project");
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "project-scoped");
+    assert_eq!(json["states"]["result"], "partial");
+
+    let nodes = json["nodes"].as_array().expect("nodes should be an array");
+    assert!(
+        nodes.iter().any(|node| node["uid"] == "sym:impact:caller"),
+        "project-scoped impact should include project member callers"
+    );
+    assert!(
+        !nodes
+            .iter()
+            .any(|node| { node["uid"] == "sym:impact:test" || node["uid"] == "sym:other:caller" }),
+        "project-scoped impact should exclude symbols outside the project membership"
+    );
+    assert!(
+        json["affected_tests"]["tier_2"]
+            .as_array()
+            .expect("tier_2 should be an array")
+            .is_empty(),
+        "project-scoped affected tests should not leak non-project test symbols"
+    );
+}
+
+#[tokio::test]
+async fn p1_impact_repo_scope_returns_no_match_for_out_of_scope_target() {
+    let app = make_app();
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/impact/sym:other:caller?depth=3&confidence=0.3&workspace=repo:repo:impact",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["target"].is_null());
+    assert!(json["nodes"].as_array().unwrap().is_empty());
+    assert!(json["edges"].as_array().unwrap().is_empty());
+    assert_eq!(json["_meta"]["workspace_type"], "repo");
+    assert_eq!(json["_meta"]["trust"]["result"], "no-match");
+    assert_eq!(json["states"]["result"], "no-match");
+    assert!(
+        json["_meta"]["trust"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no out-of-scope impact data was returned"),
+        "out-of-scope target should be explicit"
+    );
+}
+
+#[tokio::test]
+async fn p1_impact_vault_scope_is_explicitly_unsupported() {
+    let app = make_app();
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/impact/sym:impact:target?depth=3&confidence=0.3&workspace=vault:vlt:impact-notes",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["target"].is_null());
+    assert!(json["nodes"].as_array().unwrap().is_empty());
+    assert_eq!(json["_meta"]["workspace_type"], "vault");
+    assert_eq!(json["_meta"]["trust"]["result"], "unsupported");
+    assert_eq!(json["_meta"]["trust"]["freshness"], "unknown");
+    assert_eq!(json["states"]["tier"], "unsupported");
+    assert_eq!(json["states"]["timeout"], "not-applicable");
+    assert!(
+        json["_meta"]["trust"]["unsupported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "two-tier-impact"),
+        "vault-scoped unsupported impact should still disclose unavailable two-tier state"
     );
 }

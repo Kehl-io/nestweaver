@@ -1,5 +1,9 @@
 import { useMemo, useState } from "react";
 import { ArrowDownUp } from "lucide-react";
+import type {
+  AffectedTestsResult,
+  ImpactLensStates,
+} from "../../api/impactLens";
 import { useStore } from "../../stores";
 import type {
   BacklinkResultState,
@@ -110,7 +114,9 @@ function relationshipForNode(
   }
   if (lower.includes("impact")) {
     const depth = graph.getNodeAttribute(uid, "depth") as number | undefined;
-    const edgeType = graph.getNodeAttribute(uid, "edge_type") as string | undefined;
+    const edgeType =
+      (graph.getNodeAttribute(uid, "edgeType") as string | undefined) ||
+      (graph.getNodeAttribute(uid, "edge_type") as string | undefined);
     return [
       depth != null ? `impact depth ${depth}` : "impact candidate",
       edgeType ? `via ${edgeType}` : null,
@@ -414,6 +420,145 @@ function unsupportedRows(
   }));
 }
 
+function graphAttribute<T>(graph: GraphInstance, name: string): T | null {
+  const value = graph.getAttribute(name) as T | undefined;
+  return value ?? null;
+}
+
+function affectedTestCount(tests: AffectedTestsResult): number {
+  return [...tests.tier_1, ...tests.tier_2, ...tests.tier_3].reduce(
+    (count, file) => count + file.tests.length,
+    0,
+  );
+}
+
+function affectedTestRows(
+  tests: AffectedTestsResult | null,
+  startOrder: number,
+  status: string,
+): ResultRow[] {
+  if (!tests) {
+    return [{
+      id: "impact-tests-unavailable",
+      order: startOrder,
+      uid: null,
+      primary: "Affected-test hints unavailable",
+      kind: "Affected tests",
+      relationship: "No affected-test metadata is loaded for this impact result.",
+      status,
+      location: "",
+      metadata: "Impact graph attributes do not include affectedTests.",
+    }];
+  }
+
+  const rows: ResultRow[] = [{
+    id: "impact-tests-summary",
+    order: startOrder,
+    uid: null,
+    primary: "Affected-test summary",
+    kind: "Affected tests",
+    relationship: tests.summary,
+    status,
+    location: tests.changed_files.join(", "),
+    metadata: tests.disclaimer,
+  }];
+
+  const tiers: Array<[keyof Pick<AffectedTestsResult, "tier_1" | "tier_2" | "tier_3">, string]> = [
+    ["tier_1", "Tier 1"],
+    ["tier_2", "Tier 2"],
+    ["tier_3", "Tier 3"],
+  ];
+
+  for (const [key, label] of tiers) {
+    for (const file of tests[key]) {
+      rows.push({
+        id: `impact-test:${key}:${file.symbol_uid}:${file.test_file}`,
+        order: startOrder + rows.length,
+        uid: file.symbol_uid,
+        primary: file.test_file,
+        kind: "Affected test",
+        relationship: `${label} static affected-test hint`,
+        status,
+        location: file.test_file,
+        metadata: [
+          file.tests.length > 0 ? `tests ${file.tests.join(", ")}` : null,
+          `confidence ${file.confidence.toFixed(2)}`,
+        ].filter(Boolean).join(", "),
+      });
+    }
+  }
+
+  if (affectedTestCount(tests) === 0) {
+    rows.push({
+      id: "impact-tests-empty",
+      order: startOrder + rows.length,
+      uid: null,
+      primary: "No affected tests returned",
+      kind: "Affected tests",
+      relationship: "Static affected-test analysis returned no scoped test hints.",
+      status,
+      location: tests.changed_files.join(", "),
+      metadata: tests.disclaimer,
+    });
+  }
+
+  return rows;
+}
+
+function impactRows(
+  graph: GraphInstance | null,
+  activeLensLabel: string,
+  targetUid: string | null | undefined,
+  trustResult: string,
+): ResultRow[] {
+  if (!graph) {
+    return graphRows(graph, activeLensLabel, targetUid, trustResult);
+  }
+
+  const states = graphAttribute<ImpactLensStates>(graph, "impactStates");
+  const tests = graphAttribute<AffectedTestsResult>(graph, "affectedTests");
+  if (!states && !tests) {
+    return graphRows(graph, activeLensLabel, targetUid, trustResult);
+  }
+
+  const rows: ResultRow[] = [];
+  if (states) {
+    ([
+      ["tier", "Impact tier", states.tier],
+      ["local", "Local impact", states.local],
+      ["org", "Org impact", states.org],
+      ["freshness", "Freshness", states.freshness],
+      ["timeout", "Timeout state", states.timeout],
+      ["permission", "Permission state", states.permission],
+      ["read_only", "Read-only state", states.read_only],
+      ["result", "Result", states.result],
+    ] as const).forEach(([key, label, value]) => {
+      rows.push({
+        id: `impact-state:${key}`,
+        order: rows.length,
+        uid: null,
+        primary: label,
+        kind: "Impact state",
+        relationship: value,
+        status: states.result,
+        location: "",
+        metadata: key === "org"
+          ? "Org-wide and two-tier continuation state from the impact response."
+          : "Impact response trust state.",
+      });
+    });
+  }
+
+  rows.push(...affectedTestRows(tests, rows.length, states?.result ?? trustResult));
+
+  if (graph.order > 0) {
+    const nodeRows = graphRows(graph, activeLensLabel, targetUid, states?.result ?? trustResult);
+    rows.push(...nodeRows.map((row) => ({ ...row, order: rows.length + row.order })));
+  }
+
+  return rows;
+}
+
 export function NodeListView() {
   const graphInstance = useStore((s) => s.graphInstance);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
@@ -452,6 +597,9 @@ export function NodeListView() {
       return directBacklinks;
     }
     if (gapActive || lowerLabel.includes("dead code")) return gapRows(gapItems);
+    if (activeLens.lens === "impact" || lowerLabel.includes("impact")) {
+      return impactRows(graphInstance, activeLens.label, activeLens.targetUid, trustResult);
+    }
     if (
       activeLens.lens === "unsupported" ||
       lowerLabel.includes("contract drift") ||
