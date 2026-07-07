@@ -312,6 +312,13 @@ Acceptance criteria:
 - E2E covers Impact lens trust metadata and deep-link restore.
 - Test failures are reported as issues; testing agents do not fix source.
 
+Issue remediation discovered during verification:
+- `graph-explorer.spec.ts` needs P1-aware mode-tab locators because the new breadcrumb lens button also has the accessible name `Overview`.
+- `ui-p0-foundation.spec.ts` needs the P1 table/list representation role expectation; list/table is now a region named `Node table view`.
+- Remediation files owned by the fix sub-agent:
+  - `crates/nestweaver-web/frontend/e2e/graph-explorer.spec.ts`
+  - `crates/nestweaver-web/frontend/e2e/ui-p0-foundation.spec.ts`
+
 ### Task 8 - P1 Documentation Links
 
 Status: pending
