@@ -51,24 +51,24 @@ impl EmbeddingIndex {
     /// already stored, the entire index is cleared on the first mismatch so
     /// the new dimension becomes authoritative — this is the model-switch path.
     pub fn add(&mut self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
-        if let Some(existing) = self.embeddings.values().next() {
-            if embedding.len() != existing.len() {
-                if force {
-                    tracing::info!(
-                        old_dim = existing.len(),
-                        new_dim = embedding.len(),
-                        "dimension change detected with --force; clearing index for model switch"
-                    );
-                    self.embeddings.clear();
-                } else {
-                    tracing::warn!(
-                        uid,
-                        got = embedding.len(),
-                        expected = existing.len(),
-                        "skipping embedding with mismatched dimension (re-embed with --force to switch models)"
-                    );
-                    return false;
-                }
+        if let Some(existing) = self.embeddings.values().next()
+            && embedding.len() != existing.len()
+        {
+            if force {
+                tracing::info!(
+                    old_dim = existing.len(),
+                    new_dim = embedding.len(),
+                    "dimension change detected with --force; clearing index for model switch"
+                );
+                self.embeddings.clear();
+            } else {
+                tracing::warn!(
+                    uid,
+                    got = embedding.len(),
+                    expected = existing.len(),
+                    "skipping embedding with mismatched dimension (re-embed with --force to switch models)"
+                );
+                return false;
             }
         }
         self.embeddings.insert(uid.to_string(), embedding);
@@ -508,7 +508,11 @@ mod tests {
         // Force with new dimension clears existing entries
         assert!(idx.add("sym:c", vec![1.0_f32, 0.0], true));
         assert_eq!(idx.len(), 1, "force should clear old entries");
-        assert_eq!(idx.dimension(), Some(2), "dimension should switch to new model's");
+        assert_eq!(
+            idx.dimension(),
+            Some(2),
+            "dimension should switch to new model's"
+        );
 
         // Subsequent adds with matching dimension work normally
         assert!(idx.add("sym:d", vec![0.0_f32, 1.0], false));

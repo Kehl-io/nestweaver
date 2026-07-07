@@ -4297,10 +4297,10 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
 
-    if let Ok(db_path) = current_db_path(store) {
-        if let Err(e) = nestweaver_engine::save_clusters(&db_path, &output) {
-            tracing::warn!("failed to persist clusters sidecar: {e}");
-        }
+    if let Ok(db_path) = current_db_path(store)
+        && let Err(e) = nestweaver_engine::save_clusters(&db_path, &output)
+    {
+        tracing::warn!("failed to persist clusters sidecar: {e}");
     }
 
     let clusters_json: Vec<Value> = output

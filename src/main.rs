@@ -12593,7 +12593,8 @@ fn run_embed(
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(&sym.uid, emb.clone(), force) {
+                                    if store.add_embedding_with_force(&sym.uid, emb.clone(), force)
+                                    {
                                         success_count += 1;
                                     } else {
                                         rejected_count += 1;
@@ -12636,7 +12637,8 @@ fn run_embed(
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(&note.uid, emb.clone(), force) {
+                                    if store.add_embedding_with_force(&note.uid, emb.clone(), force)
+                                    {
                                         success_count += 1;
                                     } else {
                                         rejected_count += 1;
