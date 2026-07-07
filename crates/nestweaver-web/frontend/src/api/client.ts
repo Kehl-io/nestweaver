@@ -5,7 +5,6 @@ import type {
   ContextResult,
   FlowNode,
   GapReport,
-  ImpactNode,
   Note,
   NoteDetail,
   OverviewResponse,
@@ -22,6 +21,7 @@ import type {
   UnlinkedMention,
   Vault,
 } from "./types";
+import { loadImpactLens } from "./impactLens";
 
 export class ApiError extends Error {
   status: number;
@@ -94,10 +94,8 @@ export const api = {
     return get<OverviewResponse>(`/api/v1/overview?limit=${limit}`);
   },
 
-  impact(uid: string, depth = 3, confidence = 0.5) {
-    return get<ImpactNode[]>(
-      `/api/v1/impact/${encodeURIComponent(uid)}?depth=${depth}&confidence=${confidence}`,
-    );
+  impact(uid: string, depth = 3, confidence = 0.3, workspaceId?: string | null) {
+    return loadImpactLens(uid, { depth, confidence, workspaceId });
   },
 
   repos() {
