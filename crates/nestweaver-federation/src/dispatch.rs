@@ -418,7 +418,13 @@ async fn dispatch_typed_hub_nodes(
     auth_token: Option<&str>,
 ) -> Result<Value> {
     let req = nestweaver_proto::HubNodesRequest {
-        top_n: params.get("top_n").and_then(|v| v.as_i64()).unwrap_or(10) as i32,
+        // The MCP schema advertises 'limit'; 'top_n' kept as a backward-compat
+        // alias (and it is the proto field name).
+        top_n: params
+            .get("limit")
+            .or_else(|| params.get("top_n"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(10) as i32,
         response_format: params
             .get("response_format")
             .and_then(|v| v.as_str())

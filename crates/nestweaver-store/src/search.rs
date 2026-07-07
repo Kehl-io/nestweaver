@@ -29,6 +29,15 @@ use crate::ranking::SeedResolutionConfig;
 /// ```
 pub struct EmbeddingIndex {
     embeddings: HashMap<String, Vec<f32>>, // uid -> embedding vector
+    /// Whether a `force` add has already cleared this index for a dimension
+    /// switch. A model switch flips the dimension exactly once; a second flip
+    /// in the same run means the embedding source is emitting mixed dimensions
+    /// (e.g. a mid-run fallback to a different model) — clearing again would
+    /// wipe everything embedded so far, so those vectors are rejected instead.
+    /// Reset via [`reset_force_guard`] at the start of each embed run.
+    ///
+    /// [`reset_force_guard`]: EmbeddingIndex::reset_force_guard
+    force_cleared: bool,
 }
 
 impl Default for EmbeddingIndex {
@@ -41,26 +50,39 @@ impl EmbeddingIndex {
     pub fn new() -> Self {
         Self {
             embeddings: HashMap::new(),
+            force_cleared: false,
         }
     }
 
     /// Insert an embedding. Returns `true` if accepted, `false` if rejected
-    /// due to a dimension mismatch (when `force` is false).
+    /// due to a dimension mismatch (when `force` is false, or when `force`
+    /// already cleared the index once this run).
     ///
     /// When `force` is true and the incoming dimension differs from what's
     /// already stored, the entire index is cleared on the first mismatch so
     /// the new dimension becomes authoritative — this is the model-switch path.
+    /// The clear happens at most once per run (see `force_cleared`).
     pub fn add(&mut self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
         if let Some(existing) = self.embeddings.values().next()
             && embedding.len() != existing.len()
         {
-            if force {
+            if force && !self.force_cleared {
                 tracing::info!(
                     old_dim = existing.len(),
                     new_dim = embedding.len(),
                     "dimension change detected with --force; clearing index for model switch"
                 );
                 self.embeddings.clear();
+                self.force_cleared = true;
+            } else if force {
+                tracing::warn!(
+                    uid,
+                    got = embedding.len(),
+                    expected = existing.len(),
+                    "rejecting embedding: index was already force-cleared once this run; \
+                     the embedding source is emitting mixed dimensions"
+                );
+                return false;
             } else {
                 tracing::warn!(
                     uid,
@@ -75,6 +97,13 @@ impl EmbeddingIndex {
         true
     }
 
+    /// Re-arm the force-clear guard. Call at the start of an embed run so a
+    /// long-lived index (the daemon's) can honor a later, separate model
+    /// switch while still refusing mixed dimensions within one run.
+    pub fn reset_force_guard(&mut self) {
+        self.force_cleared = false;
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), anyhow::Error> {
         let json = serde_json::to_string(&self.embeddings)?;
         std::fs::write(path, json)?;
@@ -84,7 +113,10 @@ impl EmbeddingIndex {
     pub fn load(path: &Path) -> Result<Self, anyhow::Error> {
         let json = std::fs::read_to_string(path)?;
         let embeddings: HashMap<String, Vec<f32>> = serde_json::from_str(&json)?;
-        Ok(Self { embeddings })
+        Ok(Self {
+            embeddings,
+            force_cleared: false,
+        })
     }
 
     // -- Binary persistence -------------------------------------------------
@@ -176,7 +208,10 @@ impl EmbeddingIndex {
             embeddings.insert(uid, vec);
         }
 
-        Ok(Self { embeddings })
+        Ok(Self {
+            embeddings,
+            force_cleared: false,
+        })
     }
 
     /// Return the top-`limit` (uid, similarity) pairs sorted descending.
@@ -517,6 +552,38 @@ mod tests {
         // Subsequent adds with matching dimension work normally
         assert!(idx.add("sym:d", vec![0.0_f32, 1.0], false));
         assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn add_force_clears_at_most_once_per_run() {
+        // A mixed-dimension source under --force must not ping-pong-wipe the
+        // index: the first flip is a legitimate model switch, a second flip in
+        // the same run means the source is emitting mixed dimensions and its
+        // vectors must be rejected, not honored with another clear.
+        let mut idx = EmbeddingIndex::new();
+        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false); // dim 3
+        assert!(idx.add("sym:b", vec![1.0_f32, 0.0], true)); // dim 2: first clear
+        assert!(idx.add("sym:c", vec![0.0_f32, 1.0], true)); // dim 2: normal add
+        assert_eq!(idx.len(), 2);
+
+        // dim-3 straggler (e.g. a mid-run fallback model) — rejected, no wipe
+        assert!(!idx.add("sym:d", vec![1.0_f32, 0.0, 0.0], true));
+        assert_eq!(idx.len(), 2, "second flip must not clear again");
+        assert_eq!(idx.dimension(), Some(2));
+    }
+
+    #[test]
+    fn reset_force_guard_allows_a_later_model_switch() {
+        // The daemon's index outlives embed runs; a fresh run re-arms the
+        // guard so a second deliberate model switch works.
+        let mut idx = EmbeddingIndex::new();
+        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false); // dim 3
+        assert!(idx.add("sym:b", vec![1.0_f32, 0.0], true)); // switch to dim 2
+
+        idx.reset_force_guard();
+        assert!(idx.add("sym:c", vec![1.0_f32, 0.0, 0.0], true)); // switch back to dim 3
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.dimension(), Some(3));
     }
 
     #[test]

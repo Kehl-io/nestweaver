@@ -3214,6 +3214,11 @@ impl NestWeaverDaemon for DaemonService {
             let result = tokio::task::spawn_blocking(move || {
                 let mut succeeded = 0u32;
                 let mut failed = 0u32;
+                let mut rejected = 0u32;
+
+                // Each embed run may legitimately force-switch the model once;
+                // re-arm the once-per-run clear guard on this long-lived index.
+                store.reset_embedding_force_guard();
 
                 if do_symbols && let Ok(symbols) = store.list_all_symbols() {
                     let to_embed: Vec<_> = if force {
@@ -3233,7 +3238,7 @@ impl NestWeaverDaemon for DaemonService {
                                     if store.add_embedding_with_force(&sym.uid, emb, force) {
                                         succeeded += 1;
                                     } else {
-                                        failed += 1;
+                                        rejected += 1;
                                     }
                                 }
                                 Err(e) => {
@@ -3260,7 +3265,7 @@ impl NestWeaverDaemon for DaemonService {
                                     if store.add_embedding_with_force(&note.uid, emb, force) {
                                         succeeded += 1;
                                     } else {
-                                        failed += 1;
+                                        rejected += 1;
                                     }
                                 }
                                 Err(e) => {
@@ -3287,7 +3292,7 @@ impl NestWeaverDaemon for DaemonService {
                                     if store.add_embedding_with_force(&heading.uid, emb, force) {
                                         succeeded += 1;
                                     } else {
-                                        failed += 1;
+                                        rejected += 1;
                                     }
                                 }
                                 Err(e) => {
@@ -3305,8 +3310,12 @@ impl NestWeaverDaemon for DaemonService {
                     tracing::warn!("failed to flush embedding index: {e}");
                 }
 
-                tracing::info!(succeeded, failed, "embed RPC completed");
-                Ok::<_, Status>(EmbedResponse { succeeded, failed })
+                tracing::info!(succeeded, failed, rejected, "embed RPC completed");
+                Ok::<_, Status>(EmbedResponse {
+                    succeeded,
+                    failed,
+                    rejected,
+                })
             })
             .await
             .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?;

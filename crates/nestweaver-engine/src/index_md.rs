@@ -1526,14 +1526,21 @@ impl<'a> WikilinkLookup<'a> {
         }
     }
 
-    /// Apply the 5-priority resolution scheme to `target`.
+    /// Apply the priority resolution scheme to `target`. Confidence decreases
+    /// monotonically down the chain — an earlier (more authoritative) tier
+    /// must never score below a later one, so downstream consumers can
+    /// threshold on confidence without inverting the resolver's own ordering.
     ///
-    /// 1. Path match: target contains `/` and matches a known path (lowercased,
-    ///    with/without `.md`) → confidence 1.0.
-    /// 2. Unique title match → confidence 1.0.
-    /// 3. Alias match → confidence 0.7.
-    /// 4. Same-folder match (title scoped to source's folder) → confidence 0.5.
-    /// 5. Ambiguous (multiple title/alias matches) → split confidence 1/N.
+    /// - Priority 1: path match — target contains `/` and matches a known
+    ///   path (lowercased, with/without `.md`) → confidence 1.0.
+    /// - Priority 2: unique title match → confidence 1.0.
+    /// - Priority 3: same-folder match (filename stem or title scoped to the
+    ///   source's folder) → confidence 0.95.
+    /// - Priority 3b: unique global filename-stem match (Obsidian
+    ///   shortest-path) → confidence 0.9.
+    /// - Priority 4: alias match → unique 0.7, ambiguous split.
+    /// - Priority 5: ambiguous title match → same-folder narrowing 0.5,
+    ///   otherwise split across all candidates.
     fn resolve(&self, target: &str, source_folder: &str) -> ResolveOutcome {
         let key = target.trim().replace('\\', "/").to_lowercase();
         if key.is_empty() {
@@ -1574,7 +1581,9 @@ impl<'a> WikilinkLookup<'a> {
         {
             return ResolveOutcome::Resolved(vec![ResolveCandidate {
                 note_uid: uids[0].to_string(),
-                confidence: 0.5,
+                // Must stay above priority 3b's 0.9: this tier outranks the
+                // global-stem match, and confidence must not invert priority.
+                confidence: 0.95,
             }]);
         }
 
@@ -2154,6 +2163,67 @@ sub b body
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(result.wikilinks_resolved, 1);
+    }
+
+    #[test]
+    fn global_stem_match_resolves_cross_folder_wikilink() {
+        // Obsidian shortest-path: [[Boost Billing]] from another folder must
+        // resolve to projects/Boost Billing.md by filename stem, even though
+        // the note's title differs and it declares no alias. This was the
+        // ~25%-resolution-rate bug: only title/alias/same-folder matched.
+        let (_dir, root) = make_vault(&[
+            ("projects/Boost Billing.md", "# Billing PRD\n\nbody\n"),
+            ("logs/daily.md", "# Daily\n\nShipped [[Boost Billing]].\n"),
+        ]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.wikilinks_unresolved, 0);
+    }
+
+    #[test]
+    fn same_folder_match_outranks_global_stem() {
+        // Two notes share the stem `target`; the source sits next to one of
+        // them. Same-folder (priority 3) must win over the global-stem tier
+        // and pick the sibling, not leave the link ambiguous.
+        let (_dir, root) = make_vault(&[
+            ("f/x.md", "# X\n\nSee [[target]].\n"),
+            ("f/target.md", "# Alpha\n\nbody\n"),
+            ("g/target.md", "# Beta\n\nbody\n"),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 1);
+
+        let notes = store.list_notes(None).unwrap();
+        let uid_of = |path_frag: &str| {
+            notes
+                .iter()
+                .find(|n| n.file_path.contains(path_frag))
+                .map(|n| n.uid.clone())
+                .unwrap()
+        };
+        let edges = store.note_wikilink_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].0, uid_of("f/x.md"));
+        assert_eq!(
+            edges[0].1,
+            uid_of("f/target.md"),
+            "same-folder sibling must beat the cross-folder stem match"
+        );
+    }
+
+    #[test]
+    fn ambiguous_global_stem_stays_unresolved() {
+        // Two notes share the stem and the source is in a third folder: no
+        // tier can break the tie, so the link must count as unresolved rather
+        // than guess.
+        let (_dir, root) = make_vault(&[
+            ("logs/daily.md", "# Daily\n\nSee [[target]].\n"),
+            ("f/target.md", "# Alpha\n\nbody\n"),
+            ("g/target.md", "# Beta\n\nbody\n"),
+        ]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(result.wikilinks_unresolved, 1);
     }
 
     #[test]

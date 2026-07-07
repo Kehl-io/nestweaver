@@ -1256,7 +1256,7 @@ enum Commands {
         model: Option<String>,
         #[arg(
             long,
-            default_value = "sentence-transformers/all-MiniLM-L6-v2",
+            default_value = nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID,
             help = "HuggingFace model ID for local inference"
         )]
         model_id: String,
@@ -12322,12 +12322,22 @@ fn run_embed(
     // NOT touch the daemon: connecting auto-starts one, whose held DB lock then
     // breaks the direct fallback with a confusing "could not set lock" error (and
     // leaks the daemon). Skip straight to the in-process path instead.
-    const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
     if use_daemon && endpoint.is_none() && !local {
-        if model_id != DEFAULT_MODEL_ID {
+        // The daemon embeds with the model recorded in the database (or the
+        // compiled-in default for a fresh DB) — it cannot honor a different
+        // --model-id, so bail early instead of silently embedding with the
+        // wrong model. Read the recorded model through a read-only open: the
+        // daemon may hold the write lock, and a missing/locked DB just falls
+        // back to the default (matching what the daemon would load).
+        let daemon_model = nestweaver_store::GraphStore::open_read_only(path)
+            .ok()
+            .and_then(|s| s.get_embedding_metadata().ok().flatten())
+            .map(|(recorded_model, _dim)| recorded_model)
+            .unwrap_or_else(|| nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID.to_string());
+        if model_id != daemon_model {
             anyhow::bail!(
                 "--model-id '{model_id}' cannot be honored through the daemon; \
-                 the daemon uses the model recorded in the database. \
+                 the daemon uses the model recorded in the database ('{daemon_model}'). \
                  Use --local --model-id '{model_id}' --force to switch models."
             );
         }
@@ -12338,11 +12348,20 @@ fn run_embed(
                 match rt.block_on(client.embed(scope, force, batch_size as u32)) {
                     Ok(resp) => {
                         let elapsed = t0.elapsed();
+                        if resp.rejected > 0 {
+                            eprintln!(
+                                "Error: {} embedding(s) rejected due to dimension mismatch. \
+                                 Use --force to switch models (clears existing embeddings).",
+                                resp.rejected
+                            );
+                        }
                         if stats {
                             eprintln!(
-                                "Embed stats: {} succeeded, {} failed, {:.2}s elapsed",
+                                "Embed stats: {} succeeded, {} failed, \
+                                 {} rejected (dim mismatch), {:.2}s elapsed",
                                 resp.succeeded,
                                 resp.failed,
+                                resp.rejected,
                                 elapsed.as_secs_f64()
                             );
                         } else {
@@ -12351,7 +12370,7 @@ fn run_embed(
                                 resp.succeeded, resp.failed
                             );
                         }
-                        return if resp.failed > 0 {
+                        return if resp.failed > 0 || resp.rejected > 0 {
                             Ok(EXIT_ERROR)
                         } else {
                             Ok(EXIT_SUCCESS)

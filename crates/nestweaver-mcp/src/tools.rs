@@ -4297,6 +4297,11 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
 
+    // Persist so hub_nodes/bridge_nodes can read the sidecar afterwards.
+    // Deliberate exception to "reads don't write": `clusters` is not in
+    // MUTATING_TOOLS, so this runs under the daemon's read guard — but it
+    // only writes derived cache data to a fixed sidecar path, never graph
+    // state, and degrades to warn-only (e.g. on a read-only filesystem).
     if let Ok(db_path) = current_db_path(store)
         && let Err(e) = nestweaver_engine::save_clusters(&db_path, &output)
     {
@@ -6263,7 +6268,13 @@ pub fn dispatch_via_daemon(
             "hub_nodes" => {
                 use nestweaver_proto::HubNodesRequest;
                 let req = tonic::Request::new(HubNodesRequest {
-                    top_n: i32_field("top_n"),
+                    // The schema advertises 'limit'; 'top_n' kept as a
+                    // backward-compat alias (and it is the proto field name).
+                    top_n: args
+                        .get("limit")
+                        .or_else(|| args.get("top_n"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0) as i32,
                     response_format: str_field("response_format"),
                 });
                 let resp = client
@@ -7239,5 +7250,45 @@ mod tool_doc_tests {
         for (name, cat, _, _) in &entries {
             assert_ne!(cat, "Other", "tool {name} is missing a category assignment");
         }
+    }
+}
+
+// The v2.2.1 schema renames (top_n → limit, files → changed_files) keep the
+// old names as runtime aliases. These tests pin both spellings on the
+// store-direct handlers; the daemon dispatch mappings (dispatch_via_daemon,
+// nestweaver-federation) forward 'limit' into the proto's top_n field.
+#[cfg(test)]
+mod arg_alias_tests {
+    use super::*;
+
+    #[test]
+    fn hub_nodes_accepts_limit_and_top_n_alias() {
+        let store = GraphStore::in_memory().unwrap();
+        let via_limit = tool_hub_nodes(&store, json!({ "limit": 5 })).unwrap();
+        assert_eq!(via_limit["top_n"], json!(5));
+        let via_alias = tool_hub_nodes(&store, json!({ "top_n": 7 })).unwrap();
+        assert_eq!(via_alias["top_n"], json!(7));
+        let default = tool_hub_nodes(&store, json!({})).unwrap();
+        assert_eq!(default["top_n"], json!(10));
+    }
+
+    #[test]
+    fn bridge_nodes_accepts_limit_and_top_n_alias() {
+        let store = GraphStore::in_memory().unwrap();
+        let via_limit = tool_bridge_nodes(&store, json!({ "limit": 5 })).unwrap();
+        assert_eq!(via_limit["top_n"], json!(5));
+        let via_alias = tool_bridge_nodes(&store, json!({ "top_n": 7 })).unwrap();
+        assert_eq!(via_alias["top_n"], json!(7));
+    }
+
+    #[test]
+    fn detect_changes_accepts_changed_files_and_files_alias() {
+        let store = GraphStore::in_memory().unwrap();
+        let via_new =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/a.rs"] })).unwrap();
+        assert_eq!(via_new["files"], json!(["src/a.rs"]));
+        let via_alias = tool_detect_changes(&store, json!({ "files": ["src/b.rs"] })).unwrap();
+        assert_eq!(via_alias["files"], json!(["src/b.rs"]));
+        assert!(tool_detect_changes(&store, json!({})).is_err());
     }
 }

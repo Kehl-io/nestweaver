@@ -462,6 +462,17 @@ impl GraphStore {
         idx.add(uid, embedding, force)
     }
 
+    /// Re-arm the embedding index's once-per-run force-clear guard. Call at
+    /// the start of an embed run — matters for long-lived stores (the daemon)
+    /// where the index outlives individual embed runs.
+    pub fn reset_embedding_force_guard(&self) {
+        let mut idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        idx.reset_force_guard();
+    }
+
     /// Check whether the embedding index already has an entry for `uid`.
     pub fn has_embedding(&self, uid: &str) -> bool {
         let idx = self
