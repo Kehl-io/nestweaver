@@ -62,6 +62,7 @@ impl EmbeddingIndex {
     /// already stored, the entire index is cleared on the first mismatch so
     /// the new dimension becomes authoritative — this is the model-switch path.
     /// The clear happens at most once per run (see `force_cleared`).
+    #[must_use = "a false return means the dimension guard rejected the embedding"]
     pub fn add(&mut self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
         if let Some(existing) = self.embeddings.values().next()
             && embedding.len() != existing.len()
@@ -535,8 +536,8 @@ mod tests {
     #[test]
     fn add_force_clears_index_on_dimension_change() {
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false);
-        idx.add("sym:b", vec![0.0_f32, 1.0, 0.0], false);
+        assert!(idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false));
+        assert!(idx.add("sym:b", vec![0.0_f32, 1.0, 0.0], false));
         assert_eq!(idx.len(), 2);
         assert_eq!(idx.dimension(), Some(3));
 
@@ -561,7 +562,7 @@ mod tests {
         // the same run means the source is emitting mixed dimensions and its
         // vectors must be rejected, not honored with another clear.
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false); // dim 3
+        assert!(idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false)); // dim 3
         assert!(idx.add("sym:b", vec![1.0_f32, 0.0], true)); // dim 2: first clear
         assert!(idx.add("sym:c", vec![0.0_f32, 1.0], true)); // dim 2: normal add
         assert_eq!(idx.len(), 2);
@@ -577,7 +578,7 @@ mod tests {
         // The daemon's index outlives embed runs; a fresh run re-arms the
         // guard so a second deliberate model switch works.
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false); // dim 3
+        assert!(idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false)); // dim 3
         assert!(idx.add("sym:b", vec![1.0_f32, 0.0], true)); // switch to dim 2
 
         idx.reset_force_guard();
@@ -593,7 +594,7 @@ mod tests {
         // guard). Before the query guard, `.zip()` truncated and returned a
         // plausible-but-wrong score.
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:right", vec![1.0_f32, 0.0, 0.0], false);
+        assert!(idx.add("sym:right", vec![1.0_f32, 0.0, 0.0], false));
         idx.embeddings
             .insert("sym:wrongdim".to_string(), vec![1.0_f32, 0.0]);
         let query = vec![1.0_f32, 0.0, 0.0];
@@ -621,9 +622,9 @@ mod tests {
     #[test]
     fn vector_search_cancellable_uncancelled_returns_results() {
         let mut idx = EmbeddingIndex::new();
-        idx.add("a", vec![1.0, 0.0, 0.0], false);
-        idx.add("b", vec![0.9, 0.1, 0.0], false);
-        idx.add("c", vec![0.0, 0.0, 1.0], false);
+        assert!(idx.add("a", vec![1.0, 0.0, 0.0], false));
+        assert!(idx.add("b", vec![0.9, 0.1, 0.0], false));
+        assert!(idx.add("c", vec![0.0, 0.0, 1.0], false));
 
         // Not cancelled → normal results.
         let live = idx
@@ -638,9 +639,9 @@ mod tests {
     #[test]
     fn vector_search_cancellable_returns_err_not_empty_on_cancel() {
         let mut idx = EmbeddingIndex::new();
-        idx.add("a", vec![1.0, 0.0, 0.0], false);
-        idx.add("b", vec![0.9, 0.1, 0.0], false);
-        idx.add("c", vec![0.0, 0.0, 1.0], false);
+        assert!(idx.add("a", vec![1.0, 0.0, 0.0], false));
+        assert!(idx.add("b", vec![0.9, 0.1, 0.0], false));
+        assert!(idx.add("c", vec![0.0, 0.0, 1.0], false));
 
         // Pre-cancelled over a NON-empty candidate set: a cancelled computation
         // is incomplete, not empty — it must surface as a distinct error so no
@@ -656,9 +657,9 @@ mod tests {
     #[test]
     fn vector_search_returns_most_similar() {
         let mut idx = EmbeddingIndex::new();
-        idx.add("a", vec![1.0, 0.0, 0.0], false);
-        idx.add("b", vec![0.9, 0.1, 0.0], false);
-        idx.add("c", vec![0.0, 0.0, 1.0], false);
+        assert!(idx.add("a", vec![1.0, 0.0, 0.0], false));
+        assert!(idx.add("b", vec![0.9, 0.1, 0.0], false));
+        assert!(idx.add("c", vec![0.0, 0.0, 1.0], false));
 
         let results = idx.vector_search(&[1.0, 0.0, 0.0], 2);
         assert_eq!(results.len(), 2);
@@ -670,7 +671,7 @@ mod tests {
     fn vector_search_limit_respected() {
         let mut idx = EmbeddingIndex::new();
         for i in 0..10 {
-            idx.add(&format!("sym:{i}"), vec![i as f32, 0.0], false);
+            assert!(idx.add(&format!("sym:{i}"), vec![i as f32, 0.0], false));
         }
         let results = idx.vector_search(&[1.0, 0.0], 3);
         assert_eq!(results.len(), 3);
@@ -684,7 +685,7 @@ mod tests {
         // Use an L2-normalized vector (vector_search assumes pre-normalized embeddings)
         let norm = (0.1_f32 * 0.1 + 0.2 * 0.2 + 0.3 * 0.3).sqrt();
         let v = vec![0.1 / norm, 0.2 / norm, 0.3 / norm];
-        idx.add("sym:test", v.clone(), false);
+        assert!(idx.add("sym:test", v.clone(), false));
         idx.save(&path).unwrap();
 
         let loaded = EmbeddingIndex::load(&path).unwrap();
@@ -760,9 +761,9 @@ mod tests {
         let path = dir.path().join("embeddings.bin");
 
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:alpha", vec![0.1, 0.2, 0.3], false);
-        idx.add("sym:beta", vec![0.4, 0.5, 0.6], false);
-        idx.add("sym:gamma", vec![0.7, 0.8, 0.9], false);
+        assert!(idx.add("sym:alpha", vec![0.1, 0.2, 0.3], false));
+        assert!(idx.add("sym:beta", vec![0.4, 0.5, 0.6], false));
+        assert!(idx.add("sym:gamma", vec![0.7, 0.8, 0.9], false));
         idx.save_binary(&path).unwrap();
 
         let loaded = EmbeddingIndex::load_binary(&path).unwrap();
@@ -825,8 +826,8 @@ mod tests {
 
         let mut idx = EmbeddingIndex::new();
         // farewell gets a perfect embedding match; greet gets a distant one
-        idx.add("sym:farewell", vec![1.0, 0.0, 0.0], false);
-        idx.add("sym:greet", vec![0.0, 1.0, 0.0], false);
+        assert!(idx.add("sym:farewell", vec![1.0, 0.0, 0.0], false));
+        assert!(idx.add("sym:greet", vec![0.0, 1.0, 0.0], false));
 
         let query_vec = [1.0_f32, 0.0, 0.0];
         let results = store

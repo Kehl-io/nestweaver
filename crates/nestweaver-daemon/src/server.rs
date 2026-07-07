@@ -511,8 +511,11 @@ impl DaemonService {
                     );
                     match model.embed_query(&text) {
                         Ok(emb) => {
-                            store.add_embedding(&sym.uid, emb);
-                            embedded += 1;
+                            // Dimension-guard rejections must not count as
+                            // embedded (add_embedding logs them).
+                            if store.add_embedding(&sym.uid, emb) {
+                                embedded += 1;
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
@@ -535,8 +538,9 @@ impl DaemonService {
                     let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
                     match model.embed_query(&text) {
                         Ok(emb) => {
-                            store.add_embedding(&note.uid, emb);
-                            embedded += 1;
+                            if store.add_embedding(&note.uid, emb) {
+                                embedded += 1;
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(uid = %note.uid, "embedding failed: {e}");
@@ -559,8 +563,9 @@ impl DaemonService {
                     let text = nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
                     match model.embed_query(&text) {
                         Ok(emb) => {
-                            store.add_embedding(&heading.uid, emb);
-                            embedded += 1;
+                            if store.add_embedding(&heading.uid, emb) {
+                                embedded += 1;
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(uid = %heading.uid, "embedding failed: {e}");

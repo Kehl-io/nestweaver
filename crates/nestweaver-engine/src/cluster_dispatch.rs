@@ -190,11 +190,22 @@ pub fn sidecar_path(db_path: &Path) -> PathBuf {
 }
 
 /// Persist clustering output to the sidecar file.
+///
+/// Writes to a process-unique temp file and renames into place, so a
+/// concurrent `load_clusters` (e.g. `hub_nodes` racing a `clusters` call)
+/// never observes a partially-written file. Concurrent writers resolve to
+/// last-writer-wins — acceptable because the output is deterministic for a
+/// given graph state.
 pub fn save_clusters(db_path: &Path, output: &ClusteringOutput) -> Result<()> {
     let path = sidecar_path(db_path);
     let json =
         serde_json::to_string_pretty(output).context("failed to serialize clustering output")?;
-    fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("failed to move {} into place", path.display()));
+    }
     Ok(())
 }
 

@@ -450,10 +450,15 @@ impl GraphStore {
 
     /// Add an embedding to the in-memory index without saving to disk.
     /// Use `flush_embedding_index` after a batch of additions to persist.
+    ///
+    /// Returns `false` when the dimension guard rejects the vector — callers
+    /// must not count a rejected embedding as stored.
+    #[must_use = "a false return means the dimension guard rejected the embedding"]
     pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) -> bool {
         self.add_embedding_with_force(uid, embedding, false)
     }
 
+    #[must_use = "a false return means the dimension guard rejected the embedding"]
     pub fn add_embedding_with_force(&self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
         let mut idx = self
             .embedding_index

@@ -12327,11 +12327,23 @@ fn run_embed(
         // compiled-in default for a fresh DB) — it cannot honor a different
         // --model-id, so bail early instead of silently embedding with the
         // wrong model. Read the recorded model through a read-only open: the
-        // daemon may hold the write lock, and a missing/locked DB just falls
-        // back to the default (matching what the daemon would load).
-        let daemon_model = nestweaver_store::GraphStore::open_read_only(path)
-            .ok()
-            .and_then(|s| s.get_embedding_metadata().ok().flatten())
+        // daemon may hold the write lock. A missing DB legitimately falls back
+        // to the default (that is what the daemon would load); a DB that
+        // exists but cannot be read gets a warning, because comparing against
+        // the default could then produce a spurious "cannot honor" error.
+        let recorded_model = match nestweaver_store::GraphStore::open_read_only(path) {
+            Ok(store) => store.get_embedding_metadata().ok().flatten(),
+            Err(e) => {
+                if path.exists() {
+                    eprintln!(
+                        "Warning: could not read the recorded embedding model ({e:#}); \
+                         assuming the default model"
+                    );
+                }
+                None
+            }
+        };
+        let daemon_model = recorded_model
             .map(|(recorded_model, _dim)| recorded_model)
             .unwrap_or_else(|| nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID.to_string());
         if model_id != daemon_model {
