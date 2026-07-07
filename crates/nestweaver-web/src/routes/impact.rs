@@ -486,36 +486,6 @@ fn build_layered_edges(
         }
     }
 
-    let mut has_edge_for: std::collections::HashSet<String> =
-        edges.iter().map(|edge| edge.source.clone()).collect();
-    let mut previous_by_layer: HashMap<u32, &ImpactNode> = HashMap::new();
-    for node in nodes {
-        previous_by_layer.entry(node.depth).or_insert(node);
-    }
-    for node in nodes {
-        if has_edge_for.contains(&node.uid) {
-            continue;
-        }
-        let fallback_target = if node.depth <= 1 {
-            Some((target_uid, 0))
-        } else {
-            previous_by_layer
-                .get(&(node.depth - 1))
-                .map(|parent| (parent.uid.as_str(), parent.depth))
-        };
-        if let Some((fallback_uid, fallback_layer)) = fallback_target {
-            edges.push(ImpactGraphEdge {
-                source: node.uid.clone(),
-                target: fallback_uid.to_string(),
-                edge_type: node.edge_type.clone(),
-                confidence: node.confidence,
-                source_layer: node.depth,
-                target_layer: fallback_layer,
-            });
-            has_edge_for.insert(node.uid.clone());
-        }
-    }
-
     edges.sort_by(|left, right| {
         left.source
             .cmp(&right.source)

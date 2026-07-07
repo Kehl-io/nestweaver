@@ -122,6 +122,24 @@ fn make_app() -> axum::Router {
         ))
         .unwrap();
     store
+        .insert_symbol(&symbol(
+            "sym:other:bridge",
+            &other_repo.uid,
+            "external_bridge",
+            "src/external_bridge.rs",
+            50,
+        ))
+        .unwrap();
+    store
+        .insert_symbol(&symbol(
+            "sym:impact:through-external",
+            &impact_repo.uid,
+            "through_external_bridge",
+            "src/through_external_bridge.rs",
+            60,
+        ))
+        .unwrap();
+    store
         .insert_edge(&calls_edge("sym:impact:caller", "sym:impact:target", 0.9))
         .unwrap();
     store
@@ -129,6 +147,16 @@ fn make_app() -> axum::Router {
         .unwrap();
     store
         .insert_edge(&calls_edge("sym:other:caller", "sym:impact:target", 0.95))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge("sym:other:bridge", "sym:impact:target", 0.9))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge(
+            "sym:impact:through-external",
+            "sym:other:bridge",
+            0.85,
+        ))
         .unwrap();
 
     let project = project("proj:impact-core", "Impact Core");
@@ -256,6 +284,44 @@ async fn p1_impact_returns_layered_envelope_with_tests_evidence_and_meta() {
     assert!(
         !nodes.iter().any(|node| node["uid"] == "sym:other:caller"),
         "repo-scoped impact should not include callers from another repo"
+    );
+}
+
+#[tokio::test]
+async fn p1_impact_repo_scope_omits_edges_when_filtered_parent_is_missing() {
+    let app = make_app();
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/impact/sym:impact:target?depth=3&confidence=0.3&workspace=repo:repo:impact",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let nodes = json["nodes"].as_array().expect("nodes should be an array");
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node["uid"] == "sym:impact:caller" && node["layer"] == 1),
+        "fixture should include an unrelated in-scope previous-layer node"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node["uid"] == "sym:impact:through-external" && node["layer"] == 2),
+        "in-scope node reached through an out-of-scope bridge should remain visible"
+    );
+    assert!(
+        !nodes.iter().any(|node| node["uid"] == "sym:other:bridge"),
+        "repo scope should filter the actual out-of-scope parent"
+    );
+
+    let edges = json["edges"].as_array().expect("edges should be an array");
+    assert!(
+        !edges.iter().any(|edge| {
+            edge["source"] == "sym:impact:through-external"
+                && (edge["target"] == "sym:impact:caller" || edge["target"] == "sym:impact:target")
+        }),
+        "scoped impact should not fabricate a dependency to an unrelated in-scope node or target"
     );
 }
 
