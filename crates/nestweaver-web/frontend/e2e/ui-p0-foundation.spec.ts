@@ -76,21 +76,6 @@ async function openShortcutsDialog(page: Page): Promise<Locator> {
   return shortcutsDialog;
 }
 
-async function focusBody(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    document.body.setAttribute("tabindex", "-1");
-    document.body.focus();
-    document.body.removeAttribute("tabindex");
-  });
-
-  await expect
-    .poll(
-      async () => page.evaluate(() => document.activeElement === document.body),
-      { message: "body should receive focus before opening fallback dialog" },
-    )
-    .toBe(true);
-}
-
 async function canvasPixelStats(canvas: Locator): Promise<CanvasPixelStats> {
   return canvas.evaluate((element) => {
     const source = element as HTMLCanvasElement;
@@ -277,7 +262,7 @@ test.describe("P0 foundation release gates", () => {
     await expect(settingsButton).toBeFocused();
   });
 
-  test("dialogs fall back to the current graph panel application in list view", async ({
+  test("dialogs return focus to the current graph panel region in table view", async ({
     page,
     request,
   }) => {
@@ -291,10 +276,11 @@ test.describe("P0 foundation release gates", () => {
     const viewShortcut = process.platform === "darwin" ? "Meta+L" : "Control+L";
     await page.keyboard.press(viewShortcut);
 
-    const listApp = page.getByRole("application", { name: "Node list view" });
-    await expect(listApp).toBeVisible();
+    const tableView = page.getByRole("region", { name: "Node table view" });
+    await expect(tableView).toBeVisible();
 
-    await focusBody(page);
+    await tableView.focus();
+    await expect(tableView).toBeFocused();
 
     const askShortcut = process.platform === "darwin" ? "Meta+K" : "Control+K";
     await page.keyboard.press(askShortcut);
@@ -303,15 +289,16 @@ test.describe("P0 foundation release gates", () => {
     await expect(askDialog).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(askDialog).toHaveCount(0);
-    await expect(listApp).toBeFocused();
+    await expect(tableView).toBeFocused();
 
-    await focusBody(page);
+    await tableView.focus();
+    await expect(tableView).toBeFocused();
 
     const shortcutsDialog = await openShortcutsDialog(page);
     await expect(shortcutsDialog).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(shortcutsDialog).toHaveCount(0);
-    await expect(listApp).toBeFocused();
+    await expect(tableView).toBeFocused();
   });
 
   test("reduced effects is accessible and toggles in reduced-motion contexts", async ({

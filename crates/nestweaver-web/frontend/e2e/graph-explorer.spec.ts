@@ -103,9 +103,9 @@ async function openOverview(
   await dock.getByRole("button", { name: "Settings" }).click();
   await dock.getByRole("button", { name: "Focus Map" }).click();
 
-  const modeIndicator = page.getByRole("button", {
-    name: /Overview/,
-  });
+  const modeIndicator = page
+    .getByRole("group", { name: "Graph mode" })
+    .getByRole("button", { name: "Overview" });
   await expect(modeIndicator).toBeVisible();
 
   // Close the settings flyout by clicking outside it
@@ -292,22 +292,24 @@ test.describe("Graph Explorer", () => {
   test("grouped controls switch to list and matrix views", async ({ page }) => {
     await openOverview(page, { panels: true });
 
-    const dock = page.getByTestId("control-dock");
+    const representationTabs = page.getByRole("tablist", {
+      name: "Result representation",
+    });
 
-    await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: /List/ }).click();
+    await representationTabs.getByRole("tab", { name: "Table" }).click();
     await expect(
-      page.getByRole("region", { name: "Ranked node table" }),
+      page.getByRole("region", { name: "Node table view" }),
     ).toBeVisible();
 
-    // Flyout stays open after clicking List — no need to re-open
-    await dock.getByRole("button", { name: /Matrix/ }).click();
+    await representationTabs.getByRole("tab", { name: "Matrix" }).click();
     await expect(
-      page.getByRole("region", { name: "Graph matrix view" }),
+      page.getByRole("table", { name: "Node adjacency matrix" }),
     ).toBeVisible();
 
-    // Flyout still open — check filter section
-    await expect(page.getByLabel("Scope")).toBeVisible();
+    await expect(representationTabs.getByRole("tab", { name: "Matrix" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   test("export menu downloads current graph as PNG, SVG, and HTML", async ({
@@ -353,15 +355,16 @@ test.describe("Graph Explorer", () => {
   test("ranked table sorts and selects nodes", async ({ page }) => {
     await openOverview(page, { panels: true });
 
-    const dock = page.getByTestId("control-dock");
-    await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: /List/ }).click();
+    await page
+      .getByRole("tablist", { name: "Result representation" })
+      .getByRole("tab", { name: "Table" })
+      .click();
 
-    const table = page.getByRole("region", { name: "Ranked node table" });
+    const table = page.getByRole("region", { name: "Node table view" });
     await expect(table).toBeVisible();
     await table
       .locator("thead")
-      .getByRole("button", { name: "Name", exact: true })
+      .getByRole("button", { name: "Result", exact: true })
       .click();
     const firstRowButton = table.locator("tbody button").first();
     await expect(firstRowButton).toBeVisible();
@@ -373,14 +376,21 @@ test.describe("Graph Explorer", () => {
   }) => {
     await openOverview(page, { panels: true });
 
-    const dock = page.getByTestId("control-dock");
-    await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: /Matrix/ }).click();
+    await page
+      .getByRole("tablist", { name: "Result representation" })
+      .getByRole("tab", { name: "Matrix" })
+      .click();
 
-    const matrix = page.getByRole("region", { name: "Graph matrix view" });
-    await expect(matrix).toBeVisible();
-    await expect(matrix.getByText(/Showing top \d+ of \d+/)).toBeVisible();
-    const firstRowButton = matrix.locator("tbody th button").first();
+    const matrixRegion = page.getByRole("region", {
+      name: "Graph matrix view",
+    }).first();
+    const matrixTable = page.getByRole("table", {
+      name: "Node adjacency matrix",
+    });
+    await expect(matrixRegion).toBeVisible();
+    await expect(matrixRegion.getByText(/Showing top \d+ of \d+/)).toBeVisible();
+    await expect(matrixTable).toBeVisible();
+    const firstRowButton = matrixTable.locator("tbody th button").first();
     await expect(firstRowButton).toBeVisible();
     await firstRowButton.click();
   });
