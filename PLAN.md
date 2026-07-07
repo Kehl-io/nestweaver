@@ -431,7 +431,7 @@ Overall success: graph answers have accessible non-graph equivalents.
 
 ## Final P1 Verification
 
-Status: pending
+Status: in_progress
 
 After all tasks pass review and manual issue cycles are closed, dispatch a testing sub-agent to run the complete phase test plan. Then run or verify these commands through testing agents:
 
