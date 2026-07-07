@@ -433,6 +433,10 @@ Overall success: graph answers have accessible non-graph equivalents.
 
 Status: in_progress
 
+Open issue:
+- `npm run lint` fails on `no-case-declarations` in `crates/nestweaver-web/frontend/src/searchPhrases/execute.ts`.
+- Fix ownership: implementation sub-agent may edit only `crates/nestweaver-web/frontend/src/searchPhrases/execute.ts`, then rerun frontend lint/typecheck.
+
 After all tasks pass review and manual issue cycles are closed, dispatch a testing sub-agent to run the complete phase test plan. Then run or verify these commands through testing agents:
 
 - `cd crates/nestweaver-web/frontend && npx tsc -b --noEmit`
