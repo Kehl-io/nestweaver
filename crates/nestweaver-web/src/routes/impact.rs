@@ -467,19 +467,16 @@ fn build_layered_edges(
 
     let mut edges = Vec::new();
     for node in nodes {
-        let callees = state.store.callees_of(&node.uid)?;
-        for callee in callees {
-            let Some(target_layer) = layers.get(callee.uid.as_str()).copied() else {
+        let outgoing_edges = state.store.outgoing_impact_edges(&node.uid)?;
+        for edge in outgoing_edges {
+            let Some(target_layer) = layers.get(edge.target_uid.as_str()).copied() else {
                 continue;
             };
-            if target_layer + 1 != node.depth {
-                continue;
-            }
             edges.push(ImpactGraphEdge {
                 source: node.uid.clone(),
-                target: callee.uid,
-                edge_type: node.edge_type.clone(),
-                confidence: node.confidence,
+                target: edge.target_uid,
+                edge_type: edge.edge_type,
+                confidence: edge.confidence,
                 source_layer: node.depth,
                 target_layer,
             });

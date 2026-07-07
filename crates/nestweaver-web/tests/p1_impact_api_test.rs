@@ -68,10 +68,14 @@ fn symbol(uid: &str, repo_uid: &str, name: &str, file_path: &str, line: u32) -> 
 }
 
 fn calls_edge(source_uid: &str, target_uid: &str, confidence: f32) -> ResolvedEdge {
+    edge(source_uid, target_uid, EdgeType::Calls, confidence)
+}
+
+fn edge(source_uid: &str, target_uid: &str, edge_type: EdgeType, confidence: f32) -> ResolvedEdge {
     ResolvedEdge {
         source_uid: source_uid.to_string(),
         target_uid: target_uid.to_string(),
-        edge_type: EdgeType::Calls,
+        edge_type,
         confidence,
         link_type: None,
         evidence: Vec::new(),
@@ -140,6 +144,15 @@ fn make_app() -> axum::Router {
         ))
         .unwrap();
     store
+        .insert_symbol(&symbol(
+            "sym:impact:subclass",
+            &impact_repo.uid,
+            "derived_target_logic",
+            "src/subclass.rs",
+            70,
+        ))
+        .unwrap();
+    store
         .insert_edge(&calls_edge("sym:impact:caller", "sym:impact:target", 0.9))
         .unwrap();
     store
@@ -156,6 +169,14 @@ fn make_app() -> axum::Router {
             "sym:impact:through-external",
             "sym:other:bridge",
             0.85,
+        ))
+        .unwrap();
+    store
+        .insert_edge(&edge(
+            "sym:impact:subclass",
+            "sym:impact:target",
+            EdgeType::Extends,
+            0.88,
         ))
         .unwrap();
 
@@ -322,6 +343,35 @@ async fn p1_impact_repo_scope_omits_edges_when_filtered_parent_is_missing() {
                 && (edge["target"] == "sym:impact:caller" || edge["target"] == "sym:impact:target")
         }),
         "scoped impact should not fabricate a dependency to an unrelated in-scope node or target"
+    );
+}
+
+#[tokio::test]
+async fn p1_impact_repo_scope_includes_structural_impact_edges() {
+    let app = make_app();
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/impact/sym:impact:target?depth=3&confidence=0.3&workspace=repo:repo:impact",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let nodes = json["nodes"].as_array().expect("nodes should be an array");
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node["uid"] == "sym:impact:subclass" && node["layer"] == 1),
+        "fixture should include the in-scope symbol reached via EXTENDS_SYM"
+    );
+
+    let edges = json["edges"].as_array().expect("edges should be an array");
+    assert!(
+        edges.iter().any(|edge| {
+            edge["source"] == "sym:impact:subclass"
+                && edge["target"] == "sym:impact:target"
+                && edge["edge_type"] == "EXTENDS_SYM"
+        }),
+        "impact DAG edges should include actual in-scope EXTENDS_SYM relationships"
     );
 }
 
