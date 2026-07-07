@@ -218,7 +218,7 @@ Acceptance criteria:
 
 ### Task 5 - Tri-Panel Workspace and Representation Parity
 
-Status: in_progress
+Status: review
 
 Owner type: implementation sub-agent
 
