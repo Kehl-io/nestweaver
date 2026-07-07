@@ -450,12 +450,16 @@ impl GraphStore {
 
     /// Add an embedding to the in-memory index without saving to disk.
     /// Use `flush_embedding_index` after a batch of additions to persist.
-    pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) {
+    pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) -> bool {
+        self.add_embedding_with_force(uid, embedding, false)
+    }
+
+    pub fn add_embedding_with_force(&self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
         let mut idx = self
             .embedding_index
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        idx.add(uid, embedding);
+        idx.add(uid, embedding, force)
     }
 
     /// Check whether the embedding index already has an entry for `uid`.

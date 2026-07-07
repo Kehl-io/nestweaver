@@ -44,27 +44,35 @@ impl EmbeddingIndex {
         }
     }
 
-    pub fn add(&mut self, uid: &str, embedding: Vec<f32>) {
-        // Keep the index homogeneous. A mixed-dimension index breaks the binary
-        // sidecar (`save_binary` writes one header dim but per-vector bytes;
-        // `load_binary` reads a fixed stride) → misaligned garbage or a load
-        // failure that silently kills semantic search. A dimension mismatch here
-        // means a vector from a different model — e.g. the daemon's local-fallback
-        // (384) leaking into a remote-embedded (768/1536) index on a transient
-        // remote outage, or a model switch without `--force`. Reject it rather
-        // than corrupt the index; the caller should re-embed with `--force`.
-        if let Some(existing) = self.embeddings.values().next()
-            && embedding.len() != existing.len()
-        {
-            tracing::warn!(
-                uid,
-                got = embedding.len(),
-                expected = existing.len(),
-                "skipping embedding with mismatched dimension (re-embed with --force to switch models)"
-            );
-            return;
+    /// Insert an embedding. Returns `true` if accepted, `false` if rejected
+    /// due to a dimension mismatch (when `force` is false).
+    ///
+    /// When `force` is true and the incoming dimension differs from what's
+    /// already stored, the entire index is cleared on the first mismatch so
+    /// the new dimension becomes authoritative — this is the model-switch path.
+    pub fn add(&mut self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
+        if let Some(existing) = self.embeddings.values().next() {
+            if embedding.len() != existing.len() {
+                if force {
+                    tracing::info!(
+                        old_dim = existing.len(),
+                        new_dim = embedding.len(),
+                        "dimension change detected with --force; clearing index for model switch"
+                    );
+                    self.embeddings.clear();
+                } else {
+                    tracing::warn!(
+                        uid,
+                        got = embedding.len(),
+                        expected = existing.len(),
+                        "skipping embedding with mismatched dimension (re-embed with --force to switch models)"
+                    );
+                    return false;
+                }
+            }
         }
         self.embeddings.insert(uid.to_string(), embedding);
+        true
     }
 
     pub fn save(&self, path: &Path) -> Result<(), anyhow::Error> {
@@ -483,10 +491,28 @@ mod tests {
     fn add_rejects_dimension_mismatched_vector() {
         // The index must stay homogeneous so the binary sidecar can't misalign.
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0]); // establishes dim 3
-        idx.add("sym:b", vec![1.0_f32, 0.0]); // dim 2 — must be rejected
+        assert!(idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false)); // establishes dim 3
+        assert!(!idx.add("sym:b", vec![1.0_f32, 0.0], false)); // dim 2 — must be rejected
         assert_eq!(idx.len(), 1, "mismatched-dim vector must not be added");
         assert_eq!(idx.dimension(), Some(3));
+    }
+
+    #[test]
+    fn add_force_clears_index_on_dimension_change() {
+        let mut idx = EmbeddingIndex::new();
+        idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false);
+        idx.add("sym:b", vec![0.0_f32, 1.0, 0.0], false);
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.dimension(), Some(3));
+
+        // Force with new dimension clears existing entries
+        assert!(idx.add("sym:c", vec![1.0_f32, 0.0], true));
+        assert_eq!(idx.len(), 1, "force should clear old entries");
+        assert_eq!(idx.dimension(), Some(2), "dimension should switch to new model's");
+
+        // Subsequent adds with matching dimension work normally
+        assert!(idx.add("sym:d", vec![0.0_f32, 1.0], false));
+        assert_eq!(idx.len(), 2);
     }
 
     #[test]
@@ -496,7 +522,7 @@ mod tests {
         // guard). Before the query guard, `.zip()` truncated and returned a
         // plausible-but-wrong score.
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:right", vec![1.0_f32, 0.0, 0.0]);
+        idx.add("sym:right", vec![1.0_f32, 0.0, 0.0], false);
         idx.embeddings
             .insert("sym:wrongdim".to_string(), vec![1.0_f32, 0.0]);
         let query = vec![1.0_f32, 0.0, 0.0];
@@ -524,9 +550,9 @@ mod tests {
     #[test]
     fn vector_search_cancellable_uncancelled_returns_results() {
         let mut idx = EmbeddingIndex::new();
-        idx.add("a", vec![1.0, 0.0, 0.0]);
-        idx.add("b", vec![0.9, 0.1, 0.0]);
-        idx.add("c", vec![0.0, 0.0, 1.0]);
+        idx.add("a", vec![1.0, 0.0, 0.0], false);
+        idx.add("b", vec![0.9, 0.1, 0.0], false);
+        idx.add("c", vec![0.0, 0.0, 1.0], false);
 
         // Not cancelled → normal results.
         let live = idx
@@ -541,9 +567,9 @@ mod tests {
     #[test]
     fn vector_search_cancellable_returns_err_not_empty_on_cancel() {
         let mut idx = EmbeddingIndex::new();
-        idx.add("a", vec![1.0, 0.0, 0.0]);
-        idx.add("b", vec![0.9, 0.1, 0.0]);
-        idx.add("c", vec![0.0, 0.0, 1.0]);
+        idx.add("a", vec![1.0, 0.0, 0.0], false);
+        idx.add("b", vec![0.9, 0.1, 0.0], false);
+        idx.add("c", vec![0.0, 0.0, 1.0], false);
 
         // Pre-cancelled over a NON-empty candidate set: a cancelled computation
         // is incomplete, not empty — it must surface as a distinct error so no
@@ -559,9 +585,9 @@ mod tests {
     #[test]
     fn vector_search_returns_most_similar() {
         let mut idx = EmbeddingIndex::new();
-        idx.add("a", vec![1.0, 0.0, 0.0]);
-        idx.add("b", vec![0.9, 0.1, 0.0]);
-        idx.add("c", vec![0.0, 0.0, 1.0]);
+        idx.add("a", vec![1.0, 0.0, 0.0], false);
+        idx.add("b", vec![0.9, 0.1, 0.0], false);
+        idx.add("c", vec![0.0, 0.0, 1.0], false);
 
         let results = idx.vector_search(&[1.0, 0.0, 0.0], 2);
         assert_eq!(results.len(), 2);
@@ -573,7 +599,7 @@ mod tests {
     fn vector_search_limit_respected() {
         let mut idx = EmbeddingIndex::new();
         for i in 0..10 {
-            idx.add(&format!("sym:{i}"), vec![i as f32, 0.0]);
+            idx.add(&format!("sym:{i}"), vec![i as f32, 0.0], false);
         }
         let results = idx.vector_search(&[1.0, 0.0], 3);
         assert_eq!(results.len(), 3);
@@ -587,7 +613,7 @@ mod tests {
         // Use an L2-normalized vector (vector_search assumes pre-normalized embeddings)
         let norm = (0.1_f32 * 0.1 + 0.2 * 0.2 + 0.3 * 0.3).sqrt();
         let v = vec![0.1 / norm, 0.2 / norm, 0.3 / norm];
-        idx.add("sym:test", v.clone());
+        idx.add("sym:test", v.clone(), false);
         idx.save(&path).unwrap();
 
         let loaded = EmbeddingIndex::load(&path).unwrap();
@@ -663,9 +689,9 @@ mod tests {
         let path = dir.path().join("embeddings.bin");
 
         let mut idx = EmbeddingIndex::new();
-        idx.add("sym:alpha", vec![0.1, 0.2, 0.3]);
-        idx.add("sym:beta", vec![0.4, 0.5, 0.6]);
-        idx.add("sym:gamma", vec![0.7, 0.8, 0.9]);
+        idx.add("sym:alpha", vec![0.1, 0.2, 0.3], false);
+        idx.add("sym:beta", vec![0.4, 0.5, 0.6], false);
+        idx.add("sym:gamma", vec![0.7, 0.8, 0.9], false);
         idx.save_binary(&path).unwrap();
 
         let loaded = EmbeddingIndex::load_binary(&path).unwrap();
@@ -728,8 +754,8 @@ mod tests {
 
         let mut idx = EmbeddingIndex::new();
         // farewell gets a perfect embedding match; greet gets a distant one
-        idx.add("sym:farewell", vec![1.0, 0.0, 0.0]);
-        idx.add("sym:greet", vec![0.0, 1.0, 0.0]);
+        idx.add("sym:farewell", vec![1.0, 0.0, 0.0], false);
+        idx.add("sym:greet", vec![0.0, 1.0, 0.0], false);
 
         let query_vec = [1.0_f32, 0.0, 0.0];
         let results = store
