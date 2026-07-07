@@ -67,6 +67,7 @@ export function TopBar() {
   const setSearchResults = useStore((s) => s.setSearchResults);
   const clearSearch = useStore((s) => s.clearSearch);
   const exploreNode = useStore((s) => s.exploreNode);
+  const setActiveLens = useStore((s) => s.setActiveLens);
   const setScopeFilter = useStore((s) => s.setScopeFilter);
 
   function isCurrentSearch(
@@ -163,6 +164,12 @@ export function TopBar() {
 
   function handleSelect(uid: string, kind: string) {
     exploreNode(uid, kind);
+    setActiveLens({
+      lens: "search",
+      label: "Search results",
+      targetUid: uid,
+      workspaceId: activeWorkspaceId,
+    });
     clearSearch();
     inputRef.current?.blur();
   }

@@ -1,4 +1,5 @@
 import type { StateCreator } from "zustand";
+import type { ActiveLensState } from "../api/p1Types";
 import type { StoreState } from "./index";
 import type { BrainContextResult, FlowNode, PathResult } from "../api/types";
 
@@ -73,7 +74,10 @@ export interface AnalysisSlice {
   gapActive: boolean;
   setGapItems: (items: GapItem[]) => void;
   toggleGapPanel: () => void;
-  restoreAnalysisState: (snapshot: AnalysisStateSnapshot) => void;
+  restoreAnalysisState: (
+    snapshot: AnalysisStateSnapshot,
+    lens?: ActiveLensState,
+  ) => void;
 }
 
 function flattenFlowTree(node: FlowNode): string[] {
@@ -92,6 +96,15 @@ function pathRequestMatches(state: StoreState, request?: PathRequest): boolean {
     state.pathfindingTo === request.to &&
     state.pathRequestId === request.requestId
   );
+}
+
+function lensKeepsDiff(lens: ActiveLensState): boolean {
+  return lens.label.toLowerCase().startsWith("compare");
+}
+
+function lensKeepsGap(lens: ActiveLensState): boolean {
+  const label = lens.label.toLowerCase();
+  return lens.lens === "unsupported" && (label.includes("dead code") || label.includes("gap"));
 }
 
 export const createAnalysisSlice: StateCreator<
@@ -237,29 +250,35 @@ export const createAnalysisSlice: StateCreator<
       s.gapActive = !s.gapActive;
     }),
 
-  restoreAnalysisState: (snapshot) =>
+  restoreAnalysisState: (snapshot, lens) =>
     set((s) => {
-      s.flowTraceRoot = snapshot.flowTraceRoot;
-      s.flowTraceNodeUids = snapshot.flowTraceRoot
-        ? flattenFlowTree(snapshot.flowTraceRoot)
+      const targetLens = lens ?? s.activeLens;
+      const keepTrace = targetLens.lens === "trace";
+      const keepPath = targetLens.lens === "path";
+      const keepDiff = lensKeepsDiff(targetLens);
+      const keepGap = lensKeepsGap(targetLens);
+
+      s.flowTraceRoot = keepTrace ? snapshot.flowTraceRoot : null;
+      s.flowTraceNodeUids = s.flowTraceRoot
+        ? flattenFlowTree(s.flowTraceRoot!)
         : [];
-      s.flowTraceActive = snapshot.flowTraceRoot !== null;
-      s.pathfindingActive = snapshot.pathfindingActive;
-      s.pathfindingFrom = snapshot.pathfindingFrom;
-      s.pathfindingTo = snapshot.pathfindingTo;
-      s.pathRequestId = snapshot.pathRequestId;
-      s.pathResults = snapshot.pathResults;
-      s.pathStatus = snapshot.pathStatus;
-      s.pathError = snapshot.pathError;
-      s.selectedPathIndex = snapshot.selectedPathIndex;
-      s.diffActive = snapshot.diffActive;
+      s.flowTraceActive = s.flowTraceRoot !== null;
+      s.pathfindingActive = keepPath ? snapshot.pathfindingActive : false;
+      s.pathfindingFrom = keepPath ? snapshot.pathfindingFrom : null;
+      s.pathfindingTo = keepPath ? snapshot.pathfindingTo : null;
+      s.pathRequestId = keepPath ? snapshot.pathRequestId : s.pathRequestId + 1;
+      s.pathResults = keepPath ? snapshot.pathResults : [];
+      s.pathStatus = keepPath ? snapshot.pathStatus : "idle";
+      s.pathError = keepPath ? snapshot.pathError : null;
+      s.selectedPathIndex = keepPath ? snapshot.selectedPathIndex : 0;
+      s.diffActive = keepDiff ? snapshot.diffActive : false;
       s.diffState = {
-        snapshotA: snapshot.diffState.snapshotA,
-        snapshotB: snapshot.diffState.snapshotB,
-        seedsA: [...snapshot.diffState.seedsA],
-        seedsB: [...snapshot.diffState.seedsB],
+        snapshotA: keepDiff ? snapshot.diffState.snapshotA : null,
+        snapshotB: keepDiff ? snapshot.diffState.snapshotB : null,
+        seedsA: keepDiff ? [...snapshot.diffState.seedsA] : [],
+        seedsB: keepDiff ? [...snapshot.diffState.seedsB] : [],
       };
-      s.gapItems = snapshot.gapItems;
-      s.gapActive = snapshot.gapActive;
+      s.gapItems = keepGap ? snapshot.gapItems : [];
+      s.gapActive = keepGap ? snapshot.gapActive : false;
     }),
 });

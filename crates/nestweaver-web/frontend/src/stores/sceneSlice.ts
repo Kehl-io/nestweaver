@@ -76,10 +76,43 @@ export const createSceneSlice: StateCreator<
 
   setActiveLens: (lens) =>
     set((s) => {
-      s.activeLens =
+      const nextLens =
         typeof lens === "string"
           ? { lens, label: lensLabel(lens), targetUid: null, workspaceId: null }
           : lens;
+      const lowerLabel = nextLens.label.toLowerCase();
+      const keepDiff = lowerLabel.startsWith("compare");
+      const keepGap =
+        nextLens.lens === "unsupported" &&
+        (lowerLabel.includes("dead code") || lowerLabel.includes("gap"));
+
+      s.activeLens = nextLens;
+      if (nextLens.lens !== "trace") {
+        s.flowTraceRoot = null;
+        s.flowTraceNodeUids = [];
+        s.flowTraceActive = false;
+      }
+      if (nextLens.lens !== "path") {
+        s.pathfindingActive = false;
+        s.pathfindingFrom = null;
+        s.pathfindingTo = null;
+        s.pathRequestId += 1;
+        s.pathResults = [];
+        s.pathStatus = "idle";
+        s.pathError = null;
+        s.selectedPathIndex = 0;
+      }
+      if (!keepDiff) {
+        s.diffActive = false;
+        s.diffState.snapshotA = null;
+        s.diffState.snapshotB = null;
+        s.diffState.seedsA = [];
+        s.diffState.seedsB = [];
+      }
+      if (!keepGap) {
+        s.gapItems = [];
+        s.gapActive = false;
+      }
     }),
 
   setRepresentationMode: (mode) =>

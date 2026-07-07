@@ -106,6 +106,9 @@ function relationshipForNode(
       edgeType ? `via ${edgeType}` : null,
     ].filter(Boolean).join(", ");
   }
+  if (lower.includes("search")) {
+    return "search result in the current workspace scope";
+  }
   return "current graph result";
 }
 

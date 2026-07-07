@@ -30,6 +30,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const workspaces = useStore((s) => s.workspaces);
   const selectNode = useStore((s) => s.selectNode);
   const setDetailFocus = useStore((s) => s.setDetailFocus);
+  const setActiveLens = useStore((s) => s.setActiveLens);
   const addSeed = useStore((s) => s.addSeed);
   const setGapItems = useStore((s) => s.setGapItems);
   const toggleGapPanel = useStore((s) => s.toggleGapPanel);
@@ -118,11 +119,23 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   function openDetail(uid: string, kind: string) {
     selectNode(uid, kind);
     setDetailFocus("summary");
+    setActiveLens({
+      lens: "search",
+      label: "Search results",
+      targetUid: uid,
+      workspaceId: activeWorkspaceId,
+    });
   }
 
   function addResultToScene(uid: string, kind: string) {
     selectNode(uid, kind);
     addSeed(uid);
+    setActiveLens({
+      lens: "search",
+      label: "Search results",
+      targetUid: uid,
+      workspaceId: activeWorkspaceId,
+    });
   }
 
   function askFromSearch() {

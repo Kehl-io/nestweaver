@@ -88,6 +88,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
   const setDetailFocus = useStore((s) => s.setDetailFocus);
   const startPathfinding = useStore((s) => s.startPathfinding);
   const setFlowTrace = useStore((s) => s.setFlowTrace);
+  const clearFlowTrace = useStore((s) => s.clearFlowTrace);
   const startDiff = useStore((s) => s.startDiff);
   const openLlmBar = useStore((s) => s.openLlmBar);
   const setLlmQuery = useStore((s) => s.setLlmQuery);
@@ -259,6 +260,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
           "analysis",
           true,
         );
+        clearFlowTrace();
         const result = await api.flow(traceTargetUid, 10);
         const state = useStore.getState();
         if (

@@ -7,6 +7,7 @@ const JSON_CAPS = {
   graphNodes: 500,
   graphEdges: 1000,
   flowRows: 250,
+  flowNodeUids: 250,
   pathResults: 50,
   gapItems: 100,
   diffSeeds: 100,
@@ -71,10 +72,32 @@ function buildGraphPayload() {
   };
 }
 
-function flowToList(node: ReturnType<typeof useStore.getState>["flowTraceRoot"]) {
-  if (!node) return [];
+function flowToCappedList(
+  node: ReturnType<typeof useStore.getState>["flowTraceRoot"],
+  limit: number,
+) {
+  if (!node) {
+    return {
+      items: [] as Record<string, unknown>[],
+      _meta: {
+        exported_count: 0,
+        total_count: 0,
+        total_count_exact: true,
+        limit,
+        truncated: false,
+        omitted_count: 0,
+      },
+    };
+  }
   const rows: Record<string, unknown>[] = [];
-  const visit = (current: NonNullable<typeof node>, parentUid: string | null) => {
+  const stack: Array<{
+    current: NonNullable<typeof node>;
+    parentUid: string | null;
+  }> = [{ current: node, parentUid: null }];
+  let truncated = false;
+
+  while (stack.length > 0 && rows.length < limit) {
+    const { current, parentUid } = stack.pop()!;
     rows.push({
       uid: current.uid,
       name: current.name,
@@ -83,10 +106,33 @@ function flowToList(node: ReturnType<typeof useStore.getState>["flowTraceRoot"])
       parent_uid: parentUid,
       child_count: current.children.length,
     });
-    current.children.forEach((child) => visit(child, current.uid));
+
+    if (rows.length >= limit) {
+      truncated = stack.length > 0 || current.children.length > 0;
+      break;
+    }
+
+    for (let index = current.children.length - 1; index >= 0; index -= 1) {
+      stack.push({ current: current.children[index], parentUid: current.uid });
+    }
+  }
+
+  if (stack.length > 0) truncated = true;
+
+  return {
+    items: rows,
+    _meta: {
+      exported_count: rows.length,
+      total_count: truncated ? null : rows.length,
+      total_count_exact: !truncated,
+      limit,
+      truncated,
+      omitted_count: truncated ? null : 0,
+      truncation_reason: truncated
+        ? "Trace traversal stopped at the JSON export limit."
+        : null,
+    },
   };
-  visit(node, null);
-  return rows;
 }
 
 function capList<T>(items: T[], limit: number) {
@@ -144,9 +190,12 @@ export function JsonResultView() {
   const payload = useMemo(() => {
     void graphVersion;
     const graph = buildGraphPayload();
-    const flowRows = capList(flowToList(flowTraceRoot), JSON_CAPS.flowRows);
+    const flowRows = flowToCappedList(flowTraceRoot, JSON_CAPS.flowRows);
+    const cappedFlowNodeUids = capList(flowTraceNodeUids, JSON_CAPS.flowNodeUids);
     const cappedPathResults = capList(pathResults, JSON_CAPS.pathResults);
     const cappedGapItems = capList(gapItems, JSON_CAPS.gapItems);
+    const cappedSeedsA = capList(diffState.seedsA, JSON_CAPS.diffSeeds);
+    const cappedSeedsB = capList(diffState.seedsB, JSON_CAPS.diffSeeds);
     return {
       _meta: {
         ...(sceneMetadata ?? {
@@ -158,6 +207,7 @@ export function JsonResultView() {
         client_caps: {
           graph: graph._meta,
           flow_rows: flowRows._meta,
+          flow_trace_node_uids: cappedFlowNodeUids._meta,
           path_results: cappedPathResults._meta,
           gap_items: cappedGapItems._meta,
           diff_snapshots: {
@@ -177,9 +227,12 @@ export function JsonResultView() {
       analysis: {
         flow_trace: {
           active: Boolean(flowTraceRoot),
-          node_uids: flowTraceNodeUids,
+          node_uids: cappedFlowNodeUids.items,
           rows: flowRows.items,
-          _meta: flowRows._meta,
+          _meta: {
+            rows: flowRows._meta,
+            node_uids: cappedFlowNodeUids._meta,
+          },
         },
         paths: {
           status: pathStatus,
@@ -194,8 +247,12 @@ export function JsonResultView() {
         },
         diff: {
           active: diffActive,
-          seeds_a: diffState.seedsA,
-          seeds_b: diffState.seedsB,
+          seeds_a: cappedSeedsA.items,
+          seeds_b: cappedSeedsB.items,
+          seeds_meta: {
+            seeds_a: cappedSeedsA._meta,
+            seeds_b: cappedSeedsB._meta,
+          },
           snapshot_a: capBrainContextResult(diffState.snapshotA),
           snapshot_b: capBrainContextResult(diffState.snapshotB),
         },

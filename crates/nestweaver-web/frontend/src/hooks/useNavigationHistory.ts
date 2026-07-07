@@ -82,14 +82,13 @@ function analysisSnapshotForState(
 ): AnalysisStateSnapshot {
   const snapshot: AnalysisStateSnapshot = {
     ...emptyAnalysisSnapshot,
-    pathRequestId: state.pathRequestId,
   };
 
   if (state.activeLens.lens === "trace" && state.flowTraceRoot) {
     snapshot.flowTraceRoot = state.flowTraceRoot;
   }
 
-  if (state.activeLens.lens === "path" || state.pathfindingActive) {
+  if (state.activeLens.lens === "path") {
     snapshot.pathfindingActive = state.pathfindingActive;
     snapshot.pathfindingFrom = state.pathfindingFrom;
     snapshot.pathfindingTo = state.pathfindingTo;
@@ -180,7 +179,7 @@ export function useNavigationHistory() {
     setRepresentationMode(entry.representationMode);
     selectNode(entry.selectedNodeId, entry.selectedNodeKind);
     setDetailFocus(entry.detailFocus);
-    restoreAnalysisState(entry.analysis);
+    restoreAnalysisState(entry.analysis, entry.activeLens);
     historyState.isNavigating = false;
     emitChange();
   }, [
@@ -206,7 +205,7 @@ export function useNavigationHistory() {
     setRepresentationMode(entry.representationMode);
     selectNode(entry.selectedNodeId, entry.selectedNodeKind);
     setDetailFocus(entry.detailFocus);
-    restoreAnalysisState(entry.analysis);
+    restoreAnalysisState(entry.analysis, entry.activeLens);
     historyState.isNavigating = false;
     emitChange();
   }, [

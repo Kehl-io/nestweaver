@@ -247,6 +247,7 @@ export async function executeSearchPhrase(
         targetUid: target.uid ?? target.id,
         workspaceId: state.activeWorkspaceId,
       });
+      state.clearFlowTrace();
       const result = await api.flow(target.uid ?? target.id, 10);
       if (!isCurrent(options)) {
         return { status: "error", message: "Trace result was superseded by a newer phrase." };
