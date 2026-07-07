@@ -228,6 +228,18 @@ fn make_app_with_tantivy_vault_scope_fixture() -> (axum::Router, tempfile::TempD
     std::fs::create_dir_all(&beta_root).unwrap();
     std::fs::write(alpha_root.join("Needle Alpha.md"), "needle").unwrap();
     std::fs::write(beta_root.join("Needle Beta.md"), "needle ".repeat(200)).unwrap();
+    // Notes whose *bodies* (not titles or paths) match a query, to prove
+    // scoped search covers full text when Tantivy is present.
+    std::fs::write(
+        alpha_root.join("Alpha Recipe.md"),
+        "zucchini bread instructions",
+    )
+    .unwrap();
+    std::fs::write(
+        beta_root.join("Beta Recipe.md"),
+        "zucchini muffin instructions",
+    )
+    .unwrap();
 
     let store = GraphStore::in_memory().unwrap();
     let alpha_vault = Vault {
@@ -258,6 +270,22 @@ fn make_app_with_tantivy_vault_scope_fixture() -> (axum::Router, tempfile::TempD
             &beta_vault.uid,
             "Needle Beta",
             0.9,
+        ))
+        .unwrap();
+    store
+        .insert_note(&note(
+            "note:alpha:recipe",
+            &alpha_vault.uid,
+            "Alpha Recipe",
+            0.5,
+        ))
+        .unwrap();
+    store
+        .insert_note(&note(
+            "note:beta:recipe",
+            &beta_vault.uid,
+            "Beta Recipe",
+            0.6,
         ))
         .unwrap();
 
@@ -643,7 +671,17 @@ async fn p1_workspace_brain_search_vault_scope_filters_results_with_metadata() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["_meta"]["trust"]["data_scope"], "vault-scoped");
-    assert_eq!(json["_meta"]["trust"]["result"], "complete");
+    // Without Tantivy, the fallback matches note titles/paths only, so
+    // coverage must never be reported as complete.
+    assert_eq!(json["_meta"]["trust"]["result"], "partial");
+    assert!(
+        json["_meta"]["trust"]["unsupported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "note-body-search"),
+        "substring fallback should disclose that note bodies are not searched"
+    );
     let results = json["results"].as_array().unwrap();
     assert!(
         results.iter().all(|item| item["vault_uid"] == "vlt:brain"),
@@ -673,10 +711,7 @@ async fn p1_workspace_brain_search_vault_scope_limits_after_scope_with_tantivy_p
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["_meta"]["trust"]["data_scope"], "vault-scoped");
-    assert_eq!(
-        json["_meta"]["provenance"][0]["source"],
-        "local_graph_store"
-    );
+    assert_eq!(json["_meta"]["provenance"][0]["source"], "local_tantivy");
 
     let results = json["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
@@ -846,4 +881,133 @@ async fn p1_workspace_brain_search_vault_scope_limit_reports_truncation() {
     assert_eq!(json["_meta"]["truncation"]["limit"], 1);
     assert_eq!(json["_meta"]["truncation"]["omitted_count"], 1);
     assert_eq!(json["results"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_search_vault_scope_finds_note_body_matches_with_tantivy() {
+    let (app, _dir) = make_app_with_tantivy_vault_scope_fixture();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let vault_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "vlt:alpha")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // "zucchini" appears only in note bodies, never in titles or paths.
+    let (status, json) = get_json(
+        &app,
+        &format!("/api/v1/brain/search?q=zucchini&workspace={vault_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["_meta"]["trust"]["data_scope"], "vault-scoped");
+    assert_eq!(json["_meta"]["provenance"][0]["source"], "local_tantivy");
+    assert_eq!(json["_meta"]["trust"]["result"], "complete");
+
+    let results = json["results"].as_array().unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|item| item["uid"] == "note:alpha:recipe"),
+        "vault-scoped search should match note bodies via Tantivy: {results:?}"
+    );
+    assert!(
+        !results.iter().any(|item| item["uid"] == "note:beta:recipe"),
+        "vault-scoped body search should not leak notes from other vaults: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_search_limit_is_clamped() {
+    let app = make_app();
+    let (catalog_status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    let vault_id = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uid"] == "vlt:brain")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, json) = get_json(
+        &app,
+        &format!("/api/v1/brain/search?q=Note&limit=0&workspace={vault_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["results"].as_array().unwrap().len(),
+        1,
+        "limit=0 should be clamped to 1, not return an empty page"
+    );
+    assert_eq!(json["_meta"]["truncation"]["limit"], 1);
+}
+
+#[tokio::test]
+async fn p1_workspace_brain_context_token_budget_is_disclosed_not_echoed() {
+    let app = make_app();
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["sym:alpha:parse"], "token_budget": 4000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["_meta"]["truncation"]["limit"].is_null(),
+        "an unenforced token budget must not surface as an applied truncation limit"
+    );
+    assert_eq!(json["_meta"]["truncation"]["truncated"], false);
+    assert!(
+        json["_meta"]["trust"]["unsupported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "token-budget"),
+        "brain context should disclose that the token budget is not enforced"
+    );
+}
+
+#[tokio::test]
+async fn p1_workspace_catalog_is_bounded_and_discloses_truncation() {
+    let store = GraphStore::in_memory().unwrap();
+    for index in 0..600 {
+        store
+            .insert_vault(&Vault {
+                uid: format!("vlt:bulk:{index:04}"),
+                name: format!("Bulk Vault {index:04}"),
+                root_path: format!("/tmp/bulk-{index:04}"),
+                instance_id: "local".to_string(),
+            })
+            .unwrap();
+    }
+    let state = AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/p1-catalog-test.lbug"),
+    );
+    let app = create_router(state);
+
+    let (status, json) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(status, StatusCode::OK);
+    let workspaces = json["workspaces"].as_array().unwrap();
+    assert_eq!(
+        workspaces.len(),
+        500,
+        "catalog should be capped at 500 entries"
+    );
+    assert_eq!(json["_meta"]["trust"]["result"], "truncated");
+    assert_eq!(json["_meta"]["truncation"]["truncated"], true);
+    assert_eq!(json["_meta"]["truncation"]["limit"], 500);
+    // 1 "all" entry + 600 vaults = 601 total, 500 returned.
+    assert_eq!(json["_meta"]["truncation"]["omitted_count"], 101);
+    assert_eq!(json["_meta"]["continuation"]["has_more"], true);
 }

@@ -184,18 +184,27 @@ struct WorkspaceCatalogResponse {
     meta: P1Meta,
 }
 
+/// Upper bound on entries returned by the workspace catalog. Per-project
+/// counts are O(store) each, so an unbounded catalog would scale with the
+/// number of registered projects/repos/vaults; bound it and disclose the
+/// truncation in `_meta`.
+const WORKSPACE_CATALOG_LIMIT: usize = 500;
+
 pub async fn workspaces(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let entries = workspace_entries(&state.store)?;
     let all = ResolvedWorkspace::all();
+    let meta = p1_meta_for_result_set(
+        &all,
+        entries.result_state("complete"),
+        Vec::<&str>::new(),
+        vec![P1Provenance::local_graph_store("workspace catalog")],
+        Some(WORKSPACE_CATALOG_LIMIT),
+        entries.items.len(),
+        Some(entries.total_count),
+    );
     Ok(Json(WorkspaceCatalogResponse {
-        workspaces: entries,
-        meta: p1_meta(
-            &all,
-            "complete",
-            Vec::<&str>::new(),
-            vec![P1Provenance::local_graph_store("workspace catalog")],
-            None,
-        ),
+        workspaces: entries.items,
+        meta,
     })
     .into_response())
 }
@@ -617,7 +626,7 @@ pub fn symbol_search_hit(symbol: Symbol) -> serde_json::Value {
     })
 }
 
-fn workspace_entries(store: &GraphStore) -> Result<Vec<WorkspaceEntry>, ApiError> {
+fn workspace_entries(store: &GraphStore) -> Result<BoundedResults<WorkspaceEntry>, ApiError> {
     let projects = store.list_projects()?;
     let repos = store.list_repos(None)?;
     let vaults = store.list_vaults(None)?;
@@ -646,7 +655,8 @@ fn workspace_entries(store: &GraphStore) -> Result<Vec<WorkspaceEntry>, ApiError
             .or_default() += 1;
     }
 
-    let mut entries = Vec::with_capacity(1 + projects.len() + repos.len() + vaults.len());
+    let total_count = 1 + projects.len() + repos.len() + vaults.len();
+    let mut entries = Vec::with_capacity(total_count.min(WORKSPACE_CATALOG_LIMIT));
     let all = ResolvedWorkspace::all();
     entries.push(workspace_entry(
         all,
@@ -663,6 +673,9 @@ fn workspace_entries(store: &GraphStore) -> Result<Vec<WorkspaceEntry>, ApiError
     ));
 
     for project in &projects {
+        if entries.len() >= WORKSPACE_CATALOG_LIMIT {
+            break;
+        }
         entries.push(workspace_entry(
             ResolvedWorkspace::project(project),
             project_counts(store, &project.uid)?,
@@ -672,6 +685,9 @@ fn workspace_entries(store: &GraphStore) -> Result<Vec<WorkspaceEntry>, ApiError
     }
 
     for repo in &repos {
+        if entries.len() >= WORKSPACE_CATALOG_LIMIT {
+            break;
+        }
         entries.push(workspace_entry(
             ResolvedWorkspace::repo(repo),
             WorkspaceCounts {
@@ -687,6 +703,9 @@ fn workspace_entries(store: &GraphStore) -> Result<Vec<WorkspaceEntry>, ApiError
         ));
     }
     for vault in &vaults {
+        if entries.len() >= WORKSPACE_CATALOG_LIMIT {
+            break;
+        }
         entries.push(workspace_entry(
             ResolvedWorkspace::vault(vault),
             WorkspaceCounts {
@@ -702,7 +721,10 @@ fn workspace_entries(store: &GraphStore) -> Result<Vec<WorkspaceEntry>, ApiError
         ));
     }
 
-    Ok(entries)
+    Ok(BoundedResults {
+        items: entries,
+        total_count,
+    })
 }
 
 fn workspace_entry(

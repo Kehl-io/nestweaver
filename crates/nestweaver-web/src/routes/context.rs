@@ -198,40 +198,39 @@ fn brain_context_meta(
     token_budget: Option<usize>,
     empty_result: bool,
 ) -> workspaces::P1Meta {
-    match workspace.kind {
-        WorkspaceKind::All => workspaces::p1_meta(
-            workspace,
-            if empty_result { "no-match" } else { "complete" },
-            Vec::<&str>::new(),
-            vec![P1Provenance::local_graph_store("brain context")],
-            token_budget,
-        ),
-        WorkspaceKind::Project => workspaces::p1_meta(
-            workspace,
-            if empty_result { "no-match" } else { "partial" },
+    // The engine's brain-context builder has no token-budget support, so a
+    // requested budget is never enforced. Disclose it as unsupported rather
+    // than echoing it as an applied truncation limit.
+    let (success_result, mut unsupported, provenance_detail) = match workspace.kind {
+        WorkspaceKind::All => ("complete", Vec::new(), "brain context"),
+        WorkspaceKind::Project => (
+            "partial",
             vec!["project-components"],
-            vec![P1Provenance::local_graph_store(
-                "project-filtered brain context",
-            )],
-            token_budget,
+            "project-filtered brain context",
         ),
-        WorkspaceKind::Repo => workspaces::p1_meta(
-            workspace,
-            if empty_result { "no-match" } else { "partial" },
+        WorkspaceKind::Repo => (
+            "partial",
             vec!["note-results"],
-            vec![P1Provenance::local_graph_store(
-                "repo-filtered brain context",
-            )],
-            token_budget,
+            "repo-filtered brain context",
         ),
-        WorkspaceKind::Vault => workspaces::p1_meta(
-            workspace,
-            if empty_result { "no-match" } else { "partial" },
+        WorkspaceKind::Vault => (
+            "partial",
             vec!["code-results"],
-            vec![P1Provenance::local_graph_store(
-                "vault-filtered brain context",
-            )],
-            token_budget,
+            "vault-filtered brain context",
         ),
+    };
+    if token_budget.is_some() {
+        unsupported.push("token-budget");
     }
+    workspaces::p1_meta(
+        workspace,
+        if empty_result {
+            "no-match"
+        } else {
+            success_result
+        },
+        unsupported,
+        vec![P1Provenance::local_graph_store(provenance_detail)],
+        None,
+    )
 }

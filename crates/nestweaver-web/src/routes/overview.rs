@@ -170,22 +170,21 @@ pub async fn overview(
     Ok(Json(response).into_response())
 }
 
+type OverviewScopeData = (
+    Vec<nestweaver_schema::Repo>,
+    Vec<nestweaver_schema::Service>,
+    Vec<nestweaver_schema::Symbol>,
+    Vec<nestweaver_schema::Vault>,
+    Vec<nestweaver_store::NoteLite>,
+    OverviewCounts,
+    OverviewMetaState,
+);
+
 fn overview_scope_data(
     state: &Arc<AppState>,
     workspace: &ResolvedWorkspace,
     limit: usize,
-) -> Result<
-    (
-        Vec<nestweaver_schema::Repo>,
-        Vec<nestweaver_schema::Service>,
-        Vec<nestweaver_schema::Symbol>,
-        Vec<nestweaver_schema::Vault>,
-        Vec<nestweaver_store::NoteLite>,
-        OverviewCounts,
-        OverviewMetaState,
-    ),
-    ApiError,
-> {
+) -> Result<OverviewScopeData, ApiError> {
     match workspace.kind {
         WorkspaceKind::All => {
             let projects = state.store.list_projects()?;

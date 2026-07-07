@@ -81,6 +81,20 @@ pub async fn impact(
     Path(uid): Path<String>,
     Query(params): Query<ImpactParams>,
 ) -> Result<Response, ApiError> {
+    // The impact computation fans out into many sequential store queries
+    // (BFS traversal, layered edge reconstruction, affected-test hints), so
+    // run it off the async runtime instead of blocking a worker thread.
+    let response = tokio::task::spawn_blocking(move || impact_response(&state, &uid, &params))
+        .await
+        .map_err(|err| ApiError::internal(format!("impact task failed: {err}")))??;
+    Ok(Json(response).into_response())
+}
+
+fn impact_response(
+    state: &Arc<AppState>,
+    uid: &str,
+    params: &ImpactParams,
+) -> Result<ImpactResponse, ApiError> {
     let confidence = params.confidence.unwrap_or(0.3).clamp(0.0, 1.0);
     let depth = params.depth.unwrap_or(3).min(20);
     let limit = params.limit.unwrap_or(250).clamp(1, 1000);
@@ -89,29 +103,31 @@ pub async fn impact(
         workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref()),
     )?;
 
-    if workspace.kind == WorkspaceKind::Vault {
-        return Ok(Json(unsupported_workspace_response(&workspace, limit)).into_response());
-    }
-
+    // Nonexistent symbols are a 404 regardless of scope; the vault
+    // unsupported envelope is reserved for symbols that exist.
     let target = state
         .store
-        .lookup_symbol(&uid)
+        .lookup_symbol(uid)
         .map_err(|_| ApiError::not_found(format!("symbol '{uid}' not found")))?;
 
-    let Some(scope) = ImpactScope::resolve(&state, &workspace)? else {
-        return Ok(Json(unsupported_workspace_response(&workspace, limit)).into_response());
+    if workspace.kind == WorkspaceKind::Vault {
+        return Ok(unsupported_workspace_response(&workspace, limit));
+    }
+
+    let Some(scope) = ImpactScope::resolve(state, &workspace)? else {
+        return Ok(unsupported_workspace_response(&workspace, limit));
     };
     if !scope.contains(&target) {
-        return Ok(Json(out_of_scope_response(&workspace, &target, limit)).into_response());
+        return Ok(out_of_scope_response(&workspace, &target, limit));
     }
 
     let impact_nodes: Vec<ImpactNode> = state
         .store
-        .impact(&uid, depth, confidence)?
+        .impact(uid, depth, confidence)?
         .into_iter()
         .filter(|node| scope.contains_impact_node(node))
         .collect();
-    let affected_tests = scoped_affected_tests(&state, &scope, &target)?;
+    let affected_tests = scoped_affected_tests(state, &scope, &target)?;
     let total_node_count = impact_nodes.len() + 1;
     let returned_impact_nodes: Vec<ImpactNode> = impact_nodes
         .iter()
@@ -119,7 +135,7 @@ pub async fn impact(
         .cloned()
         .collect();
     let returned_count = returned_impact_nodes.len() + 1;
-    let stale = target_repo_is_stale(&state, &target)?;
+    let stale = target_repo_is_stale(state, &target)?;
     let result_state = if total_node_count > returned_count {
         "truncated"
     } else if impact_nodes.is_empty() {
@@ -150,7 +166,7 @@ pub async fn impact(
     let mut nodes = Vec::with_capacity(returned_count);
     nodes.push(target_graph_node(&target));
     nodes.extend(returned_impact_nodes.iter().map(impact_graph_node));
-    let edges = build_layered_edges(&state, &target.uid, &returned_impact_nodes, confidence)?;
+    let edges = build_layered_edges(state, &target.uid, &returned_impact_nodes, confidence)?;
     let states = ImpactStates {
         tier: "local-only",
         local: "available",
@@ -162,7 +178,7 @@ pub async fn impact(
         result: meta.trust.result.clone(),
     };
 
-    Ok(Json(ImpactResponse {
+    Ok(ImpactResponse {
         target: Some(target_node),
         nodes,
         edges,
@@ -170,7 +186,6 @@ pub async fn impact(
         states,
         meta,
     })
-    .into_response())
 }
 
 struct ImpactScope {

@@ -479,6 +479,21 @@ async fn p1_impact_repo_scope_returns_no_match_for_out_of_scope_target() {
 }
 
 #[tokio::test]
+async fn p1_impact_nonexistent_symbol_is_404_even_under_vault_scope() {
+    let app = make_app();
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/impact/sym:impact:missing?depth=3&confidence=0.3&workspace=vault:vlt:impact-notes",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a nonexistent symbol must 404 regardless of scope, not masquerade as unsupported: {json:?}"
+    );
+}
+
+#[tokio::test]
 async fn p1_impact_vault_scope_is_explicitly_unsupported() {
     let app = make_app();
     let (status, json) = get_json(
