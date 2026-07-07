@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 import type { ActiveLensState, RepresentationMode } from "../api/p1Types";
+import type { AnalysisStateSnapshot } from "../stores/analysisSlice";
+import type { DetailFocus } from "../stores/graphSlice";
 
 interface NavState {
   seeds: string[];
@@ -11,6 +13,8 @@ interface NavState {
   representationMode: RepresentationMode;
   selectedNodeId: string | null;
   selectedNodeKind: string | null;
+  detailFocus: DetailFocus;
+  analysis: AnalysisStateSnapshot;
 }
 
 const MAX_HISTORY = 50;
@@ -22,6 +26,27 @@ const historyState = {
 };
 
 const listeners = new Set<() => void>();
+
+const emptyAnalysisSnapshot: AnalysisStateSnapshot = {
+  flowTraceRoot: null,
+  pathfindingActive: false,
+  pathfindingFrom: null,
+  pathfindingTo: null,
+  pathRequestId: 0,
+  pathResults: [],
+  pathStatus: "idle",
+  pathError: null,
+  selectedPathIndex: 0,
+  diffActive: false,
+  diffState: {
+    snapshotA: null,
+    snapshotB: null,
+    seedsA: [],
+    seedsB: [],
+  },
+  gapItems: [],
+  gapActive: false,
+};
 
 function emitChange() {
   listeners.forEach((listener) => listener());
@@ -46,8 +71,59 @@ function statesEqual(left: NavState | undefined, right: NavState): boolean {
     left.activeLens.workspaceId === right.activeLens.workspaceId &&
     left.representationMode === right.representationMode &&
     left.selectedNodeId === right.selectedNodeId &&
-    left.selectedNodeKind === right.selectedNodeKind
+    left.selectedNodeKind === right.selectedNodeKind &&
+    left.detailFocus === right.detailFocus &&
+    JSON.stringify(left.analysis) === JSON.stringify(right.analysis)
   );
+}
+
+function analysisSnapshotForState(
+  state: ReturnType<typeof useStore.getState>,
+): AnalysisStateSnapshot {
+  const snapshot: AnalysisStateSnapshot = {
+    ...emptyAnalysisSnapshot,
+    pathRequestId: state.pathRequestId,
+  };
+
+  if (state.activeLens.lens === "trace" && state.flowTraceRoot) {
+    snapshot.flowTraceRoot = state.flowTraceRoot;
+  }
+
+  if (state.activeLens.lens === "path" || state.pathfindingActive) {
+    snapshot.pathfindingActive = state.pathfindingActive;
+    snapshot.pathfindingFrom = state.pathfindingFrom;
+    snapshot.pathfindingTo = state.pathfindingTo;
+    snapshot.pathRequestId = state.pathRequestId;
+    snapshot.pathResults = [...state.pathResults];
+    snapshot.pathStatus = state.pathStatus;
+    snapshot.pathError = state.pathError;
+    snapshot.selectedPathIndex = state.selectedPathIndex;
+  }
+
+  if (
+    state.diffActive &&
+    state.detailFocus === "analysis" &&
+    state.activeLens.label.toLowerCase().startsWith("compare")
+  ) {
+    snapshot.diffActive = true;
+    snapshot.diffState = {
+      snapshotA: state.diffState.snapshotA,
+      snapshotB: state.diffState.snapshotB,
+      seedsA: [...state.diffState.seedsA],
+      seedsB: [...state.diffState.seedsB],
+    };
+  }
+
+  if (
+    state.gapActive &&
+    (state.activeLens.lens === "unsupported" ||
+      state.activeLens.label.toLowerCase().includes("dead code"))
+  ) {
+    snapshot.gapActive = true;
+    snapshot.gapItems = [...state.gapItems];
+  }
+
+  return snapshot;
 }
 
 function currentEntry(): NavState {
@@ -60,6 +136,8 @@ function currentEntry(): NavState {
     representationMode: state.representationMode,
     selectedNodeId: state.selectedNodeId,
     selectedNodeKind: state.selectedNodeKind,
+    detailFocus: state.detailFocus,
+    analysis: analysisSnapshotForState(state),
   };
 }
 
@@ -69,7 +147,9 @@ export function useNavigationHistory() {
   const setActiveWorkspaceId = useStore((s) => s.setActiveWorkspaceId);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setRepresentationMode = useStore((s) => s.setRepresentationMode);
+  const setDetailFocus = useStore((s) => s.setDetailFocus);
   const selectNode = useStore((s) => s.selectNode);
+  const restoreAnalysisState = useStore((s) => s.restoreAnalysisState);
   const [, setVersion] = useState(0);
 
   const pushState = useCallback(() => {
@@ -99,12 +179,16 @@ export function useNavigationHistory() {
     setActiveLens(entry.activeLens);
     setRepresentationMode(entry.representationMode);
     selectNode(entry.selectedNodeId, entry.selectedNodeKind);
+    setDetailFocus(entry.detailFocus);
+    restoreAnalysisState(entry.analysis);
     historyState.isNavigating = false;
     emitChange();
   }, [
+    restoreAnalysisState,
     selectNode,
     setActiveLens,
     setActiveWorkspaceId,
+    setDetailFocus,
     setGraphMode,
     setRepresentationMode,
     setSeeds,
@@ -121,12 +205,16 @@ export function useNavigationHistory() {
     setActiveLens(entry.activeLens);
     setRepresentationMode(entry.representationMode);
     selectNode(entry.selectedNodeId, entry.selectedNodeKind);
+    setDetailFocus(entry.detailFocus);
+    restoreAnalysisState(entry.analysis);
     historyState.isNavigating = false;
     emitChange();
   }, [
+    restoreAnalysisState,
     selectNode,
     setActiveLens,
     setActiveWorkspaceId,
+    setDetailFocus,
     setGraphMode,
     setRepresentationMode,
     setSeeds,
@@ -140,12 +228,30 @@ export function useNavigationHistory() {
   const representationMode = useStore((s) => s.representationMode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
+  const detailFocus = useStore((s) => s.detailFocus);
+  const flowTraceRoot = useStore((s) => s.flowTraceRoot);
+  const pathfindingActive = useStore((s) => s.pathfindingActive);
+  const pathfindingFrom = useStore((s) => s.pathfindingFrom);
+  const pathfindingTo = useStore((s) => s.pathfindingTo);
+  const pathRequestId = useStore((s) => s.pathRequestId);
+  const pathResults = useStore((s) => s.pathResults);
+  const pathStatus = useStore((s) => s.pathStatus);
+  const pathError = useStore((s) => s.pathError);
+  const selectedPathIndex = useStore((s) => s.selectedPathIndex);
+  const diffActive = useStore((s) => s.diffActive);
+  const diffState = useStore((s) => s.diffState);
+  const gapItems = useStore((s) => s.gapItems);
+  const gapActive = useStore((s) => s.gapActive);
   const prevSeedsRef = useRef<string>(JSON.stringify(seeds));
   const prevModeRef = useRef<GraphMode>(graphMode);
   const prevWorkspaceRef = useRef(activeWorkspaceId);
   const prevLensRef = useRef(JSON.stringify(activeLens));
   const prevRepresentationRef = useRef<RepresentationMode>(representationMode);
   const prevSelectionRef = useRef(`${selectedNodeId ?? ""}\u0000${selectedNodeKind ?? ""}`);
+  const prevDetailFocusRef = useRef<DetailFocus>(detailFocus);
+  const prevAnalysisRef = useRef<string>(
+    JSON.stringify(analysisSnapshotForState(useStore.getState())),
+  );
 
   useEffect(() => subscribe(() => setVersion((version) => version + 1)), []);
 
@@ -157,13 +263,16 @@ export function useNavigationHistory() {
     const seedsKey = JSON.stringify(seeds);
     const lensKey = JSON.stringify(activeLens);
     const selectionKey = `${selectedNodeId ?? ""}\u0000${selectedNodeKind ?? ""}`;
+    const analysisKey = JSON.stringify(analysisSnapshotForState(useStore.getState()));
     if (
       seedsKey !== prevSeedsRef.current ||
       graphMode !== prevModeRef.current ||
       activeWorkspaceId !== prevWorkspaceRef.current ||
       lensKey !== prevLensRef.current ||
       representationMode !== prevRepresentationRef.current ||
-      selectionKey !== prevSelectionRef.current
+      selectionKey !== prevSelectionRef.current ||
+      detailFocus !== prevDetailFocusRef.current ||
+      analysisKey !== prevAnalysisRef.current
     ) {
       prevSeedsRef.current = seedsKey;
       prevModeRef.current = graphMode;
@@ -171,17 +280,33 @@ export function useNavigationHistory() {
       prevLensRef.current = lensKey;
       prevRepresentationRef.current = representationMode;
       prevSelectionRef.current = selectionKey;
+      prevDetailFocusRef.current = detailFocus;
+      prevAnalysisRef.current = analysisKey;
       pushState();
     }
   }, [
     activeLens,
     activeWorkspaceId,
+    detailFocus,
+    diffActive,
+    diffState,
+    flowTraceRoot,
+    gapActive,
+    gapItems,
     graphMode,
+    pathError,
+    pathRequestId,
+    pathResults,
+    pathStatus,
+    pathfindingActive,
+    pathfindingFrom,
+    pathfindingTo,
     pushState,
     representationMode,
     seeds,
     selectedNodeId,
     selectedNodeKind,
+    selectedPathIndex,
   ]);
 
   const canUndo = historyState.index > 0;

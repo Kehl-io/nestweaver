@@ -24,6 +24,22 @@ export interface GapItem {
   nodeUids: string[];
 }
 
+export interface AnalysisStateSnapshot {
+  flowTraceRoot: FlowNode | null;
+  pathfindingActive: boolean;
+  pathfindingFrom: string | null;
+  pathfindingTo: string | null;
+  pathRequestId: number;
+  pathResults: PathResult[];
+  pathStatus: "idle" | "pending" | "success" | "empty" | "error";
+  pathError: string | null;
+  selectedPathIndex: number;
+  diffActive: boolean;
+  diffState: DiffState;
+  gapItems: GapItem[];
+  gapActive: boolean;
+}
+
 export interface AnalysisSlice {
   flowTraceRoot: FlowNode | null;
   flowTraceNodeUids: string[];
@@ -57,6 +73,7 @@ export interface AnalysisSlice {
   gapActive: boolean;
   setGapItems: (items: GapItem[]) => void;
   toggleGapPanel: () => void;
+  restoreAnalysisState: (snapshot: AnalysisStateSnapshot) => void;
 }
 
 function flattenFlowTree(node: FlowNode): string[] {
@@ -218,5 +235,31 @@ export const createAnalysisSlice: StateCreator<
   toggleGapPanel: () =>
     set((s) => {
       s.gapActive = !s.gapActive;
+    }),
+
+  restoreAnalysisState: (snapshot) =>
+    set((s) => {
+      s.flowTraceRoot = snapshot.flowTraceRoot;
+      s.flowTraceNodeUids = snapshot.flowTraceRoot
+        ? flattenFlowTree(snapshot.flowTraceRoot)
+        : [];
+      s.flowTraceActive = snapshot.flowTraceRoot !== null;
+      s.pathfindingActive = snapshot.pathfindingActive;
+      s.pathfindingFrom = snapshot.pathfindingFrom;
+      s.pathfindingTo = snapshot.pathfindingTo;
+      s.pathRequestId = snapshot.pathRequestId;
+      s.pathResults = snapshot.pathResults;
+      s.pathStatus = snapshot.pathStatus;
+      s.pathError = snapshot.pathError;
+      s.selectedPathIndex = snapshot.selectedPathIndex;
+      s.diffActive = snapshot.diffActive;
+      s.diffState = {
+        snapshotA: snapshot.diffState.snapshotA,
+        snapshotB: snapshot.diffState.snapshotB,
+        seedsA: [...snapshot.diffState.seedsA],
+        seedsB: [...snapshot.diffState.seedsB],
+      };
+      s.gapItems = snapshot.gapItems;
+      s.gapActive = snapshot.gapActive;
     }),
 });

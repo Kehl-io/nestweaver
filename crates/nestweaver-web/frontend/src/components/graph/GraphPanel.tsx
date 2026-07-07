@@ -194,7 +194,7 @@ function GraphModeHooks() {
   const { hops, setHops } = useLocalMode();
 
   const graphMode = useStore((s) => s.graphMode);
-  const viewMode = useStore((s) => s.viewMode);
+  const representationMode = useStore((s) => s.representationMode);
   const layoutMode = useStore((s) => s.layoutMode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const setGraphMode = useStore((s) => s.setGraphMode);
@@ -219,7 +219,7 @@ function GraphModeHooks() {
 
   return (
     <>
-      {graphMode === "overview" && viewMode === "graph" && layoutMode !== "zen" && (
+      {graphMode === "overview" && representationMode === "graph" && layoutMode !== "zen" && (
         <>
           <OverviewCommandShelf {...overviewState} />
           <OverviewContextSurface
@@ -227,7 +227,7 @@ function GraphModeHooks() {
           />
         </>
       )}
-      {graphMode === "local" && (
+      {graphMode === "local" && representationMode === "graph" && (
         <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3 py-1.5 rounded bg-[var(--color-surface-alt)] shadow text-xs text-[var(--color-text)]">
           <label htmlFor="local-hops-slider" className="whitespace-nowrap">
             Depth: {hops}
@@ -260,6 +260,7 @@ export function GraphPanel() {
   const minimapVisible = useStore((s) => s.minimapVisible);
   const layoutMode = useStore((s) => s.layoutMode);
   const focusMap = layoutMode === "zen";
+  const graphRepresentationActive = representationMode === "graph";
 
   const graphPanelRef = useRef<HTMLDivElement>(null);
   useGraphKeyboardNav(graphPanelRef);
@@ -288,11 +289,13 @@ export function GraphPanel() {
           aria-label={
             representationMode === "json"
               ? "JSON result view"
-              : viewMode === "list" || representationMode === "table"
+              : representationMode === "table" || representationMode === "list"
                 ? "Node table view"
+                : representationMode === "matrix"
+                  ? "Graph matrix view"
                 : "Code knowledge graph"
           }
-          role={viewMode === "graph" && representationMode !== "json" ? "application" : "region"}
+          role={graphRepresentationActive ? "application" : "region"}
           tabIndex={0}
           style={{ background: "var(--color-graph-bg)", width: "100%", height: "100%" }}
           onContextMenu={handleContextMenu}
@@ -301,7 +304,7 @@ export function GraphPanel() {
             <JsonResultView />
           ) : viewMode === "list" || representationMode === "table" ? (
             <NodeListView />
-          ) : viewMode === "matrix" ? (
+          ) : representationMode === "matrix" ? (
             <GraphMatrixView />
           ) : (
             <GraphCanvas />
@@ -309,15 +312,15 @@ export function GraphPanel() {
         </div>
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
-        {representationMode !== "json" && <ControlDock />}
-        <NodePreviewCard />
-        {viewMode === "graph" && !focusMap && <GraphLegend />}
-        {viewMode === "graph" && minimapVisible && graphMode !== "overview" && !focusMap && (
+        {graphRepresentationActive && <ControlDock />}
+        {graphRepresentationActive && <NodePreviewCard />}
+        {graphRepresentationActive && !focusMap && <GraphLegend />}
+        {graphRepresentationActive && minimapVisible && graphMode !== "overview" && !focusMap && (
           <div className="absolute bottom-14 right-3 z-10 opacity-80 transition-opacity hover:opacity-100">
             <GraphMinimap />
           </div>
         )}
-        {representationMode === "graph" && graphMode !== "overview" && !focusMap && (
+        {graphRepresentationActive && graphMode !== "overview" && !focusMap && (
           <div className="absolute left-3 top-3 z-20 w-[min(320px,calc(100%-1.5rem))]">
             <LensSummaryPanel compact />
           </div>

@@ -1,6 +1,18 @@
 import { useMemo } from "react";
 import { Copy, Download } from "lucide-react";
+import type { BrainContextResult } from "../../api/types";
 import { useStore } from "../../stores";
+
+const JSON_CAPS = {
+  graphNodes: 500,
+  graphEdges: 1000,
+  flowRows: 250,
+  pathResults: 50,
+  gapItems: 100,
+  diffSeeds: 100,
+  diffConnected: 200,
+  diffUnresolved: 100,
+};
 
 function attrsToRecord(attrs: unknown): Record<string, unknown> {
   return attrs && typeof attrs === "object"
@@ -15,17 +27,48 @@ function buildGraphPayload() {
       nodes: [],
       edges: [],
       unavailable_reason: "No graph data is loaded for the current scene.",
+      _meta: {
+        node_count: 0,
+        edge_count: 0,
+        nodes_truncated: false,
+        edges_truncated: false,
+        node_limit: JSON_CAPS.graphNodes,
+        edge_limit: JSON_CAPS.graphEdges,
+        omitted_nodes: 0,
+        omitted_edges: 0,
+      },
     };
   }
   const nodes: Record<string, unknown>[] = [];
+  let nodeCount = 0;
   graph.forEachNode((uid, attrs) => {
-    nodes.push({ uid, ...attrsToRecord(attrs) });
+    if (nodes.length < JSON_CAPS.graphNodes) {
+      nodes.push({ uid, ...attrsToRecord(attrs) });
+    }
+    nodeCount += 1;
   });
   const edges: Record<string, unknown>[] = [];
+  let edgeCount = 0;
   graph.forEachEdge((edgeId, attrs, source, target) => {
-    edges.push({ id: edgeId, source, target, ...attrsToRecord(attrs) });
+    if (edges.length < JSON_CAPS.graphEdges) {
+      edges.push({ id: edgeId, source, target, ...attrsToRecord(attrs) });
+    }
+    edgeCount += 1;
   });
-  return { nodes, edges };
+  return {
+    nodes,
+    edges,
+    _meta: {
+      node_count: nodeCount,
+      edge_count: edgeCount,
+      nodes_truncated: nodeCount > nodes.length,
+      edges_truncated: edgeCount > edges.length,
+      node_limit: JSON_CAPS.graphNodes,
+      edge_limit: JSON_CAPS.graphEdges,
+      omitted_nodes: Math.max(0, nodeCount - nodes.length),
+      omitted_edges: Math.max(0, edgeCount - edges.length),
+    },
+  };
 }
 
 function flowToList(node: ReturnType<typeof useStore.getState>["flowTraceRoot"]) {
@@ -44,6 +87,38 @@ function flowToList(node: ReturnType<typeof useStore.getState>["flowTraceRoot"])
   };
   visit(node, null);
   return rows;
+}
+
+function capList<T>(items: T[], limit: number) {
+  return {
+    items: items.slice(0, limit),
+    _meta: {
+      total_count: items.length,
+      limit,
+      truncated: items.length > limit,
+      omitted_count: Math.max(0, items.length - limit),
+    },
+  };
+}
+
+function capBrainContextResult(
+  snapshot: BrainContextResult | null,
+): (BrainContextResult & { _meta: Record<string, unknown> }) | null {
+  if (!snapshot) return null;
+  const seeds = capList(snapshot.seeds, JSON_CAPS.diffSeeds);
+  const connected = capList(snapshot.connected, JSON_CAPS.diffConnected);
+  const unresolved = capList(snapshot.unresolved_seeds, JSON_CAPS.diffUnresolved);
+  return {
+    seeds: seeds.items,
+    connected: connected.items,
+    unresolved_seeds: unresolved.items,
+    _meta: {
+      capped: true,
+      seeds: seeds._meta,
+      connected: connected._meta,
+      unresolved_seeds: unresolved._meta,
+    },
+  };
 }
 
 export function JsonResultView() {
@@ -69,12 +144,28 @@ export function JsonResultView() {
   const payload = useMemo(() => {
     void graphVersion;
     const graph = buildGraphPayload();
+    const flowRows = capList(flowToList(flowTraceRoot), JSON_CAPS.flowRows);
+    const cappedPathResults = capList(pathResults, JSON_CAPS.pathResults);
+    const cappedGapItems = capList(gapItems, JSON_CAPS.gapItems);
     return {
-      _meta: sceneMetadata ?? {
-        workspace_id: activeWorkspaceId,
-        trust: trustSummary,
-        unavailable_reason:
-          "No scene metadata is available; showing current client-side scene state.",
+      _meta: {
+        ...(sceneMetadata ?? {
+          workspace_id: activeWorkspaceId,
+          trust: trustSummary,
+          unavailable_reason:
+            "No scene metadata is available; showing current client-side scene state.",
+        }),
+        client_caps: {
+          graph: graph._meta,
+          flow_rows: flowRows._meta,
+          path_results: cappedPathResults._meta,
+          gap_items: cappedGapItems._meta,
+          diff_snapshots: {
+            seeds_limit: JSON_CAPS.diffSeeds,
+            connected_limit: JSON_CAPS.diffConnected,
+            unresolved_limit: JSON_CAPS.diffUnresolved,
+          },
+        },
       },
       active_lens: activeLens,
       selected_node: {
@@ -87,23 +178,26 @@ export function JsonResultView() {
         flow_trace: {
           active: Boolean(flowTraceRoot),
           node_uids: flowTraceNodeUids,
-          rows: flowToList(flowTraceRoot),
+          rows: flowRows.items,
+          _meta: flowRows._meta,
         },
         paths: {
           status: pathStatus,
           error: pathError,
-          results: pathResults,
+          results: cappedPathResults.items,
+          _meta: cappedPathResults._meta,
         },
         gaps: {
           active: gapActive,
-          items: gapItems,
+          items: cappedGapItems.items,
+          _meta: cappedGapItems._meta,
         },
         diff: {
           active: diffActive,
           seeds_a: diffState.seedsA,
           seeds_b: diffState.seedsB,
-          snapshot_a: diffState.snapshotA,
-          snapshot_b: diffState.snapshotB,
+          snapshot_a: capBrainContextResult(diffState.snapshotA),
+          snapshot_b: capBrainContextResult(diffState.snapshotB),
         },
       },
       unsupported_or_limited: trustSummary?.unsupported ?? [],

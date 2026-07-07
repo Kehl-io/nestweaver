@@ -90,7 +90,7 @@ function AppContent() {
             {graphView}
           </ErrorBoundary>
           {selectedNodeId && activeView === "graph" && (
-            <div className="absolute bottom-14 right-3 top-14 z-30 hidden w-[min(360px,calc(100vw-1.5rem))] overflow-hidden rounded border border-[var(--color-border)] shadow-xl xl:block">
+            <div className="absolute bottom-14 right-3 top-14 z-30 hidden w-[min(360px,calc(100vw-1.5rem))] overflow-hidden rounded border border-[var(--color-border)] shadow-xl md:block">
               <ErrorBoundary>
                 <SourceEvidencePanel compact />
               </ErrorBoundary>
