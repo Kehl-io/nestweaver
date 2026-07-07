@@ -50,6 +50,15 @@ function trustSummaryFromMetadata(metadata: SceneMetadata): TrustSummary {
   };
 }
 
+function lensKeepsRelationshipResult(lens: ActiveLensState): boolean {
+  const label = lens.label.toLowerCase();
+  return lens.lens === "search" && (label.startsWith("callers of") || label.startsWith("callees of"));
+}
+
+function lensKeepsBacklinkResult(lens: ActiveLensState): boolean {
+  return lens.lens === "rationale" && lens.label.toLowerCase().startsWith("backlinks for");
+}
+
 export interface SceneSlice {
   activeLens: ActiveLensState;
   representationMode: RepresentationMode;
@@ -85,6 +94,8 @@ export const createSceneSlice: StateCreator<
       const keepGap =
         nextLens.lens === "unsupported" &&
         (lowerLabel.includes("dead code") || lowerLabel.includes("gap"));
+      const keepRelationship = lensKeepsRelationshipResult(nextLens);
+      const keepBacklinks = lensKeepsBacklinkResult(nextLens);
 
       s.activeLens = nextLens;
       if (nextLens.lens !== "trace") {
@@ -112,6 +123,12 @@ export const createSceneSlice: StateCreator<
       if (!keepGap) {
         s.gapItems = [];
         s.gapActive = false;
+      }
+      if (!keepRelationship) {
+        s.relationshipResult = null;
+      }
+      if (!keepBacklinks) {
+        s.backlinkResult = null;
       }
     }),
 
@@ -149,5 +166,7 @@ export const createSceneSlice: StateCreator<
       s.viewMode = "graph";
       s.sceneMetadata = null;
       s.trustSummary = null;
+      s.relationshipResult = null;
+      s.backlinkResult = null;
     }),
 });

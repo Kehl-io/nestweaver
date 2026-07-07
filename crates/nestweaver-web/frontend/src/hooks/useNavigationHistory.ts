@@ -46,6 +46,8 @@ const emptyAnalysisSnapshot: AnalysisStateSnapshot = {
   },
   gapItems: [],
   gapActive: false,
+  relationshipResult: null,
+  backlinkResult: null,
 };
 
 function emitChange() {
@@ -120,6 +122,29 @@ function analysisSnapshotForState(
   ) {
     snapshot.gapActive = true;
     snapshot.gapItems = [...state.gapItems];
+  }
+
+  const lowerLabel = state.activeLens.label.toLowerCase();
+  if (
+    state.relationshipResult &&
+    state.activeLens.lens === "search" &&
+    (lowerLabel.startsWith("callers of") || lowerLabel.startsWith("callees of"))
+  ) {
+    snapshot.relationshipResult = {
+      ...state.relationshipResult,
+      rows: [...state.relationshipResult.rows],
+    };
+  }
+
+  if (
+    state.backlinkResult &&
+    state.activeLens.lens === "rationale" &&
+    lowerLabel.startsWith("backlinks for")
+  ) {
+    snapshot.backlinkResult = {
+      ...state.backlinkResult,
+      rows: [...state.backlinkResult.rows],
+    };
   }
 
   return snapshot;
@@ -241,6 +266,8 @@ export function useNavigationHistory() {
   const diffState = useStore((s) => s.diffState);
   const gapItems = useStore((s) => s.gapItems);
   const gapActive = useStore((s) => s.gapActive);
+  const relationshipResult = useStore((s) => s.relationshipResult);
+  const backlinkResult = useStore((s) => s.backlinkResult);
   const prevSeedsRef = useRef<string>(JSON.stringify(seeds));
   const prevModeRef = useRef<GraphMode>(graphMode);
   const prevWorkspaceRef = useRef(activeWorkspaceId);
@@ -302,10 +329,12 @@ export function useNavigationHistory() {
     pathfindingTo,
     pushState,
     representationMode,
+    relationshipResult,
     seeds,
     selectedNodeId,
     selectedNodeKind,
     selectedPathIndex,
+    backlinkResult,
   ]);
 
   const canUndo = historyState.index > 0;

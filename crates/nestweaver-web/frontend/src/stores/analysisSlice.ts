@@ -1,7 +1,13 @@
 import type { StateCreator } from "zustand";
 import type { ActiveLensState } from "../api/p1Types";
 import type { StoreState } from "./index";
-import type { BrainContextResult, FlowNode, PathResult } from "../api/types";
+import type {
+  BacklinkRow,
+  BrainContextResult,
+  FlowNode,
+  PathResult,
+  Symbol,
+} from "../api/types";
 
 export type { FlowNode } from "../api/types";
 
@@ -25,6 +31,27 @@ export interface GapItem {
   nodeUids: string[];
 }
 
+export type RelationshipResultKind = "callers" | "callees";
+
+export interface RelationshipResultState {
+  kind: RelationshipResultKind;
+  targetUid: string;
+  targetLabel: string;
+  workspaceId: string;
+  rows: Symbol[];
+  status: "success" | "empty" | "error";
+  error: string | null;
+}
+
+export interface BacklinkResultState {
+  targetUid: string;
+  targetLabel: string;
+  workspaceId: string;
+  rows: BacklinkRow[];
+  status: "success" | "empty" | "error";
+  error: string | null;
+}
+
 export interface AnalysisStateSnapshot {
   flowTraceRoot: FlowNode | null;
   pathfindingActive: boolean;
@@ -39,6 +66,8 @@ export interface AnalysisStateSnapshot {
   diffState: DiffState;
   gapItems: GapItem[];
   gapActive: boolean;
+  relationshipResult: RelationshipResultState | null;
+  backlinkResult: BacklinkResultState | null;
 }
 
 export interface AnalysisSlice {
@@ -74,6 +103,11 @@ export interface AnalysisSlice {
   gapActive: boolean;
   setGapItems: (items: GapItem[]) => void;
   toggleGapPanel: () => void;
+
+  relationshipResult: RelationshipResultState | null;
+  setRelationshipResult: (result: RelationshipResultState | null) => void;
+  backlinkResult: BacklinkResultState | null;
+  setBacklinkResult: (result: BacklinkResultState | null) => void;
   restoreAnalysisState: (
     snapshot: AnalysisStateSnapshot,
     lens?: ActiveLensState,
@@ -105,6 +139,15 @@ function lensKeepsDiff(lens: ActiveLensState): boolean {
 function lensKeepsGap(lens: ActiveLensState): boolean {
   const label = lens.label.toLowerCase();
   return lens.lens === "unsupported" && (label.includes("dead code") || label.includes("gap"));
+}
+
+function lensKeepsRelationship(lens: ActiveLensState): boolean {
+  const label = lens.label.toLowerCase();
+  return lens.lens === "search" && (label.startsWith("callers of") || label.startsWith("callees of"));
+}
+
+function lensKeepsBacklinks(lens: ActiveLensState): boolean {
+  return lens.lens === "rationale" && lens.label.toLowerCase().startsWith("backlinks for");
 }
 
 export const createAnalysisSlice: StateCreator<
@@ -250,6 +293,20 @@ export const createAnalysisSlice: StateCreator<
       s.gapActive = !s.gapActive;
     }),
 
+  relationshipResult: null,
+
+  setRelationshipResult: (result) =>
+    set((s) => {
+      s.relationshipResult = result;
+    }),
+
+  backlinkResult: null,
+
+  setBacklinkResult: (result) =>
+    set((s) => {
+      s.backlinkResult = result;
+    }),
+
   restoreAnalysisState: (snapshot, lens) =>
     set((s) => {
       const targetLens = lens ?? s.activeLens;
@@ -257,6 +314,8 @@ export const createAnalysisSlice: StateCreator<
       const keepPath = targetLens.lens === "path";
       const keepDiff = lensKeepsDiff(targetLens);
       const keepGap = lensKeepsGap(targetLens);
+      const keepRelationship = lensKeepsRelationship(targetLens);
+      const keepBacklinks = lensKeepsBacklinks(targetLens);
 
       s.flowTraceRoot = keepTrace ? snapshot.flowTraceRoot : null;
       s.flowTraceNodeUids = s.flowTraceRoot
@@ -280,5 +339,7 @@ export const createAnalysisSlice: StateCreator<
       };
       s.gapItems = keepGap ? snapshot.gapItems : [];
       s.gapActive = keepGap ? snapshot.gapActive : false;
+      s.relationshipResult = keepRelationship ? snapshot.relationshipResult : null;
+      s.backlinkResult = keepBacklinks ? snapshot.backlinkResult : null;
     }),
 });

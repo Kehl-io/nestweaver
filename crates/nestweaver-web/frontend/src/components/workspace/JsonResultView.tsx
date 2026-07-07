@@ -10,6 +10,8 @@ const JSON_CAPS = {
   flowNodeUids: 250,
   pathResults: 50,
   gapItems: 100,
+  relationshipRows: 100,
+  backlinkRows: 100,
   diffSeeds: 100,
   diffConnected: 200,
   diffUnresolved: 100,
@@ -183,6 +185,8 @@ export function JsonResultView() {
   const pathError = useStore((s) => s.pathError);
   const gapItems = useStore((s) => s.gapItems);
   const gapActive = useStore((s) => s.gapActive);
+  const relationshipResult = useStore((s) => s.relationshipResult);
+  const backlinkResult = useStore((s) => s.backlinkResult);
   const diffState = useStore((s) => s.diffState);
   const diffActive = useStore((s) => s.diffActive);
   const notify = useStore((s) => s.notify);
@@ -194,6 +198,14 @@ export function JsonResultView() {
     const cappedFlowNodeUids = capList(flowTraceNodeUids, JSON_CAPS.flowNodeUids);
     const cappedPathResults = capList(pathResults, JSON_CAPS.pathResults);
     const cappedGapItems = capList(gapItems, JSON_CAPS.gapItems);
+    const cappedRelationshipRows = capList(
+      relationshipResult?.rows ?? [],
+      JSON_CAPS.relationshipRows,
+    );
+    const cappedBacklinkRows = capList(
+      backlinkResult?.rows ?? [],
+      JSON_CAPS.backlinkRows,
+    );
     const cappedSeedsA = capList(diffState.seedsA, JSON_CAPS.diffSeeds);
     const cappedSeedsB = capList(diffState.seedsB, JSON_CAPS.diffSeeds);
     return {
@@ -210,6 +222,8 @@ export function JsonResultView() {
           flow_trace_node_uids: cappedFlowNodeUids._meta,
           path_results: cappedPathResults._meta,
           gap_items: cappedGapItems._meta,
+          relationship_rows: cappedRelationshipRows._meta,
+          backlink_rows: cappedBacklinkRows._meta,
           diff_snapshots: {
             seeds_limit: JSON_CAPS.diffSeeds,
             connected_limit: JSON_CAPS.diffConnected,
@@ -245,6 +259,35 @@ export function JsonResultView() {
           items: cappedGapItems.items,
           _meta: cappedGapItems._meta,
         },
+        relationships: {
+          active: Boolean(relationshipResult),
+          kind: relationshipResult?.kind ?? null,
+          target_uid: relationshipResult?.targetUid ?? null,
+          target_label: relationshipResult?.targetLabel ?? null,
+          workspace_id: relationshipResult?.workspaceId ?? null,
+          status: relationshipResult?.status ?? "idle",
+          error: relationshipResult?.error ?? null,
+          rows: cappedRelationshipRows.items,
+          _meta: {
+            ...cappedRelationshipRows._meta,
+            semantics:
+              "Rows are direct symbol-detail caller/callee results when active; generic graph rows are contextual only.",
+          },
+        },
+        backlinks: {
+          active: Boolean(backlinkResult),
+          target_uid: backlinkResult?.targetUid ?? null,
+          target_label: backlinkResult?.targetLabel ?? null,
+          workspace_id: backlinkResult?.workspaceId ?? null,
+          status: backlinkResult?.status ?? "idle",
+          error: backlinkResult?.error ?? null,
+          rows: cappedBacklinkRows.items,
+          _meta: {
+            ...cappedBacklinkRows._meta,
+            semantics:
+              "Rows are direct backlinks API results for the active note target.",
+          },
+        },
         diff: {
           active: diffActive,
           seeds_a: cappedSeedsA.items,
@@ -268,6 +311,8 @@ export function JsonResultView() {
     flowTraceRoot,
     gapActive,
     gapItems,
+    relationshipResult,
+    backlinkResult,
     graphVersion,
     pathError,
     pathResults,

@@ -106,6 +106,6 @@ export interface PhraseResolution {
 }
 
 export interface PhraseExecutionResult {
-  status: "executed" | "limited" | "unsupported" | "error";
+  status: "executed" | "limited" | "unsupported" | "error" | "cancelled";
   message: string;
 }

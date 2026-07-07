@@ -1,7 +1,11 @@
 import { useMemo, useState } from "react";
 import { ArrowDownUp } from "lucide-react";
 import { useStore } from "../../stores";
-import type { FlowNode } from "../../stores/analysisSlice";
+import type {
+  BacklinkResultState,
+  FlowNode,
+  RelationshipResultState,
+} from "../../stores/analysisSlice";
 import { NodeActionBar } from "../actions/NodeActionBar";
 
 type SortKey = "order" | "primary" | "kind" | "relationship" | "status" | "location";
@@ -84,13 +88,19 @@ function relationshipForNode(
 ): string {
   const lower = lensLabel.toLowerCase();
   if (targetUid && lower.startsWith("callers of")) {
-    return edgeSummary(graph, uid, targetUid) ?? "caller of target";
+    const summary = edgeSummary(graph, uid, targetUid);
+    return summary
+      ? `contextual incoming edge to target: ${summary}`
+      : "contextual neighbor; direct caller relationship unverified";
   }
   if (targetUid && lower.startsWith("callees of")) {
-    return edgeSummary(graph, targetUid, uid) ?? "callee from target";
+    const summary = edgeSummary(graph, targetUid, uid);
+    return summary
+      ? `contextual outgoing edge from target: ${summary}`
+      : "contextual neighbor; direct callee relationship unverified";
   }
   if (lower.startsWith("backlinks for")) {
-    return "backlink or rationale reference";
+    return "contextual rationale neighbor; backlink row unverified";
   }
   if (lower.includes("bridge")) {
     return "bridge hint; exact bridge score unavailable in P1 table state";
@@ -152,6 +162,101 @@ function graphRows(
   });
 
   return rows;
+}
+
+function relationshipRows(result: RelationshipResultState | null): ResultRow[] | null {
+  if (!result) return null;
+  if (result.status === "error") {
+    return [{
+      id: "relationship-error",
+      order: 0,
+      uid: null,
+      primary: `Direct ${result.kind} unavailable`,
+      kind: "Relationship state",
+      relationship: `Direct ${result.kind} for ${result.targetLabel} could not be loaded.`,
+      status: "error",
+      location: "",
+      metadata: result.error ?? "The symbol detail API returned an error.",
+    }];
+  }
+  if (result.status === "empty" || result.rows.length === 0) {
+    return [{
+      id: "relationship-empty",
+      order: 0,
+      uid: null,
+      primary: `No direct ${result.kind}`,
+      kind: "Relationship state",
+      relationship: `The symbol detail API returned no direct ${result.kind} for ${result.targetLabel}.`,
+      status: "empty",
+      location: "",
+      metadata: "Rows are not inferred from contextual graph neighbors.",
+    }];
+  }
+
+  return result.rows.map((symbol, index) => ({
+    id: `relationship:${result.kind}:${symbol.uid}`,
+    order: index,
+    uid: symbol.uid,
+    primary: symbol.name,
+    kind: symbol.kind,
+    relationship:
+      result.kind === "callers"
+        ? `direct caller of ${result.targetLabel}`
+        : `direct callee from ${result.targetLabel}`,
+    status: result.status,
+    location: `${symbol.file_path}:${symbol.start_line}`,
+    metadata: [
+      symbol.signature,
+      symbol.summary,
+      symbol.pagerank_score > 0 ? `rank ${symbol.pagerank_score.toFixed(3)}` : null,
+    ].filter(Boolean).join(", "),
+  }));
+}
+
+function backlinkRows(result: BacklinkResultState | null): ResultRow[] | null {
+  if (!result) return null;
+  if (result.status === "error") {
+    return [{
+      id: "backlink-error",
+      order: 0,
+      uid: null,
+      primary: "Backlinks unavailable",
+      kind: "Backlink state",
+      relationship: `Backlinks for ${result.targetLabel} could not be loaded.`,
+      status: "error",
+      location: "",
+      metadata: result.error ?? "The backlinks API returned an error.",
+    }];
+  }
+  if (result.status === "empty" || result.rows.length === 0) {
+    return [{
+      id: "backlink-empty",
+      order: 0,
+      uid: null,
+      primary: "No backlinks returned",
+      kind: "Backlink state",
+      relationship: `No notes link to ${result.targetLabel} in the current scope.`,
+      status: "empty",
+      location: "",
+      metadata: "Backlink rows are direct API results, not graph-neighbor inference.",
+    }];
+  }
+
+  return result.rows.map((row, index) => ({
+    id: `backlink:${row.source_note_uid}:${row.source_section_uid || index}`,
+    order: index,
+    uid: row.source_note_uid,
+    primary: row.source_note_title,
+    kind: "Note",
+    relationship: `direct backlink to ${result.targetLabel}`,
+    status: "success",
+    location: row.source_note_path,
+    metadata: [
+      `confidence ${row.confidence.toFixed(2)}`,
+      row.display ? `display ${row.display}` : null,
+      row.source_section_uid ? `section ${row.source_section_uid}` : null,
+    ].filter(Boolean).join(", "),
+  }));
 }
 
 function traceRows(root: FlowNode | null): ResultRow[] {
@@ -323,6 +428,8 @@ export function NodeListView() {
   const pathError = useStore((s) => s.pathError);
   const gapItems = useStore((s) => s.gapItems);
   const gapActive = useStore((s) => s.gapActive);
+  const relationshipResult = useStore((s) => s.relationshipResult);
+  const backlinkResult = useStore((s) => s.backlinkResult);
   const [filter, setFilter] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("order");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
@@ -331,10 +438,18 @@ export function NodeListView() {
     const trustResult = trustSummary?.result ?? sceneMetadata?.trust.result ?? "unknown";
     const unsupported = trustSummary?.unsupported ?? sceneMetadata?.trust.unsupported ?? [];
     const lowerLabel = activeLens.label.toLowerCase();
+    const directRelationships = relationshipRows(relationshipResult);
+    const directBacklinks = backlinkRows(backlinkResult);
 
     if (activeLens.lens === "trace") return traceRows(flowTraceRoot);
     if (activeLens.lens === "path" || pathStatus !== "idle") {
       return pathRows(pathResults, pathStatus, pathError);
+    }
+    if (directRelationships && lowerLabel.startsWith(`${relationshipResult?.kind ?? ""} of`)) {
+      return directRelationships;
+    }
+    if (directBacklinks && lowerLabel.startsWith("backlinks for")) {
+      return directBacklinks;
     }
     if (gapActive || lowerLabel.includes("dead code")) return gapRows(gapItems);
     if (
@@ -359,8 +474,10 @@ export function NodeListView() {
     pathError,
     pathResults,
     pathStatus,
+    relationshipResult,
     sceneMetadata,
     trustSummary,
+    backlinkResult,
   ]);
 
   const filtered = useMemo(() => {

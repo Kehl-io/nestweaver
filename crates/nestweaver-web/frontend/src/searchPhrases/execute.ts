@@ -53,6 +53,40 @@ function canApplyTraceResult(
   );
 }
 
+function canApplyRelationshipResult(
+  state: StoreState,
+  kind: "callers" | "callees",
+  targetUid: string,
+  workspaceId: string,
+): boolean {
+  const expectedLabel = kind === "callers" ? "callers of" : "callees of";
+  return (
+    state.selectedNodeId === targetUid &&
+    state.detailFocus === "related" &&
+    state.activeWorkspaceId === workspaceId &&
+    state.activeLens.lens === "search" &&
+    state.activeLens.label.toLowerCase().startsWith(expectedLabel) &&
+    state.activeLens.targetUid === targetUid &&
+    state.activeLens.workspaceId === workspaceId
+  );
+}
+
+function canApplyBacklinkResult(
+  state: StoreState,
+  targetUid: string,
+  workspaceId: string,
+): boolean {
+  return (
+    state.selectedNodeId === targetUid &&
+    state.detailFocus === "related" &&
+    state.activeWorkspaceId === workspaceId &&
+    state.activeLens.lens === "rationale" &&
+    state.activeLens.label.toLowerCase().startsWith("backlinks for") &&
+    state.activeLens.targetUid === targetUid &&
+    state.activeLens.workspaceId === workspaceId
+  );
+}
+
 function resultForExecution(
   resolution: PhraseResolution,
 ): SceneMetadata["trust"]["result"] {
@@ -270,28 +304,111 @@ export async function executeSearchPhrase(
         workspaceId: traceWorkspaceId,
       });
       state.clearFlowTrace();
-      const result = await api.flow(traceTargetUid, 10);
+      let result: Awaited<ReturnType<typeof api.flow>>;
+      try {
+        result = await api.flow(traceTargetUid, 10);
+      } catch (error) {
+        const latestState = currentState(state, options);
+        if (!isCurrent(options) || !canApplyTraceResult(latestState, traceTargetUid, traceWorkspaceId)) {
+          return { status: "cancelled", message: "Trace failure was superseded by a newer phrase." };
+        }
+        return {
+          status: "error",
+          message:
+            error instanceof Error && error.message
+              ? error.message
+              : "Trace request failed.",
+        };
+      }
       const latestState = currentState(state, options);
       if (!isCurrent(options) || !canApplyTraceResult(latestState, traceTargetUid, traceWorkspaceId)) {
-        return { status: "error", message: "Trace result was superseded by a newer phrase." };
+        return { status: "cancelled", message: "Trace result was superseded by a newer phrase." };
       }
       state.setFlowTrace(result);
       return { status: "executed", message: `Opened trace for ${target.label}.` };
 
     case "callers":
-    case "callees":
+    case "callees": {
       if (!target) return { status: "error", message: "Choose a symbol first." };
       applyMetadata(state, executionMetadata);
-      state.selectNode(target.uid ?? target.id, target.kind);
+      const relationshipTargetUid = target.uid ?? target.id;
+      const relationshipWorkspaceId = state.activeWorkspaceId;
+      state.selectNode(relationshipTargetUid, target.kind);
       state.setDetailFocus("related");
       state.setGraphMode("local");
       state.setActiveLens({
         lens: "search",
         label: resolution.intent.kind === "callers" ? `Callers of ${target.label}` : `Callees of ${target.label}`,
-        targetUid: target.uid ?? target.id,
-        workspaceId: state.activeWorkspaceId,
+        targetUid: relationshipTargetUid,
+        workspaceId: relationshipWorkspaceId,
       });
-      return { status: "executed", message: `Opened relationships for ${target.label}.` };
+      state.setRelationshipResult(null);
+      let detail: Awaited<ReturnType<typeof api.symbol>>;
+      try {
+        detail = await api.symbol(relationshipTargetUid);
+      } catch (error) {
+        const latestState = currentState(state, options);
+        if (
+          !isCurrent(options) ||
+          !canApplyRelationshipResult(
+            latestState,
+            resolution.intent.kind,
+            relationshipTargetUid,
+            relationshipWorkspaceId,
+          )
+        ) {
+          return { status: "cancelled", message: "Relationship failure was superseded by a newer phrase." };
+        }
+        state.setRelationshipResult({
+          kind: resolution.intent.kind,
+          targetUid: relationshipTargetUid,
+          targetLabel: target.label,
+          workspaceId: relationshipWorkspaceId,
+          rows: [],
+          status: "error",
+          error:
+            error instanceof Error && error.message
+              ? error.message
+              : "Relationship request failed.",
+        });
+        return {
+          status: "error",
+          message:
+            error instanceof Error && error.message
+              ? error.message
+              : "Relationship request failed.",
+        };
+      }
+      const latestState = currentState(state, options);
+      if (
+        !isCurrent(options) ||
+        !canApplyRelationshipResult(
+          latestState,
+          resolution.intent.kind,
+          relationshipTargetUid,
+          relationshipWorkspaceId,
+        )
+      ) {
+        return { status: "cancelled", message: "Relationship result was superseded by a newer phrase." };
+      }
+      const rows = resolution.intent.kind === "callers" ? detail.callers : detail.callees;
+      state.setRelationshipResult({
+        kind: resolution.intent.kind,
+        targetUid: relationshipTargetUid,
+        targetLabel: target.label,
+        workspaceId: relationshipWorkspaceId,
+        rows,
+        status: rows.length > 0 ? "success" : "empty",
+        error: null,
+      });
+      return {
+        status: "executed",
+        message:
+          rows.length > 0
+            ? `Opened ${rows.length} direct ${resolution.intent.kind} for ${target.label}.`
+            : `No direct ${resolution.intent.kind} returned for ${target.label}.`,
+      };
+    }
 
     case "path":
       return executePath(state, resolution, options);
@@ -369,16 +486,62 @@ export async function executeSearchPhrase(
     case "backlinks":
       if (!target) return { status: "error", message: "Choose a note first." };
       applyMetadata(state, executionMetadata);
-      state.selectNode(target.uid ?? target.id, target.kind);
+      const backlinkTargetUid = target.uid ?? target.id;
+      const backlinkWorkspaceId = state.activeWorkspaceId;
+      state.selectNode(backlinkTargetUid, target.kind);
       state.setDetailFocus("related");
       state.setActiveLens({
         lens: "rationale",
         label: `Backlinks for ${target.label}`,
-        targetUid: target.uid ?? target.id,
-        workspaceId: state.activeWorkspaceId,
+        targetUid: backlinkTargetUid,
+        workspaceId: backlinkWorkspaceId,
       });
-      await api.brainBacklinks(target.uid ?? target.id).catch(() => []);
-      return { status: "executed", message: `Opened backlink context for ${target.label}.` };
+      state.setBacklinkResult(null);
+      try {
+        const rows = await api.brainBacklinks(backlinkTargetUid);
+        const latestState = currentState(state, options);
+        if (!isCurrent(options) || !canApplyBacklinkResult(latestState, backlinkTargetUid, backlinkWorkspaceId)) {
+          return { status: "cancelled", message: "Backlink result was superseded by a newer phrase." };
+        }
+        state.setBacklinkResult({
+          targetUid: backlinkTargetUid,
+          targetLabel: target.label,
+          workspaceId: backlinkWorkspaceId,
+          rows,
+          status: rows.length > 0 ? "success" : "empty",
+          error: null,
+        });
+        return {
+          status: "executed",
+          message:
+            rows.length > 0
+              ? `Opened ${rows.length} backlink(s) for ${target.label}.`
+              : `No backlinks returned for ${target.label}.`,
+        };
+      } catch (error) {
+        const latestState = currentState(state, options);
+        if (!isCurrent(options) || !canApplyBacklinkResult(latestState, backlinkTargetUid, backlinkWorkspaceId)) {
+          return { status: "cancelled", message: "Backlink failure was superseded by a newer phrase." };
+        }
+        state.setBacklinkResult({
+          targetUid: backlinkTargetUid,
+          targetLabel: target.label,
+          workspaceId: backlinkWorkspaceId,
+          rows: [],
+          status: "error",
+          error:
+            error instanceof Error && error.message
+              ? error.message
+              : "Backlink request failed.",
+        });
+        return {
+          status: "error",
+          message:
+            error instanceof Error && error.message
+              ? error.message
+              : "Backlink request failed.",
+        };
+      }
 
     case "stale_repos": {
       applyMetadata(state, executionMetadata);

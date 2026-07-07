@@ -261,12 +261,38 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
           true,
         );
         clearFlowTrace();
-        const result = await api.flow(traceTargetUid, 10);
+        let result: Awaited<ReturnType<typeof api.flow>>;
+        try {
+          result = await api.flow(traceTargetUid, 10);
+        } catch (error) {
+          const state = useStore.getState();
+          if (
+            traceActionId !== latestTraceActionId ||
+            state.selectedNodeId !== traceTargetUid ||
+            state.detailFocus !== "analysis" ||
+            state.activeWorkspaceId !== traceWorkspaceId ||
+            state.activeLens.lens !== "trace" ||
+            state.activeLens.targetUid !== traceTargetUid ||
+            state.activeLens.workspaceId !== traceWorkspaceId
+          ) {
+            return;
+          }
+          notify({
+            kind: "error",
+            title: "Trace failed",
+            message:
+              error instanceof Error && error.message
+                ? error.message
+                : "Trace request failed.",
+          });
+          return;
+        }
         const state = useStore.getState();
         if (
           traceActionId !== latestTraceActionId ||
           state.selectedNodeId !== traceTargetUid ||
           state.detailFocus !== "analysis" ||
+          state.activeWorkspaceId !== traceWorkspaceId ||
           state.activeLens.lens !== "trace" ||
           state.activeLens.targetUid !== traceTargetUid ||
           state.activeLens.workspaceId !== traceWorkspaceId

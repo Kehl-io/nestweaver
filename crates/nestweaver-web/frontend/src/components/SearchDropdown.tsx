@@ -158,7 +158,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
         isCurrent,
         getCurrentState: useStore.getState,
       });
-      if (!isCurrent()) return;
+      if (!isCurrent() || result.status === "cancelled") return;
       notify({
         kind: result.status === "error" ? "error" : "info",
         title: result.status === "unsupported" ? "Phrase unsupported" : "Phrase executed",
