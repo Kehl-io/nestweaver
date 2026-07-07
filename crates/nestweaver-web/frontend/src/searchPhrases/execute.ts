@@ -290,7 +290,7 @@ export async function executeSearchPhrase(
       });
       return { status: "executed", message: `Opened impact for ${target.label}.` };
 
-    case "trace_flow":
+    case "trace_flow": {
       if (!target) return { status: "error", message: "Choose a symbol first." };
       applyMetadata(state, executionMetadata);
       const traceTargetUid = target.uid ?? target.id;
@@ -326,6 +326,7 @@ export async function executeSearchPhrase(
       }
       state.setFlowTrace(result);
       return { status: "executed", message: `Opened trace for ${target.label}.` };
+    }
 
     case "callers":
     case "callees": {
@@ -483,7 +484,7 @@ export async function executeSearchPhrase(
       });
       return { status: "executed", message: target ? `Opened ${target.label}.` : "Opened note search metadata." };
 
-    case "backlinks":
+    case "backlinks": {
       if (!target) return { status: "error", message: "Choose a note first." };
       applyMetadata(state, executionMetadata);
       const backlinkTargetUid = target.uid ?? target.id;
@@ -542,6 +543,7 @@ export async function executeSearchPhrase(
               : "Backlink request failed.",
         };
       }
+    }
 
     case "stale_repos": {
       applyMetadata(state, executionMetadata);
