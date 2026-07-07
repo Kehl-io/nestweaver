@@ -275,13 +275,22 @@ pub struct EmbeddingConfig {
     pub semantic_search_limit: usize,
 }
 
+/// The default local embedding model, canonical for the whole workspace.
+///
+/// all-MiniLM-L6-v2: 384-dim, ~22MB, mean-pooled, no prefix — fast and light, the best
+/// general default for most users (many run CPU-only servers). A DB embedded with a
+/// different model records it (set_embedding_metadata) and the daemon loads that instead,
+/// so this default only applies to fresh/un-embedded instances. Override per-instance via
+/// `[embedding] model_id` (e.g. thenlper/gte-base for higher-quality 768-dim retrieval).
+///
+/// The CLI's `--model-id` default and the daemon-routing guard in `run_embed`
+/// reference this constant. `nestweaver-embed` keeps an internal copy in its
+/// `Default` impl (it cannot depend on this crate — the dependency runs the
+/// other way); keep the two in sync.
+pub const DEFAULT_EMBEDDING_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
 fn default_model_id() -> String {
-    // all-MiniLM-L6-v2: 384-dim, ~22MB, mean-pooled, no prefix — fast and light, the best
-    // general default for most users (many run CPU-only servers). A DB embedded with a
-    // different model records it (set_embedding_metadata) and the daemon loads that instead,
-    // so this default only applies to fresh/un-embedded instances. Override per-instance via
-    // `[embedding] model_id` (e.g. thenlper/gte-base for higher-quality 768-dim retrieval).
-    "sentence-transformers/all-MiniLM-L6-v2".to_string()
+    DEFAULT_EMBEDDING_MODEL_ID.to_string()
 }
 fn default_embedding_cache_dir() -> String {
     "~/.cache/nestweaver/models".to_string()

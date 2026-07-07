@@ -2510,8 +2510,12 @@ impl GraphStore {
     /// to disk. For batch operations, prefer `add_embedding` +
     /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_note_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
-        self.add_embedding(uid, embedding.to_vec());
-        self.flush_embedding_index()
+        // A dimension-guard rejection is logged by the index; nothing was
+        // inserted, so skip the flush.
+        if self.add_embedding(uid, embedding.to_vec()) {
+            self.flush_embedding_index()?;
+        }
+        Ok(())
     }
 
     /// Persist a Heading embedding to the sidecar `EmbeddingIndex`.
@@ -2520,8 +2524,10 @@ impl GraphStore {
     /// to disk. For batch operations, prefer `add_embedding` +
     /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_heading_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
-        self.add_embedding(uid, embedding.to_vec());
-        self.flush_embedding_index()
+        if self.add_embedding(uid, embedding.to_vec()) {
+            self.flush_embedding_index()?;
+        }
+        Ok(())
     }
 
     /// Persist a Symbol embedding to the sidecar `EmbeddingIndex`.
@@ -2530,8 +2536,10 @@ impl GraphStore {
     /// to disk. For batch operations, prefer `add_embedding` +
     /// `flush_embedding_index` to avoid O(n^2) writes.
     pub fn update_symbol_embedding(&self, uid: &str, embedding: &[f32]) -> Result<(), StoreError> {
-        self.add_embedding(uid, embedding.to_vec());
-        self.flush_embedding_index()
+        if self.add_embedding(uid, embedding.to_vec()) {
+            self.flush_embedding_index()?;
+        }
+        Ok(())
     }
 
     /// Bulk-delete all Symbol and File nodes belonging to `repo_uid` using two
