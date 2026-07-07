@@ -13,6 +13,9 @@ import { PathTargetSelector } from "../PathTargetSelector";
 import { DiffSeedInput } from "../DiffSeedInput";
 import { OverviewCommandShelf } from "../overview/OverviewCommandShelf";
 import { OverviewContextSurface } from "../overview/OverviewContextSurface";
+import { JsonResultView } from "../workspace/JsonResultView";
+import { LensSummaryPanel } from "../workspace/LensSummaryPanel";
+import { WorkspaceToolbar } from "../workspace/WorkspaceToolbar";
 import { useOverviewMode } from "./modes/useOverviewMode";
 import { useContextMode } from "./modes/useContextMode";
 import { useImpactMode } from "./modes/useImpactMode";
@@ -252,6 +255,7 @@ export function GraphPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const viewMode = useStore((s) => s.viewMode);
+  const representationMode = useStore((s) => s.representationMode);
   const graphMode = useStore((s) => s.graphMode);
   const minimapVisible = useStore((s) => s.minimapVisible);
   const layoutMode = useStore((s) => s.layoutMode);
@@ -277,16 +281,25 @@ export function GraphPanel() {
 
   return (
     <div data-testid="graph-panel" className="flex h-full flex-col relative">
+      <WorkspaceToolbar />
       <div className="flex-1 relative bg-[var(--color-surface)]">
         <div
           ref={graphPanelRef}
-          aria-label={viewMode === "list" ? "Node list view" : "Code knowledge graph"}
-          role="application"
+          aria-label={
+            representationMode === "json"
+              ? "JSON result view"
+              : viewMode === "list" || representationMode === "table"
+                ? "Node table view"
+                : "Code knowledge graph"
+          }
+          role={viewMode === "graph" && representationMode !== "json" ? "application" : "region"}
           tabIndex={0}
           style={{ background: "var(--color-graph-bg)", width: "100%", height: "100%" }}
           onContextMenu={handleContextMenu}
         >
-          {viewMode === "list" ? (
+          {representationMode === "json" ? (
+            <JsonResultView />
+          ) : viewMode === "list" || representationMode === "table" ? (
             <NodeListView />
           ) : viewMode === "matrix" ? (
             <GraphMatrixView />
@@ -296,12 +309,17 @@ export function GraphPanel() {
         </div>
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
-        <ControlDock />
+        {representationMode !== "json" && <ControlDock />}
         <NodePreviewCard />
         {viewMode === "graph" && !focusMap && <GraphLegend />}
         {viewMode === "graph" && minimapVisible && graphMode !== "overview" && !focusMap && (
           <div className="absolute bottom-14 right-3 z-10 opacity-80 transition-opacity hover:opacity-100">
             <GraphMinimap />
+          </div>
+        )}
+        {representationMode === "graph" && graphMode !== "overview" && !focusMap && (
+          <div className="absolute left-3 top-3 z-20 w-[min(320px,calc(100%-1.5rem))]">
+            <LensSummaryPanel compact />
           </div>
         )}
         {contextMenu && (

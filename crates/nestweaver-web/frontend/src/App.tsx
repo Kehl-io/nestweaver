@@ -8,6 +8,7 @@ import { DetailPanel } from "./components/detail/DetailPanel";
 import { GraphPanel } from "./components/graph/GraphPanel";
 import { CanvasView } from "./components/canvas/CanvasView";
 import { PresentationView } from "./components/presentation/PresentationView";
+import { SourceEvidencePanel } from "./components/workspace/SourceEvidencePanel";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useTheme } from "./hooks/useTheme";
 import { useDeepLink } from "./hooks/useDeepLink";
@@ -33,6 +34,7 @@ function AppContent() {
   const activeView = useStore((s) => s.activeView);
   const layoutMode = useStore((s) => s.layoutMode);
   const setLayoutMode = useStore((s) => s.setLayoutMode);
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
   const modalOpen = useStore((s) => s.llmBarOpen || s.shortcutsOpen);
   // Responsive breakpoint detection
   const [width, setWidth] = useState(window.innerWidth);
@@ -60,7 +62,15 @@ function AppContent() {
   const isZen = layoutMode === "zen";
   // Responsive: below 900px behaves like zen (graph only), 900-1199 hides explorer
   const hideExplorer = isZen || width < 1200;
+  const hideEvidence = !isZen && width < 980;
   const hideDetail = !isZen && width < 900;
+  const graphDefaultSize = !hideExplorer && !hideEvidence && !hideDetail
+    ? "42%"
+    : !hideEvidence && !hideDetail
+      ? "58%"
+      : hideExplorer
+        ? "78%"
+        : "62%";
 
   const graphView = activeView === "canvas" ? (
     <CanvasView />
@@ -74,11 +84,18 @@ function AppContent() {
     <div className="flex h-full flex-col overflow-hidden">
       <TopBar />
       {isZen ? (
-        // Zen mode: graph takes full area, NodePreviewCard handles selection detail
+        // Zen mode: graph takes full area, with a compact evidence path for the selected node.
         <div className="flex-1 min-h-0 relative">
           <ErrorBoundary>
             {graphView}
           </ErrorBoundary>
+          {selectedNodeId && activeView === "graph" && (
+            <div className="absolute bottom-14 right-3 top-14 z-30 hidden w-[min(360px,calc(100vw-1.5rem))] overflow-hidden rounded border border-[var(--color-border)] shadow-xl xl:block">
+              <ErrorBoundary>
+                <SourceEvidencePanel compact />
+              </ErrorBoundary>
+            </div>
+          )}
         </div>
       ) : (
         // Normal / responsive layout
@@ -100,11 +117,27 @@ function AppContent() {
               <ResizeHandle />
             </>
           )}
-          <Panel id="graph" defaultSize={hideExplorer ? "78%" : "62%"} minSize="36%">
+          <Panel id="graph" defaultSize={graphDefaultSize} minSize="30%">
             <ErrorBoundary>
               {graphView}
             </ErrorBoundary>
           </Panel>
+          {!hideEvidence && activeView === "graph" && (
+            <>
+              <ResizeHandle />
+              <Panel
+                id="evidence"
+                defaultSize="20%"
+                minSize="220px"
+                maxSize="34%"
+                collapsible
+              >
+                <ErrorBoundary>
+                  <SourceEvidencePanel />
+                </ErrorBoundary>
+              </Panel>
+            </>
+          )}
           {!hideDetail && (
             <>
               <ResizeHandle />

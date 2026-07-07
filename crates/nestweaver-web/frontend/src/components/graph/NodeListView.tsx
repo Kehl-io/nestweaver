@@ -25,6 +25,8 @@ export function NodeListView() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectNode = useStore((s) => s.selectNode);
   const exploreNode = useStore((s) => s.exploreNode);
+  const activeLens = useStore((s) => s.activeLens);
+  const sceneMetadata = useStore((s) => s.sceneMetadata);
   const [filter, setFilter] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("relevance");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
@@ -73,6 +75,41 @@ export function NodeListView() {
     }
   };
 
+  const rowButtonSelector = "[data-node-row-button='true']";
+  const focusRowButton = (index: number) => {
+    const next = document.querySelector<HTMLButtonElement>(
+      `${rowButtonSelector}[data-row-index='${index}']`,
+    );
+    next?.focus();
+  };
+
+  const handleRowKeyDown = (
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    index: number,
+    node: TableNode,
+  ) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      focusRowButton(Math.min(filtered.length - 1, index + 1));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      focusRowButton(Math.max(0, index - 1));
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      exploreNode(node.uid, node.kind);
+    } else if (event.key === " ") {
+      event.preventDefault();
+      selectNode(node.uid, node.kind);
+    }
+  };
+
+  const ariaSort = (key: SortKey) =>
+    sortKey === key
+      ? sortDirection === "asc"
+        ? "ascending"
+        : "descending"
+      : "none";
+
   const header = (key: SortKey, label: string) => (
     <button
       type="button"
@@ -91,6 +128,14 @@ export function NodeListView() {
       aria-label="Ranked node table"
     >
       <div className="flex items-center gap-2 border-b border-[var(--color-border)] p-2">
+        <div className="hidden min-w-0 flex-col pr-2 md:flex">
+          <span className="truncate text-[11px] font-semibold text-[var(--color-text)]">
+            {activeLens.label}
+          </span>
+          <span className="truncate text-[10px] text-[var(--color-text-muted)]">
+            {sceneMetadata?.trust.message ?? "Rows mirror the current graph result."}
+          </span>
+        </div>
         <input
           type="search"
           placeholder="Filter nodes by name, kind, or location..."
@@ -105,21 +150,24 @@ export function NodeListView() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto">
-        <table className="w-full min-w-[760px] border-collapse text-left text-xs">
+        <table
+          className="w-full min-w-[760px] border-collapse text-left text-xs"
+          aria-label={`${activeLens.label} node results`}
+        >
           <thead className="sticky top-0 z-10 bg-[var(--color-surface)] shadow-sm">
             <tr className="border-b border-[var(--color-border)]">
-              <th className="px-3 py-2">{header("name", "Name")}</th>
-              <th className="px-3 py-2">{header("kind", "Kind")}</th>
-              <th className="px-3 py-2">{header("relevance", "Rank")}</th>
-              <th className="px-3 py-2">{header("degree", "Degree")}</th>
-              <th className="px-3 py-2">{header("location", "Location")}</th>
-              <th className="px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+              <th scope="col" aria-sort={ariaSort("name")} className="px-3 py-2">{header("name", "Name")}</th>
+              <th scope="col" aria-sort={ariaSort("kind")} className="px-3 py-2">{header("kind", "Kind")}</th>
+              <th scope="col" aria-sort={ariaSort("relevance")} className="px-3 py-2">{header("relevance", "Rank")}</th>
+              <th scope="col" aria-sort={ariaSort("degree")} className="px-3 py-2">{header("degree", "Degree")}</th>
+              <th scope="col" aria-sort={ariaSort("location")} className="px-3 py-2">{header("location", "Location")}</th>
+              <th scope="col" className="px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
                 Actions
               </th>
             </tr>
           </thead>
           <tbody>
-            {filtered.map((node) => (
+            {filtered.map((node, index) => (
               <tr
                 key={node.uid}
                 className={`border-b border-[var(--color-border)] ${
@@ -127,13 +175,18 @@ export function NodeListView() {
                     ? "bg-[var(--color-surface-alt)]"
                     : "hover:bg-[var(--color-surface-alt)]"
                 }`}
+                aria-selected={selectedNodeId === node.uid}
               >
                 <td className="max-w-[240px] px-3 py-2">
                   <button
                     type="button"
+                    data-node-row-button="true"
+                    data-row-index={index}
                     onClick={() => selectNode(node.uid, node.kind)}
                     onDoubleClick={() => exploreNode(node.uid, node.kind)}
-                    className="max-w-full truncate font-medium text-[var(--color-text)] hover:text-[var(--color-graph-selection)]"
+                    onKeyDown={(event) => handleRowKeyDown(event, index, node)}
+                    className="max-w-full truncate rounded font-medium text-[var(--color-text)] outline-none hover:text-[var(--color-graph-selection)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
+                    aria-label={`${node.name}, ${node.kind}. Press Space to select, Enter to open, arrows to move rows.`}
                   >
                     {node.name}
                   </button>

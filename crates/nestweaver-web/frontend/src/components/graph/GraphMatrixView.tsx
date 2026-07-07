@@ -145,13 +145,19 @@ export function GraphMatrixView() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto">
-        <table className="border-collapse">
+        <table className="border-collapse" aria-label="Node adjacency matrix">
           <thead>
             <tr>
-              <th className="sticky left-0 top-0 z-30 h-28 w-44 border border-[var(--color-border)] bg-[var(--color-surface)]" />
+              <th
+                scope="col"
+                className="sticky left-0 top-0 z-30 h-28 w-44 border border-[var(--color-border)] bg-[var(--color-surface)]"
+              >
+                <span className="sr-only">Source node by target node</span>
+              </th>
               {nodes.map((node) => (
                 <th
                   key={node.uid}
+                  scope="col"
                   className="sticky top-0 z-20 h-28 min-w-8 border border-[var(--color-border)] bg-[var(--color-surface)] p-1 align-bottom"
                 >
                   <button
@@ -160,6 +166,7 @@ export function GraphMatrixView() {
                     className="mx-auto block max-h-24 max-w-7 truncate text-left text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
                     style={{ writingMode: "vertical-rl", textOrientation: "mixed" }}
                     title={node.name}
+                    aria-label={`Select target node ${node.name}`}
                   >
                     {node.name}
                   </button>
@@ -170,7 +177,10 @@ export function GraphMatrixView() {
           <tbody>
             {nodes.map((row) => (
               <tr key={row.uid}>
-                <th className="sticky left-0 z-10 max-w-44 border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 text-left">
+                <th
+                  scope="row"
+                  className="sticky left-0 z-10 max-w-44 border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 text-left"
+                >
                   <button
                     type="button"
                     onClick={() => selectNode(row.uid, row.kind)}
@@ -180,6 +190,7 @@ export function GraphMatrixView() {
                         : "text-[var(--color-text)] hover:text-[var(--color-graph-selection)]"
                     }`}
                     title={row.name}
+                    aria-label={`Select source node ${row.name}`}
                   >
                     <span
                       className="h-2.5 w-2.5 shrink-0 rounded-full"
@@ -199,6 +210,11 @@ export function GraphMatrixView() {
                         <button
                           type="button"
                           title={`${row.name} -> ${column.name}: ${edge.type}`}
+                          aria-label={`${row.name} to ${column.name}: ${edge.type}${
+                            edge.confidence != null
+                              ? `, confidence ${edge.confidence.toFixed(2)}`
+                              : ""
+                          }`}
                           onClick={() => {
                             selectNode(row.uid, row.kind);
                             setSelectedCell({ source: row, target: column, edge });

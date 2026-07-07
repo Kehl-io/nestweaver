@@ -5,9 +5,16 @@ import type { SourceResponse } from "../../api/types";
 interface CodePreviewProps {
   filePath: string;
   line: number;
+  context?: number;
+  ariaLabel?: string;
 }
 
-export function CodePreview({ filePath, line }: CodePreviewProps) {
+export function CodePreview({
+  filePath,
+  line,
+  context = 10,
+  ariaLabel,
+}: CodePreviewProps) {
   const [source, setSource] = useState<SourceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -16,7 +23,7 @@ export function CodePreview({ filePath, line }: CodePreviewProps) {
     setSource(null);
     setError(null);
     api
-      .source(filePath, line, 10)
+      .source(filePath, line, context)
       .then((data) => {
         if (!controller.signal.aborted) setSource(data);
       })
@@ -24,7 +31,7 @@ export function CodePreview({ filePath, line }: CodePreviewProps) {
         if (!controller.signal.aborted) setError(`Source not available: ${filePath}:${line}`);
       });
     return () => controller.abort();
-  }, [filePath, line]);
+  }, [context, filePath, line]);
 
   if (error) {
     return (
@@ -45,23 +52,30 @@ export function CodePreview({ filePath, line }: CodePreviewProps) {
   const startLine = source.start_line ?? 1;
 
   return (
-    <div className="overflow-x-auto rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)]">
+    <div
+      className="overflow-x-auto rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)]"
+      role="region"
+      aria-label={ariaLabel ?? `Source preview for ${filePath}:${line}`}
+    >
       <pre className="text-xs leading-5">
+        <code>
         {source.lines.map((content, i) => {
           const lineNum = startLine + i;
           const isTarget = lineNum === line;
           return (
-            <div
+            <span
               key={lineNum}
-              className={isTarget ? "bg-yellow-500/20" : ""}
+              aria-current={isTarget ? "true" : undefined}
+              className={`block min-w-max ${isTarget ? "bg-yellow-500/20" : ""}`}
             >
               <span className="inline-block w-10 select-none pr-2 text-right text-[var(--color-text-muted)]">
                 {lineNum}
               </span>
-              <code>{content}</code>
-            </div>
+              <span>{content}</span>
+            </span>
           );
         })}
+        </code>
       </pre>
     </div>
   );

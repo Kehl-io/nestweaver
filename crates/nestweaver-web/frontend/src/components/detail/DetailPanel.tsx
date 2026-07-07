@@ -9,6 +9,7 @@ import { NoteDetail } from "./NoteDetail";
 import { PathDetail } from "./PathDetail";
 import { SymbolDetail } from "./SymbolDetail";
 import { NodeActionBar } from "../actions/NodeActionBar";
+import { LensSummaryPanel } from "../workspace/LensSummaryPanel";
 
 export function DetailPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
@@ -34,6 +35,7 @@ export function DetailPanel() {
           </p>
         </div>
         <div className="mt-4 space-y-3 text-xs">
+          <LensSummaryPanel />
           <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-2">
             <p className="font-medium text-[var(--color-text)]">Fast starts</p>
             <p className="mt-1 leading-5">
@@ -72,6 +74,9 @@ export function DetailPanel() {
           node={{ uid: selectedNodeId, kind: selectedNodeKind }}
           compact
         />
+      </div>
+      <div className="border-b border-[var(--color-border)] p-2">
+        <LensSummaryPanel compact />
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
         {llmResult && <LlmResultDetail />}
