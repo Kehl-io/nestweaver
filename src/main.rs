@@ -12294,7 +12294,7 @@ fn print_project_context_json(
 }
 
 /// Generate embeddings for symbols, notes, and/or headings.
-#[allow(clippy::too_many_arguments, unused_variables)]
+#[allow(clippy::too_many_arguments)]
 fn run_embed(
     db: Option<&Path>,
     local: bool,
@@ -12322,7 +12322,15 @@ fn run_embed(
     // NOT touch the daemon: connecting auto-starts one, whose held DB lock then
     // breaks the direct fallback with a confusing "could not set lock" error (and
     // leaks the daemon). Skip straight to the in-process path instead.
+    const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
     if use_daemon && endpoint.is_none() && !local {
+        if model_id != DEFAULT_MODEL_ID {
+            anyhow::bail!(
+                "--model-id '{model_id}' cannot be honored through the daemon; \
+                 the daemon uses the model recorded in the database. \
+                 Use --local --model-id '{model_id}' --force to switch models."
+            );
+        }
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
@@ -12388,6 +12396,7 @@ fn run_embed(
 
     let mut success_count = 0usize;
     let mut error_count = 0usize;
+    let mut rejected_count = 0usize;
 
     if let Some(ep) = endpoint {
         // ── External API path ────────────────────────────────────
@@ -12426,8 +12435,11 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (sym, emb) in chunk.iter().zip(embeddings) {
-                                store.add_embedding(&sym.uid, emb);
-                                success_count += 1;
+                                if store.add_embedding_with_force(&sym.uid, emb, force) {
+                                    success_count += 1;
+                                } else {
+                                    rejected_count += 1;
+                                }
                             }
                         }
                         Err(e) => {
@@ -12463,8 +12475,11 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (note, emb) in chunk.iter().zip(embeddings) {
-                                store.add_embedding(&note.uid, emb);
-                                success_count += 1;
+                                if store.add_embedding_with_force(&note.uid, emb, force) {
+                                    success_count += 1;
+                                } else {
+                                    rejected_count += 1;
+                                }
                             }
                         }
                         Err(e) => {
@@ -12519,8 +12534,11 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (h, emb) in chunk.iter().zip(embeddings) {
-                                store.add_embedding(&h.uid, emb);
-                                success_count += 1;
+                                if store.add_embedding_with_force(&h.uid, emb, force) {
+                                    success_count += 1;
+                                } else {
+                                    rejected_count += 1;
+                                }
                             }
                         }
                         Err(e) => {
@@ -12575,8 +12593,11 @@ fn run_embed(
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
-                                    store.add_embedding(&sym.uid, emb.clone());
-                                    success_count += 1;
+                                    if store.add_embedding_with_force(&sym.uid, emb.clone(), force) {
+                                        success_count += 1;
+                                    } else {
+                                        rejected_count += 1;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -12615,8 +12636,11 @@ fn run_embed(
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
-                                    store.add_embedding(&note.uid, emb.clone());
-                                    success_count += 1;
+                                    if store.add_embedding_with_force(&note.uid, emb.clone(), force) {
+                                        success_count += 1;
+                                    } else {
+                                        rejected_count += 1;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -12668,8 +12692,11 @@ fn run_embed(
                         match embed_model.embed(&text_refs) {
                             Ok(embeddings) => {
                                 for (h, emb) in batch.iter().zip(embeddings.iter()) {
-                                    store.add_embedding(&h.uid, emb.clone());
-                                    success_count += 1;
+                                    if store.add_embedding_with_force(&h.uid, emb.clone(), force) {
+                                        success_count += 1;
+                                    } else {
+                                        rejected_count += 1;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -12716,10 +12743,18 @@ fn run_embed(
         }
     }
 
+    if rejected_count > 0 {
+        eprintln!(
+            "Error: {rejected_count} embedding(s) rejected due to dimension mismatch. \
+             Use --force to switch models (clears existing embeddings)."
+        );
+    }
+
     if stats {
         let elapsed = t0.elapsed();
         eprintln!(
-            "Embed stats: {success_count} succeeded, {error_count} failed, {:.2}s elapsed",
+            "Embed stats: {success_count} succeeded, {error_count} failed, \
+             {rejected_count} rejected (dim mismatch), {:.2}s elapsed",
             elapsed.as_secs_f64()
         );
     } else {
@@ -12728,7 +12763,7 @@ fn run_embed(
 
     drop(store);
 
-    if error_count > 0 {
+    if error_count > 0 || rejected_count > 0 {
         Ok(EXIT_ERROR)
     } else {
         Ok(EXIT_SUCCESS)
@@ -13594,39 +13629,59 @@ fn run_mcp_hybrid(
                 } else if write_tools.contains(name) {
                     // Write operations go through standard gRPC dispatch.
                     let grpc = hybrid.inner_mut();
-                    match nestweaver_mcp::tools::dispatch_via_daemon(
-                        grpc,
-                        &rt,
-                        name,
-                        arguments.clone(),
-                    ) {
-                        Ok(result) => {
+                    let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        nestweaver_mcp::tools::dispatch_via_daemon(
+                            grpc,
+                            &rt,
+                            name,
+                            arguments.clone(),
+                        )
+                    }));
+                    match dispatched {
+                        Ok(Ok(result)) => {
                             serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
                                 "result": nestweaver_mcp::tools::wrap_tool_result(result),
                             })
                         }
-                        Err(e) => serde_json::json!({
+                        Ok(Err(e)) => serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
                         }),
+                        Err(_) => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": nestweaver_mcp::tools::wrap_tool_error(
+                                &format!("tool '{name}' panicked")
+                            ),
+                        }),
                     }
                 } else {
                     // Read queries go through HybridClient for routing.
-                    match rt.block_on(hybrid.query(name, &arguments)) {
-                        Ok(result) => {
+                    let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rt.block_on(hybrid.query(name, &arguments))
+                    }));
+                    match dispatched {
+                        Ok(Ok(result)) => {
                             serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
                                 "result": nestweaver_mcp::tools::wrap_tool_result(result),
                             })
                         }
-                        Err(e) => serde_json::json!({
+                        Ok(Err(e)) => serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
+                        }),
+                        Err(_) => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": nestweaver_mcp::tools::wrap_tool_error(
+                                &format!("tool '{name}' panicked")
+                            ),
                         }),
                     }
                 }

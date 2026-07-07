@@ -3230,8 +3230,11 @@ impl NestWeaverDaemon for DaemonService {
                             );
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    store.add_embedding(&sym.uid, emb);
-                                    succeeded += 1;
+                                    if store.add_embedding_with_force(&sym.uid, emb, force) {
+                                        succeeded += 1;
+                                    } else {
+                                        failed += 1;
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(uid = %sym.uid, "embedding failed: {e}");
@@ -3254,8 +3257,11 @@ impl NestWeaverDaemon for DaemonService {
                                 nestweaver_embed::preprocess::note_embed_text(&note.title, None);
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    store.add_embedding(&note.uid, emb);
-                                    succeeded += 1;
+                                    if store.add_embedding_with_force(&note.uid, emb, force) {
+                                        succeeded += 1;
+                                    } else {
+                                        failed += 1;
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(uid = %note.uid, "embedding failed: {e}");
@@ -3278,8 +3284,11 @@ impl NestWeaverDaemon for DaemonService {
                                 nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    store.add_embedding(&heading.uid, emb);
-                                    succeeded += 1;
+                                    if store.add_embedding_with_force(&heading.uid, emb, force) {
+                                        succeeded += 1;
+                                    } else {
+                                        failed += 1;
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(uid = %heading.uid, "embedding failed: {e}");
