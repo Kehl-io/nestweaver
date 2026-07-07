@@ -15,6 +15,7 @@ interface ExecutePhraseOptions {
   targetOverride?: PhraseCandidate;
   targetOverrides?: PhraseCandidateOverrides;
   isCurrent?: () => boolean;
+  getCurrentState?: () => StoreState;
 }
 
 function targetFromResolution(
@@ -31,6 +32,25 @@ function applyMetadata(state: StoreState, metadata: SceneMetadata | null) {
 
 function isCurrent(options: ExecutePhraseOptions): boolean {
   return options.isCurrent?.() ?? true;
+}
+
+function currentState(state: StoreState, options: ExecutePhraseOptions): StoreState {
+  return options.getCurrentState?.() ?? state;
+}
+
+function canApplyTraceResult(
+  state: StoreState,
+  targetUid: string,
+  workspaceId: string,
+): boolean {
+  return (
+    state.selectedNodeId === targetUid &&
+    state.detailFocus === "analysis" &&
+    state.activeWorkspaceId === workspaceId &&
+    state.activeLens.lens === "trace" &&
+    state.activeLens.targetUid === targetUid &&
+    state.activeLens.workspaceId === workspaceId
+  );
 }
 
 function resultForExecution(
@@ -239,17 +259,20 @@ export async function executeSearchPhrase(
     case "trace_flow":
       if (!target) return { status: "error", message: "Choose a symbol first." };
       applyMetadata(state, executionMetadata);
-      state.selectNode(target.uid ?? target.id, target.kind);
+      const traceTargetUid = target.uid ?? target.id;
+      const traceWorkspaceId = state.activeWorkspaceId;
+      state.selectNode(traceTargetUid, target.kind);
       state.setDetailFocus("analysis");
       state.setActiveLens({
         lens: "trace",
         label: `Trace from ${target.label}`,
-        targetUid: target.uid ?? target.id,
-        workspaceId: state.activeWorkspaceId,
+        targetUid: traceTargetUid,
+        workspaceId: traceWorkspaceId,
       });
       state.clearFlowTrace();
-      const result = await api.flow(target.uid ?? target.id, 10);
-      if (!isCurrent(options)) {
+      const result = await api.flow(traceTargetUid, 10);
+      const latestState = currentState(state, options);
+      if (!isCurrent(options) || !canApplyTraceResult(latestState, traceTargetUid, traceWorkspaceId)) {
         return { status: "error", message: "Trace result was superseded by a newer phrase." };
       }
       state.setFlowTrace(result);

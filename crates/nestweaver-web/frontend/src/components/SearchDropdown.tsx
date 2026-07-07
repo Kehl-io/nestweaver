@@ -156,6 +156,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
         targetOverride: candidate,
         targetOverrides: candidateOverrides,
         isCurrent,
+        getCurrentState: useStore.getState,
       });
       if (!isCurrent()) return;
       notify({
