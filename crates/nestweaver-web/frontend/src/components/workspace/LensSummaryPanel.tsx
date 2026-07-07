@@ -1,7 +1,63 @@
-import { AlertTriangle, CheckCircle2, Info, Network } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, Info, Network } from "lucide-react";
+import * as Select from "@radix-ui/react-select";
 import type { SceneMetadata, TrustSummary } from "../../api/p1Types";
 import { useStore } from "../../stores";
 import { WorkspaceScopeSummary } from "./WorkspaceScopeSummary";
+
+const DEPTH_OPTIONS = ["1", "2", "3", "4", "5", "6"];
+const CONFIDENCE_OPTIONS = [
+  { value: "0", label: "Any" },
+  { value: "0.3", label: "≥ 0.3" },
+  { value: "0.5", label: "≥ 0.5" },
+  { value: "0.7", label: "≥ 0.7" },
+  { value: "0.9", label: "≥ 0.9" },
+];
+
+function ImpactFilterSelect({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="flex min-w-0 flex-1 flex-col gap-1">
+      <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)]">
+        {label}
+      </span>
+      <Select.Root value={value} onValueChange={onChange}>
+        <Select.Trigger
+          aria-label={label}
+          className="inline-flex h-7 items-center justify-between gap-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)]/70 px-2 text-[11px] text-[var(--color-text)] outline-none focus:ring-1 focus:ring-[var(--color-graph-selection)]"
+        >
+          <Select.Value />
+          <Select.Icon>
+            <ChevronDown className="h-3 w-3" />
+          </Select.Icon>
+        </Select.Trigger>
+        <Select.Portal>
+          <Select.Content className="z-[70] overflow-hidden rounded border border-[var(--color-border)] bg-[var(--color-surface)] text-[11px] text-[var(--color-text)] shadow-xl">
+            <Select.Viewport className="p-1">
+              {options.map((option) => (
+                <Select.Item
+                  key={option.value}
+                  value={option.value}
+                  className="cursor-default rounded px-2 py-1 outline-none data-[highlighted]:bg-[var(--color-surface-alt)] data-[state=checked]:text-[var(--color-graph-selection)]"
+                >
+                  <Select.ItemText>{option.label}</Select.ItemText>
+                </Select.Item>
+              ))}
+            </Select.Viewport>
+          </Select.Content>
+        </Select.Portal>
+      </Select.Root>
+    </label>
+  );
+}
 
 interface LensSummaryPanelProps {
   compact?: boolean;
@@ -58,6 +114,9 @@ export function LensSummaryPanel({
   const flowTraceNodeUids = useStore((s) => s.flowTraceNodeUids);
   const pathResults = useStore((s) => s.pathResults);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const impactDepth = useStore((s) => s.impactDepth);
+  const impactConfidence = useStore((s) => s.impactConfidence);
+  const setImpactFilters = useStore((s) => s.setImpactFilters);
   const facts = metadataFacts(sceneMetadata);
   const nodeCount = graphInstance?.order ?? 0;
   const edgeCount = graphInstance?.size ?? 0;
@@ -85,6 +144,22 @@ export function LensSummaryPanel({
 
       {!compact && (
         <>
+          {activeLens.lens === "impact" && (
+            <div className="mt-3 flex gap-2">
+              <ImpactFilterSelect
+                label="Depth"
+                value={String(impactDepth)}
+                options={DEPTH_OPTIONS.map((value) => ({ value, label: value }))}
+                onChange={(value) => setImpactFilters({ depth: Number(value) })}
+              />
+              <ImpactFilterSelect
+                label="Confidence"
+                value={CONFIDENCE_OPTIONS.some((o) => o.value === String(impactConfidence)) ? String(impactConfidence) : "0.3"}
+                options={CONFIDENCE_OPTIONS}
+                onChange={(value) => setImpactFilters({ confidence: Number(value) })}
+              />
+            </div>
+          )}
           <div className="mt-3">
             <WorkspaceScopeSummary metadata={sceneMetadata} compact />
           </div>

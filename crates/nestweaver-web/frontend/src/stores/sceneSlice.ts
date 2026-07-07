@@ -59,13 +59,32 @@ function lensKeepsBacklinkResult(lens: ActiveLensState): boolean {
   return lens.lens === "rationale" && lens.label.toLowerCase().startsWith("backlinks for");
 }
 
+export const DEFAULT_IMPACT_DEPTH = 3;
+export const DEFAULT_IMPACT_CONFIDENCE = 0.3;
+
+export interface ImpactFilters {
+  depth?: number;
+  confidence?: number;
+}
+
+export function clampImpactDepth(depth: number): number {
+  return Math.min(6, Math.max(1, Math.round(depth)));
+}
+
+export function clampImpactConfidence(confidence: number): number {
+  return Math.min(1, Math.max(0, confidence));
+}
+
 export interface SceneSlice {
   activeLens: ActiveLensState;
   representationMode: RepresentationMode;
   sceneMetadata: SceneMetadata | null;
   trustSummary: TrustSummary | null;
+  impactDepth: number;
+  impactConfidence: number;
   setActiveLens: (lens: ActiveLensState | ActiveLens) => void;
   setRepresentationMode: (mode: RepresentationMode) => void;
+  setImpactFilters: (filters: ImpactFilters) => void;
   setSceneMetadata: (metadata: SceneMetadata | null) => void;
   setTrustSummary: (summary: TrustSummary | null) => void;
   clearSceneMetadata: () => void;
@@ -82,6 +101,8 @@ export const createSceneSlice: StateCreator<
   representationMode: "graph",
   sceneMetadata: null,
   trustSummary: null,
+  impactDepth: DEFAULT_IMPACT_DEPTH,
+  impactConfidence: DEFAULT_IMPACT_CONFIDENCE,
 
   setActiveLens: (lens) =>
     set((s) => {
@@ -140,6 +161,18 @@ export const createSceneSlice: StateCreator<
       } else if (mode === "graph" || mode === "list" || mode === "matrix") {
         s.viewMode = mode;
       }
+      // mode === "json": viewMode intentionally keeps the canvas view to
+      // return to when the JSON overlay is toggled off (see toggleViewMode)
+    }),
+
+  setImpactFilters: (filters) =>
+    set((s) => {
+      if (filters.depth !== undefined && Number.isFinite(filters.depth)) {
+        s.impactDepth = clampImpactDepth(filters.depth);
+      }
+      if (filters.confidence !== undefined && Number.isFinite(filters.confidence)) {
+        s.impactConfidence = clampImpactConfidence(filters.confidence);
+      }
     }),
 
   setSceneMetadata: (metadata) =>
@@ -168,5 +201,7 @@ export const createSceneSlice: StateCreator<
       s.trustSummary = null;
       s.relationshipResult = null;
       s.backlinkResult = null;
+      s.impactDepth = DEFAULT_IMPACT_DEPTH;
+      s.impactConfidence = DEFAULT_IMPACT_CONFIDENCE;
     }),
 });

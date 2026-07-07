@@ -75,7 +75,7 @@ export function buildGraphFromImpact(result: ImpactLensResponse): Graph {
       impactScore: node.impact_score,
       filePath: node.file_path,
       startLine: node.start_line,
-      sourceUrl: node.source.url,
+      sourceUrl: node.source?.url,
       forceLabel: node.role === "target",
     });
   }

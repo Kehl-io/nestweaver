@@ -18,6 +18,8 @@ export function useImpactMode() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const graphMode = useStore((s) => s.graphMode);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
+  const impactDepth = useStore((s) => s.impactDepth);
+  const impactConfidence = useStore((s) => s.impactConfidence);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
   const requestIdRef = useRef(0);
@@ -35,13 +37,17 @@ export function useImpactMode() {
     const targetNodeId = selectedNodeId;
     const requestWorkspaceId = activeWorkspaceId || "all";
     const layoutKey = `${requestWorkspaceId}:${targetNodeId}`;
+    const requestDepth = impactDepth;
+    const requestConfidence = impactConfidence;
     const isCurrentRequest = () => {
       const state = useStore.getState();
       return (
         requestId === requestIdRef.current &&
         state.graphMode === "impact" &&
         state.selectedNodeId === targetNodeId &&
-        state.activeWorkspaceId === requestWorkspaceId
+        state.activeWorkspaceId === requestWorkspaceId &&
+        state.impactDepth === requestDepth &&
+        state.impactConfidence === requestConfidence
       );
     };
 
@@ -67,8 +73,8 @@ export function useImpactMode() {
       }
 
       const result = await loadImpactLens(targetNodeId, {
-        depth: 3,
-        confidence: 0.3,
+        depth: requestDepth,
+        confidence: requestConfidence,
         workspaceId: requestWorkspaceId,
       });
       if (!isCurrentRequest()) return;
@@ -119,6 +125,8 @@ export function useImpactMode() {
     activeWorkspaceId,
     clearGraphData,
     graphMode,
+    impactConfidence,
+    impactDepth,
     notify,
     selectedNodeId,
     setActiveLens,

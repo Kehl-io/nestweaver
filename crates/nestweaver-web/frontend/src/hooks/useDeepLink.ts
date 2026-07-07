@@ -2,6 +2,10 @@ import { useEffect, useRef } from "react";
 import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 import type { ActiveLens, RepresentationMode } from "../api/p1Types";
+import {
+  DEFAULT_IMPACT_CONFIDENCE,
+  DEFAULT_IMPACT_DEPTH,
+} from "../stores/sceneSlice";
 
 const graphModes: GraphMode[] = [
   "overview",
@@ -55,6 +59,12 @@ function graphModeForLens(lens: ActiveLens): GraphMode | null {
   return null;
 }
 
+function parseNumberParam(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 export function useDeepLink() {
   const seeds = useStore((s) => s.seeds);
   const graphMode = useStore((s) => s.graphMode);
@@ -63,6 +73,8 @@ export function useDeepLink() {
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const activeLens = useStore((s) => s.activeLens);
   const representationMode = useStore((s) => s.representationMode);
+  const impactDepth = useStore((s) => s.impactDepth);
+  const impactConfidence = useStore((s) => s.impactConfidence);
   const setSeeds = useStore((s) => s.setSeeds);
   const setGraphMode = useStore((s) => s.setGraphMode);
   const setActiveWorkspaceId = useStore((s) => s.setActiveWorkspaceId);
@@ -100,6 +112,14 @@ export function useDeepLink() {
     }
     if (representationParam) {
       setRepresentationMode(representationParam);
+    }
+    const depthParam = parseNumberParam(params.get("depth"));
+    const confidenceParam = parseNumberParam(params.get("confidence"));
+    if (depthParam !== undefined || confidenceParam !== undefined) {
+      useStore.getState().setImpactFilters({
+        depth: depthParam,
+        confidence: confidenceParam,
+      });
     }
     if (lensParam) {
       setActiveLens({
@@ -144,6 +164,12 @@ export function useDeepLink() {
     if (representationMode !== "graph") {
       params.set("representation", representationMode);
     }
+    if (impactDepth !== DEFAULT_IMPACT_DEPTH) {
+      params.set("depth", String(impactDepth));
+    }
+    if (impactConfidence !== DEFAULT_IMPACT_CONFIDENCE) {
+      params.set("confidence", String(impactConfidence));
+    }
 
     const url = params.toString()
       ? `${window.location.pathname}?${params}`
@@ -154,6 +180,8 @@ export function useDeepLink() {
     activeLens,
     activeWorkspaceId,
     graphMode,
+    impactConfidence,
+    impactDepth,
     representationMode,
     seeds,
     selectedNodeId,
