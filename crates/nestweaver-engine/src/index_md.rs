@@ -1431,6 +1431,9 @@ struct WikilinkLookup<'a> {
     by_title: HashMap<String, Vec<&'a str>>,
     /// Lowercased alias → list of note_uids that declare that alias.
     by_alias: HashMap<String, Vec<&'a str>>,
+    /// Lowercased filename stem → list of note_uids. Global lookup that
+    /// mirrors Obsidian's shortest-path resolution.
+    by_stem: HashMap<String, Vec<&'a str>>,
     /// note_uid → folder (relative, forward-slash). For same-folder priority.
     folder_by_note: HashMap<&'a str, &'a str>,
     /// note_uid → heading slug → heading_uid. For anchor resolution.
@@ -1449,6 +1452,7 @@ impl<'a> WikilinkLookup<'a> {
         let mut by_path: HashMap<String, &'a str> = HashMap::new();
         let mut by_title: HashMap<String, Vec<&'a str>> = HashMap::new();
         let mut by_alias: HashMap<String, Vec<&'a str>> = HashMap::new();
+        let mut by_stem: HashMap<String, Vec<&'a str>> = HashMap::new();
         let mut folder_by_note: HashMap<&'a str, &'a str> = HashMap::new();
         let mut headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>> = HashMap::new();
         let mut by_folder_name: HashMap<(String, String), Vec<&'a str>> = HashMap::new();
@@ -1494,7 +1498,11 @@ impl<'a> WikilinkLookup<'a> {
             {
                 let stem_lc = stem.to_lowercase();
                 by_folder_name
-                    .entry((folder, stem_lc))
+                    .entry((folder, stem_lc.clone()))
+                    .or_default()
+                    .push(note.note_uid.as_str());
+                by_stem
+                    .entry(stem_lc)
                     .or_default()
                     .push(note.note_uid.as_str());
             }
@@ -1510,6 +1518,7 @@ impl<'a> WikilinkLookup<'a> {
             by_path,
             by_title,
             by_alias,
+            by_stem,
             folder_by_note,
             headings_by_note,
             by_folder_name,
@@ -1566,6 +1575,16 @@ impl<'a> WikilinkLookup<'a> {
             return ResolveOutcome::Resolved(vec![ResolveCandidate {
                 note_uid: uids[0].to_string(),
                 confidence: 0.5,
+            }]);
+        }
+
+        // Priority 3b: global filename-stem match (Obsidian shortest-path).
+        if let Some(uids) = self.by_stem.get(&key)
+            && uids.len() == 1
+        {
+            return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                note_uid: uids[0].to_string(),
+                confidence: 0.9,
             }]);
         }
 
