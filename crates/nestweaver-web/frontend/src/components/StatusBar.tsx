@@ -18,8 +18,20 @@ export function StatusBar() {
   const sceneMetadata = useStore((s) => s.sceneMetadata);
 
   useEffect(() => {
-    api.brainStatus().then(setStatus).catch(() => {});
-    api.repos().then(setRepos).catch(() => {});
+    api.brainStatus().then(setStatus).catch((error) => {
+      useStore.getState().notify({
+        kind: "error",
+        title: "Status unavailable",
+        message: error instanceof Error ? error.message : "Brain status request failed",
+      });
+    });
+    api.repos().then(setRepos).catch((error) => {
+      useStore.getState().notify({
+        kind: "error",
+        title: "Repos unavailable",
+        message: error instanceof Error ? error.message : "Repository request failed",
+      });
+    });
   }, []);
 
   return (

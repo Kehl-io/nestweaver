@@ -39,7 +39,10 @@ export function Queue() {
     api
       .get<DrainStatus>("/drain/status")
       .then(setDrain)
-      .catch(() => {});
+      .catch((error) => {
+        // drain status is optional on older daemons; degrade silently but observably
+        console.warn("drain status unavailable", error);
+      });
   }, [api]);
 
   useEffect(() => {

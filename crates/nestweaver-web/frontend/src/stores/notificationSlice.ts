@@ -48,16 +48,28 @@ export const createNotificationSlice: StateCreator<
   notifications: [],
   liveMessage: "",
   notify: (input) => {
-    const id = createNotificationId();
+    let id = createNotificationId();
     set((s) => {
-      s.notifications.unshift({
-        id,
-        kind: input.kind,
-        title: input.title,
-        message: input.message,
-        createdAt: Date.now(),
-      });
-      s.notifications = s.notifications.slice(0, MAX_NOTIFICATIONS);
+      const duplicate = s.notifications.find(
+        (notification) =>
+          notification.kind === input.kind &&
+          notification.title === input.title &&
+          notification.message === input.message,
+      );
+      if (duplicate) {
+        // Repeated identical failures refresh the existing toast instead of stacking
+        duplicate.createdAt = Date.now();
+        id = duplicate.id;
+      } else {
+        s.notifications.unshift({
+          id,
+          kind: input.kind,
+          title: input.title,
+          message: input.message,
+          createdAt: Date.now(),
+        });
+        s.notifications = s.notifications.slice(0, MAX_NOTIFICATIONS);
+      }
       s.liveMessage = formatLiveMessage(input);
     });
     return id;
