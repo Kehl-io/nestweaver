@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.2.1](https://github.com/Kehl-io/nestweaver/compare/v2.2.0...v2.2.1) (2026-07-07)
+
+
+### Bug Fixes
+
+* address code-review findings on embedding, wikilink, and schema fixes ([5d4317c](https://github.com/Kehl-io/nestweaver/commit/5d4317cf21d7e9387ed8a67f3fa0d53d14508e76))
+* embedding model-switch, MCP crash recovery, wikilink resolution, and schema consistency ([899fec4](https://github.com/Kehl-io/nestweaver/commit/899fec4536358da0c4f487f98d04aa38935709a1))
+* **embed:** honor --force flag in EmbeddingIndex dimension guard ([be4e64d](https://github.com/Kehl-io/nestweaver/commit/be4e64dd2c8894c3149e4500b16d68d8e6c4be80))
+* **embed:** reject --model-id when routed through daemon ([cfd05bf](https://github.com/Kehl-io/nestweaver/commit/cfd05bf84473a2a802f4090cb750db73fddb938e))
+* harden embedding add API and clusters sidecar write per review ([ed1d3bc](https://github.com/Kehl-io/nestweaver/commit/ed1d3bc4dd4ce458c15c02b2aa046ae77f2fbfe6))
+* **mcp:** persist clusters sidecar and improve tool schema consistency ([a11162b](https://github.com/Kehl-io/nestweaver/commit/a11162bc5a62c85db5c1eafaeba9eaf4d7b422ce))
+* **vault:** add global filename-stem resolution for wikilinks ([7911f23](https://github.com/Kehl-io/nestweaver/commit/7911f238d36d59cba92257cf7927a3bee3810a5f))
+
 ## [2.2.0](https://github.com/Kehl-io/nestweaver/compare/v2.1.1...v2.2.0) (2026-07-06)
 
 
