@@ -13,6 +13,8 @@ function isEditableTarget(target: EventTarget | null) {
 
 export function useKeyboardShortcuts() {
   const modalOpen = useStore((s) => s.llmBarOpen || s.shortcutsOpen);
+  const activeView = useStore((s) => s.activeView);
+  const graphViewActive = activeView === "graph";
   const setMode = useStore((s) => s.setGraphMode);
   const toggleLeft = useStore((s) => s.toggleLeftPanel);
   const toggleRight = useStore((s) => s.toggleRightPanel);
@@ -23,7 +25,8 @@ export function useKeyboardShortcuts() {
   const toggleViewMode = useStore((s) => s.toggleViewMode);
   const seedReducedEffectsFromSystem = useStore((s) => s.seedReducedEffectsFromSystem);
   const { undo, redo } = useNavigationHistory();
-  const globalHotkeyOptions = { enabled: !modalOpen };
+  // Graph-scene hotkeys must not fire under Presentation/Canvas views
+  const globalHotkeyOptions = { enabled: !modalOpen && graphViewActive };
 
   useHotkeys("1", () => setMode(MODES[0]), globalHotkeyOptions);
   useHotkeys("2", () => setMode(MODES[1]), globalHotkeyOptions);
@@ -50,14 +53,15 @@ export function useKeyboardShortcuts() {
 
   useHotkeys("escape", () => selectNode(null), globalHotkeyOptions);
 
-  // mod+z — undo navigation
+  // mod+z — undo navigation. Not enabled on form tags: inside inputs the
+  // browser's native text undo must win over scene-history undo.
   useHotkeys(
     "mod+z",
     (e) => {
       e.preventDefault();
       undo();
     },
-    { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
+    { enabled: !modalOpen && graphViewActive },
   );
 
   // mod+shift+z — redo navigation
@@ -67,7 +71,7 @@ export function useKeyboardShortcuts() {
       e.preventDefault();
       redo();
     },
-    { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
+    { enabled: !modalOpen && graphViewActive },
   );
 
   // i — impact analysis for selected node
@@ -117,7 +121,7 @@ export function useKeyboardShortcuts() {
       e.preventDefault();
       toggleViewMode();
     },
-    { enableOnFormTags: ["INPUT"], enabled: !modalOpen },
+    { enableOnFormTags: ["INPUT"], enabled: !modalOpen && graphViewActive },
   );
 
   // e — export (no-op; export menu is UI-driven via toolbar button)
