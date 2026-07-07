@@ -247,6 +247,76 @@ function GraphModeHooks() {
   );
 }
 
+const ZERO_NODE_IMPACT_RESULTS = new Set([
+  "no-match",
+  "unsupported",
+  "partial",
+  "truncated",
+  "error",
+  "timed-out",
+  "cancelled",
+  "empty",
+]);
+
+function resultLabel(result: string): string {
+  return result.replace(/-/g, " ");
+}
+
+function impactStatusTone(result: string, hasUnsupported: boolean): string {
+  if (result === "error" || result === "timed-out" || result === "cancelled") {
+    return "border-red-500/35 bg-red-500/10 text-red-200";
+  }
+  if (result === "unsupported" || hasUnsupported) {
+    return "border-amber-500/35 bg-amber-500/10 text-amber-200";
+  }
+  if (result === "no-match" || result === "empty") {
+    return "border-[var(--color-border)] bg-[var(--color-surface-alt)]/90 text-[var(--color-text)]";
+  }
+  return "border-sky-500/35 bg-sky-500/10 text-sky-200";
+}
+
+function ZeroNodeImpactOverlay() {
+  const activeLens = useStore((s) => s.activeLens);
+  const sceneMetadata = useStore((s) => s.sceneMetadata);
+  const trustSummary = useStore((s) => s.trustSummary);
+  const result = trustSummary?.result ?? sceneMetadata?.trust.result ?? "";
+  const unsupported =
+    trustSummary?.unsupported ?? sceneMetadata?.trust.unsupported ?? [];
+  const message =
+    trustSummary?.message ??
+    sceneMetadata?.trust.message ??
+    "Impact result metadata is unavailable.";
+
+  if (!ZERO_NODE_IMPACT_RESULTS.has(result)) return null;
+
+  return (
+    <section
+      aria-label="Impact result state"
+      className={`absolute left-3 top-3 z-30 w-[min(360px,calc(100%-1.5rem))] rounded border p-3 text-xs shadow-lg backdrop-blur ${impactStatusTone(
+        result,
+        unsupported.length > 0,
+      )}`}
+    >
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <p className="truncate font-semibold text-[var(--color-text)]">
+          {activeLens.lens === "impact" ? activeLens.label : "Impact"}
+        </p>
+        <span className="shrink-0 rounded border border-current/25 px-2 py-0.5 text-[10px] uppercase">
+          {resultLabel(result)}
+        </span>
+      </div>
+      <p className="mt-2 leading-5 text-[var(--color-text-muted)]">
+        {message}
+      </p>
+      {unsupported.length > 0 && (
+        <p className="mt-2 break-words text-[11px] leading-5 text-amber-300">
+          Unavailable: {unsupported.join(", ")}
+        </p>
+      )}
+    </section>
+  );
+}
+
 export function GraphPanel() {
   const pathfindingActive = useStore((s) => s.pathfindingActive);
   const pathfindingTo = useStore((s) => s.pathfindingTo);
@@ -259,8 +329,17 @@ export function GraphPanel() {
   const graphMode = useStore((s) => s.graphMode);
   const minimapVisible = useStore((s) => s.minimapVisible);
   const layoutMode = useStore((s) => s.layoutMode);
+  const graphInstance = useStore((s) => s.graphInstance);
+  const sceneMetadata = useStore((s) => s.sceneMetadata);
+  const trustSummary = useStore((s) => s.trustSummary);
   const focusMap = layoutMode === "zen";
   const graphRepresentationActive = representationMode === "graph";
+  const trustResult = trustSummary?.result ?? sceneMetadata?.trust.result ?? "";
+  const zeroNodeImpactActive =
+    graphRepresentationActive &&
+    graphMode === "impact" &&
+    (graphInstance?.order ?? 0) === 0 &&
+    ZERO_NODE_IMPACT_RESULTS.has(trustResult);
 
   const graphPanelRef = useRef<HTMLDivElement>(null);
   useGraphKeyboardNav(graphPanelRef);
@@ -320,7 +399,8 @@ export function GraphPanel() {
             <GraphMinimap />
           </div>
         )}
-        {graphRepresentationActive && graphMode !== "overview" && !focusMap && (
+        {zeroNodeImpactActive && <ZeroNodeImpactOverlay />}
+        {graphRepresentationActive && graphMode !== "overview" && !focusMap && !zeroNodeImpactActive && (
           <div className="absolute left-3 top-3 z-20 w-[min(320px,calc(100%-1.5rem))]">
             <LensSummaryPanel compact />
           </div>

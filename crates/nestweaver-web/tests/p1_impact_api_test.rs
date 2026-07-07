@@ -159,6 +159,9 @@ fn make_app() -> axum::Router {
         .insert_edge(&calls_edge("sym:impact:test", "sym:impact:caller", 0.8))
         .unwrap();
     store
+        .insert_edge(&calls_edge("sym:impact:test", "sym:impact:target", 0.2))
+        .unwrap();
+    store
         .insert_edge(&calls_edge("sym:other:caller", "sym:impact:target", 0.95))
         .unwrap();
     store
@@ -372,6 +375,49 @@ async fn p1_impact_repo_scope_includes_structural_impact_edges() {
                 && edge["edge_type"] == "EXTENDS_SYM"
         }),
         "impact DAG edges should include actual in-scope EXTENDS_SYM relationships"
+    );
+}
+
+#[tokio::test]
+async fn p1_impact_reconstructed_edges_honor_request_confidence() {
+    let app = make_app();
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/impact/sym:impact:target?depth=3&confidence=0.8&workspace=repo:repo:impact",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let nodes = json["nodes"].as_array().expect("nodes should be an array");
+    assert!(
+        nodes.iter().any(|node| node["uid"] == "sym:impact:caller"),
+        "high-confidence direct caller should be returned"
+    );
+    assert!(
+        nodes.iter().any(|node| node["uid"] == "sym:impact:test"),
+        "high-confidence transitive caller should be returned"
+    );
+
+    let edges = json["edges"].as_array().expect("edges should be an array");
+    assert!(
+        edges.iter().any(|edge| {
+            edge["source"] == "sym:impact:test"
+                && edge["target"] == "sym:impact:caller"
+                && edge["confidence"]
+                    .as_f64()
+                    .is_some_and(|confidence| confidence >= 0.8)
+        }),
+        "fixture should preserve the high-confidence path that returned the endpoint"
+    );
+    assert!(
+        !edges.iter().any(|edge| {
+            edge["source"] == "sym:impact:test"
+                && edge["target"] == "sym:impact:target"
+                && edge["confidence"]
+                    .as_f64()
+                    .is_some_and(|confidence| confidence < 0.8)
+        }),
+        "reconstructed impact edges must apply the same confidence threshold as traversal"
     );
 }
 

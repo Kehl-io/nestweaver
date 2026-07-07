@@ -150,7 +150,7 @@ pub async fn impact(
     let mut nodes = Vec::with_capacity(returned_count);
     nodes.push(target_graph_node(&target));
     nodes.extend(returned_impact_nodes.iter().map(impact_graph_node));
-    let edges = build_layered_edges(&state, &target.uid, &returned_impact_nodes)?;
+    let edges = build_layered_edges(&state, &target.uid, &returned_impact_nodes, confidence)?;
     let states = ImpactStates {
         tier: "local-only",
         local: "available",
@@ -456,6 +456,7 @@ fn build_layered_edges(
     state: &Arc<AppState>,
     target_uid: &str,
     nodes: &[ImpactNode],
+    min_confidence: f32,
 ) -> Result<Vec<ImpactGraphEdge>, ApiError> {
     use std::collections::HashMap;
 
@@ -467,7 +468,9 @@ fn build_layered_edges(
 
     let mut edges = Vec::new();
     for node in nodes {
-        let outgoing_edges = state.store.outgoing_impact_edges(&node.uid)?;
+        let outgoing_edges = state
+            .store
+            .outgoing_impact_edges(&node.uid, min_confidence)?;
         for edge in outgoing_edges {
             let Some(target_layer) = layers.get(edge.target_uid.as_str()).copied() else {
                 continue;

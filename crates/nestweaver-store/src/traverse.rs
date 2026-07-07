@@ -306,8 +306,13 @@ impl GraphStore {
 
     /// Return outgoing edges that use the same relationship types as impact
     /// traversal.
-    pub fn outgoing_impact_edges(&self, source_uid: &str) -> Result<Vec<ImpactEdge>, StoreError> {
+    pub fn outgoing_impact_edges(
+        &self,
+        source_uid: &str,
+        min_confidence: f32,
+    ) -> Result<Vec<ImpactEdge>, StoreError> {
         let conn = self.conn()?;
+        let min_conf = min_confidence as f64;
         let mut edges = Vec::new();
 
         for edge_type in IMPACT_EDGE_TYPES
@@ -316,6 +321,7 @@ impl GraphStore {
         {
             let q = format!(
                 "MATCH (s:Symbol {{uid: $uid}})-[r:{et}]->(t:Symbol) \
+                 WHERE r.confidence >= $min_conf \
                  RETURN t.uid, r.confidence",
                 et = edge_type,
             );
@@ -330,7 +336,10 @@ impl GraphStore {
             };
             let result = match conn.execute(
                 &mut stmt,
-                vec![("uid", lbug::Value::String(source_uid.to_string()))],
+                vec![
+                    ("uid", lbug::Value::String(source_uid.to_string())),
+                    ("min_conf", lbug::Value::Double(min_conf)),
+                ],
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -585,7 +594,7 @@ mod tests {
             })
             .unwrap();
 
-        let edges = store.outgoing_impact_edges("derived").unwrap();
+        let edges = store.outgoing_impact_edges("derived", 0.0).unwrap();
         assert!(
             edges.iter().any(|edge| {
                 edge.target_uid == "base"
