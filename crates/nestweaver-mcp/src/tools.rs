@@ -2605,7 +2605,7 @@ fn group_search_hits_by_note(
 fn tool_schema_note_get() -> Value {
     json!({
         "name": "note_get",
-        "description": "Fetch a vault note's full markdown body or specific sections, plus structural metadata (frontmatter, heading outline, tags).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid for unambiguous lookup, or title for case-insensitive first-match\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
+        "description": "Fetch a vault note's full markdown body or specific sections, plus structural metadata (frontmatter, heading outline, tags).\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid for unambiguous lookup, or title for case-insensitive first-match\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2777,7 +2777,7 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 fn tool_schema_backlinks() -> Value {
     json!({
         "name": "backlinks",
-        "description": "Find every note that wiki-links TO a specific target note, revealing the reverse link graph.\n\nGuidelines:\n- Pass uid or title (case-insensitive, first match) to identify the target\n- Returns source note paths, linking sections, confidence scores, and display text\n- For forward links (what a note links to), read the note body with note_get instead\n\nLimitations:\n- Only considers vault wikilinks, not code symbol dependencies (use brain_impact for those)\n- Confidence reflects link resolution quality, not semantic relevance",
+        "description": "Find every note that wiki-links TO a specific target note, revealing the reverse link graph.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Pass uid or title (case-insensitive, first match) to identify the target\n- Returns source note paths, linking sections, confidence scores, and display text\n- For forward links (what a note links to), read the note body with note_get instead\n\nLimitations:\n- Only considers vault wikilinks, not code symbol dependencies (use brain_impact for those)\n- Confidence reflects link resolution quality, not semantic relevance",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3615,7 +3615,7 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
+        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4129,22 +4129,23 @@ fn tool_schema_detect_changes() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "files": {
+                "changed_files": {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
                 }
             },
-            "required": ["files"]
+            "required": ["changed_files"]
         }
     })
 }
 
 fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let files: Vec<String> = args
-        .get("files")
+        .get("changed_files")
+        .or_else(|| args.get("files"))
         .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("'files' must be an array of strings"))?
+        .ok_or_else(|| anyhow!("'changed_files' must be an array of strings"))?
         .iter()
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
@@ -4202,7 +4203,7 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4295,6 +4296,17 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     });
 
     let output = compute_clusters(store, resolution).context("compute_clusters")?;
+
+    // Persist so hub_nodes/bridge_nodes can read the sidecar afterwards.
+    // Deliberate exception to "reads don't write": `clusters` is not in
+    // MUTATING_TOOLS, so this runs under the daemon's read guard — but it
+    // only writes derived cache data to a fixed sidecar path, never graph
+    // state, and degrades to warn-only (e.g. on a read-only filesystem).
+    if let Ok(db_path) = current_db_path(store)
+        && let Err(e) = nestweaver_engine::save_clusters(&db_path, &output)
+    {
+        tracing::warn!("failed to persist clusters sidecar: {e}");
+    }
 
     let clusters_json: Vec<Value> = output
         .communities
@@ -4556,7 +4568,7 @@ fn dispatch_set_extension_via_daemon(
 fn tool_schema_query_extensions() -> Value {
     json!({
         "name": "query_extensions",
-        "description": "Query custom metadata set via set_extension. Two modes: by uid (all properties for a node) or by key+value (find all nodes matching a property).\n\nGuidelines:\n- Pass uid alone to inspect a node's custom properties\n- Pass key + value to find all nodes matching that property (exact match only)\n- For core graph queries use brain_search or brain_context, not this tool\n\nLimitations:\n- Exact match only — no partial matching, ranges, or regex on values\n- Only queries the extension sidecar, not core graph properties",
+        "description": "Query custom metadata set via set_extension. Two modes: by uid (all properties for a node) or by key+value (find all nodes matching a property).\n\nRequires either 'uid' or both 'key' and 'value' (at least one mode must be specified).\n\nGuidelines:\n- Pass uid alone to inspect a node's custom properties\n- Pass key + value to find all nodes matching that property (exact match only)\n- For core graph queries use brain_search or brain_context, not this tool\n\nLimitations:\n- Exact match only — no partial matching, ranges, or regex on values\n- Only queries the extension sidecar, not core graph properties",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5467,7 +5479,7 @@ fn tool_schema_hub_nodes() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "top_n": {
+                "limit": {
                     "type": "integer",
                     "description": "Number of top hubs to return. Default 10.",
                     "default": 10
@@ -5485,7 +5497,8 @@ fn tool_schema_hub_nodes() -> Value {
 
 fn tool_hub_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let top_n = args
-        .get("top_n")
+        .get("limit")
+        .or_else(|| args.get("top_n"))
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(10);
@@ -5549,7 +5562,7 @@ fn tool_schema_bridge_nodes() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "top_n": {
+                "limit": {
                     "type": "integer",
                     "description": "Number of top bridges to return. Default 10.",
                     "default": 10
@@ -5567,7 +5580,8 @@ fn tool_schema_bridge_nodes() -> Value {
 
 fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let top_n = args
-        .get("top_n")
+        .get("limit")
+        .or_else(|| args.get("top_n"))
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(10);
@@ -6254,7 +6268,13 @@ pub fn dispatch_via_daemon(
             "hub_nodes" => {
                 use nestweaver_proto::HubNodesRequest;
                 let req = tonic::Request::new(HubNodesRequest {
-                    top_n: i32_field("top_n"),
+                    // The schema advertises 'limit'; 'top_n' kept as a
+                    // backward-compat alias (and it is the proto field name).
+                    top_n: args
+                        .get("limit")
+                        .or_else(|| args.get("top_n"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0) as i32,
                     response_format: str_field("response_format"),
                 });
                 let resp = client
@@ -7230,5 +7250,45 @@ mod tool_doc_tests {
         for (name, cat, _, _) in &entries {
             assert_ne!(cat, "Other", "tool {name} is missing a category assignment");
         }
+    }
+}
+
+// The v2.2.1 schema renames (top_n → limit, files → changed_files) keep the
+// old names as runtime aliases. These tests pin both spellings on the
+// store-direct handlers; the daemon dispatch mappings (dispatch_via_daemon,
+// nestweaver-federation) forward 'limit' into the proto's top_n field.
+#[cfg(test)]
+mod arg_alias_tests {
+    use super::*;
+
+    #[test]
+    fn hub_nodes_accepts_limit_and_top_n_alias() {
+        let store = GraphStore::in_memory().unwrap();
+        let via_limit = tool_hub_nodes(&store, json!({ "limit": 5 })).unwrap();
+        assert_eq!(via_limit["top_n"], json!(5));
+        let via_alias = tool_hub_nodes(&store, json!({ "top_n": 7 })).unwrap();
+        assert_eq!(via_alias["top_n"], json!(7));
+        let default = tool_hub_nodes(&store, json!({})).unwrap();
+        assert_eq!(default["top_n"], json!(10));
+    }
+
+    #[test]
+    fn bridge_nodes_accepts_limit_and_top_n_alias() {
+        let store = GraphStore::in_memory().unwrap();
+        let via_limit = tool_bridge_nodes(&store, json!({ "limit": 5 })).unwrap();
+        assert_eq!(via_limit["top_n"], json!(5));
+        let via_alias = tool_bridge_nodes(&store, json!({ "top_n": 7 })).unwrap();
+        assert_eq!(via_alias["top_n"], json!(7));
+    }
+
+    #[test]
+    fn detect_changes_accepts_changed_files_and_files_alias() {
+        let store = GraphStore::in_memory().unwrap();
+        let via_new =
+            tool_detect_changes(&store, json!({ "changed_files": ["src/a.rs"] })).unwrap();
+        assert_eq!(via_new["files"], json!(["src/a.rs"]));
+        let via_alias = tool_detect_changes(&store, json!({ "files": ["src/b.rs"] })).unwrap();
+        assert_eq!(via_alias["files"], json!(["src/b.rs"]));
+        assert!(tool_detect_changes(&store, json!({})).is_err());
     }
 }

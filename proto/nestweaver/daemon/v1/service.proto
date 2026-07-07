@@ -323,6 +323,9 @@ message EmbedRequest {
 message EmbedResponse {
   uint32 succeeded = 1;
   uint32 failed = 2;
+  // Embeddings rejected by the dimension guard (model mismatch), as opposed
+  // to `failed` (the model errored). Zero from pre-2.2.1 daemons.
+  uint32 rejected = 3;
 }
 
 // ─── Impact Analysis (Phase 4) ──────────────────────────────────────

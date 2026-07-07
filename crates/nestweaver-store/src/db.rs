@@ -450,12 +450,32 @@ impl GraphStore {
 
     /// Add an embedding to the in-memory index without saving to disk.
     /// Use `flush_embedding_index` after a batch of additions to persist.
-    pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) {
+    ///
+    /// Returns `false` when the dimension guard rejects the vector — callers
+    /// must not count a rejected embedding as stored.
+    #[must_use = "a false return means the dimension guard rejected the embedding"]
+    pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) -> bool {
+        self.add_embedding_with_force(uid, embedding, false)
+    }
+
+    #[must_use = "a false return means the dimension guard rejected the embedding"]
+    pub fn add_embedding_with_force(&self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
         let mut idx = self
             .embedding_index
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        idx.add(uid, embedding);
+        idx.add(uid, embedding, force)
+    }
+
+    /// Re-arm the embedding index's once-per-run force-clear guard. Call at
+    /// the start of an embed run — matters for long-lived stores (the daemon)
+    /// where the index outlives individual embed runs.
+    pub fn reset_embedding_force_guard(&self) {
+        let mut idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        idx.reset_force_guard();
     }
 
     /// Check whether the embedding index already has an entry for `uid`.
