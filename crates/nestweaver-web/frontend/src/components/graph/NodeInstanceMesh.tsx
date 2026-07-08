@@ -117,6 +117,7 @@ varying float v_ripple;
 uniform float u_time;
 uniform vec3 u_strokeColor;
 uniform float u_haloAmp;
+uniform float u_motionAmp;
 
 void main() {
     vec2 uv = v_uv - 0.5;
