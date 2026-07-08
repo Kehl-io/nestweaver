@@ -551,3 +551,16 @@ Evidence to capture when executed: Automated test command output, screenshots/vi
 - Every failed step includes expected result, actual result, reproduction path, evidence, and severity.
 - Every deliberate P1 limitation or exclusion is visible in the UI and captured as evidence.
 - Manual findings are cross-checked against the automated companion results before P1 is called complete.
+
+## Execution Record — 2026-07-07 (post-review remediation pass)
+
+Environment: macOS (Darwin 25.5), Chrome (real GPU) for interactive verification + Playwright Chromium for automated gates. Build under test: `feature/nestweaver-ui-overhaul` through commit `2028aee8`. Data: scratch DB with 4 indexed repos (nestweaver, bx-react-native-client, coyote-server, coyote-client, ~58k symbols) served by the branch's own `nestweaver ui`; fixture DB (`testdata/js`) for the automated suite. Theme: dark (new default) and light both exercised; reduced-motion not simulated this round.
+
+Interactively verified this session (evidence: session screenshots):
+
+- MT-01 Orient (partial): landing constellation renders per-repo galaxy clusters with settled layout and readable repo labels; Start Here shelf, scope summary, and trust chip legible after the truncation fixes; workspace trust chip shows `local-only · current · truncated` honestly against real data.
+- MT-02 Understand (partial): clicking the `nestweaver` repo hub opens the knowledge card with identity, role, evidence, relationships, and actions; repo/service nodes now show an expected empty preview instead of an error chip; deep link (`?node=…&kind=repo`) restores selection.
+- MT-06 Representation/theming (partial): graph⇄table⇄matrix⇄JSON tabs reachable (icons-only at narrow widths); theme flip mid-scene re-derives node palette correctly (was stale before this pass).
+- Automated release gates re-run on HEAD: see PLAN.md remediation section; full results recorded by the final verification run (tsc, eslint, vite build, full Playwright suite, cargo test -p nestweaver-web, clippy -D warnings, fmt --check).
+
+Full MT-01…MT-06 execution across all six journeys (keyboard-only paths, Search Phrase ambiguity, impact trust-state matrix, reduced-motion) remains open for a dedicated manual session with a human at the controls.

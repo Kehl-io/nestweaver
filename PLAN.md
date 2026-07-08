@@ -448,3 +448,20 @@ P1 can be marked complete only when:
 - every discovered issue is resolved,
 - this plan is updated to complete,
 - the completed P1 work is committed with conventional commits.
+
+## Post-P1 review remediation and UX pass (2026-07-07)
+
+Status: complete
+
+A four-agent adversarial review of the branch (spec compliance P0/P1, frontend bug hunt, backend bug hunt) plus an interactive visual pass produced a remediation round, committed as:
+
+- `e8137647` fix(web): surface silenced request failures and harden toasts
+- `946d6a9a` fix(web): scope graph hotkeys to graph view and free native text undo
+- `17a00bcd` feat(web): add impact lens depth and confidence filters with deep links (closes the PRD P1.6 "filters" deep-link gap)
+- `f85a001b` fix(web): honest scoped search coverage and impact envelope hardening (vault/project search now uses membership-filtered Tantivy full-text or discloses `note-body-search` as unsupported; token_budget no longer echoed as an unapplied cap; search limit clamped; impact 404s before vault-unsupported; impact computation moved to spawn_blocking; workspace catalog bounded at 500 with truncation disclosure)
+- `0d2ebf17` feat(web): repo-galaxy constellation overview with settled layout (fixes the "nodes in a circle" landing — fixed-ring placement replaced by per-repo galaxy clusters + settle-and-freeze force pass + post-settle camera re-fit)
+- `2df15857` fix(web): theme-correct node colors, kind-hue rims, and clear hub labels
+- `3a6b7239` feat(web): dark-first panels-first defaults with mode tabs under the top bar (locked design decisions applied; zen was the accidental default and hid Start Here)
+- `2028aee8` fix(web): stop toolbar and shelf text from truncating illegibly
+
+Deferred (candidates for P2 polish): exponential fog / nebula backdrop / film grain from the design note's atmosphere tier; per-galaxy ambient edge tint; camera fly-to on focus.
