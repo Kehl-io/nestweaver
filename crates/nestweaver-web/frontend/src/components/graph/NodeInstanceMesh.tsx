@@ -88,7 +88,9 @@ void main() {
 
     float rebound = sin(ignite * 3.14159) * (1.0 - ignite) * 0.08 * u_motionAmp;
     float introScale = mix(0.55, 1.0, ignite) + rebound;
-    float breathe = 1.0 + u_breatheAmp * sin(u_time * 0.8 + aPhase * 6.2831);
+    // Gentle breathing on focus + hubs only (locked design; ambient stays calm)
+    float breatheScope = max(aHighlight, step(0.7, aImportance));
+    float breathe = 1.0 + u_breatheAmp * breatheScope * sin(u_time * 0.8 + aPhase * 6.2831);
     float focusLift = 1.0 + aHighlight * 0.18 + aSeed * 0.04;
     float baseScale = 0.45;
     // Quads are enlarged 1.6x purely for the ambient halo ring; the disc
@@ -118,6 +120,7 @@ uniform float u_time;
 uniform vec3 u_strokeColor;
 uniform float u_haloAmp;
 uniform float u_motionAmp;
+uniform float u_hdrAmp;
 
 void main() {
     vec2 uv = v_uv - 0.5;
@@ -177,6 +180,13 @@ void main() {
     }
 
     if (alpha < 0.012) discard;
+    // When the HDR composer (Neutral tone map + bloom) is not in the
+    // pipeline — light mode and reduced motion — over-1.0 emissives would
+    // hard-clip per channel toward white and destroy the kind hue. Compress
+    // by peak instead (hue-preserving scalar normalize).
+    float peak = max(color.r, max(color.g, color.b));
+    vec3 compressed = color / max(peak, 1.0);
+    color = mix(compressed, color, u_hdrAmp);
     gl_FragColor = vec4(color, alpha);
 }
 `;
@@ -210,6 +220,7 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
       u_intro: { value: reducedMotion ? 1 : 0 },
       u_strokeColor: { value: [0.369, 0.816, 0.996] },
       u_haloAmp: { value: 0 },
+      u_hdrAmp: { value: 0 },
       u_rippleOrigin: { value: [0, 0] },
       u_rippleStart: { value: -1 },
     }),
@@ -217,9 +228,10 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     [],
   );
 
-  // Sync reducedMotion -> uniform
+  // Sync reducedMotion -> uniforms (breathing is scoped to focus + hubs
+  // in the vertex shader; the amp only enables the sanctioned idle motion)
   useEffect(() => {
-    uniforms.u_breatheAmp.value = 0;
+    uniforms.u_breatheAmp.value = reducedMotion ? 0 : 0.02;
     uniforms.u_motionAmp.value = reducedMotion ? 0 : 1;
     if (reducedMotion) uniforms.u_intro.value = 1;
   }, [reducedMotion, uniforms]);
@@ -233,12 +245,15 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
         ? [0.369, 0.816, 0.996]
         : [0.031, 0.384, 0.655];
       uniforms.u_haloAmp.value = isDark && buffers.nodeCount <= 2000 ? 1 : 0;
+      // HDR path (over-1.0 emissives feeding the composer) exists only when
+      // the composer is mounted: dark mode + full motion
+      uniforms.u_hdrAmp.value = isDark && !reducedMotion ? 1 : 0;
     }
     updateStroke();
     const observer = new MutationObserver(updateStroke);
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
     return () => observer.disconnect();
-  }, [uniforms, buffers.nodeCount]);
+  }, [uniforms, buffers.nodeCount, reducedMotion]);
 
   const introStartRef = useRef<number | null>(null);
 

@@ -37,15 +37,30 @@ pub fn global_bridge_scores(state: &AppState) -> Arc<HashMap<String, f64>> {
     state
         .bridge_scores
         .get_or_init(|| {
-            let bridges =
-                nestweaver_engine::find_bridge_nodes(&state.store, BRIDGE_POOL).unwrap_or_default();
-            Arc::new(
-                bridges
-                    .into_iter()
-                    .filter(|bridge| bridge.betweenness_score > 0.0)
-                    .map(|bridge| (bridge.uid, bridge.betweenness_score))
-                    .collect(),
-            )
+            // The sampled Brandes pass can take seconds on large stores; keep
+            // the cold-cache computation off the async worker threads so the
+            // first overview request doesn't stall the runtime. block_in_place
+            // panics on current-thread runtimes (tokio::test), so fall back to
+            // inline computation there.
+            let compute = || {
+                let bridges = nestweaver_engine::find_bridge_nodes(&state.store, BRIDGE_POOL)
+                    .unwrap_or_default();
+                Arc::new(
+                    bridges
+                        .into_iter()
+                        .filter(|bridge| bridge.betweenness_score > 0.0)
+                        .map(|bridge| (bridge.uid, bridge.betweenness_score))
+                        .collect(),
+                )
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    tokio::task::block_in_place(compute)
+                }
+                _ => compute(),
+            }
         })
         .clone()
 }

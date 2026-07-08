@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { useThree } from "@react-three/fiber";
 import { Html } from "@react-three/drei";
 import { useStore } from "../../stores";
@@ -26,7 +27,13 @@ export function NodeLabels({ buffers }: Props) {
   const canvasSize = useThree((s) => s.size);
   const focusMap = layoutMode === "zen";
 
-  if (!graphInstance || buffers.nodeCount === 0) return null;
+  // Bucket the zoom so the grid recomputes ~once per 25 units of dolly
+  // instead of on every 0.5-unit camera tick (the grid pass is O(nodes)
+  // plus Html portal reconciliation — unbounded recompute janks at scale)
+  const zoomBucket = Math.round(cameraZoom / 25) * 25;
+
+  const visibleLabels = useMemo(() => {
+  if (!graphInstance || buffers.nodeCount === 0) return [];
 
   // Collect all nodes with label data
   const labelNodes: Array<{
@@ -117,7 +124,7 @@ export function NodeLabels({ buffers }: Props) {
   // force-labeled > size). World→screen scale for the perspective camera:
   // px-per-world-unit ≈ viewportHeight / (2·tan(fov/2)·cameraZ), fov 50°.
   const pxPerWorld =
-    canvasSize.height / (2 * Math.tan((50 * Math.PI) / 360) * Math.max(cameraZoom, 1));
+    canvasSize.height / (2 * Math.tan((50 * Math.PI) / 360) * Math.max(zoomBucket, 1));
   const cellBest = new Map<string, { score: number; index: number }>();
   labelNodes.forEach((node, index) => {
     const score = node.isSelected
@@ -134,13 +141,17 @@ export function NodeLabels({ buffers }: Props) {
   const keptIndices = new Set(
     [...cellBest.values()].map((entry) => entry.index),
   );
-  const visibleLabels = labelNodes.filter(
+  return labelNodes.filter(
     (node, index) =>
       node.isSelected || node.isHovered || keptIndices.has(index),
   );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buffers, graphInstance, selectedNodeId, hoveredNodeId, focusMap, canvasSize.height, zoomBucket]);
+
+  if (!graphInstance || buffers.nodeCount === 0) return null;
 
   // Font size scales inversely with zoom: bigger when close, smaller when far
-  const baseFontSize = cameraZoom < 300 ? 12 : cameraZoom < 600 ? 11 : 10;
+  const baseFontSize = zoomBucket < 300 ? 12 : zoomBucket < 600 ? 11 : 10;
 
   return (
     <>

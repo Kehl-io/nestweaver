@@ -162,10 +162,16 @@ export function EdgeParticles({ buffers }: Props) {
       burstAttr.setX(i, incident ? 1 : 0);
     }
     burstAttr.needsUpdate = true;
-    if (focusIdx !== undefined) {
+  }, [selectedNodeId, buffers, uniforms]);
+
+  // Kick the burst clock only when the SELECTION changes — the attribute
+  // effect above also re-runs on every buffer rebuild during force settling
+  // (~15 ticks), which would visibly re-trigger the burst mid-flight
+  useEffect(() => {
+    if (selectedNodeId) {
       uniforms.u_burstStart.value = clockRef.current;
     }
-  }, [selectedNodeId, buffers, uniforms]);
+  }, [selectedNodeId, uniforms]);
 
   useEffect(() => {
     function updateColor() {
