@@ -7,8 +7,11 @@ import {
   workspaceSceneMetadataWithResult,
 } from "../../../api/workspaces";
 import { useStore } from "../../../stores";
+import { useForceLayout } from "../../../hooks/useForceLayout";
 import { buildGraphFromOverview } from "../utils/buildGraphFromOverview";
 import { preserveGraphLayout } from "../utils/preserveGraphLayout";
+
+const MAX_LAYOUT_MS = 10_000;
 
 type ScopedOverviewResponse = OverviewResponse & { _meta?: SceneMetadata };
 
@@ -42,6 +45,8 @@ export function useOverviewMode() {
   const [error, setError] = useState<string | null>(null);
   const requestIdRef = useRef(0);
   const previousOverviewGraphRef = useRef<{ workspaceId: string; graph: Graph } | null>(null);
+  const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { start, stop, kill } = useForceLayout();
 
   const loadOverview = useCallback(async () => {
     if (graphMode !== "overview") {
@@ -81,9 +86,10 @@ export function useOverviewMode() {
 
       const graph = buildGraphFromOverview(result);
       const previous = previousOverviewGraphRef.current;
+      const hasPreviousLayout = previous?.workspaceId === requestWorkspaceId;
       preserveGraphLayout(
         graph,
-        previous?.workspaceId === requestWorkspaceId ? previous.graph : null,
+        hasPreviousLayout ? previous.graph : null,
         {
           keepExistingNewNodePositions: true,
         },
@@ -99,6 +105,13 @@ export function useOverviewMode() {
       setSceneMetadata(result._meta ?? null);
       setGraphData(graph);
       previousOverviewGraphRef.current = { workspaceId: requestWorkspaceId, graph };
+      // Settle fresh constellations organically; preserved layouts stay frozen
+      // (object constancy), and reduced-effects users keep the static seed layout.
+      if (!hasPreviousLayout && !useStore.getState().reducedEffects) {
+        start(graph);
+        if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+        stopTimerRef.current = setTimeout(() => stop(), MAX_LAYOUT_MS);
+      }
     } catch (err) {
       if (!isCurrentRequest()) return;
 
@@ -131,14 +144,18 @@ export function useOverviewMode() {
     setActiveLens,
     setGraphData,
     setSceneMetadata,
+    start,
+    stop,
   ]);
 
   useEffect(() => {
     loadOverview();
     return () => {
       requestIdRef.current += 1;
+      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+      kill();
     };
-  }, [loadOverview]);
+  }, [loadOverview, kill]);
 
   return { overview, loading, error, reload: loadOverview };
 }

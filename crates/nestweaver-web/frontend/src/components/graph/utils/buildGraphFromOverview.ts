@@ -1,67 +1,141 @@
 import Graph from "graphology";
 import type { OverviewResponse, OverviewLandmark } from "../../../api/types";
-import { kindToColor, nodeSize } from "./graphColors";
+import { kindToColor } from "./graphColors";
+import { deterministicGraphPosition } from "./preserveGraphLayout";
+
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+const HUB_SPACING = 46;
+const MEMBER_MIN_DISTANCE = 24;
+const MEMBER_DISTANCE_SPREAD = 20;
+
+function landmarkPaletteKind(item: OverviewLandmark): string {
+  if (item.kind === "repo") return "Section";
+  if (item.kind === "service") return "Interface";
+  if (item.kind === "symbol") return "Function";
+  if (item.kind === "note") return "Note";
+  return item.kind;
+}
 
 function landmarkColor(item: OverviewLandmark): string {
-  if (item.kind === "repo") return kindToColor("Section");
-  if (item.kind === "service") return kindToColor("Interface");
-  if (item.kind === "symbol") return kindToColor("Function");
-  if (item.kind === "note") return kindToColor("Note");
-  return kindToColor(item.kind);
+  return kindToColor(landmarkPaletteKind(item));
+}
+
+/** Extract the owning repo uid from service/symbol uids like
+ * `svc:repo:<a>:<b>:<hash>` or `sym:repo:<a>:<b>:...`. */
+export function parentRepoUid(uid: string): string | null {
+  const match = /^(?:svc|sym):(repo:[^:]+:[^:]+)/.exec(uid);
+  return match ? match[1] : null;
+}
+
+function hashUnit(value: string): number {
+  let hash = 2_166_136_261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0) / 0xffffffff;
+}
+
+/** Repo hubs seed on a phyllotaxis spiral (sunflower pattern) with per-uid
+ * jitter — organic scatter instead of a ring, stable across reloads. */
+function hubSeedPosition(uid: string, index: number): { x: number; y: number } {
+  const angle = index * GOLDEN_ANGLE + (hashUnit(`${uid}:hub-angle`) - 0.5) * 0.6;
+  const radius = HUB_SPACING * Math.sqrt(index + 0.6) * (0.9 + hashUnit(`${uid}:hub-radius`) * 0.25);
+  return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+}
+
+function memberSeedPosition(
+  uid: string,
+  hub: { x: number; y: number },
+): { x: number; y: number } {
+  const angle = hashUnit(`${uid}:member-angle`) * Math.PI * 2;
+  const distance = MEMBER_MIN_DISTANCE + hashUnit(`${uid}:member-radius`) * MEMBER_DISTANCE_SPREAD;
+  return {
+    x: hub.x + Math.cos(angle) * distance,
+    y: hub.y + Math.sin(angle) * distance,
+  };
 }
 
 export function buildGraphFromOverview(result: OverviewResponse): Graph {
   const graph = new Graph({ type: "directed", multi: true });
   const maxScore = Math.max(...result.landmarks.map((n) => n.score), 0.001);
-  const hubItems = result.landmarks.filter(
-    (item) => item.kind === "repo" || item.kind === "service",
-  );
-  const orbitItems = result.landmarks.filter(
-    (item) => item.kind !== "repo" && item.kind !== "service",
+
+  const hubs = result.landmarks.filter((item) => item.kind === "repo");
+  const members = result.landmarks.filter((item) => item.kind !== "repo");
+  const hubPositions = new Map<string, { x: number; y: number }>();
+  const memberCounts = new Map<string, number>();
+
+  for (const item of members) {
+    const parent = parentRepoUid(item.uid);
+    if (parent) memberCounts.set(parent, (memberCounts.get(parent) ?? 0) + 1);
+  }
+
+  // Bigger galaxies (more members in scene) seed closer to the center
+  const orderedHubs = [...hubs].sort(
+    (left, right) =>
+      (memberCounts.get(right.uid) ?? 0) - (memberCounts.get(left.uid) ?? 0),
   );
 
-  for (let i = 0; i < result.landmarks.length; i++) {
-    const item = result.landmarks[i];
-    const isHub = item.kind === "repo" || item.kind === "service";
-    const group = isHub ? hubItems : orbitItems;
-    const groupIndex = group.findIndex((candidate) => candidate.uid === item.uid);
-    const angle =
-      (groupIndex / Math.max(group.length, 1)) * Math.PI * 2;
-    const ring = isHub
-      ? hubItems.length <= 1 ? 0 : 64
-      : 96 + (groupIndex % 3) * 14;
-    const overviewOffsetX = 62;
-    const overviewOffsetY = 12;
+  const maxMemberCount = Math.max(...[...memberCounts.values()], 1);
+
+  orderedHubs.forEach((item, index) => {
+    const position = hubSeedPosition(item.uid, index);
+    hubPositions.set(item.uid, position);
+    const memberShare = (memberCounts.get(item.uid) ?? 0) / maxMemberCount;
+
+    graph.addNode(item.uid, {
+      label: item.label,
+      x: position.x,
+      y: position.y,
+      size: 22 + memberShare * 14,
+      color: landmarkColor(item),
+      paletteKind: landmarkPaletteKind(item),
+      kind: item.kind,
+      location: item.location,
+      // Raw overview scores sit at ~1.0 for every repo, which reads as
+      // "everything is loud" downstream (emissive/bloom). Spread importance
+      // by how much of the indexed scene each galaxy owns instead.
+      relevance: 0.35 + memberShare * 0.65,
+      reason: item.reason,
+      forceLabel: true,
+      isSeed: index < 8,
+      isOverview: true,
+    });
+  });
+
+  const maxHubRadius = HUB_SPACING * Math.sqrt(Math.max(orderedHubs.length, 1));
+
+  members.forEach((item, index) => {
+    const parent = parentRepoUid(item.uid);
+    const hubPosition = parent ? hubPositions.get(parent) : undefined;
+    const position = hubPosition
+      ? memberSeedPosition(item.uid, hubPosition)
+      : deterministicGraphPosition(item.uid, { radius: maxHubRadius + 70 });
     const normalized = Math.max(item.score / maxScore, 0.08);
 
     graph.addNode(item.uid, {
       label: item.label,
-      x: overviewOffsetX + Math.cos(angle) * ring,
-      y: overviewOffsetY + Math.sin(angle) * ring,
-      size: nodeSize(isHub ? 3 : 1, normalized) * (isHub ? 1.18 : 1.08),
+      x: position.x,
+      y: position.y,
+      size: 11 + normalized * 4,
       color: landmarkColor(item),
+      paletteKind: landmarkPaletteKind(item),
       kind: item.kind,
       location: item.location,
-      relevance: item.score,
+      relevance: 0.15 + normalized * 0.25,
       reason: item.reason,
-      forceLabel: i < 8,
-      // Current label filtering preserves seed labels through zoom changes.
-      isSeed: i < 8,
+      forceLabel: false,
+      isSeed: index < 2 && hubs.length === 0,
       isOverview: true,
     });
-  }
 
-  const primaryHub = hubItems[0];
-  if (primaryHub && graph.hasNode(primaryHub.uid)) {
-    for (const item of orbitItems) {
-      if (graph.hasNode(item.uid)) {
-        graph.addEdge(primaryHub.uid, item.uid, {
-          type: "overview",
-          confidence: Math.max(item.score / maxScore, 0.18),
-        });
-      }
+    if (parent && graph.hasNode(parent)) {
+      graph.addEdge(parent, item.uid, {
+        type: "overview",
+        confidence: Math.max(item.score / maxScore, 0.18),
+      });
     }
-  }
+  });
 
   return graph;
 }

@@ -1,7 +1,8 @@
 import { useCallback, useMemo, useRef, useState, useEffect, useLayoutEffect } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
-import { EffectComposer, Bloom } from "@react-three/postprocessing";
+import { EffectComposer, Bloom, ToneMapping, Vignette } from "@react-three/postprocessing";
+import { ToneMappingMode } from "postprocessing";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
 import { EdgeParticles } from "./EdgeParticles";
@@ -267,12 +268,13 @@ function CameraFitController({
     () => buffers.indexToUid.join("\u0000"),
     [buffers.indexToUid],
   );
+  const cameraFitRequestId = useStore((s) => s.cameraFitRequestId);
   const fittedKeyRef = useRef("");
 
   useEffect(() => {
     if (buffers.nodeCount === 0 || !controls) return;
     if (canvasSize.width <= 0 || canvasSize.height <= 0) return;
-    const fitKey = `${graphKey}:${canvasSize.width}x${canvasSize.height}`;
+    const fitKey = `${graphKey}:${canvasSize.width}x${canvasSize.height}:${cameraFitRequestId}`;
     if (fittedKeyRef.current === fitKey) return;
 
     let minX = Infinity;
@@ -307,7 +309,7 @@ function CameraFitController({
     (controls as any).target.set(centerX, centerY, 0);
     (controls as any).update?.();
     fittedKeyRef.current = fitKey;
-  }, [buffers, canvasSize.height, canvasSize.width, camera, controls, graphKey]);
+  }, [buffers, cameraFitRequestId, canvasSize.height, canvasSize.width, camera, controls, graphKey]);
 
   return null;
 }
@@ -495,6 +497,10 @@ export function GraphCanvas() {
                       luminanceSmoothing={0.22}
                       intensity={0.42}
                     />
+                    {/* Filmic curve rolls >1.0 emissive cores into soft shoulders
+                        instead of clipping to white (design: HDR product-photo look) */}
+                    <ToneMapping mode={ToneMappingMode.ACES_FILMIC} />
+                    <Vignette eskil={false} offset={0.24} darkness={0.55} />
                   </EffectComposer>
                 )}
               </>

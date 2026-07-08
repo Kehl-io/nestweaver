@@ -53,6 +53,8 @@ export interface GraphSlice {
   semanticLayoutRequested: boolean;
   requestSemanticLayout: () => void;
   clearSemanticLayoutRequest: () => void;
+  cameraFitRequestId: number;
+  requestCameraFit: () => void;
   setNodeTypeFilter: (kind: string, visible: boolean) => void;
   setAllNodeTypes: (visible: boolean) => void;
   setEdgeTypeFilter: (type: string, visible: boolean) => void;
@@ -131,6 +133,11 @@ export const createGraphSlice: StateCreator<
 
   toggleViewMode: () =>
     set((s) => {
+      if (s.representationMode === "json") {
+        // JSON is an overlay representation; toggling returns to the canvas view
+        s.representationMode = s.viewMode;
+        return;
+      }
       s.viewMode =
         s.viewMode === "graph"
           ? "list"
@@ -250,6 +257,12 @@ export const createGraphSlice: StateCreator<
   requestSemanticLayout: () =>
     set((s) => {
       s.semanticLayoutRequested = true;
+    }),
+
+  cameraFitRequestId: 0,
+  requestCameraFit: () =>
+    set((s) => {
+      s.cameraFitRequestId += 1;
     }),
 
   clearSemanticLayoutRequest: () =>

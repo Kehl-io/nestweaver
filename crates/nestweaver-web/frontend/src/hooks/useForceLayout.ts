@@ -94,6 +94,9 @@ export function useForceLayout(): ForceLayoutControls {
 
       if (msg.type === "end") {
         setIsRunning(false);
+        // Re-frame the settled layout — settling expands scenes past the
+        // initial fit, and topology-keyed fitting won't re-run on its own
+        useStore.getState().requestCameraFit();
       }
     };
 
