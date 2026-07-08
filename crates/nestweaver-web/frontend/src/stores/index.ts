@@ -116,3 +116,8 @@ export const useStore = create<StoreState>()(
     ),
   ),
 );
+
+// Dev-only handle for debugging store state from the browser console
+if (import.meta.env.DEV && typeof window !== "undefined") {
+  (window as unknown as { __nwStore?: typeof useStore }).__nwStore = useStore;
+}

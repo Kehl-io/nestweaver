@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useStore } from "../stores";
-import { EDGE_COLORS } from "../components/graph/utils/graphColors";
+import { EDGE_COLORS, desaturate, kindColor } from "../components/graph/utils/graphColors";
 
 export interface GraphBuffers {
   /** [x0, y0, z0, x1, y1, z1, ...] length = nodeCount * 3 */
@@ -186,8 +186,15 @@ export function useGraphBridge(): GraphBuffers {
       positions[ni * 3 + 1] = typeof attrs.y === "number" ? attrs.y : 0;
       positions[ni * 3 + 2] = typeof attrs.z === "number" ? attrs.z : 0;
 
-      // Colors: parse hex color attribute, fall back to mid-gray
-      let [r, g, b] = hexToRgb(typeof attrs.color === "string" ? attrs.color : "");
+      // Colors: derive from paletteKind when present (stays correct across
+      // theme flips), else parse the baked hex color, fall back to mid-gray
+      let colorHex = typeof attrs.color === "string" ? attrs.color : "";
+      if (typeof attrs.paletteKind === "string") {
+        colorHex = kindColor(attrs.paletteKind, isDark);
+        const fade = typeof attrs.colorDesaturate === "number" ? attrs.colorDesaturate : 0;
+        if (fade > 0) colorHex = desaturate(colorHex, fade);
+      }
+      let [r, g, b] = hexToRgb(colorHex);
 
       // Style rule: color by directory
       if (activeStyleRules.colorByDir && typeof attrs.location === "string") {

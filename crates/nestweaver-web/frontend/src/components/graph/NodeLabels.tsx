@@ -82,13 +82,17 @@ export function NodeLabels({ buffers }: Props) {
     }
 
     const rawLabel = (attrs.label as string) || uid.split(":").pop() || uid;
-    const label = truncateLabel(rawLabel);
+    // Force-labeled nodes (repo hubs, seeds) get more room — repo names like
+    // "bx-react-native-client" must not truncate on the landing scene
+    const label = truncateLabel(rawLabel, forceLabel ? 32 : 20);
     const x = buffers.positions[idx * 3];
     const y = buffers.positions[idx * 3 + 1];
     const radialX = x - centerX;
     const radialY = y - centerY;
     const radialLength = Math.hypot(radialX, radialY);
-    const labelOffset = size * 0.95 + 8;
+    // High-degree hubs sit inside a satellite ring; push their label past it
+    const ringClearance = Math.min(graphInstance.degree(uid) * 1.4, 34);
+    const labelOffset = size * 0.95 + 8 + ringClearance;
     const horizontalSpoke =
       radialLength > 1 && Math.abs(radialX) > Math.abs(radialY) * 1.25;
     const verticalDirection =
@@ -102,7 +106,7 @@ export function NodeLabels({ buffers }: Props) {
         ? horizontalSpoke
           ? y + verticalDirection * labelOffset
           : y + (radialY / radialLength) * labelOffset
-        : y - size - 2;
+        : y - size - 2 - ringClearance;
 
     labelNodes.push({
       uid,

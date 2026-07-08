@@ -30,6 +30,10 @@ export function buildGraphFromContext(result: BrainContextResult): Graph {
       y: position.y,
       size: 6, // placeholder; finalized by finalizeNodeSizes after edges are added
       color,
+      // paletteKind lets the graph bridge re-derive theme-correct colors when
+      // the theme flips mid-scene; colorDesaturate preserves the relevance fade
+      paletteKind: node.kind,
+      colorDesaturate: satAmount,
       kind: node.kind,
       location: node.location,
       relevance: node.relevance,

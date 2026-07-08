@@ -90,13 +90,19 @@ void main() {
     float bridge = smoothstep(0.2, 1.0, v_bridge);
     float bloom = clamp(v_bloom, 0.0, 1.0);
 
-    vec3 color = v_color * (1.0 + v_highlight * 0.22 + important * 0.08);
-    vec3 coreColor = mix(color, vec3(1.0), 0.14 + bloom * 0.22);
-    color = mix(color, coreColor, core * (0.16 + bloom * 0.42));
+    vec3 color = v_color * (1.05 + v_highlight * 0.22 + important * 0.15);
+    // Hue-tinted near-white core; importance lifts core luminance (design:
+    // "big = important" reads as a hotter core, body keeps the kind hue)
+    vec3 coreColor = mix(color, vec3(1.0), 0.18 + bloom * 0.30 + important * 0.14);
+    color = mix(color, coreColor, core * (0.20 + bloom * 0.45));
 
-    vec3 rimColor = mix(color, u_strokeColor, 0.38 + bloom * 0.34 + bridge * 0.12);
-    color = mix(color, rimColor, rim * (0.20 + bloom * 0.38));
-    color += u_strokeColor * bloom * (core * 0.22 + rim * 0.44);
+    // Rim darkens the node's own hue — the accent cyan is reserved for
+    // selection and bloom-tier emphasis, never a broad tint on every node
+    vec3 rimColor = color * 0.68;
+    color = mix(color, rimColor, rim * 0.30);
+    color += u_strokeColor * bloom * (core * 0.20 + rim * 0.26) * smoothstep(0.35, 1.0, bloom);
+    // Emissive lift above 1.0 on loud nodes feeds the bloom pass (HDR corona)
+    color *= 1.0 + bloom * bloom * 0.9;
 
     // Selection stroke ring: thin annulus at edge
     float ringInner = smoothstep(0.78, 0.82, dist);
