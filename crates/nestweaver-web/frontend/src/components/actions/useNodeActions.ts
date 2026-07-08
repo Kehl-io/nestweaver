@@ -49,7 +49,15 @@ function isNoteLike(uid: string, kind?: string | null): boolean {
 }
 
 function nodeLabel(node: NodeActionContext): string {
-  return node.label ?? node.uid.split(":").pop() ?? node.uid;
+  if (node.label) return node.label;
+  const graph = useStore.getState().graphInstance;
+  if (graph?.hasNode(node.uid)) {
+    const attr = graph.getNodeAttribute(node.uid, "label");
+    if (typeof attr === "string" && attr) return attr;
+  }
+  const tail = node.uid.split(":").pop() ?? node.uid;
+  // Symbol uids end in a line number — never show that as the display name
+  return /^\d+$/.test(tail) ? "this symbol" : tail;
 }
 
 function deepLinkForNode(node: NodeActionContext): string {

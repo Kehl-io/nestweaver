@@ -137,7 +137,7 @@ export function PhrasePreview({
                     {resolution.intent.kind === "path" &&
                     pathSelections[group.role]?.id === candidate.id
                       ? "selected"
-                      : candidate.targetType}
+                      : candidate.kind || candidate.targetType}
                   </span>
                 </button>
               ))

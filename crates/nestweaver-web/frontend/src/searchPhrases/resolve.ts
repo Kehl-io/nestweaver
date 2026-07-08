@@ -225,7 +225,14 @@ async function resolveCandidates(
       all.push(...pool.symbols.filter((symbol) => isSymbolKind(symbol.kind)).map(symbolCandidate));
     }
     if (targetTypes.includes("note")) {
-      all.push(...pool.brain.filter((hit) => isNoteLike(hit.kind)).map(noteCandidate));
+      // Whole notes carry the body/backlinks; heading/section hits of the
+      // same document read as duplicates and resolve to empty backlink or
+      // rationale results. Only fall back to them when no note matches.
+      const noteLike = pool.brain.filter((hit) => isNoteLike(hit.kind));
+      const wholeNotes = noteLike.filter(
+        (hit) => hit.kind === "note" || hit.kind === "Note",
+      );
+      all.push(...(wholeNotes.length > 0 ? wholeNotes : noteLike).map(noteCandidate));
     }
   }
 

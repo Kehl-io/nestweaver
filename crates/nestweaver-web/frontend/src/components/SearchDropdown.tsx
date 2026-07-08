@@ -271,8 +271,13 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                 className="flex min-w-0 flex-1 items-center gap-2 text-left"
               >
                 <KindBadge kind={s.kind} />
-                <span className="min-w-0 font-medium">{s.name}</span>
-                <span className="ml-auto truncate text-xs text-[var(--color-text-muted)]">
+                <span className="min-w-0 truncate font-medium" title={s.name}>
+                  {s.name}
+                </span>
+                <span
+                  className="ml-auto hidden max-w-[38%] shrink-0 truncate text-xs text-[var(--color-text-muted)] md:inline"
+                  title={s.file_path}
+                >
                   {s.file_path}
                 </span>
               </button>
@@ -338,8 +343,10 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                 className="flex min-w-0 flex-1 items-center gap-2 text-left"
               >
                 <KindBadge kind={n.kind} />
-                <span className="min-w-0 font-medium">{n.title}</span>
-                <span className="ml-auto text-xs text-[var(--color-text-muted)]">
+                <span className="min-w-0 truncate font-medium" title={n.title}>
+                  {n.title}
+                </span>
+                <span className="ml-auto shrink-0 text-xs text-[var(--color-text-muted)]">
                   {n.score.toFixed(2)}
                 </span>
               </button>
