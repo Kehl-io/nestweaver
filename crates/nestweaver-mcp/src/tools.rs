@@ -14,14 +14,16 @@ use anyhow::{Context, anyhow};
 use nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
 use nestweaver_engine::{
     BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig, SummaryLevel,
-    affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities, broken_links,
-    build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
+    ToolDocEntry, affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
+    broken_links, build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
     detect_dead_code_cancellable, doc_stats, expand_query_with_aliases, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_guide, generate_summaries, get_all_properties,
-    get_last_indexed_at, investigate, investigate_expand, investigate_hydrate, load_alias_sidecar,
-    load_clusters, load_extensions, memory_consolidate, memory_lint, memory_related,
-    orphan_documents, parse_iso8601_to_epoch, populate_inline_bodies, query_by_property,
-    render_text, search_symbols, tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
+    generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
+    investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
+    load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, search_symbols,
+    tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::{GraphStore, TantivyIndex};
@@ -3872,18 +3874,48 @@ fn tool_brain_impact(
 fn tool_schema_brain_guide() -> Value {
     json!({
         "name": "brain_guide",
-        "description": "Generate a comprehensive orientation guide covering all indexed repos, vaults, cross-repo relationships, and available tools. No parameters required.\n\nGuidelines:\n- Call at session start for a read-once overview before issuing specific queries\n- Regenerated from current graph state on each call\n- Not a query tool — use brain_context or brain_search for specific lookups\n\nLimitations:\n- Can be expensive on large graphs; prefer brain_status for lightweight session initialization\n- Output size scales with number of indexed sources",
+        "description": "Generate a comprehensive orientation guide covering all indexed repos, vaults, cross-repo relationships, and available tools.\n\nGuidelines:\n- Call at session start for a read-once overview before issuing specific queries\n- Regenerated from current graph state on each call\n- The tools section is generated from the live MCP registry, so it never drifts from the actual tool set\n- Not a query tool — use brain_context or brain_search for specific lookups\n\nLimitations:\n- Can be expensive on large graphs; prefer brain_status for lightweight session initialization\n- Output size scales with number of indexed sources",
         "inputSchema": {
             "type": "object",
-            "properties": {}
+            "properties": {
+                "format": {
+                    "type": "string",
+                    "enum": ["markdown", "skill", "cursor-rule", "agents-md", "claude-md"],
+                    "default": "markdown",
+                    "description": "Output format. \"markdown\" (default) is the full orientation guide; \"skill\" emits a Claude skill; the others emit the matching agent-instruction file. All formats render the tool list from the live registry."
+                }
+            }
         }
     })
 }
 
-fn tool_brain_guide(store: &GraphStore, _args: Value) -> Result<Value, anyhow::Error> {
+fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let format = args
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("markdown");
+
+    // Build tool docs from the live MCP registry so the tools section always
+    // reflects the real tool set rather than a hand-curated subset.
+    let tool_docs: Vec<ToolDocEntry> = tool_doc_entries()
+        .into_iter()
+        .map(|(name, category, purpose, key_params)| ToolDocEntry {
+            name,
+            category,
+            purpose,
+            key_params,
+        })
+        .collect();
+
     // The MCP server does not hold an InstanceConfig at runtime; cross-repo
     // edges from the graph are still included via the store query.
-    let guide = generate_guide(store, None)?;
+    let guide = match format {
+        "skill" => generate_skill_with_tools(store, None, None, &tool_docs)?,
+        "cursor-rule" => generate_cursor_rule_with_rules(store, None, None)?,
+        "agents-md" => generate_agents_md_with_rules(store, None, None, Some(tool_docs.len()))?,
+        "claude-md" => generate_claude_md_with_rules(store, None, None)?,
+        _ => generate_guide_with_tools(store, None, None, &tool_docs)?,
+    };
     Ok(json!({ "guide": guide }))
 }
 

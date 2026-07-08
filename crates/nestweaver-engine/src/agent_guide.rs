@@ -53,6 +53,22 @@ pub fn generate_guide_with_rules(
     config: Option<&InstanceConfig>,
     rules: Option<&[OwnedRule]>,
 ) -> Result<String, anyhow::Error> {
+    generate_guide_with_tools(store, config, rules, &[])
+}
+
+/// Like [`generate_guide_with_rules`] but accepts dynamic MCP tool metadata.
+///
+/// When `tool_docs` is non-empty the "Available MCP tools" section is rendered
+/// from the live registry (the full tool set); when empty it falls back to the
+/// curated legacy table for backward compatibility. Callers with access to the
+/// MCP registry (the CLI, the daemon's `brain_guide`) should always pass the
+/// live entries so the guide never drifts from the actual tool set.
+pub fn generate_guide_with_tools(
+    store: &GraphStore,
+    config: Option<&InstanceConfig>,
+    rules: Option<&[OwnedRule]>,
+    tool_docs: &[ToolDocEntry],
+) -> Result<String, anyhow::Error> {
     let mut out = String::new();
 
     // ── Frontmatter (carries the rules_version stamp) ─────────────────────
@@ -312,19 +328,26 @@ pub fn generate_guide_with_rules(
         }
     }
 
-    // Section 8: Available tools
-    out.push_str("## NestWeaver Tools\n\n");
-    out.push_str("This codebase is indexed by NestWeaver. Available MCP tools:\n\n");
-    out.push_str("| Tool | Use when |\n");
-    out.push_str("|------|----------|\n");
-    out.push_str("| `brain_context` | Exploring unfamiliar code — seeds from symbols, files, or note titles |\n");
-    out.push_str("| `brain_search` | Finding symbols or notes by keyword |\n");
-    out.push_str("| `note_get` | Reading a vault note's full content |\n");
-    out.push_str("| `backlinks` | Finding what links TO a note |\n");
-    out.push_str("| `brain_impact` | Checking blast radius before modifying a function |\n");
-    out.push_str("| `cross_repo_contracts` | Finding cross-service symbol relationships |\n");
-    out.push_str("| `brain_status` | Checking what's indexed |\n");
-    out.push('\n');
+    // Section 8: Available tools. Rendered from the live MCP registry when
+    // provided (the full tool set, grouped by category); otherwise a curated
+    // fallback for callers without registry access.
+    if !tool_docs.is_empty() {
+        out.push_str("This codebase is indexed by NestWeaver.\n\n");
+        render_dynamic_tool_tables(&mut out, tool_docs);
+    } else {
+        out.push_str("## NestWeaver Tools\n\n");
+        out.push_str("This codebase is indexed by NestWeaver. Available MCP tools:\n\n");
+        out.push_str("| Tool | Use when |\n");
+        out.push_str("|------|----------|\n");
+        out.push_str("| `brain_context` | Exploring unfamiliar code — seeds from symbols, files, or note titles |\n");
+        out.push_str("| `brain_search` | Finding symbols or notes by keyword |\n");
+        out.push_str("| `note_get` | Reading a vault note's full content |\n");
+        out.push_str("| `backlinks` | Finding what links TO a note |\n");
+        out.push_str("| `brain_impact` | Checking blast radius before modifying a function |\n");
+        out.push_str("| `cross_repo_contracts` | Finding cross-service symbol relationships |\n");
+        out.push_str("| `brain_status` | Checking what's indexed |\n");
+        out.push('\n');
+    }
 
     out.push_str("## When to Use MCP vs CLI vs Grep\n\n");
     out.push_str("NestWeaver provides three retrieval channels. Choose by context:\n\n");
@@ -973,6 +996,36 @@ mod tests {
         assert!(guide.contains("# Codebase Intelligence Guide"));
         assert!(guide.contains("## NestWeaver Tools"));
         assert!(guide.contains("brain_context"));
+    }
+
+    #[test]
+    fn guide_and_skill_render_dynamic_tool_registry_when_provided() {
+        // Regression guard: the tools section must come from the live registry
+        // passed by callers (CLI, daemon brain_guide), never a hand-curated
+        // subset. A probe tool that only exists here proves the dynamic path.
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let tools = vec![ToolDocEntry {
+            name: "zzz_probe_tool".to_string(),
+            category: "Core retrieval".to_string(),
+            purpose: "A probe tool that only exists in this test.".to_string(),
+            key_params: vec!["seeds".to_string()],
+        }];
+
+        // With dynamic tool docs: categorized "Available MCP tools" table that
+        // includes the probe tool; the curated legacy heading is dropped.
+        let guide = generate_guide_with_tools(&store, None, None, &tools).unwrap();
+        assert!(guide.contains("## Available MCP tools"));
+        assert!(guide.contains("zzz_probe_tool"));
+        assert!(!guide.contains("## NestWeaver Tools"));
+
+        let skill = generate_skill_with_tools(&store, None, None, &tools).unwrap();
+        assert!(skill.contains("## Available MCP tools"));
+        assert!(skill.contains("zzz_probe_tool"));
+
+        // With no tool docs: both fall back to the curated legacy tables.
+        let guide_legacy = generate_guide_with_tools(&store, None, None, &[]).unwrap();
+        assert!(guide_legacy.contains("## NestWeaver Tools"));
+        assert!(!guide_legacy.contains("zzz_probe_tool"));
     }
 
     #[test]
