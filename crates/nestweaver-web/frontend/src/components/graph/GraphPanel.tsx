@@ -5,7 +5,7 @@ import { GraphMatrixView } from "./GraphMatrixView";
 import { GraphMinimap } from "./GraphMinimap";
 import { NodeListView } from "./NodeListView";
 import { ContextMenu } from "./ContextMenu";
-import { ModeIndicator } from "./ModeIndicator";
+import { ModeTabs } from "./ModeTabs";
 import { ControlDock } from "./ControlDock";
 import { NodePreviewCard } from "./NodePreviewCard";
 import { GraphLegend } from "./GraphLegend";
@@ -13,6 +13,9 @@ import { PathTargetSelector } from "../PathTargetSelector";
 import { DiffSeedInput } from "../DiffSeedInput";
 import { OverviewCommandShelf } from "../overview/OverviewCommandShelf";
 import { OverviewContextSurface } from "../overview/OverviewContextSurface";
+import { JsonResultView } from "../workspace/JsonResultView";
+import { LensSummaryPanel } from "../workspace/LensSummaryPanel";
+import { WorkspaceToolbar } from "../workspace/WorkspaceToolbar";
 import { useOverviewMode } from "./modes/useOverviewMode";
 import { useContextMode } from "./modes/useContextMode";
 import { useImpactMode } from "./modes/useImpactMode";
@@ -25,7 +28,7 @@ import { useStore } from "../../stores";
 /**
  * Attaches keyboard navigation to the graph panel div.
  *
- * - Tab / Shift+Tab: cycle nodes ordered by PageRank relevance
+ * - Ctrl+Tab / Alt+Tab: cycle nodes ordered by PageRank relevance
  * - Arrow keys: navigate to the connected neighbor closest in that direction
  * - Enter: set selected node as seed
  * - Escape: deselect
@@ -95,7 +98,7 @@ function useGraphKeyboardNav(
         return;
       }
 
-      if (e.key === "Tab") {
+      if (e.key === "Tab" && (e.ctrlKey || e.altKey)) {
         e.preventDefault();
         if (sorted.length === 0) return;
         const idx = currentId ? sorted.indexOf(currentId) : -1;
@@ -191,7 +194,7 @@ function GraphModeHooks() {
   const { hops, setHops } = useLocalMode();
 
   const graphMode = useStore((s) => s.graphMode);
-  const viewMode = useStore((s) => s.viewMode);
+  const representationMode = useStore((s) => s.representationMode);
   const layoutMode = useStore((s) => s.layoutMode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const setGraphMode = useStore((s) => s.setGraphMode);
@@ -216,7 +219,7 @@ function GraphModeHooks() {
 
   return (
     <>
-      {graphMode === "overview" && viewMode === "graph" && layoutMode !== "zen" && (
+      {graphMode === "overview" && representationMode === "graph" && layoutMode !== "zen" && (
         <>
           <OverviewCommandShelf {...overviewState} />
           <OverviewContextSurface
@@ -224,7 +227,7 @@ function GraphModeHooks() {
           />
         </>
       )}
-      {graphMode === "local" && (
+      {graphMode === "local" && representationMode === "graph" && (
         <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3 py-1.5 rounded bg-[var(--color-surface-alt)] shadow text-xs text-[var(--color-text)]">
           <label htmlFor="local-hops-slider" className="whitespace-nowrap">
             Depth: {hops}
@@ -244,6 +247,76 @@ function GraphModeHooks() {
   );
 }
 
+const ZERO_NODE_IMPACT_RESULTS = new Set([
+  "no-match",
+  "unsupported",
+  "partial",
+  "truncated",
+  "error",
+  "timed-out",
+  "cancelled",
+  "empty",
+]);
+
+function resultLabel(result: string): string {
+  return result.replace(/-/g, " ");
+}
+
+function impactStatusTone(result: string, hasUnsupported: boolean): string {
+  if (result === "error" || result === "timed-out" || result === "cancelled") {
+    return "border-red-500/35 bg-red-500/10 text-red-200";
+  }
+  if (result === "unsupported" || hasUnsupported) {
+    return "border-amber-500/35 bg-amber-500/10 text-amber-200";
+  }
+  if (result === "no-match" || result === "empty") {
+    return "border-[var(--color-border)] bg-[var(--color-surface-alt)]/90 text-[var(--color-text)]";
+  }
+  return "border-sky-500/35 bg-sky-500/10 text-sky-200";
+}
+
+function ZeroNodeImpactOverlay() {
+  const activeLens = useStore((s) => s.activeLens);
+  const sceneMetadata = useStore((s) => s.sceneMetadata);
+  const trustSummary = useStore((s) => s.trustSummary);
+  const result = trustSummary?.result ?? sceneMetadata?.trust.result ?? "";
+  const unsupported =
+    trustSummary?.unsupported ?? sceneMetadata?.trust.unsupported ?? [];
+  const message =
+    trustSummary?.message ??
+    sceneMetadata?.trust.message ??
+    "Impact result metadata is unavailable.";
+
+  if (!ZERO_NODE_IMPACT_RESULTS.has(result)) return null;
+
+  return (
+    <section
+      aria-label="Impact result state"
+      className={`absolute left-3 top-3 z-30 w-[min(360px,calc(100%-1.5rem))] rounded border p-3 text-xs shadow-lg backdrop-blur ${impactStatusTone(
+        result,
+        unsupported.length > 0,
+      )}`}
+    >
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <p className="truncate font-semibold text-[var(--color-text)]">
+          {activeLens.lens === "impact" ? activeLens.label : "Impact"}
+        </p>
+        <span className="shrink-0 rounded border border-current/25 px-2 py-0.5 text-[10px] uppercase">
+          {resultLabel(result)}
+        </span>
+      </div>
+      <p className="mt-2 leading-5 text-[var(--color-text-muted)]">
+        {message}
+      </p>
+      {unsupported.length > 0 && (
+        <p className="mt-2 break-words text-[11px] leading-5 text-amber-300">
+          Unavailable: {unsupported.join(", ")}
+        </p>
+      )}
+    </section>
+  );
+}
+
 export function GraphPanel() {
   const pathfindingActive = useStore((s) => s.pathfindingActive);
   const pathfindingTo = useStore((s) => s.pathfindingTo);
@@ -252,10 +325,21 @@ export function GraphPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const viewMode = useStore((s) => s.viewMode);
+  const representationMode = useStore((s) => s.representationMode);
   const graphMode = useStore((s) => s.graphMode);
   const minimapVisible = useStore((s) => s.minimapVisible);
   const layoutMode = useStore((s) => s.layoutMode);
+  const graphInstance = useStore((s) => s.graphInstance);
+  const sceneMetadata = useStore((s) => s.sceneMetadata);
+  const trustSummary = useStore((s) => s.trustSummary);
   const focusMap = layoutMode === "zen";
+  const graphRepresentationActive = representationMode === "graph";
+  const trustResult = trustSummary?.result ?? sceneMetadata?.trust.result ?? "";
+  const zeroNodeImpactActive =
+    graphRepresentationActive &&
+    graphMode === "impact" &&
+    (graphInstance?.order ?? 0) === 0 &&
+    ZERO_NODE_IMPACT_RESULTS.has(trustResult);
 
   const graphPanelRef = useRef<HTMLDivElement>(null);
   useGraphKeyboardNav(graphPanelRef);
@@ -277,18 +361,30 @@ export function GraphPanel() {
 
   return (
     <div data-testid="graph-panel" className="flex h-full flex-col relative">
+      <WorkspaceToolbar />
+      <ModeTabs />
       <div className="flex-1 relative bg-[var(--color-surface)]">
         <div
           ref={graphPanelRef}
-          aria-label={viewMode === "list" ? "Node list view" : "Code knowledge graph"}
-          role="application"
+          aria-label={
+            representationMode === "json"
+              ? "JSON result view"
+              : representationMode === "table" || representationMode === "list"
+                ? "Node table view"
+                : representationMode === "matrix"
+                  ? "Graph matrix view"
+                : "Code knowledge graph"
+          }
+          role={graphRepresentationActive ? "application" : "region"}
           tabIndex={0}
           style={{ background: "var(--color-graph-bg)", width: "100%", height: "100%" }}
           onContextMenu={handleContextMenu}
         >
-          {viewMode === "list" ? (
+          {representationMode === "json" ? (
+            <JsonResultView />
+          ) : viewMode === "list" || representationMode === "table" ? (
             <NodeListView />
-          ) : viewMode === "matrix" ? (
+          ) : representationMode === "matrix" ? (
             <GraphMatrixView />
           ) : (
             <GraphCanvas />
@@ -296,12 +392,18 @@ export function GraphPanel() {
         </div>
         {/* Mode hooks run outside the R3F canvas — they only need zustand, not a 3D context */}
         <GraphModeHooks />
-        <ControlDock />
-        <NodePreviewCard />
-        {viewMode === "graph" && !focusMap && <GraphLegend />}
-        {viewMode === "graph" && minimapVisible && graphMode !== "overview" && !focusMap && (
+        {graphRepresentationActive && <ControlDock />}
+        {graphRepresentationActive && <NodePreviewCard />}
+        {graphRepresentationActive && !focusMap && <GraphLegend />}
+        {graphRepresentationActive && minimapVisible && graphMode !== "overview" && !focusMap && (
           <div className="absolute bottom-14 right-3 z-10 opacity-80 transition-opacity hover:opacity-100">
             <GraphMinimap />
+          </div>
+        )}
+        {zeroNodeImpactActive && <ZeroNodeImpactOverlay />}
+        {graphRepresentationActive && graphMode !== "overview" && !focusMap && !zeroNodeImpactActive && (
+          <div className="absolute left-3 top-3 z-20 w-[min(320px,calc(100%-1.5rem))]">
+            <LensSummaryPanel compact />
           </div>
         )}
         {contextMenu && (
@@ -320,8 +422,23 @@ export function GraphPanel() {
             <>Selected: {selectedNodeName}{selectedNodeKind ? `, ${selectedNodeKind}` : ""}</>
           )}
         </div>
+        {/* Canvas labels render as WebGL SDF text (not DOM); this summary
+            keeps the scene's landmarks accessible to screen readers */}
+        <div className="sr-only" data-testid="graph-label-summary">
+          {(() => {
+            if (!graphInstance) return null;
+            const landmarks: string[] = [];
+            graphInstance.forEachNode((_uid, attrs) => {
+              if (attrs.forceLabel === true && typeof attrs.label === "string") {
+                landmarks.push(attrs.label);
+              }
+            });
+            return landmarks.length > 0
+              ? `Landmarks: ${landmarks.join(", ")}`
+              : null;
+          })()}
+        </div>
       </div>
-      <ModeIndicator />
     </div>
   );
 }

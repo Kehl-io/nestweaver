@@ -82,6 +82,13 @@ pub struct ImpactNode {
     pub impact_score: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImpactEdge {
+    pub target_uid: String,
+    pub edge_type: String,
+    pub confidence: f32,
+}
+
 /// A row representing caller + edge metadata returned from the BFS query.
 struct CallerRow {
     uid: String,
@@ -91,6 +98,15 @@ struct CallerRow {
     edge_type: String,
     confidence: f32,
 }
+
+const IMPACT_EDGE_TYPES: &[EdgeType] = &[
+    EdgeType::Calls,
+    EdgeType::Imports,
+    EdgeType::Extends,
+    EdgeType::Implements,
+    EdgeType::Includes,
+    EdgeType::CrossRepoLink,
+];
 
 impl GraphStore {
     /// Find all symbols that directly or transitively call/import/extend/implement `target_uid`.
@@ -213,21 +229,12 @@ impl GraphStore {
     ) -> Result<Vec<CallerRow>, StoreError> {
         let conn = self.conn()?;
         let min_conf = min_confidence as f64;
-
-        let edge_types = [
-            EdgeType::Calls.rel_table_name(),
-            EdgeType::Imports.rel_table_name(),
-            EdgeType::Extends.rel_table_name(),
-            EdgeType::Implements.rel_table_name(),
-            EdgeType::Includes.rel_table_name(),
-            // Cross-repo links carry downstream consumers in other repos. Without
-            // this, impact analysis stops at repo boundaries and misses org-wide
-            // callers in a unified multi-repo graph.
-            EdgeType::CrossRepoLink.rel_table_name(),
-        ];
         let mut rows: Vec<CallerRow> = Vec::new();
 
-        for edge_type in &edge_types {
+        for edge_type in IMPACT_EDGE_TYPES
+            .iter()
+            .map(|edge_type| edge_type.rel_table_name())
+        {
             let q = format!(
                 "MATCH (s:Symbol)-[r:{et}]->(t:Symbol {{uid: $uid}}) \
                  WHERE r.confidence >= $min_conf \
@@ -295,6 +302,75 @@ impl GraphStore {
         }
 
         Ok(rows)
+    }
+
+    /// Return outgoing edges that use the same relationship types as impact
+    /// traversal.
+    pub fn outgoing_impact_edges(
+        &self,
+        source_uid: &str,
+        min_confidence: f32,
+    ) -> Result<Vec<ImpactEdge>, StoreError> {
+        let conn = self.conn()?;
+        let min_conf = min_confidence as f64;
+        let mut edges = Vec::new();
+
+        for edge_type in IMPACT_EDGE_TYPES
+            .iter()
+            .map(|edge_type| edge_type.rel_table_name())
+        {
+            let q = format!(
+                "MATCH (s:Symbol {{uid: $uid}})-[r:{et}]->(t:Symbol) \
+                 WHERE r.confidence >= $min_conf \
+                 RETURN t.uid, r.confidence",
+                et = edge_type,
+            );
+            let mut stmt = match conn.prepare(&q) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::trace!(
+                        "outgoing_impact_edges: edge type {edge_type} skipped (table may not exist): {e}"
+                    );
+                    continue;
+                }
+            };
+            let result = match conn.execute(
+                &mut stmt,
+                vec![
+                    ("uid", lbug::Value::String(source_uid.to_string())),
+                    ("min_conf", lbug::Value::Double(min_conf)),
+                ],
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::trace!(
+                        "outgoing_impact_edges: edge type {edge_type} query failed: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            for row in result {
+                use lbug::Value;
+                let target_uid = match &row[0] {
+                    Value::String(s) => s.clone(),
+                    _ => continue,
+                };
+                let confidence = match &row[1] {
+                    Value::Float(f) => *f,
+                    Value::Double(f) => *f as f32,
+                    _ => 0.0,
+                };
+
+                edges.push(ImpactEdge {
+                    target_uid,
+                    edge_type: edge_type.to_string(),
+                    confidence,
+                });
+            }
+        }
+
+        Ok(edges)
     }
 
     /// Search symbols whose name contains `query` (case-insensitive substring match).
@@ -493,6 +569,39 @@ mod tests {
             impacted.iter().any(|n| n.uid == "consumer"),
             "impact must surface cross-repo callers linked via CROSS_REPO_LINK; got: {:?}",
             impacted.iter().map(|n| n.uid.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn outgoing_impact_edges_include_structural_edges() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("derived", "DerivedHandler"))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol("base", "BaseHandler"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "derived".to_string(),
+                target_uid: "base".to_string(),
+                edge_type: EdgeType::Extends,
+                confidence: 0.88,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let edges = store.outgoing_impact_edges("derived", 0.0).unwrap();
+        assert!(
+            edges.iter().any(|edge| {
+                edge.target_uid == "base"
+                    && edge.edge_type == "EXTENDS_SYM"
+                    && (edge.confidence - 0.88).abs() < f32::EPSILON
+            }),
+            "outgoing impact helper must match traversal edge types; got: {edges:?}"
         );
     }
 

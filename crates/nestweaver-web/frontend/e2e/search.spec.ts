@@ -29,9 +29,7 @@ test.describe("Search Flow", () => {
     const dock = page.getByTestId("control-dock");
     await expect(dock).toBeVisible({ timeout: 15_000 });
 
-    // Switch to panels mode so the detail panel is visible
-    await dock.getByRole("button", { name: "Settings" }).click();
-    await dock.getByRole("button", { name: "Focus Map" }).click();
+    // Panels mode is the default; the detail panel is already visible
 
     const searchInput = page.locator('[data-testid="search-input"]');
     await searchInput.waitFor({ timeout: 10_000 });

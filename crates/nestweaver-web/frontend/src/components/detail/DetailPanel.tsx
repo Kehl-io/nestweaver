@@ -9,13 +9,13 @@ import { NoteDetail } from "./NoteDetail";
 import { PathDetail } from "./PathDetail";
 import { SymbolDetail } from "./SymbolDetail";
 import { NodeActionBar } from "../actions/NodeActionBar";
+import { LensSummaryPanel } from "../workspace/LensSummaryPanel";
 
 export function DetailPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const flowTraceActive = useStore((s) => s.flowTraceActive);
   const pathfindingActive = useStore((s) => s.pathfindingActive);
-  const pathResults = useStore((s) => s.pathResults);
   const diffActive = useStore((s) => s.diffActive);
   const gapActive = useStore((s) => s.gapActive);
   const llmResult = useStore((s) => s.llmResult);
@@ -35,6 +35,7 @@ export function DetailPanel() {
           </p>
         </div>
         <div className="mt-4 space-y-3 text-xs">
+          <LensSummaryPanel />
           <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-2">
             <p className="font-medium text-[var(--color-text)]">Fast starts</p>
             <p className="mt-1 leading-5">
@@ -74,12 +75,15 @@ export function DetailPanel() {
           compact
         />
       </div>
+      <div className="border-b border-[var(--color-border)] p-2">
+        <LensSummaryPanel compact />
+      </div>
       <div className="min-h-0 flex-1 overflow-hidden">
         {llmResult && <LlmResultDetail />}
         {diffActive && <DiffDetail />}
         {gapActive && <GapDetail />}
         {flowTraceActive && <FlowDetail />}
-        {pathfindingActive && pathResults.length > 0 && <PathDetail />}
+        {pathfindingActive && <PathDetail />}
         {isSymbol ? (
           <SymbolDetail uid={selectedNodeId} />
         ) : isNote ? (

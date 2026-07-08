@@ -15,36 +15,81 @@ import type { LlmSlice } from "./llmSlice";
 import { createLlmSlice } from "./llmSlice";
 import type { GraphDataSlice } from "./graphDataSlice";
 import { createGraphDataSlice } from "./graphDataSlice";
+import type { ShortcutsSlice } from "./shortcutsSlice";
+import { createShortcutsSlice } from "./shortcutsSlice";
+import type { NotificationSlice } from "./notificationSlice";
+import { createNotificationSlice } from "./notificationSlice";
+import type { SceneSlice } from "./sceneSlice";
+import { createSceneSlice } from "./sceneSlice";
+import type { WorkspaceSlice } from "./workspaceSlice";
+import { createWorkspaceSlice } from "./workspaceSlice";
+
+function sanitizeViewMode(value: unknown): "graph" | "list" | "matrix" {
+  return value === "list" || value === "matrix" ? value : "graph";
+}
+
+function sanitizeRepresentationMode(value: unknown): "graph" | "list" | "table" | "matrix" | "json" {
+  return value === "graph" ||
+    value === "list" ||
+    value === "table" ||
+    value === "matrix" ||
+    value === "json"
+    ? value
+    : "graph";
+}
 
 export type StoreState = GraphSlice &
+  WorkspaceSlice &
+  SceneSlice &
   PanelSlice &
   SearchSlice &
   AnalysisSlice &
   ContentSlice &
   LlmSlice &
-  GraphDataSlice;
+  GraphDataSlice &
+  ShortcutsSlice &
+  NotificationSlice;
 
 export const useStore = create<StoreState>()(
   devtools(
     persist(
       immer((...a) => ({
         ...createGraphSlice(...a),
+        ...createWorkspaceSlice(...a),
+        ...createSceneSlice(...a),
         ...createPanelSlice(...a),
         ...createSearchSlice(...a),
         ...createAnalysisSlice(...a),
         ...createContentSlice(...a),
         ...createLlmSlice(...a),
         ...createGraphDataSlice(...a),
+        ...createShortcutsSlice(...a),
+        ...createNotificationSlice(...a),
       })),
       {
         name: "nestweaver-ui",
-        version: 3,
+        version: 6,
         migrate: (persistedState: any, version: number) => {
           if (persistedState && typeof persistedState === "object") {
             const state = { ...persistedState };
             if (version < 3) {
               delete state.graphMode;
               delete state.layoutMode;
+            }
+            if (version < 4) {
+              state.reducedEffectsUserSet = typeof state.reducedEffects === "boolean";
+            }
+            if (version < 5) {
+              delete state.scopeRepoUid;
+              delete state.scopeVaultUid;
+              state.activeWorkspaceId = state.activeWorkspaceId ?? "all";
+              state.representationMode = state.representationMode ?? state.viewMode ?? "graph";
+            }
+            if (version < 6) {
+              state.representationMode = sanitizeRepresentationMode(
+                state.representationMode ?? state.viewMode,
+              );
+              state.viewMode = sanitizeViewMode(state.viewMode);
             }
             return state;
           }
@@ -62,8 +107,17 @@ export const useStore = create<StoreState>()(
           tagsVisible: state.tagsVisible,
           minimapVisible: state.minimapVisible,
           reducedEffects: state.reducedEffects,
+          reducedEffectsUserSet: state.reducedEffectsUserSet,
+          activeWorkspaceId: state.activeWorkspaceId,
+          representationMode: state.representationMode,
+          viewMode: state.viewMode,
         }),
       },
     ),
   ),
 );
+
+// Dev-only handle for debugging store state from the browser console
+if (import.meta.env.DEV && typeof window !== "undefined") {
+  (window as unknown as { __nwStore?: typeof useStore }).__nwStore = useStore;
+}

@@ -1,0 +1,86 @@
+import { ApiError } from "./client";
+import type {
+  ResultState,
+  SceneMetadata,
+  ScopedBrainSearchResponse,
+  ScopedSearchHit,
+  WorkspaceCatalogResponse,
+} from "./p1Types";
+
+async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: res.statusText }));
+    throw new ApiError(res.status, body.error || res.statusText);
+  }
+  return res.json() as Promise<T>;
+}
+
+export interface WorkspaceScopedOptions {
+  workspaceId?: string | null;
+  limit?: number;
+}
+
+export function workspaceQueryParams(
+  workspaceId?: string | null,
+): URLSearchParams {
+  const params = new URLSearchParams();
+  if (workspaceId) params.set("workspace", workspaceId);
+  return params;
+}
+
+export function appendWorkspaceParam(
+  url: string,
+  workspaceId?: string | null,
+): string {
+  if (!workspaceId) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}workspace=${encodeURIComponent(workspaceId)}`;
+}
+
+export function workspaceContextBody(
+  seeds: string[],
+  tokenBudget = 4096,
+  workspaceId?: string | null,
+): { seeds: string[]; token_budget: number; workspace?: string } {
+  const body: { seeds: string[]; token_budget: number; workspace?: string } = {
+    seeds,
+    token_budget: tokenBudget,
+  };
+  if (workspaceId) body.workspace = workspaceId;
+  return body;
+}
+
+export function loadWorkspaces(): Promise<WorkspaceCatalogResponse> {
+  return request<WorkspaceCatalogResponse>("/api/v1/workspaces");
+}
+
+export function workspaceSceneMetadataWithResult(
+  base: SceneMetadata | null | undefined,
+  result: ResultState,
+  message: string,
+): SceneMetadata | null {
+  if (!base) return null;
+  return {
+    ...base,
+    trust: {
+      ...base.trust,
+      result,
+      freshness: result === "loading" ? "partial" : base.trust.freshness,
+      partial: result === "complete" ? base.trust.partial : true,
+      message,
+    },
+  };
+}
+
+export function brainSearchInWorkspace(
+  q: string,
+  options: WorkspaceScopedOptions = {},
+): Promise<ScopedBrainSearchResponse<ScopedSearchHit>> {
+  const params = workspaceQueryParams(options.workspaceId ?? "all");
+  params.set("q", q);
+  params.set("limit", String(options.limit ?? 20));
+  return request<ScopedBrainSearchResponse<ScopedSearchHit>>(
+    `/api/v1/brain/search?${params.toString()}`,
+  );
+}

@@ -78,3 +78,7 @@ nestweaver.filemeta.json
 .agents/
 .worktrees/
 __pycache__/
+
+# Internal orchestration/planning scratch — never commit to the public repo
+/PLAN.md
+/TEST_PLAN.md

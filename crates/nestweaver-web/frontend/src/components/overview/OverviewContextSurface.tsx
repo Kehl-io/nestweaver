@@ -1,13 +1,15 @@
 import type { OverviewLandmark, OverviewResponse } from "../../api/types";
+import type { SceneMetadata } from "../../api/p1Types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
+import { WorkspaceScopeSummary } from "../workspace/WorkspaceScopeSummary";
 
 interface OverviewContextSurfaceProps {
-  overview: OverviewResponse | null;
+  overview: (OverviewResponse & { _meta?: SceneMetadata }) | null;
 }
 
 function findOverviewItem(
-  overview: OverviewResponse | null,
+  overview: (OverviewResponse & { _meta?: SceneMetadata }) | null,
   uid: string | null,
 ): OverviewLandmark | null {
   if (!overview || !uid) return null;
@@ -77,6 +79,10 @@ export function OverviewContextSurface({ overview }: OverviewContextSurfaceProps
           <p className="mt-2 max-h-12 overflow-hidden text-xs leading-5 text-[var(--color-text-muted)]">
             {selected.reason ?? "Selected overview landmark"}
           </p>
+
+          <div className="mt-3">
+            <WorkspaceScopeSummary metadata={overview?._meta} />
+          </div>
 
           <NodeActionBar
             node={{

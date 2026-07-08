@@ -52,6 +52,8 @@ export interface BrainNode {
   title: string;
   location: string;
   relevance: number;
+  /** Normalized betweenness for the scene's top bridges (absent otherwise) */
+  bridge_score?: number;
 }
 
 export interface BrainContextResult {
@@ -61,6 +63,7 @@ export interface BrainContextResult {
 }
 
 export interface OverviewCounts {
+  project_count: number;
   repo_count: number;
   service_count: number;
   vault_count: number;
@@ -76,6 +79,8 @@ export interface OverviewLandmark {
   location: string;
   score: number;
   reason: string;
+  /** Normalized betweenness for the scene's top bridges (absent otherwise) */
+  bridge_score?: number;
 }
 
 export interface OverviewGap {
@@ -174,6 +179,25 @@ export interface ImpactNode {
   edge_type: string;
   confidence: number;
   depth: number;
+}
+
+export interface FlowNode {
+  uid: string;
+  name: string;
+  file_path: string;
+  depth: number;
+  children: FlowNode[];
+}
+
+export interface PathEdge {
+  type: string;
+  confidence: number;
+}
+
+export interface PathResult {
+  nodes: string[];
+  edges: PathEdge[];
+  length: number;
 }
 
 export interface SourceResponse {

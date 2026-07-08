@@ -21,13 +21,14 @@ interface NodeDatum extends SimulationNodeDatum {
 interface LinkDatum extends SimulationLinkDatum<NodeDatum> {
   source: string | NodeDatum;
   target: string | NodeDatum;
+  distance?: number;
 }
 
 type InMessage =
   | {
       type: "init";
       nodes: Array<{ id: string; x: number; y: number }>;
-      links: Array<{ source: string; target: string }>;
+      links: Array<{ source: string; target: string; distance?: number }>;
       options: InitOptions;
     }
   | { type: "stop" }
@@ -58,6 +59,7 @@ self.onmessage = (event: MessageEvent<InMessage>) => {
     const links: LinkDatum[] = rawLinks.map((l) => ({
       source: l.source,
       target: l.target,
+      distance: l.distance,
     }));
 
     const repulsionStrength = -options.repulsion * 30;
@@ -69,7 +71,7 @@ self.onmessage = (event: MessageEvent<InMessage>) => {
         "link",
         forceLink<NodeDatum, LinkDatum>(links)
           .id((d) => d.id)
-          .distance(30),
+          .distance((l) => l.distance ?? 30),
       )
       .force("charge", forceManyBody<NodeDatum>().strength(repulsionStrength))
       .force("center", forceCenter<NodeDatum>(0, 0).strength(gravityStrength))

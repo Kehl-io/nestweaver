@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import * as Select from "@radix-ui/react-select";
+import { ChevronDown } from "lucide-react";
 import { api } from "../../api/client";
 import type { SymbolCandidate } from "../../api/types";
 import { useStore } from "../../stores";
@@ -63,19 +65,38 @@ export function SymbolsTab() {
           placeholder="Filter symbols..."
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1 text-xs text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-1 focus:ring-blue-500"
+          className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1 text-xs text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-1 focus:ring-[var(--color-graph-selection)]"
         />
-        <select
-          value={kindFilter}
-          onChange={(e) => setKindFilter(e.target.value)}
-          className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-1 py-1 text-xs text-[var(--color-text)] focus:outline-none focus:ring-1 focus:ring-blue-500"
-        >
-          {KIND_OPTIONS.map((k) => (
-            <option key={k} value={k}>
-              {k}
-            </option>
-          ))}
-        </select>
+        <Select.Root value={kindFilter} onValueChange={setKindFilter}>
+          <Select.Trigger
+            aria-label="Kind"
+            className="inline-flex h-7 w-[6.75rem] shrink-0 items-center justify-between gap-1 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 text-xs text-[var(--color-text)] outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-graph-selection)]"
+          >
+            <Select.Value />
+            <Select.Icon asChild>
+              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+            </Select.Icon>
+          </Select.Trigger>
+          <Select.Portal>
+            <Select.Content
+              position="popper"
+              sideOffset={4}
+              className="z-[100] min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] py-1 text-xs text-[var(--color-text)] shadow-xl"
+            >
+              <Select.Viewport>
+                {KIND_OPTIONS.map((k) => (
+                  <Select.Item
+                    key={k}
+                    value={k}
+                    className="relative cursor-default select-none px-3 py-1.5 outline-none data-[highlighted]:bg-[var(--color-surface-alt)] data-[state=checked]:text-[var(--color-graph-selection)]"
+                  >
+                    <Select.ItemText>{k}</Select.ItemText>
+                  </Select.Item>
+                ))}
+              </Select.Viewport>
+            </Select.Content>
+          </Select.Portal>
+        </Select.Root>
       </div>
 
       <div className="flex-1 overflow-y-auto">

@@ -14,12 +14,16 @@ import {
   Tags,
 } from "lucide-react";
 import { api, loadGapItems } from "../../api/client";
-import type { ScopeFilter } from "../../api/types";
 import { useStore } from "../../stores";
 import { ExportMenu } from "../export/ExportMenu";
+import { ScopeSelect } from "../shared/ScopeSelect";
 import { ForceControls } from "./ForceControls";
 import { NodeFilterBar } from "./NodeFilterBar";
 import { StyleRules } from "./StyleRules";
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
 
 function MenuButton({
   active,
@@ -34,6 +38,7 @@ function MenuButton({
     <button
       type="button"
       onClick={onClick}
+      aria-pressed={active}
       className={`inline-flex h-8 items-center gap-1.5 rounded border px-2 text-xs font-medium transition-colors ${
         active
           ? "border-[var(--color-graph-selection)] bg-[var(--color-surface-alt)] text-[var(--color-graph-selection)]"
@@ -72,18 +77,35 @@ export function ControlDock() {
   const setGapItems = useStore((s) => s.setGapItems);
   const gapActive = useStore((s) => s.gapActive);
   const toggleGapPanel = useStore((s) => s.toggleGapPanel);
+  const notify = useStore((s) => s.notify);
 
   const analyzeGaps = async () => {
-    const items = await loadGapItems();
-    setGapItems(items);
-    if (!gapActive) toggleGapPanel();
+    try {
+      const items = await loadGapItems();
+      setGapItems(items);
+      if (!gapActive) toggleGapPanel();
+    } catch (error) {
+      notify({
+        kind: "error",
+        title: "Gap analysis failed",
+        message: getErrorMessage(error, "Gap analysis request failed"),
+      });
+    }
   };
 
   const compareContext = async () => {
     const compareSeeds = seeds.length > 0 ? seeds : selectedNodeId ? [selectedNodeId] : [];
     if (compareSeeds.length === 0) return;
-    const result = await api.brainContext(compareSeeds, 2000, "all");
-    startDiff(result, compareSeeds);
+    try {
+      const result = await api.brainContext(compareSeeds, 2000, "all");
+      startDiff(result, compareSeeds);
+    } catch (error) {
+      notify({
+        kind: "error",
+        title: "Compare failed",
+        message: getErrorMessage(error, "Context comparison request failed"),
+      });
+    }
   };
 
   return (
@@ -159,18 +181,12 @@ export function ControlDock() {
             <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
               Filter
             </h2>
-            <label className="mb-2 block text-[11px] font-medium text-[var(--color-text-muted)]">
-              Scope
-              <select
-                value={scopeFilter}
-                onChange={(event) => setScopeFilter(event.target.value as ScopeFilter)}
-                className="mt-1 w-full rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1 text-xs outline-none"
-              >
-                <option value="all">All</option>
-                <option value="code_only">Code only</option>
-                <option value="notes_only">Notes only</option>
-              </select>
-            </label>
+            <div className="mb-2">
+              <div className="mb-1 text-[11px] font-medium text-[var(--color-text-muted)]">
+                Scope
+              </div>
+              <ScopeSelect value={scopeFilter} onChange={setScopeFilter} />
+            </div>
             <NodeFilterBar />
 
             <hr className="my-3 border-[var(--color-border)]" />

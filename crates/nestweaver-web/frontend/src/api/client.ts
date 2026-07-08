@@ -3,11 +3,12 @@ import type {
   BrainContextResult,
   BrainStatus,
   ContextResult,
+  FlowNode,
   GapReport,
-  ImpactNode,
   Note,
   NoteDetail,
   OverviewResponse,
+  PathResult,
   Perspective,
   Repo,
   ScopeFilter,
@@ -20,6 +21,7 @@ import type {
   UnlinkedMention,
   Vault,
 } from "./types";
+import { loadImpactLens } from "./impactLens";
 
 export class ApiError extends Error {
   status: number;
@@ -92,10 +94,8 @@ export const api = {
     return get<OverviewResponse>(`/api/v1/overview?limit=${limit}`);
   },
 
-  impact(uid: string, depth = 3, confidence = 0.5) {
-    return get<ImpactNode[]>(
-      `/api/v1/impact/${encodeURIComponent(uid)}?depth=${depth}&confidence=${confidence}`,
-    );
+  impact(uid: string, depth = 3, confidence = 0.3, workspaceId?: string | null) {
+    return loadImpactLens(uid, { depth, confidence, workspaceId });
   },
 
   repos() {
@@ -160,13 +160,13 @@ export const api = {
   },
 
   paths(from: string, to: string, maxDepth = 5, limit = 10) {
-    return get<SymbolCandidate[][]>(
+    return get<PathResult[]>(
       `/api/v1/paths/${encodeURIComponent(from)}/${encodeURIComponent(to)}?max_depth=${maxDepth}&limit=${limit}`,
     );
   },
 
   flow(uid: string, maxDepth = 5) {
-    return get<ImpactNode[]>(
+    return get<FlowNode>(
       `/api/v1/flow/${encodeURIComponent(uid)}?max_depth=${maxDepth}`,
     );
   },

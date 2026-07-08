@@ -20,3 +20,4 @@ pub mod source;
 pub mod symbols;
 pub mod timeline;
 pub mod version;
+pub mod workspaces;

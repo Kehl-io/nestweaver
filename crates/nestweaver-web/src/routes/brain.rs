@@ -1,12 +1,15 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
+use nestweaver_store::{SearchHit, TantivyIndex};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::ApiError;
+use crate::routes::workspaces::{self, P1Provenance, WorkspaceKind};
 use crate::state::AppState;
 
 fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
@@ -187,6 +190,8 @@ pub async fn unlinked_mentions(
 pub struct BrainSearchParams {
     pub q: Option<String>,
     pub limit: Option<usize>,
+    pub workspace: Option<String>,
+    pub scope: Option<String>,
 }
 
 pub async fn brain_search(
@@ -197,7 +202,27 @@ pub async fn brain_search(
     if q.is_empty() {
         return Err(ApiError::bad_request("query parameter 'q' is required"));
     }
-    let limit = params.limit.unwrap_or(20);
+    let limit = params.limit.unwrap_or(20).clamp(1, 500);
+    let workspace_param =
+        workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref());
+    if let Some(workspace_param) = workspace_param {
+        let workspace = workspaces::resolve_workspace(&state.store, Some(workspace_param))?;
+        let search = scoped_brain_search(&state, &workspace, &q, limit)?;
+        let meta = workspaces::p1_meta_for_result_set(
+            &workspace,
+            search.result_state,
+            search.unsupported,
+            search.provenance,
+            Some(limit),
+            search.results.len(),
+            search.total_count,
+        );
+        return Ok(Json(json!({
+            "results": search.results,
+            "_meta": meta,
+        }))
+        .into_response());
+    }
 
     // Use tantivy if available, otherwise fall back to lookup_notes_by_title
     if let Some(tantivy) = &state.tantivy {
@@ -215,4 +240,293 @@ pub async fn brain_search(
     let notes = state.store.lookup_notes_by_title(&q)?;
     let json = serde_json::to_value(&notes)?;
     Ok(Json(json).into_response())
+}
+
+struct ScopedBrainSearch {
+    results: Vec<serde_json::Value>,
+    provenance: Vec<P1Provenance>,
+    result_state: &'static str,
+    unsupported: Vec<&'static str>,
+    total_count: Option<usize>,
+}
+
+/// Cap on the Tantivy over-fetch used to fill scoped searches: hits are
+/// fetched beyond the requested limit so that post-filtering by workspace
+/// membership can still fill the page, without letting a large limit fan
+/// out into an unbounded fetch.
+const SCOPED_SEARCH_OVERFETCH_CAP: usize = 1000;
+
+struct TantivyScopedNotes {
+    results: Vec<serde_json::Value>,
+    /// In-scope hit count; `None` when the over-fetch saturated and the
+    /// true total is therefore unknown.
+    total_count: Option<usize>,
+    /// True when in-scope hits were cut to the limit or the over-fetch
+    /// saturated (coverage beyond the returned hits is uncertain).
+    truncated: bool,
+    saturated: bool,
+}
+
+/// Full-text note search via Tantivy, filtered to workspace membership.
+///
+/// Returns `Ok(None)` when the Tantivy query fails so callers can fall back
+/// to the substring path (which must disclose `note-body-search` as
+/// unsupported).
+fn tantivy_scoped_note_search(
+    state: &Arc<AppState>,
+    tantivy: &TantivyIndex,
+    workspace: &workspaces::ResolvedWorkspace,
+    q: &str,
+    limit: usize,
+) -> Result<Option<TantivyScopedNotes>, ApiError> {
+    let fetch_limit = limit
+        .saturating_mul(4)
+        .clamp(limit.max(1), SCOPED_SEARCH_OVERFETCH_CAP);
+    let hits = match tantivy.search(q, fetch_limit) {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(error = %e, "tantivy search failed, falling back to scoped title lookup");
+            return Ok(None);
+        }
+    };
+    let saturated = hits.len() >= fetch_limit;
+
+    let project_note_uids: Option<HashSet<String>> = if workspace.kind == WorkspaceKind::Project {
+        Some(
+            state
+                .store
+                .list_project_note_uids(workspace.uid.as_deref().unwrap_or_default())?
+                .into_iter()
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let mut in_scope = Vec::new();
+    for hit in hits {
+        if hit_in_workspace(state, workspace, project_note_uids.as_ref(), &hit) {
+            in_scope.push(hit);
+        }
+    }
+
+    let total_in_scope = in_scope.len();
+    let results: Vec<serde_json::Value> = in_scope
+        .into_iter()
+        .take(limit)
+        .map(|hit| serde_json::to_value(hit).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let truncated = saturated || total_in_scope > results.len();
+    Ok(Some(TantivyScopedNotes {
+        results,
+        total_count: (!saturated).then_some(total_in_scope),
+        truncated,
+        saturated,
+    }))
+}
+
+fn hit_in_workspace(
+    state: &Arc<AppState>,
+    workspace: &workspaces::ResolvedWorkspace,
+    project_note_uids: Option<&HashSet<String>>,
+    hit: &SearchHit,
+) -> bool {
+    match workspace.kind {
+        WorkspaceKind::Vault => workspace.uid.as_deref() == Some(hit.vault_uid.as_str()),
+        WorkspaceKind::Project => {
+            let Some(note_uids) = project_note_uids else {
+                return false;
+            };
+            // Join the hit back to its owning note: note docs carry the
+            // note uid directly; heading/section docs resolve through the
+            // store. Tag docs are vault-level, never project members.
+            let note_uid = match hit.kind.as_str() {
+                "note" => Some(hit.uid.clone()),
+                "heading" => state
+                    .store
+                    .lookup_heading(&hit.uid)
+                    .ok()
+                    .map(|heading| heading.note_uid),
+                "section" => state
+                    .store
+                    .lookup_section(&hit.uid)
+                    .ok()
+                    .map(|section| section.note_uid),
+                _ => None,
+            };
+            note_uid.is_some_and(|uid| note_uids.contains(&uid))
+        }
+        WorkspaceKind::All | WorkspaceKind::Repo => true,
+    }
+}
+
+fn scoped_brain_search(
+    state: &Arc<AppState>,
+    workspace: &workspaces::ResolvedWorkspace,
+    q: &str,
+    limit: usize,
+) -> Result<ScopedBrainSearch, ApiError> {
+    if workspace.kind == WorkspaceKind::Repo {
+        let page = workspaces::symbols_for_query(&state.store, q, workspace, limit)?;
+        let total_count = page.total_count;
+        let result_state = page.result_state("partial");
+        let results = page
+            .items
+            .into_iter()
+            .map(workspaces::symbol_search_hit)
+            .collect();
+        return Ok(ScopedBrainSearch {
+            results,
+            provenance: vec![P1Provenance::local_graph_store("repo-scoped symbol search")],
+            result_state,
+            unsupported: vec!["note-search"],
+            total_count: Some(total_count),
+        });
+    }
+
+    if workspace.kind == WorkspaceKind::Project {
+        let symbol_page = workspaces::symbols_for_query(&state.store, q, workspace, limit)?;
+        let remaining = limit.saturating_sub(symbol_page.items.len());
+
+        if let Some(tantivy) = &state.tantivy
+            && let Some(scoped) =
+                tantivy_scoped_note_search(state, tantivy, workspace, q, remaining)?
+        {
+            let symbols_truncated = symbol_page.is_truncated();
+            let total_count = scoped
+                .total_count
+                .map(|note_total| symbol_page.total_count + note_total);
+            let mut results: Vec<_> = symbol_page
+                .items
+                .into_iter()
+                .map(workspaces::symbol_search_hit)
+                .collect();
+            results.extend(scoped.results);
+            let result_state = if results.is_empty() {
+                if scoped.saturated {
+                    "partial"
+                } else {
+                    "no-match"
+                }
+            } else if symbols_truncated || scoped.truncated {
+                "truncated"
+            } else {
+                "partial"
+            };
+            return Ok(ScopedBrainSearch {
+                results,
+                provenance: vec![
+                    P1Provenance::local_graph_store("project-scoped symbol search"),
+                    P1Provenance::local_tantivy("project-scoped note search"),
+                ],
+                result_state,
+                unsupported: vec!["project-components"],
+                total_count,
+            });
+        }
+
+        // Substring fallback: note titles/paths only, so note bodies are
+        // disclosed as unsearched.
+        let note_page = workspaces::notes_for_query(&state.store, q, workspace, remaining)?;
+        let total_count = symbol_page.total_count + note_page.total_count;
+        let mut results: Vec<_> = symbol_page
+            .items
+            .into_iter()
+            .map(workspaces::symbol_search_hit)
+            .collect();
+        results.extend(note_page.items.into_iter().map(workspaces::note_search_hit));
+        let result_state = if total_count == 0 {
+            "no-match"
+        } else if limit > 0 && total_count > results.len() {
+            "truncated"
+        } else {
+            "partial"
+        };
+        return Ok(ScopedBrainSearch {
+            results,
+            provenance: vec![P1Provenance::local_graph_store(
+                "project-scoped brain search",
+            )],
+            result_state,
+            unsupported: vec!["project-components", "note-body-search"],
+            total_count: Some(total_count),
+        });
+    }
+
+    if workspace.kind == WorkspaceKind::All
+        && let Some(tantivy) = &state.tantivy
+    {
+        match tantivy.search(q, limit) {
+            Ok(hits) => {
+                let saturated = limit > 0 && hits.len() >= limit;
+                let results: Vec<_> = hits
+                    .into_iter()
+                    .map(|hit| serde_json::to_value(hit).unwrap_or(serde_json::Value::Null))
+                    .collect();
+                let result_state = if results.is_empty() {
+                    if saturated { "partial" } else { "no-match" }
+                } else if saturated {
+                    "truncated"
+                } else {
+                    "complete"
+                };
+                let total_count = if saturated { None } else { Some(results.len()) };
+                return Ok(ScopedBrainSearch {
+                    results,
+                    provenance: vec![P1Provenance::local_tantivy("brain search")],
+                    result_state,
+                    unsupported: Vec::new(),
+                    total_count,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "tantivy search failed, falling back to scoped title lookup");
+            }
+        }
+    }
+
+    if workspace.kind == WorkspaceKind::Vault
+        && let Some(tantivy) = &state.tantivy
+        && let Some(scoped) = tantivy_scoped_note_search(state, tantivy, workspace, q, limit)?
+    {
+        let result_state = if scoped.results.is_empty() {
+            if scoped.saturated {
+                "partial"
+            } else {
+                "no-match"
+            }
+        } else if scoped.truncated {
+            "truncated"
+        } else {
+            "complete"
+        };
+        return Ok(ScopedBrainSearch {
+            results: scoped.results,
+            provenance: vec![P1Provenance::local_tantivy("vault-scoped brain search")],
+            result_state,
+            unsupported: Vec::new(),
+            total_count: scoped.total_count,
+        });
+    }
+
+    // Substring fallback (Tantivy absent or failed): matches note
+    // titles/paths only, never bodies, so coverage is never reported as
+    // complete and the gap is disclosed.
+    let page = workspaces::notes_for_query(&state.store, q, workspace, limit)?;
+    let total_count = page.total_count;
+    let result_state = page.result_state("partial");
+    let results = page
+        .items
+        .into_iter()
+        .map(workspaces::note_search_hit)
+        .collect();
+    Ok(ScopedBrainSearch {
+        results,
+        provenance: vec![P1Provenance::local_graph_store(match workspace.kind {
+            WorkspaceKind::Vault => "vault-scoped note search",
+            _ => "scoped note search fallback",
+        })],
+        result_state,
+        unsupported: vec!["note-body-search"],
+        total_count: Some(total_count),
+    })
 }

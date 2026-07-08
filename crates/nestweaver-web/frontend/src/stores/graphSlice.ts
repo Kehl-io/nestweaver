@@ -11,7 +11,7 @@ export interface GraphSlice {
   hoveredNodeId: string | null;
   previewNodeId: string | null;
   previewExpanded: boolean;
-  openPreview: (id: string, kind?: string | null) => void;
+  openPreview: (id: string, kind?: string | null, expanded?: boolean) => void;
   closePreview: () => void;
   togglePreviewExpanded: () => void;
   contextMenu: { x: number; y: number; nodeId: string } | null;
@@ -20,8 +20,6 @@ export interface GraphSlice {
   graphMode: GraphMode;
   seeds: string[];
   scopeFilter: ScopeFilter;
-  scopeRepoUid: string | null;
-  scopeVaultUid: string | null;
   communityOverlay: boolean;
   tagsVisible: boolean;
   minimapVisible: boolean;
@@ -31,6 +29,9 @@ export interface GraphSlice {
   layoutMode: "panels" | "zen";
   activeStyleRules: Record<string, boolean>;
   reducedEffects: boolean;
+  reducedEffectsUserSet: boolean;
+  setReducedEffects: (reduced: boolean) => void;
+  seedReducedEffectsFromSystem: (reduced: boolean) => void;
   toggleReducedEffects: () => void;
   viewMode: ViewMode;
   detailFocus: DetailFocus;
@@ -46,14 +47,14 @@ export interface GraphSlice {
   setSeeds: (seeds: string[]) => void;
   addSeed: (uid: string) => void;
   setScopeFilter: (filter: ScopeFilter) => void;
-  setScopeRepo: (uid: string | null) => void;
-  setScopeVault: (uid: string | null) => void;
   toggleCommunityOverlay: () => void;
   toggleTags: () => void;
   toggleMinimap: () => void;
   semanticLayoutRequested: boolean;
   requestSemanticLayout: () => void;
   clearSemanticLayoutRequest: () => void;
+  cameraFitRequestId: number;
+  requestCameraFit: () => void;
   setNodeTypeFilter: (kind: string, visible: boolean) => void;
   setAllNodeTypes: (visible: boolean) => void;
   setEdgeTypeFilter: (type: string, visible: boolean) => void;
@@ -77,47 +78,81 @@ export const createGraphSlice: StateCreator<
   graphMode: "overview",
   seeds: [],
   scopeFilter: "all",
-  scopeRepoUid: null,
-  scopeVaultUid: null,
   communityOverlay: false,
   tagsVisible: true,
   minimapVisible: true,
   nodeTypeFilter: {
-    Function: true, Class: true, Method: true, Interface: true,
-    Trait: true, Enum: true, Module: true, Note: true, Tag: true,
+    Function: true,
+    Class: true,
+    Method: true,
+    Interface: true,
+    Trait: true,
+    Enum: true,
+    Module: true,
+    Note: true,
+    Tag: true,
   },
   edgeTypeFilter: {
-    calls: true, imports: true, extends: true, implements: true, includes: true,
+    calls: true,
+    imports: true,
+    extends: true,
+    implements: true,
+    includes: true,
   },
   forceParams: { repulsion: 2, gravity: 1, settling: 10 },
-  layoutMode: "zen" as const,
+  // Panels-first default: landing in zen hides Start Here and the detail
+  // panels, which defeats the orient journey. Zen stays one toggle away.
+  layoutMode: "panels" as const,
   activeStyleRules: {
-    colorByDir: false, sizeByCallers: false,
-    highlightEntryPoints: false, highlightHighPageRank: false,
+    colorByDir: false,
+    sizeByCallers: false,
+    highlightEntryPoints: false,
+    highlightHighPageRank: false,
   },
   reducedEffects: false,
+  reducedEffectsUserSet: false,
   viewMode: "graph" as const,
   detailFocus: "summary" as const,
   cameraZoom: 1,
 
+  setReducedEffects: (reduced) =>
+    set((s) => {
+      s.reducedEffects = reduced;
+    }),
+
+  seedReducedEffectsFromSystem: (reduced) =>
+    set((s) => {
+      if (!s.reducedEffectsUserSet) {
+        s.reducedEffects = reduced;
+      }
+    }),
+
   toggleReducedEffects: () =>
     set((s) => {
+      s.reducedEffectsUserSet = true;
       s.reducedEffects = !s.reducedEffects;
     }),
 
   toggleViewMode: () =>
     set((s) => {
+      if (s.representationMode === "json") {
+        // JSON is an overlay representation; toggling returns to the canvas view
+        s.representationMode = s.viewMode;
+        return;
+      }
       s.viewMode =
         s.viewMode === "graph"
           ? "list"
           : s.viewMode === "list"
             ? "matrix"
             : "graph";
+      s.representationMode = s.viewMode;
     }),
 
   setViewMode: (mode) =>
     set((s) => {
       s.viewMode = mode;
+      s.representationMode = mode;
     }),
 
   setDetailFocus: (focus) =>
@@ -155,10 +190,10 @@ export const createGraphSlice: StateCreator<
       s.hoveredNodeId = id;
     }),
 
-  openPreview: (id, kind) =>
+  openPreview: (id, kind, expanded = false) =>
     set((s) => {
       s.previewNodeId = id;
-      s.previewExpanded = false;
+      s.previewExpanded = expanded;
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
     }),
@@ -205,16 +240,6 @@ export const createGraphSlice: StateCreator<
       s.scopeFilter = filter;
     }),
 
-  setScopeRepo: (uid) =>
-    set((s) => {
-      s.scopeRepoUid = uid;
-    }),
-
-  setScopeVault: (uid) =>
-    set((s) => {
-      s.scopeVaultUid = uid;
-    }),
-
   toggleCommunityOverlay: () =>
     set((s) => {
       s.communityOverlay = !s.communityOverlay;
@@ -235,6 +260,13 @@ export const createGraphSlice: StateCreator<
     set((s) => {
       s.semanticLayoutRequested = true;
     }),
+
+  cameraFitRequestId: 0,
+  requestCameraFit: () =>
+    set((s) => {
+      s.cameraFitRequestId += 1;
+    }),
+
   clearSemanticLayoutRequest: () =>
     set((s) => {
       s.semanticLayoutRequested = false;
@@ -247,7 +279,9 @@ export const createGraphSlice: StateCreator<
 
   setAllNodeTypes: (visible) =>
     set((s) => {
-      Object.keys(s.nodeTypeFilter).forEach((k) => { s.nodeTypeFilter[k] = visible; });
+      Object.keys(s.nodeTypeFilter).forEach((kind) => {
+        s.nodeTypeFilter[kind] = visible;
+      });
     }),
 
   setEdgeTypeFilter: (type, visible) =>

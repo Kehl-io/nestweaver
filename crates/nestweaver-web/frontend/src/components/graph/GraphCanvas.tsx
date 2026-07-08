@@ -1,6 +1,8 @@
 import { useCallback, useMemo, useRef, useState, useEffect, useLayoutEffect } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
+import { EffectComposer, Bloom, Noise, ToneMapping, Vignette } from "@react-three/postprocessing";
+import { ToneMappingMode } from "postprocessing";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
 import { EdgeParticles } from "./EdgeParticles";
@@ -10,6 +12,8 @@ import { useGPUPicking } from "../../hooks/useGPUPicking";
 import { useStore } from "../../stores";
 import { CameraZoomBridge } from "./CameraZoomBridge";
 import { CommunityOverlay } from "./overlays/CommunityOverlay";
+import { NebulaBackdrop } from "./NebulaBackdrop";
+import { HubCoronaMesh } from "./HubCoronaMesh";
 
 // ---- Reduced motion hook ----
 
@@ -29,6 +33,25 @@ function useReducedMotion(): boolean {
   }, []);
 
   return reduced;
+}
+
+function useSystemPrefersDark(): boolean {
+  const [prefersDark, setPrefersDark] = useState(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e: MediaQueryListEvent) => setPrefersDark(e.matches);
+    setPrefersDark(mq.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  return prefersDark;
 }
 
 // ---- Interaction handler (inside R3F scene) ----
@@ -247,12 +270,15 @@ function CameraFitController({
     () => buffers.indexToUid.join("\u0000"),
     [buffers.indexToUid],
   );
+  const cameraFitRequestId = useStore((s) => s.cameraFitRequestId);
+  const graphMode = useStore((s) => s.graphMode);
+  const layoutMode = useStore((s) => s.layoutMode);
   const fittedKeyRef = useRef("");
 
   useEffect(() => {
     if (buffers.nodeCount === 0 || !controls) return;
     if (canvasSize.width <= 0 || canvasSize.height <= 0) return;
-    const fitKey = `${graphKey}:${canvasSize.width}x${canvasSize.height}`;
+    const fitKey = `${graphKey}:${canvasSize.width}x${canvasSize.height}:${cameraFitRequestId}`;
     if (fittedKeyRef.current === fitKey) return;
 
     let minX = Infinity;
@@ -272,6 +298,15 @@ function CameraFitController({
 
     if (!Number.isFinite(minX) || !Number.isFinite(minY)) return;
 
+    // The Start Here shelf overlays the canvas's left ~340px in the panels
+    // overview — widen the left bound so the constellation centers in the
+    // *unobscured* area instead of hiding behind the card
+    if (graphMode === "overview" && layoutMode !== "zen") {
+      const overlayPx = Math.min(340, canvasSize.width * 0.4);
+      const visiblePx = Math.max(canvasSize.width - overlayPx, 1);
+      minX -= (maxX - minX) * (overlayPx / visiblePx);
+    }
+
     const centerX = (minX + maxX) / 2;
     const centerY = (minY + maxY) / 2;
     const boundsWidth = Math.max(1, maxX - minX);
@@ -281,13 +316,13 @@ function CameraFitController({
     const fov = ((perspective.fov ?? 50) * Math.PI) / 180;
     const fitHeightZ = boundsHeight / (2 * Math.tan(fov / 2));
     const fitWidthZ = boundsWidth / (2 * Math.tan(fov / 2) * aspect);
-    const z = Math.min(900, Math.max(300, Math.max(fitHeightZ, fitWidthZ) * 1.2));
+    const z = Math.min(900, Math.max(230, Math.max(fitHeightZ, fitWidthZ) * 1.15));
 
     camera.position.set(centerX, centerY, z);
     (controls as any).target.set(centerX, centerY, 0);
     (controls as any).update?.();
     fittedKeyRef.current = fitKey;
-  }, [buffers, canvasSize.height, canvasSize.width, camera, controls, graphKey]);
+  }, [buffers, cameraFitRequestId, canvasSize.height, canvasSize.width, camera, controls, graphKey, graphMode, layoutMode]);
 
   return null;
 }
@@ -409,24 +444,84 @@ class ImmediateResizeObserver implements ResizeObserver {
   };
 }
 
+// Under reduced motion the scene is static between interactions, so frames
+// render on demand only (battery + "screenshot-perfect still"). Store-driven
+// scene changes must invalidate explicitly in that mode.
+function InvalidateOnStoreChange() {
+  const invalidate = useThree((s) => s.invalidate);
+  const graphVersion = useStore((s) => s.graphVersion);
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const hoveredNodeId = useStore((s) => s.hoveredNodeId);
+  const cameraFitRequestId = useStore((s) => s.cameraFitRequestId);
+
+  useEffect(() => {
+    invalidate();
+  }, [graphVersion, selectedNodeId, hoveredNodeId, cameraFitRequestId, invalidate]);
+
+  return null;
+}
+
+// Idle camera drift: a barely-there parallax sway once the user has been
+// hands-off for a while — the reconciled version of CBM's auto-rotation
+// (design decision: camera may drift; the graph never moves after settle)
+function CameraDrift({ enabled }: { enabled: boolean }) {
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls);
+  const idleSinceRef = useRef(performance.now());
+  const driftRef = useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    if (!controls) return;
+    const markActive = () => {
+      idleSinceRef.current = performance.now();
+    };
+    (controls as unknown as { addEventListener: (e: string, f: () => void) => void })
+      .addEventListener("start", markActive);
+    window.addEventListener("pointerdown", markActive);
+    window.addEventListener("keydown", markActive);
+    return () => {
+      (controls as unknown as { removeEventListener: (e: string, f: () => void) => void })
+        .removeEventListener("start", markActive);
+      window.removeEventListener("pointerdown", markActive);
+      window.removeEventListener("keydown", markActive);
+    };
+  }, [controls]);
+
+  useFrame(({ clock }) => {
+    const idleMs = performance.now() - idleSinceRef.current;
+    // Ease drift in after 6s idle, out instantly on interaction
+    const ramp = enabled ? Math.min(1, Math.max(0, (idleMs - 6000) / 4000)) : 0;
+    const t = clock.getElapsedTime();
+    const targetX = Math.sin(t * 0.105) * 4 * ramp;
+    const targetY = Math.cos(t * 0.083) * 3 * ramp;
+    const prev = driftRef.current;
+    camera.position.x += targetX - prev.x;
+    camera.position.y += targetY - prev.y;
+    driftRef.current = { x: targetX, y: targetY };
+  });
+
+  return null;
+}
+
 // ---- Main canvas ----
 
 export function GraphCanvas() {
   const buffers = useGraphBridge();
   const theme = useStore((s) => s.theme);
   const reducedEffectsToggle = useStore((s) => s.reducedEffects);
+  const reducedEffectsUserSet = useStore((s) => s.reducedEffectsUserSet);
   const layoutMode = useStore((s) => s.layoutMode);
-  const reducedMotion = useReducedMotion() || reducedEffectsToggle;
+  const systemReducedMotion = useReducedMotion();
+  const reducedMotion = reducedEffectsUserSet
+    ? reducedEffectsToggle
+    : systemReducedMotion || reducedEffectsToggle;
+  const systemPrefersDark = useSystemPrefersDark();
   const focusMap = layoutMode === "zen";
   const { ref: shellRef, size: canvasSize } = useGraphCanvasSize();
 
   // Determine background color from theme
-  const isDark =
-    theme === "dark" ||
-    (theme === "system" &&
-      typeof window !== "undefined" &&
-      window.matchMedia("(prefers-color-scheme: dark)").matches);
-  const bgColor = isDark ? "#1e1e2e" : "#eff1f5";
+  const isDark = theme === "dark" || (theme === "system" && systemPrefersDark);
+  const bgColor = isDark ? "#080b11" : "#eef3f8";
   const pixelRatio =
     typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
 
@@ -439,6 +534,7 @@ export function GraphCanvas() {
         >
           <Canvas
             camera={{ position: [0, 0, 500], fov: 50, near: 0.1, far: 10000 }}
+            frameloop={reducedMotion ? "demand" : "always"}
             dpr={[1, pixelRatio]}
             resize={{
               offsetSize: true,
@@ -456,16 +552,39 @@ export function GraphCanvas() {
           >
             <color attach="background" args={[bgColor]} />
             <ambientLight intensity={1} />
+            {isDark && <NebulaBackdrop reducedMotion={reducedMotion} />}
             <CanvasSizeBridge pixelRatio={pixelRatio} />
             <CameraZoomBridge />
             <CameraFitController buffers={buffers} canvasSize={canvasSize} />
+            <CameraDrift enabled={!reducedMotion && !focusMap} />
+            <InvalidateOnStoreChange />
             {buffers.nodeCount > 0 && (
               <>
                 <CommunityOverlay />
                 <EdgeInstanceMesh buffers={buffers} />
                 {!reducedMotion && !focusMap && <EdgeParticles buffers={buffers} />}
+                {isDark && <HubCoronaMesh buffers={buffers} reducedMotion={reducedMotion} />}
                 <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
                 <NodeLabels buffers={buffers} />
+                {isDark && !reducedMotion && (
+                  <EffectComposer>
+                    {/* HDR-selective: only deliberately over-1.0 emissives bloom
+                        (loud tier = focus/hubs/bridges); ambient shimmer lives in
+                        the node shader's halo term below this threshold */}
+                    <Bloom
+                      mipmapBlur
+                      luminanceThreshold={0.95}
+                      luminanceSmoothing={0.12}
+                      intensity={0.95}
+                    />
+                    {/* Khronos PBR Neutral: hue-preserving compression — ACES
+                        desaturates the vivid kind palette toward white (verified:
+                        modelviewer.dev tone-mapping study, SIGGRAPH 2024) */}
+                    <ToneMapping mode={ToneMappingMode.NEUTRAL} />
+                    <Noise premultiply opacity={0.05} />
+                    <Vignette eskil={false} offset={0.24} darkness={0.5} />
+                  </EffectComposer>
+                )}
               </>
             )}
             <GraphInteraction buffers={buffers} />

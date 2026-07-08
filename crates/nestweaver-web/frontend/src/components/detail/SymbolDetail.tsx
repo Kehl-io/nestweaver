@@ -95,7 +95,7 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
         </div>
         <NodeActionBar
           node={{ uid: symbol.uid, kind: symbol.kind, label: symbol.name }}
-          ids={["open", "related", "ask"]}
+          ids={["open", "explore", "impact", "trace", "path", "related", "ask", "copyLink"]}
           compact
           className="mt-3"
         />
@@ -175,9 +175,13 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
         }
       >
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
-          Source
+          Source Evidence
         </h3>
-        <CodePreview filePath={symbol.file_path} line={symbol.start_line} />
+        <CodePreview
+          filePath={symbol.file_path}
+          line={symbol.start_line}
+          ariaLabel={`Source evidence for ${symbol.name}`}
+        />
       </div>
     </div>
   );

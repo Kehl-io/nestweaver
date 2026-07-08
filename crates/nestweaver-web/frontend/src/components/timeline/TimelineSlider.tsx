@@ -19,12 +19,16 @@ export function TimelineSlider() {
             const res = await fetch(`/api/v1/timeline/${repos[0].uid}`);
             const data = await res.json();
             if (Array.isArray(data)) setEntries(data);
-          } catch {
-            // timeline endpoint may not exist yet
+          } catch (error) {
+            // timeline endpoint may not exist yet; degrade silently but observably
+            console.warn("timeline unavailable", error);
           }
         }
       })
-      .catch(() => {});
+      .catch((error) => {
+        // repos failure already surfaces a StatusBar notification; avoid double-toasting
+        console.warn("timeline repos load failed", error);
+      });
   }, [setEntries]);
 
   useEffect(() => {

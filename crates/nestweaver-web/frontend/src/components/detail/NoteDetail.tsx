@@ -104,7 +104,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
         </div>
         <NodeActionBar
           node={{ uid: note.uid, kind: "note", label: note.title }}
-          ids={["open", "related", "ask"]}
+          ids={["open", "explore", "related", "path", "ask", "copyLink"]}
           compact
           className="mt-3"
         />
@@ -152,7 +152,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
         }`}
       >
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
-          Content
+          Note Evidence
         </h3>
         <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-3">
           <MarkdownPreview body={body} onWikilink={handleWikilink} />

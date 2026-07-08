@@ -29,7 +29,13 @@ export function PerspectiveSelector() {
   const toggleMinimap = useStore((s) => s.toggleMinimap);
 
   useEffect(() => {
-    api.perspectives().then(setPerspectives).catch(() => {});
+    api.perspectives().then(setPerspectives).catch((error) => {
+      useStore.getState().notify({
+        kind: "error",
+        title: "Perspectives unavailable",
+        message: error instanceof Error ? error.message : "Perspective request failed",
+      });
+    });
   }, [setPerspectives]);
 
   useEffect(() => {

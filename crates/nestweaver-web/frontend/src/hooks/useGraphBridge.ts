@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useStore } from "../stores";
-import { EDGE_COLORS } from "../components/graph/utils/graphColors";
+import { EDGE_COLORS, desaturate, kindColor } from "../components/graph/utils/graphColors";
 
 export interface GraphBuffers {
   /** [x0, y0, z0, x1, y1, z1, ...] length = nodeCount * 3 */
@@ -23,6 +23,8 @@ export interface GraphBuffers {
   edgeColors: Float32Array;
   /** [sourceIndex0, targetIndex0, ...] length = edgeCount * 2 */
   edgeNodeIndices: Int32Array;
+  /** [t0, t1, ...] length = edgeCount, 1 = intra-galaxy tinted edge */
+  edgeTints: Float32Array;
   uidToIndex: Map<string, number>;
   indexToUid: string[];
   nodeCount: number;
@@ -40,6 +42,7 @@ export const EMPTY_BUFFERS: GraphBuffers = {
   edgePositions: new Float32Array(0),
   edgeColors: new Float32Array(0),
   edgeNodeIndices: new Int32Array(0),
+  edgeTints: new Float32Array(0),
   uidToIndex: new Map(),
   indexToUid: [],
   nodeCount: 0,
@@ -68,11 +71,11 @@ function hexToRgb(hex: string): [number, number, number] {
   return [0.5, 0.5, 0.5];
 }
 
-function edgeColorForType(type: unknown, isDark: boolean): [number, number, number] | null {
+function edgeColorForType(type: unknown): [number, number, number] | null {
   if (typeof type !== "string") return null;
-  if (type === "overview") {
-    return isDark ? hexToRgb("#64748b") : hexToRgb("#6b7280");
-  }
+  // "overview" (intra-galaxy) edges intentionally return null so the
+  // node-color fallback tints them with their galaxy's hue (glowing web)
+  if (type === "overview") return null;
   const color = EDGE_COLORS[type];
   return color ? hexToRgb(color) : null;
 }
@@ -186,8 +189,15 @@ export function useGraphBridge(): GraphBuffers {
       positions[ni * 3 + 1] = typeof attrs.y === "number" ? attrs.y : 0;
       positions[ni * 3 + 2] = typeof attrs.z === "number" ? attrs.z : 0;
 
-      // Colors: parse hex color attribute, fall back to mid-gray
-      let [r, g, b] = hexToRgb(typeof attrs.color === "string" ? attrs.color : "");
+      // Colors: derive from paletteKind when present (stays correct across
+      // theme flips), else parse the baked hex color, fall back to mid-gray
+      let colorHex = typeof attrs.color === "string" ? attrs.color : "";
+      if (typeof attrs.paletteKind === "string") {
+        colorHex = kindColor(attrs.paletteKind, isDark);
+        const fade = typeof attrs.colorDesaturate === "number" ? attrs.colorDesaturate : 0;
+        if (fade > 0) colorHex = desaturate(colorHex, fade);
+      }
+      let [r, g, b] = hexToRgb(colorHex);
 
       // Style rule: color by directory
       if (activeStyleRules.colorByDir && typeof attrs.location === "string") {
@@ -228,10 +238,15 @@ export function useGraphBridge(): GraphBuffers {
       const degreeScore = maxDegree > 0 ? degree / maxDegree : 0;
       importance[ni] = Math.min(1, Math.max(relevanceScore, degreeScore * 0.7));
       seedMarkers[ni] = attrs.isSeed === true || seedSet.has(uid) ? 1 : 0;
+      // Real betweenness from the backend when present (top-12 per scene,
+      // normalized); degree heuristic only as a fallback for older payloads
+      const bridgeScore = numericMetric(attrs, ["bridgeScore"]);
       bridgeStrengths[ni] =
-        degree >= 3 && degreeScore >= 0.45 && seedMarkers[ni] === 0
-          ? Math.min(1, degreeScore)
-          : 0;
+        bridgeScore > 0
+          ? Math.min(1, bridgeScore)
+          : degree >= 3 && degreeScore >= 0.45 && seedMarkers[ni] === 0
+            ? Math.min(1, degreeScore)
+            : 0;
 
       ni++;
     });
@@ -242,6 +257,8 @@ export function useGraphBridge(): GraphBuffers {
     const edgePositions = new Float32Array(edgeCount * 6);
     const edgeColors = new Float32Array(edgeCount * 6);
     const edgeNodeIndices = new Int32Array(edgeCount * 2);
+    // 1 = intra-galaxy edge (tinted glowing web), 0 = cross-cutting (neutral)
+    const edgeTints = new Float32Array(edgeCount);
 
     let ei = 0;
     graph.forEachEdge((_edge, _attrs, sourceUid, targetUid) => {
@@ -261,7 +278,7 @@ export function useGraphBridge(): GraphBuffers {
         edgePositions[ei * 6 + 4] = positions[ti * 3 + 1];
         edgePositions[ei * 6 + 5] = positions[ti * 3 + 2];
 
-        const edgeColor = edgeColorForType(_attrs.type, isDark);
+        const edgeColor = edgeColorForType(_attrs.type);
         const sourceColor = edgeColor ?? [
           colors[si * 3 + 0],
           colors[si * 3 + 1],
@@ -279,6 +296,8 @@ export function useGraphBridge(): GraphBuffers {
         edgeColors[ei * 6 + 3] = targetColor[0];
         edgeColors[ei * 6 + 4] = targetColor[1];
         edgeColors[ei * 6 + 5] = targetColor[2];
+
+        edgeTints[ei] = _attrs.type === "overview" ? 1 : 0;
       }
 
       ei++;
@@ -295,6 +314,7 @@ export function useGraphBridge(): GraphBuffers {
       edgePositions,
       edgeColors,
       edgeNodeIndices,
+      edgeTints,
       uidToIndex,
       indexToUid,
       nodeCount,

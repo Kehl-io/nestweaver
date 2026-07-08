@@ -2,7 +2,7 @@ use nestweaver_store::{GraphStore, TantivyIndex};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
@@ -18,6 +18,12 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<GraphEvent>,
     pub db_path: PathBuf,
     pub file_lock: Mutex<()>,
+    /// Lazily computed global bridge pool (uid -> raw betweenness), filled
+    /// once per process by `crate::bridge::global_bridge_scores`. Cached
+    /// because the engine's sampled Brandes pass is too expensive to run per
+    /// request on large graphs; the data is advisory UI emphasis, so
+    /// within-process staleness is acceptable.
+    pub bridge_scores: OnceLock<Arc<HashMap<String, f64>>>,
 }
 
 impl AppState {
@@ -29,6 +35,7 @@ impl AppState {
             event_tx,
             db_path,
             file_lock: Mutex::new(()),
+            bridge_scores: OnceLock::new(),
         })
     }
 
@@ -44,6 +51,7 @@ impl AppState {
             event_tx,
             db_path,
             file_lock: Mutex::new(()),
+            bridge_scores: OnceLock::new(),
         })
     }
 
@@ -59,6 +67,7 @@ impl AppState {
             event_tx,
             db_path,
             file_lock: Mutex::new(()),
+            bridge_scores: OnceLock::new(),
         })
     }
 }
