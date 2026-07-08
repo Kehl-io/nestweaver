@@ -74,10 +74,8 @@ export function ToastViewport() {
             <div className="flex items-start gap-3">
               <meta.Icon size={16} aria-hidden="true" className={`mt-0.5 shrink-0 ${meta.icon}`} />
               <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-semibold">
-                  <span className="sr-only">{meta.label}: </span>
-                  {notification.title}
-                </p>
+                <span className="sr-only">{meta.label}:</span>
+                <p className="truncate text-sm font-semibold">{notification.title}</p>
                 {notification.message && (
                   <p className="mt-0.5 line-clamp-3 text-xs leading-5 text-[var(--color-text-muted)]">
                     {notification.message}

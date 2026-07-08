@@ -81,10 +81,7 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function openOverview(
-  page: Page,
-  options: { panels?: boolean } = {},
-) {
+async function openOverview(page: Page) {
   await page.goto("/");
 
   const graphContainer = page.locator('[data-testid="graph-panel"]');
@@ -93,33 +90,26 @@ async function openOverview(
   const dock = page.getByTestId("control-dock");
   await expect(dock).toBeVisible();
 
-  if (!options.panels) {
-    await expect(
-      page.getByRole("region", { name: "Start Here" }),
-    ).toHaveCount(0);
-    return;
-  }
-
-  await dock.getByRole("button", { name: "Settings" }).click();
-  await dock.getByRole("button", { name: "Focus Map" }).click();
+  // Panels-first default: the overview always lands with Start Here visible
+  // and the mode tab strip under the top bar. Zen remains a manual toggle.
+  await expect(
+    page.getByRole("region", { name: "Start Here" }),
+  ).toBeVisible({ timeout: 15_000 });
 
   const modeIndicator = page
     .getByRole("group", { name: "Graph mode" })
     .getByRole("button", { name: "Overview" });
   await expect(modeIndicator).toBeVisible();
-
-  // Close the settings flyout by clicking outside it
-  await page.locator('[data-testid="graph-panel"]').click({ position: { x: 10, y: 10 } });
 }
 
 test.describe("Graph Explorer", () => {
-  test("first open renders Focus Map by default", async ({ page, request }) => {
+  test("first open renders panels overview with Start Here", async ({ page, request }) => {
     await fetchOverview(request);
     await openOverview(page);
     await expect(page.getByTestId("control-dock")).toBeVisible();
     await expect(
       page.getByRole("region", { name: "Start Here" }),
-    ).toHaveCount(0);
+    ).toBeVisible();
   });
 
   test("panel overview shows Start Here without an idle context card", async ({
@@ -129,7 +119,7 @@ test.describe("Graph Explorer", () => {
     const overview = await fetchOverview(request);
     const visibleItems = displayedStartHereItems(overview);
 
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await expect(startHere).toBeVisible({ timeout: 15_000 });
@@ -163,7 +153,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await expect(
@@ -206,7 +196,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     await page.getByTestId("search-input").fill(firstSymbol.name);
     const results = page.getByRole("listbox", { name: "Search results" });
@@ -239,7 +229,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await startHere
@@ -273,7 +263,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page, { panels: true });
+    await openOverview(page);
     await page.getByTestId("search-input").fill(firstSymbol.name);
 
     const option = page
@@ -290,7 +280,7 @@ test.describe("Graph Explorer", () => {
   });
 
   test("grouped controls switch to list and matrix views", async ({ page }) => {
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     const representationTabs = page.getByRole("tablist", {
       name: "Result representation",
@@ -317,9 +307,11 @@ test.describe("Graph Explorer", () => {
   }, testInfo) => {
     await openOverview(page);
     await expect(page.locator("canvas").first()).toBeVisible();
-    await expect(page.getByText("js", { exact: true })).toBeVisible({
-      timeout: 15_000,
-    });
+    // Scope to the canvas label — panels mode also shows "js" in the
+    // explorer and the Start Here card
+    await expect(
+      page.getByLabel("Code knowledge graph").getByText("js", { exact: true }),
+    ).toBeVisible({ timeout: 15_000 });
 
     async function downloadExport(label: RegExp, extension: string) {
       const dock = page.getByTestId("control-dock");
@@ -353,7 +345,7 @@ test.describe("Graph Explorer", () => {
   });
 
   test("ranked table sorts and selects nodes", async ({ page }) => {
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     await page
       .getByRole("tablist", { name: "Result representation" })
@@ -374,7 +366,7 @@ test.describe("Graph Explorer", () => {
   test("matrix view renders bounded nodes and row selection", async ({
     page,
   }) => {
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     await page
       .getByRole("tablist", { name: "Result representation" })
@@ -400,7 +392,7 @@ test.describe("Graph Explorer", () => {
       await route.fulfill({ json: emptyOverview() });
     });
 
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await expect(startHere.getByText("No indexed content")).toBeVisible();
@@ -436,7 +428,7 @@ test.describe("Graph Explorer", () => {
       return;
     }
 
-    await openOverview(page, { panels: true });
+    await openOverview(page);
 
     const startHere = page.getByRole("region", { name: "Start Here" });
     await startHere
