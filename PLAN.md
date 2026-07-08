@@ -465,3 +465,14 @@ A four-agent adversarial review of the branch (spec compliance P0/P1, frontend b
 - `2028aee8` fix(web): stop toolbar and shelf text from truncating illegibly
 
 Deferred (candidates for P2 polish): exponential fog / nebula backdrop / film grain from the design note's atmosphere tier; per-galaxy ambient edge tint; camera fly-to on focus.
+
+## Constellation wow tiers (2026-07-07 evening)
+
+Status: complete (nw-030/031/032; spec: brain note constellation-wow-spec)
+
+- `944145e8` feat(web): tier 1 ambient glow field — NEUTRAL tone mapping (ACES demonstrably desaturated the palette), HDR-selective bloom (threshold 0.95, emissive-over-1.0 loud tier), ambient node halos, per-galaxy additive edge web (0.06–0.25 band, 5k escape hatch), 96-landmark density with per-galaxy caps, grain, FBM nebula backdrop, idle camera drift.
+- `c99da37d` feat(web): bridge_score on overview and context payloads — engine betweenness (sampled Brandes) behind a once-per-process top-512 cache; top 12 per scene normalized 0..1.
+- `e49c2f06` feat(web): tier 2 signature moments — 2s hubs-first ignition (dwell ≤0.4, cubic easing, supernova overshoot), 800ms shader impact-ripple + incident-edge particle burst, breathing kind-tinted hub coronas.
+- `472a6d78` feat(web): tier 3 — Spark-green convergence rings on real betweenness, bridge channeling particles, sigma-style constant-density label grid, reduced-motion demand frames.
+
+Deliberate deviations from the spec: FogExp2 skipped (planar scene + custom shader materials make it a no-op; vignette carries depth falloff); zoom-reveal landmark tiers deferred (double-click explore + workspace scope cover the journey; revisit after usability sessions). All motion features zero out under reduced motion; static meaning channels (halo, tint, rings mid-phase, coronas) persist.
