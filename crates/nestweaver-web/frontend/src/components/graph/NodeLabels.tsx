@@ -11,6 +11,10 @@ import type { GraphBuffers } from "../../hooks/useGraphBridge";
 //   - hubs (forceLabel/seeds) are landmarks: always labeled
 //   - member labels appear when zoomed in (or hovered/selected/related)
 //   - a constant-density screen grid caps how many labels show per area
+//   - candidate placement: each label tries below/above/right/left and takes
+//     the first slot clear of every node disc AND every already-placed label;
+//     labels with no clean slot are dropped (landmarks/active node fall back
+//     to "below") so text is never rendered on top of a node
 //   - every enter/exit is a fade, never a pop
 const LABEL_CELL_PX = 100;
 const MEMBER_LABEL_ZOOM = 420; // members labeled when camera z is closer than this
@@ -120,15 +124,6 @@ export function NodeLabels({ buffers }: Props) {
     }
 
     const candidates: LabelDatum[] = [];
-    let centerX = 0;
-    let centerY = 0;
-    for (let i = 0; i < buffers.nodeCount; i++) {
-      centerX += buffers.positions[i * 3];
-      centerY += buffers.positions[i * 3 + 1];
-    }
-    centerX /= buffers.nodeCount;
-    centerY /= buffers.nodeCount;
-
     const membersVisible = zoomBucket <= MEMBER_LABEL_ZOOM;
     const activeNodeId = hoveredNodeId ?? selectedNodeId;
 
@@ -140,7 +135,6 @@ export function NodeLabels({ buffers }: Props) {
       const forceLabel = attrs.forceLabel === true || isSeed;
       const isSelected = uid === selectedNodeId;
       const isHovered = uid === hoveredNodeId;
-      const size = buffers.sizes[idx] || 6;
 
       const isRelatedToActive =
         activeNodeId != null &&
@@ -161,23 +155,12 @@ export function NodeLabels({ buffers }: Props) {
       const x = buffers.positions[idx * 3];
       const y = buffers.positions[idx * 3 + 1];
       const z = buffers.positions[idx * 3 + 2];
-      const radialX = x - centerX;
-      const radialY = y - centerY;
-      const radialLength = Math.hypot(radialX, radialY);
-      const ringClearance = Math.min(graphInstance.degree(uid) * 1.4, 34);
-      const labelOffset = size * 0.62 + 5 + ringClearance;
-      const labelX =
-        radialLength > 1 ? x + (radialX / radialLength) * labelOffset * 0.35 : x;
-      const labelY =
-        radialLength > 1
-          ? y - Math.abs(labelOffset) * 0.85
-          : y - size * 0.62 - 4 - ringClearance;
 
       candidates.push({
         uid,
         label,
-        x: labelX,
-        y: labelY,
+        x,
+        y,
         z,
         fontSize: forceLabel ? 7 : 4.8,
         isSelected,
@@ -205,12 +188,78 @@ export function NodeLabels({ buffers }: Props) {
     });
     const kept = new Set([...cellBest.values()].map((entry) => entry.index));
 
-    const out = new Map<string, LabelDatum>();
-    candidates.forEach((node, index) => {
-      if (node.isSelected || node.isHovered || kept.has(index)) {
-        out.set(node.uid, node);
+    // Cartographic placement: for each kept label try the four classic
+    // anchor positions (below, above, right, left of the node) and take the
+    // first that overlaps no node disc and no already-placed label. Labels
+    // that can't find a clean slot are dropped unless they're landmarks or
+    // the active node — fewer clean labels beat text sitting on nodes.
+    const nodeRadius = (i: number) => (buffers.sizes[i] || 6) * 0.45;
+    const placedBoxes: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+    const boxFor = (
+      node: LabelDatum,
+      anchor: "below" | "above" | "right" | "left",
+    ) => {
+      const idx = buffers.uidToIndex.get(node.uid)!;
+      const r = nodeRadius(idx) + 3;
+      const w = node.label.length * node.fontSize * 0.58;
+      const h = node.fontSize * 1.25;
+      if (anchor === "below") {
+        return { x: node.x, y: node.y - r - 1, x0: node.x - w / 2, y0: node.y - r - 1 - h, x1: node.x + w / 2, y1: node.y - r - 1 };
       }
-    });
+      if (anchor === "above") {
+        return { x: node.x, y: node.y + r + 1 + h, x0: node.x - w / 2, y0: node.y + r + 1, x1: node.x + w / 2, y1: node.y + r + 1 + h };
+      }
+      if (anchor === "right") {
+        return { x: node.x + r + 2 + w / 2, y: node.y + h / 2, x0: node.x + r + 2, y0: node.y - h / 2, x1: node.x + r + 2 + w, y1: node.y + h / 2 };
+      }
+      return { x: node.x - r - 2 - w / 2, y: node.y + h / 2, x0: node.x - r - 2 - w, y0: node.y - h / 2, x1: node.x - r - 2, y1: node.y + h / 2 };
+    };
+    const hitsNode = (box: { x0: number; y0: number; x1: number; y1: number }, selfIdx: number) => {
+      for (let i = 0; i < buffers.nodeCount; i++) {
+        if (i === selfIdx) continue;
+        const nx = buffers.positions[i * 3];
+        const ny = buffers.positions[i * 3 + 1];
+        const r = nodeRadius(i);
+        // circle-vs-box overlap
+        const cx = Math.max(box.x0, Math.min(nx, box.x1));
+        const cy = Math.max(box.y0, Math.min(ny, box.y1));
+        if ((nx - cx) ** 2 + (ny - cy) ** 2 < r * r) return true;
+      }
+      return false;
+    };
+    const hitsLabel = (box: { x0: number; y0: number; x1: number; y1: number }) =>
+      placedBoxes.some(
+        (b) => box.x0 < b.x1 && box.x1 > b.x0 && box.y0 < b.y1 && box.y1 > b.y0,
+      );
+
+    const out = new Map<string, LabelDatum>();
+    // Landmarks place first so detail labels route around them
+    const ordered = candidates
+      .map((node, index) => ({ node, index }))
+      .filter(({ node, index }) => node.isSelected || node.isHovered || kept.has(index))
+      .sort((a, b) => Number(b.node.forceLabel) - Number(a.node.forceLabel));
+
+    for (const { node } of ordered) {
+      const selfIdx = buffers.uidToIndex.get(node.uid)!;
+      const mustPlace = node.isSelected || node.isHovered || node.forceLabel;
+      let placed = false;
+      for (const anchor of ["below", "above", "right", "left"] as const) {
+        const box = boxFor(node, anchor);
+        if (!hitsNode(box, selfIdx) && !hitsLabel(box)) {
+          out.set(node.uid, { ...node, x: box.x, y: box.y });
+          placedBoxes.push(box);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed && mustPlace) {
+        // Landmarks and the active node always show — take "below" even if
+        // imperfect rather than hiding the map's names
+        const box = boxFor(node, "below");
+        out.set(node.uid, { ...node, x: box.x, y: box.y });
+        placedBoxes.push(box);
+      }
+    }
     return out;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buffers, graphInstance, selectedNodeId, hoveredNodeId, focusMap, canvasSize.height, zoomBucket]);
