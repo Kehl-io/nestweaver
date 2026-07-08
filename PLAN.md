@@ -487,3 +487,13 @@ User-reported issues from live testing (Safari, light mode): nodes invisible, "s
 - `fd3a9f5f` — the "circle": physics, not placement. One hub + uniform 30-unit link distances settles members onto a perfect ring. Fixed with per-link varied rest lengths (26–60), sibling member↔member links (~45% of members chain to a hash-picked sibling) for internal filaments, and ±22 z-depth parallax. Also: camera fit now excludes the Start Here overlay area (constellation no longer hides behind the card) with a tighter zoom floor (230); light mode gets galaxy edge tint at 0.55 amplitude + 0.62 opacity; dark bloom to 0.95; favicon → transparent `logo-icon-dark.svg`.
 
 Both themes visually re-verified on the scratch testbed (nodes, tint, framing, organic structure).
+
+## Label polish round (2026-07-08)
+
+Status: complete
+
+User feedback across two rounds: node labels looked janky, then "text shows up over nodes."
+- SDF in-scene labels (troika via drei <Text>) replaced DOM <Html> overlays — pixel-locked to the camera, outlined for legibility over the nebula/edge-web in both themes, member labels reveal on zoom/hover, landmark hubs always labeled, ~200ms fades on enter/exit. Inter 500 instanced to static TTF (troika can't parse woff2). sr-only landmark summary preserves screen-reader access.
+- Collision-aware placement: four-anchor candidate search (below/above/right/left), each tested against node discs and placed labels; unplaceable non-landmark labels are dropped. Text no longer renders on nodes.
+
+Testing note: e2e reuses a running dev server via Playwright's reuseExistingServer — leaving the scratch testbed (real repos) on ports 3000/5173 makes fixture-content assertions fail. Always stop the testbed before the suite; clean run is 40/40.
