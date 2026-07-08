@@ -2,6 +2,7 @@ import { useRef, useEffect, useMemo } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Points, BufferGeometry, Float32BufferAttribute, ShaderMaterial } from "three";
 import type { GraphBuffers } from "../../hooks/useGraphBridge";
+import { useStore } from "../../stores";
 
 interface Props {
   buffers: GraphBuffers;
@@ -14,23 +15,36 @@ const vertexShader = `
   attribute vec3 aSource;
   attribute vec3 aTarget;
   attribute float aPhase;
+  attribute float aBurst;
 
   uniform float u_time;
+  uniform float u_burstStart;
   uniform vec3 u_particleColor;
 
   varying vec3 v_color;
   varying float v_alpha;
 
   void main() {
-    float t = fract(u_time * 0.3 + aPhase);
+    // Focus burst: particles on focus-incident edges race outward for 800ms
+    // (part of the impact-ripple moment), then settle to ambient flow
+    float burst = 0.0;
+    if (u_burstStart >= 0.0 && aBurst > 0.5) {
+      float age = u_time - u_burstStart;
+      if (age >= 0.0 && age < 0.8) {
+        burst = 1.0 - age / 0.8;
+      }
+    }
+
+    float speed = 0.3 * (1.0 + burst * 2.0);
+    float t = fract(u_time * speed + aPhase);
     vec3 pos = mix(aSource, aTarget, t);
 
     float centerDist = abs(t - 0.5) * 2.0;
-    v_alpha = exp(-3.0 * centerDist * centerDist);
+    v_alpha = exp(-3.0 * centerDist * centerDist) * (1.0 + burst * 1.2);
     v_color = u_particleColor;
 
     vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
-    gl_PointSize = 2.0 * (300.0 / -mvPosition.z);
+    gl_PointSize = (2.0 + burst * 1.5) * (300.0 / -mvPosition.z);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -50,6 +64,8 @@ const fragmentShader = `
 export function EdgeParticles({ buffers }: Props) {
   const pointsRef = useRef<Points>(null);
   const materialRef = useRef<ShaderMaterial>(null);
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const clockRef = useRef(0);
 
   // Build per-particle attributes from edge data
   useEffect(() => {
@@ -84,11 +100,16 @@ export function EdgeParticles({ buffers }: Props) {
     geo.setAttribute("aSource", new Float32BufferAttribute(sources, 3));
     geo.setAttribute("aTarget", new Float32BufferAttribute(targets, 3));
     geo.setAttribute("aPhase", new Float32BufferAttribute(phases, 1));
+    geo.setAttribute(
+      "aBurst",
+      new Float32BufferAttribute(new Float32Array(n), 1),
+    );
     geo.computeBoundingSphere();
   }, [buffers]);
 
   // Animate time uniform
   useFrame(({ clock }) => {
+    clockRef.current = clock.elapsedTime;
     if (materialRef.current) {
       materialRef.current.uniforms.u_time.value = clock.elapsedTime;
     }
@@ -96,8 +117,35 @@ export function EdgeParticles({ buffers }: Props) {
 
   const uniforms = useMemo(() => ({
     u_time: { value: 0.0 },
+    u_burstStart: { value: -1.0 },
     u_particleColor: { value: [0.498, 0.518, 0.612] },
   }), []);
+
+  // Mark focus-incident edges and kick the burst clock on selection.
+  // (EdgeParticles only mounts when motion is allowed, so no reduced-motion
+  // branch is needed here.)
+  useEffect(() => {
+    const points = pointsRef.current;
+    if (!points) return;
+    const geo = points.geometry as BufferGeometry;
+    const burstAttr = geo.getAttribute("aBurst") as Float32BufferAttribute | undefined;
+    if (!burstAttr) return;
+
+    const focusIdx = selectedNodeId
+      ? buffers.uidToIndex.get(selectedNodeId)
+      : undefined;
+    for (let i = 0; i < buffers.edgeCount; i++) {
+      const s = buffers.edgeNodeIndices[i * 2];
+      const t = buffers.edgeNodeIndices[i * 2 + 1];
+      const incident =
+        focusIdx !== undefined && (s === focusIdx || t === focusIdx);
+      burstAttr.setX(i, incident ? 1 : 0);
+    }
+    burstAttr.needsUpdate = true;
+    if (focusIdx !== undefined) {
+      uniforms.u_burstStart.value = clockRef.current;
+    }
+  }, [selectedNodeId, buffers, uniforms]);
 
   useEffect(() => {
     function updateColor() {

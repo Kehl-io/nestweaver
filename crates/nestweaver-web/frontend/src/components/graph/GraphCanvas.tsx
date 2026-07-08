@@ -13,6 +13,7 @@ import { useStore } from "../../stores";
 import { CameraZoomBridge } from "./CameraZoomBridge";
 import { CommunityOverlay } from "./overlays/CommunityOverlay";
 import { NebulaBackdrop } from "./NebulaBackdrop";
+import { HubCoronaMesh } from "./HubCoronaMesh";
 
 // ---- Reduced motion hook ----
 
@@ -532,6 +533,7 @@ export function GraphCanvas() {
                 <CommunityOverlay />
                 <EdgeInstanceMesh buffers={buffers} />
                 {!reducedMotion && !focusMap && <EdgeParticles buffers={buffers} />}
+                {isDark && <HubCoronaMesh buffers={buffers} reducedMotion={reducedMotion} />}
                 <NodeInstanceMesh buffers={buffers} reducedMotion={reducedMotion} />
                 <NodeLabels buffers={buffers} />
                 {isDark && !reducedMotion && (
