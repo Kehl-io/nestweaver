@@ -422,6 +422,22 @@ export function GraphPanel() {
             <>Selected: {selectedNodeName}{selectedNodeKind ? `, ${selectedNodeKind}` : ""}</>
           )}
         </div>
+        {/* Canvas labels render as WebGL SDF text (not DOM); this summary
+            keeps the scene's landmarks accessible to screen readers */}
+        <div className="sr-only" data-testid="graph-label-summary">
+          {(() => {
+            if (!graphInstance) return null;
+            const landmarks: string[] = [];
+            graphInstance.forEachNode((_uid, attrs) => {
+              if (attrs.forceLabel === true && typeof attrs.label === "string") {
+                landmarks.push(attrs.label);
+              }
+            });
+            return landmarks.length > 0
+              ? `Landmarks: ${landmarks.join(", ")}`
+              : null;
+          })()}
+        </div>
       </div>
     </div>
   );

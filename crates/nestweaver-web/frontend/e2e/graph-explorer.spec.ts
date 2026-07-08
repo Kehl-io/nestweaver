@@ -307,11 +307,11 @@ test.describe("Graph Explorer", () => {
   }, testInfo) => {
     await openOverview(page);
     await expect(page.locator("canvas").first()).toBeVisible();
-    // Scope to the canvas label — panels mode also shows "js" in the
-    // explorer and the Start Here card
-    await expect(
-      page.getByLabel("Code knowledge graph").getByText("js", { exact: true }),
-    ).toBeVisible({ timeout: 15_000 });
+    // Canvas labels are WebGL SDF text (not DOM); the sr-only landmark
+    // summary is the accessible mirror of what the scene labels
+    await expect(page.getByTestId("graph-label-summary")).toContainText("js", {
+      timeout: 15_000,
+    });
 
     async function downloadExport(label: RegExp, extension: string) {
       const dock = page.getByTestId("control-dock");
