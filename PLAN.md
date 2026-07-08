@@ -476,3 +476,14 @@ Status: complete (nw-030/031/032; spec: brain note constellation-wow-spec)
 - `472a6d78` feat(web): tier 3 — Spark-green convergence rings on real betweenness, bridge channeling particles, sigma-style constant-density label grid, reduced-motion demand frames.
 
 Deliberate deviations from the spec: FogExp2 skipped (planar scene + custom shader materials make it a no-op; vignette carries depth falloff); zoom-reveal landmark tiers deferred (double-click explore + workspace scope cover the journey; revisit after usability sessions). All motion features zero out under reduced motion; static meaning channels (halo, tint, rings mid-phase, coronas) persist.
+
+## Wow-tier remediation round (2026-07-08, after user visual review)
+
+Status: complete
+
+User-reported issues from live testing (Safari, light mode): nodes invisible, "still a circle", insufficient wow, favicon not the brand mark. Root causes and fixes:
+
+- `8131e0c9` — nodes invisible in BOTH themes: the tier-3 bridge-ring shader block referenced `u_motionAmp` without declaring it in the fragment stage; GLSL compile failure silently killed the node material while edges/labels still rendered. One-line declaration fix. A new e2e guard ("graph shaders compile without errors") fails on any THREE program/shader console error so this class of regression can't pass gates again.
+- `fd3a9f5f` — the "circle": physics, not placement. One hub + uniform 30-unit link distances settles members onto a perfect ring. Fixed with per-link varied rest lengths (26–60), sibling member↔member links (~45% of members chain to a hash-picked sibling) for internal filaments, and ±22 z-depth parallax. Also: camera fit now excludes the Start Here overlay area (constellation no longer hides behind the card) with a tighter zoom floor (230); light mode gets galaxy edge tint at 0.55 amplitude + 0.62 opacity; dark bloom to 0.95; favicon → transparent `logo-icon-dark.svg`.
+
+Both themes visually re-verified on the scratch testbed (nodes, tint, framing, organic structure).
