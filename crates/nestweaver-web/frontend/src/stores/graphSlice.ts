@@ -100,7 +100,9 @@ export const createGraphSlice: StateCreator<
     includes: true,
   },
   forceParams: { repulsion: 2, gravity: 1, settling: 10 },
-  layoutMode: "zen" as const,
+  // Panels-first default: landing in zen hides Start Here and the detail
+  // panels, which defeats the orient journey. Zen stays one toggle away.
+  layoutMode: "panels" as const,
   activeStyleRules: {
     colorByDir: false,
     sizeByCallers: false,

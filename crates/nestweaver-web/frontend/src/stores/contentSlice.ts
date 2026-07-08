@@ -280,7 +280,9 @@ export const createContentSlice: StateCreator<
       s.lastEventTimestamp = timestamp;
     }),
 
-  theme: "system",
+  // Dark-first default per the locked design decisions — the graph's bloom
+  // and HDR treatment only sing on dark. Users' explicit choices persist.
+  theme: "dark",
   setTheme: (theme) =>
     set((s) => {
       s.theme = theme;

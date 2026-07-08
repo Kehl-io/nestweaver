@@ -362,6 +362,7 @@ export function GraphPanel() {
   return (
     <div data-testid="graph-panel" className="flex h-full flex-col relative">
       <WorkspaceToolbar />
+      <ModeTabs />
       <div className="flex-1 relative bg-[var(--color-surface)]">
         <div
           ref={graphPanelRef}
@@ -422,7 +423,6 @@ export function GraphPanel() {
           )}
         </div>
       </div>
-      <ModeTabs />
     </div>
   );
 }
