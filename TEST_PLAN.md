@@ -564,3 +564,7 @@ Interactively verified this session (evidence: session screenshots):
 - Automated release gates re-run on HEAD: see PLAN.md remediation section; full results recorded by the final verification run (tsc, eslint, vite build, full Playwright suite, cargo test -p nestweaver-web, clippy -D warnings, fmt --check).
 
 Full MT-01…MT-06 execution across all six journeys (keyboard-only paths, Search Phrase ambiguity, impact trust-state matrix, reduced-motion) remains open for a dedicated manual session with a human at the controls.
+
+### Addendum — six-journey drive on real data (2026-07-07 evening)
+
+Executed MT-01…MT-06 interactively in Chrome against a 4-repo + 1-vault scratch DB (58k symbols, 3 linked notes) on the branch dev server. Results: Orient PASS (workspace catalog, scoped constellation, honest partial/note-landmarks disclosure, deep-link restore); Understand PASS (search → knowledge card → tri-panel with source spans, callers/callees); Trace PASS (32-step stepper with synced source); Rationale PASS after fix (note-target phrases previously resolved to heading nodes and returned empty backlinks); Representation PASS (graph/table/JSON with _meta trust, URL carries representation); Search Phrases PASS (ambiguity candidates, unsupported contract-drift state); Cmd+K and ? overlay PASS (the latter via real key events). Impact lens: endpoint returns correct data but first-query lazy PageRank on a cold DB took ~7 min (debug build) with no single-flight or UI feedback — filed as nw-029; not reproducible on fixture-scale DBs.
