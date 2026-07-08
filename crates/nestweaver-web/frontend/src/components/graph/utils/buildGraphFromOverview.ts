@@ -150,8 +150,43 @@ export function buildGraphFromOverview(result: OverviewResponse): Graph {
       graph.addEdge(parent, item.uid, {
         type: "overview",
         confidence: Math.max(item.score / maxScore, 0.18),
+        // Varied rest lengths break the perfect-radius starburst: without
+        // this, uniform link distances settle every member onto one ring
+        linkDistance: 26 + hashUnit(`${item.uid}:len`) * 34,
       });
     }
+  });
+
+  // Sibling links: chain a fraction of each galaxy's members to a nearby
+  // sibling so galaxies develop internal clumps and filaments instead of
+  // pure hub-and-spoke symmetry (the "circle look" killer)
+  const byParent = new Map<string, string[]>();
+  for (const item of members) {
+    const parent = parentRepoUid(item.uid);
+    if (!parent || !graph.hasNode(parent)) continue;
+    const list = byParent.get(parent) ?? [];
+    list.push(item.uid);
+    byParent.set(parent, list);
+  }
+  for (const [, uids] of byParent) {
+    for (let i = 1; i < uids.length; i++) {
+      if (hashUnit(`${uids[i]}:sib`) < 0.45) {
+        const j = Math.floor(hashUnit(`${uids[i]}:pick`) * i);
+        if (!graph.hasEdge(uids[j], uids[i]) && !graph.hasEdge(uids[i], uids[j])) {
+          graph.addEdge(uids[j], uids[i], {
+            type: "overview",
+            confidence: 0.14,
+            linkDistance: 20 + hashUnit(`${uids[i]}:siblen`) * 22,
+          });
+        }
+      }
+    }
+  }
+
+  // Subtle depth variance for parallax richness (the scene stays 2.5D;
+  // camera rotation remains disabled)
+  graph.forEachNode((uid) => {
+    graph.setNodeAttribute(uid, "z", (hashUnit(`${uid}:z`) - 0.5) * 44);
   });
 
   return graph;

@@ -327,6 +327,25 @@ test.describe("P0 foundation release gates", () => {
     );
   });
 
+  test("graph shaders compile without errors", async ({ page, request }) => {
+    // Regression guard: a GLSL error in the custom node/edge shaders makes
+    // every mark silently vanish while edges/labels keep rendering — the
+    // nonblank check alone cannot catch it. Any THREE program error fails.
+    const shaderErrors: string[] = [];
+    page.on("console", (message) => {
+      const text = message.text();
+      if (/THREE\.WebGLProgram|Shader Error|Fragment shader|Vertex shader/i.test(text)) {
+        shaderErrors.push(text.slice(0, 300));
+      }
+    });
+
+    await openGraph(page, request);
+    // Give the composer + instanced materials a frame to compile everything
+    await page.waitForTimeout(1500);
+
+    expect(shaderErrors, shaderErrors.join("\n---\n")).toHaveLength(0);
+  });
+
   test("gap analysis failures surface a notification", async ({
     page,
     request,

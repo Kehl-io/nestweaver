@@ -109,10 +109,12 @@ export function EdgeInstanceMesh({ buffers }: Props) {
       setIsDark(dark);
       material.uniforms.u_edgeColor.value = dark
         ? [0.345, 0.357, 0.439]
-        : [0.612, 0.627, 0.690];
-      // Galaxy tinting is a dark-mode treatment; light mode keeps calm gray
+        : [0.58, 0.60, 0.66];
+      material.uniforms.u_opacity.value = dark ? 0.5 : 0.62;
+      // Galaxy tinting reads at full strength in dark; light mode keeps a
+      // gentler tint so the web still has identity without the glow
       material.uniforms.u_tintAmp.value =
-        dark && buffers.edgeCount <= ADDITIVE_EDGE_LIMIT ? 1 : 0;
+        buffers.edgeCount <= ADDITIVE_EDGE_LIMIT ? (dark ? 1 : 0.55) : 0;
     }
     updateTheme();
     const observer = new MutationObserver(updateTheme);

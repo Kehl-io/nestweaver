@@ -67,9 +67,16 @@ export function useForceLayout(): ForceLayoutControls {
       });
     });
 
-    const links: Array<{ source: string; target: string }> = [];
-    graph.forEachEdge((_edge, _attrs, sourceUid, targetUid) => {
-      links.push({ source: sourceUid, target: targetUid });
+    const links: Array<{ source: string; target: string; distance: number }> = [];
+    graph.forEachEdge((_edge, attrs, sourceUid, targetUid) => {
+      links.push({
+        source: sourceUid,
+        target: targetUid,
+        // Per-link rest lengths (varied by the builders) break the
+        // uniform-radius starburst that reads as "nodes in a circle"
+        distance:
+          typeof attrs.linkDistance === "number" ? attrs.linkDistance : 30,
+      });
     });
 
     const nodeIds = nodes.map((n) => n.id);

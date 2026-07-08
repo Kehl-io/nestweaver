@@ -271,6 +271,8 @@ function CameraFitController({
     [buffers.indexToUid],
   );
   const cameraFitRequestId = useStore((s) => s.cameraFitRequestId);
+  const graphMode = useStore((s) => s.graphMode);
+  const layoutMode = useStore((s) => s.layoutMode);
   const fittedKeyRef = useRef("");
 
   useEffect(() => {
@@ -296,6 +298,15 @@ function CameraFitController({
 
     if (!Number.isFinite(minX) || !Number.isFinite(minY)) return;
 
+    // The Start Here shelf overlays the canvas's left ~340px in the panels
+    // overview — widen the left bound so the constellation centers in the
+    // *unobscured* area instead of hiding behind the card
+    if (graphMode === "overview" && layoutMode !== "zen") {
+      const overlayPx = Math.min(340, canvasSize.width * 0.4);
+      const visiblePx = Math.max(canvasSize.width - overlayPx, 1);
+      minX -= (maxX - minX) * (overlayPx / visiblePx);
+    }
+
     const centerX = (minX + maxX) / 2;
     const centerY = (minY + maxY) / 2;
     const boundsWidth = Math.max(1, maxX - minX);
@@ -305,13 +316,13 @@ function CameraFitController({
     const fov = ((perspective.fov ?? 50) * Math.PI) / 180;
     const fitHeightZ = boundsHeight / (2 * Math.tan(fov / 2));
     const fitWidthZ = boundsWidth / (2 * Math.tan(fov / 2) * aspect);
-    const z = Math.min(900, Math.max(300, Math.max(fitHeightZ, fitWidthZ) * 1.2));
+    const z = Math.min(900, Math.max(230, Math.max(fitHeightZ, fitWidthZ) * 1.15));
 
     camera.position.set(centerX, centerY, z);
     (controls as any).target.set(centerX, centerY, 0);
     (controls as any).update?.();
     fittedKeyRef.current = fitKey;
-  }, [buffers, cameraFitRequestId, canvasSize.height, canvasSize.width, camera, controls, graphKey]);
+  }, [buffers, cameraFitRequestId, canvasSize.height, canvasSize.width, camera, controls, graphKey, graphMode, layoutMode]);
 
   return null;
 }
@@ -564,7 +575,7 @@ export function GraphCanvas() {
                       mipmapBlur
                       luminanceThreshold={0.95}
                       luminanceSmoothing={0.12}
-                      intensity={0.75}
+                      intensity={0.95}
                     />
                     {/* Khronos PBR Neutral: hue-preserving compression — ACES
                         desaturates the vivid kind palette toward white (verified:
