@@ -81,7 +81,9 @@ export function useOverviewMode() {
       );
     }
     try {
-      const result = await loadScopedOverview(24, requestWorkspaceId);
+      // Starfield density: the constellation should feel populated. Server
+      // clamps at 100; per-galaxy caps in the builder keep it readable.
+      const result = await loadScopedOverview(96, requestWorkspaceId);
       if (!isCurrentRequest()) return;
 
       const graph = buildGraphFromOverview(result);

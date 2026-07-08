@@ -56,12 +56,27 @@ function memberSeedPosition(
   };
 }
 
+const MAX_MEMBERS_PER_GALAXY = 14;
+
 export function buildGraphFromOverview(result: OverviewResponse): Graph {
   const graph = new Graph({ type: "directed", multi: true });
   const maxScore = Math.max(...result.landmarks.map((n) => n.score), 0.001);
 
   const hubs = result.landmarks.filter((item) => item.kind === "repo");
-  const members = result.landmarks.filter((item) => item.kind !== "repo");
+  // Cap members per galaxy so one huge repo can't hairball the scene;
+  // deterministic (score-then-uid ordered) so reloads stay stable
+  const perGalaxy = new Map<string, number>();
+  const members = result.landmarks
+    .filter((item) => item.kind !== "repo")
+    .sort((a, b) => (a.score === b.score ? a.uid.localeCompare(b.uid) : b.score - a.score))
+    .filter((item) => {
+      const parent = parentRepoUid(item.uid);
+      if (!parent) return true;
+      const count = perGalaxy.get(parent) ?? 0;
+      if (count >= MAX_MEMBERS_PER_GALAXY) return false;
+      perGalaxy.set(parent, count + 1);
+      return true;
+    });
   const hubPositions = new Map<string, { x: number; y: number }>();
   const memberCounts = new Map<string, number>();
 
@@ -117,7 +132,7 @@ export function buildGraphFromOverview(result: OverviewResponse): Graph {
       label: item.label,
       x: position.x,
       y: position.y,
-      size: 11 + normalized * 4,
+      size: 9 + normalized * 3,
       color: landmarkColor(item),
       paletteKind: landmarkPaletteKind(item),
       kind: item.kind,

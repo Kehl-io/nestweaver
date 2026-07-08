@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useRef, useState, useEffect, useLayoutEffect } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
-import { EffectComposer, Bloom, ToneMapping, Vignette } from "@react-three/postprocessing";
+import { EffectComposer, Bloom, Noise, ToneMapping, Vignette } from "@react-three/postprocessing";
 import { ToneMappingMode } from "postprocessing";
 import { NodeInstanceMesh } from "./NodeInstanceMesh";
 import { EdgeInstanceMesh } from "./EdgeInstanceMesh";
@@ -12,6 +12,7 @@ import { useGPUPicking } from "../../hooks/useGPUPicking";
 import { useStore } from "../../stores";
 import { CameraZoomBridge } from "./CameraZoomBridge";
 import { CommunityOverlay } from "./overlays/CommunityOverlay";
+import { NebulaBackdrop } from "./NebulaBackdrop";
 
 // ---- Reduced motion hook ----
 
@@ -431,6 +432,48 @@ class ImmediateResizeObserver implements ResizeObserver {
   };
 }
 
+// Idle camera drift: a barely-there parallax sway once the user has been
+// hands-off for a while — the reconciled version of CBM's auto-rotation
+// (design decision: camera may drift; the graph never moves after settle)
+function CameraDrift({ enabled }: { enabled: boolean }) {
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls);
+  const idleSinceRef = useRef(performance.now());
+  const driftRef = useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    if (!controls) return;
+    const markActive = () => {
+      idleSinceRef.current = performance.now();
+    };
+    (controls as unknown as { addEventListener: (e: string, f: () => void) => void })
+      .addEventListener("start", markActive);
+    window.addEventListener("pointerdown", markActive);
+    window.addEventListener("keydown", markActive);
+    return () => {
+      (controls as unknown as { removeEventListener: (e: string, f: () => void) => void })
+        .removeEventListener("start", markActive);
+      window.removeEventListener("pointerdown", markActive);
+      window.removeEventListener("keydown", markActive);
+    };
+  }, [controls]);
+
+  useFrame(({ clock }) => {
+    const idleMs = performance.now() - idleSinceRef.current;
+    // Ease drift in after 6s idle, out instantly on interaction
+    const ramp = enabled ? Math.min(1, Math.max(0, (idleMs - 6000) / 4000)) : 0;
+    const t = clock.getElapsedTime();
+    const targetX = Math.sin(t * 0.105) * 4 * ramp;
+    const targetY = Math.cos(t * 0.083) * 3 * ramp;
+    const prev = driftRef.current;
+    camera.position.x += targetX - prev.x;
+    camera.position.y += targetY - prev.y;
+    driftRef.current = { x: targetX, y: targetY };
+  });
+
+  return null;
+}
+
 // ---- Main canvas ----
 
 export function GraphCanvas() {
@@ -479,9 +522,11 @@ export function GraphCanvas() {
           >
             <color attach="background" args={[bgColor]} />
             <ambientLight intensity={1} />
+            {isDark && <NebulaBackdrop reducedMotion={reducedMotion} />}
             <CanvasSizeBridge pixelRatio={pixelRatio} />
             <CameraZoomBridge />
             <CameraFitController buffers={buffers} canvasSize={canvasSize} />
+            <CameraDrift enabled={!reducedMotion && !focusMap} />
             {buffers.nodeCount > 0 && (
               <>
                 <CommunityOverlay />
@@ -491,16 +536,21 @@ export function GraphCanvas() {
                 <NodeLabels buffers={buffers} />
                 {isDark && !reducedMotion && (
                   <EffectComposer>
+                    {/* HDR-selective: only deliberately over-1.0 emissives bloom
+                        (loud tier = focus/hubs/bridges); ambient shimmer lives in
+                        the node shader's halo term below this threshold */}
                     <Bloom
                       mipmapBlur
-                      luminanceThreshold={0.74}
-                      luminanceSmoothing={0.22}
-                      intensity={0.42}
+                      luminanceThreshold={0.95}
+                      luminanceSmoothing={0.12}
+                      intensity={0.75}
                     />
-                    {/* Filmic curve rolls >1.0 emissive cores into soft shoulders
-                        instead of clipping to white (design: HDR product-photo look) */}
-                    <ToneMapping mode={ToneMappingMode.ACES_FILMIC} />
-                    <Vignette eskil={false} offset={0.24} darkness={0.55} />
+                    {/* Khronos PBR Neutral: hue-preserving compression — ACES
+                        desaturates the vivid kind palette toward white (verified:
+                        modelviewer.dev tone-mapping study, SIGGRAPH 2024) */}
+                    <ToneMapping mode={ToneMappingMode.NEUTRAL} />
+                    <Noise premultiply opacity={0.05} />
+                    <Vignette eskil={false} offset={0.24} darkness={0.5} />
                   </EffectComposer>
                 )}
               </>

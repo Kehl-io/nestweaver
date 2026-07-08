@@ -57,7 +57,10 @@ void main() {
     float breathe = 1.0 + u_breatheAmp * sin(u_time * 0.8 + aPhase * 6.2831);
     float focusLift = 1.0 + aHighlight * 0.18 + aSeed * 0.04;
     float baseScale = 0.45;
-    float scale = aSize * baseScale * introScale * breathe * focusLift;
+    // Quads are enlarged 1.6x purely for the ambient halo ring; the disc
+    // body keeps its world size (fragment dist is compensated). Picking is
+    // CPU-side over aSize, so hit areas are unaffected.
+    float scale = aSize * baseScale * introScale * breathe * focusLift * 1.6;
 
     vec3 pos = position * scale;
 
@@ -78,10 +81,12 @@ varying float v_phase;
 
 uniform float u_time;
 uniform vec3 u_strokeColor;
+uniform float u_haloAmp;
 
 void main() {
     vec2 uv = v_uv - 0.5;
-    float dist = length(uv) * 2.0;
+    // Quad is 1.6x oversized for the halo; dist=1.0 is the disc edge
+    float dist = length(uv) * 3.2;
 
     float body = 1.0 - smoothstep(0.92, 0.985, dist);
     float core = exp(-3.5 * dist * dist);
@@ -101,8 +106,9 @@ void main() {
     vec3 rimColor = color * 0.68;
     color = mix(color, rimColor, rim * 0.30);
     color += u_strokeColor * bloom * (core * 0.20 + rim * 0.26) * smoothstep(0.35, 1.0, bloom);
-    // Emissive lift above 1.0 on loud nodes feeds the bloom pass (HDR corona)
-    color *= 1.0 + bloom * bloom * 0.9;
+    // Emissive lift above 1.0 on loud nodes feeds the HDR-selective bloom
+    // pass (threshold ~1.0); ambient nodes stay below and never bloom
+    color *= 1.0 + bloom * bloom * 1.6;
 
     // Selection stroke ring: thin annulus at edge
     float ringInner = smoothstep(0.78, 0.82, dist);
@@ -110,8 +116,16 @@ void main() {
     float ring = ringInner * ringOuter * v_highlight;
     color = mix(color, u_strokeColor, ring * 0.92);
 
-    float alpha = max(body, ring);
+    // Ambient halo outside the disc: the below-bloom shimmer that makes the
+    // resting field feel alive (design: universal glow floor, density-gated
+    // via u_haloAmp; dark mode only)
+    float halo = exp(-2.4 * max(dist - 0.95, 0.0)) * step(0.95, dist);
+    float haloAlpha = halo * 0.22 * u_haloAmp * (0.6 + 0.4 * v_importance);
+
+    float alpha = max(body, ring) + haloAlpha;
     if (alpha < 0.012) discard;
+    vec3 haloColor = v_color * (0.85 + bloom * 0.3);
+    color = mix(haloColor, color, clamp(body + ring, 0.0, 1.0));
     gl_FragColor = vec4(color, alpha);
 }
 `;
@@ -144,6 +158,7 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
       u_motionAmp: { value: reducedMotion ? 0 : 1 },
       u_intro: { value: reducedMotion ? 1 : 0 },
       u_strokeColor: { value: [0.369, 0.816, 0.996] },
+      u_haloAmp: { value: 0 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -156,19 +171,21 @@ export function NodeInstanceMesh({ buffers, reducedMotion = false }: Props) {
     if (reducedMotion) uniforms.u_intro.value = 1;
   }, [reducedMotion, uniforms]);
 
-  // Theme-reactive stroke color
+  // Theme-reactive stroke color + halo gate (dark mode only; halo also
+  // gates off on very dense scenes to bound additive fill cost)
   useEffect(() => {
     function updateStroke() {
       const isDark = document.documentElement.classList.contains("dark");
       uniforms.u_strokeColor.value = isDark
         ? [0.369, 0.816, 0.996]
         : [0.031, 0.384, 0.655];
+      uniforms.u_haloAmp.value = isDark && buffers.nodeCount <= 2000 ? 1 : 0;
     }
     updateStroke();
     const observer = new MutationObserver(updateStroke);
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
     return () => observer.disconnect();
-  }, [uniforms]);
+  }, [uniforms, buffers.nodeCount]);
 
   const introStartRef = useRef<number | null>(null);
 

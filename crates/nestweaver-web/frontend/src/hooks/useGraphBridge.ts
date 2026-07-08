@@ -23,6 +23,8 @@ export interface GraphBuffers {
   edgeColors: Float32Array;
   /** [sourceIndex0, targetIndex0, ...] length = edgeCount * 2 */
   edgeNodeIndices: Int32Array;
+  /** [t0, t1, ...] length = edgeCount, 1 = intra-galaxy tinted edge */
+  edgeTints: Float32Array;
   uidToIndex: Map<string, number>;
   indexToUid: string[];
   nodeCount: number;
@@ -40,6 +42,7 @@ export const EMPTY_BUFFERS: GraphBuffers = {
   edgePositions: new Float32Array(0),
   edgeColors: new Float32Array(0),
   edgeNodeIndices: new Int32Array(0),
+  edgeTints: new Float32Array(0),
   uidToIndex: new Map(),
   indexToUid: [],
   nodeCount: 0,
@@ -68,11 +71,11 @@ function hexToRgb(hex: string): [number, number, number] {
   return [0.5, 0.5, 0.5];
 }
 
-function edgeColorForType(type: unknown, isDark: boolean): [number, number, number] | null {
+function edgeColorForType(type: unknown, _isDark: boolean): [number, number, number] | null {
   if (typeof type !== "string") return null;
-  if (type === "overview") {
-    return isDark ? hexToRgb("#64748b") : hexToRgb("#6b7280");
-  }
+  // "overview" (intra-galaxy) edges intentionally return null so the
+  // node-color fallback tints them with their galaxy's hue (glowing web)
+  if (type === "overview") return null;
   const color = EDGE_COLORS[type];
   return color ? hexToRgb(color) : null;
 }
@@ -249,6 +252,8 @@ export function useGraphBridge(): GraphBuffers {
     const edgePositions = new Float32Array(edgeCount * 6);
     const edgeColors = new Float32Array(edgeCount * 6);
     const edgeNodeIndices = new Int32Array(edgeCount * 2);
+    // 1 = intra-galaxy edge (tinted glowing web), 0 = cross-cutting (neutral)
+    const edgeTints = new Float32Array(edgeCount);
 
     let ei = 0;
     graph.forEachEdge((_edge, _attrs, sourceUid, targetUid) => {
@@ -286,6 +291,8 @@ export function useGraphBridge(): GraphBuffers {
         edgeColors[ei * 6 + 3] = targetColor[0];
         edgeColors[ei * 6 + 4] = targetColor[1];
         edgeColors[ei * 6 + 5] = targetColor[2];
+
+        edgeTints[ei] = _attrs.type === "overview" ? 1 : 0;
       }
 
       ei++;
@@ -302,6 +309,7 @@ export function useGraphBridge(): GraphBuffers {
       edgePositions,
       edgeColors,
       edgeNodeIndices,
+      edgeTints,
       uidToIndex,
       indexToUid,
       nodeCount,
