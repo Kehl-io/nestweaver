@@ -100,3 +100,30 @@ jobs:
           files: |
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256
+
+  publish-npm:
+    name: Publish npm wrapper
+    needs: [release-please, build]
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      # The wrapper's postinstall downloads the matching release binary, so it
+      # must publish only after the `build` job has uploaded the assets for
+      # this tag. No-ops with a clear message until NPM_TOKEN is configured,
+      # so releases stay green before the secret exists.
+      - name: Publish to npm
+        working-directory: npm
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN not set — skipping npm publish."
+            echo "Add the NPM_TOKEN repo secret to enable automatic publishing."
+            exit 0
+          fi
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -55,6 +55,12 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
 cp "$SCRIPT_DIR/Info.plist" "$APP_DIR/Contents/"
+# Stamp the bundle version from version.txt (release-please keeps it current)
+# so Finder/About match the nestweaver binary the bundle wraps.
+VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/version.txt")"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_DIR/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP_DIR/Contents/Info.plist"
+echo "      Stamped app bundle version: $VERSION"
 cp "$REPO_ROOT/target/release/NestWeaverLauncher" "$APP_DIR/Contents/MacOS/NestWeaver"
 cp "$REPO_ROOT/target/release/nestweaver" "$APP_DIR/Contents/MacOS/nestweaver-cli"
 cp "$ICNS" "$APP_DIR/Contents/Resources/AppIcon.icns"
