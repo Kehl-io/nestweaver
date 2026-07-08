@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.0](https://github.com/Kehl-io/nestweaver/compare/v2.2.1...v2.3.0) (2026-07-08)
+
+
+### Features
+
+* **web:** search-first task-lens UI overhaul with constellation view ([#122](https://github.com/Kehl-io/nestweaver/issues/122)) ([424d879](https://github.com/Kehl-io/nestweaver/commit/424d879858cd7b9c4d96354a5fec62cfafbd1a11))
+
 ## [2.2.1](https://github.com/Kehl-io/nestweaver/compare/v2.2.0...v2.2.1) (2026-07-07)
 
 
