@@ -433,6 +433,23 @@ class ImmediateResizeObserver implements ResizeObserver {
   };
 }
 
+// Under reduced motion the scene is static between interactions, so frames
+// render on demand only (battery + "screenshot-perfect still"). Store-driven
+// scene changes must invalidate explicitly in that mode.
+function InvalidateOnStoreChange() {
+  const invalidate = useThree((s) => s.invalidate);
+  const graphVersion = useStore((s) => s.graphVersion);
+  const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const hoveredNodeId = useStore((s) => s.hoveredNodeId);
+  const cameraFitRequestId = useStore((s) => s.cameraFitRequestId);
+
+  useEffect(() => {
+    invalidate();
+  }, [graphVersion, selectedNodeId, hoveredNodeId, cameraFitRequestId, invalidate]);
+
+  return null;
+}
+
 // Idle camera drift: a barely-there parallax sway once the user has been
 // hands-off for a while — the reconciled version of CBM's auto-rotation
 // (design decision: camera may drift; the graph never moves after settle)
@@ -506,6 +523,7 @@ export function GraphCanvas() {
         >
           <Canvas
             camera={{ position: [0, 0, 500], fov: 50, near: 0.1, far: 10000 }}
+            frameloop={reducedMotion ? "demand" : "always"}
             dpr={[1, pixelRatio]}
             resize={{
               offsetSize: true,
@@ -528,6 +546,7 @@ export function GraphCanvas() {
             <CameraZoomBridge />
             <CameraFitController buffers={buffers} canvasSize={canvasSize} />
             <CameraDrift enabled={!reducedMotion && !focusMap} />
+            <InvalidateOnStoreChange />
             {buffers.nodeCount > 0 && (
               <>
                 <CommunityOverlay />

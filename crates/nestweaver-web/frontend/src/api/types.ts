@@ -52,6 +52,8 @@ export interface BrainNode {
   title: string;
   location: string;
   relevance: number;
+  /** Normalized betweenness for the scene's top bridges (absent otherwise) */
+  bridge_score?: number;
 }
 
 export interface BrainContextResult {
@@ -77,6 +79,8 @@ export interface OverviewLandmark {
   location: string;
   score: number;
   reason: string;
+  /** Normalized betweenness for the scene's top bridges (absent otherwise) */
+  bridge_score?: number;
 }
 
 export interface OverviewGap {

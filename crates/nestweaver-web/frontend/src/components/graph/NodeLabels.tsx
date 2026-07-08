@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useThree } from "@react-three/fiber";
 import { Html } from "@react-three/drei";
 import { useStore } from "../../stores";
 import type { GraphBuffers } from "../../hooks/useGraphBridge";
@@ -6,6 +6,12 @@ import type { GraphBuffers } from "../../hooks/useGraphBridge";
 interface Props {
   buffers: GraphBuffers;
 }
+
+// Constant-density label grid (sigma.js pattern, verified): the viewport is
+// divided into fixed-pixel cells and each cell shows only its worthiest
+// label — label count scales with screen area, not node count, so density
+// stays readable from 20 nodes to 10k.
+const LABEL_CELL_PX = 100;
 
 function truncateLabel(name: string, max = 20): string {
   return name.length > max ? name.slice(0, max) + "…" : name;
@@ -17,17 +23,8 @@ export function NodeLabels({ buffers }: Props) {
   const hoveredNodeId = useStore((s) => s.hoveredNodeId);
   const cameraZoom = useStore((s) => s.cameraZoom);
   const layoutMode = useStore((s) => s.layoutMode);
+  const canvasSize = useThree((s) => s.size);
   const focusMap = layoutMode === "zen";
-
-  // Compute median size for filtering at medium zoom
-  const medianSize = useMemo(() => {
-    if (buffers.nodeCount === 0) return 6;
-    const sorted = Array.from(buffers.sizes).sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 === 0
-      ? (sorted[mid - 1] + sorted[mid]) / 2
-      : sorted[mid];
-  }, [buffers.sizes, buffers.nodeCount]);
 
   if (!graphInstance || buffers.nodeCount === 0) return null;
 
@@ -69,16 +66,10 @@ export function NodeLabels({ buffers }: Props) {
       graphInstance.hasNode(uid) &&
       (uid === activeNodeId || graphInstance.hasEdge(activeNodeId, uid) || graphInstance.hasEdge(uid, activeNodeId));
 
-    // Zoom-aware visibility:
-    // - Zoomed in (z < 300): show all labels
-    // - Default zoom (300-600): show labels for nodes with size > median
-    // - Zoomed out (z > 600): show only seed labels
-    // Selected/hovered are always visible regardless of zoom
+    // Focus-map narrows candidates to the active neighborhood; the screen-
+    // space grid below handles density at every zoom level
     if (!isSelected && !isHovered) {
       if (focusMap && activeNodeId && !isRelatedToActive && !forceLabel) return;
-      if (focusMap && !activeNodeId && !forceLabel && size <= medianSize) return;
-      if (cameraZoom > 600 && !forceLabel) return;
-      if (cameraZoom >= 300 && cameraZoom <= 600 && size <= medianSize && !forceLabel) return;
     }
 
     const rawLabel = (attrs.label as string) || uid.split(":").pop() || uid;
@@ -121,12 +112,39 @@ export function NodeLabels({ buffers }: Props) {
     });
   });
 
+  // Constant-density selection: bin candidates into fixed-pixel screen
+  // cells and keep the worthiest label per cell (selected > hovered >
+  // force-labeled > size). World→screen scale for the perspective camera:
+  // px-per-world-unit ≈ viewportHeight / (2·tan(fov/2)·cameraZ), fov 50°.
+  const pxPerWorld =
+    canvasSize.height / (2 * Math.tan((50 * Math.PI) / 360) * Math.max(cameraZoom, 1));
+  const cellBest = new Map<string, { score: number; index: number }>();
+  labelNodes.forEach((node, index) => {
+    const score = node.isSelected
+      ? 4e12
+      : node.isHovered
+        ? 2e12
+        : (node.forceLabel ? 1e6 : 0) + node.size;
+    const cx = Math.floor((node.x * pxPerWorld) / LABEL_CELL_PX);
+    const cy = Math.floor((node.y * pxPerWorld) / LABEL_CELL_PX);
+    const key = `${cx}:${cy}`;
+    const best = cellBest.get(key);
+    if (!best || score > best.score) cellBest.set(key, { score, index });
+  });
+  const keptIndices = new Set(
+    [...cellBest.values()].map((entry) => entry.index),
+  );
+  const visibleLabels = labelNodes.filter(
+    (node, index) =>
+      node.isSelected || node.isHovered || keptIndices.has(index),
+  );
+
   // Font size scales inversely with zoom: bigger when close, smaller when far
   const baseFontSize = cameraZoom < 300 ? 12 : cameraZoom < 600 ? 11 : 10;
 
   return (
     <>
-      {labelNodes.map((node) => {
+      {visibleLabels.map((node) => {
         const isHighlighted = node.isSelected || node.isHovered;
         return (
           <Html

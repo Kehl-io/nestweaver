@@ -111,6 +111,7 @@ export function buildGraphFromOverview(result: OverviewResponse): Graph {
       // "everything is loud" downstream (emissive/bloom). Spread importance
       // by how much of the indexed scene each galaxy owns instead.
       relevance: 0.35 + memberShare * 0.65,
+      bridgeScore: item.bridge_score ?? 0,
       reason: item.reason,
       forceLabel: true,
       isSeed: index < 8,
@@ -138,6 +139,7 @@ export function buildGraphFromOverview(result: OverviewResponse): Graph {
       kind: item.kind,
       location: item.location,
       relevance: 0.15 + normalized * 0.25,
+      bridgeScore: item.bridge_score ?? 0,
       reason: item.reason,
       forceLabel: false,
       isSeed: index < 2 && hubs.length === 0,

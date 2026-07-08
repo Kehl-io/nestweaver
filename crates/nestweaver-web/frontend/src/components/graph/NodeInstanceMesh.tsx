@@ -159,9 +159,23 @@ void main() {
     float haloAlpha = halo * 0.22 * u_haloAmp * (0.6 + 0.4 * v_importance);
 
     float alpha = max(body, ring) + haloAlpha;
-    if (alpha < 0.012) discard;
     vec3 haloColor = v_color * (0.85 + bloom * 0.3);
     color = mix(haloColor, color, clamp(body + ring, 0.0, 1.0));
+
+    // Bridge convergence ring: Spark green (the reserved hue), slowly
+    // contracting inward — betweenness made literal, "flow pulled in from
+    // all directions". Freezes at mid-phase under reduced motion.
+    if (v_bridge > 0.5) {
+      float phase = mix(0.5, fract(u_time * 0.22 + v_seed), u_motionAmp);
+      float radius = mix(1.45, 0.95, phase);
+      float bridgeRing = smoothstep(0.10, 0.0, abs(dist - radius)) * clamp((v_bridge - 0.5) * 2.0, 0.0, 1.0);
+      vec3 spark = vec3(0.302, 1.0, 0.0);
+      // Above-1.0 contribution joins the bloom set (locked decision)
+      color += spark * bridgeRing * 1.25;
+      alpha = max(alpha, bridgeRing * 0.85);
+    }
+
+    if (alpha < 0.012) discard;
     gl_FragColor = vec4(color, alpha);
 }
 `;

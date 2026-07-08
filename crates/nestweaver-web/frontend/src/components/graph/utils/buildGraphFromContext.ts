@@ -37,6 +37,7 @@ export function buildGraphFromContext(result: BrainContextResult): Graph {
       kind: node.kind,
       location: node.location,
       relevance: node.relevance,
+      bridgeScore: node.bridge_score ?? 0,
       isSeed,
       forceLabel: isSeed,
     });

@@ -238,10 +238,15 @@ export function useGraphBridge(): GraphBuffers {
       const degreeScore = maxDegree > 0 ? degree / maxDegree : 0;
       importance[ni] = Math.min(1, Math.max(relevanceScore, degreeScore * 0.7));
       seedMarkers[ni] = attrs.isSeed === true || seedSet.has(uid) ? 1 : 0;
+      // Real betweenness from the backend when present (top-12 per scene,
+      // normalized); degree heuristic only as a fallback for older payloads
+      const bridgeScore = numericMetric(attrs, ["bridgeScore"]);
       bridgeStrengths[ni] =
-        degree >= 3 && degreeScore >= 0.45 && seedMarkers[ni] === 0
-          ? Math.min(1, degreeScore)
-          : 0;
+        bridgeScore > 0
+          ? Math.min(1, bridgeScore)
+          : degree >= 3 && degreeScore >= 0.45 && seedMarkers[ni] === 0
+            ? Math.min(1, degreeScore)
+            : 0;
 
       ni++;
     });

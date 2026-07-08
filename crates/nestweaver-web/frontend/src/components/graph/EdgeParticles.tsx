@@ -16,6 +16,7 @@ const vertexShader = `
   attribute vec3 aTarget;
   attribute float aPhase;
   attribute float aBurst;
+  attribute float aChannel;
 
   uniform float u_time;
   uniform float u_burstStart;
@@ -35,16 +36,22 @@ const vertexShader = `
       }
     }
 
-    float speed = 0.3 * (1.0 + burst * 2.0);
+    // Bridge channeling: pulses on bridge-incident edges stream toward the
+    // bridge node (betweenness made kinetic; capped to top scene bridges)
+    float channel = abs(aChannel);
+    float speed = 0.3 * (1.0 + burst * 2.0 + channel * 0.4);
     float t = fract(u_time * speed + aPhase);
+    if (aChannel < -0.5) t = 1.0 - t;
     vec3 pos = mix(aSource, aTarget, t);
 
     float centerDist = abs(t - 0.5) * 2.0;
-    v_alpha = exp(-3.0 * centerDist * centerDist) * (1.0 + burst * 1.2);
-    v_color = u_particleColor;
+    v_alpha = exp(-3.0 * centerDist * centerDist) * (1.0 + burst * 1.2 + channel * 0.5);
+    // Channeled pulses lean toward Spark green as they approach the bridge
+    float approach = aChannel > 0.5 ? t : (aChannel < -0.5 ? t : 0.0);
+    v_color = mix(u_particleColor, vec3(0.302, 1.0, 0.0), channel * approach * 0.55);
 
     vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
-    gl_PointSize = (2.0 + burst * 1.5) * (300.0 / -mvPosition.z);
+    gl_PointSize = (2.0 + burst * 1.5 + channel * 0.8) * (300.0 / -mvPosition.z);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -104,6 +111,19 @@ export function EdgeParticles({ buffers }: Props) {
       "aBurst",
       new Float32BufferAttribute(new Float32Array(n), 1),
     );
+
+    // aChannel: +1 when the target is a scene bridge, -1 when the source is
+    // (pulses always flow toward the bridge); bridges are already capped to
+    // the scene's top 12 by the backend
+    const channels = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const s = buffers.edgeNodeIndices[i * 2];
+      const t = buffers.edgeNodeIndices[i * 2 + 1];
+      const sBridge = buffers.bridgeStrengths[s] > 0.5;
+      const tBridge = buffers.bridgeStrengths[t] > 0.5;
+      channels[i] = tBridge ? 1 : sBridge ? -1 : 0;
+    }
+    geo.setAttribute("aChannel", new Float32BufferAttribute(channels, 1));
     geo.computeBoundingSphere();
   }, [buffers]);
 
