@@ -1011,3 +1011,149 @@ async fn p1_workspace_catalog_is_bounded_and_discloses_truncation() {
     assert_eq!(json["_meta"]["truncation"]["omitted_count"], 101);
     assert_eq!(json["_meta"]["continuation"]["has_more"], true);
 }
+
+/// Bridge-score contract on the overview payload: `bridge_score` is an
+/// additive optional field set on at most 12 landmarks per scene, values
+/// normalized 0..=1 by the scene max, and omitted everywhere else.
+///
+/// In the fixture graph, `sym:alpha:parse` is the sole cut vertex (the
+/// undirected edges parse->format and parse->beta:parse make it the middle
+/// of a path), so it is the only node with positive betweenness.
+#[tokio::test]
+async fn p1_overview_landmarks_expose_scene_bridge_scores() {
+    let app = make_app();
+
+    // Cold call also warms the process-wide bridge pool cache.
+    let cold_start = std::time::Instant::now();
+    let (status, json) = get_json(&app, "/api/v1/overview?limit=20").await;
+    let cold_elapsed = cold_start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+
+    let landmarks = json["landmarks"].as_array().unwrap();
+    let bridged: Vec<&Value> = landmarks
+        .iter()
+        .filter(|item| !item["bridge_score"].is_null())
+        .collect();
+
+    assert!(
+        !bridged.is_empty(),
+        "fixture has a cut vertex, so at least one landmark should carry a bridge_score"
+    );
+    assert!(
+        bridged.len() <= 12,
+        "bridge_score must be set on at most 12 landmarks per scene, got {}",
+        bridged.len()
+    );
+    for item in &bridged {
+        let score = item["bridge_score"]
+            .as_f64()
+            .expect("bridge_score must be a number");
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "bridge_score must be normalized 0..=1, got {score} on {}",
+            item["uid"]
+        );
+    }
+    // Normalization is by the scene max, so the strongest bridge reads 1.0.
+    let max = bridged
+        .iter()
+        .filter_map(|item| item["bridge_score"].as_f64())
+        .fold(f64::MIN, f64::max);
+    assert!(
+        (max - 1.0).abs() < 1e-6,
+        "top scene bridge should normalize to 1.0, got {max}"
+    );
+    // The fixture's cut vertex is the top bridge.
+    assert!(
+        bridged.iter().any(|item| item["uid"] == "sym:alpha:parse"),
+        "sym:alpha:parse is the fixture's cut vertex and must carry a bridge_score"
+    );
+    // Non-bridge landmarks omit the field entirely (backward-compatible
+    // additive contract; serde skips None).
+    let non_bridge = landmarks
+        .iter()
+        .find(|item| item["uid"] == "repo:alpha")
+        .expect("repo landmark present");
+    assert!(
+        non_bridge.get("bridge_score").is_none(),
+        "non-bridge landmarks must omit bridge_score, not serialize null"
+    );
+
+    // Latency budget: the betweenness pool is computed once per process and
+    // cached on AppState, so warm requests only pay a hash lookup. On this
+    // fixture even the cold call runs exact Brandes over a handful of nodes
+    // in well under a millisecond; the generous bounds only guard against
+    // pathological regressions on slow CI machines.
+    let warm_start = std::time::Instant::now();
+    let (warm_status, _) = get_json(&app, "/api/v1/overview?limit=20").await;
+    let warm_elapsed = warm_start.elapsed();
+    assert_eq!(warm_status, StatusCode::OK);
+    assert!(
+        cold_elapsed < std::time::Duration::from_millis(2000),
+        "cold overview (incl. bridge pool build) took {cold_elapsed:?}"
+    );
+    assert!(
+        warm_elapsed < std::time::Duration::from_millis(1000),
+        "warm overview took {warm_elapsed:?}"
+    );
+}
+
+/// Bridge-score contract on brain-context payloads: seeds + connected form
+/// one scene; at most 12 nodes carry a 0..=1 `bridge_score`, everyone else
+/// omits the field.
+#[tokio::test]
+async fn p1_brain_context_nodes_expose_scene_bridge_scores() {
+    let app = make_app();
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["sym:alpha:parse"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let scene: Vec<&Value> = json["seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(json["connected"].as_array().unwrap().iter())
+        .collect();
+    assert!(!scene.is_empty(), "context scene should not be empty");
+
+    let bridged: Vec<&&Value> = scene
+        .iter()
+        .filter(|node| !node["bridge_score"].is_null())
+        .collect();
+    assert!(
+        bridged.len() <= 12,
+        "bridge_score must be set on at most 12 context nodes per scene, got {}",
+        bridged.len()
+    );
+    for node in &bridged {
+        let score = node["bridge_score"]
+            .as_f64()
+            .expect("bridge_score must be a number");
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "bridge_score must be normalized 0..=1, got {score} on {}",
+            node["uid"]
+        );
+    }
+    // The fixture's cut vertex resolves as the seed and is the scene's top
+    // bridge, normalized to 1.0.
+    let cut_vertex = scene
+        .iter()
+        .find(|node| node["uid"] == "sym:alpha:parse")
+        .expect("seed node present in scene");
+    let score = cut_vertex["bridge_score"]
+        .as_f64()
+        .expect("cut vertex should carry a bridge_score");
+    assert!((score - 1.0).abs() < 1e-6, "scene max normalizes to 1.0");
+    // Leaf nodes have zero betweenness and must omit the field.
+    if let Some(leaf) = scene.iter().find(|node| node["uid"] == "sym:alpha:format") {
+        assert!(
+            leaf.get("bridge_score").is_none(),
+            "zero-betweenness nodes must omit bridge_score"
+        );
+    }
+}

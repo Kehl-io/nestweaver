@@ -28,7 +28,8 @@ pub async fn code_context(
         return Err(ApiError::bad_request("seeds must not be empty"));
     }
     let result = nestweaver_engine::build_context(&state.store, &body.seeds)?;
-    let json = serde_json::to_value(&result)?;
+    let mut json = serde_json::to_value(&result)?;
+    crate::bridge::annotate_context_payload(&state, &mut json);
     Ok(Json(json).into_response())
 }
 
@@ -67,6 +68,9 @@ pub async fn brain_context(
     let empty_result = result.seeds.is_empty() && result.connected.is_empty();
     let meta = brain_context_meta(&workspace, body.token_budget, empty_result);
     let mut json = serde_json::to_value(&result)?;
+    // Scene-level bridge emphasis: seeds + connected form one scene, so
+    // the top-12 cap and 0..=1 normalization span the whole response.
+    crate::bridge::annotate_context_payload(&state, &mut json);
     if let serde_json::Value::Object(ref mut object) = json {
         object.insert("_meta".to_string(), serde_json::to_value(meta)?);
     }

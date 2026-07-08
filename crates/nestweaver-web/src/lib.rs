@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod error;
 pub mod routes;
 pub mod state;

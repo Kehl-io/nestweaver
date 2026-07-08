@@ -71,7 +71,7 @@ function hexToRgb(hex: string): [number, number, number] {
   return [0.5, 0.5, 0.5];
 }
 
-function edgeColorForType(type: unknown, _isDark: boolean): [number, number, number] | null {
+function edgeColorForType(type: unknown): [number, number, number] | null {
   if (typeof type !== "string") return null;
   // "overview" (intra-galaxy) edges intentionally return null so the
   // node-color fallback tints them with their galaxy's hue (glowing web)
@@ -273,7 +273,7 @@ export function useGraphBridge(): GraphBuffers {
         edgePositions[ei * 6 + 4] = positions[ti * 3 + 1];
         edgePositions[ei * 6 + 5] = positions[ti * 3 + 2];
 
-        const edgeColor = edgeColorForType(_attrs.type, isDark);
+        const edgeColor = edgeColorForType(_attrs.type);
         const sourceColor = edgeColor ?? [
           colors[si * 3 + 0],
           colors[si * 3 + 1],

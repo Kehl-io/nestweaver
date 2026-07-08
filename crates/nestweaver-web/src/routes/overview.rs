@@ -25,6 +25,11 @@ struct OverviewLandmark {
     location: String,
     score: f64,
     reason: String,
+    /// Betweenness-centrality emphasis for bridge glyphs. Set only on the
+    /// top scene bridges (at most `crate::bridge::SCENE_BRIDGE_LIMIT`),
+    /// normalized 0..=1 by the scene maximum; omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridge_score: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +108,7 @@ pub async fn overview(
             location: repo.url.clone(),
             score: 1.0,
             reason: "Indexed repository".to_string(),
+            bridge_score: None,
         })
         .collect();
     let service_landmarks = services
@@ -114,6 +120,7 @@ pub async fn overview(
             location: service.repo_uid.clone(),
             score: 0.9,
             reason: "Detected service".to_string(),
+            bridge_score: None,
         })
         .collect();
     let symbol_landmarks = top_symbols
@@ -125,6 +132,7 @@ pub async fn overview(
             location: symbol.file_path.clone(),
             score: symbol.pagerank_score.unwrap_or(0.0),
             reason: "High PageRank symbol".to_string(),
+            bridge_score: None,
         })
         .collect();
     let note_landmarks = notes
@@ -136,15 +144,29 @@ pub async fn overview(
             location: note.file_path.clone(),
             score: note.pagerank_score,
             reason: "High PageRank note".to_string(),
+            bridge_score: None,
         })
         .collect();
-    let landmarks = select_landmarks(
+    let mut landmarks = select_landmarks(
         repo_landmarks,
         service_landmarks,
         symbol_landmarks,
         note_landmarks,
         limit,
     );
+
+    // Bridge glyph emphasis: intersect this scene's landmarks with the
+    // cached global betweenness pool (see crate::bridge) and mark only the
+    // top scene bridges, normalized by the scene max. Additive optional
+    // field — landmarks that are not bridges serialize unchanged.
+    let bridge_scores = crate::bridge::scene_bridge_scores(
+        &crate::bridge::global_bridge_scores(&state),
+        landmarks.iter().map(|landmark| landmark.uid.clone()),
+    );
+    for landmark in &mut landmarks {
+        landmark.bridge_score = bridge_scores.get(&landmark.uid).copied();
+    }
+
     let meta = workspaces::p1_meta_for_result_set(
         &workspace,
         meta_state.result,
