@@ -103,7 +103,7 @@ export function OverviewCommandShelf({
   return (
     <section
       aria-label="Start Here"
-      className="absolute left-3 top-3 z-30 flex max-h-[min(310px,calc(100%-5rem))] w-[min(248px,calc(100vw-1.5rem))] flex-col overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface)]/86 shadow-md backdrop-blur-xl sm:left-4 sm:top-4"
+      className="absolute left-3 top-3 z-30 flex max-h-[min(340px,calc(100%-5rem))] w-[min(300px,calc(100vw-1.5rem))] flex-col overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface)]/86 shadow-md backdrop-blur-xl sm:left-4 sm:top-4"
     >
       <div className="flex items-start justify-between gap-3 px-3 py-2.5">
         <div className="min-w-0">

@@ -33,7 +33,7 @@ export function SceneBreadcrumbs() {
   return (
     <nav
       aria-label="Scene breadcrumbs"
-      className="flex min-w-0 items-center gap-1 text-[11px] text-[var(--color-text-muted)]"
+      className="flex min-w-0 items-center gap-1 overflow-hidden text-[11px] text-[var(--color-text-muted)]"
     >
       <button
         type="button"
@@ -51,7 +51,7 @@ export function SceneBreadcrumbs() {
         title="Go to workspace overview"
       >
         <Home className="h-3.5 w-3.5 shrink-0" />
-        <span className="max-w-[8rem] truncate">
+        <span className="min-w-[3rem] max-w-[8rem] truncate">
           {workspace?.label ?? "All indexed content"}
         </span>
       </button>
@@ -61,23 +61,23 @@ export function SceneBreadcrumbs() {
         onClick={() => {
           if (lensMode) setGraphMode(lensMode);
         }}
-        className="h-7 max-w-[8rem] truncate rounded px-1.5 font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
+        className="h-7 min-w-[3rem] max-w-[8rem] shrink-0 truncate rounded px-1.5 font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
         title={`Lens: ${activeLens.label}`}
       >
         {activeLens.label}
       </button>
       <ChevronRight className="h-3.5 w-3.5 shrink-0" />
       <span
-        className="max-w-[10rem] truncate rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
+        className="min-w-[4rem] max-w-[10rem] truncate rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
         title={selectedNodeId ?? "No selected node"}
       >
         {compactNodeLabel(selectedNodeId, graphLabel)}
       </span>
-      <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 sm:block" />
+      <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 xl:block" />
       <button
         type="button"
         onClick={() => setRepresentationMode(representationMode)}
-        className="hidden h-7 rounded px-1.5 font-medium capitalize text-[var(--color-graph-selection)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)] sm:inline"
+        className="hidden h-7 shrink-0 rounded px-1.5 font-medium capitalize text-[var(--color-graph-selection)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)] xl:inline"
         title="Current representation"
       >
         {representationMode === "table" ? "table" : representationMode}

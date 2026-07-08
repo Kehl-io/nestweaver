@@ -40,7 +40,7 @@ export function WorkspaceScopeSummary({
   if (compact) {
     return (
       <div className="min-w-0 space-y-1 text-[11px] text-[var(--color-text-muted)]">
-        <p className="truncate">
+        <p className="line-clamp-2" title={`${scopeLabel(workspace)} · ${countLabel(workspace)}`}>
           {scopeLabel(workspace)} · {countLabel(workspace)}
         </p>
         <WorkspaceStatusChip

@@ -48,7 +48,7 @@ export function RepresentationTabs() {
             }`}
           >
             <Icon className="h-3.5 w-3.5 shrink-0" />
-            <span className="hidden sm:inline">{shortLabel}</span>
+            <span className="hidden 2xl:inline">{shortLabel}</span>
           </button>
         );
       })}

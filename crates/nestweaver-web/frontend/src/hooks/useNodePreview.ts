@@ -82,6 +82,20 @@ export function useNodePreview(
       nodeKind === "note" ||
       nodeKind === "Note";
 
+    // Repos and services have no symbol detail; treat "no preview" as an
+    // expected empty state, not an error (repo hubs are the landing scene)
+    const isContainer =
+      nodeId.startsWith("repo:") ||
+      nodeId.startsWith("svc:") ||
+      nodeKind === "repo" ||
+      nodeKind === "service";
+    if (isContainer) {
+      setData(null);
+      setLoading(false);
+      setError(null);
+      return () => controller.abort();
+    }
+
     const fetchData = async () => {
       try {
         if (isNote) {

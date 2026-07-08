@@ -95,7 +95,7 @@ export function WorkspaceToolbar() {
         >
           <Map className="h-4 w-4" />
         </button>
-        <span className="hidden items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-1 text-[10px] text-[var(--color-text-muted)] lg:inline-flex">
+        <span className="hidden items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-1 text-[10px] text-[var(--color-text-muted)] 2xl:inline-flex">
           <CornerDownLeft className="h-3 w-3" />
           Enter opens
         </span>
