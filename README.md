@@ -474,7 +474,7 @@ timeout_secs = 60
 
 ## Web UI
 
-Launch an interactive graph visualization powered by Three.js with GPU-accelerated rendering. Nodes glow with per-kind colors, radial gradients, and bloom post-processing on a deep dark canvas. Features force-directed layout, community detection overlays, semantic zoom, accessible list view, and full search.
+A search-first, task-lens workspace over your code+notes graph, powered by Three.js/React-Three-Fiber. The landing view is a **repo-galaxy constellation** — one luminous cluster per repository — rendered dark-first with selective HDR bloom, in-scene SDF labels, and a procedural nebula backdrop. Everything encodes meaning: color = kind, size = importance, and Spark-green convergence rings mark betweenness bridges (architectural chokepoints).
 
 ```sh
 nestweaver ui --db ./nestweaver.lbug --port 8080
@@ -482,34 +482,39 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 ```
 
 <p align="center">
-  <img src="assets/web-ui-screenshot.png" width="700" alt="NestWeaver Web UI — context graph with glowing nodes">
+  <img src="assets/web-ui-screenshot.png" width="700" alt="NestWeaver Web UI — repo-galaxy constellation with glowing hubs">
 </p>
 <p align="center">
-  <img src="assets/web-ui-graph.png" width="700" alt="NestWeaver Web UI — class hierarchy with bloom effects">
+  <img src="assets/web-ui-graph.png" width="700" alt="NestWeaver Web UI — focused symbol with tri-panel source evidence">
 </p>
 
-**Graph features:**
-- GPU-rendered nodes with SDF circles, radial gradients, outer glow halos, and breathing animation
-- Bloom post-processing for a premium atmospheric feel
-- Edge particles with directional flow
-- Click to inspect: callers, callees, source code with syntax highlighting
-- Accessible node list view (Ctrl+L) with keyboard navigation
-- Community overlay with Louvain detection
-- Reduced effects toggle for accessibility (`prefers-reduced-motion` auto-detected)
-- URL deep-linking for shareable views
-- Navigation history (Ctrl+Z / Ctrl+Shift+Z)
-- Glassmorphism panels with cursor-responsive lighting
-- Dark/light/system theme with kehl.io-inspired dark palette
+**Work by task, not by graph theory:**
+- **Workspace scope** — switch between all indexed content, a single repo, or a vault; every view carries an honest trust chip (local-only / federated, current / stale, partial / truncated)
+- **Command bar (`⌘K`) + Search Phrases** — plain-language queries resolve to typed scenes deterministically: `impact of <symbol>`, `trace flow from <symbol>`, `callers of <symbol>`, `path from <A> to <B>`, `notes about <topic>`, `backlinks for <note>`, `hubs in <repo>`, `dead code in <repo>`, `stale repos`
+- **Task lenses** — Overview, Context, Impact (layered blast-radius DAG with affected tests and local/org trust states), Trace (execution stepper), Repos, Features, Local neighborhood
+- **Tri-panel workspace** — activating a node opens a focused graph, synced source/note evidence, and a knowledge card (identity, role, evidence, relationships, trust, next actions), cross-highlighted
+- **Graph / table / JSON parity** — every result set is inspectable as a graph, an accessible table, or raw JSON with provenance/trust `_meta`
+- **Deep links** restore workspace scope, selected node, active lens, and representation mode
+
+**Visual & motion** (all gated behind `prefers-reduced-motion`, which the UI auto-detects):
+- Selective HDR bloom via Khronos PBR-Neutral tone mapping — loud only on focus, hubs, and bridges; the ambient field stays calm
+- In-scene SDF text labels with collision-aware placement (labels never overlap nodes) and a landmark hierarchy that reveals detail on zoom
+- Per-galaxy glowing edge web, hub coronas, and settle-and-freeze force layout that preserves spatial memory across re-indexing
+- Signature moments: repo-galaxy ignition on load and a focus impact-ripple that traces blast radius
+- Community overlay (Louvain), minimap, and an explicit System / Light / Dark theme control
+
+**Accessibility:** all six task journeys have a keyboard-only path; reduced-motion preserves every static meaning channel; graph answers always have a table/JSON equivalent; a screen-reader landmark summary mirrors the canvas.
 
 **WASM mode** — Append `?engine=wasm` to the URL to run graph algorithms client-side via WebAssembly. The browser downloads a MessagePack snapshot and executes PPR locally — no server round-trips for queries. Requires building the wasm first (use `--remap-path-prefix` so the build
 machine's home path isn't baked into the artifact):
 `RUSTFLAGS="--remap-path-prefix=$HOME=/build" wasm-pack build crates/nestweaver-wasm --target web --out-dir ../../crates/nestweaver-web/frontend/src/wasm`.
 
-**Keyboard shortcuts:**
-- `Tab` / `Shift+Tab` — cycle forward/backward through nodes
-- `Arrow keys` — navigate to neighboring nodes
-- `Ctrl+L` — toggle accessible node list view
-- `Ctrl+Z` / `Ctrl+Shift+Z` — navigate history backward/forward
+**Keyboard shortcuts** (press `?` in the UI for the full list):
+- `1`–`6` — switch task mode (Overview, Context, Impact, Repos, Features, Local)
+- `⌘K` — open the ask / Search-Phrase command bar · `/` — focus search
+- `⌘L` — cycle graph / list / matrix representation · `⌘⇧G` — toggle zen (canvas-only) layout
+- `I` — impact of selected · `P` — path from selected · `M` / `C` / `T` — minimap / communities / tags
+- `⌘Z` / `⌘⇧Z` — navigate history back / forward · `Esc` — clear selection
 
 ## Architecture
 
