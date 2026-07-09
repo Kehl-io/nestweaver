@@ -10,6 +10,11 @@
           "type": "toml",
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.version"
         }
       ]
     }

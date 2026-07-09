@@ -12,8 +12,13 @@ nestweaver --version
 
 ## Option 2: Cargo (Rust users)
 
+Build and install from a local checkout (crates.io publishing is not yet
+automated, so `cargo install nestweaver` from the registry may lag the latest
+release — build from source to guarantee the current version):
+
 ```bash
-cargo install nestweaver
+git clone https://github.com/Kehl-io/nestweaver && cd nestweaver
+cargo install --path .
 nestweaver --version
 # Expected: nestweaver X.Y.Z
 ```
@@ -22,7 +27,7 @@ Semantic embeddings are included by default (`embed` feature). On **macOS**, add
 `--features metal` for GPU-accelerated embeddings from the CLI:
 
 ```bash
-cargo install nestweaver --features metal   # macOS: Metal GPU embeddings
+cargo install --path . --features metal   # macOS: Metal GPU embeddings
 ```
 
 > The macOS `.app` bundle (below) is already built with Metal and is the

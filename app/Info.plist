@@ -8,10 +8,13 @@
     <string>NestWeaver</string>
     <key>CFBundleIdentifier</key>
     <string>io.kehl.nestweaver</string>
+    <!-- Version is injected from version.txt by app/build.sh at build time,
+         so the bundle always matches the nestweaver binary it wraps. This
+         placeholder is only used if the bundle is assembled by hand. -->
     <key>CFBundleVersion</key>
-    <string>1.0.1</string>
+    <string>0.0.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.1</string>
+    <string>0.0.0</string>
     <key>CFBundleExecutable</key>
     <string>NestWeaver</string>
     <key>CFBundleIconFile</key>

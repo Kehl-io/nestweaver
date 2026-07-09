@@ -157,7 +157,7 @@ See [Server Mode Guide](docs/server-mode.md) for full documentation.
 
 ### macOS (recommended: native app)
 
-Download **NestWeaver.app** from [GitHub Releases](https://github.com/Kehl-io/nestweaver/releases) — or build from source:
+Build the native **NestWeaver.app** from source (it bundles Metal-accelerated embeddings and the web UI):
 
 ```sh
 cd app && bash build.sh
@@ -379,8 +379,6 @@ NestWeaver includes a native macOS `.app` bundle — the recommended way to run 
 # Build from source (requires Xcode Command Line Tools)
 cd app && bash build.sh
 open target/release/NestWeaver.app
-
-# Or download NestWeaver.app from GitHub Releases
 ```
 
 The app is menubar-only (no Dock icon). Click the NestWeaver icon in the menubar to open the web UI or quit. Database is auto-detected from `NESTWEAVER_DB`, `~/.nestweaver/instance.toml`, or `~/.local/share/nestweaver/*/brain.lbug`.
