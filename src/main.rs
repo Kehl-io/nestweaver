@@ -16,7 +16,7 @@ use nestweaver_engine::{
     discover_cross_domain_links, embedding::generate_embeddings_batch, expand_query_with_aliases,
     export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
     find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
-    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_rules,
+    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
     generate_repo_map, generate_summaries, get_last_indexed_at, incremental_index_with_name,
     index_directory_with_options, index_markdown_directory_since_with_ignore,
     index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
@@ -4019,8 +4019,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config.as_deref(), "brain_guide", args)
                 {
-                    // brain_guide returns the guide text as a JSON string.
-                    let text = if let Some(s) = value.as_str() {
+                    // brain_guide returns { "guide": "<markdown>" }. Extract the
+                    // raw markdown body — printing the JSON object would emit an
+                    // envelope with escaped newlines instead of a usable guide.
+                    let text = if let Some(s) = value.get("guide").and_then(|g| g.as_str()) {
+                        s.to_string()
+                    } else if let Some(s) = value.as_str() {
                         s.to_string()
                     } else {
                         serde_json::to_string_pretty(&value)?
@@ -4077,7 +4081,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Some(tool_docs.len()),
                 )?,
                 "claude-md" => generate_claude_md_with_rules(&store, cfg_ref, rules_ref)?,
-                _ => generate_guide_with_rules(&store, cfg_ref, rules_ref)?,
+                _ => generate_guide_with_tools(&store, cfg_ref, rules_ref, &tool_docs)?,
             };
             match output {
                 Some(path) => {
