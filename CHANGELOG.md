@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.3.1](https://github.com/Kehl-io/nestweaver/compare/v2.3.0...v2.3.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* **dist:** repair npm install path and stamp app bundle version ([f732e8a](https://github.com/Kehl-io/nestweaver/commit/f732e8a1a4122b68bafb3242bb274b851d5c4ae7))
+* **dist:** repair npm install path and stamp app bundle version ([40dadf9](https://github.com/Kehl-io/nestweaver/commit/40dadf9a0cb714ffdf17698be212a2865356a0cf))
+* **dist:** sync Cargo.lock workspace versions to 2.3.0 ([7a37392](https://github.com/Kehl-io/nestweaver/commit/7a3739203c58f70e539afbefb1c6359778f066b6))
+* **guide:** generate-guide uses the live tool registry, emits raw markdown ([fdbedbd](https://github.com/Kehl-io/nestweaver/commit/fdbedbda7f9094db6da2c550327ea800bf711701))
+* **guide:** generate-guide uses the live tool registry, emits raw markdown ([ada5f9e](https://github.com/Kehl-io/nestweaver/commit/ada5f9e7910b572047ce9061ae613cd6545a6260))
+
 ## [2.3.0](https://github.com/Kehl-io/nestweaver/compare/v2.2.1...v2.3.0) (2026-07-08)
 
 
