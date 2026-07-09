@@ -1,6 +1,6 @@
 {
   "name": "@kehl-io/nestweaver",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Code knowledge graph for AI agents — 40 MCP tools, 15 languages, graph visualization",
   "bin": {
     "nestweaver": "bin/nestweaver"
@@ -8,9 +8,22 @@
   "scripts": {
     "postinstall": "node install.js"
   },
-  "os": ["darwin", "linux"],
-  "cpu": ["x64", "arm64"],
-  "keywords": ["mcp", "code-graph", "tree-sitter", "code-intelligence", "knowledge-graph", "code-analysis"],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "keywords": [
+    "mcp",
+    "code-graph",
+    "tree-sitter",
+    "code-intelligence",
+    "knowledge-graph",
+    "code-analysis"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/Kehl-io/nestweaver"
