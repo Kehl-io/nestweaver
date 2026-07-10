@@ -4,6 +4,8 @@ export interface SymbolCandidate {
   kind: string;
   file_path: string;
   start_line: number;
+  /** Present on /symbols/top responses; used to group files by repo. */
+  repo_uid?: string;
 }
 
 export interface Symbol {
@@ -250,10 +252,5 @@ export interface GapReport {
 }
 
 export type GraphMode =
-  | "overview"
-  | "context"
-  | "impact"
-  | "repos"
-  | "features"
-  | "local";
+  "overview" | "context" | "impact" | "repos" | "features" | "local";
 export type ScopeFilter = "all" | "code_only" | "notes_only";

@@ -12,7 +12,12 @@ interface TreeNode {
 }
 
 function buildTree(paths: string[]): TreeNode {
-  const root: TreeNode = { name: "", fullPath: "", children: new Map(), isFile: false };
+  const root: TreeNode = {
+    name: "",
+    fullPath: "",
+    children: new Map(),
+    isFile: false,
+  };
   for (const p of paths) {
     const parts = p.split("/").filter(Boolean);
     let cur = root;
@@ -115,8 +120,11 @@ export function FilesTab() {
   const repoTrees = useMemo(() => {
     const byRepo = new Map<string, Set<string>>();
     for (const sym of symbols) {
-      const repo = repos.find((r) => r.uid === sym.uid.split("::")[0]);
-      const repoId = repo?.uid ?? "__default__";
+      // Bucket by the symbol's repo_uid (colon-delimited, matches Repo.uid).
+      // Previously this split the uid on "::" — which symbol uids never
+      // contain — so every file landed in a bogus bucket and every repo's
+      // tree rendered empty (0 files).
+      const repoId = sym.repo_uid || "__default__";
       if (!byRepo.has(repoId)) byRepo.set(repoId, new Set());
       byRepo.get(repoId)!.add(sym.file_path);
     }

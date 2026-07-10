@@ -58,7 +58,9 @@ export interface GraphSlice {
   setNodeTypeFilter: (kind: string, visible: boolean) => void;
   setAllNodeTypes: (visible: boolean) => void;
   setEdgeTypeFilter: (type: string, visible: boolean) => void;
-  setForceParams: (params: Partial<{ repulsion: number; gravity: number; settling: number }>) => void;
+  setForceParams: (
+    params: Partial<{ repulsion: number; gravity: number; settling: number }>,
+  ) => void;
   setLayoutMode: (mode: "panels" | "zen") => void;
   toggleStyleRule: (rule: string) => void;
 }
@@ -187,7 +189,14 @@ export const createGraphSlice: StateCreator<
 
   hoverNode: (id) =>
     set((s) => {
-      s.hoveredNodeId = id;
+      // Skip redundant updates: the pointer handler fires on every mouse move,
+      // so moving within the same node (or over empty background) would emit a
+      // store notification + graph re-render on every event. Only update when
+      // the hovered node actually changes. (immer returns the same state when
+      // the producer makes no change, so this is a true no-op.)
+      if (s.hoveredNodeId !== id) {
+        s.hoveredNodeId = id;
+      }
     }),
 
   openPreview: (id, kind, expanded = false) =>

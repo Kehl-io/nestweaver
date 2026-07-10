@@ -39,11 +39,13 @@ interface LabelDatum {
 function FadingLabel({
   datum,
   visible,
+  isHovered,
   isDark,
   onFaded,
 }: {
   datum: LabelDatum;
   visible: boolean;
+  isHovered: boolean;
   isDark: boolean;
   onFaded: (uid: string) => void;
 }) {
@@ -64,7 +66,7 @@ function FadingLabel({
     if (!visible && next < 0.02) onFaded(datum.uid);
   });
 
-  const emphasized = datum.isSelected || datum.isHovered;
+  const emphasized = datum.isSelected || isHovered;
   const fill = isDark
     ? emphasized
       ? "#f2f6fb"
@@ -125,7 +127,10 @@ export function NodeLabels({ buffers }: Props) {
 
     const candidates: LabelDatum[] = [];
     const membersVisible = zoomBucket <= MEMBER_LABEL_ZOOM;
-    const activeNodeId = hoveredNodeId ?? selectedNodeId;
+    // Selection-only: hover is deliberately excluded so moving the mouse never
+    // re-runs this O(n^2) label-placement pass (that was the glitchy hover).
+    // Hover emphasis is applied cheaply at render time instead.
+    const activeNodeId = selectedNodeId;
 
     graphInstance.forEachNode((uid, attrs) => {
       const idx = buffers.uidToIndex.get(uid);
@@ -134,7 +139,7 @@ export function NodeLabels({ buffers }: Props) {
       const isSeed = attrs.isSeed === true;
       const forceLabel = attrs.forceLabel === true || isSeed;
       const isSelected = uid === selectedNodeId;
-      const isHovered = uid === hoveredNodeId;
+      const isHovered = false; // hover emphasis applied at render, not here
 
       const isRelatedToActive =
         activeNodeId != null &&
@@ -146,7 +151,8 @@ export function NodeLabels({ buffers }: Props) {
       // Landmark hierarchy: hubs always; members only zoomed-in or when
       // they're part of the active neighborhood
       if (!isSelected && !isHovered) {
-        if (focusMap && activeNodeId && !isRelatedToActive && !forceLabel) return;
+        if (focusMap && activeNodeId && !isRelatedToActive && !forceLabel)
+          return;
         if (!forceLabel && !membersVisible && !isRelatedToActive) return;
       }
 
@@ -194,7 +200,12 @@ export function NodeLabels({ buffers }: Props) {
     // that can't find a clean slot are dropped unless they're landmarks or
     // the active node — fewer clean labels beat text sitting on nodes.
     const nodeRadius = (i: number) => (buffers.sizes[i] || 6) * 0.45;
-    const placedBoxes: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+    const placedBoxes: Array<{
+      x0: number;
+      y0: number;
+      x1: number;
+      y1: number;
+    }> = [];
     const boxFor = (
       node: LabelDatum,
       anchor: "below" | "above" | "right" | "left",
@@ -204,17 +215,48 @@ export function NodeLabels({ buffers }: Props) {
       const w = node.label.length * node.fontSize * 0.58;
       const h = node.fontSize * 1.25;
       if (anchor === "below") {
-        return { x: node.x, y: node.y - r - 1, x0: node.x - w / 2, y0: node.y - r - 1 - h, x1: node.x + w / 2, y1: node.y - r - 1 };
+        return {
+          x: node.x,
+          y: node.y - r - 1,
+          x0: node.x - w / 2,
+          y0: node.y - r - 1 - h,
+          x1: node.x + w / 2,
+          y1: node.y - r - 1,
+        };
       }
       if (anchor === "above") {
-        return { x: node.x, y: node.y + r + 1 + h, x0: node.x - w / 2, y0: node.y + r + 1, x1: node.x + w / 2, y1: node.y + r + 1 + h };
+        return {
+          x: node.x,
+          y: node.y + r + 1 + h,
+          x0: node.x - w / 2,
+          y0: node.y + r + 1,
+          x1: node.x + w / 2,
+          y1: node.y + r + 1 + h,
+        };
       }
       if (anchor === "right") {
-        return { x: node.x + r + 2 + w / 2, y: node.y + h / 2, x0: node.x + r + 2, y0: node.y - h / 2, x1: node.x + r + 2 + w, y1: node.y + h / 2 };
+        return {
+          x: node.x + r + 2 + w / 2,
+          y: node.y + h / 2,
+          x0: node.x + r + 2,
+          y0: node.y - h / 2,
+          x1: node.x + r + 2 + w,
+          y1: node.y + h / 2,
+        };
       }
-      return { x: node.x - r - 2 - w / 2, y: node.y + h / 2, x0: node.x - r - 2 - w, y0: node.y - h / 2, x1: node.x - r - 2, y1: node.y + h / 2 };
+      return {
+        x: node.x - r - 2 - w / 2,
+        y: node.y + h / 2,
+        x0: node.x - r - 2 - w,
+        y0: node.y - h / 2,
+        x1: node.x - r - 2,
+        y1: node.y + h / 2,
+      };
     };
-    const hitsNode = (box: { x0: number; y0: number; x1: number; y1: number }, selfIdx: number) => {
+    const hitsNode = (
+      box: { x0: number; y0: number; x1: number; y1: number },
+      selfIdx: number,
+    ) => {
       for (let i = 0; i < buffers.nodeCount; i++) {
         if (i === selfIdx) continue;
         const nx = buffers.positions[i * 3];
@@ -227,7 +269,12 @@ export function NodeLabels({ buffers }: Props) {
       }
       return false;
     };
-    const hitsLabel = (box: { x0: number; y0: number; x1: number; y1: number }) =>
+    const hitsLabel = (box: {
+      x0: number;
+      y0: number;
+      x1: number;
+      y1: number;
+    }) =>
       placedBoxes.some(
         (b) => box.x0 < b.x1 && box.x1 > b.x0 && box.y0 < b.y1 && box.y1 > b.y0,
       );
@@ -236,7 +283,10 @@ export function NodeLabels({ buffers }: Props) {
     // Landmarks place first so detail labels route around them
     const ordered = candidates
       .map((node, index) => ({ node, index }))
-      .filter(({ node, index }) => node.isSelected || node.isHovered || kept.has(index))
+      .filter(
+        ({ node, index }) =>
+          node.isSelected || node.isHovered || kept.has(index),
+      )
       .sort((a, b) => Number(b.node.forceLabel) - Number(a.node.forceLabel));
 
     for (const { node } of ordered) {
@@ -261,8 +311,14 @@ export function NodeLabels({ buffers }: Props) {
       }
     }
     return out;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [buffers, graphInstance, selectedNodeId, hoveredNodeId, focusMap, canvasSize.height, zoomBucket]);
+  }, [
+    buffers,
+    graphInstance,
+    selectedNodeId,
+    focusMap,
+    canvasSize.height,
+    zoomBucket,
+  ]);
 
   // Fade lifecycle: render the union of currently-visible labels and those
   // still fading out; FadingLabel reports back when it reaches zero
@@ -293,6 +349,7 @@ export function NodeLabels({ buffers }: Props) {
           key={datum.uid}
           datum={datum}
           visible={visibleLabels.has(datum.uid)}
+          isHovered={datum.uid === hoveredNodeId}
           isDark={isDark}
           onFaded={handleFaded}
         />
