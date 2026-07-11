@@ -13,8 +13,35 @@ env:
   CFLAGS: "-DZSTD_DISABLE_ASM"
 
 jobs:
+  # Detect what actually changed so we don't recompile the entire Rust
+  # workspace (~50 min) for a frontend-only PR, or run the frontend/e2e
+  # stack for a pure-Rust change. There are no branch-protection required
+  # checks, so skipped jobs are safe — they don't deadlock merges.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+            frontend:
+              - 'crates/nestweaver-web/frontend/**'
+
   fmt:
     name: Rustfmt
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -25,6 +52,8 @@ jobs:
 
   build-and-check:
     name: Build, Clippy & Tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
@@ -63,6 +92,12 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: changes
+    # Coverage is informational (uploads an lcov artifact; nothing gates on it)
+    # and is the single slowest job — a full *instrumented* recompile that can't
+    # reuse the build job's cache. Run it only when landing on main, not on
+    # every PR, so it's off the PR critical path.
+    if: github.event_name == 'push' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
@@ -104,17 +139,25 @@ jobs:
 
   audit:
     name: Security Audit
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # Prebuilt binary via install-action instead of `cargo install cargo-audit`
+      # (which compiles it from source on every run, ~3 min).
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
       - name: Run audit
         run: cargo audit || true
 
   e2e:
     name: E2E Tests
+    needs: changes
+    # E2E drives the real backend API + the frontend, so run it whenever either
+    # side changes.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     env:
       NESTWEAVER_NO_DAEMON: "1"
