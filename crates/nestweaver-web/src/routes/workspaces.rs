@@ -531,6 +531,45 @@ fn project_counts(store: &GraphStore, project_uid: &str) -> Result<WorkspaceCoun
     })
 }
 
+/// Like [`project_counts`] but derives every count from pre-built graph maps
+/// plus the project's own symbol/note uid lists, so it never touches the full
+/// `list_services` / `list_all_symbols` scans. The catalog builder calls this
+/// once per project; using the maps keeps the whole catalog linear in graph
+/// size instead of O(projects × store) — the difference between ~1s and ~50s
+/// on a large multi-repo graph.
+fn project_counts_scoped(
+    store: &GraphStore,
+    project_uid: &str,
+    repo_by_symbol_uid: &HashMap<String, String>,
+    vault_by_note_uid: &HashMap<String, String>,
+    service_counts_by_repo: &HashMap<String, usize>,
+) -> Result<WorkspaceCounts, ApiError> {
+    let symbol_uids = store.list_project_symbol_uids(project_uid)?;
+    let note_uids = store.list_project_note_uids(project_uid)?;
+
+    let repo_uids: HashSet<&str> = symbol_uids
+        .iter()
+        .filter_map(|uid| repo_by_symbol_uid.get(uid).map(String::as_str))
+        .collect();
+    let vault_uids: HashSet<&str> = note_uids
+        .iter()
+        .filter_map(|uid| vault_by_note_uid.get(uid).map(String::as_str))
+        .collect();
+    let service_count = repo_uids
+        .iter()
+        .map(|repo| service_counts_by_repo.get(*repo).copied().unwrap_or(0))
+        .sum();
+
+    Ok(WorkspaceCounts {
+        project_count: 1,
+        repo_count: repo_uids.len(),
+        service_count,
+        vault_count: vault_uids.len(),
+        note_count: note_uids.len(),
+        symbol_count: symbol_uids.len(),
+    })
+}
+
 pub fn notes_for_query(
     store: &GraphStore,
     query: &str,
@@ -642,17 +681,21 @@ fn workspace_entries(store: &GraphStore) -> Result<BoundedResults<WorkspaceEntry
     }
 
     let mut symbol_counts_by_repo = HashMap::<String, usize>::new();
+    let mut repo_by_symbol_uid = HashMap::<String, String>::with_capacity(symbols.len());
     for symbol in &symbols {
         *symbol_counts_by_repo
             .entry(symbol.repo_uid.clone())
             .or_default() += 1;
+        repo_by_symbol_uid.insert(symbol.uid.clone(), symbol.repo_uid.clone());
     }
 
     let mut note_counts_by_vault = HashMap::<String, usize>::new();
+    let mut vault_by_note_uid = HashMap::<String, String>::with_capacity(notes.len());
     for note in &notes {
         *note_counts_by_vault
             .entry(note.vault_uid.clone())
             .or_default() += 1;
+        vault_by_note_uid.insert(note.uid.clone(), note.vault_uid.clone());
     }
 
     let total_count = 1 + projects.len() + repos.len() + vaults.len();
@@ -678,7 +721,13 @@ fn workspace_entries(store: &GraphStore) -> Result<BoundedResults<WorkspaceEntry
         }
         entries.push(workspace_entry(
             ResolvedWorkspace::project(project),
-            project_counts(store, &project.uid)?,
+            project_counts_scoped(
+                store,
+                &project.uid,
+                &repo_by_symbol_uid,
+                &vault_by_note_uid,
+                &service_counts_by_repo,
+            )?,
             "partial",
             vec!["project-components"],
         ));
