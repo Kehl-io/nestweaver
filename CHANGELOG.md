@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.2](https://github.com/Kehl-io/nestweaver/compare/v2.3.1...v2.3.2) (2026-07-11)
+
+
+### Bug Fixes
+
+* **web:** make the workspace catalog fast at scale + fix breadcrumb label ([#128](https://github.com/Kehl-io/nestweaver/issues/128)) ([140f2c2](https://github.com/Kehl-io/nestweaver/commit/140f2c27990ca6957d8e80b9688fe0df9fcef1cf))
+
 ## [2.3.1](https://github.com/Kehl-io/nestweaver/compare/v2.3.0...v2.3.1) (2026-07-09)
 
 
