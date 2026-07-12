@@ -64,12 +64,18 @@ interface LensSummaryPanelProps {
   className?: string;
 }
 
+const EXPECTED_UNSUPPORTED = new Set(["project-components"]);
+
+function hasCriticalUnsupported(summary: TrustSummary): boolean {
+  return summary.unsupported.some((item) => !EXPECTED_UNSUPPORTED.has(item));
+}
+
 function tone(summary: TrustSummary | null): string {
   if (!summary) return "border-[var(--color-border)] text-[var(--color-text-muted)]";
   if (summary.result === "error" || summary.result === "timed-out") {
     return "border-red-500/35 bg-red-500/10 text-red-200";
   }
-  if (summary.result === "unsupported" || summary.unsupported.length > 0) {
+  if (summary.result === "unsupported" || hasCriticalUnsupported(summary)) {
     return "border-amber-500/35 bg-amber-500/10 text-amber-200";
   }
   if (summary.partial || summary.result === "partial" || summary.result === "truncated") {
@@ -83,7 +89,7 @@ function SummaryIcon({ summary }: { summary: TrustSummary | null }) {
   if (summary.result === "error" || summary.result === "timed-out") {
     return <AlertTriangle className="h-4 w-4" />;
   }
-  if (summary.result === "unsupported" || summary.unsupported.length > 0) {
+  if (summary.result === "unsupported" || hasCriticalUnsupported(summary)) {
     return <Info className="h-4 w-4" />;
   }
   return <CheckCircle2 className="h-4 w-4" />;
@@ -118,6 +124,9 @@ export function LensSummaryPanel({
   const impactConfidence = useStore((s) => s.impactConfidence);
   const setImpactFilters = useStore((s) => s.setImpactFilters);
   const facts = metadataFacts(sceneMetadata);
+  const criticalUnsupported = trustSummary?.unsupported?.filter(
+    (item) => !EXPECTED_UNSUPPORTED.has(item),
+  );
   const nodeCount = graphInstance?.order ?? 0;
   const edgeCount = graphInstance?.size ?? 0;
 
@@ -188,14 +197,16 @@ export function LensSummaryPanel({
               </span>
             ))}
           </div>
-          {trustSummary?.unsupported && trustSummary.unsupported.length > 0 && (
+          {criticalUnsupported && criticalUnsupported.length > 0 && (
             <p className="mt-3 text-[11px] leading-5 text-amber-300">
-              Unavailable: {trustSummary.unsupported.join(", ")}
+              Unavailable: {criticalUnsupported.join(", ")}
             </p>
           )}
           {selectedNodeId && (
             <p className="mt-3 break-all border-t border-[var(--color-border)] pt-2 text-[11px] text-[var(--color-text-muted)]">
-              Selected: {selectedNodeId}
+              {(graphInstance?.hasNode(selectedNodeId)
+                ? (graphInstance.getNodeAttribute(selectedNodeId, "label") as string)
+                : null) || selectedNodeId.split(":").pop() || selectedNodeId}
             </p>
           )}
         </>

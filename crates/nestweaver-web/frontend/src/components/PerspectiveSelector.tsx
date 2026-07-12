@@ -92,8 +92,12 @@ export function PerspectiveSelector() {
       if (activePerspectiveId === id) {
         setActivePerspectiveId(null);
       }
-    } catch {
-      // ignore
+    } catch (error) {
+      useStore.getState().notify({
+        kind: "error",
+        title: "Delete failed",
+        message: error instanceof Error ? error.message : "Failed to delete perspective",
+      });
     }
   }
 
@@ -115,8 +119,12 @@ export function PerspectiveSelector() {
       setNewName("");
       setSaving(false);
       setOpen(false);
-    } catch {
-      // ignore
+    } catch (error) {
+      useStore.getState().notify({
+        kind: "error",
+        title: "Save failed",
+        message: error instanceof Error ? error.message : "Failed to save perspective",
+      });
     }
   }
 

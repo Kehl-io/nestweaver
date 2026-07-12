@@ -61,7 +61,14 @@ export function useContextMode() {
   const { start, stop, kill, isRunning } = useForceLayout();
 
   const loadContextData = useCallback(async () => {
-    if (graphMode !== "context" || seeds.length === 0) {
+    if (graphMode !== "context") {
+      requestIdRef.current += 1;
+      return;
+    }
+
+    setActiveLens({ lens: "context", label: "Context", targetUid: seeds[0] ?? null, workspaceId: activeWorkspaceId || "all" });
+
+    if (seeds.length === 0) {
       requestIdRef.current += 1;
       return;
     }

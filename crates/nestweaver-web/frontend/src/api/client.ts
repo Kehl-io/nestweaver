@@ -22,6 +22,7 @@ import type {
   Vault,
 } from "./types";
 import { loadImpactLens } from "./impactLens";
+import { appendWorkspaceParam } from "./workspaces";
 
 export class ApiError extends Error {
   status: number;
@@ -70,8 +71,9 @@ export const api = {
     );
   },
 
-  symbolsTop(limit = 20) {
-    return get<SymbolCandidate[]>(`/api/v1/symbols/top?limit=${limit}`);
+  symbolsTop(limit = 20, workspaceId?: string | null) {
+    const url = appendWorkspaceParam(`/api/v1/symbols/top?limit=${limit}`, workspaceId);
+    return get<SymbolCandidate[]>(url);
   },
 
   context(seeds: string[], limit = 30) {

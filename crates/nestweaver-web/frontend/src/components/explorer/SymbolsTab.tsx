@@ -12,6 +12,7 @@ const MAX_VISIBLE = 100;
 export function SymbolsTab() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const exploreNode = useStore((s) => s.exploreNode);
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
 
   const [symbols, setSymbols] = useState<SymbolCandidate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -23,11 +24,11 @@ export function SymbolsTab() {
     setLoading(true);
     setError(null);
     api
-      .symbolsTop(200)
+      .symbolsTop(200, activeWorkspaceId)
       .then(setSymbols)
       .catch((e) => setError(e.message ?? "Failed to load symbols"))
       .finally(() => setLoading(false));
-  }, []);
+  }, [activeWorkspaceId]);
 
   const filtered = useMemo(() => {
     const lc = filter.toLowerCase();

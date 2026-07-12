@@ -34,18 +34,22 @@ export function StatusBar() {
     });
   }, []);
 
+  const repoCount = selectedWorkspace?.counts.repo_count ?? repos.length;
+  const vaultCount = selectedWorkspace?.counts.vault_count ?? status?.vault_count;
+  const noteCount = selectedWorkspace?.counts.note_count ?? status?.note_count;
+
   return (
     <footer data-testid="status-bar" className="flex h-6 shrink-0 items-center gap-3 overflow-hidden border-t border-[var(--color-border)] px-4 text-xs text-[var(--color-text-muted)]">
       <WorkspaceStatusChip
         workspace={selectedWorkspace}
         metadata={sceneMetadata}
       />
-      <span>{repos.length} repo{repos.length !== 1 ? "s" : ""}</span>
-      {status && (
-        <>
-          <span>{status.vault_count} vault{status.vault_count !== 1 ? "s" : ""}</span>
-          <span>{status.note_count} note{status.note_count !== 1 ? "s" : ""}</span>
-        </>
+      <span>{repoCount} repo{repoCount !== 1 ? "s" : ""}</span>
+      {vaultCount != null && (
+        <span>{vaultCount} vault{vaultCount !== 1 ? "s" : ""}</span>
+      )}
+      {noteCount != null && (
+        <span>{noteCount} note{noteCount !== 1 ? "s" : ""}</span>
       )}
       <span
         className={
