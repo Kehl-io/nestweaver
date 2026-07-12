@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use lbug::Value;
 use nestweaver_schema::{
     Contract, EntryPointKind, Heading, Note, NoteKind, Project, Repo, Section, Service, Symbol,
@@ -494,6 +496,31 @@ impl GraphStore {
             .execute(&mut stmt, vec![("uid", Value::String(uid.to_string()))])
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         result.map(|row| row_to_symbol(&row)).collect()
+    }
+
+    /// Returns the set of service UIDs that have at least one caller whose
+    /// `file_path` contains "test" or "spec" (case-insensitive). Used by the
+    /// gaps endpoint to compute the untested-services set in a single query
+    /// instead of N individual `callers_of` calls.
+    pub fn tested_service_uids(&self) -> Result<HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (caller:Symbol)-[:CALLS]->(callee:Symbol)\
+                 <-[:SERVICE_HAS_SYMBOL]-(svc:Service) \
+                 RETURN svc.uid, caller.file_path";
+        let result = conn
+            .query(q)
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        let mut tested = HashSet::new();
+        for row in result {
+            let svc_uid = extract_string(&row, 0)?;
+            let file_path = extract_string(&row, 1)?;
+            let lc = file_path.to_lowercase();
+            if lc.contains("test") || lc.contains("spec") {
+                tested.insert(svc_uid);
+            }
+        }
+        Ok(tested)
     }
 
     /// Look up a symbol by its canonical_id (Phase 4 cross-boundary matching).
