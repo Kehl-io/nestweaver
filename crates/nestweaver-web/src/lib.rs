@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod error;
+pub mod gaps_cache;
 pub mod routes;
 pub mod state;
 
