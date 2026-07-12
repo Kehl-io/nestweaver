@@ -33,6 +33,8 @@ export function useImpactMode() {
       return;
     }
 
+    setActiveLens({ lens: "impact", label: "Impact", targetUid: selectedNodeId, workspaceId: activeWorkspaceId || "all" });
+
     const requestId = ++requestIdRef.current;
     const targetNodeId = selectedNodeId;
     const requestWorkspaceId = activeWorkspaceId || "all";

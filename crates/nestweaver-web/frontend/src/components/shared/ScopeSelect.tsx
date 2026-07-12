@@ -18,7 +18,7 @@ interface ScopeSelectProps {
 export function ScopeSelect({
   value,
   onChange,
-  label = "Scope",
+  label = "Search scope",
   compact = false,
 }: ScopeSelectProps) {
   const selectedLabel =

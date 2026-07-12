@@ -8,10 +8,13 @@ export function useFeaturesMode() {
   const graphMode = useStore((s) => s.graphMode);
   const seeds = useStore((s) => s.seeds);
   const setActiveLens = useStore((s) => s.setActiveLens);
+  const setSceneMetadata = useStore((s) => s.setSceneMetadata);
 
   const loadFeaturesData = useCallback(async () => {
-    if (graphMode !== "features" || seeds.length === 0) return;
+    if (graphMode !== "features") return;
     setActiveLens({ lens: "overview", label: "Features", targetUid: null, workspaceId: null });
+    setSceneMetadata(null);
+    if (seeds.length === 0) return;
 
     try {
       const result = await api.brainContext(seeds, 4000, "all");
@@ -20,7 +23,7 @@ export function useFeaturesMode() {
     } catch (err) {
       console.error("Failed to load features:", err);
     }
-  }, [graphMode, seeds, setGraphData, setActiveLens]);
+  }, [graphMode, seeds, setGraphData, setActiveLens, setSceneMetadata]);
 
   useEffect(() => {
     loadFeaturesData();
