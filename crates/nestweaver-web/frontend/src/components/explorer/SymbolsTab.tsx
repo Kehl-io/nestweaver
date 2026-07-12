@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import * as Select from "@radix-ui/react-select";
 import { ChevronDown } from "lucide-react";
+import { api } from "../../api/client";
 import type { SymbolCandidate } from "../../api/types";
-import { appendWorkspaceParam } from "../../api/workspaces";
 import { useStore } from "../../stores";
 import { KindBadge } from "../shared/KindBadge";
 
@@ -23,12 +23,8 @@ export function SymbolsTab() {
   useEffect(() => {
     setLoading(true);
     setError(null);
-    const url = appendWorkspaceParam("/api/v1/symbols/top?limit=200", activeWorkspaceId);
-    fetch(url)
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+    api
+      .symbolsTop(200, activeWorkspaceId)
       .then(setSymbols)
       .catch((e) => setError(e.message ?? "Failed to load symbols"))
       .finally(() => setLoading(false));

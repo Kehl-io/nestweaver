@@ -124,6 +124,9 @@ export function LensSummaryPanel({
   const impactConfidence = useStore((s) => s.impactConfidence);
   const setImpactFilters = useStore((s) => s.setImpactFilters);
   const facts = metadataFacts(sceneMetadata);
+  const criticalUnsupported = trustSummary?.unsupported?.filter(
+    (item) => !EXPECTED_UNSUPPORTED.has(item),
+  );
   const nodeCount = graphInstance?.order ?? 0;
   const edgeCount = graphInstance?.size ?? 0;
 
@@ -194,16 +197,11 @@ export function LensSummaryPanel({
               </span>
             ))}
           </div>
-          {(() => {
-            const critical = trustSummary?.unsupported?.filter(
-              (item) => !EXPECTED_UNSUPPORTED.has(item),
-            );
-            return critical && critical.length > 0 ? (
-              <p className="mt-3 text-[11px] leading-5 text-amber-300">
-                Unavailable: {critical.join(", ")}
-              </p>
-            ) : null;
-          })()}
+          {criticalUnsupported && criticalUnsupported.length > 0 && (
+            <p className="mt-3 text-[11px] leading-5 text-amber-300">
+              Unavailable: {criticalUnsupported.join(", ")}
+            </p>
+          )}
           {selectedNodeId && (
             <p className="mt-3 break-all border-t border-[var(--color-border)] pt-2 text-[11px] text-[var(--color-text-muted)]">
               {(graphInstance?.hasNode(selectedNodeId)
