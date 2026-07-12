@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
+use crate::gaps_cache::GapsCache;
+
 #[derive(Clone)]
 pub struct GraphEvent {
     pub event_type: String,
@@ -24,6 +26,7 @@ pub struct AppState {
     /// request on large graphs; the data is advisory UI emphasis, so
     /// within-process staleness is acceptable.
     pub bridge_scores: OnceLock<Arc<HashMap<String, f64>>>,
+    pub gaps_cache: GapsCache,
 }
 
 impl AppState {
@@ -36,6 +39,7 @@ impl AppState {
             db_path,
             file_lock: Mutex::new(()),
             bridge_scores: OnceLock::new(),
+            gaps_cache: GapsCache::new(),
         })
     }
 
@@ -52,6 +56,7 @@ impl AppState {
             db_path,
             file_lock: Mutex::new(()),
             bridge_scores: OnceLock::new(),
+            gaps_cache: GapsCache::new(),
         })
     }
 
@@ -68,6 +73,7 @@ impl AppState {
             db_path,
             file_lock: Mutex::new(()),
             bridge_scores: OnceLock::new(),
+            gaps_cache: GapsCache::new(),
         })
     }
 }
