@@ -6,9 +6,11 @@ import { buildGraphFromRepos } from "../utils/buildGraphFromRepos";
 export function useReposMode() {
   const setGraphData = useStore((s) => s.setGraphData);
   const graphMode = useStore((s) => s.graphMode);
+  const setActiveLens = useStore((s) => s.setActiveLens);
 
   const loadReposData = useCallback(async () => {
     if (graphMode !== "repos") return;
+    setActiveLens({ lens: "overview", label: "Repos", targetUid: null, workspaceId: null });
 
     try {
       const [repos, services] = await Promise.all([
@@ -20,7 +22,7 @@ export function useReposMode() {
     } catch (err) {
       console.error("Failed to load repos:", err);
     }
-  }, [graphMode, setGraphData]);
+  }, [graphMode, setGraphData, setActiveLens]);
 
   useEffect(() => {
     loadReposData();

@@ -74,8 +74,11 @@ export function NotesTab() {
 
   const filteredNotes = useMemo(() => {
     const lc = filter.toLowerCase();
-    if (!lc) return notes;
-    return notes.filter((n) => n.title.toLowerCase().includes(lc));
+    return notes.filter((n) => {
+      if (n.title.includes("{{") || n.file_path.includes("_templates/")) return false;
+      if (lc && !n.title.toLowerCase().includes(lc)) return false;
+      return true;
+    });
   }, [notes, filter]);
 
   const notesByVault = useMemo(() => {
@@ -162,6 +165,11 @@ export function NotesTab() {
                         >
                           <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-text)]">
                             {note.title}
+                            {note.file_path && (
+                              <span className="ml-1 text-[10px] text-[var(--color-text-muted)]">
+                                {note.file_path.split("/").slice(-2, -1)[0] || ""}
+                              </span>
+                            )}
                           </span>
                           <KindBadge kind={note.note_kind} />
                           {note.word_count > 0 && (

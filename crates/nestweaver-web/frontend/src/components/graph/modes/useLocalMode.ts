@@ -11,6 +11,7 @@ export function useLocalMode() {
   const setGraphData = useStore((s) => s.setGraphData);
   const graphMode = useStore((s) => s.graphMode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const setActiveLens = useStore((s) => s.setActiveLens);
   const [hops, setHops] = useState(2);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -18,6 +19,7 @@ export function useLocalMode() {
 
   const loadLocalData = useCallback(async () => {
     if (graphMode !== "local" || !selectedNodeId) return;
+    setActiveLens({ lens: "overview", label: "Local", targetUid: selectedNodeId, workspaceId: null });
 
     const budget = HOP_BUDGETS[hops] ?? 2000;
 
@@ -40,7 +42,7 @@ export function useLocalMode() {
     } catch (err) {
       console.error("Failed to load local graph:", err);
     }
-  }, [graphMode, selectedNodeId, hops, setGraphData, start, stop]);
+  }, [graphMode, selectedNodeId, hops, setGraphData, setActiveLens, start, stop]);
 
   // Clear stop timer when layout converges
   useEffect(() => {

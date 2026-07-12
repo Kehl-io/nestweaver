@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import * as Select from "@radix-ui/react-select";
 import { ChevronDown } from "lucide-react";
-import { api } from "../../api/client";
 import type { SymbolCandidate } from "../../api/types";
+import { appendWorkspaceParam } from "../../api/workspaces";
 import { useStore } from "../../stores";
 import { KindBadge } from "../shared/KindBadge";
 
@@ -12,6 +12,7 @@ const MAX_VISIBLE = 100;
 export function SymbolsTab() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const exploreNode = useStore((s) => s.exploreNode);
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
 
   const [symbols, setSymbols] = useState<SymbolCandidate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -22,12 +23,16 @@ export function SymbolsTab() {
   useEffect(() => {
     setLoading(true);
     setError(null);
-    api
-      .symbolsTop(200)
+    const url = appendWorkspaceParam("/api/v1/symbols/top?limit=200", activeWorkspaceId);
+    fetch(url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then(setSymbols)
       .catch((e) => setError(e.message ?? "Failed to load symbols"))
       .finally(() => setLoading(false));
-  }, []);
+  }, [activeWorkspaceId]);
 
   const filtered = useMemo(() => {
     const lc = filter.toLowerCase();

@@ -733,7 +733,7 @@ export function NodeListView() {
 
       <div className="min-h-0 flex-1 overflow-auto">
         <table
-          className="w-full min-w-[860px] border-collapse text-left text-xs"
+          className="w-full min-w-[1060px] border-collapse text-left text-xs"
           aria-label={`${activeLens.label} result rows`}
         >
           <thead className="sticky top-0 z-10 bg-[var(--color-surface)] shadow-sm">
@@ -744,10 +744,10 @@ export function NodeListView() {
               <th scope="col" aria-sort={ariaSort("relationship")} className="px-3 py-2">{header("relationship", "Semantics")}</th>
               <th scope="col" aria-sort={ariaSort("status")} className="px-3 py-2">{header("status", "State")}</th>
               <th scope="col" aria-sort={ariaSort("location")} className="px-3 py-2">{header("location", "Evidence")}</th>
-              <th scope="col" className="px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+              <th scope="col" className="whitespace-nowrap px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
                 Metadata
               </th>
-              <th scope="col" className="px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
+              <th scope="col" className="whitespace-nowrap px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
                 Actions
               </th>
             </tr>
