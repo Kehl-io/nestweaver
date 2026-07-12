@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.3](https://github.com/Kehl-io/nestweaver/compare/v2.3.2...v2.3.3) (2026-07-12)
+
+
+### Bug Fixes
+
+* **web:** UI bug hunt — mode labels, notes cleanup, workspace scoping, detail panel polish ([#131](https://github.com/Kehl-io/nestweaver/issues/131)) ([e8a85e2](https://github.com/Kehl-io/nestweaver/commit/e8a85e2e280eb7c674b5a64cec3f2acce9bf5909))
+
 ## [2.3.2](https://github.com/Kehl-io/nestweaver/compare/v2.3.1...v2.3.2) (2026-07-11)
 
 
