@@ -348,6 +348,20 @@ async fn gaps_returns_report_structure() {
     );
 }
 
+#[tokio::test]
+async fn gaps_second_call_returns_cached_result() {
+    let app = make_app();
+
+    // First call: cold
+    let (status1, json1) = get_json(&app, "/api/v1/gaps").await;
+    assert_eq!(status1, StatusCode::OK);
+
+    // Second call: should return identical result (cached)
+    let (status2, json2) = get_json(&app, "/api/v1/gaps").await;
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(json1, json2, "cached response should be identical");
+}
+
 #[test]
 fn tested_service_uids_returns_only_tested() {
     let store = GraphStore::in_memory().unwrap();
