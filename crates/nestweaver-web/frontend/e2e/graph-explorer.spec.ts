@@ -209,7 +209,7 @@ test.describe("Graph Explorer", () => {
       .click();
 
     await expect(
-      page.getByRole("button", { name: /Context/ }),
+      page.getByLabel("Graph mode").getByRole("button", { name: /Context/ }),
     ).toBeVisible();
     await postOk(request, "/api/v1/context", {
       seeds: [firstSymbol.uid],
@@ -275,7 +275,7 @@ test.describe("Graph Explorer", () => {
     await option.getByRole("button", { name: "Add" }).click();
 
     await expect(
-      page.getByRole("button", { name: /Context/ }),
+      page.getByLabel("Graph mode").getByRole("button", { name: /Context/ }),
     ).toBeVisible();
   });
 
