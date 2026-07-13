@@ -15,6 +15,12 @@ pub struct GapsCache {
     cached: RwLock<Option<CachedGaps>>,
 }
 
+impl Default for GapsCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GapsCache {
     pub fn new() -> Self {
         Self {
@@ -28,19 +34,19 @@ impl GapsCache {
         // Fast path: read lock, check generation
         {
             let guard = self.cached.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(cached) = guard.as_ref() {
-                if cached.generation == current_gen {
-                    return Ok(cached.response.clone());
-                }
+            if let Some(cached) = guard.as_ref()
+                && cached.generation == current_gen
+            {
+                return Ok(cached.response.clone());
             }
         }
 
         // Slow path: write lock, double-check, compute
         let mut guard = self.cached.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.as_ref() {
-            if cached.generation == current_gen {
-                return Ok(cached.response.clone());
-            }
+        if let Some(cached) = guard.as_ref()
+            && cached.generation == current_gen
+        {
+            return Ok(cached.response.clone());
         }
 
         let response = Self::compute(store)?;
