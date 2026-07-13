@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.4](https://github.com/Kehl-io/nestweaver/compare/v2.3.3...v2.3.4) (2026-07-13)
+
+
+### Performance Improvements
+
+* **web:** gaps endpoint — batch query + generation-gated cache (2.1s → 7ms) ([#133](https://github.com/Kehl-io/nestweaver/issues/133)) ([daebcc9](https://github.com/Kehl-io/nestweaver/commit/daebcc9dc3f0ae3c02ed370d0a71116bb54c2685))
+
 ## [2.3.3](https://github.com/Kehl-io/nestweaver/compare/v2.3.2...v2.3.3) (2026-07-12)
 
 
