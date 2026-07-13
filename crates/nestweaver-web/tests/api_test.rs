@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Visibility};
 use nestweaver_store::{GraphScope, GraphStore};
 use nestweaver_web::create_router;
 use nestweaver_web::state::AppState;
@@ -346,6 +346,151 @@ async fn gaps_returns_report_structure() {
         json.get("disconnected_pairs").is_some(),
         "should have disconnected_pairs"
     );
+}
+
+#[tokio::test]
+async fn gaps_second_call_returns_cached_result() {
+    let app = make_app();
+
+    // First call: cold
+    let (status1, json1) = get_json(&app, "/api/v1/gaps").await;
+    assert_eq!(status1, StatusCode::OK);
+
+    // Second call: should return identical result (cached)
+    let (status2, json2) = get_json(&app, "/api/v1/gaps").await;
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(json1, json2, "cached response should be identical");
+}
+
+#[test]
+fn tested_service_uids_returns_only_tested() {
+    let store = GraphStore::in_memory().unwrap();
+
+    // Insert a repo
+    let repo = Repo {
+        uid: "repo:test".to_string(),
+        url: "https://example.com/test.git".to_string(),
+        indexed_sha: "abc123".to_string(),
+        staleness_commits_behind: 0,
+        instance_id: String::new(),
+        name: None,
+        root_path: None,
+    };
+    store.insert_repo(&repo).unwrap();
+
+    // Two services
+    let svc_tested = Service {
+        uid: "svc:tested".to_string(),
+        name: "TestedService".to_string(),
+        repo_uid: "repo:test".to_string(),
+        summary: None,
+        summary_hash: None,
+        embedding: None,
+    };
+    let svc_untested = Service {
+        uid: "svc:untested".to_string(),
+        name: "UntestedService".to_string(),
+        repo_uid: "repo:test".to_string(),
+        summary: None,
+        summary_hash: None,
+        embedding: None,
+    };
+    store.insert_service(&svc_tested).unwrap();
+    store.insert_service(&svc_untested).unwrap();
+
+    // Symbols belonging to each service
+    let sym_a = Symbol {
+        uid: "sym:a".to_string(),
+        name: "handleRequest".to_string(),
+        kind: SymbolKind::Function,
+        repo_uid: "repo:test".to_string(),
+        file_path: "src/service_a.ts".to_string(),
+        start_line: 1,
+        end_line: 10,
+        signature: "fn handleRequest()".to_string(),
+        summary: None,
+        content_hash: "h1".to_string(),
+        embedding: None,
+        pagerank_score: None,
+        is_entry_point: false,
+        entry_point_kind: None,
+        visibility: Visibility::Inferred,
+        type_info: None,
+        framework_hint: None,
+        canonical_id: None,
+    };
+    let sym_b = Symbol {
+        uid: "sym:b".to_string(),
+        name: "processData".to_string(),
+        kind: SymbolKind::Function,
+        repo_uid: "repo:test".to_string(),
+        file_path: "src/service_b.ts".to_string(),
+        start_line: 1,
+        end_line: 10,
+        signature: "fn processData()".to_string(),
+        summary: None,
+        content_hash: "h2".to_string(),
+        embedding: None,
+        pagerank_score: None,
+        is_entry_point: false,
+        entry_point_kind: None,
+        visibility: Visibility::Inferred,
+        type_info: None,
+        framework_hint: None,
+        canonical_id: None,
+    };
+    store.insert_symbol(&sym_a).unwrap();
+    store.insert_symbol(&sym_b).unwrap();
+    store
+        .insert_service_symbol_edge("svc:tested", "sym:a")
+        .unwrap();
+    store
+        .insert_service_symbol_edge("svc:untested", "sym:b")
+        .unwrap();
+
+    // A test-file symbol that calls sym_a (making svc:tested "tested")
+    let test_caller = Symbol {
+        uid: "sym:test_caller".to_string(),
+        name: "testHandleRequest".to_string(),
+        kind: SymbolKind::Function,
+        repo_uid: "repo:test".to_string(),
+        file_path: "src/__tests__/service_a.test.ts".to_string(),
+        start_line: 1,
+        end_line: 5,
+        signature: "fn testHandleRequest()".to_string(),
+        summary: None,
+        content_hash: "h3".to_string(),
+        embedding: None,
+        pagerank_score: None,
+        is_entry_point: false,
+        entry_point_kind: None,
+        visibility: Visibility::Inferred,
+        type_info: None,
+        framework_hint: None,
+        canonical_id: None,
+    };
+    store.insert_symbol(&test_caller).unwrap();
+    store
+        .insert_edge(&ResolvedEdge {
+            source_uid: "sym:test_caller".to_string(),
+            target_uid: "sym:a".to_string(),
+            edge_type: EdgeType::Calls,
+            confidence: 1.0,
+            link_type: None,
+            evidence: vec![],
+        })
+        .unwrap();
+
+    let tested = store.tested_service_uids().unwrap();
+    assert!(
+        tested.contains("svc:tested"),
+        "svc:tested should be in the tested set"
+    );
+    assert!(
+        !tested.contains("svc:untested"),
+        "svc:untested should NOT be in the tested set"
+    );
+    assert_eq!(tested.len(), 1);
 }
 
 fn make_app_with_tempdir() -> (axum::Router, tempfile::TempDir) {
