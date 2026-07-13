@@ -41,19 +41,21 @@ impl GapsCache {
             }
         }
 
-        // Slow path: write lock, double-check, compute
-        let mut guard = self.cached.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.as_ref()
-            && cached.generation == current_gen
-        {
-            return Ok(cached.response.clone());
-        }
-
+        // Slow path: compute OUTSIDE the lock so concurrent readers aren't
+        // blocked for the full computation. Two threads may redundantly
+        // compute for the same generation; the last writer wins with an
+        // identical value — preferable to serializing all readers behind
+        // a ~1s write lock.
         let response = Self::compute(store)?;
-        *guard = Some(CachedGaps {
-            generation: current_gen,
-            response: response.clone(),
-        });
+
+        // Brief write lock to store the result
+        let mut guard = self.cached.write().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_none_or(|c| c.generation < current_gen) {
+            *guard = Some(CachedGaps {
+                generation: current_gen,
+                response: response.clone(),
+            });
+        }
         Ok(response)
     }
 
