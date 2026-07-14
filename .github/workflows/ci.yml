@@ -173,7 +173,7 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: build
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: "npm"
