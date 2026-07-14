@@ -89,6 +89,21 @@ pub struct ImpactEdge {
     pub confidence: f32,
 }
 
+/// Result of an impact traversal plus honesty flags about whether the walk
+/// was complete. Truncation means real dependents may exist beyond `nodes`.
+#[derive(Debug, Clone)]
+pub struct ImpactResult {
+    pub nodes: Vec<ImpactNode>,
+    /// A path was pruned because its decayed score fell below the impact
+    /// threshold — the tail of the impact set may be incomplete.
+    pub truncated_by_threshold: bool,
+    /// A frontier node was reached at `max_depth` and left unexpanded —
+    /// deeper dependents may exist beyond the returned set.
+    pub truncated_by_depth: bool,
+    /// The edge types actually traversed.
+    pub edge_types: Vec<EdgeType>,
+}
+
 /// A row representing caller + edge metadata returned from the BFS query.
 struct CallerRow {
     uid: String,
@@ -143,6 +158,35 @@ impl GraphStore {
         min_confidence: f32,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<ImpactNode>, StoreError> {
+        Ok(self
+            .impact_detailed(
+                target_uid,
+                max_depth,
+                min_confidence,
+                IMPACT_EDGE_TYPES,
+                cancel,
+            )?
+            .nodes)
+    }
+
+    /// Confidence-weighted reverse BFS that also reports whether the walk was
+    /// complete. `edges` selects which incoming relationship types to follow;
+    /// pass [`IMPACT_EDGE_TYPES`] for the default impact edge set. The returned
+    /// [`ImpactResult`] carries the ranked nodes plus `truncated_by_threshold`
+    /// / `truncated_by_depth` honesty flags so callers can tell an *incomplete*
+    /// walk from a genuinely small impact set.
+    ///
+    /// `cancel` behaves exactly as in [`impact_cancellable`](Self::impact_cancellable):
+    /// the flag is checked once per dequeue and a tripped flag returns
+    /// `Err(StoreError::Cancelled(_))`.
+    pub fn impact_detailed(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        edges: &[EdgeType],
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
         // Track the best impact score seen so far for each node.
         let mut scores: HashMap<String, f64> = HashMap::new();
         scores.insert(target_uid.to_string(), 1.0);
@@ -155,6 +199,10 @@ impl GraphStore {
         // better path is found.
         let mut result_map: HashMap<String, ImpactNode> = HashMap::new();
 
+        // Honesty flags: whether the walk left part of the impact set unseen.
+        let mut truncated_by_threshold = false;
+        let mut truncated_by_depth = false;
+
         while let Some((current_uid, depth)) = queue.pop_front() {
             if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                 // The shared cancel flag is a bare bool and can't carry a
@@ -163,12 +211,15 @@ impl GraphStore {
                 return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
             }
             if depth >= max_depth {
+                // A frontier node reached the depth boundary unexpanded;
+                // deeper dependents may exist beyond the returned set.
+                truncated_by_depth = true;
                 continue;
             }
 
             let parent_score = scores.get(&current_uid).copied().unwrap_or(0.0);
 
-            let callers = self.direct_callers_of(&current_uid, min_confidence)?;
+            let callers = self.direct_callers_of(&current_uid, min_confidence, edges)?;
 
             for row in callers {
                 // Skip the seed node itself.
@@ -180,6 +231,7 @@ impl GraphStore {
 
                 // Prune paths that fall below the impact threshold.
                 if candidate_score < DEFAULT_IMPACT_THRESHOLD {
+                    truncated_by_threshold = true;
                     continue;
                 }
 
@@ -217,7 +269,12 @@ impl GraphStore {
                 .then_with(|| a.uid.cmp(&b.uid))
         });
 
-        Ok(results)
+        Ok(ImpactResult {
+            nodes: results,
+            truncated_by_threshold,
+            truncated_by_depth,
+            edge_types: edges.to_vec(),
+        })
     }
 
     /// Internal: fetch all direct callers of `uid` across
@@ -226,15 +283,13 @@ impl GraphStore {
         &self,
         uid: &str,
         min_confidence: f32,
+        edges: &[EdgeType],
     ) -> Result<Vec<CallerRow>, StoreError> {
         let conn = self.conn()?;
         let min_conf = min_confidence as f64;
         let mut rows: Vec<CallerRow> = Vec::new();
 
-        for edge_type in IMPACT_EDGE_TYPES
-            .iter()
-            .map(|edge_type| edge_type.rel_table_name())
-        {
+        for edge_type in edges.iter().map(|edge_type| edge_type.rel_table_name()) {
             let q = format!(
                 "MATCH (s:Symbol)-[r:{et}]->(t:Symbol {{uid: $uid}}) \
                  WHERE r.confidence >= $min_conf \
@@ -893,5 +948,173 @@ mod tests {
         let priority = vec!["Class".to_string()];
         assert_eq!(kind_rank(SymbolKind::Class, &priority), 0);
         assert_eq!(kind_rank(SymbolKind::Function, &priority), usize::MAX);
+    }
+
+    // ── impact_detailed — truncation honesty flags ──────────────────────
+
+    use super::IMPACT_EDGE_TYPES;
+
+    /// A chain fully contained within `max_depth`, all high-confidence, is a
+    /// complete walk: neither truncation flag should fire.
+    #[test]
+    fn impact_detailed_complete_walk_sets_no_flags() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["target", "a", "b"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // b → a → target (callers point at their callee).
+        for (src, tgt) in [("a", "target"), ("b", "a")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let result = store
+            .impact_detailed("target", 5, 0.0, IMPACT_EDGE_TYPES, None)
+            .unwrap();
+        assert!(
+            !result.truncated_by_threshold,
+            "no path was pruned below threshold"
+        );
+        assert!(
+            !result.truncated_by_depth,
+            "no frontier node hit the depth boundary"
+        );
+        assert_eq!(result.nodes.len(), 2, "both a and b are reachable");
+    }
+
+    /// A chain longer than `max_depth` leaves a frontier node unexpanded at the
+    /// boundary — `truncated_by_depth` must fire.
+    #[test]
+    fn impact_detailed_flags_depth_truncation() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["target", "a", "b", "c"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        for (src, tgt) in [("a", "target"), ("b", "a"), ("c", "b")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let result = store
+            .impact_detailed("target", 2, 0.0, IMPACT_EDGE_TYPES, None)
+            .unwrap();
+        assert!(
+            result.truncated_by_depth,
+            "a node reached max_depth and was left unexpanded"
+        );
+        assert!(
+            !result.truncated_by_threshold,
+            "all confidences are high; nothing pruned by threshold"
+        );
+    }
+
+    /// A chain whose decayed score falls below `DEFAULT_IMPACT_THRESHOLD`
+    /// (0.10) must set `truncated_by_threshold`.
+    #[test]
+    fn impact_detailed_flags_threshold_truncation() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["target", "a", "b"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // 1.0 * 0.3 = 0.30 (kept); 0.30 * 0.3 = 0.09 (< 0.10, pruned).
+        for (src, tgt) in [("a", "target"), ("b", "a")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.3,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let result = store
+            .impact_detailed("target", 5, 0.0, IMPACT_EDGE_TYPES, None)
+            .unwrap();
+        assert!(
+            result.truncated_by_threshold,
+            "the b→a path decays below the impact threshold and is pruned"
+        );
+        assert!(
+            !result.truncated_by_depth,
+            "the boundary was never reached (b never enqueued)"
+        );
+        assert_eq!(
+            result.nodes.len(),
+            1,
+            "only a survives; b is pruned below threshold"
+        );
+    }
+
+    /// A restricted `edges` set is honored: only the listed edge types are
+    /// traversed, and `edge_types` echoes the set actually used.
+    #[test]
+    fn impact_detailed_restricts_to_requested_edges() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["target", "caller", "importer"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // One dependent reaches `target` via CALLS, another only via IMPORTS.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "importer".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Imports,
+                confidence: 0.9,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let result = store
+            .impact_detailed("target", 5, 0.0, &[EdgeType::Calls], None)
+            .unwrap();
+        assert_eq!(
+            result.edge_types,
+            vec![EdgeType::Calls],
+            "edge_types must echo the requested set"
+        );
+        let uids: Vec<&str> = result.nodes.iter().map(|n| n.uid.as_str()).collect();
+        assert!(uids.contains(&"caller"), "CALLS dependent must be included");
+        assert!(
+            !uids.contains(&"importer"),
+            "IMPORTS-only dependent must be excluded when only CALLS is traversed"
+        );
     }
 }
