@@ -3127,51 +3127,88 @@ impl NestWeaverDaemon for DaemonService {
         let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
-        let result = tokio::task::spawn_blocking(move || {
-            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
-            let changed_files: Vec<std::path::PathBuf> = args
-                .get("files")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if changed_files.is_empty() {
-                return Err(Status::invalid_argument(
-                    "missing or empty 'files' array argument",
-                ));
-            }
-            // TODO(nw-033): resolve target repo_uid from the working repo
-            let options = nestweaver_engine::BlastRadiusOptions {
-                target_repo: None,
-                max_depth: depth,
-                include_data_edges: false,
-                limit: None,
-            };
-            // TODO(nw-034): thread a cancellation token through this handler so
-            // the timeout can stop the traversal.
-            let result = nestweaver_engine::analyze_blast_radius(
-                &state.store,
-                &changed_files,
-                &options,
-                None,
-                Some(&state.db_path),
-            )
-            .map_err(|e| {
-                // Log the detailed chain server-side; return a generic message
-                // so the client never sees internal error internals.
-                tracing::error!("analyze_blast_radius failed: {e:#}");
-                Status::internal("blast radius analysis failed")
-            })?;
-            serde_json::to_string(&result)
-                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+        // Route pr_impact through the same safeguard framework as dispatched MCP
+        // tools. pr_impact analysis is `blast_radius` under the hood, so it uses
+        // that tool's safeguard profile for timeout and depth clamping. (Per-client
+        // rate limiting is applied upstream at the auth interceptor for every RPC,
+        // so it already covers this handler.)
+        let tool = "blast_radius";
+        let safeguards = &self.state.safeguards;
+        let server_mode = state.server_mode;
+        // Cooperative cancellation flag: tripped by `with_safeguard_cancellable`
+        // on timeout and observed by `analyze_blast_radius`'s BFS, which then
+        // stops and yields status=Degraded.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        result.map(|j| Response::new(JsonResponse { result_json: j }))
+        // Clamp traversal depth before building options, mirroring
+        // `dispatch_json_tool_inner`: hard-cap in all modes (guards the BFS
+        // regardless of server_mode), then tighten via the safeguard config in
+        // server mode. The pr_impact response is a raw serialized
+        // `BlastRadiusResult` with no `_meta`, so the clamp is applied silently
+        // (no `_clamped`/`_original_depth` annotation).
+        let requested_depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3);
+        let depth = requested_depth.min(HARD_MAX_DEPTH) as u32;
+        let depth = if server_mode {
+            state.safeguards.effective_depth(tool, Some(depth)).depth
+        } else {
+            depth
+        };
+
+        let changed_files: Vec<std::path::PathBuf> = args
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if changed_files.is_empty() {
+            return Err(Status::invalid_argument(
+                "missing or empty 'files' array argument",
+            ));
+        }
+
+        let cancel_for_task = cancel.clone();
+        let handler = async move {
+            tokio::task::spawn_blocking(move || {
+                // TODO(nw-033): resolve target repo_uid from the working repo
+                let options = nestweaver_engine::BlastRadiusOptions {
+                    target_repo: None,
+                    max_depth: depth,
+                    include_data_edges: false,
+                    limit: None,
+                };
+                let result = nestweaver_engine::analyze_blast_radius(
+                    &state.store,
+                    &changed_files,
+                    &options,
+                    Some(&cancel_for_task),
+                    Some(&state.db_path),
+                )
+                .map_err(|e| {
+                    // Log the detailed chain server-side; return a generic message
+                    // so the client never sees internal error internals.
+                    tracing::error!("analyze_blast_radius failed: {e:#}");
+                    Status::internal("blast radius analysis failed")
+                })?;
+                serde_json::to_string(&result)
+                    .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?
+        };
+
+        // Wrap in the per-tool timeout only in server mode, matching
+        // `dispatch_json_tool`. On timeout the cancel flag is set, which stops
+        // the BFS above.
+        let result_json = if server_mode {
+            with_safeguard_cancellable(tool, safeguards, None, cancel, handler).await?
+        } else {
+            handler.await?
+        };
+
+        Ok(Response::new(JsonResponse { result_json }))
     }
 
     // ── Embedding ───────────────────────────────────────────────────
