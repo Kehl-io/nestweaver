@@ -43,6 +43,7 @@ pub mod admin;
 pub mod affected_tests;
 pub mod agent_guide;
 pub mod atomic_changes;
+pub mod authz;
 pub mod backup;
 pub mod bare_clone;
 pub mod blast_radius;
@@ -114,6 +115,10 @@ pub use agent_guide::{
     generate_guide, generate_guide_with_rules, generate_guide_with_tools, generate_skill,
     generate_skill_with_rules, generate_skill_with_tools,
 };
+pub use authz::{
+    Identity, PermissionSource, StaticConfigPermissionSource, VisibleRepos,
+    redact_blast_radius_for_visibility,
+};
 pub use backup::{
     BackupConfig, BackupManifest, BackupRepoInfo, BackupResult, BackupSizes, RestoreConfig,
     RestoreResult, StagedBackup, backup_inspect, backup_list, backup_restore, backup_save,
@@ -142,11 +147,11 @@ pub use cluster_dispatch::{
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{
-    CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule, InferenceConfig,
-    InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig, RepoConfig,
-    RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig, StorageConfig, UpstreamEntry,
-    WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file, default_kind_priority,
-    default_test_path_patterns, remove_repo_from_config_file,
+    AuthzConfig, CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule,
+    InferenceConfig, InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig,
+    RepoConfig, RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig, StorageConfig,
+    UpstreamEntry, WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file,
+    default_kind_priority, default_test_path_patterns, remove_repo_from_config_file,
 };
 pub use contract_change::breaking_changes_from_git;
 pub use cross_domain::{

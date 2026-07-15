@@ -230,6 +230,11 @@ pub struct InstanceConfig {
     /// via its own discovery layer.
     #[serde(default)]
     pub upstream: Vec<UpstreamEntry>,
+    /// Per-repo authorization policy (`[authz]`, Blast Radius R9/R9b). Absent /
+    /// empty ⇒ disabled ⇒ every caller is `VisibleRepos::All` (no behavior
+    /// change). See [`AuthzConfig`].
+    #[serde(default)]
+    pub authz: Option<AuthzConfig>,
 }
 
 /// `[embedding]` — local embedding model and hybrid-search blend configuration.
@@ -352,6 +357,30 @@ impl Default for CacheConfig {
         Self {
             max_size_mb: default_cache_max_size_mb(),
         }
+    }
+}
+
+/// `[authz]` — per-repo authorization policy (Blast Radius R9/R9b).
+///
+/// Maps a query bearer token to a list of repo glob patterns (matched against
+/// each repo's `url` or `uid`). An empty map (or an absent `[authz]` section)
+/// leaves the policy *disabled*: every caller resolves to
+/// [`VisibleRepos::All`](crate::authz::VisibleRepos::All) and blast-radius
+/// redaction is a no-op — the historical single-trust-domain behavior. Add any
+/// rule and the policy is *enabled*: it fails closed for unknown tokens.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthzConfig {
+    /// token -> repo glob patterns (matched against `Repo.url` and `Repo.uid`).
+    #[serde(default)]
+    pub rules: HashMap<String, Vec<String>>,
+}
+
+impl AuthzConfig {
+    /// Build a [`StaticConfigPermissionSource`](crate::authz::StaticConfigPermissionSource)
+    /// from this config. An empty rule map yields a disabled source (everyone
+    /// sees [`VisibleRepos::All`](crate::authz::VisibleRepos::All)).
+    pub fn build_permission_source(&self) -> crate::authz::StaticConfigPermissionSource {
+        crate::authz::StaticConfigPermissionSource::new(self.rules.clone())
     }
 }
 
