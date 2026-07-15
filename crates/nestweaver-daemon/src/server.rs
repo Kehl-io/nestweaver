@@ -3143,9 +3143,11 @@ impl NestWeaverDaemon for DaemonService {
                     "missing or empty 'files' array argument",
                 ));
             }
+            // TODO(nw-033): resolve target repo_uid from the working repo
             let result = nestweaver_engine::analyze_blast_radius(
                 &state.store,
                 &changed_files,
+                None,
                 depth,
                 Some(&state.db_path),
             )

@@ -5672,6 +5672,10 @@ fn tool_schema_blast_radius() -> Value {
                     "type": "integer",
                     "description": "Maximum transitive traversal depth. Default 3. Higher values find more distant dependents.",
                     "default": 3
+                },
+                "repo": {
+                    "type": "string",
+                    "description": "Optional repo_uid to scope changed-file resolution to (recommended in multi-repo graphs)."
                 }
             },
             "required": ["changed_files"]
@@ -5698,8 +5702,10 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .map(|n| n as u32)
         .unwrap_or(3);
 
+    let target_repo = args.get("repo").and_then(|v| v.as_str());
+
     let db_path = current_db_path(store).ok();
-    let result = analyze_blast_radius(store, &files, max_depth, db_path.as_deref())
+    let result = analyze_blast_radius(store, &files, target_repo, max_depth, db_path.as_deref())
         .context("analyze_blast_radius")?;
 
     let risk_str = match result.risk_level {

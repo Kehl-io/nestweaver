@@ -114,6 +114,7 @@ pub struct BlastRadiusResult {
 pub fn analyze_blast_radius(
     store: &GraphStore,
     changed_files: &[PathBuf],
+    target_repo: Option<&str>,
     max_depth: u32,
     db_path: Option<&Path>,
 ) -> Result<BlastRadiusResult> {
@@ -126,7 +127,14 @@ pub fn analyze_blast_radius(
 
     for file in changed_files {
         let file_str = file.to_string_lossy();
-        let syms = store.symbols_in_file(&file_str).unwrap_or_default();
+        // In a unified multi-repo graph, scope resolution to the repo under
+        // review so identical relative paths don't conflate across repos.
+        let syms = match target_repo {
+            Some(repo) => store
+                .symbols_in_file_in_repo(&file_str, repo)
+                .unwrap_or_default(),
+            None => store.symbols_in_file(&file_str).unwrap_or_default(),
+        };
         for sym in syms {
             changed_repos.insert(sym.repo_uid.clone());
             if changed_uids.insert(sym.uid.clone()) {
@@ -509,7 +517,7 @@ mod tests {
     fn analyze_blast_radius_empty_store() {
         let store = GraphStore::in_memory().expect("in_memory store");
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("nonexistent.rs")], 3, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("nonexistent.rs")], None, 3, None).unwrap();
         assert!(result.changed_symbols.is_empty());
         assert!(result.affected_symbols.is_empty());
         assert_eq!(result.risk_level, RiskLevel::Low);
@@ -577,7 +585,8 @@ mod tests {
             })
             .expect("insert edge");
 
-        let result = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], 3, None).unwrap();
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
 
         assert_eq!(result.changed_symbols.len(), 1);
         assert_eq!(result.changed_symbols[0].name, "fn_a");
@@ -645,7 +654,8 @@ mod tests {
             })
             .unwrap();
 
-        let result = analyze_blast_radius(&store, &[PathBuf::from("src/api.rs")], 3, None).unwrap();
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/api.rs")], None, 3, None).unwrap();
 
         let org = result
             .org_wide
@@ -705,7 +715,8 @@ mod tests {
             })
             .unwrap();
 
-        let result = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], 3, None).unwrap();
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
         assert!(
             result.org_wide.is_none(),
             "org_wide must stay None when all impact is within one repo"
@@ -773,7 +784,8 @@ mod tests {
             })
             .unwrap();
 
-        let result = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], 5, None).unwrap();
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 5, None).unwrap();
 
         assert_eq!(result.affected_symbols.len(), 2);
         // Results should be sorted by impact_score descending.
@@ -845,11 +857,95 @@ mod tests {
             })
             .unwrap();
 
-        let result = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], 5, None).unwrap();
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 5, None).unwrap();
 
         // B is included (score 0.3 >= 0.10), but C is pruned (score 0.06 < 0.10).
         assert_eq!(result.affected_symbols.len(), 1);
         assert_eq!(result.affected_symbols[0].name, "fn_b");
         assert!((result.affected_symbols[0].impact_score - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn target_repo_scopes_changed_file_resolution() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        // Same relative path `src/main.rs` lives in two repos, each owning a
+        // distinct symbol — the unified multi-repo graph scenario.
+        let store = GraphStore::in_memory().expect("in_memory store");
+
+        let sym_r1 = Symbol {
+            uid: "sym:r1_main".to_string(),
+            name: "main_r1".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: "src/main.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: "fn main()".to_string(),
+            summary: None,
+            content_hash: "h1".to_string(),
+            embedding: None,
+            pagerank_score: Some(0.1),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let sym_r2 = Symbol {
+            uid: "sym:r2_main".to_string(),
+            name: "main_r2".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:2".to_string(),
+            file_path: "src/main.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: "fn main()".to_string(),
+            summary: None,
+            content_hash: "h2".to_string(),
+            embedding: None,
+            pagerank_score: Some(0.1),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        store.insert_symbol(&sym_r1).expect("insert sym_r1");
+        store.insert_symbol(&sym_r2).expect("insert sym_r2");
+
+        // Scoped to repo:1 — only repo:1's symbol resolves.
+        let scoped = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/main.rs")],
+            Some("repo:1"),
+            3,
+            None,
+        )
+        .unwrap();
+        let scoped_names: HashSet<&str> = scoped
+            .changed_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(scoped.changed_symbols.len(), 1);
+        assert!(scoped_names.contains("main_r1"));
+        assert!(!scoped_names.contains("main_r2"));
+
+        // Unscoped (None) — the historical behavior picks up both repos.
+        let unscoped =
+            analyze_blast_radius(&store, &[PathBuf::from("src/main.rs")], None, 3, None).unwrap();
+        let unscoped_names: HashSet<&str> = unscoped
+            .changed_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(unscoped.changed_symbols.len(), 2);
+        assert!(unscoped_names.contains("main_r1"));
+        assert!(unscoped_names.contains("main_r2"));
     }
 }

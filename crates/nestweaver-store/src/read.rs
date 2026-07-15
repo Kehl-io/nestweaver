@@ -921,6 +921,34 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
+    /// Symbols in `file_path` scoped to a single repo. In a unified multi-repo
+    /// graph, identical relative paths (e.g. `src/main.rs`) exist in many repos;
+    /// this avoids conflating them by also matching `repo_uid`.
+    pub fn symbols_in_file_in_repo(
+        &self,
+        file_path: &str,
+        repo_uid: &str,
+    ) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol) WHERE s.file_path = $path AND s.repo_uid = $repo RETURN {}",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![
+                    ("path", Value::String(file_path.to_string())),
+                    ("repo", Value::String(repo_uid.to_string())),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result.map(|row| row_to_symbol(&row)).collect()
+    }
+
     // ── Brain extension: markdown node reads ────────────────────────────────
 
     /// List all Vault nodes, optionally filtered by instance ID.
