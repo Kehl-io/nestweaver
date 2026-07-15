@@ -92,6 +92,7 @@ pub mod registry;
 pub mod rerank;
 pub mod resolution_cache;
 pub mod scheduler;
+pub mod signature_diff;
 pub mod snapshot;
 pub mod ssrf;
 pub mod suggest;
@@ -223,6 +224,7 @@ pub use rerank::{
     MonotonicWeights, RerankFeatures, RerankModel, Reranker, TrainingRow, export_training_rows,
     load_rerank_model, rerank, rerank_sidecar_path, select_reranker,
 };
+pub use signature_diff::{BreakKind, BreakTier, BreakingChange, diff_public_api, diff_symbol};
 pub use snapshot::*;
 pub use suggest::{
     Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,
