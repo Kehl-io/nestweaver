@@ -361,10 +361,13 @@ pub fn analyze_blast_radius(
         // most PRs touch — and when there is no target repo to judge against, so
         // a healthy change never gates as degraded on benign files.
         if syms.is_empty() {
+            let is_source = nestweaver_parser::detect_language(file).is_some();
             if let Some(repo) = target_repo
                 && known_repo_uids.contains(repo)
-                && nestweaver_parser::detect_language(file).is_some()
+                && is_source
             {
+                // Scoped to a known repo: a source file with no symbols is a real
+                // drift/stale signal — warn and degrade the run.
                 notifications.push(Notification {
                     level: NotificationLevel::Warning,
                     message: format!(
@@ -374,6 +377,19 @@ pub fn analyze_blast_radius(
                     descriptor: "changed-file-no-symbols".to_string(),
                 });
                 status = status.max(AnalysisStatus::Partial);
+            } else if target_repo.is_none() && !known_repo_uids.is_empty() && is_source {
+                // Unscoped (e.g. pre-push CLI) against a non-empty index: a source
+                // file with no symbols is likely new or the index is stale. Inform
+                // without gating — new files are common and shouldn't degrade the
+                // verdict, but the reviewer should know its impact isn't assessed.
+                notifications.push(Notification {
+                    level: NotificationLevel::Note,
+                    message: format!(
+                        "changed source file {file_str} has no indexed symbols (new file or \
+                         stale index) — its impact was not assessed"
+                    ),
+                    descriptor: "changed-file-no-symbols".to_string(),
+                });
             }
             continue;
         }
@@ -398,6 +414,27 @@ pub fn analyze_blast_radius(
     // "nothing affected".
     if !changed_files.is_empty() && files_ok == 0 && files_errored > 0 {
         status = status.max(AnalysisStatus::Failed);
+    }
+
+    // Empty-index guard: we resolved no changed symbols AND the database has no
+    // repositories indexed — the index is missing/empty (e.g. a wrong or unbuilt
+    // --db), so this is "cannot assess", NOT "nothing affected". Surface it
+    // loudly rather than returning a confident clean result. Gated on
+    // `files_errored == 0` so a store failure keeps its Degraded/Failed status
+    // and its own notification instead of this one.
+    if changed_symbols.is_empty()
+        && known_repo_uids.is_empty()
+        && files_errored == 0
+        && !changed_files.is_empty()
+    {
+        notifications.push(Notification {
+            level: NotificationLevel::Warning,
+            message: "no repositories are indexed in this database — cannot assess blast \
+                      radius (is the index built, and is --db pointing at it?)"
+                .to_string(),
+            descriptor: "index-empty".to_string(),
+        });
+        status = status.max(AnalysisStatus::Degraded);
     }
 
     // Step 2: For each changed symbol, run transitive impact analysis.
@@ -1015,6 +1052,28 @@ mod tests {
         assert!(result.changed_symbols.is_empty());
         assert!(result.affected_symbols.is_empty());
         assert_eq!(result.risk_level, RiskLevel::Low);
+        // An empty/missing index with changes to assess must NOT read as a
+        // confident "nothing affected" — it is a degraded, unknown result.
+        assert_eq!(result.status, AnalysisStatus::Degraded);
+        assert_eq!(result.gate_state, GateState::DegradedUnknown);
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "index-empty"),
+            "empty index must surface an index-empty notification: {:?}",
+            result.notifications
+        );
+    }
+
+    #[test]
+    fn empty_diff_on_empty_store_is_not_degraded() {
+        // No changed files → nothing to assess → the empty-index guard must not
+        // fire (an empty diff is a legitimate clean no-op, not a degraded run).
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let result = analyze_blast_radius(&store, &[], &opts(None, 3, false), None, None).unwrap();
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.gate_state, GateState::Ok);
     }
 
     #[test]
