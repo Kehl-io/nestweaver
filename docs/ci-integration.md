@@ -225,6 +225,59 @@ request field made newly required. Compatible additions (a new endpoint, a new
 optional field) are reported as INFO and do not fail the job. Add `--json` for a
 machine-readable report. See `nestweaver contracts diff --help`.
 
+## Blast Radius as SARIF (code scanning / PR annotations)
+
+The impact report posts a PR **comment**. To surface blast radius as inline
+**code-scanning annotations** on the PR's "Files changed" tab (and in the
+Security tab), emit [SARIF](https://sarifweb.azurewebsites.net/) and upload it.
+This needs no server — `pr-impact` runs against a local `nestweaver.lbug` index
+and drives the same hardened blast-radius engine as everything else.
+
+```yaml
+# .github/workflows/blast-radius.yml
+name: Blast Radius
+on: pull_request
+permissions:
+  contents: read
+  security-events: write   # required to upload SARIF
+jobs:
+  blast-radius:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # need the merge-base
+      # ... install nestweaver and build/restore the index (nestweaver.lbug) ...
+      - name: Blast radius (SARIF)
+        run: |
+          base="$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD)"
+          nestweaver pr-impact --base "$base" --sarif > blast-radius.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: blast-radius.sarif
+          category: nestweaver-blast-radius
+```
+
+The SARIF carries the full trust contract, so reviewers see it inline:
+
+- **`invocations[].executionSuccessful` + `toolExecutionNotifications`** — a
+  degraded/incomplete run is visible, never silently reported as "clean".
+- **`run.properties["nestweaver/gateState"]`** — `ok` / `degraded-unknown` /
+  `risk-flagged`. A degraded run is `degraded-unknown`, never `risk-flagged`.
+- **`nestweaver/coverage`** (repos in scope / not indexed / stale / truncated)
+  and **`nestweaver/blindSpots`** (dynamic dispatch, reflection, config wiring,
+  codegen) — so "no impact" is distinguishable from "incomplete coverage".
+- **`result.rank`** ranks affected symbols by impact score; **`nw/contract-break`**
+  results carry `severitySource: contract-verified` (a real signature diff),
+  distinct from the reach-based cross-repo hints (`severitySource: reach-only`).
+
+This is advisory: the workflow never fails the build. To gate, add a separate
+step that inspects `gateState`/`nw/contract-break` and exits non-zero, or use
+`pr-impact --base "$base" --strict` (blocks only on a *complete* High-risk run).
+
+**Locally**, the same output is one command away — `nestweaver hooks --install`
+adds an advisory pre-push check (see the CLI guide), and `--sarif` can be opened
+in the VS Code *SARIF Viewer* extension for inline review before you push.
+
 ## Networking
 
 ### GitHub-hosted runners
