@@ -3149,6 +3149,7 @@ impl NestWeaverDaemon for DaemonService {
                 &changed_files,
                 None,
                 depth,
+                false,
                 Some(&state.db_path),
             )
             .map_err(|e| Status::internal(format!("analyze_blast_radius failed: {e:#}")))?;

@@ -5148,7 +5148,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             ));
 
             // TODO(nw-033): resolve target repo_uid from the working repo
-            let result = analyze_blast_radius(&store, &changed_files, None, depth, Some(&db_path))?;
+            let result =
+                analyze_blast_radius(&store, &changed_files, None, depth, false, Some(&db_path))?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);

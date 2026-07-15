@@ -123,6 +123,11 @@ const IMPACT_EDGE_TYPES: &[EdgeType] = &[
     EdgeType::CrossRepoLink,
 ];
 
+/// Data-dependence edges: a symbol references a changed type (`Uses`) or reads/
+/// writes a changed field/property (`Accesses`). Followed only to a shallow
+/// depth because they fan out heavily.
+pub const IMPACT_DATA_EDGE_TYPES: &[EdgeType] = &[EdgeType::Uses, EdgeType::Accesses];
+
 impl GraphStore {
     /// Find all symbols that directly or transitively call/import/extend/implement `target_uid`.
     ///
@@ -204,6 +209,68 @@ impl GraphStore {
         edges: &[EdgeType],
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
+        // Structural-only walk: no data-dependence edges (empty set, cap 0).
+        self.impact_bfs(target_uid, max_depth, min_confidence, edges, &[], 0, cancel)
+    }
+
+    /// Impact with the structural edge set (to `max_depth`) plus data-dependence
+    /// edges followed only while depth < `data_max_depth`. Data edges are shallow-
+    /// capped because type-reference/field-access edges approach full program
+    /// slices if followed transitively.
+    pub fn impact_with_data_edges(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        data_max_depth: u32,
+    ) -> Result<ImpactResult, StoreError> {
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            IMPACT_EDGE_TYPES,
+            IMPACT_DATA_EDGE_TYPES,
+            data_max_depth,
+            None,
+        )
+    }
+
+    /// Shared confidence-weighted reverse BFS backing both [`impact_detailed`]
+    /// (structural-only) and [`impact_with_data_edges`] (structural + shallow
+    /// data-dependence tier).
+    ///
+    /// `structural` edges are followed to `max_depth`; `data` edges are followed
+    /// only at depths `d < data_max_depth`, because type-reference/field-access
+    /// edges fan out toward full program slices if followed transitively. The
+    /// combined edge slice is precomputed once and selected per depth: combined
+    /// while `d < data_max_depth`, structural-only beyond. When `data` is empty
+    /// or `data_max_depth == 0` this is byte-for-byte the structural-only walk.
+    #[allow(clippy::too_many_arguments)]
+    fn impact_bfs(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        structural: &[EdgeType],
+        data: &[EdgeType],
+        data_max_depth: u32,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        // Whether the shallow data tier is actually in play for this walk.
+        let data_active = data_max_depth > 0 && !data.is_empty();
+
+        // Precompute the combined slice once (structural ++ data) so per-node
+        // expansion just picks structural-only vs combined by depth.
+        let combined: Vec<EdgeType> = if data_active {
+            structural
+                .iter()
+                .copied()
+                .chain(data.iter().copied())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Track the best impact score seen so far for each node.
         let mut scores: HashMap<String, f64> = HashMap::new();
         scores.insert(target_uid.to_string(), 1.0);
@@ -236,6 +303,13 @@ impl GraphStore {
 
             let parent_score = scores.get(&current_uid).copied().unwrap_or(0.0);
 
+            // Follow the structural set always; fold in the shallow data tier
+            // only while still under its depth cap.
+            let edges: &[EdgeType] = if data_active && depth < data_max_depth {
+                &combined
+            } else {
+                structural
+            };
             let callers = self.direct_callers_of(&current_uid, min_confidence, edges)?;
 
             for row in callers {
@@ -286,11 +360,19 @@ impl GraphStore {
                 .then_with(|| a.uid.cmp(&b.uid))
         });
 
+        // Reflect the union actually available to traverse: structural + data
+        // when the shallow tier is in play, structural-only otherwise.
+        let edge_types = if data_active {
+            combined
+        } else {
+            structural.to_vec()
+        };
+
         Ok(ImpactResult {
             nodes: results,
             truncated_by_threshold,
             truncated_by_depth,
-            edge_types: edges.to_vec(),
+            edge_types,
         })
     }
 
@@ -1133,5 +1215,124 @@ mod tests {
             !uids.contains(&"importer"),
             "IMPORTS-only dependent must be excluded when only CALLS is traversed"
         );
+    }
+
+    // ── data-dependence edge tier ───────────────────────────────────────
+
+    /// The data tier surfaces symbols that only reference the changed *type*
+    /// (`Uses`) or read/write its *field* (`Accesses`) — dependents the
+    /// structural-only walk misses entirely.
+    #[test]
+    fn impact_with_data_edges_follows_type_and_field_edges() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["changed", "caller", "reader"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // caller references the changed type; reader accesses a changed field.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "changed".to_string(),
+                edge_type: EdgeType::Uses,
+                confidence: 0.9,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "reader".to_string(),
+                target_uid: "changed".to_string(),
+                edge_type: EdgeType::Accesses,
+                confidence: 0.9,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        // Data tier on: both the type-reference and field-access dependents show.
+        let with_data = store.impact_with_data_edges("changed", 3, 0.0, 2).unwrap();
+        let data_uids: Vec<&str> = with_data.nodes.iter().map(|n| n.uid.as_str()).collect();
+        assert!(
+            data_uids.contains(&"caller"),
+            "Uses (type-reference) dependent must surface with the data tier; got: {data_uids:?}"
+        );
+        assert!(
+            data_uids.contains(&"reader"),
+            "Accesses (field-access) dependent must surface with the data tier; got: {data_uids:?}"
+        );
+
+        // Structural-only: neither is reachable (default-off behavior).
+        let structural = store.impact_with_flags("changed", 3, 0.0).unwrap();
+        let struct_uids: Vec<&str> = structural.nodes.iter().map(|n| n.uid.as_str()).collect();
+        assert!(
+            !struct_uids.contains(&"caller"),
+            "structural-only walk must NOT follow Uses edges; got: {struct_uids:?}"
+        );
+        assert!(
+            !struct_uids.contains(&"reader"),
+            "structural-only walk must NOT follow Accesses edges; got: {struct_uids:?}"
+        );
+    }
+
+    /// Data edges are shallow-capped: a `Uses` chain deeper than
+    /// `data_max_depth` is not followed past the cap, while the structural set
+    /// still traverses to full `max_depth`.
+    #[test]
+    fn data_edges_are_depth_capped() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["changed", "d1", "d2", "s1", "s2", "s3"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // A Uses chain: d2 --Uses--> d1 --Uses--> changed.
+        for (src, tgt) in [("d1", "changed"), ("d2", "d1")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Uses,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        // A structural Calls chain: s3 -> s2 -> s1 -> changed.
+        for (src, tgt) in [("s1", "changed"), ("s2", "s1"), ("s3", "s2")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        // data_max_depth = 1: data edges are followed only from the seed (depth
+        // 0), so d1 (depth 1) is reached but d2 (depth 2) is not.
+        let result = store.impact_with_data_edges("changed", 5, 0.0, 1).unwrap();
+        let uids: Vec<&str> = result.nodes.iter().map(|n| n.uid.as_str()).collect();
+        assert!(
+            uids.contains(&"d1"),
+            "the first Uses hop is within the data cap; got: {uids:?}"
+        );
+        assert!(
+            !uids.contains(&"d2"),
+            "a Uses hop past data_max_depth must NOT be followed; got: {uids:?}"
+        );
+        // Structural edges still traverse to full max_depth.
+        for s in ["s1", "s2", "s3"] {
+            assert!(
+                uids.contains(&s),
+                "structural chain must traverse to full depth; missing {s}, got: {uids:?}"
+            );
+        }
     }
 }

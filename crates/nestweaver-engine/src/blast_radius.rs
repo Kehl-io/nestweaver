@@ -231,6 +231,11 @@ fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState
     }
 }
 
+/// Depth to which data-dependence edges (type references and field access)
+/// are followed when `include_data_edges` is on. Shallow because these edges
+/// fan out toward full program slices if followed transitively.
+const DATA_EDGE_MAX_DEPTH: u32 = 2;
+
 /// Analyze the blast radius of a set of changed files.
 ///
 /// 1. Maps changed files to their symbols in the graph.
@@ -250,6 +255,7 @@ pub fn analyze_blast_radius(
     changed_files: &[PathBuf],
     target_repo: Option<&str>,
     max_depth: u32,
+    include_data_edges: bool,
     db_path: Option<&Path>,
 ) -> Result<BlastRadiusResult> {
     // Trust core: track whether the analysis actually ran to completion and why
@@ -389,7 +395,14 @@ pub fn analyze_blast_radius(
     let mut traversal_truncated = false;
 
     for cs in &changed_symbols {
-        let impact_nodes = match store.impact_with_flags(&cs.uid, max_depth, 0.0) {
+        // Optionally fold in the shallow data-dependence tier (type references
+        // & field access). Default off: higher recall but noisier.
+        let impact_call = if include_data_edges {
+            store.impact_with_data_edges(&cs.uid, max_depth, 0.0, DATA_EDGE_MAX_DEPTH)
+        } else {
+            store.impact_with_flags(&cs.uid, max_depth, 0.0)
+        };
+        let impact_nodes = match impact_call {
             Ok(result) => {
                 traversal_truncated |= result.truncated_by_threshold || result.truncated_by_depth;
                 result.nodes
@@ -873,9 +886,15 @@ mod tests {
     #[test]
     fn analyze_blast_radius_empty_store() {
         let store = GraphStore::in_memory().expect("in_memory store");
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("nonexistent.rs")], None, 3, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("nonexistent.rs")],
+            None,
+            3,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(result.changed_symbols.is_empty());
         assert!(result.affected_symbols.is_empty());
         assert_eq!(result.risk_level, RiskLevel::Low);
@@ -944,7 +963,8 @@ mod tests {
             .expect("insert edge");
 
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
+                .unwrap();
 
         assert_eq!(result.changed_symbols.len(), 1);
         assert_eq!(result.changed_symbols[0].name, "fn_a");
@@ -1013,7 +1033,8 @@ mod tests {
             .unwrap();
 
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/api.rs")], None, 3, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("src/api.rs")], None, 3, false, None)
+                .unwrap();
 
         let org = result
             .org_wide
@@ -1074,7 +1095,8 @@ mod tests {
             .unwrap();
 
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
+                .unwrap();
         assert!(
             result.org_wide.is_none(),
             "org_wide must stay None when all impact is within one repo"
@@ -1143,7 +1165,8 @@ mod tests {
             .unwrap();
 
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 5, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 5, false, None)
+                .unwrap();
 
         assert_eq!(result.affected_symbols.len(), 2);
         // Results should be sorted by impact_score descending.
@@ -1216,7 +1239,8 @@ mod tests {
             .unwrap();
 
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 5, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 5, false, None)
+                .unwrap();
 
         // B is included (score 0.3 >= 0.10), but C is pruned (score 0.06 < 0.10).
         assert_eq!(result.affected_symbols.len(), 1);
@@ -1282,6 +1306,7 @@ mod tests {
             &[PathBuf::from("src/main.rs")],
             Some("repo:1"),
             3,
+            false,
             None,
         )
         .unwrap();
@@ -1295,8 +1320,15 @@ mod tests {
         assert!(!scoped_names.contains("main_r2"));
 
         // Unscoped (None) — the historical behavior picks up both repos.
-        let unscoped =
-            analyze_blast_radius(&store, &[PathBuf::from("src/main.rs")], None, 3, None).unwrap();
+        let unscoped = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/main.rs")],
+            None,
+            3,
+            false,
+            None,
+        )
+        .unwrap();
         let unscoped_names: HashSet<&str> = unscoped
             .changed_symbols
             .iter()
@@ -1347,7 +1379,8 @@ mod tests {
             .unwrap();
 
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
+                .unwrap();
 
         assert_eq!(result.status, AnalysisStatus::Complete);
         assert!(
@@ -1410,6 +1443,7 @@ mod tests {
             &[PathBuf::from("src/other.rs")],
             Some("repo:1"),
             3,
+            false,
             None,
         )
         .unwrap();
@@ -1452,6 +1486,7 @@ mod tests {
             &[PathBuf::from("README.md")],
             Some("repo:1"),
             3,
+            false,
             None,
         )
         .unwrap();
@@ -1520,7 +1555,8 @@ mod tests {
             .unwrap();
 
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
+                .unwrap();
 
         assert_eq!(result.analysis_direction, "over-approximate");
         assert!(
@@ -1606,8 +1642,15 @@ mod tests {
                 .unwrap();
         }
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/target.rs")], None, 2, None).unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/target.rs")],
+            None,
+            2,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert!(
             result.coverage.traversal_truncated,
@@ -1663,7 +1706,8 @@ mod tests {
             .unwrap();
 
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
+                .unwrap();
 
         let stale = result
             .coverage
@@ -1720,6 +1764,7 @@ mod tests {
             &[PathBuf::from("src/a.rs")],
             Some("repo:absent"),
             3,
+            false,
             None,
         )
         .unwrap();
@@ -1763,6 +1808,68 @@ mod tests {
         assert_eq!(
             derive_gate_state(AnalysisStatus::Complete, RiskLevel::Low),
             GateState::Ok
+        );
+    }
+
+    #[test]
+    fn data_edges_surface_type_reference_dependent() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&mk("a", "fn_a", "src/a.rs")).unwrap();
+        store.insert_symbol(&mk("b", "fn_b", "src/b.rs")).unwrap();
+        // b only references a's type (Uses) — there is no call edge, so the
+        // structural-only walk cannot reach it.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b".to_string(),
+                target_uid: "a".to_string(),
+                edge_type: EdgeType::Uses,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        // Default off: the type-reference dependent is a false negative.
+        let without =
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
+                .unwrap();
+        assert!(
+            !without.affected_symbols.iter().any(|s| s.name == "fn_b"),
+            "with include_data_edges=false, the Uses-only dependent must be absent"
+        );
+
+        // Data tier on: the type-reference dependent surfaces (false-negative fix).
+        let with = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, true, None)
+            .unwrap();
+        assert!(
+            with.affected_symbols.iter().any(|s| s.name == "fn_b"),
+            "with include_data_edges=true, the Uses-only dependent must surface; got: {:?}",
+            with.affected_symbols
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 }

@@ -5676,6 +5676,11 @@ fn tool_schema_blast_radius() -> Value {
                 "repo": {
                     "type": "string",
                     "description": "Optional repo_uid to scope changed-file resolution to (recommended in multi-repo graphs)."
+                },
+                "include_data_edges": {
+                    "type": "boolean",
+                    "description": "Also follow data-dependence edges (type refs & field access). Higher recall, noisier; default false.",
+                    "default": false
                 }
             },
             "required": ["changed_files"]
@@ -5704,9 +5709,23 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 
     let target_repo = args.get("repo").and_then(|v| v.as_str());
 
+    // Optional: also follow data-dependence edges (type refs & field access).
+    // Default false — higher recall but noisier.
+    let include_data_edges = args
+        .get("include_data_edges")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let db_path = current_db_path(store).ok();
-    let result = analyze_blast_radius(store, &files, target_repo, max_depth, db_path.as_deref())
-        .context("analyze_blast_radius")?;
+    let result = analyze_blast_radius(
+        store,
+        &files,
+        target_repo,
+        max_depth,
+        include_data_edges,
+        db_path.as_deref(),
+    )
+    .context("analyze_blast_radius")?;
 
     let risk_str = match result.risk_level {
         nestweaver_engine::RiskLevel::Low => "low",
