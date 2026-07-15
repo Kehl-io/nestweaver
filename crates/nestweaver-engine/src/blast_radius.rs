@@ -8,7 +8,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use nestweaver_store::{GraphStore, StoreError};
+use nestweaver_store::{GraphStore, ImpactNode, StoreError};
 
 use crate::cluster_dispatch::{ClusteringOutput, load_clusters};
 use crate::process::RiskLevel;
@@ -431,6 +431,13 @@ pub fn analyze_blast_radius(
         *status = (*status).max(AnalysisStatus::Degraded);
     };
 
+    // First pass buffers each newly-seen affected node together with the
+    // changed symbol that surfaced it (name/kind), so we can batch the per-node
+    // kind/owning-repo lookup into ONE store query afterwards instead of N.
+    // Buffering in first-seen order (the same order the old per-node path pushed
+    // into `affected_symbols`) keeps the pre-sort ordering byte-identical.
+    let mut buffered: Vec<(ImpactNode, String, String)> = Vec::new();
+
     for cs in &changed_symbols {
         // Check the deadline before starting another symbol's traversal so a
         // tripped timeout stops promptly rather than after the whole set.
@@ -475,67 +482,93 @@ pub fn analyze_blast_radius(
             if changed_uids.contains(&node.uid) {
                 continue;
             }
+            // Dedup: first-seen wins for a uid's node data. Because impact scores
+            // only increase along the traversal, the first traversal to reach a
+            // node already carries its best data — same semantics as the prior
+            // `if affected_uids.insert(uid) { ... }` per-node path. Buffer the
+            // node plus its surfacing changed symbol; the kind/repo lookup is
+            // deferred to a single batched query below.
             if affected_uids.insert(node.uid.clone()) {
-                // Look up the symbol so we know its kind and owning repo.
-                let affected_sym = match store.lookup_symbol(&node.uid) {
-                    Ok(sym) => Some(sym),
-                    Err(_) => {
-                        lookup_failures += 1;
-                        None
-                    }
-                };
-                let kind = affected_sym
-                    .as_ref()
-                    .map(|s| s.kind.to_string())
-                    .unwrap_or_default();
-                let affected_repo = affected_sym
-                    .as_ref()
-                    .map(|s| s.repo_uid.clone())
-                    .unwrap_or_default();
-
-                // If the affected symbol lives in a different repo than any
-                // changed symbol, it is a cross-repo (org-wide) impact.
-                if !affected_repo.is_empty() && !changed_repos.contains(&affected_repo) {
-                    impacted_repos.insert(affected_repo.clone());
-                    let repo_label = repo_display
-                        .get(&affected_repo)
-                        .cloned()
-                        .unwrap_or_else(|| affected_repo.clone());
-                    let item = OrgImpactItem {
-                        change_name: cs.name.clone(),
-                        change_kind: cs.kind.clone(),
-                        affected_name: node.name.clone(),
-                        affected_repo: repo_label,
-                        affected_file: node.file_path.clone(),
-                        affected_line: node.start_line as i32,
-                        severity: classify_org_severity(node.impact_score).to_string(),
-                        reason: format!(
-                            "cross-repo dependency (via {}) — verify the downstream consumer \
-                             still works against the changed symbol",
-                            node.edge_type
-                        ),
-                    };
-                    match classify_org_severity(node.impact_score) {
-                        "breaking" => org_breaking.push(item),
-                        "warning" => org_warnings.push(item),
-                        _ => org_info.push(item),
-                    }
-                }
-
-                affected_symbols.push(AffectedSymbol {
-                    uid: node.uid,
-                    name: node.name,
-                    file_path: node.file_path,
-                    kind,
-                    depth: node.depth,
-                    edge_type: node.edge_type,
-                    confidence: node.confidence,
-                    start_line: node.start_line,
-                    impact_score: node.impact_score,
-                    repo_uid: affected_repo.clone(),
-                });
+                buffered.push((node, cs.name.clone(), cs.kind.clone()));
             }
         }
+    }
+
+    // Batch the per-node kind/owning-repo enrichment into ONE store query,
+    // replacing the former N per-affected-node `lookup_symbol` round-trips.
+    let uid_refs: Vec<&str> = buffered
+        .iter()
+        .map(|(node, _, _)| node.uid.as_str())
+        .collect();
+    let lookup_map = match store.batch_lookup_symbols(&uid_refs) {
+        Ok(map) => map,
+        // Loud failure: a store error on the batch lookup is surfaced and
+        // degrades the run (like the impact-traversal error path). We then treat
+        // every node's kind/repo as unknown/empty rather than crashing — the
+        // aggregated `lookup-symbol-failed` note below still fires for the misses.
+        Err(e) => {
+            notifications.push(Notification {
+                level: NotificationLevel::Error,
+                message: format!("batch symbol lookup failed: {e}"),
+                descriptor: "store.batch-lookup-failed".to_string(),
+            });
+            status = status.max(AnalysisStatus::Degraded);
+            std::collections::HashMap::new()
+        }
+    };
+
+    // Second pass: rebuild affected_symbols (and the org-wide items) from the
+    // buffered nodes + the batch lookup map, in the same first-seen order, so the
+    // pre-sort output is identical to the old per-node path.
+    for (node, change_name, change_kind) in buffered {
+        let affected_sym = lookup_map.get(&node.uid);
+        if affected_sym.is_none() {
+            lookup_failures += 1;
+        }
+        let kind = affected_sym.map(|s| s.kind.to_string()).unwrap_or_default();
+        let affected_repo = affected_sym.map(|s| s.repo_uid.clone()).unwrap_or_default();
+
+        // If the affected symbol lives in a different repo than any
+        // changed symbol, it is a cross-repo (org-wide) impact.
+        if !affected_repo.is_empty() && !changed_repos.contains(&affected_repo) {
+            impacted_repos.insert(affected_repo.clone());
+            let repo_label = repo_display
+                .get(&affected_repo)
+                .cloned()
+                .unwrap_or_else(|| affected_repo.clone());
+            let item = OrgImpactItem {
+                change_name,
+                change_kind,
+                affected_name: node.name.clone(),
+                affected_repo: repo_label,
+                affected_file: node.file_path.clone(),
+                affected_line: node.start_line as i32,
+                severity: classify_org_severity(node.impact_score).to_string(),
+                reason: format!(
+                    "cross-repo dependency (via {}) — verify the downstream consumer \
+                     still works against the changed symbol",
+                    node.edge_type
+                ),
+            };
+            match classify_org_severity(node.impact_score) {
+                "breaking" => org_breaking.push(item),
+                "warning" => org_warnings.push(item),
+                _ => org_info.push(item),
+            }
+        }
+
+        affected_symbols.push(AffectedSymbol {
+            uid: node.uid,
+            name: node.name,
+            file_path: node.file_path,
+            kind,
+            depth: node.depth,
+            edge_type: node.edge_type,
+            confidence: node.confidence,
+            start_line: node.start_line,
+            impact_score: node.impact_score,
+            repo_uid: affected_repo.clone(),
+        });
     }
 
     // One aggregated note when any affected node's kind/repo couldn't be
@@ -1140,6 +1173,138 @@ mod tests {
         );
         let all_items = org.breaking.len() + org.warnings.len() + org.info.len();
         assert!(all_items >= 1, "expected at least one org-wide impact item");
+        assert!(
+            org.breaking
+                .iter()
+                .chain(&org.warnings)
+                .chain(&org.info)
+                .any(|i| i.affected_name == "Caller" && i.affected_repo == "repo:client"),
+            "org-wide item should describe the cross-repo consumer"
+        );
+    }
+
+    #[test]
+    fn batched_lookup_preserves_kinds_and_repos() {
+        use nestweaver_schema::{
+            CrossRepoLinkType, EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility,
+        };
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+
+        let mk = |uid: &str, name: &str, kind: SymbolKind, repo: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 3,
+            end_line: 9,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: Some(0.2),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        // Changing `api` (repo:api) affects two downstream symbols with distinct
+        // kinds across two repos: a Method in the SAME repo (via Calls) and a
+        // Class in ANOTHER repo (via a cross-repo link). The batch lookup must
+        // populate each affected symbol's kind + repo_uid identically to the old
+        // per-node path, and the cross-repo one must still trip org_wide.
+        store
+            .insert_symbol(&mk(
+                "api",
+                "Handler",
+                SymbolKind::Function,
+                "repo:api",
+                "src/api.rs",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&mk(
+                "helper",
+                "Helper",
+                SymbolKind::Method,
+                "repo:api",
+                "src/helper.rs",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&mk(
+                "client",
+                "Caller",
+                SymbolKind::Class,
+                "repo:client",
+                "src/client.rs",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "helper".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "client".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/api.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let helper = result
+            .affected_symbols
+            .iter()
+            .find(|s| s.uid == "helper")
+            .expect("helper must be in the affected set");
+        assert_eq!(helper.kind, "Method", "batch lookup must populate kind");
+        assert_eq!(
+            helper.repo_uid, "repo:api",
+            "batch lookup must populate repo_uid"
+        );
+
+        let client = result
+            .affected_symbols
+            .iter()
+            .find(|s| s.uid == "client")
+            .expect("client must be in the affected set");
+        assert_eq!(client.kind, "Class", "batch lookup must populate kind");
+        assert_eq!(
+            client.repo_uid, "repo:client",
+            "batch lookup must populate repo_uid"
+        );
+
+        // Cross-repo org-wide detection still fires off the batch-populated repos.
+        let org = result
+            .org_wide
+            .expect("org_wide must be populated for the cross-repo consumer");
+        assert!(
+            org.impacted_repos.iter().any(|r| r == "repo:client"),
+            "impacted_repos should include the downstream repo; got: {:?}",
+            org.impacted_repos
+        );
         assert!(
             org.breaking
                 .iter()
