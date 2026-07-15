@@ -2147,4 +2147,395 @@ mod tests {
         // A degraded run is never RiskFlagged — it is DegradedUnknown.
         assert_eq!(result.gate_state, GateState::DegradedUnknown);
     }
+
+    // ── feature-level depth truncation (end-to-end) ─────────────────────
+
+    /// End-to-end through `analyze_blast_radius`: a call chain deeper than
+    /// `max_depth` must (a) include only the dependents within `max_depth` in
+    /// `affected_symbols`, and (b) surface the incompleteness — `coverage`
+    /// flags the truncation and `blind_spots` names `PrunedBelowThreshold`.
+    /// (Distinct from the store-level `impact_detailed_flags_depth_truncation`:
+    /// this asserts the affected-set membership the feature actually returns.)
+    #[test]
+    fn depth_truncation_limits_affected_set_end_to_end() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        // Chain: far → mid → near → target (near depth 1, mid depth 2, far
+        // depth 3). With max_depth=2 the walk reaches near+mid but leaves the
+        // frontier at mid unexpanded, so far never appears.
+        for (uid, name, file) in [
+            ("target", "fn_target", "src/target.rs"),
+            ("near", "fn_near", "src/near.rs"),
+            ("mid", "fn_mid", "src/mid.rs"),
+            ("far", "fn_far", "src/far.rs"),
+        ] {
+            store.insert_symbol(&mk(uid, name, file)).unwrap();
+        }
+        for (src, tgt) in [("near", "target"), ("mid", "near"), ("far", "mid")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/target.rs")],
+            &opts(None, 2, false),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let affected: HashSet<&str> = result
+            .affected_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            affected.contains("fn_near") && affected.contains("fn_mid"),
+            "dependents within max_depth must appear; got: {affected:?}"
+        );
+        assert!(
+            !affected.contains("fn_far"),
+            "a dependent beyond max_depth must be truncated out; got: {affected:?}"
+        );
+        assert!(
+            result.coverage.traversal_truncated,
+            "a chain deeper than max_depth must set coverage.traversal_truncated"
+        );
+        assert!(
+            result
+                .blind_spots
+                .contains(&BlindSpot::PrunedBelowThreshold),
+            "a depth-truncated feature run must flag PrunedBelowThreshold, got: {:?}",
+            result.blind_spots
+        );
+    }
+
+    // ── classify_org_severity boundaries ────────────────────────────────
+
+    /// Exercise `classify_org_severity` directly at its cutoffs. The function
+    /// is `>= 0.5 → breaking`, `>= 0.25 → warning`, else `info`.
+    #[test]
+    fn classify_org_severity_boundaries() {
+        // Breaking cutoff at 0.5 (inclusive).
+        assert_eq!(classify_org_severity(0.5), "breaking");
+        assert_eq!(classify_org_severity(0.49), "warning");
+        // Warning cutoff at 0.25 (inclusive).
+        assert_eq!(classify_org_severity(0.25), "warning");
+        assert_eq!(classify_org_severity(0.24), "info");
+        // Clearly-high and clearly-low ends of the range.
+        assert_eq!(classify_org_severity(0.99), "breaking");
+        assert_eq!(classify_org_severity(0.0), "info");
+    }
+
+    // ── changed_files_from_git ──────────────────────────────────────────
+
+    /// Whether `git` is on PATH; tests that shell out to git skip gracefully
+    /// when it is not (e.g. a minimal CI image).
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Run a git subcommand in `dir`, asserting it succeeds.
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// `changed_files_from_git` over a real temp repo: the working-tree case
+    /// (`None`), the base-ref case (`Some(base)`), the empty-diff case, and the
+    /// non-repo error case.
+    #[test]
+    fn changed_files_from_git_working_tree_and_base_ref() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+
+        // Init an isolated repo (no signing / template surprises) with a
+        // committed baseline file.
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "first"]);
+
+        // Working-tree case (None): an unstaged modification to a tracked file
+        // shows up in `git diff --name-only`.
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        let working = changed_files_from_git(repo, None).unwrap();
+        assert_eq!(
+            working,
+            vec![PathBuf::from("a.txt")],
+            "working-tree diff must list the modified tracked file"
+        );
+
+        // Commit a second change (modify a.txt, add b.txt) so a base-ref diff
+        // has two files between HEAD~1 and the working tree.
+        git(repo, &["add", "a.txt"]);
+        std::fs::write(repo.join("b.txt"), "bee\n").unwrap();
+        git(repo, &["add", "b.txt"]);
+        git(repo, &["commit", "-q", "-m", "second"]);
+
+        // Base-ref case (Some): diff against the first commit lists both files.
+        let mut against_base = changed_files_from_git(repo, Some("HEAD~1")).unwrap();
+        against_base.sort();
+        assert_eq!(
+            against_base,
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
+            "base-ref diff must list every file changed since the base"
+        );
+
+        // Empty-diff case: a clean working tree against HEAD yields no files.
+        let empty = changed_files_from_git(repo, Some("HEAD")).unwrap();
+        assert!(
+            empty.is_empty(),
+            "a clean tree against HEAD must yield an empty vec, got: {empty:?}"
+        );
+
+        // Error case: a path that is not a git repo must return Err, never a
+        // silent empty vec.
+        let non_repo = tempfile::tempdir().expect("tempdir");
+        let err = changed_files_from_git(non_repo.path(), None);
+        assert!(
+            err.is_err(),
+            "git diff outside a repository must return Err, got: {err:?}"
+        );
+    }
+
+    // ── cluster wiring end-to-end ───────────────────────────────────────
+
+    /// Exercise the `load_clusters` + `compute_affected_clusters` path through
+    /// `analyze_blast_radius` (the other tests pass `db_path = None`, so it is
+    /// never hit). Cluster data is written to a real sidecar next to a temp db
+    /// path; the changed + affected symbols land in >3 clusters, so
+    /// `affected_clusters` is populated AND the cluster risk boost fires
+    /// (base Low → Medium).
+    #[test]
+    fn affected_clusters_populated_from_sidecar_boosts_risk() {
+        use crate::cluster_dispatch::{
+            ClusterMember, ClusteringOutput, CommunityInfo, save_clusters,
+        };
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        // Change `target`; four callers depend on it directly. Each of the five
+        // symbols lives in its own cluster, so five clusters are touched (>3).
+        store
+            .insert_symbol(&mk("target", "fn_target", "src/target.rs"))
+            .unwrap();
+        for (uid, file) in [
+            ("d1", "src/d1.rs"),
+            ("d2", "src/d2.rs"),
+            ("d3", "src/d3.rs"),
+            ("d4", "src/d4.rs"),
+        ] {
+            store.insert_symbol(&mk(uid, uid, file)).unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid.to_string(),
+                    target_uid: "target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+
+        // Write cluster data to the sidecar for a temp db path: one cluster per
+        // symbol so all five are "touched" (the changed target + 4 affected).
+        let member = |uid: &str, file: &str| ClusterMember {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            file_path: file.to_string(),
+            kind: "Function".to_string(),
+        };
+        let communities: Vec<CommunityInfo> = [
+            ("target", "src/target.rs"),
+            ("d1", "src/d1.rs"),
+            ("d2", "src/d2.rs"),
+            ("d3", "src/d3.rs"),
+            ("d4", "src/d4.rs"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (uid, file))| CommunityInfo {
+            id: i as u32,
+            name: format!("cluster-{i}"),
+            cohesion: 0.8,
+            member_count: 1,
+            members: vec![member(uid, file)],
+            key_files: vec![file.to_string()],
+        })
+        .collect();
+        let clustering = ClusteringOutput {
+            resolution: 1.0,
+            modularity: 0.5,
+            communities,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("graph.lbug");
+        save_clusters(&db_path, &clustering).expect("write clusters sidecar");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/target.rs")],
+            &opts(None, 3, false),
+            None,
+            Some(db_path.as_path()),
+        )
+        .unwrap();
+
+        // load_clusters resolved the sidecar and compute_affected_clusters found
+        // every touched cluster (target + 4 dependents = 5).
+        assert_eq!(
+            result.affected_clusters.len(),
+            5,
+            "all five touched clusters must be reported; got: {:?}",
+            result
+                .affected_clusters
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>()
+        );
+        // 4 affected symbols is base Low, but >3 clusters touched applies the
+        // cluster risk boost, escalating to Medium.
+        assert_eq!(
+            result.risk_level,
+            RiskLevel::Medium,
+            "the >3-cluster boost must escalate Low → Medium end-to-end"
+        );
+    }
+
+    // ── silent-empty degradation is loud (not-indexed surfacing) ─────────
+
+    /// Trust-core guarantee: when `list_repos` is empty but symbols exist under
+    /// a `repo_uid`, the result must NOT read as a clean, fully-covered run.
+    /// The owning repo is surfaced in `coverage.repos_not_indexed` and
+    /// `blind_spots` names `NotIndexed`, so "not indexed" is always loud rather
+    /// than silently collapsing to a low-risk empty answer.
+    #[test]
+    fn unindexed_owning_repo_is_surfaced_not_silent() {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        // A symbol owned by repo:1 exists, but NO Repo row was inserted, so
+        // `list_repos` returns empty and repo:1 is "not indexed" as metadata.
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:a".to_string(),
+                name: "fn_a".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:1".to_string(),
+                file_path: "src/a.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn fn_a()".to_string(),
+                summary: None,
+                content_hash: "h_a".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The changed symbol resolved, but its owning repo is not in the repo
+        // metadata — that gap is reported, never swallowed.
+        assert_eq!(result.changed_symbols.len(), 1);
+        assert!(
+            result
+                .coverage
+                .repos_not_indexed
+                .contains(&"repo:1".to_string()),
+            "the owning repo absent from list_repos must appear in repos_not_indexed, got: {:?}",
+            result.coverage.repos_not_indexed
+        );
+        assert!(
+            result.blind_spots.contains(&BlindSpot::NotIndexed),
+            "an unindexed owning repo must flag NotIndexed, got: {:?}",
+            result.blind_spots
+        );
+    }
 }

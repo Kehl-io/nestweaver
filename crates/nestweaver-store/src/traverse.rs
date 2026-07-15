@@ -1341,4 +1341,83 @@ mod tests {
             );
         }
     }
+
+    // ── cycle termination ───────────────────────────────────────────────
+
+    /// A cyclic call graph (A→B→A) must not send the reverse-BFS into an
+    /// infinite loop. The "scores only increase" invariant means a node is
+    /// re-enqueued only when a strictly better path is found; since each hop
+    /// multiplies by a confidence ≤ 1.0 the score cannot keep improving around
+    /// a cycle, so the walk terminates with a finite node set.
+    #[test]
+    fn impact_terminates_on_two_node_cycle() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["A", "B"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // A calls B and B calls A — a 2-cycle over impact-relevant edges.
+        for (src, tgt) in [("A", "B"), ("B", "A")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        // impact(A): the only caller of A is B (seed A is skipped when reached
+        // again around the cycle). Terminates with exactly {B}.
+        let nodes = store.impact("A", 10, 0.0).unwrap();
+        let uids: Vec<&str> = nodes.iter().map(|n| n.uid.as_str()).collect();
+        assert_eq!(uids, vec!["B"], "2-cycle must yield exactly the caller set");
+
+        // impact_detailed returns the same finite set without hanging.
+        let result = store
+            .impact_detailed("A", 10, 0.0, IMPACT_EDGE_TYPES, None)
+            .unwrap();
+        let detailed_uids: Vec<&str> = result.nodes.iter().map(|n| n.uid.as_str()).collect();
+        assert_eq!(detailed_uids, vec!["B"]);
+    }
+
+    /// A three-node cycle (A→B→C→A) also terminates, yielding the finite set of
+    /// transitive callers reachable before the walk loops back to the seed.
+    #[test]
+    fn impact_terminates_on_three_node_cycle() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["A", "B", "C"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // A→B→C→A.
+        for (src, tgt) in [("A", "B"), ("B", "C"), ("C", "A")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        // impact(A): caller of A is C, caller of C is B, caller of B is A (seed,
+        // skipped). Terminates with {B, C}.
+        let nodes = store.impact("A", 10, 0.0).unwrap();
+        let mut uids: Vec<&str> = nodes.iter().map(|n| n.uid.as_str()).collect();
+        uids.sort_unstable();
+        assert_eq!(
+            uids,
+            vec!["B", "C"],
+            "3-cycle must yield the finite caller set"
+        );
+    }
 }
