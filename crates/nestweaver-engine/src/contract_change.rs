@@ -146,7 +146,9 @@ fn raw_to_api_symbol(raw: &RawSymbol, file: &Path) -> Symbol {
         file_path: file_display,
         start_line: raw.start_line,
         end_line: raw.end_line,
-        signature: raw.signature.clone(),
+        // Declaration only — the parser's signature includes the body, which
+        // would defeat the diff engine's body-only filter (signature equality).
+        signature: strip_body(&raw.signature),
         summary: None,
         content_hash: raw.content_hash.clone(),
         embedding: None,
@@ -160,23 +162,45 @@ fn raw_to_api_symbol(raw: &RawSymbol, file: &Path) -> Symbol {
     }
 }
 
+/// Strip a symbol's body from its signature/type text. The parser's `signature`
+/// (and, for some languages, `return_type`) includes the function body — e.g.
+/// `fn foo(a: i32) -> i32 { a + 1 }` — but the API surface is the *declaration*
+/// only. Cutting at the first `{` (the body brace, which for a function always
+/// follows the parameter list and return type) yields the declaration, so a
+/// body-only edit doesn't read as a signature/return-type change.
+fn strip_body(s: &str) -> String {
+    match s.find('{') {
+        Some(i) => s[..i].trim_end().to_string(),
+        None => s.trim_end().to_string(),
+    }
+}
+
 /// Build the `type_info` the diff engine reads, backfilling `parameter_types`
-/// from the signature for param-bearing kinds (the raw parse leaves them empty).
-/// The parser's `return_type`/`declared_type` are preserved when present.
+/// from the signature for param-bearing kinds (the raw parse leaves them empty)
+/// and stripping any body captured into `return_type`.
 fn enriched_type_info(raw: &RawSymbol) -> Option<TypeInfo> {
     let params = match raw.kind {
         SymbolKind::Function | SymbolKind::Method => extract_params_from_signature(&raw.signature),
         _ => Vec::new(),
     };
+    // The parser sometimes captures the body into return_type; keep the
+    // declaration only so body edits don't look like a return-type change.
+    let sanitize_ret = |ti: &TypeInfo| ti.return_type.as_deref().map(strip_body);
 
     match (&raw.type_info, params.is_empty()) {
-        // Nothing to add: keep whatever the parser produced (may be `None`, which
-        // lets the engine's coarse signature fallback fire on a signature change).
-        (_, true) => raw.type_info.clone(),
+        // No params to backfill, but still sanitize a body-laden return_type.
+        (Some(ti), true) => Some(TypeInfo {
+            declared_type: ti.declared_type.clone(),
+            parameter_types: ti.parameter_types.clone(),
+            return_type: sanitize_ret(ti),
+        }),
+        // `None` type_info stays None so the engine's coarse signature fallback
+        // can still fire on a genuine signature change.
+        (None, true) => None,
         (Some(ti), false) => Some(TypeInfo {
             declared_type: ti.declared_type.clone(),
             parameter_types: params,
-            return_type: ti.return_type.clone(),
+            return_type: sanitize_ret(ti),
         }),
         (None, false) => Some(TypeInfo {
             declared_type: None,
@@ -409,6 +433,33 @@ mod tests {
         assert!(
             changes.is_empty(),
             "a body-only change must not be breaking: {changes:?}"
+        );
+    }
+
+    /// Regression: a SINGLE-LINE function body. The parser captures the body
+    /// into the signature/return_type here (unlike a multi-line body), so a
+    /// body-only edit would otherwise read as a bogus `return-type-changed`
+    /// break. `strip_body` must neutralize it.
+    #[test]
+    fn breaking_changes_single_line_body_only_is_not_breaking() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        init_repo(repo);
+
+        std::fs::write(repo.join("api.rs"), "pub fn foo(a: i32) -> i32 { a + 1 }\n").unwrap();
+        git(repo, &["add", "api.rs"]);
+        git(repo, &["commit", "-q", "-m", "first"]);
+
+        std::fs::write(repo.join("api.rs"), "pub fn foo(a: i32) -> i32 { a + 2 }\n").unwrap();
+
+        let changes = breaking_changes_from_git(repo, "HEAD", &[PathBuf::from("api.rs")]).unwrap();
+        assert!(
+            changes.is_empty(),
+            "a single-line body-only change must not be breaking: {changes:?}"
         );
     }
 
