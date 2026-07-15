@@ -305,8 +305,38 @@ cargo build --release
 | `service-summary` | Display a summary of a specific service |
 | `admin` | Subagent guidance instructions |
 | `interactions` | Manage interaction memory |
+| `hooks` | Install/remove the local pre-push blast-radius check (`--install`, `--strict`, `--uninstall`) |
 
 </details>
+
+### Local pre-push check
+
+Get "confidence before you push" from the same hardened blast-radius analysis CI runs — locally, on your machine:
+
+```sh
+nestweaver hooks --install
+```
+
+This writes a `.git/hooks/pre-push` that runs `nestweaver pr-impact` against the merge-base before every push. It is **advisory by default**: it **never blocks** your push (fail-open), stays **silent on a trivial change**, and prints a concise banner — the gate verdict, the top affected symbols, and a coverage caveat when the analysis was incomplete — only when there's something to review. A degraded/incomplete run never blocks, because an incomplete traversal can't be trusted to have found the risk.
+
+To make it block a push when a **complete** run reports **High** risk (exit 2):
+
+```sh
+nestweaver hooks --install --strict
+```
+
+Remove it (restoring any hook it backed up) with:
+
+```sh
+nestweaver hooks --uninstall
+```
+
+You can also run the check manually — this is exactly what the hook does:
+
+```sh
+nestweaver pr-impact --base origin/main            # advisory banner
+nestweaver pr-impact --base origin/main --strict   # exit 2 on complete High risk
+```
 
 ## Features
 
