@@ -190,6 +190,12 @@ pub struct McpHttpState {
     /// Optional admin bearer token. When query auth is enabled, this token is
     /// also accepted so MCP and gRPC query auth share the same semantics.
     pub admin_token: Option<String>,
+    /// Per-repo authorization policy (Blast Radius R9/R9b). Built from the
+    /// instance config's `[authz]` section; absent config yields a *disabled*
+    /// source that resolves every identity to [`VisibleRepos::All`], so
+    /// blast-radius redaction is a no-op and behavior is unchanged unless an
+    /// operator configures repo-scoping.
+    pub permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
     pub client_rate_limiter: Arc<HttpRateLimiter>,
     /// Lazily-loaded embedding model for semantic search, shared with the
     /// daemon's gRPC path. Populated by a background task when the `embed`
@@ -203,6 +209,52 @@ pub struct McpHttpState {
     pub federation: Option<Arc<crate::federation::FederationState>>,
 }
 
+/// Build the per-repo permission source from the instance config's `[authz]`
+/// section. An absent config (or absent `[authz]`) yields a *disabled*
+/// [`StaticConfigPermissionSource`] (empty rules) that resolves every identity
+/// to [`VisibleRepos::All`] — redaction becomes a no-op, so behavior is
+/// unchanged unless repo-scoping is configured.
+fn build_permission_source(
+    instance_cfg: &Option<Arc<nestweaver_engine::InstanceConfig>>,
+) -> Arc<dyn nestweaver_engine::authz::PermissionSource> {
+    match instance_cfg.as_ref().and_then(|c| c.authz.as_ref()) {
+        Some(authz) => Arc::new(authz.build_permission_source()),
+        None => Arc::new(nestweaver_engine::authz::StaticConfigPermissionSource::new(
+            std::collections::HashMap::new(),
+        )),
+    }
+}
+
+/// Map a validated bearer to an authorization [`Identity`]. The admin token →
+/// [`Identity::Admin`]; the query token value → [`Identity::Token`] keyed on
+/// that value; no/unrecognized bearer → [`Identity::Anonymous`]. Comparisons are
+/// constant-time, matching the bearer-validation path. When auth is unconfigured
+/// (`admin_token`/`query_token` both `None`) every request resolves to
+/// `Anonymous`, but the disabled permission source still returns `All`, so this
+/// has no effect on visibility.
+fn resolve_identity(
+    provided_bearer: Option<&str>,
+    admin_token: Option<&str>,
+    query_token: Option<&str>,
+) -> nestweaver_engine::authz::Identity {
+    use nestweaver_engine::authz::Identity;
+    use subtle::ConstantTimeEq;
+    let Some(bearer) = provided_bearer else {
+        return Identity::Anonymous;
+    };
+    if let Some(admin) = admin_token
+        && bool::from(bearer.as_bytes().ct_eq(admin.as_bytes()))
+    {
+        return Identity::Admin;
+    }
+    if let Some(query) = query_token
+        && bool::from(bearer.as_bytes().ct_eq(query.as_bytes()))
+    {
+        return Identity::Token(bearer.to_string());
+    }
+    Identity::Anonymous
+}
+
 impl McpHttpState {
     /// Create a new state with an empty session registry and no auth.
     pub fn new(
@@ -213,6 +265,7 @@ impl McpHttpState {
         instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
         server_mode: bool,
     ) -> Self {
+        let permission_source = build_permission_source(&instance_cfg);
         Self {
             lite,
             store,
@@ -225,6 +278,7 @@ impl McpHttpState {
             read_only: false,
             auth_token: None,
             admin_token: None,
+            permission_source,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             #[cfg(feature = "daemon")]
@@ -244,6 +298,7 @@ impl McpHttpState {
         auth_token: String,
         admin_token: Option<String>,
     ) -> Self {
+        let permission_source = build_permission_source(&instance_cfg);
         Self {
             lite,
             store,
@@ -256,6 +311,7 @@ impl McpHttpState {
             read_only: false,
             auth_token: Some(auth_token),
             admin_token,
+            permission_source,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             #[cfg(feature = "daemon")]
@@ -784,6 +840,23 @@ async fn handle_mcp(
             #[cfg(feature = "daemon")]
             let federation = state.federation.clone();
 
+            // Resolve the caller's per-repo visibility once per request (R9/R9b).
+            // The bearer was already validated above; map it to an identity — the
+            // admin token → Admin, the query token value → Token(<value>), and
+            // anything else (no/unrecognized bearer) → Anonymous — then let the
+            // permission source resolve which repos this identity may see against
+            // the live repo set. With no `[authz]` config the source is disabled
+            // and returns `All` for every identity, so `Some(&All)` makes the
+            // blast_radius redaction a no-op (zero behavior change).
+            let identity = resolve_identity(
+                provided_bearer,
+                state.admin_token.as_deref(),
+                state.auth_token.as_deref(),
+            );
+            let visible = state
+                .permission_source
+                .visible_repos(&identity, &store.list_repos(None).unwrap_or_default());
+
             // Read the embed model Arc outside the blocking thread (matches the
             // gRPC handler pattern in server.rs), then drop the RwLock guard.
             let embed_arc = {
@@ -849,6 +922,7 @@ async fn handle_mcp(
                         arguments,
                         embed_arc.as_deref(),
                         Some(&dispatch_cancel),
+                        Some(&visible),
                     )
                 }),
             )

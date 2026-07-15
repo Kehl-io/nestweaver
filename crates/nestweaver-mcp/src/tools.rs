@@ -261,13 +261,19 @@ pub fn dispatch(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
 ) -> Result<Value, anyhow::Error> {
-    dispatch_cancellable(store, tantivy, name, args, embed_model, None)
+    dispatch_cancellable(store, tantivy, name, args, embed_model, None, None)
 }
 
 /// Like [`dispatch`], but threads a cooperative cancellation flag into the
 /// heavy traversals (e.g. `brain_context`/`project_context` vector fan-out) so a
 /// query timeout or client disconnect can stop the work. `cancel = None` is the
 /// original behavior.
+///
+/// `visible` carries the caller's per-repo visibility (R9/R9b), resolved by the
+/// HTTP boundary from the bearer identity. `None` (and `Some(VisibleRepos::All)`)
+/// means no scoping — the backward-compatible single-trust-domain default, in
+/// which blast-radius redaction is a no-op. Only `blast_radius` reads it; every
+/// other tool ignores it, exactly like `cancel`.
 pub fn dispatch_cancellable(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -275,6 +281,7 @@ pub fn dispatch_cancellable(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     // Enforce tool allowlist when configured.
     let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
@@ -290,10 +297,10 @@ pub fn dispatch_cancellable(
     // F16: serve cacheable read tools from (or populate) the response cache.
     // Correctness rests on the cache KEY — see `maybe_cached`.
     if is_cacheable_tool(name) && !cache_bypassed(&args) {
-        return maybe_cached(store, tantivy, name, args, embed_model, cancel);
+        return maybe_cached(store, tantivy, name, args, embed_model, cancel, visible);
     }
 
-    dispatch_uncached(store, tantivy, name, args, embed_model, cancel)
+    dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
 }
 
 /// The actual tool dispatch table, after cache handling.
@@ -304,6 +311,7 @@ fn dispatch_uncached(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel),
@@ -328,7 +336,7 @@ fn dispatch_uncached(
         "dead_code" => tool_dead_code(store, args, cancel),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
-        "blast_radius" => tool_blast_radius(store, args, cancel),
+        "blast_radius" => tool_blast_radius(store, args, cancel, visible),
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
         "regex_search" => tool_regex_search(store, args),
@@ -445,6 +453,29 @@ fn whole_db_scope_digest(db_path: &Path) -> u64 {
 /// Number of cache misses between periodic disk flushes.
 const CACHE_FLUSH_INTERVAL: u32 = 50;
 
+/// Salt folded into the response-cache key to keep redacted results from leaking
+/// across identities. `None`/`All` (no scoping) returns 0 — the key is unchanged
+/// and existing entries still hit, preserving zero behavior change when no
+/// `[authz]` policy is configured. A restricting `Only(set)` hashes its sorted
+/// repo_uids so each distinct visibility scope keys its own cache slot.
+fn visibility_cache_salt(visible: Option<&nestweaver_engine::authz::VisibleRepos>) -> u64 {
+    use nestweaver_engine::authz::VisibleRepos;
+    use std::hash::{Hash, Hasher};
+    match visible {
+        None | Some(VisibleRepos::All) => 0,
+        Some(VisibleRepos::Only(set)) => {
+            let mut uids: Vec<&str> = set.iter().map(String::as_str).collect();
+            uids.sort_unstable();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            "visible_only".hash(&mut hasher);
+            for uid in uids {
+                uid.hash(&mut hasher);
+            }
+            hasher.finish()
+        }
+    }
+}
+
 fn maybe_cached(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -452,13 +483,22 @@ fn maybe_cached(
     args: Value,
     embed_model: Option<&dyn EmbedQueryFn>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let Ok(db_path) = current_db_path(store) else {
-        return dispatch_uncached(store, tantivy, name, args, embed_model, cancel);
+        return dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible);
     };
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
-    let key = nestweaver_store::cache::ResponseCache::key(name, &args);
+    // Fold the caller's repo-visibility into the cache key so a redacted
+    // blast_radius result is never served across identities (R9b). A `None`/`All`
+    // visibility (the unconfigured single-trust-domain default) contributes 0, so
+    // the key is byte-identical to before and existing entries still hit —
+    // zero behavior change when no `[authz]` policy is set. A restricting
+    // `Only(set)` mixes a stable digest of its sorted repo_uids, giving each
+    // visibility scope its own cache slot.
+    let key =
+        nestweaver_store::cache::ResponseCache::key(name, &args) ^ visibility_cache_salt(visible);
     let generation = store.graph_generation();
     let scope_digest = whole_db_scope_digest(&db_path);
 
@@ -480,7 +520,7 @@ fn maybe_cached(
     }
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel)?;
+    let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)?;
     match serde_json::to_vec(&result) {
         Ok(bytes) => {
             // Insert into the in-process cache, then decide whether to flush.
@@ -5703,6 +5743,7 @@ fn tool_blast_radius(
     store: &GraphStore,
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let files: Vec<std::path::PathBuf> = args
         .get("changed_files")
@@ -5745,8 +5786,18 @@ fn tool_blast_radius(
     };
 
     let db_path = current_db_path(store).ok();
-    let result = analyze_blast_radius(store, &files, &options, cancel, db_path.as_deref())
+    let mut result = analyze_blast_radius(store, &files, &options, cancel, db_path.as_deref())
         .context("analyze_blast_radius")?;
+
+    // R9b: redact the typed result down to the caller's visible repos BEFORE
+    // building any output (both the JSON and SARIF paths), so every derived
+    // count/field reflects the redacted vecs. A `None`/`All` visibility (the
+    // unconfigured single-trust-domain default) is a no-op — zero behavior
+    // change unless an `[authz]` policy scopes this caller.
+    if let Some(v) = visible {
+        let repos = store.list_repos(None).unwrap_or_default();
+        nestweaver_engine::authz::redact_blast_radius_for_visibility(&mut result, v, &repos);
+    }
 
     // SARIF output: emit a standard SARIF v2.1.0 run (with namespaced
     // nestweaver/* extensions) instead of the native json result. The default
@@ -7237,6 +7288,7 @@ mod cache_dispatch_tests {
             args.clone(),
             Some(&embed),
             Some(&cancel),
+            None,
         );
         assert!(
             cancelled.is_err(),
@@ -7257,7 +7309,15 @@ mod cache_dispatch_tests {
         // A subsequent uncancelled call must RECOMPUTE (a MISS), never serve a
         // cached truncated/empty result.
         reset_session();
-        let ok = dispatch_cancellable(&store, None, "brain_context", args, Some(&embed), None);
+        let ok = dispatch_cancellable(
+            &store,
+            None,
+            "brain_context",
+            args,
+            Some(&embed),
+            None,
+            None,
+        );
         assert!(ok.is_ok(), "uncancelled recompute must succeed");
         assert_eq!(
             CACHE_MISSES.with(|c| c.get()),
@@ -7284,6 +7344,7 @@ mod cache_dispatch_tests {
             args.clone(),
             None,
             Some(&cancel),
+            None,
         );
         let err =
             cancelled.expect_err("a cancelled flow_trace must return Err, not a truncated tree");
@@ -7295,7 +7356,15 @@ mod cache_dispatch_tests {
 
         // Untripped flag: the trace completes as before.
         let untripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ok = dispatch_cancellable(&store, None, "flow_trace", args, None, Some(&untripped));
+        let ok = dispatch_cancellable(
+            &store,
+            None,
+            "flow_trace",
+            args,
+            None,
+            Some(&untripped),
+            None,
+        );
         assert!(ok.is_ok(), "uncancelled flow_trace must succeed");
     }
 }
@@ -7408,5 +7477,116 @@ mod arg_alias_tests {
         let via_alias = tool_detect_changes(&store, json!({ "files": ["src/b.rs"] })).unwrap();
         assert_eq!(via_alias["files"], json!(["src/b.rs"]));
         assert!(tool_detect_changes(&store, json!({})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod blast_radius_visibility_tests {
+    use super::*;
+    use nestweaver_engine::authz::VisibleRepos;
+    use nestweaver_schema::{
+        CrossRepoLinkType, EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility,
+    };
+
+    /// Build a two-repo (repo:api → repo:client) cross-repo store, mirroring the
+    /// engine's `org_wide_populated_for_cross_repo_impact` fixture. Changing the
+    /// api symbol surfaces repo:client as an org-wide impact. Repo records are
+    /// inserted (with `url == uid`) so `redact_blast_radius_for_visibility` can
+    /// resolve an org item's `affected_repo` display label back to a repo_uid.
+    fn cross_repo_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+
+        let mk = |uid: &str, name: &str, repo: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 3,
+            end_line: 9,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: Some(0.2),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        let mk_repo = |uid: &str| Repo {
+            uid: uid.to_string(),
+            url: uid.to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+
+        store.insert_repo(&mk_repo("repo:api")).unwrap();
+        store.insert_repo(&mk_repo("repo:client")).unwrap();
+        store
+            .insert_symbol(&mk("api", "Handler", "repo:api", "src/api.rs"))
+            .unwrap();
+        store
+            .insert_symbol(&mk("client", "Caller", "repo:client", "src/client.rs"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "client".to_string(),
+                target_uid: "api".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: vec![],
+            })
+            .unwrap();
+        store
+    }
+
+    /// Redaction must strip the cross-repo (repo:client) org item and affected
+    /// symbol when the caller may only see repo:api, while `None` (the
+    /// backward-compatible default) leaves the full result intact.
+    #[test]
+    fn tool_blast_radius_redacts_to_visible_repos() {
+        let store = cross_repo_store();
+        let args = json!({ "changed_files": ["src/api.rs"] });
+
+        // None ⇒ no scoping ⇒ the cross-repo consumer is present.
+        let full = tool_blast_radius(&store, args.clone(), None, None).unwrap();
+        let full_str = serde_json::to_string(&full).unwrap();
+        assert!(
+            full_str.contains("repo:client"),
+            "unredacted result must name the downstream repo; got: {full_str}"
+        );
+        assert!(
+            full_str.contains("Caller"),
+            "unredacted result must include the cross-repo affected symbol"
+        );
+        assert!(
+            !full["org_wide"].is_null(),
+            "unredacted result must carry org_wide impact"
+        );
+
+        // Only(repo:api) ⇒ everything naming repo:client is redacted out.
+        let visible = VisibleRepos::Only(["repo:api".to_string()].into_iter().collect());
+        let scoped = tool_blast_radius(&store, args, None, Some(&visible)).unwrap();
+        let scoped_str = serde_json::to_string(&scoped).unwrap();
+        assert!(
+            !scoped_str.contains("repo:client"),
+            "redacted result must not leak the hidden repo; got: {scoped_str}"
+        );
+        assert!(
+            !scoped_str.contains("Caller"),
+            "redacted result must drop the hidden repo's affected symbol"
+        );
+        assert!(
+            scoped["org_wide"].is_null(),
+            "org_wide collapses to null once its only item (repo:client) is hidden"
+        );
     }
 }

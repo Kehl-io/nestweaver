@@ -308,6 +308,11 @@ impl DaemonService {
                 args,
                 embed_ref,
                 Some(&cancel),
+                // TODO(nw-033): the daemon gRPC path exposes only IsAdmin(bool),
+                // not the caller's token identity, so blast_radius cannot be
+                // scoped here yet. Pass None (= All = no redaction) until a token
+                // identity is threaded through the gRPC boundary.
+                None,
             )
             .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
             tracing::debug!(
@@ -440,6 +445,10 @@ impl DaemonService {
                 args,
                 embed_ref,
                 Some(&cancel),
+                // TODO(nw-033): daemon gRPC path lacks the caller's token
+                // identity (only IsAdmin(bool)); pass None (= All = no redaction)
+                // until token identity is threaded through the gRPC boundary.
+                None,
             )
             .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
             tracing::debug!(
@@ -3179,6 +3188,11 @@ impl NestWeaverDaemon for DaemonService {
                     include_data_edges: false,
                     limit: None,
                 };
+                // TODO(nw-033): daemon pr_impact needs token identity to scope.
+                // The gRPC boundary exposes only IsAdmin(bool), not the caller's
+                // query token, so the blast-radius result cannot be redacted to
+                // the caller's visible repos here (unlike the MCP-HTTP path).
+                // Threading a token identity through gRPC is a separate change.
                 let result = nestweaver_engine::analyze_blast_radius(
                     &state.store,
                     &changed_files,
