@@ -139,6 +139,44 @@ pub enum GateState {
     RiskFlagged,
 }
 
+/// A repo that is indexed but behind its source (its graph may be out of date).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleRepo {
+    pub repo_uid: String,
+    pub commits_behind: u32,
+}
+
+/// Which repos were actually covered by this analysis, and how completely. Lets
+/// a consumer tell "no impact" from "incomplete coverage": a repo referenced by
+/// the change but absent from the graph, or a stale/truncated traversal, means
+/// the reported impact is a floor, not the whole picture.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Distinct repos that owned a changed or affected symbol.
+    pub repos_in_scope: Vec<String>,
+    /// Repos referenced by the change but not present in the graph (not indexed).
+    pub repos_not_indexed: Vec<String>,
+    /// In-scope repos whose index is behind source (`commits_behind > 0`).
+    pub stale_repos: Vec<StaleRepo>,
+    /// Whether any impact traversal was cut short by depth or the score
+    /// threshold — true means real dependents may exist beyond the reported set.
+    pub traversal_truncated: bool,
+}
+
+/// A category of impact that static analysis cannot see. The first four are
+/// inherent gaps in any static call-graph traversal; the last two describe
+/// this specific run being cut short or missing an indexed repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlindSpot {
+    DynamicDispatch,
+    Reflection,
+    ConfigWiring,
+    Codegen,
+    PrunedBelowThreshold,
+    NotIndexed,
+}
+
 /// Full result of a blast radius analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlastRadiusResult {
@@ -163,6 +201,19 @@ pub struct BlastRadiusResult {
     /// a degraded run is `DegradedUnknown` so a consumer treats it as unknown.
     #[serde(default)]
     pub gate_state: GateState,
+    /// Which repos were in scope, stale, or not indexed, and whether the
+    /// traversal was truncated — so "no impact" is distinguishable from
+    /// "incomplete coverage".
+    #[serde(default)]
+    pub coverage: Coverage,
+    /// Categories of impact this static analysis cannot see.
+    #[serde(default)]
+    pub blind_spots: Vec<BlindSpot>,
+    /// How to read the result: static impact analysis over-approximates edges
+    /// (it may report reachable-but-not-actually-affected symbols) while
+    /// under-approximating the blind spots above.
+    #[serde(default)]
+    pub analysis_direction: String,
 }
 
 /// Derive the gate verdict from the run status and computed risk.
@@ -222,6 +273,12 @@ pub fn analyze_blast_radius(
         }
     };
     let known_repo_uids: HashSet<String> = repos.iter().map(|r| r.uid.clone()).collect();
+    // Retain staleness so an in-scope repo whose index is behind source is
+    // surfaced in coverage rather than silently trusted as up to date.
+    let repo_staleness: HashMap<String, u32> = repos
+        .iter()
+        .map(|r| (r.uid.clone(), r.staleness_commits_behind))
+        .collect();
     let repo_display: HashMap<String, String> = repos
         .into_iter()
         .map(|r| (r.uid.clone(), if r.url.is_empty() { r.uid } else { r.url }))
@@ -326,9 +383,18 @@ pub fn analyze_blast_radius(
     // aggregated note instead of spamming one per node.
     let mut lookup_failures: usize = 0;
 
+    // OR of every traversal's truncation flags. True means at least one impact
+    // walk was cut short (by depth or the score threshold), so the reported
+    // affected set is a floor, not the complete picture.
+    let mut traversal_truncated = false;
+
     for cs in &changed_symbols {
-        let impact_nodes = match store.impact(&cs.uid, max_depth, 0.0) {
-            Ok(nodes) => nodes,
+        let impact_nodes = match store.impact_with_flags(&cs.uid, max_depth, 0.0) {
+            Ok(result) => {
+                traversal_truncated |=
+                    result.truncated_by_threshold || result.truncated_by_depth;
+                result.nodes
+            }
             Err(e) => {
                 // Do NOT silently drop this symbol's downstream as if empty —
                 // that would under-report the blast radius.
@@ -527,6 +593,77 @@ pub fn analyze_blast_radius(
         })
     };
 
+    // Coverage & blind spots: report which repos were in scope, which were
+    // stale or not indexed, whether the traversal was truncated, and the
+    // inherent static-analysis gaps — so a consumer can tell "no impact" from
+    // "incomplete coverage".
+    let mut scope_uids: HashSet<String> = HashSet::new();
+    for cs in &changed_symbols {
+        if !cs.repo_uid.is_empty() {
+            scope_uids.insert(cs.repo_uid.clone());
+        }
+    }
+    for af in &affected_symbols {
+        if !af.repo_uid.is_empty() {
+            scope_uids.insert(af.repo_uid.clone());
+        }
+    }
+    let mut repos_in_scope: Vec<String> = scope_uids.iter().cloned().collect();
+    repos_in_scope.sort();
+
+    let mut stale_repos: Vec<StaleRepo> = repos_in_scope
+        .iter()
+        .filter_map(|uid| match repo_staleness.get(uid) {
+            Some(&behind) if behind > 0 => Some(StaleRepo {
+                repo_uid: uid.clone(),
+                commits_behind: behind,
+            }),
+            _ => None,
+        })
+        .collect();
+    stale_repos.sort_by(|a, b| a.repo_uid.cmp(&b.repo_uid));
+
+    // Any repo referenced by the change but absent from the graph: the target
+    // repo (if named) plus any owning repo of a changed/affected symbol.
+    let mut not_indexed: HashSet<String> = HashSet::new();
+    if let Some(repo) = target_repo
+        && !repo.is_empty()
+        && !known_repo_uids.contains(repo)
+    {
+        not_indexed.insert(repo.to_string());
+    }
+    for uid in &scope_uids {
+        if !uid.is_empty() && !known_repo_uids.contains(uid) {
+            not_indexed.insert(uid.clone());
+        }
+    }
+    let mut repos_not_indexed: Vec<String> = not_indexed.into_iter().collect();
+    repos_not_indexed.sort();
+
+    let coverage = Coverage {
+        repos_in_scope,
+        repos_not_indexed: repos_not_indexed.clone(),
+        stale_repos,
+        traversal_truncated,
+    };
+
+    // Inherent static-analysis gaps are always present; the run-specific ones
+    // fire only when this traversal was actually cut short or missed a repo.
+    let mut blind_spots = vec![
+        BlindSpot::DynamicDispatch,
+        BlindSpot::Reflection,
+        BlindSpot::ConfigWiring,
+        BlindSpot::Codegen,
+    ];
+    if traversal_truncated {
+        blind_spots.push(BlindSpot::PrunedBelowThreshold);
+    }
+    if !repos_not_indexed.is_empty() {
+        blind_spots.push(BlindSpot::NotIndexed);
+    }
+
+    let analysis_direction = "over-approximate".to_string();
+
     Ok(BlastRadiusResult {
         changed_symbols,
         affected_symbols,
@@ -537,6 +674,9 @@ pub fn analyze_blast_radius(
         status,
         notifications,
         gate_state,
+        coverage,
+        blind_spots,
+        analysis_direction,
     })
 }
 
@@ -1321,6 +1461,270 @@ mod tests {
             result.notifications
         );
         assert_eq!(result.gate_state, GateState::Ok);
+    }
+
+    #[test]
+    fn coverage_reports_repos_in_scope_and_direction() {
+        use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        // The owning repo is indexed and up to date, so NotIndexed must not fire.
+        store
+            .insert_repo(&Repo {
+                uid: "repo:1".to_string(),
+                url: "https://example.com/repo".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst-1".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&mk("a", "fn_a", "src/a.rs")).unwrap();
+        store.insert_symbol(&mk("b", "fn_b", "src/b.rs")).unwrap();
+        // b calls a — a healthy, fully-resolvable run.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b".to_string(),
+                target_uid: "a".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
+
+        assert_eq!(result.analysis_direction, "over-approximate");
+        assert!(
+            result.coverage.repos_in_scope.contains(&"repo:1".to_string()),
+            "in-scope repos should include repo:1, got: {:?}",
+            result.coverage.repos_in_scope
+        );
+        assert!(
+            !result.coverage.traversal_truncated,
+            "a complete walk must not report truncation"
+        );
+        for bs in [
+            BlindSpot::DynamicDispatch,
+            BlindSpot::Reflection,
+            BlindSpot::ConfigWiring,
+            BlindSpot::Codegen,
+        ] {
+            assert!(
+                result.blind_spots.contains(&bs),
+                "static-analysis blind spot {bs:?} must always be present"
+            );
+        }
+        assert!(
+            !result.blind_spots.contains(&BlindSpot::PrunedBelowThreshold),
+            "a complete walk must not flag PrunedBelowThreshold"
+        );
+        assert!(
+            !result.blind_spots.contains(&BlindSpot::NotIndexed),
+            "a fully-indexed run must not flag NotIndexed"
+        );
+    }
+
+    #[test]
+    fn truncated_traversal_sets_coverage_flag_and_blind_spot() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        // Chain c → b → a → target, all high-confidence, deeper than max_depth=2
+        // so a frontier node is left unexpanded at the boundary.
+        for (uid, file) in [
+            ("target", "src/target.rs"),
+            ("a", "src/a.rs"),
+            ("b", "src/b.rs"),
+            ("c", "src/c.rs"),
+        ] {
+            store.insert_symbol(&mk(uid, uid, file)).unwrap();
+        }
+        for (src, tgt) in [("a", "target"), ("b", "a"), ("c", "b")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/target.rs")], None, 2, None).unwrap();
+
+        assert!(
+            result.coverage.traversal_truncated,
+            "a chain deeper than max_depth must set traversal_truncated"
+        );
+        assert!(
+            result.blind_spots.contains(&BlindSpot::PrunedBelowThreshold),
+            "a truncated traversal must flag PrunedBelowThreshold, got: {:?}",
+            result.blind_spots
+        );
+    }
+
+    #[test]
+    fn stale_repo_appears_in_coverage() {
+        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        // An indexed repo whose graph is 7 commits behind source.
+        store
+            .insert_repo(&Repo {
+                uid: "repo:stale".to_string(),
+                url: "https://example.com/stale".to_string(),
+                indexed_sha: "old123".to_string(),
+                staleness_commits_behind: 7,
+                instance_id: "inst-1".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:a".to_string(),
+                name: "fn_a".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:stale".to_string(),
+                file_path: "src/a.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn fn_a()".to_string(),
+                summary: None,
+                content_hash: "h_a".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
+
+        let stale = result
+            .coverage
+            .stale_repos
+            .iter()
+            .find(|s| s.repo_uid == "repo:stale")
+            .expect("the stale repo owning a changed symbol must appear in stale_repos");
+        assert_eq!(stale.commits_behind, 7);
+    }
+
+    #[test]
+    fn unindexed_target_repo_flagged() {
+        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        // A known, indexed repo exists, but the analysis targets a different,
+        // absent repo.
+        store
+            .insert_repo(&Repo {
+                uid: "repo:known".to_string(),
+                url: "https://example.com/known".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst-1".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:a".to_string(),
+                name: "fn_a".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:known".to_string(),
+                file_path: "src/a.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn fn_a()".to_string(),
+                summary: None,
+                content_hash: "h_a".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            Some("repo:absent"),
+            3,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result
+                .coverage
+                .repos_not_indexed
+                .contains(&"repo:absent".to_string()),
+            "the unindexed target repo must appear in repos_not_indexed, got: {:?}",
+            result.coverage.repos_not_indexed
+        );
+        assert!(
+            result.blind_spots.contains(&BlindSpot::NotIndexed),
+            "an unindexed referenced repo must flag NotIndexed, got: {:?}",
+            result.blind_spots
+        );
     }
 
     #[test]

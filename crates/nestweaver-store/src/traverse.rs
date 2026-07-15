@@ -169,6 +169,17 @@ impl GraphStore {
             .nodes)
     }
 
+    /// Impact with the default edge set, returning the ImpactResult (with
+    /// truncation-honesty flags). Convenience over `impact_detailed`.
+    pub fn impact_with_flags(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+    ) -> Result<ImpactResult, StoreError> {
+        self.impact_detailed(target_uid, max_depth, min_confidence, IMPACT_EDGE_TYPES, None)
+    }
+
     /// Confidence-weighted reverse BFS that also reports whether the walk was
     /// complete. `edges` selects which incoming relationship types to follow;
     /// pass [`IMPACT_EDGE_TYPES`] for the default impact edge set. The returned

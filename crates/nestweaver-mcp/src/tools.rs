@@ -5768,6 +5768,12 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     let status_json = serde_json::to_value(result.status).unwrap_or(Value::Null);
     let gate_state_json = serde_json::to_value(result.gate_state).unwrap_or(Value::Null);
 
+    // Coverage & blind spots: which repos were in scope/stale/not-indexed,
+    // whether the traversal was truncated, and the static-analysis gaps — so a
+    // consumer can tell "no impact" from "incomplete coverage".
+    let coverage_json = serde_json::to_value(&result.coverage).unwrap_or(Value::Null);
+    let blind_spots_json = serde_json::to_value(&result.blind_spots).unwrap_or(Value::Null);
+
     Ok(json!({
         "changed_files": files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "max_depth": max_depth,
@@ -5782,6 +5788,9 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "affected_symbol_count": affected_json.len(),
         "affected_clusters": clusters_json,
         "affected_cluster_count": clusters_json.len(),
+        "coverage": coverage_json,
+        "blind_spots": blind_spots_json,
+        "analysis_direction": result.analysis_direction,
     }))
 }
 

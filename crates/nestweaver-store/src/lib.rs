@@ -33,7 +33,7 @@ pub use tantivy_index::{
     PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K, SearchHit,
     TantivyError, TantivyIndex,
 };
-pub use traverse::{ImpactEdge, ImpactNode};
+pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{DiscardedVault, MergeResult, PurgeInstanceResult};
 
 #[cfg(test)]
