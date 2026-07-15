@@ -5758,11 +5758,24 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         })
         .collect();
 
+    // Trust signals: whether the analysis ran to completion, the gate verdict
+    // (never RiskFlagged from a degraded run), and machine-readable reasons.
+    let notifications_json: Vec<Value> = result
+        .notifications
+        .iter()
+        .map(|n| serde_json::to_value(n).unwrap_or(Value::Null))
+        .collect();
+    let status_json = serde_json::to_value(result.status).unwrap_or(Value::Null);
+    let gate_state_json = serde_json::to_value(result.gate_state).unwrap_or(Value::Null);
+
     Ok(json!({
         "changed_files": files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "max_depth": max_depth,
         "risk": risk_str,
         "summary": result.summary,
+        "status": status_json,
+        "gate_state": gate_state_json,
+        "notifications": notifications_json,
         "changed_symbols": changed_json,
         "changed_symbol_count": changed_json.len(),
         "affected_symbols": affected_json,

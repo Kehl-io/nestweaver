@@ -118,8 +118,9 @@ pub use backup::{
 };
 pub use bare_clone::{mint_repo_identity, read_origin_url};
 pub use blast_radius::{
-    AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
-    analyze_blast_radius, changed_files_from_git,
+    AffectedCluster, AffectedSymbol as BlastAffectedSymbol, AnalysisStatus, BlastRadiusResult,
+    ChangedSymbol, GateState, Notification, NotificationLevel, analyze_blast_radius,
+    changed_files_from_git,
 };
 pub use brain_docgraph::{
     BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,

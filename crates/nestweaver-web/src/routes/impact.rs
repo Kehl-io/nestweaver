@@ -293,6 +293,8 @@ fn empty_affected_tests(
         summary: summary.into(),
         disclaimer: "Static affected-test hints are unavailable for this scoped impact response."
             .to_string(),
+        status: nestweaver_engine::AnalysisStatus::Complete,
+        notifications: Vec::new(),
     }
 }
 

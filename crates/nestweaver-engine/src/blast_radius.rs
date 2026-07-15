@@ -1,7 +1,7 @@
 // PR blast radius analysis: maps changed files to affected symbols,
 // runs transitive impact analysis, groups by cluster, and scores risk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -83,6 +83,62 @@ pub struct OrgImpactItem {
     pub reason: String,
 }
 
+/// Whether the analysis ran to completion. Ordered by severity so status can
+/// only escalate (Complete < Partial < Degraded < Failed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnalysisStatus {
+    // Old serialized results (no `status` field) predate the trust core and
+    // described healthy runs, so they deserialize as Complete.
+    #[default]
+    Complete,
+    Partial,
+    Degraded,
+    Failed,
+}
+
+impl AnalysisStatus {
+    /// Lowercase label for embedding in the human summary string.
+    fn label(self) -> &'static str {
+        match self {
+            AnalysisStatus::Complete => "complete",
+            AnalysisStatus::Partial => "partial",
+            AnalysisStatus::Degraded => "degraded",
+            AnalysisStatus::Failed => "failed",
+        }
+    }
+}
+
+/// Severity of a [`Notification`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationLevel {
+    Note,
+    Warning,
+    Error,
+}
+
+/// A machine-readable reason the analysis was incomplete or degraded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub level: NotificationLevel,
+    pub message: String,
+    /// Stable kebab/dotted reason code, e.g. "store.impact-failed".
+    pub descriptor: String,
+}
+
+/// The gate verdict. Derived, never over-approximated from a degraded run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateState {
+    Ok,
+    // Absent gate state on an old result maps to the conservative "unknown"
+    // rather than falsely asserting Ok.
+    #[default]
+    DegradedUnknown,
+    RiskFlagged,
+}
+
 /// Full result of a blast radius analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlastRadiusResult {
@@ -95,6 +151,33 @@ pub struct BlastRadiusResult {
     /// `None` when no upstream is configured or the server is unreachable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_wide: Option<OrgWideImpact>,
+    /// Whether the analysis ran to completion. A degraded/failed run must NOT
+    /// be read as "safe" — see `gate_state`.
+    #[serde(default)]
+    pub status: AnalysisStatus,
+    /// Machine-readable reasons the analysis was incomplete or degraded.
+    #[serde(default)]
+    pub notifications: Vec<Notification>,
+    /// The gate verdict, derived from `status` + `risk_level`. Never emits
+    /// `RiskFlagged` from a degraded run (that would be an over-approximation);
+    /// a degraded run is `DegradedUnknown` so a consumer treats it as unknown.
+    #[serde(default)]
+    pub gate_state: GateState,
+}
+
+/// Derive the gate verdict from the run status and computed risk.
+///
+/// NON-NEGOTIABLE rule: a run that did not complete is never `RiskFlagged`
+/// (we cannot trust an incomplete traversal to have found the risk), it is
+/// `DegradedUnknown`.
+fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState {
+    if status != AnalysisStatus::Complete {
+        GateState::DegradedUnknown
+    } else if matches!(risk_level, RiskLevel::High) {
+        GateState::RiskFlagged
+    } else {
+        GateState::Ok
+    }
 }
 
 /// Analyze the blast radius of a set of changed files.
@@ -118,23 +201,94 @@ pub fn analyze_blast_radius(
     max_depth: u32,
     db_path: Option<&Path>,
 ) -> Result<BlastRadiusResult> {
+    // Trust core: track whether the analysis actually ran to completion and why
+    // not. A failed/partial query must NOT be reported as "nothing affected".
+    let mut status = AnalysisStatus::Complete;
+    let mut notifications: Vec<Notification> = Vec::new();
+
+    // Resolve repo_uid -> display name (repo URL when available, else the uid)
+    // for org-wide impact reporting. Fetched up front so the changed-file loop
+    // can tell "unindexed repo" from "indexed repo, drifted path".
+    let repos = match store.list_repos(None) {
+        Ok(r) => r,
+        Err(e) => {
+            notifications.push(Notification {
+                level: NotificationLevel::Error,
+                message: format!("failed to list repos: {e}"),
+                descriptor: "store.list-repos-failed".to_string(),
+            });
+            status = status.max(AnalysisStatus::Degraded);
+            Vec::new()
+        }
+    };
+    let known_repo_uids: HashSet<String> = repos.iter().map(|r| r.uid.clone()).collect();
+    let repo_display: HashMap<String, String> = repos
+        .into_iter()
+        .map(|r| (r.uid.clone(), if r.url.is_empty() { r.uid } else { r.url }))
+        .collect();
+
     // Step 1: Map changed files to symbols.
     let mut changed_symbols: Vec<ChangedSymbol> = Vec::new();
     let mut changed_uids: HashSet<String> = HashSet::new();
     // Repos that own the changed symbols — used to separate same-repo ("local")
     // impact from cross-repo ("org-wide") impact below.
     let mut changed_repos: HashSet<String> = HashSet::new();
+    // Count file lookups that succeeded vs errored, so a wholesale store failure
+    // (every lookup errored) escalates to a hard `Failed` rather than a quiet
+    // "0 symbols".
+    let mut files_ok: usize = 0;
+    let mut files_errored: usize = 0;
 
     for file in changed_files {
         let file_str = file.to_string_lossy();
         // In a unified multi-repo graph, scope resolution to the repo under
         // review so identical relative paths don't conflate across repos.
-        let syms = match target_repo {
-            Some(repo) => store
-                .symbols_in_file_in_repo(&file_str, repo)
-                .unwrap_or_default(),
-            None => store.symbols_in_file(&file_str).unwrap_or_default(),
+        let lookup = match target_repo {
+            Some(repo) => store.symbols_in_file_in_repo(&file_str, repo),
+            None => store.symbols_in_file(&file_str),
         };
+        let syms = match lookup {
+            Ok(syms) => {
+                files_ok += 1;
+                syms
+            }
+            Err(e) => {
+                files_errored += 1;
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!("failed to resolve symbols for {file_str}: {e}"),
+                    descriptor: "store.symbols-lookup-failed".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+                continue;
+            }
+        };
+
+        // A successful lookup that resolves 0 symbols is suspicious *only* when
+        // (a) we scoped to a repo the graph actually knows, and (b) the file is
+        // a recognized source file we would expect to have indexed. That points
+        // at path drift or a not-yet-reindexed source file. We deliberately stay
+        // silent for non-source files (docs, config, assets, lockfiles) — which
+        // most PRs touch — and when there is no target repo to judge against, so
+        // a healthy change never gates as degraded on benign files.
+        if syms.is_empty() {
+            if let Some(repo) = target_repo
+                && known_repo_uids.contains(repo)
+                && nestweaver_parser::detect_language(file).is_some()
+            {
+                notifications.push(Notification {
+                    level: NotificationLevel::Warning,
+                    message: format!(
+                        "changed file {file_str} mapped to 0 symbols (possible path-format \
+                         drift or unindexed file)"
+                    ),
+                    descriptor: "changed-file-no-symbols".to_string(),
+                });
+                status = status.max(AnalysisStatus::Partial);
+            }
+            continue;
+        }
+
         for sym in syms {
             changed_repos.insert(sym.repo_uid.clone());
             if changed_uids.insert(sym.uid.clone()) {
@@ -150,14 +304,12 @@ pub fn analyze_blast_radius(
         }
     }
 
-    // Resolve repo_uid -> display name (repo URL when available, else the uid)
-    // for org-wide impact reporting.
-    let repo_display: std::collections::HashMap<String, String> = store
-        .list_repos(None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| (r.uid.clone(), if r.url.is_empty() { r.uid } else { r.url }))
-        .collect();
+    // Hard failure: we had files to analyze and *every* lookup errored. The
+    // store is broken, not merely partial — a consumer must not read this as
+    // "nothing affected".
+    if !changed_files.is_empty() && files_ok == 0 && files_errored > 0 {
+        status = status.max(AnalysisStatus::Failed);
+    }
 
     // Step 2: For each changed symbol, run transitive impact analysis.
     let mut affected_symbols: Vec<AffectedSymbol> = Vec::new();
@@ -169,8 +321,26 @@ pub fn analyze_blast_radius(
     let mut org_info: Vec<OrgImpactItem> = Vec::new();
     let mut impacted_repos: HashSet<String> = HashSet::new();
 
+    // Affected nodes whose per-symbol lookup (kind/owning-repo) errored. We
+    // fall back to empty kind/repo but count them so we can surface ONE
+    // aggregated note instead of spamming one per node.
+    let mut lookup_failures: usize = 0;
+
     for cs in &changed_symbols {
-        let impact_nodes = store.impact(&cs.uid, max_depth, 0.0).unwrap_or_default();
+        let impact_nodes = match store.impact(&cs.uid, max_depth, 0.0) {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                // Do NOT silently drop this symbol's downstream as if empty —
+                // that would under-report the blast radius.
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!("impact traversal failed for {}: {e}", cs.name),
+                    descriptor: "store.impact-failed".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+                continue;
+            }
+        };
         for node in impact_nodes {
             // Skip symbols that are themselves in the changed set.
             if changed_uids.contains(&node.uid) {
@@ -178,7 +348,13 @@ pub fn analyze_blast_radius(
             }
             if affected_uids.insert(node.uid.clone()) {
                 // Look up the symbol so we know its kind and owning repo.
-                let affected_sym = store.lookup_symbol(&node.uid).ok();
+                let affected_sym = match store.lookup_symbol(&node.uid) {
+                    Ok(sym) => Some(sym),
+                    Err(_) => {
+                        lookup_failures += 1;
+                        None
+                    }
+                };
                 let kind = affected_sym
                     .as_ref()
                     .map(|s| s.kind.to_string())
@@ -232,6 +408,19 @@ pub fn analyze_blast_radius(
         }
     }
 
+    // One aggregated note when any affected node's kind/repo couldn't be
+    // resolved — the blast radius is still reported, but enrichment is partial.
+    if lookup_failures > 0 {
+        notifications.push(Notification {
+            level: NotificationLevel::Note,
+            message: format!(
+                "could not resolve kind/owning-repo for {lookup_failures} affected symbol(s)"
+            ),
+            descriptor: "lookup-symbol-failed".to_string(),
+        });
+        status = status.max(AnalysisStatus::Partial);
+    }
+
     // Sort affected symbols by impact_score (highest first).
     affected_symbols.sort_by(|a, b| {
         b.impact_score
@@ -248,10 +437,27 @@ pub fn analyze_blast_radius(
         .map(|s| s.as_str())
         .collect();
 
-    if let Some(db) = db_path
-        && let Ok(Some(clustering)) = load_clusters(db)
-    {
-        affected_clusters = compute_affected_clusters(&clustering, &all_affected_uids);
+    if let Some(db) = db_path {
+        match load_clusters(db) {
+            Ok(Some(clustering)) => {
+                affected_clusters = compute_affected_clusters(&clustering, &all_affected_uids);
+            }
+            // No clustering computed for this graph — legitimate, not a failure.
+            Ok(None) => {}
+            // A cluster read error silently drops the cluster-count risk boost,
+            // which would under-report risk on an otherwise "Complete" run — the
+            // exact silent-degradation this analysis exists to surface.
+            Err(e) => {
+                notifications.push(Notification {
+                    level: NotificationLevel::Warning,
+                    message: format!(
+                        "cluster data unavailable — cluster-based risk may be under-reported: {e}"
+                    ),
+                    descriptor: "load-clusters-failed".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+            }
+        }
     }
 
     // Step 4: Score risk.
@@ -277,7 +483,7 @@ pub fn analyze_blast_radius(
 
     let risk_level = compute_risk_level(total_affected, clusters_touched, avg_pagerank);
 
-    let summary = format!(
+    let mut summary = format!(
         "{} changed symbol(s) in {} file(s), {} transitively affected symbol(s), \
          {} cluster(s) touched. Risk: {:?}.",
         changed_symbols.len(),
@@ -286,6 +492,15 @@ pub fn analyze_blast_radius(
         clusters_touched,
         risk_level,
     );
+    // Make a non-clean run impossible to miss in the human summary.
+    if status != AnalysisStatus::Complete {
+        summary.push_str(&format!(" [status: {}]", status.label()));
+    }
+
+    // Gate verdict — a degraded/failed run is never RiskFlagged (see
+    // `derive_gate_state`); it is reported as unknown so consumers don't read a
+    // broken analysis as safe.
+    let gate_state = derive_gate_state(status, risk_level);
 
     // Build the org-wide (cross-repo) impact summary, if any. Sourced from this
     // daemon's unified multi-repo graph. A connected upstream server can augment
@@ -319,6 +534,9 @@ pub fn analyze_blast_radius(
         risk_level,
         summary,
         org_wide,
+        status,
+        notifications,
+        gate_state,
     })
 }
 
@@ -947,5 +1165,188 @@ mod tests {
         assert_eq!(unscoped.changed_symbols.len(), 2);
         assert!(unscoped_names.contains("main_r1"));
         assert!(unscoped_names.contains("main_r2"));
+    }
+
+    #[test]
+    fn status_complete_and_gate_ok_on_clean_analysis() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&mk("a", "fn_a", "src/a.rs")).unwrap();
+        store.insert_symbol(&mk("b", "fn_b", "src/b.rs")).unwrap();
+        // b calls a — changing a.rs affects b, a healthy resolvable run.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b".to_string(),
+                target_uid: "a".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, None).unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert!(
+            result.notifications.is_empty(),
+            "clean run must have no notifications, got: {:?}",
+            result.notifications
+        );
+        // Risk is Low (1 affected, no pagerank), so the gate is Ok.
+        assert!(matches!(
+            result.gate_state,
+            GateState::Ok | GateState::RiskFlagged
+        ));
+        assert_eq!(result.gate_state, GateState::Ok);
+    }
+
+    #[test]
+    fn zero_symbols_in_indexed_repo_is_partial() {
+        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        // An indexed repo (visible via list_repos) that owns one symbol.
+        store
+            .insert_repo(&Repo {
+                uid: "repo:1".to_string(),
+                url: "https://example.com/repo".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst-1".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:a".to_string(),
+                name: "fn_a".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:1".to_string(),
+                file_path: "src/a.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn fn_a()".to_string(),
+                summary: None,
+                content_hash: "h_a".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        // Analyze a DIFFERENT changed path, scoped to the indexed repo: the
+        // lookup succeeds but resolves 0 symbols — path drift / unindexed file.
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/other.rs")],
+            Some("repo:1"),
+            3,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols"),
+            "expected a changed-file-no-symbols notification, got: {:?}",
+            result.notifications
+        );
+        // A non-Complete run is never Ok/RiskFlagged — it is DegradedUnknown.
+        assert_eq!(result.gate_state, GateState::DegradedUnknown);
+    }
+
+    #[test]
+    fn zero_symbols_non_source_file_stays_complete() {
+        use nestweaver_schema::Repo;
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_repo(&Repo {
+                uid: "repo:1".to_string(),
+                url: "https://example.com/repo".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst-1".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        // A docs/config file resolving to 0 symbols is expected, not drift, so
+        // it must NOT degrade the gate — otherwise most healthy PRs (which touch
+        // markdown/config/lockfiles) would gate as DegradedUnknown.
+        let result =
+            analyze_blast_radius(&store, &[PathBuf::from("README.md")], Some("repo:1"), 3, None)
+                .unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert!(
+            !result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols"),
+            "a non-source file must not emit a drift notification: {:?}",
+            result.notifications
+        );
+        assert_eq!(result.gate_state, GateState::Ok);
+    }
+
+    #[test]
+    fn degraded_run_never_risk_flagged() {
+        // The NON-NEGOTIABLE rule: a run that did not complete is never
+        // RiskFlagged, regardless of the computed risk — it is DegradedUnknown.
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Degraded, RiskLevel::High),
+            GateState::DegradedUnknown
+        );
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Failed, RiskLevel::High),
+            GateState::DegradedUnknown
+        );
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Partial, RiskLevel::High),
+            GateState::DegradedUnknown
+        );
+        // Complete runs still map risk faithfully.
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Complete, RiskLevel::High),
+            GateState::RiskFlagged
+        );
+        assert_eq!(
+            derive_gate_state(AnalysisStatus::Complete, RiskLevel::Low),
+            GateState::Ok
+        );
     }
 }
