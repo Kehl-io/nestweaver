@@ -391,8 +391,7 @@ pub fn analyze_blast_radius(
     for cs in &changed_symbols {
         let impact_nodes = match store.impact_with_flags(&cs.uid, max_depth, 0.0) {
             Ok(result) => {
-                traversal_truncated |=
-                    result.truncated_by_threshold || result.truncated_by_depth;
+                traversal_truncated |= result.truncated_by_threshold || result.truncated_by_depth;
                 result.nodes
             }
             Err(e) => {
@@ -875,7 +874,8 @@ mod tests {
     fn analyze_blast_radius_empty_store() {
         let store = GraphStore::in_memory().expect("in_memory store");
         let result =
-            analyze_blast_radius(&store, &[PathBuf::from("nonexistent.rs")], None, 3, None).unwrap();
+            analyze_blast_radius(&store, &[PathBuf::from("nonexistent.rs")], None, 3, None)
+                .unwrap();
         assert!(result.changed_symbols.is_empty());
         assert!(result.affected_symbols.is_empty());
         assert_eq!(result.risk_level, RiskLevel::Low);
@@ -1447,9 +1447,14 @@ mod tests {
         // A docs/config file resolving to 0 symbols is expected, not drift, so
         // it must NOT degrade the gate — otherwise most healthy PRs (which touch
         // markdown/config/lockfiles) would gate as DegradedUnknown.
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("README.md")], Some("repo:1"), 3, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("README.md")],
+            Some("repo:1"),
+            3,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.status, AnalysisStatus::Complete);
         assert!(
@@ -1519,7 +1524,10 @@ mod tests {
 
         assert_eq!(result.analysis_direction, "over-approximate");
         assert!(
-            result.coverage.repos_in_scope.contains(&"repo:1".to_string()),
+            result
+                .coverage
+                .repos_in_scope
+                .contains(&"repo:1".to_string()),
             "in-scope repos should include repo:1, got: {:?}",
             result.coverage.repos_in_scope
         );
@@ -1539,7 +1547,9 @@ mod tests {
             );
         }
         assert!(
-            !result.blind_spots.contains(&BlindSpot::PrunedBelowThreshold),
+            !result
+                .blind_spots
+                .contains(&BlindSpot::PrunedBelowThreshold),
             "a complete walk must not flag PrunedBelowThreshold"
         );
         assert!(
@@ -1604,7 +1614,9 @@ mod tests {
             "a chain deeper than max_depth must set traversal_truncated"
         );
         assert!(
-            result.blind_spots.contains(&BlindSpot::PrunedBelowThreshold),
+            result
+                .blind_spots
+                .contains(&BlindSpot::PrunedBelowThreshold),
             "a truncated traversal must flag PrunedBelowThreshold, got: {:?}",
             result.blind_spots
         );

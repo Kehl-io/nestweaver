@@ -177,7 +177,13 @@ impl GraphStore {
         max_depth: u32,
         min_confidence: f32,
     ) -> Result<ImpactResult, StoreError> {
-        self.impact_detailed(target_uid, max_depth, min_confidence, IMPACT_EDGE_TYPES, None)
+        self.impact_detailed(
+            target_uid,
+            max_depth,
+            min_confidence,
+            IMPACT_EDGE_TYPES,
+            None,
+        )
     }
 
     /// Confidence-weighted reverse BFS that also reports whether the walk was
