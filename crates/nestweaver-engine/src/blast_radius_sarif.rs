@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::blast_radius::{BlastRadiusResult, BlindSpot, NotificationLevel};
 use crate::process::RiskLevel;
+use crate::signature_diff::{BreakTier, BreakingChange};
 
 /// Static metadata for every [`BlindSpot`] variant: (kebab id, rule name,
 /// short description). One `reportingDescriptor` (SARIF rule) is emitted per
@@ -223,6 +224,56 @@ pub fn blast_radius_to_sarif(result: &BlastRadiusResult, tool_version: &str) -> 
     })
 }
 
+/// Map a [`BreakTier`] to its SARIF result `level`: `Breaking` is an error,
+/// `LikelyBreaking` a warning, `ReachOnly` a note.
+fn break_tier_level(tier: BreakTier) -> &'static str {
+    match tier {
+        BreakTier::Breaking => "error",
+        BreakTier::LikelyBreaking => "warning",
+        BreakTier::ReachOnly => "note",
+    }
+}
+
+/// Append contract-verified breaking-change results (and their rule) to an
+/// already-built SARIF document from [`blast_radius_to_sarif`].
+///
+/// Each result rides under a new `nw/contract-break` rule and carries
+/// `properties["nestweaver/severitySource"] = "contract-verified"`, contrasting
+/// with the `"reach-only"` affected/org items so a viewer can tell a verified
+/// signature break from a reach-based heuristic. A no-op when `breaks` is empty.
+pub fn append_contract_breaks_to_sarif(sarif: &mut Value, breaks: &[BreakingChange]) {
+    if breaks.is_empty() {
+        return;
+    }
+    let run = &mut sarif["runs"][0];
+    if let Some(rules) = run["tool"]["driver"]["rules"].as_array_mut() {
+        rules.push(json!({
+            "id": "nw/contract-break",
+            "name": "ContractBreak",
+            "shortDescription": {
+                "text": "A contract-verified breaking change to a public API symbol"
+            }
+        }));
+    }
+    if let Some(results) = run["results"].as_array_mut() {
+        for b in breaks {
+            results.push(json!({
+                "ruleId": "nw/contract-break",
+                "kind": "review",
+                "level": break_tier_level(b.tier),
+                "message": { "text": b.detail },
+                "properties": {
+                    "nestweaver/severitySource": "contract-verified",
+                    "nestweaver/breakKind": serde_json::to_value(b.kind).unwrap_or(Value::Null),
+                    "nestweaver/breakTier": serde_json::to_value(b.tier).unwrap_or(Value::Null),
+                    "nestweaver/symbolName": b.symbol_name,
+                    "nestweaver/symbolUid": b.symbol_uid
+                }
+            }));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +282,7 @@ mod tests {
         NotificationLevel, OrgImpactItem, OrgWideImpact,
     };
     use crate::process::RiskLevel;
+    use crate::signature_diff::{BreakKind, BreakTier, BreakingChange};
 
     /// A minimal, complete result with no affected symbols or notifications.
     fn base_result() -> BlastRadiusResult {
@@ -390,5 +442,59 @@ mod tests {
         assert_eq!(props["nestweaver/analysisDirection"], "over-approximate");
         assert!(props["nestweaver/blindSpots"].is_array());
         assert!(props["nestweaver/coverage"].is_object());
+    }
+
+    #[test]
+    fn sarif_contract_breaks_appended_with_contract_verified_source() {
+        let mut sarif = blast_radius_to_sarif(&base_result(), "1.0.0");
+        let breaks = vec![
+            BreakingChange {
+                symbol_uid: "src/api.rs:foo".to_string(),
+                symbol_name: "foo".to_string(),
+                kind: BreakKind::ParamAdded,
+                tier: BreakTier::Breaking,
+                detail: "parameter count increased from 1 to 2".to_string(),
+            },
+            BreakingChange {
+                symbol_uid: "src/api.rs:bar".to_string(),
+                symbol_name: "bar".to_string(),
+                kind: BreakKind::ReturnTypeChanged,
+                tier: BreakTier::LikelyBreaking,
+                detail: "return type changed from i32 to i64".to_string(),
+            },
+        ];
+        append_contract_breaks_to_sarif(&mut sarif, &breaks);
+
+        let results = sarif["runs"][0]["results"].as_array().expect("results");
+        let cb: Vec<_> = results
+            .iter()
+            .filter(|r| r["ruleId"] == "nw/contract-break")
+            .collect();
+        assert_eq!(cb.len(), 2);
+        assert_eq!(cb[0]["level"], "error");
+        assert_eq!(
+            cb[0]["properties"]["nestweaver/severitySource"],
+            "contract-verified"
+        );
+        assert_eq!(cb[1]["level"], "warning");
+
+        // The rule is registered exactly once.
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .expect("rules");
+        let rule_count = rules
+            .iter()
+            .filter(|r| r["id"] == "nw/contract-break")
+            .count();
+        assert_eq!(rule_count, 1);
+    }
+
+    #[test]
+    fn sarif_contract_breaks_empty_is_noop() {
+        let mut sarif = blast_radius_to_sarif(&base_result(), "1.0.0");
+        let before = sarif["runs"][0]["results"].as_array().unwrap().len();
+        append_contract_breaks_to_sarif(&mut sarif, &[]);
+        let after = sarif["runs"][0]["results"].as_array().unwrap().len();
+        assert_eq!(before, after, "empty breaks must not add results");
     }
 }

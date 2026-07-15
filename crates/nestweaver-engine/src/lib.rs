@@ -57,6 +57,7 @@ pub mod clustering;
 pub mod cochange;
 pub mod config;
 pub mod content_reader;
+pub mod contract_change;
 pub mod contracts;
 pub mod cross_domain;
 pub mod dead_code;
@@ -124,7 +125,7 @@ pub use blast_radius::{
     BlastRadiusResult, ChangedSymbol, GateState, Notification, NotificationLevel,
     analyze_blast_radius, changed_files_from_git,
 };
-pub use blast_radius_sarif::blast_radius_to_sarif;
+pub use blast_radius_sarif::{append_contract_breaks_to_sarif, blast_radius_to_sarif};
 pub use brain_docgraph::{
     BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,
     broken_links, doc_stats, orphan_documents, tag_graph, tag_graph_all, topic_clusters,
@@ -147,6 +148,7 @@ pub use config::{
     WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file, default_kind_priority,
     default_test_path_patterns, remove_repo_from_config_file,
 };
+pub use contract_change::breaking_changes_from_git;
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index,
     build_symbol_index_with_config, discover_cross_domain_links,

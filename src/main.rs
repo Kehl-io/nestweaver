@@ -8,14 +8,15 @@ use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
-    BlastRadiusResult, BrainContextResult, BrainWatcher, CodeWatcher, ContextResult,
-    DeadCodeConfidence, FeatureContextResult, GateState, HubNode, HybridSearchConfig, LookupResult,
-    NotificationLevel, RiskLevel, Summary, SummaryLevel, affected_tests, analyze_blast_radius,
-    attach_cluster_ids, attach_communities, build_brain_context_hybrid_with_aliases,
-    build_context_with_intent, build_feature_context, changed_files_from_git, compute_clusters,
-    compute_cochanges, detect_implicit_projects, discover_cross_domain_links,
-    embedding::generate_embeddings_batch, expand_query_with_aliases, export_cypher, export_graphml,
-    export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
+    BlastRadiusResult, BrainContextResult, BrainWatcher, BreakTier, BreakingChange, CodeWatcher,
+    ContextResult, DeadCodeConfidence, FeatureContextResult, GateState, HubNode,
+    HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
+    affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
+    breaking_changes_from_git, build_brain_context_hybrid_with_aliases, build_context_with_intent,
+    build_feature_context, changed_files_from_git, compute_clusters, compute_cochanges,
+    detect_implicit_projects, discover_cross_domain_links, embedding::generate_embeddings_batch,
+    expand_query_with_aliases, export_cypher, export_graphml, export_in_memory_graph,
+    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
     generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
     generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
     incremental_index_with_name, index_directory_with_options,
@@ -2784,13 +2785,34 @@ fn pr_impact_degraded_reason(result: &BlastRadiusResult) -> String {
 /// Concise, advisory "confidence before you push" banner — what the pre-push
 /// hook consumes. Silent on a trivial change; otherwise a one-line gate verdict,
 /// the top affected symbols, and a coverage caveat when the run was incomplete.
-fn print_pr_impact_hook(result: &BlastRadiusResult) {
-    // Silent when trivial: a complete, low-risk run with nothing affected.
-    if result.gate_state == GateState::Ok
+fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange]) {
+    // Contract-verified breaks are surfaced even on an otherwise-trivial run.
+    let verified: Vec<&BreakingChange> = breaking
+        .iter()
+        .filter(|b| b.tier == BreakTier::Breaking)
+        .collect();
+    let likely_or_possible = breaking.len() - verified.len();
+
+    // Silent when trivial: a complete, low-risk run with nothing affected AND no
+    // verified breaking changes to report.
+    if verified.is_empty()
+        && result.gate_state == GateState::Ok
         && result.risk_level == RiskLevel::Low
         && result.affected_symbols.is_empty()
     {
         return;
+    }
+
+    // Lead with contract-verified breaking changes — these are real signature
+    // breaks, not the reach-based heuristic.
+    if !verified.is_empty() {
+        println!("⚠ {} verified breaking API change(s):", verified.len());
+        for b in verified.iter().take(5) {
+            println!("  {:?} {}", b.kind, b.symbol_name);
+        }
+        if likely_or_possible > 0 {
+            println!("  + {likely_or_possible} likely/possible");
+        }
     }
 
     match result.gate_state {
@@ -5309,6 +5331,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            let repo_root = detect_repo_root();
 
             // The default (neither --json nor --sarif) is the concise advisory
             // banner — this is what the pre-push hook consumes.
@@ -5318,17 +5341,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .split(',')
                     .map(|s| PathBuf::from(s.trim()))
                     .collect()
+            } else if let Some(ref base_ref) = base {
+                out.status(&format!(
+                    "Detecting changed files via git diff {base_ref}..."
+                ));
+                changed_files_from_git(&repo_root, Some(base_ref)).context("git diff")?
             } else {
-                let repo_root = detect_repo_root();
-                if let Some(ref base_ref) = base {
-                    out.status(&format!(
-                        "Detecting changed files via git diff {base_ref}..."
-                    ));
-                    changed_files_from_git(&repo_root, Some(base_ref)).context("git diff")?
-                } else {
-                    out.status("No --files given, detecting via git diff...");
-                    changed_files_from_git(&repo_root, None).context("git diff")?
-                }
+                out.status("No --files given, detecting via git diff...");
+                changed_files_from_git(&repo_root, None).context("git diff")?
+            };
+
+            // Contract-verified breaking API changes require a base ref to diff
+            // BEFORE↔AFTER signatures. Best-effort and advisory: a diff failure
+            // must never fail the run, so fall back to an empty list.
+            let breaking_changes: Vec<BreakingChange> = if let Some(ref base_ref) = base {
+                breaking_changes_from_git(&repo_root, base_ref, &changed_files).unwrap_or_default()
+            } else {
+                Vec::new()
             };
 
             // SARIF requires a real BlastRadiusResult to serialize, so it always
@@ -5342,6 +5371,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "changed_symbols": [],
                             "affected_symbols": [],
                             "affected_clusters": [],
+                            "breaking_changes": [],
                             "risk_level": "Low",
                             "summary": "No changed files detected.",
                         }))?
@@ -5366,9 +5396,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let result: BlastRadiusResult = serde_json::from_value(value.clone())
                         .context("decoding daemon pr_impact result")?;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        // Fold the locally-computed breaking changes into the
+                        // daemon's result JSON.
+                        let mut merged = value.clone();
+                        if let Some(obj) = merged.as_object_mut() {
+                            obj.insert(
+                                "breaking_changes".to_string(),
+                                serde_json::to_value(&breaking_changes)?,
+                            );
+                        }
+                        println!("{}", serde_json::to_string_pretty(&merged)?);
                     } else {
-                        print_pr_impact_hook(&result);
+                        print_pr_impact_hook(&result, &breaking_changes);
                     }
                     return Ok((pr_impact_exit_code(result.gate_state, strict), None));
                 }
@@ -5393,13 +5432,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 analyze_blast_radius(&store, &changed_files, &options, None, Some(&db_path))?;
 
             if sarif {
-                let sarif_value =
+                let mut sarif_value =
                     nestweaver_engine::blast_radius_to_sarif(&result, env!("CARGO_PKG_VERSION"));
+                // Contract-verified breaks ride alongside the reach-only results
+                // as `nw/contract-break` items tagged severitySource=contract-verified.
+                nestweaver_engine::append_contract_breaks_to_sarif(
+                    &mut sarif_value,
+                    &breaking_changes,
+                );
                 println!("{}", serde_json::to_string_pretty(&sarif_value)?);
             } else if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                let mut value = serde_json::to_value(&result)?;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "breaking_changes".to_string(),
+                        serde_json::to_value(&breaking_changes)?,
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                print_pr_impact_hook(&result);
+                print_pr_impact_hook(&result, &breaking_changes);
             }
 
             let stats = format!(
