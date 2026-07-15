@@ -181,13 +181,14 @@ impl GraphStore {
         target_uid: &str,
         max_depth: u32,
         min_confidence: f32,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
         self.impact_detailed(
             target_uid,
             max_depth,
             min_confidence,
             IMPACT_EDGE_TYPES,
-            None,
+            cancel,
         )
     }
 
@@ -223,6 +224,7 @@ impl GraphStore {
         max_depth: u32,
         min_confidence: f32,
         data_max_depth: u32,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
         self.impact_bfs(
             target_uid,
@@ -231,7 +233,7 @@ impl GraphStore {
             IMPACT_EDGE_TYPES,
             IMPACT_DATA_EDGE_TYPES,
             data_max_depth,
-            None,
+            cancel,
         )
     }
 
@@ -1253,7 +1255,9 @@ mod tests {
             .unwrap();
 
         // Data tier on: both the type-reference and field-access dependents show.
-        let with_data = store.impact_with_data_edges("changed", 3, 0.0, 2).unwrap();
+        let with_data = store
+            .impact_with_data_edges("changed", 3, 0.0, 2, None)
+            .unwrap();
         let data_uids: Vec<&str> = with_data.nodes.iter().map(|n| n.uid.as_str()).collect();
         assert!(
             data_uids.contains(&"caller"),
@@ -1265,7 +1269,7 @@ mod tests {
         );
 
         // Structural-only: neither is reachable (default-off behavior).
-        let structural = store.impact_with_flags("changed", 3, 0.0).unwrap();
+        let structural = store.impact_with_flags("changed", 3, 0.0, None).unwrap();
         let struct_uids: Vec<&str> = structural.nodes.iter().map(|n| n.uid.as_str()).collect();
         assert!(
             !struct_uids.contains(&"caller"),
@@ -1317,7 +1321,9 @@ mod tests {
 
         // data_max_depth = 1: data edges are followed only from the seed (depth
         // 0), so d1 (depth 1) is reached but d2 (depth 2) is not.
-        let result = store.impact_with_data_edges("changed", 5, 0.0, 1).unwrap();
+        let result = store
+            .impact_with_data_edges("changed", 5, 0.0, 1, None)
+            .unwrap();
         let uids: Vec<&str> = result.nodes.iter().map(|n| n.uid.as_str()).collect();
         assert!(
             uids.contains(&"d1"),

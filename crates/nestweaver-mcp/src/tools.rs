@@ -13,11 +13,11 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
 use nestweaver_engine::{
-    BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig, SummaryLevel,
-    ToolDocEntry, affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    broken_links, build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
-    detect_dead_code_cancellable, doc_stats, expand_query_with_aliases, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    BlastRadiusOptions, BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig,
+    SummaryLevel, ToolDocEntry, affected_tests, analyze_blast_radius, attach_cluster_ids,
+    attach_communities, broken_links, build_brain_context_hybrid_with_aliases, compute_clusters,
+    detect_changes_impact, detect_dead_code_cancellable, doc_stats, expand_query_with_aliases,
+    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
@@ -328,7 +328,7 @@ fn dispatch_uncached(
         "dead_code" => tool_dead_code(store, args, cancel),
         "hub_nodes" => tool_hub_nodes(store, args),
         "bridge_nodes" => tool_bridge_nodes(store, args),
-        "blast_radius" => tool_blast_radius(store, args),
+        "blast_radius" => tool_blast_radius(store, args, cancel),
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
         "regex_search" => tool_regex_search(store, args),
@@ -5682,6 +5682,11 @@ fn tool_schema_blast_radius() -> Value {
                     "description": "Also follow data-dependence edges (type refs & field access). Higher recall, noisier; default false.",
                     "default": false
                 },
+                "limit": {
+                    "type": "integer",
+                    "description": "Cap on returned affected_symbols (most-impactful first). Omit for the full set; a truncation note reports the true total.",
+                    "minimum": 1
+                },
                 "format": {
                     "type": "string",
                     "enum": ["json", "sarif"],
@@ -5694,7 +5699,11 @@ fn tool_schema_blast_radius() -> Value {
     })
 }
 
-fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_blast_radius(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     let files: Vec<std::path::PathBuf> = args
         .get("changed_files")
         .and_then(|v| v.as_array())
@@ -5722,16 +5731,22 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let db_path = current_db_path(store).ok();
-    let result = analyze_blast_radius(
-        store,
-        &files,
-        target_repo,
+    // Optional cap on returned affected_symbols (most-impactful first).
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    let options = BlastRadiusOptions {
+        target_repo: target_repo.map(str::to_string),
         max_depth,
         include_data_edges,
-        db_path.as_deref(),
-    )
-    .context("analyze_blast_radius")?;
+        limit,
+    };
+
+    let db_path = current_db_path(store).ok();
+    let result = analyze_blast_radius(store, &files, &options, cancel, db_path.as_deref())
+        .context("analyze_blast_radius")?;
 
     // SARIF output: emit a standard SARIF v2.1.0 run (with namespaced
     // nestweaver/* extensions) instead of the native json result. The default

@@ -5157,8 +5157,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             ));
 
             // TODO(nw-033): resolve target repo_uid from the working repo
+            let options = nestweaver_engine::BlastRadiusOptions {
+                target_repo: None,
+                max_depth: depth,
+                include_data_edges: false,
+                limit: None,
+            };
             let result =
-                analyze_blast_radius(&store, &changed_files, None, depth, false, Some(&db_path))?;
+                analyze_blast_radius(&store, &changed_files, &options, None, Some(&db_path))?;
 
             if sarif {
                 let sarif_value =

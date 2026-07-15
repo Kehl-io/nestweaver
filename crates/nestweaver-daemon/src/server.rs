@@ -3144,12 +3144,19 @@ impl NestWeaverDaemon for DaemonService {
                 ));
             }
             // TODO(nw-033): resolve target repo_uid from the working repo
+            let options = nestweaver_engine::BlastRadiusOptions {
+                target_repo: None,
+                max_depth: depth,
+                include_data_edges: false,
+                limit: None,
+            };
+            // TODO(nw-034): thread a cancellation token through this handler so
+            // the timeout can stop the traversal.
             let result = nestweaver_engine::analyze_blast_radius(
                 &state.store,
                 &changed_files,
+                &options,
                 None,
-                depth,
-                false,
                 Some(&state.db_path),
             )
             .map_err(|e| Status::internal(format!("analyze_blast_radius failed: {e:#}")))?;

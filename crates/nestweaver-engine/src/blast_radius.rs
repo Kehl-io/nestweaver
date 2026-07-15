@@ -8,7 +8,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use nestweaver_store::GraphStore;
+use nestweaver_store::{GraphStore, StoreError};
 
 use crate::cluster_dispatch::{ClusteringOutput, load_clusters};
 use crate::process::RiskLevel;
@@ -236,6 +236,21 @@ fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState
 /// fan out toward full program slices if followed transitively.
 const DATA_EDGE_MAX_DEPTH: u32 = 2;
 
+/// Tunable inputs for [`analyze_blast_radius`]. Grouped into a struct so the
+/// call sites stay readable as knobs accrete.
+#[derive(Debug, Clone, Default)]
+pub struct BlastRadiusOptions {
+    /// Repo under review; scopes changed-file resolution in a unified
+    /// multi-repo graph. `None` matches identical relative paths across repos.
+    pub target_repo: Option<String>,
+    /// Maximum traversal depth for the impact walk.
+    pub max_depth: u32,
+    /// Also follow shallow data-dependence edges (type refs & field access).
+    pub include_data_edges: bool,
+    /// Cap on returned `affected_symbols` (most-impactful first). None = no cap.
+    pub limit: Option<usize>,
+}
+
 /// Analyze the blast radius of a set of changed files.
 ///
 /// 1. Maps changed files to their symbols in the graph.
@@ -253,11 +268,14 @@ const DATA_EDGE_MAX_DEPTH: u32 = 2;
 pub fn analyze_blast_radius(
     store: &GraphStore,
     changed_files: &[PathBuf],
-    target_repo: Option<&str>,
-    max_depth: u32,
-    include_data_edges: bool,
+    options: &BlastRadiusOptions,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     db_path: Option<&Path>,
 ) -> Result<BlastRadiusResult> {
+    let target_repo = options.target_repo.as_deref();
+    let max_depth = options.max_depth;
+    let include_data_edges = options.include_data_edges;
+
     // Trust core: track whether the analysis actually ran to completion and why
     // not. A failed/partial query must NOT be reported as "nothing affected".
     let mut status = AnalysisStatus::Complete;
@@ -394,18 +412,43 @@ pub fn analyze_blast_radius(
     // affected set is a floor, not the complete picture.
     let mut traversal_truncated = false;
 
+    // Emit the cancellation notification + degrade once. Set when the timeout
+    // trips so the summary/gate reflect an incomplete run.
+    let push_cancelled = |notifications: &mut Vec<Notification>, status: &mut AnalysisStatus| {
+        notifications.push(Notification {
+            level: NotificationLevel::Warning,
+            message: "impact analysis cancelled (timeout) before completing".to_string(),
+            descriptor: "analysis-cancelled".to_string(),
+        });
+        *status = (*status).max(AnalysisStatus::Degraded);
+    };
+
     for cs in &changed_symbols {
+        // Check the deadline before starting another symbol's traversal so a
+        // tripped timeout stops promptly rather than after the whole set.
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            push_cancelled(&mut notifications, &mut status);
+            break;
+        }
+
         // Optionally fold in the shallow data-dependence tier (type references
         // & field access). Default off: higher recall but noisier.
         let impact_call = if include_data_edges {
-            store.impact_with_data_edges(&cs.uid, max_depth, 0.0, DATA_EDGE_MAX_DEPTH)
+            store.impact_with_data_edges(&cs.uid, max_depth, 0.0, DATA_EDGE_MAX_DEPTH, cancel)
         } else {
-            store.impact_with_flags(&cs.uid, max_depth, 0.0)
+            store.impact_with_flags(&cs.uid, max_depth, 0.0, cancel)
         };
         let impact_nodes = match impact_call {
             Ok(result) => {
                 traversal_truncated |= result.truncated_by_threshold || result.truncated_by_depth;
                 result.nodes
+            }
+            // A cancelled traversal means the run is incomplete — the timeout
+            // fired mid-walk. Stop processing further symbols; the reported
+            // blast radius is a floor, not the whole picture.
+            Err(StoreError::Cancelled(_)) => {
+                push_cancelled(&mut notifications, &mut status);
+                break;
             }
             Err(e) => {
                 // Do NOT silently drop this symbol's downstream as if empty —
@@ -506,6 +549,24 @@ pub fn analyze_blast_radius(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.uid.cmp(&b.uid))
     });
+
+    // R7: cap the returned set to the caller's `limit`, keeping the most-
+    // impactful symbols (already sorted). A display cap is a user request, not
+    // a failure, so it never escalates status — but the note carries the true
+    // total so a consumer knows the set was trimmed.
+    if let Some(n) = options.limit
+        && affected_symbols.len() > n
+    {
+        let total = affected_symbols.len();
+        affected_symbols.truncate(n);
+        notifications.push(Notification {
+            level: NotificationLevel::Note,
+            message: format!(
+                "affected symbols truncated to {n} of {total} (raise `limit` for the full set)"
+            ),
+            descriptor: "results-truncated".to_string(),
+        });
+    }
 
     // Step 3: Group by clusters if cluster data is available.
     let mut affected_clusters: Vec<AffectedCluster> = Vec::new();
@@ -799,6 +860,21 @@ mod tests {
     use super::*;
     use crate::cluster_dispatch::CommunityInfo;
 
+    /// Build options preserving a test's prior target_repo/max_depth/data-edge
+    /// intent, with no result cap.
+    fn opts(
+        target_repo: Option<&str>,
+        max_depth: u32,
+        include_data_edges: bool,
+    ) -> BlastRadiusOptions {
+        BlastRadiusOptions {
+            target_repo: target_repo.map(str::to_string),
+            max_depth,
+            include_data_edges,
+            limit: None,
+        }
+    }
+
     #[test]
     fn compute_risk_level_low() {
         assert_eq!(compute_risk_level(5, 1, 0.001), RiskLevel::Low);
@@ -889,9 +965,8 @@ mod tests {
         let result = analyze_blast_radius(
             &store,
             &[PathBuf::from("nonexistent.rs")],
+            &opts(None, 3, false),
             None,
-            3,
-            false,
             None,
         )
         .unwrap();
@@ -962,9 +1037,14 @@ mod tests {
             })
             .expect("insert edge");
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.changed_symbols.len(), 1);
         assert_eq!(result.changed_symbols[0].name, "fn_a");
@@ -1032,9 +1112,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/api.rs")], None, 3, false, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/api.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
 
         let org = result
             .org_wide
@@ -1094,9 +1179,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             result.org_wide.is_none(),
             "org_wide must stay None when all impact is within one repo"
@@ -1164,9 +1254,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 5, false, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 5, false),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.affected_symbols.len(), 2);
         // Results should be sorted by impact_score descending.
@@ -1238,9 +1333,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 5, false, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 5, false),
+            None,
+            None,
+        )
+        .unwrap();
 
         // B is included (score 0.3 >= 0.10), but C is pruned (score 0.06 < 0.10).
         assert_eq!(result.affected_symbols.len(), 1);
@@ -1304,9 +1404,8 @@ mod tests {
         let scoped = analyze_blast_radius(
             &store,
             &[PathBuf::from("src/main.rs")],
-            Some("repo:1"),
-            3,
-            false,
+            &opts(Some("repo:1"), 3, false),
+            None,
             None,
         )
         .unwrap();
@@ -1323,9 +1422,8 @@ mod tests {
         let unscoped = analyze_blast_radius(
             &store,
             &[PathBuf::from("src/main.rs")],
+            &opts(None, 3, false),
             None,
-            3,
-            false,
             None,
         )
         .unwrap();
@@ -1378,9 +1476,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.status, AnalysisStatus::Complete);
         assert!(
@@ -1441,9 +1544,8 @@ mod tests {
         let result = analyze_blast_radius(
             &store,
             &[PathBuf::from("src/other.rs")],
-            Some("repo:1"),
-            3,
-            false,
+            &opts(Some("repo:1"), 3, false),
+            None,
             None,
         )
         .unwrap();
@@ -1484,9 +1586,8 @@ mod tests {
         let result = analyze_blast_radius(
             &store,
             &[PathBuf::from("README.md")],
-            Some("repo:1"),
-            3,
-            false,
+            &opts(Some("repo:1"), 3, false),
+            None,
             None,
         )
         .unwrap();
@@ -1554,9 +1655,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.analysis_direction, "over-approximate");
         assert!(
@@ -1645,9 +1751,8 @@ mod tests {
         let result = analyze_blast_radius(
             &store,
             &[PathBuf::from("src/target.rs")],
+            &opts(None, 2, false),
             None,
-            2,
-            false,
             None,
         )
         .unwrap();
@@ -1705,9 +1810,14 @@ mod tests {
             })
             .unwrap();
 
-        let result =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
-                .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
 
         let stale = result
             .coverage
@@ -1762,9 +1872,8 @@ mod tests {
         let result = analyze_blast_radius(
             &store,
             &[PathBuf::from("src/a.rs")],
-            Some("repo:absent"),
-            3,
-            false,
+            &opts(Some("repo:absent"), 3, false),
+            None,
             None,
         )
         .unwrap();
@@ -1852,17 +1961,28 @@ mod tests {
             .unwrap();
 
         // Default off: the type-reference dependent is a false negative.
-        let without =
-            analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, false, None)
-                .unwrap();
+        let without = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             !without.affected_symbols.iter().any(|s| s.name == "fn_b"),
             "with include_data_edges=false, the Uses-only dependent must be absent"
         );
 
         // Data tier on: the type-reference dependent surfaces (false-negative fix).
-        let with = analyze_blast_radius(&store, &[PathBuf::from("src/a.rs")], None, 3, true, None)
-            .unwrap();
+        let with = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, true),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             with.affected_symbols.iter().any(|s| s.name == "fn_b"),
             "with include_data_edges=true, the Uses-only dependent must surface; got: {:?}",
@@ -1871,5 +1991,151 @@ mod tests {
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn limit_caps_affected_symbols_with_notification() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        // Change `target`; three distinct callers depend on it directly with
+        // decreasing confidence so their impact_scores order deterministically.
+        store
+            .insert_symbol(&mk("target", "fn_target", "src/target.rs"))
+            .unwrap();
+        for (uid, name, file, conf) in [
+            ("d1", "fn_d1", "src/d1.rs", 0.9_f32),
+            ("d2", "fn_d2", "src/d2.rs", 0.8),
+            ("d3", "fn_d3", "src/d3.rs", 0.7),
+        ] {
+            store.insert_symbol(&mk(uid, name, file)).unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid.to_string(),
+                    target_uid: "target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: conf,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+
+        let options = BlastRadiusOptions {
+            target_repo: None,
+            max_depth: 3,
+            include_data_edges: false,
+            limit: Some(2),
+        };
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/target.rs")],
+            &options,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Only the top-2 by impact_score survive the cap.
+        assert_eq!(result.affected_symbols.len(), 2);
+        assert_eq!(result.affected_symbols[0].name, "fn_d1");
+        assert_eq!(result.affected_symbols[1].name, "fn_d2");
+        // The cap emits a note carrying the true total…
+        let note = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "results-truncated")
+            .expect("a results-truncated notification must be emitted");
+        assert!(
+            note.message.contains("of 3"),
+            "the truncation note must mention the total, got: {}",
+            note.message
+        );
+        // …but a display cap is not a failure, so the run stays Complete.
+        assert_eq!(result.status, AnalysisStatus::Complete);
+    }
+
+    #[test]
+    fn cancelled_traversal_marks_degraded() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&mk("a", "fn_a", "src/a.rs")).unwrap();
+        store.insert_symbol(&mk("b", "fn_b", "src/b.rs")).unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b".to_string(),
+                target_uid: "a".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+
+        // Pre-tripped deadline: the traversal is cancelled before it completes.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/a.rs")],
+            &opts(None, 3, false),
+            Some(&cancel),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Degraded);
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "analysis-cancelled"),
+            "a cancelled run must emit an analysis-cancelled notification, got: {:?}",
+            result.notifications
+        );
+        // A degraded run is never RiskFlagged — it is DegradedUnknown.
+        assert_eq!(result.gate_state, GateState::DegradedUnknown);
     }
 }

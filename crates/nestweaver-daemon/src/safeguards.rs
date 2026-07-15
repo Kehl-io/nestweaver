@@ -147,6 +147,10 @@ impl QuerySafeguards {
             max_result_limits.insert(tool.to_string(), 500);
         }
 
+        // blast_radius: caps the returned affected_symbols. No default (omitting
+        // `limit` means the full set), but a caller-supplied limit is clamped.
+        max_result_limits.insert("blast_radius".to_string(), 500);
+
         Self {
             timeouts,
             hard_caps,
