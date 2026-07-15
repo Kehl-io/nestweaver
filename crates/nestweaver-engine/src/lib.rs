@@ -46,6 +46,7 @@ pub mod atomic_changes;
 pub mod backup;
 pub mod bare_clone;
 pub mod blast_radius;
+pub mod blast_radius_sarif;
 pub mod brain_docgraph;
 pub mod brain_memory;
 pub mod brainignore;
@@ -122,6 +123,7 @@ pub use blast_radius::{
     ChangedSymbol, GateState, Notification, NotificationLevel, analyze_blast_radius,
     changed_files_from_git,
 };
+pub use blast_radius_sarif::blast_radius_to_sarif;
 pub use brain_docgraph::{
     BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,
     broken_links, doc_stats, orphan_documents, tag_graph, tag_graph_all, topic_clusters,

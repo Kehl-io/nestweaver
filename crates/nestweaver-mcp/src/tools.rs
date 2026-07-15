@@ -5681,6 +5681,12 @@ fn tool_schema_blast_radius() -> Value {
                     "type": "boolean",
                     "description": "Also follow data-dependence edges (type refs & field access). Higher recall, noisier; default false.",
                     "default": false
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["json", "sarif"],
+                    "description": "Output format. 'json' (default) is the native result; 'sarif' emits SARIF v2.1.0 for GitHub code scanning / Azure DevOps / the VS Code SARIF viewer.",
+                    "default": "json"
                 }
             },
             "required": ["changed_files"]
@@ -5726,6 +5732,20 @@ fn tool_blast_radius(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         db_path.as_deref(),
     )
     .context("analyze_blast_radius")?;
+
+    // SARIF output: emit a standard SARIF v2.1.0 run (with namespaced
+    // nestweaver/* extensions) instead of the native json result. The default
+    // path is unchanged.
+    let format = args
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("json");
+    if format == "sarif" {
+        return Ok(nestweaver_engine::blast_radius_to_sarif(
+            &result,
+            env!("CARGO_PKG_VERSION"),
+        ));
+    }
 
     let risk_str = match result.risk_level {
         nestweaver_engine::RiskLevel::Low => "low",

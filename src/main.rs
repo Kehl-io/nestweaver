@@ -1367,6 +1367,11 @@ enum Commands {
         json: bool,
         #[arg(
             long,
+            help = "Output as SARIF v2.1.0 (for GitHub code scanning / Azure DevOps / the VS Code SARIF viewer)"
+        )]
+        sarif: bool,
+        #[arg(
+            long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
@@ -5025,6 +5030,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             files,
             depth,
             json,
+            sarif,
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
@@ -5041,7 +5047,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 changed_files_from_git(&repo_root, None).context("git diff")?
             };
 
-            if changed_files.is_empty() {
+            // SARIF requires a real BlastRadiusResult to serialize, so it always
+            // computes locally (below) even on an empty diff; JSON/human keep the
+            // early-return + daemon fast paths unchanged.
+            if changed_files.is_empty() && !sarif {
                 if json {
                     println!(
                         "{}",
@@ -5060,7 +5069,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            if use_daemon && !sarif {
                 let file_strs: Vec<&str> =
                     changed_files.iter().filter_map(|p| p.to_str()).collect();
                 let args = serde_json::json!({
@@ -5151,7 +5160,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let result =
                 analyze_blast_radius(&store, &changed_files, None, depth, false, Some(&db_path))?;
 
-            if json {
+            if sarif {
+                let sarif_value =
+                    nestweaver_engine::blast_radius_to_sarif(&result, env!("CARGO_PKG_VERSION"));
+                println!("{}", serde_json::to_string_pretty(&sarif_value)?);
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 println!("{}", result.summary);
