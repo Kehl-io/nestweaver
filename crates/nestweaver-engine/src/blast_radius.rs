@@ -36,6 +36,11 @@ pub struct AffectedSymbol {
     pub depth: u32,
     pub edge_type: String,
     pub confidence: f32,
+    /// 1-based start line of the symbol in its file, from the impact node.
+    /// Lets consumers (e.g. SARIF regions) anchor at the real location rather
+    /// than defaulting to line 1.
+    #[serde(default)]
+    pub start_line: u32,
     /// Confidence-weighted impact score (1.0 = direct high-confidence edge,
     /// decays multiplicatively through the graph). Used for sorting results
     /// so the most-affected symbols appear first.
@@ -254,17 +259,20 @@ pub struct BlastRadiusOptions {
 /// Analyze the blast radius of a set of changed files.
 ///
 /// 1. Maps changed files to their symbols in the graph.
-/// 2. For each symbol, runs transitive impact analysis (CALLS, IMPORTS,
-///    EXTENDS, IMPLEMENTS edges) up to `max_depth`.
+/// 2. For each symbol, runs transitive impact analysis over the structural
+///    edges (CALLS, IMPORTS, EXTENDS, IMPLEMENTS, INCLUDES, CROSS_REPO_LINK)
+///    up to `max_depth`. When `include_data_edges` is on, the shallow
+///    data-dependence tier (USES, ACCESSES) is also followed.
 /// 3. Groups affected symbols by cluster/community (if cluster data exists).
 /// 4. Scores risk based on: number of affected symbols, PageRank centrality
 ///    of changed symbols, and number of clusters touched.
 ///
-/// Risk levels:
+/// Risk levels (`RiskLevel` has three variants):
 /// - Low: <10 affected symbols
 /// - Medium: 10-50 affected symbols
-/// - High: 50-200 affected symbols
-/// - Critical: >200 affected symbols (mapped to High since RiskLevel has 3 variants)
+/// - High: 50+ affected symbols (everything >200 also maps to High)
+///
+/// Centrality and cluster boosts can escalate a level (see `compute_risk_level`).
 pub fn analyze_blast_radius(
     store: &GraphStore,
     changed_files: &[PathBuf],
@@ -522,6 +530,7 @@ pub fn analyze_blast_radius(
                     depth: node.depth,
                     edge_type: node.edge_type,
                     confidence: node.confidence,
+                    start_line: node.start_line,
                     impact_score: node.impact_score,
                     repo_uid: affected_repo.clone(),
                 });

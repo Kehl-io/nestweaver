@@ -251,7 +251,7 @@ cargo build --release
 |---------|-------------|
 | `hubs` | Find most connected hub nodes (degree centrality + PageRank) |
 | `bridges` | Find architectural chokepoints (betweenness centrality) |
-| `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High/Critical) |
+| `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High) |
 | `dead-code` | Detect unreachable symbols via entry point reachability |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
 | `contracts drift` | Routes declared in a spec but not implemented, and vice versa (presence-level) |

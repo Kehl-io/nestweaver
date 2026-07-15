@@ -3159,7 +3159,12 @@ impl NestWeaverDaemon for DaemonService {
                 None,
                 Some(&state.db_path),
             )
-            .map_err(|e| Status::internal(format!("analyze_blast_radius failed: {e:#}")))?;
+            .map_err(|e| {
+                // Log the detailed chain server-side; return a generic message
+                // so the client never sees internal error internals.
+                tracing::error!("analyze_blast_radius failed: {e:#}");
+                Status::internal("blast radius analysis failed")
+            })?;
             serde_json::to_string(&result)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })

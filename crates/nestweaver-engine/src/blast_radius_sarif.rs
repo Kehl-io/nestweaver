@@ -131,7 +131,8 @@ pub fn blast_radius_to_sarif(result: &BlastRadiusResult, tool_version: &str) -> 
     // ── Results: one per affected symbol, plus cross-repo impact items ────
     let mut results: Vec<Value> = Vec::new();
     for sym in &result.affected_symbols {
-        // AffectedSymbol carries no source line, so anchor the region at line 1.
+        // Anchor the region at the symbol's real start line; `physical_location`
+        // clamps a missing/zero line up to the SARIF-required minimum of 1.
         let rank = (sym.impact_score * 100.0).clamp(0.0, 100.0);
         results.push(json!({
             "ruleId": "nw/affected",
@@ -144,7 +145,7 @@ pub fn blast_radius_to_sarif(result: &BlastRadiusResult, tool_version: &str) -> 
                     sym.edge_type, sym.depth, sym.name
                 )
             },
-            "locations": [ physical_location(&sym.file_path, 1) ],
+            "locations": [ physical_location(&sym.file_path, sym.start_line as i64) ],
             "properties": {
                 "nestweaver/edgeType": sym.edge_type,
                 "nestweaver/impactScore": sym.impact_score,
@@ -258,6 +259,7 @@ mod tests {
             depth: 1,
             edge_type: "Calls".to_string(),
             confidence: 0.9,
+            start_line: 42,
             impact_score: impact,
             repo_uid: "repo:1".to_string(),
         }
@@ -339,6 +341,11 @@ mod tests {
         assert_eq!(
             r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
             "src/b.rs"
+        );
+        // The affected symbol's real start line drives the SARIF region.
+        assert_eq!(
+            r["locations"][0]["physicalLocation"]["region"]["startLine"],
+            42
         );
     }
 

@@ -5842,6 +5842,10 @@ fn tool_blast_radius(
         "affected_symbol_count": affected_json.len(),
         "affected_clusters": clusters_json,
         "affected_cluster_count": clusters_json.len(),
+        // Always present so consumers can distinguish "no cross-repo impact"
+        // (null) from the field being dropped; populated when a change reaches
+        // another repo.
+        "org_wide": serde_json::to_value(&result.org_wide).unwrap_or(Value::Null),
         "coverage": coverage_json,
         "blind_spots": blind_spots_json,
         "analysis_direction": result.analysis_direction,
