@@ -2893,10 +2893,23 @@ fn nestweaver_pre_push_hook(strict: bool) -> String {
     s.push_str(
         "base=\"$(git merge-base '@{upstream}' HEAD 2>/dev/null || git merge-base origin/main HEAD 2>/dev/null || echo HEAD)\"\n",
     );
+    // No upstream / origin/main to diff against ⇒ nothing to analyze. Say so out
+    // loud (don't silently diff HEAD..HEAD and report "nothing affected") and
+    // never block the push over it — in either mode.
+    s.push_str("if [ \"$base\" = \"HEAD\" ]; then\n");
+    s.push_str(
+        "  echo \"nestweaver: no upstream or origin/main to diff against — skipping blast-radius check.\" >&2\n",
+    );
+    s.push_str("  exit 0\n");
+    s.push_str("fi\n");
     if strict {
         s.push_str("nestweaver pr-impact --base \"$base\" --strict\n");
     } else {
-        s.push_str("nestweaver pr-impact --base \"$base\" || exit $?\n");
+        // Advisory: swallow ANY failure of the tool itself (missing binary/DB,
+        // arg error) so a broken environment can never abort the push. The gate
+        // verdict already exits 0 in non-strict mode; `|| true` also covers the
+        // pre-verdict failures (127/2/…) that `|| exit $?` would have propagated.
+        s.push_str("nestweaver pr-impact --base \"$base\" || true\n");
         s.push_str("exit 0\n");
     }
     s
@@ -2929,7 +2942,20 @@ fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
     if hook_path.exists() {
         let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
         if !existing.contains(NESTWEAVER_HOOK_MARKER) {
-            let backup = hooks_dir.join("pre-push.nestweaver.bak");
+            // Don't clobber a backup from a previous install — that could destroy
+            // the user's *original* hook. Fall back to a numbered suffix.
+            let mut backup = hooks_dir.join("pre-push.nestweaver.bak");
+            if backup.exists() {
+                let mut n = 1;
+                loop {
+                    let candidate = hooks_dir.join(format!("pre-push.nestweaver.bak.{n}"));
+                    if !candidate.exists() {
+                        backup = candidate;
+                        break;
+                    }
+                    n += 1;
+                }
+            }
             std::fs::rename(&hook_path, &backup).with_context(|| {
                 format!("backing up existing pre-push hook to {}", backup.display())
             })?;
@@ -15063,6 +15089,115 @@ mod pr_impact_hook_tests {
         assert!(
             restored.contains("echo custom-hook"),
             "uninstall must restore the backed-up hook, got:\n{restored}"
+        );
+    }
+
+    /// The whole point of the advisory hook: a broken tool must never abort the
+    /// push. Behavioral, not text-match — run the generated script with a
+    /// `nestweaver` stub that fails and assert the hook still exits 0.
+    #[test]
+    fn advisory_hook_fails_open_when_the_tool_fails() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "c0",
+            ],
+        );
+        // Give the hook a real base (origin/main == HEAD) so it proceeds past the
+        // "no upstream ⇒ skip" guard and actually reaches the tool invocation.
+        git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("nestweaver");
+        // bindir first so our stub shadows any real `nestweaver`, but git still
+        // resolves from the inherited PATH (needed for base resolution).
+        let real_path = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{}", bindir.display(), real_path);
+
+        let script = nestweaver_pre_push_hook(false);
+        // Every failure the tool can exit with — missing DB (1), arg error (2),
+        // binary-not-found (127) — must still leave the push un-blocked.
+        for code in [1, 2, 127] {
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho 'stub failure' >&2\nexit {code}\n"),
+            )
+            .unwrap();
+            make_executable(&stub).unwrap();
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(repo)
+                .env("PATH", &path)
+                .output()
+                .expect("run hook");
+            assert!(
+                out.status.success(),
+                "advisory hook must exit 0 when `nestweaver` exits {code}, got {:?}\nstderr={}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+
+    /// Reinstalling over a *second* foreign hook must not clobber the first
+    /// backup — that could destroy the user's real original hook.
+    #[test]
+    fn install_does_not_clobber_a_prior_backup() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        let hooks_dir = git_hooks_dir(repo).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook = hooks_dir.join("pre-push");
+
+        // First foreign hook → backed up to the default `.bak`.
+        std::fs::write(&hook, "#!/bin/sh\necho original\n").unwrap();
+        install_pre_push_hook(repo, false).expect("install 1");
+        let bak = hooks_dir.join("pre-push.nestweaver.bak");
+        assert!(
+            std::fs::read_to_string(&bak)
+                .unwrap()
+                .contains("echo original"),
+            "first foreign hook must be backed up"
+        );
+
+        // Drop a *second* foreign hook in place and reinstall; the original
+        // backup must survive and the second goes to a numbered backup.
+        std::fs::write(&hook, "#!/bin/sh\necho second\n").unwrap();
+        install_pre_push_hook(repo, false).expect("install 2");
+        assert!(
+            std::fs::read_to_string(&bak)
+                .unwrap()
+                .contains("echo original"),
+            "the first backup must not be clobbered"
+        );
+        let bak1 = hooks_dir.join("pre-push.nestweaver.bak.1");
+        assert!(
+            std::fs::read_to_string(&bak1)
+                .unwrap()
+                .contains("echo second"),
+            "a second foreign hook must get a numbered backup"
         );
     }
 }

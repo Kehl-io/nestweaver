@@ -476,6 +476,22 @@ fn visibility_cache_salt(visible: Option<&nestweaver_engine::authz::VisibleRepos
     }
 }
 
+/// Fold the visibility salt into the base cache key. A salt of 0 (disabled/`All`)
+/// returns the base key byte-for-byte so existing entries still hit — zero
+/// behavior change for the single-trust-domain default. A non-zero salt is mixed
+/// through a hasher rather than XORed: XOR is linear and commutative, so distinct
+/// `(query, scope)` pairs could in principle collide; a hash mix avoids that.
+fn mix_visibility_cache_key(base: u64, salt: u64) -> u64 {
+    if salt == 0 {
+        return base;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base.hash(&mut hasher);
+    salt.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn maybe_cached(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -492,13 +508,15 @@ fn maybe_cached(
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
     // Fold the caller's repo-visibility into the cache key so a redacted
     // blast_radius result is never served across identities (R9b). A `None`/`All`
-    // visibility (the unconfigured single-trust-domain default) contributes 0, so
-    // the key is byte-identical to before and existing entries still hit —
+    // visibility (the unconfigured single-trust-domain default) contributes salt
+    // 0, so the key is byte-identical to before and existing entries still hit —
     // zero behavior change when no `[authz]` policy is set. A restricting
     // `Only(set)` mixes a stable digest of its sorted repo_uids, giving each
     // visibility scope its own cache slot.
-    let key =
-        nestweaver_store::cache::ResponseCache::key(name, &args) ^ visibility_cache_salt(visible);
+    let key = mix_visibility_cache_key(
+        nestweaver_store::cache::ResponseCache::key(name, &args),
+        visibility_cache_salt(visible),
+    );
     let generation = store.graph_generation();
     let scope_digest = whole_db_scope_digest(&db_path);
 

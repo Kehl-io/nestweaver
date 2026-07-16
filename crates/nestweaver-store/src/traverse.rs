@@ -91,14 +91,24 @@ pub struct ImpactEdge {
 
 /// Result of an impact traversal plus honesty flags about whether the walk
 /// was complete. Truncation means real dependents may exist beyond `nodes`.
+///
+/// The truncation flags are deliberately *pessimistic*: they fire when the walk
+/// *could* have dropped a dependent (a pruned path, an unexpanded frontier),
+/// even if nothing was actually missed. This one-sided bias is intentional — an
+/// over-fired flag costs a needless "review manually", a missed one lets a
+/// degraded run read as "safe". Do not "tighten" them to only fire on proven
+/// loss; the whole trust model (blast-radius `DEGRADED-UNKNOWN`) depends on them
+/// over-approximating incompleteness.
 #[derive(Debug, Clone)]
 pub struct ImpactResult {
     pub nodes: Vec<ImpactNode>,
     /// A path was pruned because its decayed score fell below the impact
-    /// threshold — the tail of the impact set may be incomplete.
+    /// threshold — the tail of the impact set may be incomplete. Pessimistic:
+    /// set whenever a prune happened, not only when it hid a real dependent.
     pub truncated_by_threshold: bool,
     /// A frontier node was reached at `max_depth` and left unexpanded —
-    /// deeper dependents may exist beyond the returned set.
+    /// deeper dependents may exist beyond the returned set. Pessimistic: set on
+    /// any capped frontier, even if nothing lay beyond it.
     pub truncated_by_depth: bool,
     /// The edge types actually traversed.
     pub edge_types: Vec<EdgeType>,

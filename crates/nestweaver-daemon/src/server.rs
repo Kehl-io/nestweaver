@@ -119,6 +119,11 @@ pub struct DaemonState {
     /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
     /// `brain_search`) via the `set_current_instance_config` thread-local.
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+    /// Per-repo authorization policy (R9/R9b), built ONCE at startup from
+    /// `[authz]` config — not rebuilt per request. No `[authz]` ⇒ a disabled
+    /// source that resolves every identity to `VisibleRepos::All`. Mirrors the
+    /// MCP-HTTP boundary.
+    pub permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
     /// Lazily-loaded embedding model for semantic search. Populated by a
     /// background task when the `embed` feature is enabled.
     pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
@@ -161,29 +166,52 @@ impl DaemonState {
     /// The auth interceptor attaches an
     /// [`Identity`](nestweaver_engine::authz::Identity) extension for
     /// authenticated requests; its absence (no-auth / UDS admin paths) is
-    /// treated as `Anonymous`. The permission source is built on demand from the
-    /// `[authz]` config (a cheap `HashMap` clone). With no `[authz]` config the
-    /// source is disabled and returns [`VisibleRepos::All`] for every identity,
-    /// so blast-radius redaction becomes a no-op — zero behavior change for the
-    /// single-trust-domain default. Mirrors the MCP-HTTP boundary in
-    /// `nestweaver-mcp`.
+    /// treated as `Anonymous`. Uses the startup-built [`Self::permission_source`]
+    /// (never rebuilt per request). When the policy is disabled — the no-`[authz]`
+    /// single-trust-domain default — this returns [`VisibleRepos::All`] WITHOUT
+    /// listing repos, so the vast majority of RPCs (which don't even read the
+    /// result) pay nothing. Mirrors the MCP-HTTP boundary in `nestweaver-mcp`.
     fn visible_repos_for(
         &self,
         extensions: &tonic::Extensions,
     ) -> nestweaver_engine::authz::VisibleRepos {
-        use nestweaver_engine::authz::{Identity, PermissionSource, StaticConfigPermissionSource};
+        use nestweaver_engine::authz::{Identity, VisibleRepos};
+        // Disabled policy ⇒ everyone is All; skip the per-request repo listing.
+        if !self.permission_source.is_enabled() {
+            return VisibleRepos::All;
+        }
         let identity = extensions
             .get::<Identity>()
             .cloned()
             .unwrap_or(Identity::Anonymous);
-        let source = self
-            .instance_cfg
-            .as_ref()
-            .and_then(|c| c.authz.as_ref())
-            .map(|a| a.build_permission_source())
-            .unwrap_or_else(|| StaticConfigPermissionSource::new(std::collections::HashMap::new()));
-        let repos = self.store.list_repos(None).unwrap_or_default();
-        source.visible_repos(&identity, &repos)
+        // Fail closed on a store error (an enabled policy over an empty repo set
+        // resolves to "nothing visible"), but say so — a silent swallow here would
+        // hide a real store problem behind a redaction that looks intentional.
+        let repos = match self.store.list_repos(None) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "authz: list_repos failed, failing closed to no visible repos: {e:#}"
+                );
+                Vec::new()
+            }
+        };
+        self.permission_source.visible_repos(&identity, &repos)
+    }
+}
+
+/// Build the daemon's permission source once at startup (mirrors the MCP-HTTP
+/// boundary). No `[authz]` config ⇒ an empty, disabled source ⇒ every identity
+/// resolves to [`nestweaver_engine::authz::VisibleRepos::All`] (zero behavior
+/// change for the single-trust-domain default).
+fn build_daemon_permission_source(
+    instance_cfg: Option<&Arc<nestweaver_engine::InstanceConfig>>,
+) -> Arc<dyn nestweaver_engine::authz::PermissionSource> {
+    match instance_cfg.and_then(|c| c.authz.as_ref()) {
+        Some(authz) => Arc::new(authz.build_permission_source()),
+        None => Arc::new(nestweaver_engine::authz::StaticConfigPermissionSource::new(
+            std::collections::HashMap::new(),
+        )),
     }
 }
 
@@ -3233,11 +3261,31 @@ impl NestWeaverDaemon for DaemonService {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
         // R9/R9b: resolve the caller's per-repo visibility from the request's
-        // Identity extension BEFORE the request is consumed, so the blast-radius
-        // result can be redacted to the repos this caller may see. With no
-        // `[authz]` config this is `VisibleRepos::All` ⇒ redaction is a no-op
-        // (zero behavior change), matching the MCP-HTTP path.
-        let visible = self.state.visible_repos_for(r.extensions());
+        // Identity extension BEFORE the request is consumed. A disabled policy
+        // (no `[authz]`) short-circuits to `All` with no repo listing (zero
+        // behavior change); when enabled we list repos ONCE here and reuse that
+        // same listing for redaction below — no duplicate `list_repos`.
+        let (visible, authz_repos) = {
+            use nestweaver_engine::authz::{Identity, VisibleRepos};
+            if self.state.permission_source.is_enabled() {
+                let identity = r
+                    .extensions()
+                    .get::<Identity>()
+                    .cloned()
+                    .unwrap_or(Identity::Anonymous);
+                let repos = self.state.store.list_repos(None).unwrap_or_else(|e| {
+                    tracing::warn!("authz: list_repos failed, failing closed: {e:#}");
+                    Vec::new()
+                });
+                let v = self
+                    .state
+                    .permission_source
+                    .visible_repos(&identity, &repos);
+                (v, repos)
+            } else {
+                (VisibleRepos::All, Vec::new())
+            }
+        };
         let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
@@ -3307,13 +3355,13 @@ impl NestWeaverDaemon for DaemonService {
                     Status::internal("blast radius analysis failed")
                 })?;
                 // R9/R9b: redact the result to the caller's visible repos before
-                // serialization. `VisibleRepos::All` (the no-`[authz]` default)
-                // makes this a no-op, preserving the single-trust-domain behavior.
-                let repos = state.store.list_repos(None).unwrap_or_default();
+                // serialization, reusing the single repo listing resolved above.
+                // `VisibleRepos::All` (the no-`[authz]` default) makes this a
+                // no-op (and `authz_repos` is empty), preserving single-trust-domain.
                 nestweaver_engine::authz::redact_blast_radius_for_visibility(
                     &mut result,
                     &visible,
-                    &repos,
+                    &authz_repos,
                 );
                 serde_json::to_string(&result)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
@@ -4616,6 +4664,8 @@ pub async fn run_server(
             .and_then(|opts| opts.webhook_secret_old.clone()),
     )?;
 
+    // Build the per-repo authz policy ONCE, before the state is assembled.
+    let permission_source = build_daemon_permission_source(instance_cfg.as_ref());
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
@@ -4630,6 +4680,7 @@ pub async fn run_server(
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
         instance_cfg,
+        permission_source,
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
         write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         server_mode: is_server_mode,
@@ -7172,6 +7223,7 @@ mod startup_helper_tests {
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
             instance_cfg: None,
+            permission_source: build_daemon_permission_source(None),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             write_mutex: Arc::new(tokio::sync::Mutex::new(())),
             server_mode: false,

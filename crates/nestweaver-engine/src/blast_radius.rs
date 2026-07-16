@@ -169,8 +169,9 @@ pub struct Coverage {
 }
 
 /// A category of impact that static analysis cannot see. The first four are
-/// inherent gaps in any static call-graph traversal; the last two describe
-/// this specific run being cut short or missing an indexed repo.
+/// inherent gaps in any static call-graph traversal; the last three describe
+/// this specific run being cut short — by the score threshold or the depth cap —
+/// or missing an indexed repo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BlindSpot {
@@ -178,7 +179,13 @@ pub enum BlindSpot {
     Reflection,
     ConfigWiring,
     Codegen,
+    /// The walk dropped dependents whose confidence fell below the score
+    /// threshold — real but low-signal dependents may exist beyond the set.
     PrunedBelowThreshold,
+    /// The walk hit the depth cap before exhausting the call graph — dependents
+    /// deeper than `max_depth` are not represented. Distinct from threshold
+    /// pruning: widening depth (not lowering the threshold) is what recovers them.
+    DepthTruncated,
     NotIndexed,
 }
 
@@ -236,6 +243,29 @@ fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState
     }
 }
 
+/// Render the human summary line from result counts. Shared between the analysis
+/// path and the R9b redaction path so a redacted result's summary is regenerated
+/// from its (redacted) vecs and can never echo pre-redaction, cross-repo counts.
+pub(crate) fn render_blast_summary(
+    changed_symbols: usize,
+    changed_files: usize,
+    affected_symbols: usize,
+    clusters_touched: usize,
+    risk_level: RiskLevel,
+    status: AnalysisStatus,
+) -> String {
+    let mut summary = format!(
+        "{changed_symbols} changed symbol(s) in {changed_files} file(s), \
+         {affected_symbols} transitively affected symbol(s), \
+         {clusters_touched} cluster(s) touched. Risk: {risk_level:?}."
+    );
+    // Make a non-clean run impossible to miss in the human summary.
+    if status != AnalysisStatus::Complete {
+        summary.push_str(&format!(" [status: {}]", status.label()));
+    }
+    summary
+}
+
 /// Depth to which data-dependence edges (type references and field access)
 /// are followed when `include_data_edges` is on. Shallow because these edges
 /// fan out toward full program slices if followed transitively.
@@ -243,7 +273,7 @@ const DATA_EDGE_MAX_DEPTH: u32 = 2;
 
 /// Tunable inputs for [`analyze_blast_radius`]. Grouped into a struct so the
 /// call sites stay readable as knobs accrete.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BlastRadiusOptions {
     /// Repo under review; scopes changed-file resolution in a unified
     /// multi-repo graph. `None` matches identical relative paths across repos.
@@ -254,6 +284,19 @@ pub struct BlastRadiusOptions {
     pub include_data_edges: bool,
     /// Cap on returned `affected_symbols` (most-impactful first). None = no cap.
     pub limit: Option<usize>,
+}
+
+impl Default for BlastRadiusOptions {
+    fn default() -> Self {
+        Self {
+            target_repo: None,
+            // A derived `Default` would give `max_depth: 0` — i.e. no traversal
+            // at all, a silent footgun. 3 matches the CLI/MCP default depth.
+            max_depth: 3,
+            include_data_edges: false,
+            limit: None,
+        }
+    }
 }
 
 /// Analyze the blast radius of a set of changed files.
@@ -455,7 +498,10 @@ pub fn analyze_blast_radius(
     // OR of every traversal's truncation flags. True means at least one impact
     // walk was cut short (by depth or the score threshold), so the reported
     // affected set is a floor, not the complete picture.
-    let mut traversal_truncated = false;
+    // Tracked separately so a depth-capped run and a threshold-pruned run get
+    // the right blind-spot label (they have different remedies).
+    let mut truncated_by_threshold = false;
+    let mut truncated_by_depth = false;
 
     // Emit the cancellation notification + degrade once. Set when the timeout
     // trips so the summary/gate reflect an incomplete run.
@@ -492,7 +538,8 @@ pub fn analyze_blast_radius(
         };
         let impact_nodes = match impact_call {
             Ok(result) => {
-                traversal_truncated |= result.truncated_by_threshold || result.truncated_by_depth;
+                truncated_by_threshold |= result.truncated_by_threshold;
+                truncated_by_depth |= result.truncated_by_depth;
                 result.nodes
             }
             // A cancelled traversal means the run is incomplete — the timeout
@@ -701,19 +748,14 @@ pub fn analyze_blast_radius(
 
     let risk_level = compute_risk_level(total_affected, clusters_touched, avg_pagerank);
 
-    let mut summary = format!(
-        "{} changed symbol(s) in {} file(s), {} transitively affected symbol(s), \
-         {} cluster(s) touched. Risk: {:?}.",
+    let summary = render_blast_summary(
         changed_symbols.len(),
         changed_files.len(),
         affected_symbols.len(),
         clusters_touched,
         risk_level,
+        status,
     );
-    // Make a non-clean run impossible to miss in the human summary.
-    if status != AnalysisStatus::Complete {
-        summary.push_str(&format!(" [status: {}]", status.label()));
-    }
 
     // Gate verdict — a degraded/failed run is never RiskFlagged (see
     // `derive_gate_state`); it is reported as unknown so consumers don't read a
@@ -792,6 +834,7 @@ pub fn analyze_blast_radius(
     let mut repos_not_indexed: Vec<String> = not_indexed.into_iter().collect();
     repos_not_indexed.sort();
 
+    let traversal_truncated = truncated_by_threshold || truncated_by_depth;
     let coverage = Coverage {
         repos_in_scope,
         repos_not_indexed: repos_not_indexed.clone(),
@@ -807,8 +850,11 @@ pub fn analyze_blast_radius(
         BlindSpot::ConfigWiring,
         BlindSpot::Codegen,
     ];
-    if traversal_truncated {
+    if truncated_by_threshold {
         blind_spots.push(BlindSpot::PrunedBelowThreshold);
+    }
+    if truncated_by_depth {
+        blind_spots.push(BlindSpot::DepthTruncated);
     }
     if !repos_not_indexed.is_empty() {
         blind_spots.push(BlindSpot::NotIndexed);
@@ -1928,6 +1974,10 @@ mod tests {
             "a complete walk must not flag PrunedBelowThreshold"
         );
         assert!(
+            !result.blind_spots.contains(&BlindSpot::DepthTruncated),
+            "a complete walk must not flag DepthTruncated"
+        );
+        assert!(
             !result.blind_spots.contains(&BlindSpot::NotIndexed),
             "a fully-indexed run must not flag NotIndexed"
         );
@@ -1995,10 +2045,15 @@ mod tests {
             "a chain deeper than max_depth must set traversal_truncated"
         );
         assert!(
-            result
+            result.blind_spots.contains(&BlindSpot::DepthTruncated),
+            "a depth-capped traversal must flag DepthTruncated, got: {:?}",
+            result.blind_spots
+        );
+        assert!(
+            !result
                 .blind_spots
                 .contains(&BlindSpot::PrunedBelowThreshold),
-            "a truncated traversal must flag PrunedBelowThreshold, got: {:?}",
+            "a depth-only truncation must NOT be mislabeled PrunedBelowThreshold, got: {:?}",
             result.blind_spots
         );
     }
@@ -2377,7 +2432,7 @@ mod tests {
     /// End-to-end through `analyze_blast_radius`: a call chain deeper than
     /// `max_depth` must (a) include only the dependents within `max_depth` in
     /// `affected_symbols`, and (b) surface the incompleteness — `coverage`
-    /// flags the truncation and `blind_spots` names `PrunedBelowThreshold`.
+    /// flags the truncation and `blind_spots` names `DepthTruncated`.
     /// (Distinct from the store-level `impact_detailed_flags_depth_truncation`:
     /// this asserts the affected-set membership the feature actually returns.)
     #[test]
@@ -2456,10 +2511,8 @@ mod tests {
             "a chain deeper than max_depth must set coverage.traversal_truncated"
         );
         assert!(
-            result
-                .blind_spots
-                .contains(&BlindSpot::PrunedBelowThreshold),
-            "a depth-truncated feature run must flag PrunedBelowThreshold, got: {:?}",
+            result.blind_spots.contains(&BlindSpot::DepthTruncated),
+            "a depth-truncated feature run must flag DepthTruncated, got: {:?}",
             result.blind_spots
         );
     }

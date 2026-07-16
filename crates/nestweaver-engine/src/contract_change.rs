@@ -45,25 +45,44 @@ fn param_list_str(sig: &str) -> Option<&str> {
 }
 
 /// Split a parameter list on top-level commas, ignoring commas nested inside
-/// `()[]{}<>` (generics, tuples, closures) so `x: Map<K, V>, y: i32` yields two
-/// parameters, not three.
+/// `()[]{}` (tuples, closures, destructuring) or `<>` generics — so
+/// `x: Map<K, V>, y: i32` yields two parameters, not three.
+///
+/// Generic angle brackets are tracked in a *separate* counter that never goes
+/// negative and skips `->`/`=>` arrows (whose `>` would otherwise be read as a
+/// generic close and corrupt the depth). That keeps closure-typed params like
+/// `cb: impl Fn(i32) -> i32, x: i32` splitting correctly.
 fn split_top_level_params(list: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut depth = 0i32;
+    let mut depth = 0i32; // () [] {} — always balanced
+    let mut angle = 0i32; // <> generics — tracked apart, never negative
+    let mut prev = '\0';
     let mut cur = String::new();
     for ch in list.chars() {
         match ch {
-            '(' | '[' | '{' | '<' => {
+            '(' | '[' | '{' => {
                 depth += 1;
                 cur.push(ch);
             }
-            ')' | ']' | '}' | '>' => {
+            ')' | ']' | '}' => {
                 depth -= 1;
                 cur.push(ch);
             }
-            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            // `<` opens a generic unless it's part of `<<` (shift).
+            '<' if prev != '<' => {
+                angle += 1;
+                cur.push(ch);
+            }
+            // `>` closes a generic only when one is open and it isn't the `>` of
+            // an `->`/`=>` arrow.
+            '>' if angle > 0 && prev != '-' && prev != '=' => {
+                angle -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 && angle == 0 => out.push(std::mem::take(&mut cur)),
             _ => cur.push(ch),
         }
+        prev = ch;
     }
     if !cur.trim().is_empty() {
         out.push(cur);
@@ -165,14 +184,26 @@ fn raw_to_api_symbol(raw: &RawSymbol, file: &Path) -> Symbol {
 /// Strip a symbol's body from its signature/type text. The parser's `signature`
 /// (and, for some languages, `return_type`) includes the function body — e.g.
 /// `fn foo(a: i32) -> i32 { a + 1 }` — but the API surface is the *declaration*
-/// only. Cutting at the first `{` (the body brace, which for a function always
-/// follows the parameter list and return type) yields the declaration, so a
-/// body-only edit doesn't read as a signature/return-type change.
+/// only.
+///
+/// The body brace is the first `{` at bracket-depth 0 (outside the parameter
+/// list's `(...)`/`[...]`). Cutting there — rather than at the *first* `{` —
+/// preserves destructured parameters like TS/JS `function f({ a, b }: Props)`,
+/// whose braces sit inside the parens and would otherwise be mistaken for the
+/// body, truncating the whole signature to `function f(`. (A TS object *return*
+/// type `): { ok: bool }` is still cut at its brace — a pre-existing limitation,
+/// unchanged here — but the diff engine reads the return type from `type_info`.)
 fn strip_body(s: &str) -> String {
-    match s.find('{') {
-        Some(i) => s[..i].trim_end().to_string(),
-        None => s.trim_end().to_string(),
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '{' if depth <= 0 => return s[..i].trim_end().to_string(),
+            _ => {}
+        }
     }
+    s.trim_end().to_string()
 }
 
 /// Build the `type_info` the diff engine reads, backfilling `parameter_types`
@@ -347,6 +378,39 @@ mod tests {
     fn extract_params_empty_arg_list() {
         assert!(extract_params_from_signature("pub fn f() {").is_empty());
         assert!(extract_params_from_signature("pub const X: i32 = 5;").is_empty());
+    }
+
+    /// A closure-typed param contains `->`, whose `>` must NOT be read as a
+    /// generic close (which would swallow the following comma and merge params).
+    #[test]
+    fn extract_params_handles_arrow_in_closure_type() {
+        let sig = "pub fn f(cb: impl Fn(i32) -> i32, x: i32) -> i32 {";
+        let params = extract_params_from_signature(sig);
+        assert_eq!(
+            params,
+            vec![
+                ("cb".to_string(), Some("impl Fn(i32) -> i32".to_string())),
+                ("x".to_string(), Some("i32".to_string())),
+            ]
+        );
+    }
+
+    /// `strip_body` must cut at the *body* brace, not a destructured param's
+    /// brace — otherwise a TS/JS `function f({ a, b }: Props)` truncates to
+    /// `function f(` and every diff against it is bogus.
+    #[test]
+    fn strip_body_preserves_destructured_params() {
+        assert_eq!(
+            strip_body("function f({ a, b }: Props): void { return; }"),
+            "function f({ a, b }: Props): void"
+        );
+        // Plain function body still stripped.
+        assert_eq!(
+            strip_body("fn foo(a: i32) -> i32 { a + 1 }"),
+            "fn foo(a: i32) -> i32"
+        );
+        // No body → unchanged (trimmed).
+        assert_eq!(strip_body("fn foo(a: i32) -> i32"), "fn foo(a: i32) -> i32");
     }
 
     /// The raw→API adapter preserves the diff-relevant fields and synthesizes an

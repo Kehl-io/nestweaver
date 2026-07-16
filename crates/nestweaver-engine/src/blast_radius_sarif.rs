@@ -16,7 +16,7 @@ use crate::signature_diff::{BreakTier, BreakingChange};
 /// Static metadata for every [`BlindSpot`] variant: (kebab id, rule name,
 /// short description). One `reportingDescriptor` (SARIF rule) is emitted per
 /// variant so a viewer can resolve `nw/blind-spot/<kebab>` rule references.
-const BLIND_SPOT_META: [(&str, &str, &str); 6] = [
+const BLIND_SPOT_META: [(&str, &str, &str); 7] = [
     (
         "dynamic-dispatch",
         "DynamicDispatch",
@@ -40,7 +40,12 @@ const BLIND_SPOT_META: [(&str, &str, &str); 6] = [
     (
         "pruned-below-threshold",
         "PrunedBelowThreshold",
-        "Traversal was cut short by depth or score threshold — dependents may exist beyond the reported set",
+        "Traversal dropped paths below the score threshold — low-signal dependents may exist beyond the reported set",
+    ),
+    (
+        "depth-truncated",
+        "DepthTruncated",
+        "Traversal hit the depth cap — dependents deeper than max_depth are not represented",
     ),
     (
         "not-indexed",

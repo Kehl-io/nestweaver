@@ -69,6 +69,14 @@ impl VisibleRepos {
 pub trait PermissionSource: Send + Sync {
     /// The repos this identity may see, resolved against the known repo set.
     fn visible_repos(&self, identity: &Identity, repos: &[Repo]) -> VisibleRepos;
+
+    /// Whether any policy is actually configured. A disabled source resolves
+    /// every identity to [`VisibleRepos::All`], letting callers skip per-request
+    /// work (e.g. listing repos and running redaction) entirely. Defaults to
+    /// enabled; disabled sources override.
+    fn is_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// Match a single glob pattern against a candidate string.
@@ -107,12 +115,6 @@ impl StaticConfigPermissionSource {
         Self { rules }
     }
 
-    /// Whether any policy is configured. No rules ⇒ disabled ⇒ everyone is
-    /// [`VisibleRepos::All`].
-    pub fn is_enabled(&self) -> bool {
-        !self.rules.is_empty()
-    }
-
     /// Resolve a list of glob patterns to the concrete visible repo_uids.
     fn resolve(&self, patterns: &[String], repos: &[Repo]) -> VisibleRepos {
         let visible: HashSet<String> = repos
@@ -125,6 +127,11 @@ impl StaticConfigPermissionSource {
 }
 
 impl PermissionSource for StaticConfigPermissionSource {
+    /// No rules ⇒ disabled ⇒ everyone is [`VisibleRepos::All`].
+    fn is_enabled(&self) -> bool {
+        !self.rules.is_empty()
+    }
+
     fn visible_repos(&self, identity: &Identity, repos: &[Repo]) -> VisibleRepos {
         // Disabled (no rules) ⇒ All for everyone (backward-compatible).
         if !self.is_enabled() {
@@ -239,17 +246,51 @@ pub fn redact_blast_radius_for_visibility(
         .stale_repos
         .retain(|sr| visible_only.allows(&sr.repo_uid));
 
-    // affected_clusters, risk_level, summary, status, gate_state, blind_spots,
-    // analysis_direction, notifications, traversal_truncated: left as-is. They
-    // do not name other repos, and we deliberately add no notification that
-    // would reveal a hidden repo's existence.
+    // affected_clusters is a graph-wide (potentially cross-repo) aggregate: each
+    // cluster's `total_count` is its full size and `name` can be derived from a
+    // hidden repo's paths — both leak. We lack the clustering here to re-attribute
+    // counts to the visible subset, so we suppress it entirely (fail closed)
+    // rather than emit numbers/names that encode hidden-repo membership.
+    result.affected_clusters.clear();
+
+    // Regenerate the human summary from the REDACTED vecs. The baked-in string
+    // embedded pre-redaction counts (transitively-affected + clusters), which
+    // both disagreed with the redacted `affected_symbols` and leaked the
+    // magnitude of hidden-repo impact. Distinct changed files are recomputed from
+    // the surviving changed symbols (the caller's own diff — not a leak).
+    let changed_files = result
+        .changed_symbols
+        .iter()
+        .map(|s| s.file_path.as_str())
+        .collect::<HashSet<&str>>()
+        .len();
+    result.summary = crate::blast_radius::render_blast_summary(
+        result.changed_symbols.len(),
+        changed_files,
+        result.affected_symbols.len(),
+        result.affected_clusters.len(),
+        result.risk_level,
+        result.status,
+    );
+
+    // risk_level, gate_state, status, blind_spots, analysis_direction,
+    // notifications, coverage.traversal_truncated: intentionally NOT redacted.
+    //
+    // The gate verdict must reflect the TRUE risk of the change. Recomputing it
+    // from only the visible subset could report "safe" while real impact lives in
+    // a hidden repo — reintroducing exactly the false-safe (D3) this system
+    // exists to prevent. This is a deliberate, documented trade-off: risk_level /
+    // gate_state carry a low-bandwidth signal of aggregate hidden risk in
+    // exchange for never under-reporting danger. status/blind_spots/direction
+    // name no repos; we add no notification that would reveal a hidden repo.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blast_radius::{
-        AffectedSymbol, ChangedSymbol, Coverage, OrgImpactItem, OrgWideImpact, StaleRepo,
+        AffectedCluster, AffectedSymbol, ChangedSymbol, Coverage, OrgImpactItem, OrgWideImpact,
+        StaleRepo,
     };
     use crate::process::RiskLevel;
 
@@ -501,6 +542,57 @@ mod tests {
         assert_eq!(result.coverage.repos_in_scope, vec!["repo:a".to_string()]);
         assert!(result.coverage.repos_not_indexed.is_empty());
         assert!(result.coverage.stale_repos.is_empty());
+    }
+
+    #[test]
+    fn redact_only_regenerates_summary_and_clears_clusters() {
+        let mut result = sample_result();
+        // A cluster set and a summary baked from PRE-redaction counts (3 affected,
+        // 2 clusters) — both would otherwise leak hidden-repo magnitude/names.
+        result.affected_clusters = vec![
+            AffectedCluster {
+                id: 1,
+                name: "acme/b::payments".to_string(),
+                affected_count: 3,
+                total_count: 42,
+                cohesion: 0.9,
+            },
+            AffectedCluster {
+                id: 2,
+                name: "acme/a::api".to_string(),
+                affected_count: 1,
+                total_count: 5,
+                cohesion: 0.5,
+            },
+        ];
+        result.summary = "3 changed symbol(s) in 3 file(s), 3 transitively \
+             affected symbol(s), 2 cluster(s) touched. Risk: Medium."
+            .to_string();
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        // Clusters are a cross-repo aggregate (total_count and name leak) →
+        // suppressed under an Only-policy.
+        assert!(
+            result.affected_clusters.is_empty(),
+            "affected_clusters must be cleared under scoping"
+        );
+        // Summary regenerated from the REDACTED vecs: repo:a + empty-uid survive
+        // ⇒ 2 changed / 2 affected / 0 clusters. It must NOT echo the pre-redaction
+        // counts (3 affected, 2 clusters) that leaked hidden-repo impact.
+        assert!(
+            result.summary.contains("2 changed symbol(s)")
+                && result.summary.contains("2 transitively affected symbol(s)")
+                && result.summary.contains("0 cluster(s) touched"),
+            "summary must reflect redacted counts, got: {}",
+            result.summary
+        );
+        assert!(
+            !result.summary.contains("3 transitively affected")
+                && !result.summary.contains("2 cluster(s)"),
+            "summary must not leak pre-redaction counts, got: {}",
+            result.summary
+        );
     }
 
     #[test]
