@@ -2713,6 +2713,28 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
     }
 }
 
+/// Discover the `[pr_impact]` strict-gate policy from an instance config sitting
+/// next to the repo. Tries the known filename conventions in order — the
+/// project-dir form first, then the flat forms the CLI's `--config` help and the
+/// shipped Docker sample use — so a user can't silently miss the policy by
+/// picking a valid-but-different name. Returns the default policy when no config
+/// is present or none declares `[pr_impact]`.
+fn discover_pr_impact_policy(repo_root: &Path) -> nestweaver_engine::PrImpactConfig {
+    for name in [
+        ".nestweaver/instance.toml",
+        "nestweaver-instance.toml",
+        "instance.toml",
+    ] {
+        let p = repo_root.join(name);
+        if p.exists()
+            && let Some(cfg) = load_instance_config_opt(Some(&p))
+        {
+            return cfg.pr_impact.unwrap_or_default();
+        }
+    }
+    nestweaver_engine::PrImpactConfig::default()
+}
+
 /// Resolve a CLI `--limit` value: explicit flag > instance config > built-in default.
 fn resolve_limit(
     explicit: Option<usize>,
@@ -5411,21 +5433,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             // Strict-gate policy (`[pr_impact]`): what `--strict` blocks on.
-            // Best-effort discovery next to the repo; silent when absent (the hook
-            // runs this on every push, so a missing config must not print a warning).
-            let instance_cfg_path = repo_root.join(".nestweaver/instance.toml");
-            let strict_policy = if instance_cfg_path.exists() {
-                load_instance_config_opt(Some(&instance_cfg_path))
-                    .and_then(|c| c.pr_impact)
-                    .unwrap_or_default()
-            } else {
-                nestweaver_engine::PrImpactConfig::default()
-            };
+            // Discovered next to the repo across the known config filenames;
+            // silent when absent (the hook runs this on every push).
+            let strict_policy = discover_pr_impact_policy(&repo_root);
             // A contract-verified breaking change is a decidable signature break
             // (`BreakTier::Breaking`) — the precise, block-worthy signal.
             let has_verified_break = breaking_changes
                 .iter()
                 .any(|b| b.tier == BreakTier::Breaking);
+
+            // `--strict` under the default (breaking-only) policy is a no-op
+            // without `--base`: breaking-change detection needs a ref to diff
+            // BEFORE↔AFTER, so with no base there's nothing for it to block on.
+            // Say so on stderr (keeps --json/--sarif stdout clean) rather than
+            // silently doing nothing. (High-risk blocking, if enabled, still works.)
+            if strict && base.is_none() && strict_policy.strict_block_on_breaking {
+                eprintln!(
+                    "note: --strict skips contract-verified breaking-change detection without \
+                     --base — pass --base <ref> to enable it. (Only [pr_impact] \
+                     strict_block_on_high_risk can block a push without a base.)"
+                );
+            }
 
             // SARIF requires a real BlastRadiusResult to serialize, so it always
             // computes locally (below) even on an empty diff. JSON emits the empty
@@ -15062,6 +15090,43 @@ mod pr_impact_hook_tests {
         );
 
         assert_eq!(EXIT_STRICT_BLOCK, 2);
+    }
+
+    /// Minimal valid instance config carrying a non-default `[pr_impact]`.
+    const PR_IMPACT_TOML: &str = "instance_id = \"t\"\n\
+        [snapshot_storage]\nbackend = \"local\"\npath = \"/tmp/s\"\n\
+        [workspace]\nbackend = \"local\"\npath = \"/tmp/w\"\n\
+        [inference]\nendpoint = \"http://localhost:8080\"\n\
+        embedding_model = \"m\"\nsummary_model = \"m\"\n\
+        [git]\ncredential_method = \"ssh\"\n\
+        [pr_impact]\nstrict_block_on_breaking = false\nstrict_block_on_high_risk = true\n";
+
+    #[test]
+    fn discovers_pr_impact_policy_across_filename_conventions() {
+        // Each supported filename must be discovered and its policy applied.
+        for name in [
+            ".nestweaver/instance.toml",
+            "nestweaver-instance.toml",
+            "instance.toml",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, PR_IMPACT_TOML).unwrap();
+            let policy = discover_pr_impact_policy(tmp.path());
+            assert!(
+                !policy.strict_block_on_breaking && policy.strict_block_on_high_risk,
+                "policy in {name} must be discovered and applied"
+            );
+        }
+
+        // No config anywhere → the default policy (breaking-only).
+        let empty = tempfile::tempdir().expect("tempdir");
+        let d = discover_pr_impact_policy(empty.path());
+        assert!(
+            d.strict_block_on_breaking && !d.strict_block_on_high_risk,
+            "absent config must yield the default breaking-only policy"
+        );
     }
 
     fn git_available() -> bool {
