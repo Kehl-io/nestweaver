@@ -148,9 +148,9 @@ pub use cluster_dispatch::{
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{
     AuthzConfig, CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule,
-    InferenceConfig, InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig,
-    RepoConfig, RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig, StorageConfig,
-    UpstreamEntry, WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file,
+    InferenceConfig, InstanceConfig, LinkConfig, McpServerConfig, PrImpactConfig, ProjectConfig,
+    RankingConfig, RepoConfig, RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig,
+    StorageConfig, UpstreamEntry, WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file,
     default_kind_priority, default_test_path_patterns, remove_repo_from_config_file,
 };
 pub use contract_change::breaking_changes_from_git;

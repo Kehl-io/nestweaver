@@ -162,6 +162,46 @@ pin_sha = "abc123"    # optional: pin to a specific commit
 
 ### Optional sections
 
+#### `[pr_impact]` — Pre-push / CI strict-gate policy
+
+Controls what `nestweaver pr-impact --strict` (and the strict `hooks --install
+--strict` pre-push hook) blocks a push on. Absent ⇒ the default policy below.
+
+```toml
+[pr_impact]
+# Block --strict on a contract-verified breaking change — a decidable API
+# signature break (BreakTier::Breaking). Precision-first: on by default.
+strict_block_on_breaking = true    # default
+# Also block --strict on a *complete* High-risk (heuristic) run
+# (GateState::RiskFlagged). Off by default — the risk score stays advisory so a
+# legitimate change to a central symbol isn't blocked by a high score.
+strict_block_on_high_risk = false  # default
+```
+
+A degraded/incomplete run is never blocked on risk regardless of these settings
+(an incomplete traversal can't be trusted to have found the risk). With both
+switches `false`, `--strict` is advisory (exit 0). `pr-impact` discovers this
+config at `<repo>/.nestweaver/instance.toml`.
+
+#### `[authz]` — Per-repo authorization (Blast Radius)
+
+Optional per-repo scoping for blast-radius results on the MCP-HTTP and daemon
+gRPC surfaces (host-agnostic — matched against each repo's `url`/`uid`). **Absent
+or empty ⇒ disabled ⇒ every caller sees all repos (`VisibleRepos::All`) — zero
+behavior change.** Add any rule and the policy is enabled and **fail-closed**: an
+unknown/unlisted token sees nothing.
+
+```toml
+[authz.rules]
+# query token -> list of repo globs it may see (matched against Repo.url / uid)
+"team-frontend-token" = ["github.com/acme/frontend*", "github.com/acme/design-*"]
+"team-backend-token"  = ["github.com/acme/backend*"]
+```
+
+Blast-radius responses (affected/changed symbols, `org_wide` impact, coverage,
+cluster/summary counts) are redacted to the caller's visible repos. Stdio MCP and
+the local CLI are single-user and always see all repos.
+
 #### `[[links]]` — Cross-repo relationships
 
 Declare how repos communicate. This is how NestWeaver knows that your

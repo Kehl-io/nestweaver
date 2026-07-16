@@ -840,22 +840,33 @@ async fn handle_mcp(
             #[cfg(feature = "daemon")]
             let federation = state.federation.clone();
 
-            // Resolve the caller's per-repo visibility once per request (R9/R9b).
-            // The bearer was already validated above; map it to an identity — the
-            // admin token → Admin, the query token value → Token(<value>), and
-            // anything else (no/unrecognized bearer) → Anonymous — then let the
-            // permission source resolve which repos this identity may see against
-            // the live repo set. With no `[authz]` config the source is disabled
-            // and returns `All` for every identity, so `Some(&All)` makes the
-            // blast_radius redaction a no-op (zero behavior change).
-            let identity = resolve_identity(
-                provided_bearer,
-                state.admin_token.as_deref(),
-                state.auth_token.as_deref(),
-            );
-            let visible = state
-                .permission_source
-                .visible_repos(&identity, &store.list_repos(None).unwrap_or_default());
+            // Resolve the caller's per-repo visibility (R9/R9b). A disabled policy
+            // (no `[authz]`, the single-trust-domain default) short-circuits to
+            // `All` with NO per-request repo listing — the hot path pays nothing.
+            // Only an enabled policy maps the (already-validated) bearer to an
+            // identity — admin token → Admin, query token → Token(<value>),
+            // anything else → Anonymous — and lists repos to resolve visibility,
+            // warning (not swallowing) on a store error. Mirrors the daemon
+            // boundary; `Some(&All)` makes blast_radius redaction a no-op.
+            let visible = if state.permission_source.is_enabled() {
+                let identity = resolve_identity(
+                    provided_bearer,
+                    state.admin_token.as_deref(),
+                    state.auth_token.as_deref(),
+                );
+                let repos = match store.list_repos(None) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(
+                            "authz: list_repos failed, failing closed to no visible repos: {e:#}"
+                        );
+                        Vec::new()
+                    }
+                };
+                state.permission_source.visible_repos(&identity, &repos)
+            } else {
+                nestweaver_engine::authz::VisibleRepos::All
+            };
 
             // Read the embed model Arc outside the blocking thread (matches the
             // gRPC handler pattern in server.rs), then drop the RwLock guard.

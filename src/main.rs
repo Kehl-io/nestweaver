@@ -1369,7 +1369,8 @@ enum Commands {
         base: Option<String>,
         #[arg(
             long,
-            help = "Exit non-zero (2) when a complete run reports High risk (advisory by default)"
+            help = "Exit non-zero (2) on a contract-verified breaking change (advisory by default; \
+                    tune via [pr_impact] in nestweaver-instance.toml)"
         )]
         strict: bool,
         #[arg(long, default_value = "3", help = "Maximum traversal depth")]
@@ -1534,7 +1535,8 @@ enum Commands {
         /// Remove the pre-push hook (restores a backed-up hook if present)
         #[arg(long)]
         uninstall: bool,
-        /// Make the installed hook block the push on a complete High-risk run
+        /// Make the installed hook block the push on a contract-verified breaking
+        /// change (tune what --strict blocks on via [pr_impact] in the config)
         #[arg(long)]
         strict: bool,
     },
@@ -2738,19 +2740,35 @@ fn detect_repo_root() -> PathBuf {
 
 // ── pr-impact advisory surface ──────────────────────────────────────────────
 
-/// Exit code emitted when a `--strict` run flags a complete High-risk push.
+/// Exit code emitted when a `--strict` run trips its configured block policy.
 const EXIT_STRICT_BLOCK: i32 = 2;
 
 /// Marker embedded in hooks we write, so install/uninstall can tell "our" hook
 /// from a hand-rolled one the user already had.
 const NESTWEAVER_HOOK_MARKER: &str = "nestweaver pre-push blast-radius check";
 
-/// Advisory-by-default exit policy for `pr-impact`. ALWAYS 0 (fail-open) — never
-/// block a push — UNLESS `--strict` is set AND the gate flagged a COMPLETE
-/// High-risk run. A degraded/unknown run never blocks: an incomplete traversal
-/// can't be trusted to have found the risk, so it must not gate.
-fn pr_impact_exit_code(gate_state: GateState, strict: bool) -> i32 {
-    if strict && gate_state == GateState::RiskFlagged {
+/// Advisory-by-default exit policy for `pr-impact`. ALWAYS 0 (fail-open) unless
+/// `--strict` is set AND the caller's configured [`PrImpactConfig`] policy trips.
+///
+/// The default policy blocks only on a **contract-verified** breaking change
+/// (`has_verified_break`) — a decidable signature break — and NOT on the risk
+/// heuristic, so a legitimate change to a central symbol isn't blocked by a high
+/// score. `strict_block_on_high_risk` opts into blocking on a *complete*
+/// `RiskFlagged` run as well. A degraded/unknown run is never blocked on risk (an
+/// incomplete traversal can't be trusted to have found it); a contract-verified
+/// break is decidable independent of the traversal, so it may still block.
+fn pr_impact_exit_code(
+    gate_state: GateState,
+    has_verified_break: bool,
+    strict: bool,
+    policy: &nestweaver_engine::PrImpactConfig,
+) -> i32 {
+    if !strict {
+        return EXIT_SUCCESS;
+    }
+    let block = (policy.strict_block_on_breaking && has_verified_break)
+        || (policy.strict_block_on_high_risk && gate_state == GateState::RiskFlagged);
+    if block {
         EXIT_STRICT_BLOCK
     } else {
         EXIT_SUCCESS
@@ -2883,8 +2901,9 @@ fn git_hooks_dir(cwd: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// Build the pre-push hook script. Advisory (default) always `exit 0` so it can
-/// never block a push; strict drops the fail-open shim so a High-risk gate
-/// (exit 2) actually blocks.
+/// never block a push; strict drops the fail-open shim so `pr-impact`'s configured
+/// block policy (default: a contract-verified breaking change) can exit 2 and
+/// block the push.
 fn nestweaver_pre_push_hook(strict: bool) -> String {
     let mode = if strict { "strict" } else { "advisory" };
     let mut s = String::new();
@@ -2976,9 +2995,14 @@ fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
             hook_path.display()
         );
         println!(
-            "It BLOCKS the push (exit 2) when a complete run reports High risk. It runs the same"
+            "It BLOCKS the push (exit 2) on a contract-verified breaking change. Configure what"
         );
-        println!("hardened blast-radius as CI. Remove it with: nestweaver hooks --uninstall");
+        println!(
+            "--strict blocks on (breaking / high-risk) via [pr_impact] in nestweaver-instance.toml."
+        );
+        println!(
+            "It runs the same hardened blast-radius as CI. Remove it with: nestweaver hooks --uninstall"
+        );
     } else {
         println!(
             "Installed advisory pre-push blast-radius hook at {}",
@@ -2988,7 +3012,7 @@ fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
             "Advisory: it NEVER blocks your push (fail-open) and stays silent on a trivial change."
         );
         println!(
-            "It runs the same hardened blast-radius as CI. Add --strict to block on High risk;"
+            "It runs the same hardened blast-radius as CI. Add --strict to block on a breaking change;"
         );
         println!("remove it with: nestweaver hooks --uninstall");
     }
@@ -5386,6 +5410,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Vec::new()
             };
 
+            // Strict-gate policy (`[pr_impact]`): what `--strict` blocks on.
+            // Best-effort discovery next to the repo; silent when absent (the hook
+            // runs this on every push, so a missing config must not print a warning).
+            let instance_cfg_path = repo_root.join(".nestweaver/instance.toml");
+            let strict_policy = if instance_cfg_path.exists() {
+                load_instance_config_opt(Some(&instance_cfg_path))
+                    .and_then(|c| c.pr_impact)
+                    .unwrap_or_default()
+            } else {
+                nestweaver_engine::PrImpactConfig::default()
+            };
+            // A contract-verified breaking change is a decidable signature break
+            // (`BreakTier::Breaking`) — the precise, block-worthy signal.
+            let has_verified_break = breaking_changes
+                .iter()
+                .any(|b| b.tier == BreakTier::Breaking);
+
             // SARIF requires a real BlastRadiusResult to serialize, so it always
             // computes locally (below) even on an empty diff. JSON emits the empty
             // shape; the advisory banner stays silent on a trivial (empty) diff.
@@ -5435,7 +5476,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     } else {
                         print_pr_impact_hook(&result, &breaking_changes);
                     }
-                    return Ok((pr_impact_exit_code(result.gate_state, strict), None));
+                    return Ok((
+                        pr_impact_exit_code(
+                            result.gate_state,
+                            has_verified_break,
+                            strict,
+                            &strict_policy,
+                        ),
+                        None,
+                    ));
                 }
             }
 
@@ -5487,7 +5536,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 result.risk_level,
                 format_elapsed(t0.elapsed())
             );
-            Ok((pr_impact_exit_code(result.gate_state, strict), Some(stats)))
+            Ok((
+                pr_impact_exit_code(
+                    result.gate_state,
+                    has_verified_break,
+                    strict,
+                    &strict_policy,
+                ),
+                Some(stats),
+            ))
         }
 
         Commands::AffectedTests {
@@ -14950,21 +15007,60 @@ mod pr_impact_hook_tests {
     use std::process::Command;
 
     #[test]
-    fn exit_code_is_fail_open_except_strict_risk_flagged() {
-        // Advisory (non-strict): never blocks, whatever the gate reports.
-        assert_eq!(pr_impact_exit_code(GateState::Ok, false), 0);
-        assert_eq!(pr_impact_exit_code(GateState::DegradedUnknown, false), 0);
-        assert_eq!(pr_impact_exit_code(GateState::RiskFlagged, false), 0);
+    fn exit_code_honors_strict_block_policy() {
+        use nestweaver_engine::PrImpactConfig;
+        let default = PrImpactConfig::default(); // breaking-only
+        let risk_too = PrImpactConfig {
+            strict_block_on_breaking: true,
+            strict_block_on_high_risk: true,
+        };
+        let advisory = PrImpactConfig {
+            strict_block_on_breaking: false,
+            strict_block_on_high_risk: false,
+        };
 
-        // Strict still fail-opens on Ok and — crucially — on a degraded/unknown
-        // run: an incomplete traversal can't be trusted to have found the risk,
-        // so it must NEVER block. Only a complete High-risk run blocks (exit 2).
-        assert_eq!(pr_impact_exit_code(GateState::Ok, true), 0);
-        assert_eq!(pr_impact_exit_code(GateState::DegradedUnknown, true), 0);
+        // Advisory (non-strict): never blocks, whatever the gate or breaks.
+        for gate in [
+            GateState::Ok,
+            GateState::DegradedUnknown,
+            GateState::RiskFlagged,
+        ] {
+            assert_eq!(pr_impact_exit_code(gate, true, false, &default), 0);
+        }
+
+        // Default policy: blocks ONLY on a contract-verified break — NOT on the
+        // High-risk heuristic (the key behavior fix). A degraded run with a
+        // verified break still blocks (the break is decidable, not a heuristic).
         assert_eq!(
-            pr_impact_exit_code(GateState::RiskFlagged, true),
+            pr_impact_exit_code(GateState::RiskFlagged, false, true, &default),
+            0
+        );
+        assert_eq!(
+            pr_impact_exit_code(GateState::Ok, true, true, &default),
             EXIT_STRICT_BLOCK
         );
+        assert_eq!(
+            pr_impact_exit_code(GateState::DegradedUnknown, true, true, &default),
+            EXIT_STRICT_BLOCK
+        );
+
+        // Opt-in high-risk blocking: a complete RiskFlagged run blocks, but a
+        // degraded/unknown run still never does (can't trust an incomplete walk).
+        assert_eq!(
+            pr_impact_exit_code(GateState::RiskFlagged, false, true, &risk_too),
+            EXIT_STRICT_BLOCK
+        );
+        assert_eq!(
+            pr_impact_exit_code(GateState::DegradedUnknown, false, true, &risk_too),
+            0
+        );
+
+        // Both switches off: advisory even under --strict.
+        assert_eq!(
+            pr_impact_exit_code(GateState::RiskFlagged, true, true, &advisory),
+            0
+        );
+
         assert_eq!(EXIT_STRICT_BLOCK, 2);
     }
 

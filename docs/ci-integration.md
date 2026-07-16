@@ -264,15 +264,29 @@ The SARIF carries the full trust contract, so reviewers see it inline:
 - **`run.properties["nestweaver/gateState"]`** — `ok` / `degraded-unknown` /
   `risk-flagged`. A degraded run is `degraded-unknown`, never `risk-flagged`.
 - **`nestweaver/coverage`** (repos in scope / not indexed / stale / truncated)
-  and **`nestweaver/blindSpots`** (dynamic dispatch, reflection, config wiring,
-  codegen) — so "no impact" is distinguishable from "incomplete coverage".
+  and **`nestweaver/blindSpots`** — the inherent static gaps (`dynamic-dispatch`,
+  `reflection`, `config-wiring`, `codegen`) plus run-specific ones
+  (`pruned-below-threshold` for score-threshold pruning, `depth-truncated` for the
+  depth cap, `not-indexed`) — so "no impact" is distinguishable from "incomplete
+  coverage".
 - **`result.rank`** ranks affected symbols by impact score; **`nw/contract-break`**
   results carry `severitySource: contract-verified` (a real signature diff),
   distinct from the reach-based cross-repo hints (`severitySource: reach-only`).
 
 This is advisory: the workflow never fails the build. To gate, add a separate
 step that inspects `gateState`/`nw/contract-break` and exits non-zero, or use
-`pr-impact --base "$base" --strict` (blocks only on a *complete* High-risk run).
+`pr-impact --base "$base" --strict`. By default `--strict` exits non-zero **only
+on a contract-verified breaking change** (a decidable signature break), never on
+the risk heuristic and never on a degraded/incomplete run. Tune it per team via
+the `[pr_impact]` section of `nestweaver-instance.toml`:
+
+```toml
+[pr_impact]
+# Block --strict on a contract-verified breaking change (BreakTier::Breaking).
+strict_block_on_breaking = true   # default
+# Also block on a *complete* High-risk (heuristic) run (GateState::RiskFlagged).
+strict_block_on_high_risk = false # default — the risk score stays advisory
+```
 
 **Locally**, the same output is one command away — `nestweaver hooks --install`
 adds an advisory pre-push check (see the CLI guide), and `--sarif` can be opened
