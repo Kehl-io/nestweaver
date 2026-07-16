@@ -119,6 +119,11 @@ pub struct DaemonState {
     /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
     /// `brain_search`) via the `set_current_instance_config` thread-local.
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+    /// Per-repo authorization policy (R9/R9b), built ONCE at startup from
+    /// `[authz]` config — not rebuilt per request. No `[authz]` ⇒ a disabled
+    /// source that resolves every identity to `VisibleRepos::All`. Mirrors the
+    /// MCP-HTTP boundary.
+    pub permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
     /// Lazily-loaded embedding model for semantic search. Populated by a
     /// background task when the `embed` feature is enabled.
     pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
@@ -154,6 +159,62 @@ pub struct DaemonState {
     pub worker_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+impl DaemonState {
+    /// Resolve the caller's per-repo visibility (R9/R9b — Blast Radius scoping)
+    /// from a request's tonic extensions.
+    ///
+    /// The auth interceptor attaches an
+    /// [`Identity`](nestweaver_engine::authz::Identity) extension for
+    /// authenticated requests; its absence (no-auth / UDS admin paths) is
+    /// treated as `Anonymous`. Uses the startup-built [`Self::permission_source`]
+    /// (never rebuilt per request). When the policy is disabled — the no-`[authz]`
+    /// single-trust-domain default — this returns [`VisibleRepos::All`] WITHOUT
+    /// listing repos, so the vast majority of RPCs (which don't even read the
+    /// result) pay nothing. Mirrors the MCP-HTTP boundary in `nestweaver-mcp`.
+    fn visible_repos_for(
+        &self,
+        extensions: &tonic::Extensions,
+    ) -> nestweaver_engine::authz::VisibleRepos {
+        use nestweaver_engine::authz::{Identity, VisibleRepos};
+        // Disabled policy ⇒ everyone is All; skip the per-request repo listing.
+        if !self.permission_source.is_enabled() {
+            return VisibleRepos::All;
+        }
+        let identity = extensions
+            .get::<Identity>()
+            .cloned()
+            .unwrap_or(Identity::Anonymous);
+        // Fail closed on a store error (an enabled policy over an empty repo set
+        // resolves to "nothing visible"), but say so — a silent swallow here would
+        // hide a real store problem behind a redaction that looks intentional.
+        let repos = match self.store.list_repos(None) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "authz: list_repos failed, failing closed to no visible repos: {e:#}"
+                );
+                Vec::new()
+            }
+        };
+        self.permission_source.visible_repos(&identity, &repos)
+    }
+}
+
+/// Build the daemon's permission source once at startup (mirrors the MCP-HTTP
+/// boundary). No `[authz]` config ⇒ an empty, disabled source ⇒ every identity
+/// resolves to [`nestweaver_engine::authz::VisibleRepos::All`] (zero behavior
+/// change for the single-trust-domain default).
+fn build_daemon_permission_source(
+    instance_cfg: Option<&Arc<nestweaver_engine::InstanceConfig>>,
+) -> Arc<dyn nestweaver_engine::authz::PermissionSource> {
+    match instance_cfg.and_then(|c| c.authz.as_ref()) {
+        Some(authz) => Arc::new(authz.build_permission_source()),
+        None => Arc::new(nestweaver_engine::authz::StaticConfigPermissionSource::new(
+            std::collections::HashMap::new(),
+        )),
+    }
+}
+
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
 pub struct DaemonService {
     state: Arc<DaemonState>,
@@ -175,6 +236,7 @@ impl DaemonService {
         &self,
         tool_name: &str,
         args_json: &str,
+        visible: nestweaver_engine::authz::VisibleRepos,
     ) -> Result<Response<JsonResponse>, Status> {
         let started = std::time::Instant::now();
         // Increment gRPC request counter for this tool/method.
@@ -189,7 +251,7 @@ impl DaemonService {
         // `with_safeguard_cancellable` on timeout and observed by the
         // `spawn_blocking` dispatch (e.g. brain_context's vector fan-out).
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handler = self.dispatch_json_tool_inner(tool_name, args_json, cancel.clone());
+        let handler = self.dispatch_json_tool_inner(tool_name, args_json, cancel.clone(), visible);
 
         let response = if self.state.server_mode {
             with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
@@ -220,6 +282,7 @@ impl DaemonService {
         tool_name: &str,
         args_json: &str,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        visible: nestweaver_engine::authz::VisibleRepos,
     ) -> Result<Response<JsonResponse>, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
@@ -308,6 +371,12 @@ impl DaemonService {
                 args,
                 embed_ref,
                 Some(&cancel),
+                // R9/R9b: scope blast_radius output to the caller's visible
+                // repos. `visible` was resolved from the request's Identity
+                // extension before the request was consumed. With no `[authz]`
+                // config this is `VisibleRepos::All`, so redaction is a no-op
+                // (zero behavior change); every non-blast_radius tool ignores it.
+                Some(&visible),
             )
             .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
             tracing::debug!(
@@ -363,6 +432,7 @@ impl DaemonService {
         &self,
         tool_name: &str,
         args: serde_json::Value,
+        visible: nestweaver_engine::authz::VisibleRepos,
     ) -> Result<serde_json::Value, Status> {
         let started = std::time::Instant::now();
         // Increment gRPC request counter for this tool/method.
@@ -374,7 +444,7 @@ impl DaemonService {
         let tool = tool_name.to_string();
         let timeout = safeguards.effective_timeout(&tool, None);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handler = self.dispatch_tool_json_inner(tool_name, args, cancel.clone());
+        let handler = self.dispatch_tool_json_inner(tool_name, args, cancel.clone(), visible);
 
         let response = if self.state.server_mode {
             with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
@@ -404,6 +474,7 @@ impl DaemonService {
         tool_name: &str,
         args: serde_json::Value,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        visible: nestweaver_engine::authz::VisibleRepos,
     ) -> Result<serde_json::Value, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
@@ -440,6 +511,12 @@ impl DaemonService {
                 args,
                 embed_ref,
                 Some(&cancel),
+                // R9/R9b: scope blast_radius output to the caller's visible
+                // repos (`visible`, resolved from the request Identity by the
+                // typed handler). With no `[authz]` config this is
+                // `VisibleRepos::All` ⇒ redaction is a no-op; non-blast_radius
+                // tools ignore it entirely.
+                Some(&visible),
             )
             .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
             tracing::debug!(
@@ -616,8 +693,17 @@ macro_rules! json_rpc {
                 )));
             }
         }
+        // R9/R9b: resolve the caller's per-repo visibility from the request's
+        // Identity extension BEFORE consuming the request. This covers the
+        // generic `/mcp` tool path and every typed RPC routed through this
+        // macro (including `blast_radius`), so their output is redacted to the
+        // caller's visible repos. No `[authz]` config ⇒ `VisibleRepos::All` ⇒
+        // no-op redaction (backward compatible).
+        let visible = $self.state.visible_repos_for($request.extensions());
         let req = $request.into_inner();
-        $self.dispatch_json_tool($tool, &req.args_json).await
+        $self
+            .dispatch_json_tool($tool, &req.args_json, visible)
+            .await
     }};
 }
 
@@ -2137,7 +2223,17 @@ impl NestWeaverDaemon for DaemonService {
             args["root"] = serde_json::json!(root);
         }
 
-        let value = self.dispatch_tool_json("brain_search", args).await?;
+        // This typed handler only ever dispatches a fixed non-blast_radius
+        // tool, which ignores the visibility arg, so pass `VisibleRepos::All`
+        // (no scoping needed, and no per-request `list_repos` cost on the hot
+        // path). blast_radius scoping happens on the `json_rpc!` macro path.
+        let value = self
+            .dispatch_tool_json(
+                "brain_search",
+                args,
+                nestweaver_engine::authz::VisibleRepos::All,
+            )
+            .await?;
 
         // Parse JSON result into typed response.
         let query_echo = value
@@ -2281,7 +2377,14 @@ impl NestWeaverDaemon for DaemonService {
             args["recency_half_life_days"] = serde_json::json!(req.recency_half_life_days);
         }
 
-        let value = self.dispatch_tool_json("brain_context", args).await?;
+        // Fixed non-blast_radius tool — see brain_search above.
+        let value = self
+            .dispatch_tool_json(
+                "brain_context",
+                args,
+                nestweaver_engine::authz::VisibleRepos::All,
+            )
+            .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
 
@@ -2332,7 +2435,14 @@ impl NestWeaverDaemon for DaemonService {
             args["exclude_tags"] = serde_json::json!(req.exclude_tags);
         }
 
-        let value = self.dispatch_tool_json("project_context", args).await?;
+        // Fixed non-blast_radius tool — see brain_search above.
+        let value = self
+            .dispatch_tool_json(
+                "project_context",
+                args,
+                nestweaver_engine::authz::VisibleRepos::All,
+            )
+            .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
 
@@ -2357,7 +2467,14 @@ impl NestWeaverDaemon for DaemonService {
             args["sections"] = serde_json::json!(req.sections);
         }
 
-        let value = self.dispatch_tool_json("note_get", args).await?;
+        // Fixed non-blast_radius tool — see brain_search above.
+        let value = self
+            .dispatch_tool_json(
+                "note_get",
+                args,
+                nestweaver_engine::authz::VisibleRepos::All,
+            )
+            .await?;
 
         Ok(Response::new(NoteGetResponse {
             uid: value
@@ -2401,7 +2518,14 @@ impl NestWeaverDaemon for DaemonService {
         _r: Request<BrainStatusRequest>,
     ) -> Result<Response<BrainStatusResponse>, Status> {
         let args = serde_json::json!({});
-        let value = self.dispatch_tool_json("brain_status", args).await?;
+        // Fixed non-blast_radius tool — see brain_search above.
+        let value = self
+            .dispatch_tool_json(
+                "brain_status",
+                args,
+                nestweaver_engine::authz::VisibleRepos::All,
+            )
+            .await?;
 
         let indexing_active = self.state.indexing_active.load(Ordering::Relaxed);
         let indexing_repo = if indexing_active {
@@ -2452,7 +2576,14 @@ impl NestWeaverDaemon for DaemonService {
             args["response_format"] = serde_json::json!(req.response_format);
         }
 
-        let value = self.dispatch_tool_json("hub_nodes", args).await?;
+        // Fixed non-blast_radius tool — see brain_search above.
+        let value = self
+            .dispatch_tool_json(
+                "hub_nodes",
+                args,
+                nestweaver_engine::authz::VisibleRepos::All,
+            )
+            .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
 
@@ -2464,8 +2595,13 @@ impl NestWeaverDaemon for DaemonService {
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let req = r.into_inner();
+        // Fixed non-blast_radius tool — pass `VisibleRepos::All` (no scoping).
         let resp = self
-            .dispatch_json_tool("brain_status", &req.args_json)
+            .dispatch_json_tool(
+                "brain_status",
+                &req.args_json,
+                nestweaver_engine::authz::VisibleRepos::All,
+            )
             .await?;
         // Inject server-side indexing status into the JSON response so
         // AI agents see it via the MCP tool path as well.
@@ -3124,39 +3260,126 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
+        // R9/R9b: resolve the caller's per-repo visibility from the request's
+        // Identity extension BEFORE the request is consumed. A disabled policy
+        // (no `[authz]`) short-circuits to `All` with no repo listing (zero
+        // behavior change); when enabled we list repos ONCE here and reuse that
+        // same listing for redaction below — no duplicate `list_repos`.
+        let (visible, authz_repos) = {
+            use nestweaver_engine::authz::{Identity, VisibleRepos};
+            if self.state.permission_source.is_enabled() {
+                let identity = r
+                    .extensions()
+                    .get::<Identity>()
+                    .cloned()
+                    .unwrap_or(Identity::Anonymous);
+                let repos = self.state.store.list_repos(None).unwrap_or_else(|e| {
+                    tracing::warn!("authz: list_repos failed, failing closed: {e:#}");
+                    Vec::new()
+                });
+                let v = self
+                    .state
+                    .permission_source
+                    .visible_repos(&identity, &repos);
+                (v, repos)
+            } else {
+                (VisibleRepos::All, Vec::new())
+            }
+        };
         let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
-        let result = tokio::task::spawn_blocking(move || {
-            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
-            let changed_files: Vec<std::path::PathBuf> = args
-                .get("files")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if changed_files.is_empty() {
-                return Err(Status::invalid_argument(
-                    "missing or empty 'files' array argument",
-                ));
-            }
-            let result = nestweaver_engine::analyze_blast_radius(
-                &state.store,
-                &changed_files,
-                depth,
-                Some(&state.db_path),
-            )
-            .map_err(|e| Status::internal(format!("analyze_blast_radius failed: {e:#}")))?;
-            serde_json::to_string(&result)
-                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?;
+        // Route pr_impact through the same safeguard framework as dispatched MCP
+        // tools. pr_impact analysis is `blast_radius` under the hood, so it uses
+        // that tool's safeguard profile for timeout and depth clamping. (Per-client
+        // rate limiting is applied upstream at the auth interceptor for every RPC,
+        // so it already covers this handler.)
+        let tool = "blast_radius";
+        let safeguards = &self.state.safeguards;
+        let server_mode = state.server_mode;
+        // Cooperative cancellation flag: tripped by `with_safeguard_cancellable`
+        // on timeout and observed by `analyze_blast_radius`'s BFS, which then
+        // stops and yields status=Degraded.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        result.map(|j| Response::new(JsonResponse { result_json: j }))
+        // Clamp traversal depth before building options, mirroring
+        // `dispatch_json_tool_inner`: hard-cap in all modes (guards the BFS
+        // regardless of server_mode), then tighten via the safeguard config in
+        // server mode. The pr_impact response is a raw serialized
+        // `BlastRadiusResult` with no `_meta`, so the clamp is applied silently
+        // (no `_clamped`/`_original_depth` annotation).
+        let requested_depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3);
+        let depth = requested_depth.min(HARD_MAX_DEPTH) as u32;
+        let depth = if server_mode {
+            state.safeguards.effective_depth(tool, Some(depth)).depth
+        } else {
+            depth
+        };
+
+        let changed_files: Vec<std::path::PathBuf> = args
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if changed_files.is_empty() {
+            return Err(Status::invalid_argument(
+                "missing or empty 'files' array argument",
+            ));
+        }
+
+        let cancel_for_task = cancel.clone();
+        let handler = async move {
+            tokio::task::spawn_blocking(move || {
+                // TODO(nw-033): resolve target repo_uid from the working repo
+                let options = nestweaver_engine::BlastRadiusOptions {
+                    target_repo: None,
+                    max_depth: depth,
+                    include_data_edges: false,
+                    limit: None,
+                };
+                let mut result = nestweaver_engine::analyze_blast_radius(
+                    &state.store,
+                    &changed_files,
+                    &options,
+                    Some(&cancel_for_task),
+                    Some(&state.db_path),
+                )
+                .map_err(|e| {
+                    // Log the detailed chain server-side; return a generic message
+                    // so the client never sees internal error internals.
+                    tracing::error!("analyze_blast_radius failed: {e:#}");
+                    Status::internal("blast radius analysis failed")
+                })?;
+                // R9/R9b: redact the result to the caller's visible repos before
+                // serialization, reusing the single repo listing resolved above.
+                // `VisibleRepos::All` (the no-`[authz]` default) makes this a
+                // no-op (and `authz_repos` is empty), preserving single-trust-domain.
+                nestweaver_engine::authz::redact_blast_radius_for_visibility(
+                    &mut result,
+                    &visible,
+                    &authz_repos,
+                );
+                serde_json::to_string(&result)
+                    .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking panicked: {e}")))?
+        };
+
+        // Wrap in the per-tool timeout only in server mode, matching
+        // `dispatch_json_tool`. On timeout the cancel flag is set, which stops
+        // the BFS above.
+        let result_json = if server_mode {
+            with_safeguard_cancellable(tool, safeguards, None, cancel, handler).await?
+        } else {
+            handler.await?
+        };
+
+        Ok(Response::new(JsonResponse { result_json }))
     }
 
     // ── Embedding ───────────────────────────────────────────────────
@@ -4441,6 +4664,8 @@ pub async fn run_server(
             .and_then(|opts| opts.webhook_secret_old.clone()),
     )?;
 
+    // Build the per-repo authz policy ONCE, before the state is assembled.
+    let permission_source = build_daemon_permission_source(instance_cfg.as_ref());
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
@@ -4455,6 +4680,7 @@ pub async fn run_server(
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
         instance_cfg,
+        permission_source,
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
         write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         server_mode: is_server_mode,
@@ -6997,6 +7223,7 @@ mod startup_helper_tests {
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
             instance_cfg: None,
+            permission_source: build_daemon_permission_source(None),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             write_mutex: Arc::new(tokio::sync::Mutex::new(())),
             server_mode: false,

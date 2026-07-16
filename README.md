@@ -251,7 +251,7 @@ cargo build --release
 |---------|-------------|
 | `hubs` | Find most connected hub nodes (degree centrality + PageRank) |
 | `bridges` | Find architectural chokepoints (betweenness centrality) |
-| `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High/Critical) |
+| `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High) |
 | `dead-code` | Detect unreachable symbols via entry point reachability |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
 | `contracts drift` | Routes declared in a spec but not implemented, and vice versa (presence-level) |
@@ -305,8 +305,40 @@ cargo build --release
 | `service-summary` | Display a summary of a specific service |
 | `admin` | Subagent guidance instructions |
 | `interactions` | Manage interaction memory |
+| `hooks` | Install/remove the local pre-push blast-radius check (`--install`, `--strict`, `--uninstall`) |
 
 </details>
+
+### Local pre-push check
+
+Get "confidence before you push" from the same hardened blast-radius analysis CI runs — locally, on your machine:
+
+```sh
+nestweaver hooks --install
+```
+
+This writes a `.git/hooks/pre-push` that runs `nestweaver pr-impact` against the merge-base before every push. It is **advisory by default**: it **never blocks** your push (fail-open), stays **silent on a trivial change**, and prints a concise banner — the gate verdict, the top affected symbols, and a coverage caveat when the analysis was incomplete — only when there's something to review. A degraded/incomplete run never blocks, because an incomplete traversal can't be trusted to have found the risk.
+
+To make it block a push (exit 2) on a **contract-verified breaking change** — a decidable API-signature break, not a heuristic:
+
+```sh
+nestweaver hooks --install --strict
+```
+
+What `--strict` blocks on is configurable via the `[pr_impact]` section of `nestweaver-instance.toml` (`strict_block_on_breaking`, default `true`; `strict_block_on_high_risk`, default `false` — opt in to also block on a complete High-risk run). A degraded/incomplete run is never blocked on risk.
+
+Remove it (restoring any hook it backed up) with:
+
+```sh
+nestweaver hooks --uninstall
+```
+
+You can also run the check manually — this is exactly what the hook does:
+
+```sh
+nestweaver pr-impact --base origin/main            # advisory banner
+nestweaver pr-impact --base origin/main --strict   # exit 2 on a contract-verified breaking change (default policy)
+```
 
 ## Features
 

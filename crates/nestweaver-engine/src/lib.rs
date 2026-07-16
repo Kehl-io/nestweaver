@@ -43,9 +43,11 @@ pub mod admin;
 pub mod affected_tests;
 pub mod agent_guide;
 pub mod atomic_changes;
+pub mod authz;
 pub mod backup;
 pub mod bare_clone;
 pub mod blast_radius;
+pub mod blast_radius_sarif;
 pub mod brain_docgraph;
 pub mod brain_memory;
 pub mod brainignore;
@@ -56,6 +58,7 @@ pub mod clustering;
 pub mod cochange;
 pub mod config;
 pub mod content_reader;
+pub mod contract_change;
 pub mod contracts;
 pub mod cross_domain;
 pub mod dead_code;
@@ -91,6 +94,7 @@ pub mod registry;
 pub mod rerank;
 pub mod resolution_cache;
 pub mod scheduler;
+pub mod signature_diff;
 pub mod snapshot;
 pub mod ssrf;
 pub mod suggest;
@@ -111,6 +115,10 @@ pub use agent_guide::{
     generate_guide, generate_guide_with_rules, generate_guide_with_tools, generate_skill,
     generate_skill_with_rules, generate_skill_with_tools,
 };
+pub use authz::{
+    Identity, PermissionSource, StaticConfigPermissionSource, VisibleRepos,
+    redact_blast_radius_for_visibility,
+};
 pub use backup::{
     BackupConfig, BackupManifest, BackupRepoInfo, BackupResult, BackupSizes, RestoreConfig,
     RestoreResult, StagedBackup, backup_inspect, backup_list, backup_restore, backup_save,
@@ -118,9 +126,11 @@ pub use backup::{
 };
 pub use bare_clone::{mint_repo_identity, read_origin_url};
 pub use blast_radius::{
-    AffectedCluster, AffectedSymbol as BlastAffectedSymbol, BlastRadiusResult, ChangedSymbol,
+    AffectedCluster, AffectedSymbol as BlastAffectedSymbol, AnalysisStatus, BlastRadiusOptions,
+    BlastRadiusResult, ChangedSymbol, GateState, Notification, NotificationLevel,
     analyze_blast_radius, changed_files_from_git,
 };
+pub use blast_radius_sarif::{append_contract_breaks_to_sarif, blast_radius_to_sarif};
 pub use brain_docgraph::{
     BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,
     broken_links, doc_stats, orphan_documents, tag_graph, tag_graph_all, topic_clusters,
@@ -137,12 +147,13 @@ pub use cluster_dispatch::{
 };
 pub use cochange::{CoChangeEdge, compute_cochanges, load_cochange_sidecar, save_cochange_sidecar};
 pub use config::{
-    CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule, InferenceConfig,
-    InstanceConfig, LinkConfig, McpServerConfig, ProjectConfig, RankingConfig, RepoConfig,
-    RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig, StorageConfig, UpstreamEntry,
-    WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file, default_kind_priority,
-    default_test_path_patterns, remove_repo_from_config_file,
+    AuthzConfig, CrossDomainConfig, ExternalRefConfig, FeatureConfig, GitConfig, GlobRule,
+    InferenceConfig, InstanceConfig, LinkConfig, McpServerConfig, PrImpactConfig, ProjectConfig,
+    RankingConfig, RepoConfig, RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig,
+    StorageConfig, UpstreamEntry, WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file,
+    default_kind_priority, default_test_path_patterns, remove_repo_from_config_file,
 };
+pub use contract_change::breaking_changes_from_git;
 pub use cross_domain::{
     CrossDomainResult, SymbolIndex, VaultReaders, build_symbol_index,
     build_symbol_index_with_config, discover_cross_domain_links,
@@ -220,6 +231,7 @@ pub use rerank::{
     MonotonicWeights, RerankFeatures, RerankModel, Reranker, TrainingRow, export_training_rows,
     load_rerank_model, rerank, rerank_sidecar_path, select_reranker,
 };
+pub use signature_diff::{BreakKind, BreakTier, BreakingChange, diff_public_api, diff_symbol};
 pub use snapshot::*;
 pub use suggest::{
     Confidence, SuggestedFeature, SuggestedLink, Suggestions, discover_symbol_level_links,

@@ -8,21 +8,22 @@ use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use miette::Diagnostic;
 use nestweaver_engine::{
-    BrainContextResult, BrainWatcher, CodeWatcher, ContextResult, DeadCodeConfidence,
-    FeatureContextResult, HubNode, HybridSearchConfig, LookupResult, Summary, SummaryLevel,
+    BlastRadiusResult, BrainContextResult, BrainWatcher, BreakTier, BreakingChange, CodeWatcher,
+    ContextResult, DeadCodeConfidence, FeatureContextResult, GateState, HubNode,
+    HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
     affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
-    changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
-    discover_cross_domain_links, embedding::generate_embeddings_batch, expand_query_with_aliases,
-    export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
-    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
-    generate_repo_map, generate_summaries, get_last_indexed_at, incremental_index_with_name,
-    index_directory_with_options, index_markdown_directory_since_with_ignore,
-    index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
-    load_clusters, load_extensions, load_manifest_cache, lookup_symbol, record_last_indexed_at,
-    render_text, save_clusters, save_cochange_sidecar, save_summaries, search_symbols,
-    suggest_links, truncate_to_budget,
+    breaking_changes_from_git, build_brain_context_hybrid_with_aliases, build_context_with_intent,
+    build_feature_context, changed_files_from_git, compute_clusters, compute_cochanges,
+    detect_implicit_projects, discover_cross_domain_links, embedding::generate_embeddings_batch,
+    expand_query_with_aliases, export_cypher, export_graphml, export_in_memory_graph,
+    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
+    generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
+    generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
+    incremental_index_with_name, index_directory_with_options,
+    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
+    list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
+    lookup_symbol, record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar,
+    save_summaries, search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -1353,7 +1354,7 @@ enum Commands {
     /// groups by cluster, and scores risk. When no --files are given, uses
     /// `git diff --name-only` to detect changed files automatically.
     #[command(
-        after_help = "Examples:\n  nestweaver pr-impact\n  nestweaver pr-impact --files src/auth.rs,src/db.rs\n  nestweaver pr-impact --depth 5 --json"
+        after_help = "Examples:\n  nestweaver pr-impact\n  nestweaver pr-impact --files src/auth.rs,src/db.rs\n  nestweaver pr-impact --base origin/main\n  nestweaver pr-impact --base origin/main --strict\n  nestweaver pr-impact --depth 5 --json"
     )]
     PrImpact {
         #[arg(
@@ -1361,10 +1362,26 @@ enum Commands {
             help = "Comma-separated list of changed file paths (omit to auto-detect via git diff)"
         )]
         files: Option<String>,
+        #[arg(
+            long,
+            help = "Diff against this ref (e.g. the merge-base) instead of the working tree"
+        )]
+        base: Option<String>,
+        #[arg(
+            long,
+            help = "Exit non-zero (2) on a contract-verified breaking change (advisory by default; \
+                    tune via [pr_impact] in nestweaver-instance.toml)"
+        )]
+        strict: bool,
         #[arg(long, default_value = "3", help = "Maximum traversal depth")]
         depth: u32,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(
+            long,
+            help = "Output as SARIF v2.1.0 (for GitHub code scanning / Azure DevOps / the VS Code SARIF viewer)"
+        )]
+        sarif: bool,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
@@ -1501,6 +1518,27 @@ enum Commands {
         /// Show hardware acceleration details
         #[arg(long)]
         hardware: bool,
+    },
+    /// Manage the local git pre-push blast-radius check (advisory by default).
+    ///
+    /// Installs a `.git/hooks/pre-push` that runs `nestweaver pr-impact` against
+    /// the merge-base before you push — the SAME hardened blast-radius analysis
+    /// as CI. Advisory by design: it never blocks the push (fail-open) unless you
+    /// install with `--strict`, and it stays silent on a trivial change.
+    #[command(
+        after_help = "Examples:\n  nestweaver hooks --install\n  nestweaver hooks --install --strict\n  nestweaver hooks --uninstall"
+    )]
+    Hooks {
+        /// Install the pre-push hook in the current git repo
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Remove the pre-push hook (restores a backed-up hook if present)
+        #[arg(long)]
+        uninstall: bool,
+        /// Make the installed hook block the push on a contract-verified breaking
+        /// change (tune what --strict blocks on via [pr_impact] in the config)
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -2675,6 +2713,28 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
     }
 }
 
+/// Discover the `[pr_impact]` strict-gate policy from an instance config sitting
+/// next to the repo. Tries the known filename conventions in order — the
+/// project-dir form first, then the flat forms the CLI's `--config` help and the
+/// shipped Docker sample use — so a user can't silently miss the policy by
+/// picking a valid-but-different name. Returns the default policy when no config
+/// is present or none declares `[pr_impact]`.
+fn discover_pr_impact_policy(repo_root: &Path) -> nestweaver_engine::PrImpactConfig {
+    for name in [
+        ".nestweaver/instance.toml",
+        "nestweaver-instance.toml",
+        "instance.toml",
+    ] {
+        let p = repo_root.join(name);
+        if p.exists()
+            && let Some(cfg) = load_instance_config_opt(Some(&p))
+        {
+            return cfg.pr_impact.unwrap_or_default();
+        }
+    }
+    nestweaver_engine::PrImpactConfig::default()
+}
+
 /// Resolve a CLI `--limit` value: explicit flag > instance config > built-in default.
 fn resolve_limit(
     explicit: Option<usize>,
@@ -2698,6 +2758,318 @@ fn detect_repo_root() -> PathBuf {
             None => return cwd,
         }
     }
+}
+
+// ── pr-impact advisory surface ──────────────────────────────────────────────
+
+/// Exit code emitted when a `--strict` run trips its configured block policy.
+const EXIT_STRICT_BLOCK: i32 = 2;
+
+/// Marker embedded in hooks we write, so install/uninstall can tell "our" hook
+/// from a hand-rolled one the user already had.
+const NESTWEAVER_HOOK_MARKER: &str = "nestweaver pre-push blast-radius check";
+
+/// Advisory-by-default exit policy for `pr-impact`. ALWAYS 0 (fail-open) unless
+/// `--strict` is set AND the caller's configured [`PrImpactConfig`] policy trips.
+///
+/// The default policy blocks only on a **contract-verified** breaking change
+/// (`has_verified_break`) — a decidable signature break — and NOT on the risk
+/// heuristic, so a legitimate change to a central symbol isn't blocked by a high
+/// score. `strict_block_on_high_risk` opts into blocking on a *complete*
+/// `RiskFlagged` run as well. A degraded/unknown run is never blocked on risk (an
+/// incomplete traversal can't be trusted to have found it); a contract-verified
+/// break is decidable independent of the traversal, so it may still block.
+fn pr_impact_exit_code(
+    gate_state: GateState,
+    has_verified_break: bool,
+    strict: bool,
+    policy: &nestweaver_engine::PrImpactConfig,
+) -> i32 {
+    if !strict {
+        return EXIT_SUCCESS;
+    }
+    let block = (policy.strict_block_on_breaking && has_verified_break)
+        || (policy.strict_block_on_high_risk && gate_state == GateState::RiskFlagged);
+    if block {
+        EXIT_STRICT_BLOCK
+    } else {
+        EXIT_SUCCESS
+    }
+}
+
+/// Name the top reason a run was degraded/unknown, for the advisory banner.
+/// Prefers an error-level notification, then any notification, then coverage.
+fn pr_impact_degraded_reason(result: &BlastRadiusResult) -> String {
+    if let Some(n) = result
+        .notifications
+        .iter()
+        .find(|n| matches!(n.level, NotificationLevel::Error))
+    {
+        return format!(" ({})", n.message);
+    }
+    if let Some(n) = result.notifications.first() {
+        return format!(" ({})", n.message);
+    }
+    if !result.coverage.repos_not_indexed.is_empty() {
+        return format!(
+            " ({} repo(s) not indexed)",
+            result.coverage.repos_not_indexed.len()
+        );
+    }
+    if result.coverage.traversal_truncated {
+        return " (traversal truncated)".to_string();
+    }
+    String::new()
+}
+
+/// Concise, advisory "confidence before you push" banner — what the pre-push
+/// hook consumes. Silent on a trivial change; otherwise a one-line gate verdict,
+/// the top affected symbols, and a coverage caveat when the run was incomplete.
+fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange]) {
+    // Contract-verified breaks are surfaced even on an otherwise-trivial run.
+    let verified: Vec<&BreakingChange> = breaking
+        .iter()
+        .filter(|b| b.tier == BreakTier::Breaking)
+        .collect();
+    let likely_or_possible = breaking.len() - verified.len();
+
+    // Silent when trivial: a complete, low-risk run with nothing affected AND no
+    // verified breaking changes to report.
+    if verified.is_empty()
+        && result.gate_state == GateState::Ok
+        && result.risk_level == RiskLevel::Low
+        && result.affected_symbols.is_empty()
+    {
+        return;
+    }
+
+    // Lead with contract-verified breaking changes — these are real signature
+    // breaks, not the reach-based heuristic.
+    if !verified.is_empty() {
+        println!("⚠ {} verified breaking API change(s):", verified.len());
+        for b in verified.iter().take(5) {
+            println!("  {:?} {}", b.kind, b.symbol_name);
+        }
+        if likely_or_possible > 0 {
+            println!("  + {likely_or_possible} likely/possible");
+        }
+    }
+
+    match result.gate_state {
+        GateState::Ok => {
+            println!(
+                "Blast radius: {:?} risk — {} symbol(s) affected",
+                result.risk_level,
+                result.affected_symbols.len()
+            );
+        }
+        GateState::RiskFlagged => {
+            println!(
+                "⚠ High blast radius — {} symbol(s) affected",
+                result.affected_symbols.len()
+            );
+        }
+        GateState::DegradedUnknown => {
+            println!(
+                "⚠ Blast radius incomplete (unknown) — review manually{}",
+                pr_impact_degraded_reason(result)
+            );
+        }
+    }
+
+    // Top ~5 affected symbols (already sorted by impact_score, descending).
+    for s in result.affected_symbols.iter().take(5) {
+        println!("  {} ({}:{})", s.name, s.file_path, s.start_line);
+    }
+
+    // Coverage caveat: reported impact is a floor when the walk was cut short or
+    // a referenced repo isn't indexed.
+    if result.coverage.traversal_truncated || !result.coverage.repos_not_indexed.is_empty() {
+        let mut notes = Vec::new();
+        if result.coverage.traversal_truncated {
+            notes.push("traversal truncated".to_string());
+        }
+        if !result.coverage.repos_not_indexed.is_empty() {
+            notes.push(format!(
+                "{} repo(s) not indexed",
+                result.coverage.repos_not_indexed.len()
+            ));
+        }
+        println!("  note: {} — reported impact is a floor", notes.join(", "));
+    }
+}
+
+/// Resolve the current repo's git hooks directory via `git rev-parse`. Errors
+/// clearly when the CWD isn't a git repo (or git isn't on PATH). Handles
+/// worktrees and custom `core.hooksPath` because git computes the path for us.
+fn git_hooks_dir(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(cwd)
+        .output()
+        .context("failed to run `git rev-parse` (is git installed?)")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "not a git repository — run `nestweaver hooks --install` from inside a git repo"
+        );
+    }
+    let rel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let path = PathBuf::from(&rel);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    })
+}
+
+/// Build the pre-push hook script. Advisory (default) always `exit 0` so it can
+/// never block a push; strict drops the fail-open shim so `pr-impact`'s configured
+/// block policy (default: a contract-verified breaking change) can exit 2 and
+/// block the push.
+fn nestweaver_pre_push_hook(strict: bool) -> String {
+    let mode = if strict { "strict" } else { "advisory" };
+    let mut s = String::new();
+    s.push_str("#!/bin/sh\n");
+    s.push_str(&format!("# {NESTWEAVER_HOOK_MARKER} ({mode})\n"));
+    s.push_str(
+        "base=\"$(git merge-base '@{upstream}' HEAD 2>/dev/null || git merge-base origin/main HEAD 2>/dev/null || echo HEAD)\"\n",
+    );
+    // No upstream / origin/main to diff against ⇒ nothing to analyze. Say so out
+    // loud (don't silently diff HEAD..HEAD and report "nothing affected") and
+    // never block the push over it — in either mode.
+    s.push_str("if [ \"$base\" = \"HEAD\" ]; then\n");
+    s.push_str(
+        "  echo \"nestweaver: no upstream or origin/main to diff against — skipping blast-radius check.\" >&2\n",
+    );
+    s.push_str("  exit 0\n");
+    s.push_str("fi\n");
+    if strict {
+        s.push_str("nestweaver pr-impact --base \"$base\" --strict\n");
+    } else {
+        // Advisory: swallow ANY failure of the tool itself (missing binary/DB,
+        // arg error) so a broken environment can never abort the push. The gate
+        // verdict already exits 0 in non-strict mode; `|| true` also covers the
+        // pre-verdict failures (127/2/…) that `|| exit $?` would have propagated.
+        s.push_str("nestweaver pr-impact --base \"$base\" || true\n");
+        s.push_str("exit 0\n");
+    }
+    s
+}
+
+/// Mark a file executable (owner/group/other +x) on unix; no-op elsewhere.
+fn make_executable(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Install the advisory (or strict) pre-push blast-radius hook in the current
+/// git repo. Backs up any pre-existing non-nestweaver hook.
+fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
+    let hooks_dir = git_hooks_dir(cwd)?;
+    std::fs::create_dir_all(&hooks_dir)
+        .with_context(|| format!("creating hooks dir {}", hooks_dir.display()))?;
+    let hook_path = hooks_dir.join("pre-push");
+
+    if hook_path.exists() {
+        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
+        if !existing.contains(NESTWEAVER_HOOK_MARKER) {
+            // Don't clobber a backup from a previous install — that could destroy
+            // the user's *original* hook. Fall back to a numbered suffix.
+            let mut backup = hooks_dir.join("pre-push.nestweaver.bak");
+            if backup.exists() {
+                let mut n = 1;
+                loop {
+                    let candidate = hooks_dir.join(format!("pre-push.nestweaver.bak.{n}"));
+                    if !candidate.exists() {
+                        backup = candidate;
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            std::fs::rename(&hook_path, &backup).with_context(|| {
+                format!("backing up existing pre-push hook to {}", backup.display())
+            })?;
+            println!(
+                "Warning: backed up your existing pre-push hook to {}",
+                backup.display()
+            );
+        }
+    }
+
+    std::fs::write(&hook_path, nestweaver_pre_push_hook(strict))
+        .with_context(|| format!("writing hook {}", hook_path.display()))?;
+    make_executable(&hook_path)?;
+
+    if strict {
+        println!(
+            "Installed STRICT pre-push blast-radius hook at {}",
+            hook_path.display()
+        );
+        println!(
+            "It BLOCKS the push (exit 2) on a contract-verified breaking change. Configure what"
+        );
+        println!(
+            "--strict blocks on (breaking / high-risk) via [pr_impact] in nestweaver-instance.toml."
+        );
+        println!(
+            "It runs the same hardened blast-radius as CI. Remove it with: nestweaver hooks --uninstall"
+        );
+    } else {
+        println!(
+            "Installed advisory pre-push blast-radius hook at {}",
+            hook_path.display()
+        );
+        println!(
+            "Advisory: it NEVER blocks your push (fail-open) and stays silent on a trivial change."
+        );
+        println!(
+            "It runs the same hardened blast-radius as CI. Add --strict to block on a breaking change;"
+        );
+        println!("remove it with: nestweaver hooks --uninstall");
+    }
+    Ok(EXIT_SUCCESS)
+}
+
+/// Remove the nestweaver pre-push hook and restore any backed-up hook.
+fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
+    let hooks_dir = git_hooks_dir(cwd)?;
+    let hook_path = hooks_dir.join("pre-push");
+    let backup = hooks_dir.join("pre-push.nestweaver.bak");
+
+    if hook_path.exists() {
+        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
+        if existing.contains(NESTWEAVER_HOOK_MARKER) {
+            std::fs::remove_file(&hook_path)
+                .with_context(|| format!("removing hook {}", hook_path.display()))?;
+            println!("Removed the nestweaver pre-push hook.");
+        } else {
+            println!("The pre-push hook was not installed by nestweaver — leaving it untouched.");
+            return Ok(EXIT_SUCCESS);
+        }
+    } else {
+        println!("No pre-push hook to remove.");
+    }
+
+    if backup.exists() {
+        std::fs::rename(&backup, &hook_path)
+            .with_context(|| format!("restoring previous hook {}", hook_path.display()))?;
+        println!(
+            "Restored your previous pre-push hook from {}",
+            backup.display()
+        );
+    }
+    Ok(EXIT_SUCCESS)
 }
 
 fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
@@ -5023,25 +5395,70 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::PrImpact {
             files,
+            base,
+            strict,
             depth,
             json,
+            sarif,
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            let repo_root = detect_repo_root();
 
-            // Determine changed files: from --files flag or git diff.
+            // The default (neither --json nor --sarif) is the concise advisory
+            // banner — this is what the pre-push hook consumes.
+            // Determine changed files: --files, else git diff (--base or working tree).
             let changed_files: Vec<PathBuf> = if let Some(files_str) = files {
                 files_str
                     .split(',')
                     .map(|s| PathBuf::from(s.trim()))
                     .collect()
+            } else if let Some(ref base_ref) = base {
+                out.status(&format!(
+                    "Detecting changed files via git diff {base_ref}..."
+                ));
+                changed_files_from_git(&repo_root, Some(base_ref)).context("git diff")?
             } else {
-                let repo_root = detect_repo_root();
                 out.status("No --files given, detecting via git diff...");
                 changed_files_from_git(&repo_root, None).context("git diff")?
             };
 
-            if changed_files.is_empty() {
+            // Contract-verified breaking API changes require a base ref to diff
+            // BEFORE↔AFTER signatures. Best-effort and advisory: a diff failure
+            // must never fail the run, so fall back to an empty list.
+            let breaking_changes: Vec<BreakingChange> = if let Some(ref base_ref) = base {
+                breaking_changes_from_git(&repo_root, base_ref, &changed_files).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            // Strict-gate policy (`[pr_impact]`): what `--strict` blocks on.
+            // Discovered next to the repo across the known config filenames;
+            // silent when absent (the hook runs this on every push).
+            let strict_policy = discover_pr_impact_policy(&repo_root);
+            // A contract-verified breaking change is a decidable signature break
+            // (`BreakTier::Breaking`) — the precise, block-worthy signal.
+            let has_verified_break = breaking_changes
+                .iter()
+                .any(|b| b.tier == BreakTier::Breaking);
+
+            // `--strict` under the default (breaking-only) policy is a no-op
+            // without `--base`: breaking-change detection needs a ref to diff
+            // BEFORE↔AFTER, so with no base there's nothing for it to block on.
+            // Say so on stderr (keeps --json/--sarif stdout clean) rather than
+            // silently doing nothing. (High-risk blocking, if enabled, still works.)
+            if strict && base.is_none() && strict_policy.strict_block_on_breaking {
+                eprintln!(
+                    "note: --strict skips contract-verified breaking-change detection without \
+                     --base — pass --base <ref> to enable it. (Only [pr_impact] \
+                     strict_block_on_high_risk can block a push without a base.)"
+                );
+            }
+
+            // SARIF requires a real BlastRadiusResult to serialize, so it always
+            // computes locally (below) even on an empty diff. JSON emits the empty
+            // shape; the advisory banner stays silent on a trivial (empty) diff.
+            if changed_files.is_empty() && !sarif {
                 if json {
                     println!(
                         "{}",
@@ -5049,18 +5466,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "changed_symbols": [],
                             "affected_symbols": [],
                             "affected_clusters": [],
+                            "breaking_changes": [],
                             "risk_level": "Low",
                             "summary": "No changed files detected.",
                         }))?
                     );
-                } else {
-                    println!("No changed files detected.");
                 }
+                // Advisory banner: silent when trivial (nothing to review).
                 return Ok((EXIT_SUCCESS, None));
             }
 
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            if use_daemon && !sarif {
                 let file_strs: Vec<&str> =
                     changed_files.iter().filter_map(|p| p.to_str()).collect();
                 let args = serde_json::json!({
@@ -5068,74 +5485,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "depth": depth,
                 });
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args) {
+                    // The daemon serializes a full BlastRadiusResult; decode it so
+                    // both the concise banner and the strict exit code see the real
+                    // gate state (missing fields default via serde on old daemons).
+                    let result: BlastRadiusResult = serde_json::from_value(value.clone())
+                        .context("decoding daemon pr_impact result")?;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        // Fold the locally-computed breaking changes into the
+                        // daemon's result JSON.
+                        let mut merged = value.clone();
+                        if let Some(obj) = merged.as_object_mut() {
+                            obj.insert(
+                                "breaking_changes".to_string(),
+                                serde_json::to_value(&breaking_changes)?,
+                            );
+                        }
+                        println!("{}", serde_json::to_string_pretty(&merged)?);
                     } else {
-                        println!("{}", value["summary"].as_str().unwrap_or("(no summary)"));
-                        println!();
-
-                        if let Some(changed) = value["changed_symbols"]
-                            .as_array()
-                            .filter(|a| !a.is_empty())
-                        {
-                            println!("Changed symbols ({}):", changed.len());
-                            for s in changed {
-                                let pr = s["pagerank_score"]
-                                    .as_f64()
-                                    .map(|p| format!(" pr={p:.4}"))
-                                    .unwrap_or_default();
-                                println!(
-                                    "  {} ({}) {}{pr}",
-                                    s["name"].as_str().unwrap_or("?"),
-                                    s["kind"].as_str().unwrap_or("?"),
-                                    s["file_path"].as_str().unwrap_or("?")
-                                );
-                            }
-                            println!();
-                        }
-
-                        if let Some(affected) = value["affected_symbols"]
-                            .as_array()
-                            .filter(|a| !a.is_empty())
-                        {
-                            println!("Affected symbols ({}):", affected.len());
-                            for s in affected {
-                                println!(
-                                    "  [depth {}] {} via {} ({:.2}) — {}",
-                                    s["depth"].as_u64().unwrap_or(0),
-                                    s["name"].as_str().unwrap_or("?"),
-                                    s["edge_type"].as_str().unwrap_or("?"),
-                                    s["confidence"].as_f64().unwrap_or(0.0),
-                                    s["file_path"].as_str().unwrap_or("?")
-                                );
-                            }
-                            println!();
-                        }
-
-                        if let Some(clusters) = value["affected_clusters"]
-                            .as_array()
-                            .filter(|a| !a.is_empty())
-                        {
-                            println!("Affected clusters ({}):", clusters.len());
-                            for c in clusters {
-                                println!(
-                                    "  [{}] {} — {}/{} members affected (cohesion={:.2})",
-                                    c["id"].as_u64().unwrap_or(0),
-                                    c["name"].as_str().unwrap_or("?"),
-                                    c["affected_count"].as_u64().unwrap_or(0),
-                                    c["total_count"].as_u64().unwrap_or(0),
-                                    c["cohesion"].as_f64().unwrap_or(0.0)
-                                );
-                            }
-                            println!();
-                        }
-
-                        println!(
-                            "Risk level: {}",
-                            value["risk_level"].as_str().unwrap_or("Unknown")
-                        );
+                        print_pr_impact_hook(&result, &breaking_changes);
                     }
-                    return Ok((EXIT_SUCCESS, None));
+                    return Ok((
+                        pr_impact_exit_code(
+                            result.gate_state,
+                            has_verified_break,
+                            strict,
+                            &strict_policy,
+                        ),
+                        None,
+                    ));
                 }
             }
 
@@ -5147,49 +5524,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 depth
             ));
 
-            let result = analyze_blast_radius(&store, &changed_files, depth, Some(&db_path))?;
+            // TODO(nw-033): resolve target repo_uid from the working repo
+            let options = nestweaver_engine::BlastRadiusOptions {
+                target_repo: None,
+                max_depth: depth,
+                include_data_edges: false,
+                limit: None,
+            };
+            let result =
+                analyze_blast_radius(&store, &changed_files, &options, None, Some(&db_path))?;
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+            if sarif {
+                let mut sarif_value =
+                    nestweaver_engine::blast_radius_to_sarif(&result, env!("CARGO_PKG_VERSION"));
+                // Contract-verified breaks ride alongside the reach-only results
+                // as `nw/contract-break` items tagged severitySource=contract-verified.
+                nestweaver_engine::append_contract_breaks_to_sarif(
+                    &mut sarif_value,
+                    &breaking_changes,
+                );
+                println!("{}", serde_json::to_string_pretty(&sarif_value)?);
+            } else if json {
+                let mut value = serde_json::to_value(&result)?;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "breaking_changes".to_string(),
+                        serde_json::to_value(&breaking_changes)?,
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                println!("{}", result.summary);
-                println!();
-
-                if !result.changed_symbols.is_empty() {
-                    println!("Changed symbols ({}):", result.changed_symbols.len());
-                    for s in &result.changed_symbols {
-                        let pr = s
-                            .pagerank_score
-                            .map(|p| format!(" pr={p:.4}"))
-                            .unwrap_or_default();
-                        println!("  {} ({}) {}{pr}", s.name, s.kind, s.file_path);
-                    }
-                    println!();
-                }
-
-                if !result.affected_symbols.is_empty() {
-                    println!("Affected symbols ({}):", result.affected_symbols.len());
-                    for s in &result.affected_symbols {
-                        println!(
-                            "  [depth {}] {} via {} ({:.2}) — {}",
-                            s.depth, s.name, s.edge_type, s.confidence, s.file_path
-                        );
-                    }
-                    println!();
-                }
-
-                if !result.affected_clusters.is_empty() {
-                    println!("Affected clusters ({}):", result.affected_clusters.len());
-                    for c in &result.affected_clusters {
-                        println!(
-                            "  [{}] {} — {}/{} members affected (cohesion={:.2})",
-                            c.id, c.name, c.affected_count, c.total_count, c.cohesion
-                        );
-                    }
-                    println!();
-                }
-
-                println!("Risk level: {:?}", result.risk_level);
+                print_pr_impact_hook(&result, &breaking_changes);
             }
 
             let stats = format!(
@@ -5199,7 +5564,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 result.risk_level,
                 format_elapsed(t0.elapsed())
             );
-            Ok((EXIT_SUCCESS, Some(stats)))
+            Ok((
+                pr_impact_exit_code(
+                    result.gate_state,
+                    has_verified_break,
+                    strict,
+                    &strict_policy,
+                ),
+                Some(stats),
+            ))
         }
 
         Commands::AffectedTests {
@@ -8424,6 +8797,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 println!("Run with --hardware for acceleration details");
             }
             Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::Hooks {
+            install,
+            uninstall,
+            strict,
+        } => {
+            let cwd = std::env::current_dir().context("resolving current directory")?;
+            if uninstall {
+                Ok((uninstall_pre_push_hook(&cwd)?, None))
+            } else if install {
+                Ok((install_pre_push_hook(&cwd, strict)?, None))
+            } else {
+                eprintln!(
+                    "Specify --install (optionally with --strict) or --uninstall.\n\
+                     Example: nestweaver hooks --install"
+                );
+                Ok((EXIT_ERROR, None))
+            }
         }
     }
 }
@@ -14632,6 +15024,341 @@ mod stop_grace_tests {
         assert_eq!(
             resolve_stop_grace_secs(Some("notanumber"), Some("also-bad")),
             DEFAULT_DRAIN_CEILING_SECS + STOP_GRACE_BUFFER_SECS
+        );
+    }
+}
+
+#[cfg(test)]
+mod pr_impact_hook_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn exit_code_honors_strict_block_policy() {
+        use nestweaver_engine::PrImpactConfig;
+        let default = PrImpactConfig::default(); // breaking-only
+        let risk_too = PrImpactConfig {
+            strict_block_on_breaking: true,
+            strict_block_on_high_risk: true,
+        };
+        let advisory = PrImpactConfig {
+            strict_block_on_breaking: false,
+            strict_block_on_high_risk: false,
+        };
+
+        // Advisory (non-strict): never blocks, whatever the gate or breaks.
+        for gate in [
+            GateState::Ok,
+            GateState::DegradedUnknown,
+            GateState::RiskFlagged,
+        ] {
+            assert_eq!(pr_impact_exit_code(gate, true, false, &default), 0);
+        }
+
+        // Default policy: blocks ONLY on a contract-verified break — NOT on the
+        // High-risk heuristic (the key behavior fix). A degraded run with a
+        // verified break still blocks (the break is decidable, not a heuristic).
+        assert_eq!(
+            pr_impact_exit_code(GateState::RiskFlagged, false, true, &default),
+            0
+        );
+        assert_eq!(
+            pr_impact_exit_code(GateState::Ok, true, true, &default),
+            EXIT_STRICT_BLOCK
+        );
+        assert_eq!(
+            pr_impact_exit_code(GateState::DegradedUnknown, true, true, &default),
+            EXIT_STRICT_BLOCK
+        );
+
+        // Opt-in high-risk blocking: a complete RiskFlagged run blocks, but a
+        // degraded/unknown run still never does (can't trust an incomplete walk).
+        assert_eq!(
+            pr_impact_exit_code(GateState::RiskFlagged, false, true, &risk_too),
+            EXIT_STRICT_BLOCK
+        );
+        assert_eq!(
+            pr_impact_exit_code(GateState::DegradedUnknown, false, true, &risk_too),
+            0
+        );
+
+        // Both switches off: advisory even under --strict.
+        assert_eq!(
+            pr_impact_exit_code(GateState::RiskFlagged, true, true, &advisory),
+            0
+        );
+
+        assert_eq!(EXIT_STRICT_BLOCK, 2);
+    }
+
+    /// Minimal valid instance config carrying a non-default `[pr_impact]`.
+    const PR_IMPACT_TOML: &str = "instance_id = \"t\"\n\
+        [snapshot_storage]\nbackend = \"local\"\npath = \"/tmp/s\"\n\
+        [workspace]\nbackend = \"local\"\npath = \"/tmp/w\"\n\
+        [inference]\nendpoint = \"http://localhost:8080\"\n\
+        embedding_model = \"m\"\nsummary_model = \"m\"\n\
+        [git]\ncredential_method = \"ssh\"\n\
+        [pr_impact]\nstrict_block_on_breaking = false\nstrict_block_on_high_risk = true\n";
+
+    #[test]
+    fn discovers_pr_impact_policy_across_filename_conventions() {
+        // Each supported filename must be discovered and its policy applied.
+        for name in [
+            ".nestweaver/instance.toml",
+            "nestweaver-instance.toml",
+            "instance.toml",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, PR_IMPACT_TOML).unwrap();
+            let policy = discover_pr_impact_policy(tmp.path());
+            assert!(
+                !policy.strict_block_on_breaking && policy.strict_block_on_high_risk,
+                "policy in {name} must be discovered and applied"
+            );
+        }
+
+        // No config anywhere → the default policy (breaking-only).
+        let empty = tempfile::tempdir().expect("tempdir");
+        let d = discover_pr_impact_policy(empty.path());
+        assert!(
+            d.strict_block_on_breaking && !d.strict_block_on_high_risk,
+            "absent config must yield the default breaking-only policy"
+        );
+    }
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn install_writes_executable_advisory_hook_then_uninstall_removes_it() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+
+        let code = install_pre_push_hook(repo, false).expect("install");
+        assert_eq!(code, EXIT_SUCCESS);
+
+        let hook = git_hooks_dir(repo).unwrap().join("pre-push");
+        assert!(hook.exists(), "pre-push hook must be written");
+        let body = std::fs::read_to_string(&hook).unwrap();
+        assert!(
+            body.contains("nestweaver pr-impact --base"),
+            "hook must invoke `pr-impact --base`, got:\n{body}"
+        );
+        assert!(
+            body.contains("exit 0"),
+            "advisory hook must fail-open with exit 0"
+        );
+        assert!(
+            !body.contains("--strict"),
+            "advisory hook must not pass --strict"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "hook must be executable, mode={mode:o}");
+        }
+
+        let code = uninstall_pre_push_hook(repo).expect("uninstall");
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(!hook.exists(), "uninstall must remove the hook");
+    }
+
+    #[test]
+    fn strict_install_drops_the_fail_open_shim() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+
+        install_pre_push_hook(repo, true).expect("install");
+        let hook = git_hooks_dir(repo).unwrap().join("pre-push");
+        let body = std::fs::read_to_string(&hook).unwrap();
+        assert!(
+            body.contains("nestweaver pr-impact --base \"$base\" --strict"),
+            "strict hook must pass --strict, got:\n{body}"
+        );
+        assert!(
+            !body.contains("|| exit $?"),
+            "strict hook must drop the fail-open shim so a block actually blocks"
+        );
+    }
+
+    #[test]
+    fn install_backs_up_and_uninstall_restores_a_foreign_hook() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+
+        let hooks_dir = git_hooks_dir(repo).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook = hooks_dir.join("pre-push");
+        std::fs::write(&hook, "#!/bin/sh\necho custom-hook\n").unwrap();
+
+        install_pre_push_hook(repo, false).expect("install");
+        let backup = hooks_dir.join("pre-push.nestweaver.bak");
+        assert!(backup.exists(), "a foreign pre-push must be backed up");
+        assert!(
+            std::fs::read_to_string(&backup)
+                .unwrap()
+                .contains("echo custom-hook"),
+            "backup must preserve the original hook"
+        );
+        assert!(
+            std::fs::read_to_string(&hook)
+                .unwrap()
+                .contains("nestweaver pr-impact"),
+            "our hook must be installed over the backed-up one"
+        );
+
+        uninstall_pre_push_hook(repo).expect("uninstall");
+        let restored = std::fs::read_to_string(&hook).unwrap();
+        assert!(
+            restored.contains("echo custom-hook"),
+            "uninstall must restore the backed-up hook, got:\n{restored}"
+        );
+    }
+
+    /// The whole point of the advisory hook: a broken tool must never abort the
+    /// push. Behavioral, not text-match — run the generated script with a
+    /// `nestweaver` stub that fails and assert the hook still exits 0.
+    #[test]
+    fn advisory_hook_fails_open_when_the_tool_fails() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "c0",
+            ],
+        );
+        // Give the hook a real base (origin/main == HEAD) so it proceeds past the
+        // "no upstream ⇒ skip" guard and actually reaches the tool invocation.
+        git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("nestweaver");
+        // bindir first so our stub shadows any real `nestweaver`, but git still
+        // resolves from the inherited PATH (needed for base resolution).
+        let real_path = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{}", bindir.display(), real_path);
+
+        let script = nestweaver_pre_push_hook(false);
+        // Every failure the tool can exit with — missing DB (1), arg error (2),
+        // binary-not-found (127) — must still leave the push un-blocked.
+        for code in [1, 2, 127] {
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho 'stub failure' >&2\nexit {code}\n"),
+            )
+            .unwrap();
+            make_executable(&stub).unwrap();
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(repo)
+                .env("PATH", &path)
+                .output()
+                .expect("run hook");
+            assert!(
+                out.status.success(),
+                "advisory hook must exit 0 when `nestweaver` exits {code}, got {:?}\nstderr={}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+
+    /// Reinstalling over a *second* foreign hook must not clobber the first
+    /// backup — that could destroy the user's real original hook.
+    #[test]
+    fn install_does_not_clobber_a_prior_backup() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        let hooks_dir = git_hooks_dir(repo).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook = hooks_dir.join("pre-push");
+
+        // First foreign hook → backed up to the default `.bak`.
+        std::fs::write(&hook, "#!/bin/sh\necho original\n").unwrap();
+        install_pre_push_hook(repo, false).expect("install 1");
+        let bak = hooks_dir.join("pre-push.nestweaver.bak");
+        assert!(
+            std::fs::read_to_string(&bak)
+                .unwrap()
+                .contains("echo original"),
+            "first foreign hook must be backed up"
+        );
+
+        // Drop a *second* foreign hook in place and reinstall; the original
+        // backup must survive and the second goes to a numbered backup.
+        std::fs::write(&hook, "#!/bin/sh\necho second\n").unwrap();
+        install_pre_push_hook(repo, false).expect("install 2");
+        assert!(
+            std::fs::read_to_string(&bak)
+                .unwrap()
+                .contains("echo original"),
+            "the first backup must not be clobbered"
+        );
+        let bak1 = hooks_dir.join("pre-push.nestweaver.bak.1");
+        assert!(
+            std::fs::read_to_string(&bak1)
+                .unwrap()
+                .contains("echo second"),
+            "a second foreign hook must get a numbered backup"
         );
     }
 }

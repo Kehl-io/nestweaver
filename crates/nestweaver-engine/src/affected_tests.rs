@@ -23,12 +23,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use nestweaver_parser::is_test_file;
 use nestweaver_store::GraphStore;
 
+use crate::blast_radius::{AnalysisStatus, Notification, NotificationLevel};
 use crate::process::detect_changes_impact;
 
 /// Maximum reverse-traversal depth for finding dependent tests.
@@ -87,6 +88,14 @@ pub struct AffectedTestsResult {
     pub summary: String,
     /// Honest framing of what this analysis can and cannot guarantee.
     pub disclaimer: String,
+    /// Whether the selection ran to completion. A `Degraded` status means the
+    /// affected-tests set is incomplete — a CI consumer should fall back to
+    /// running the full suite rather than trusting this subset.
+    #[serde(default)]
+    pub status: AnalysisStatus,
+    /// Machine-readable reasons the selection was incomplete or degraded.
+    #[serde(default)]
+    pub notifications: Vec<Notification>,
 }
 
 /// A changed source symbol reference.
@@ -110,19 +119,33 @@ provably-safe subset. Misses reflection, DI, codegen, and data-driven/integratio
 ///   4. bucket by traversal depth (tier_1 = depth 1, etc.), ordering within a
 ///      tier by edge confidence.
 pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<AffectedTestsResult> {
-    // Step 1: changed files → changed symbols.
-    let impact = detect_changes_impact(store, changed_files, MAX_TEST_DEPTH)
-        .context("mapping changed files to symbols")?;
+    // Trust core: a failed traversal must surface as `Degraded` so a CI
+    // consumer runs the full suite instead of trusting an incomplete subset.
+    let mut status = AnalysisStatus::Complete;
+    let mut notifications: Vec<Notification> = Vec::new();
 
-    let changed_symbols: Vec<ChangedSymbolRef> = impact
-        .affected_symbols
-        .iter()
-        .map(|s| ChangedSymbolRef {
-            uid: s.uid.clone(),
-            name: s.name.clone(),
-            file_path: s.file_path.clone(),
-        })
-        .collect();
+    // Step 1: changed files → changed symbols.
+    let changed_symbols: Vec<ChangedSymbolRef> =
+        match detect_changes_impact(store, changed_files, MAX_TEST_DEPTH) {
+            Ok(impact) => impact
+                .affected_symbols
+                .iter()
+                .map(|s| ChangedSymbolRef {
+                    uid: s.uid.clone(),
+                    name: s.name.clone(),
+                    file_path: s.file_path.clone(),
+                })
+                .collect(),
+            Err(e) => {
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!("mapping changed files to symbols failed: {e}"),
+                    descriptor: "store.detect-changes-failed".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+                Vec::new()
+            }
+        };
 
     // Step 2 + 3: reverse-traverse from each changed symbol and keep tests.
     //
@@ -150,9 +173,20 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     }
 
     for cs in &changed_symbols {
-        let callers = store
-            .impact(&cs.uid, MAX_TEST_DEPTH, MIN_CONFIDENCE)
-            .with_context(|| format!("reverse traversal for {}", cs.uid))?;
+        let callers = match store.impact(&cs.uid, MAX_TEST_DEPTH, MIN_CONFIDENCE) {
+            Ok(callers) => callers,
+            Err(e) => {
+                // Do NOT propagate/drop silently — an incomplete affected-tests
+                // set that reads as "few tests" is the dangerous failure mode.
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!("reverse traversal for {} failed: {e}", cs.uid),
+                    descriptor: "store.impact-failed".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+                continue;
+            }
+        };
         for node in callers {
             if !is_test_file(&node.file_path) {
                 continue;
@@ -202,6 +236,8 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
         tier_3,
         summary,
         disclaimer: DISCLAIMER.to_string(),
+        status,
+        notifications,
     })
 }
 

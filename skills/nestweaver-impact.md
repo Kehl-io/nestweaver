@@ -1,9 +1,9 @@
 ---
 name: nestweaver-impact
-description: Check blast radius before modifying code using NestWeaver. DO NOT grep for callers — brain_impact shows the full dependency chain with confidence scores in one call.
+description: Check blast radius before modifying code using NestWeaver. DO NOT grep for callers — brain_impact shows confidence-weighted impact over the indexed call/type graph in one call.
 ---
 
-**Use NestWeaver instead of grep to find callers/dependents.** `brain_impact` returns the full transitive blast radius with confidence-weighted impact scores — no need to manually grep for usages.
+**Use NestWeaver instead of grep to find callers/dependents.** `brain_impact` returns confidence-weighted impact over the indexed call/type graph — no need to manually grep for usages.
 
 Before modifying a function, class, or module:
 
@@ -16,3 +16,12 @@ Before modifying a function, class, or module:
 7. Call `cross_repo_contracts` if the symbol might be used across services
 8. Call `backlinks` if the symbol is referenced in vault notes
 9. Report: what will break (sorted by impact_score), what tests to run, what notes document this decision
+
+## Limitations
+
+Impact results are a **lower bound** — they over-approximate the *candidate set* over the indexed graph, not a proven set of affected code. Treat them as "at least this, possibly more":
+
+- **False-negative classes not captured:** dynamic dispatch (trait objects / virtual calls), reflection, dependency-injection / config wiring, and macro / codegen output. Dependents reached only through these are invisible to static traversal.
+- **Pruning & depth cuts:** low-confidence paths are pruned below a `0.10` impact-score threshold, and paths deeper than `max_depth` are cut. Both are surfaced via the `coverage.traversal_truncated` flag and the `blind_spots` list — check them before trusting a "small" blast radius.
+- **Freshness:** results are only as current as the index. A stale or behind-source repo shows in `coverage.stale_repos` / `coverage.repos_not_indexed`.
+- **Cross-repo severities are heuristics:** the org-wide `breaking` / `warning` / `info` levels are reach-based (`severitySource: reach-only`), NOT a verified signature or contract diff — confirm real breakage before gating on them.

@@ -33,3 +33,15 @@ summary_model = "qwen2.5-coder:7b"
 [git]
 # How the server authenticates to clone/fetch private repos: "ssh" or "token".
 credential_method = "ssh"
+
+# [authz] — optional per-repo authorization for Blast Radius (host-agnostic).
+# Absent/empty => disabled => every caller sees all repos (zero behavior change).
+# Any rule enables the policy and is fail-closed: unknown tokens see nothing.
+# [authz.rules]
+# "team-frontend-token" = ["github.com/acme/frontend*"]
+# "team-backend-token"  = ["github.com/acme/backend*"]
+
+# [pr_impact] — what `pr-impact --strict` / the strict pre-push hook blocks on.
+# [pr_impact]
+# strict_block_on_breaking = true    # block on a contract-verified breaking change (default)
+# strict_block_on_high_risk = false  # also block on a complete High-risk run (default off)

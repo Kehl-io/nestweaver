@@ -469,17 +469,39 @@ nestweaver pre-push-impact --diff origin/main..HEAD --format json \
 
 ### Two-tier blast radius
 
-When connected to a server, `blast_radius` returns two-tier results:
+When connected to a server, `blast_radius` returns a two-tier envelope. Each
+tier is an **object**, not an array: `local_impact` is the full local blast
+radius result (with its own `changed_symbols`, `affected_symbols`, `coverage`,
+etc.), and `org_wide_impact` wraps the server's result under `results` alongside
+the `source_server` it came from. Provenance is carried in `_meta.sources`.
 
 ```json
 {
-  "local_impact": [...],
-  "org_wide_impact": [...],
+  "tier": "two_tier",
+  "local_impact": {
+    "changed_symbols": [...],
+    "affected_symbols": [...],
+    "risk": "medium",
+    "coverage": { "...": "..." }
+  },
+  "org_wide_impact": {
+    "source_server": "server",
+    "results": {
+      "changed_symbols": [...],
+      "affected_symbols": [...]
+    }
+  },
   "_meta": {
     "sources": ["local", "server"]
   }
 }
 ```
+
+When no healthy upstream is configured, the response degrades to
+`tier: "local_only"` (the local result plus a `tier` marker, with no
+`org_wide_impact`). When an upstream is configured but the org-wide query fails
+or times out, `tier` stays `"two_tier"` and `org_wide_impact` becomes
+`{ "source_server": ..., "status": "unavailable", "note": ... }`.
 
 ---
 

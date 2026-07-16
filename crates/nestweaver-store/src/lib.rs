@@ -33,7 +33,7 @@ pub use tantivy_index::{
     PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K, SearchHit,
     TantivyError, TantivyIndex,
 };
-pub use traverse::{ImpactEdge, ImpactNode};
+pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{DiscardedVault, MergeResult, PurgeInstanceResult};
 
 #[cfg(test)]
@@ -895,6 +895,30 @@ mod tests {
         assert!(matches!(err, crate::StoreError::NotFound));
         let still_there = store.lookup_symbol("sym-del-b").unwrap();
         assert_eq!(still_there.uid, "sym-del-b");
+    }
+
+    #[test]
+    fn symbols_in_file_in_repo_scopes_by_repo() {
+        let store = test_store();
+        store.insert_repo(&make_repo("repo-scope-1")).unwrap();
+        store.insert_repo(&make_repo("repo-scope-2")).unwrap();
+
+        // Same relative path in two different repos.
+        let sym_1 = make_symbol("sym-scope-1", "main_1", "repo-scope-1", "src/main.rs");
+        let sym_2 = make_symbol("sym-scope-2", "main_2", "repo-scope-2", "src/main.rs");
+        store.insert_symbol(&sym_1).unwrap();
+        store.insert_symbol(&sym_2).unwrap();
+
+        // Scoped lookup returns only the requested repo's symbol.
+        let scoped = store
+            .symbols_in_file_in_repo("src/main.rs", "repo-scope-1")
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].uid, "sym-scope-1");
+
+        // The un-scoped lookup returns both.
+        let all = store.symbols_in_file("src/main.rs").unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[test]

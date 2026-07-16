@@ -230,6 +230,46 @@ pub struct InstanceConfig {
     /// via its own discovery layer.
     #[serde(default)]
     pub upstream: Vec<UpstreamEntry>,
+    /// Per-repo authorization policy (`[authz]`, Blast Radius R9/R9b). Absent /
+    /// empty ⇒ disabled ⇒ every caller is `VisibleRepos::All` (no behavior
+    /// change). See [`AuthzConfig`].
+    #[serde(default)]
+    pub authz: Option<AuthzConfig>,
+    /// Pre-push / CI strict-gate policy (`[pr_impact]`, Blast Radius R17a).
+    /// Controls what `pr-impact --strict` blocks a push on. Absent ⇒ the default
+    /// policy: block on contract-verified breaking changes, NOT on the High-risk
+    /// heuristic. See [`PrImpactConfig`].
+    #[serde(default)]
+    pub pr_impact: Option<PrImpactConfig>,
+}
+
+/// Pre-push / CI strict-gate policy (`[pr_impact]`).
+///
+/// `pr-impact --strict` (and the strict pre-push hook) exits non-zero — blocking
+/// the push — according to these switches. The default is precision-first: block
+/// only on a *contract-verified* breaking change (a decidable signature break),
+/// never on the risk *heuristic*, so a legitimate change to a central symbol
+/// isn't blocked by a high score. Opt into `strict_block_on_high_risk` for a
+/// stricter gate. A degraded/incomplete run is never blocked on risk regardless.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PrImpactConfig {
+    /// Block a `--strict` run on a contract-verified breaking change
+    /// (`BreakTier::Breaking`). Default: true.
+    #[serde(default = "default_true")]
+    pub strict_block_on_breaking: bool,
+    /// Also block a `--strict` run on a *complete* High-risk (heuristic) result
+    /// (`GateState::RiskFlagged`). Default: false — the risk score is advisory.
+    #[serde(default)]
+    pub strict_block_on_high_risk: bool,
+}
+
+impl Default for PrImpactConfig {
+    fn default() -> Self {
+        Self {
+            strict_block_on_breaking: true,
+            strict_block_on_high_risk: false,
+        }
+    }
 }
 
 /// `[embedding]` — local embedding model and hybrid-search blend configuration.
@@ -352,6 +392,30 @@ impl Default for CacheConfig {
         Self {
             max_size_mb: default_cache_max_size_mb(),
         }
+    }
+}
+
+/// `[authz]` — per-repo authorization policy (Blast Radius R9/R9b).
+///
+/// Maps a query bearer token to a list of repo glob patterns (matched against
+/// each repo's `url` or `uid`). An empty map (or an absent `[authz]` section)
+/// leaves the policy *disabled*: every caller resolves to
+/// [`VisibleRepos::All`](crate::authz::VisibleRepos::All) and blast-radius
+/// redaction is a no-op — the historical single-trust-domain behavior. Add any
+/// rule and the policy is *enabled*: it fails closed for unknown tokens.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthzConfig {
+    /// token -> repo glob patterns (matched against `Repo.url` and `Repo.uid`).
+    #[serde(default)]
+    pub rules: HashMap<String, Vec<String>>,
+}
+
+impl AuthzConfig {
+    /// Build a [`StaticConfigPermissionSource`](crate::authz::StaticConfigPermissionSource)
+    /// from this config. An empty rule map yields a disabled source (everyone
+    /// sees [`VisibleRepos::All`](crate::authz::VisibleRepos::All)).
+    pub fn build_permission_source(&self) -> crate::authz::StaticConfigPermissionSource {
+        crate::authz::StaticConfigPermissionSource::new(self.rules.clone())
     }
 }
 
