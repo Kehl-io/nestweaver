@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.0](https://github.com/Kehl-io/nestweaver/compare/v2.3.4...v2.4.0) (2026-07-16)
+
+
+### Features
+
+* **blast-radius:** production-grade trust core, contract-diff, per-repo authz, SARIF & pre-push hooks ([#138](https://github.com/Kehl-io/nestweaver/issues/138)) ([442b6f6](https://github.com/Kehl-io/nestweaver/commit/442b6f69d7471daa26a9c26586b20eeade841878))
+
 ## [2.3.4](https://github.com/Kehl-io/nestweaver/compare/v2.3.3...v2.3.4) (2026-07-13)
 
 
