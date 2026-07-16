@@ -35,6 +35,25 @@ fn rate_limit_key(req: &Request<()>, bearer: &str) -> String {
         .unwrap_or_else(|| bearer.to_string())
 }
 
+/// Derive the caller's authorization [`Identity`] for an already-validated
+/// bearer (R9/R9b — per-repo Blast Radius scoping).
+///
+/// By the time this runs the bearer has already matched either the admin token
+/// or the query token — a non-match returns `UNAUTHENTICATED` earlier in the
+/// interceptor, so the result is never `Anonymous`. `is_admin` is the
+/// constant-time admin-match already computed by the interceptor (not
+/// recomputed here). Admin ⇒ [`Identity::Admin`]; otherwise the query-token
+/// value keys [`Identity::Token`], matching the MCP-HTTP `resolve_identity`
+/// contract so both transports scope visibility identically.
+pub fn derive_identity(bearer: &str, is_admin: bool) -> nestweaver_engine::authz::Identity {
+    use nestweaver_engine::authz::Identity;
+    if is_admin {
+        Identity::Admin
+    } else {
+        Identity::Token(bearer.to_string())
+    }
+}
+
 /// Returns a tonic interceptor that validates bearer tokens and enforces
 /// per-client rate limits.
 ///
@@ -78,8 +97,18 @@ pub fn bearer_auth_interceptor(
                     rl.check(&rate_limit_key(&req, bearer))?;
                 }
 
+                // R9/R9b: derive the caller's authorization identity while
+                // `bearer` still borrows the request metadata (before the move
+                // below). The bearer already matched (admin or query token) — a
+                // non-match returned above — so this is never `Anonymous`.
+                let identity = derive_identity(bearer, is_admin);
+
                 let mut req = req;
                 req.extensions_mut().insert(IsAdmin(is_admin));
+                // Attach the identity so handlers can scope Blast Radius output
+                // to the caller's visible repos. `IsAdmin` (the mutation gate)
+                // is left untouched.
+                req.extensions_mut().insert(identity);
                 Ok(req)
             }
             _ => Err(Status::unauthenticated("missing or invalid bearer token")),
@@ -178,6 +207,63 @@ mod tests {
         for _ in 0..50 {
             assert!(f(request_with_token("admin-token")).is_ok());
         }
+    }
+
+    #[test]
+    fn admin_token_attaches_admin_identity() {
+        use nestweaver_engine::authz::Identity;
+        let f =
+            bearer_auth_interceptor(Some("query-token".into()), Some("admin-token".into()), None);
+        let req = f(request_with_token("admin-token")).unwrap();
+        assert_eq!(
+            req.extensions().get::<Identity>(),
+            Some(&Identity::Admin),
+            "admin bearer must resolve to Identity::Admin"
+        );
+        // The mutation gate (IsAdmin) must still be set correctly.
+        assert!(matches!(
+            req.extensions().get::<IsAdmin>(),
+            Some(IsAdmin(true))
+        ));
+    }
+
+    #[test]
+    fn query_token_attaches_token_identity() {
+        use nestweaver_engine::authz::Identity;
+        let f =
+            bearer_auth_interceptor(Some("query-token".into()), Some("admin-token".into()), None);
+        let req = f(request_with_token("query-token")).unwrap();
+        assert_eq!(
+            req.extensions().get::<Identity>(),
+            Some(&Identity::Token("query-token".to_string())),
+            "query bearer must resolve to Identity::Token(<value>)"
+        );
+        // Query token is not admin — the mutation gate stays false.
+        assert!(matches!(
+            req.extensions().get::<IsAdmin>(),
+            Some(IsAdmin(false))
+        ));
+    }
+
+    #[test]
+    fn no_auth_attaches_no_identity() {
+        use nestweaver_engine::authz::Identity;
+        // When auth is disabled the early-return path inserts no extensions;
+        // handlers treat the absent identity as Anonymous.
+        let f = bearer_auth_interceptor(None, None, None);
+        let req = f(Request::new(())).unwrap();
+        assert!(req.extensions().get::<Identity>().is_none());
+        assert!(req.extensions().get::<IsAdmin>().is_none());
+    }
+
+    #[test]
+    fn derive_identity_maps_admin_and_token() {
+        use nestweaver_engine::authz::Identity;
+        assert_eq!(super::derive_identity("anything", true), Identity::Admin);
+        assert_eq!(
+            super::derive_identity("query-token", false),
+            Identity::Token("query-token".to_string())
+        );
     }
 
     #[test]
