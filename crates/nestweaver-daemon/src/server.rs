@@ -1371,8 +1371,13 @@ impl NestWeaverDaemon for DaemonService {
         if req.watch && !req.watch_repo_path.is_empty() {
             let watch_db = state.db_path.clone();
             let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
+            // nw-046: default to the daemon's logical instance (nw-019
+            // `data_instance_id`), not the literal "default" — otherwise a
+            // config daemon serving UI with --watch stamps symbols "default",
+            // a split-brain vs. how index/watch RPCs store nodes. Empty =
+            // daemon decides, mirroring index_vault/watch_code above.
             let watch_instance = if req.watch_instance_id.is_empty() {
-                "default".to_string()
+                state.data_instance_id.clone()
             } else {
                 req.watch_instance_id.clone()
             };

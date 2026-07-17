@@ -2728,7 +2728,12 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
 /// `watch`, so no path silently stamps symbols under the literal `"default"`
 /// when a `--config` names an instance.
 fn resolve_instance_id(flag: Option<String>, config: Option<&Path>) -> String {
-    flag.or_else(|| load_instance_config_opt(config).map(|c| c.instance_id))
+    // nw-047: treat an empty `--instance ""` as unset (not a literal empty
+    // instance) so it falls through to the config's `instance_id` / "default".
+    // This is CLI-side resolution only; the daemon's own empty=="decide" RPC
+    // convention lives in a different layer and is unaffected.
+    flag.filter(|f| !f.is_empty())
+        .or_else(|| load_instance_config_opt(config).map(|c| c.instance_id))
         .unwrap_or_else(|| "default".to_string())
 }
 
@@ -8017,7 +8022,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            let instance_id = instance.as_deref().unwrap_or("default");
+            // nw-047: resolve `--instance` > config `instance_id` > "default"
+            // (was `instance.unwrap_or("default")`, which ignored the config and
+            // treated `--instance ""` as a literal empty instance). Mirrors the
+            // daemon path's nw-019 resolution so the no-daemon direct write
+            // stamps nodes under the same logical instance the daemon would.
+            let instance_id = resolve_instance_id(instance, config.as_deref());
 
             // Identity: prefer the git origin remote when configured (used
             // only as an identity string — never fetched); fall back to a
@@ -8055,7 +8065,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let result = index_directory_with_options(
                     &repo_path,
                     &db_path,
-                    instance_id,
+                    &instance_id,
                     &repo_url,
                     &indexed_sha,
                     true,
@@ -8083,7 +8093,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let inc = incremental_index_with_name(
                     &repo_path,
                     &db_path,
-                    instance_id,
+                    &instance_id,
                     &repo_url,
                     name.as_deref(),
                 )

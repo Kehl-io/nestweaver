@@ -152,6 +152,7 @@ pub use config::{
     RankingConfig, RepoConfig, RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig,
     StorageConfig, UpstreamEntry, WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file,
     default_kind_priority, default_test_path_patterns, remove_repo_from_config_file,
+    validate_instance_id,
 };
 pub use contract_change::breaking_changes_from_git;
 pub use cross_domain::{

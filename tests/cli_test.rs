@@ -1331,6 +1331,129 @@ credential_method = "gh"
     );
 }
 
+/// nw-047: the no-daemon `index` direct-write path must resolve the instance
+/// id as `--instance` > config `instance_id` > "default" (was
+/// `instance.unwrap_or("default")`, which ignored the config). Without a
+/// `--instance` flag, a `--config` naming `cfgname` must stamp repos under
+/// `repo:cfgname:…`, not `repo:default:…`.
+fn nw047_valid_config(dir: &std::path::Path, instance_id: &str) -> std::path::PathBuf {
+    let config_path = dir.join(format!("instance-{instance_id}.toml"));
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "{instance_id}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            storage = dir.join("storage").display(),
+            workspace = dir.join("workspace").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("storage")).unwrap();
+    std::fs::create_dir_all(dir.join("workspace")).unwrap();
+    config_path
+}
+
+fn nw047_repo_instances(db_path: &std::path::Path) -> Vec<String> {
+    let output = nestweaver_cmd()
+        .args(["list-repos", "--json", "--db"])
+        .arg(db_path)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["instance_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn no_daemon_index_uses_config_instance_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    let db = dir.path().join("test.lbug");
+    let config_path = nw047_valid_config(dir.path(), "cfgname");
+
+    // Index with --config but NO --instance flag.
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--config")
+        .arg(&config_path)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    let instances = nw047_repo_instances(&db);
+    assert!(
+        instances.iter().any(|i| i == "cfgname"),
+        "repo must be stamped under config instance 'cfgname', got: {instances:?}"
+    );
+    assert!(
+        !instances.iter().any(|i| i == "default"),
+        "repo must NOT fall back to 'default' when --config names an instance, got: {instances:?}"
+    );
+}
+
+#[test]
+fn no_daemon_index_empty_instance_flag_falls_back_to_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    let db = dir.path().join("test.lbug");
+    let config_path = nw047_valid_config(dir.path(), "cfgname");
+
+    // `--instance ""` must be treated as unset (not a literal empty instance)
+    // and fall through to the config's instance_id.
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--instance")
+        .arg("")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    let instances = nw047_repo_instances(&db);
+    assert!(
+        instances.iter().any(|i| i == "cfgname"),
+        "empty --instance must fall back to config 'cfgname', got: {instances:?}"
+    );
+    assert!(
+        !instances.iter().any(|i| i.is_empty()),
+        "empty --instance must not be stored as a literal empty instance, got: {instances:?}"
+    );
+}
+
 #[test]
 fn index_does_not_write_setup_files_into_unrelated_cwd() {
     let dir = tempfile::tempdir().unwrap();
