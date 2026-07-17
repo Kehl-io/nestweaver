@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::ApiError;
+use crate::rank_events::with_rank_event;
 use crate::state::AppState;
 
 pub async fn list_repos(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
@@ -31,8 +32,15 @@ pub async fn repo_map(
     Query(params): Query<RepoMapParams>,
 ) -> Result<Response, ApiError> {
     let budget = params.budget.unwrap_or(2000);
-    let map = nestweaver_engine::generate_repo_map(&state.store, budget)?;
-    Ok(Json(json!({ "map": map })).into_response())
+    // `generate_repo_map` ranks symbols by PageRank and can trigger the lazy
+    // compute, so run it off the async runtime and emit `pagerank:recomputed`
+    // if a (re)compute fired.
+    let state2 = state.clone();
+    with_rank_event(&state, move || {
+        let map = nestweaver_engine::generate_repo_map(&state2.store, budget)?;
+        Ok(Json(json!({ "map": map })).into_response())
+    })
+    .await
 }
 
 pub async fn cross_repo_refs(

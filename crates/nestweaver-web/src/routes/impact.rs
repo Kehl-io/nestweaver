@@ -10,6 +10,7 @@ use nestweaver_store::ImpactNode;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::rank_events::with_rank_event;
 use crate::routes::workspaces::{self, P1Meta, P1Provenance, ResolvedWorkspace, WorkspaceKind};
 use crate::state::AppState;
 
@@ -83,10 +84,12 @@ pub async fn impact(
 ) -> Result<Response, ApiError> {
     // The impact computation fans out into many sequential store queries
     // (BFS traversal, layered edge reconstruction, affected-test hints), so
-    // run it off the async runtime instead of blocking a worker thread.
-    let response = tokio::task::spawn_blocking(move || impact_response(&state, &uid, &params))
-        .await
-        .map_err(|err| ApiError::internal(format!("impact task failed: {err}")))??;
+    // run it off the async runtime instead of blocking a worker thread. Route
+    // through `with_rank_event` for consistency with the other blocking store
+    // handlers — if a store call happens to trigger a lazy PageRank compute,
+    // the SSE event is emitted; otherwise the wrapper is transparent.
+    let state2 = state.clone();
+    let response = with_rank_event(&state, move || impact_response(&state2, &uid, &params)).await?;
     Ok(Json(response).into_response())
 }
 

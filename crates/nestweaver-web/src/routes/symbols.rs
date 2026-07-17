@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::error::ApiError;
+use crate::rank_events::with_rank_event;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -72,7 +73,13 @@ pub async fn symbols_top(
     Query(params): Query<TopParams>,
 ) -> Result<Response, ApiError> {
     let limit = params.limit.unwrap_or(20).min(1000);
-    let symbols = state.store.symbols_by_pagerank(Some(limit))?;
-    let json = serde_json::to_value(&symbols)?;
-    Ok(Json(json).into_response())
+    // `symbols_by_pagerank` triggers the lazy PageRank compute on a cold cache,
+    // so run it off the async runtime and emit `pagerank:recomputed` if it fired.
+    let state2 = state.clone();
+    with_rank_event(&state, move || {
+        let symbols = state2.store.symbols_by_pagerank(Some(limit))?;
+        let json = serde_json::to_value(&symbols)?;
+        Ok(Json(json).into_response())
+    })
+    .await
 }
