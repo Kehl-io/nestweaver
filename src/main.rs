@@ -3113,7 +3113,7 @@ fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig, fo
     let gate_open =
         setup::should_auto_setup(std::io::stderr().is_terminal(), out.quiet, &cwd, repo_root);
     if force_setup || gate_open {
-        match setup::run_auto_setup(db_path, repo_root) {
+        match setup::run_auto_setup(db_path, repo_root, out.quiet) {
             Ok(()) => {
                 let _ = std::fs::write(&marker_path, "");
             }

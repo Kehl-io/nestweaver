@@ -8,6 +8,52 @@ struct ToolSetup {
     detected: bool,
 }
 
+/// Print the one-time "NestWeaver Setup" banner (title + separator + database
+/// line). Hoisted out of `run_setup` so a per-tool loop (auto-setup) prints it
+/// at most once per invocation instead of once per detected tool (nw-051).
+fn print_setup_banner(db_path: &Path) {
+    let db_str = db_path.to_string_lossy();
+    println!("NestWeaver Setup");
+    println!("{}", "─".repeat(40));
+    if db_path.exists() {
+        println!("Database: {} (exists)", db_str);
+    } else {
+        println!("Database: {} (will be created on first index)", db_str);
+    }
+    println!();
+}
+
+/// Configure a single tool by name. Does NOT print the banner — callers own
+/// banner printing so it happens once per invocation (nw-051).
+fn configure_tool(
+    name: &str,
+    db_path: &Path,
+    allow_writes: bool,
+    force_overwrite: bool,
+    base: &Path,
+) -> Result<(), anyhow::Error> {
+    match name {
+        "claude-code" => setup_claude_code(db_path, allow_writes, force_overwrite, base)?,
+        "cursor" => setup_cursor(db_path, allow_writes, force_overwrite, base)?,
+        "codex" => setup_codex(db_path, allow_writes, base)?,
+        "windsurf" => setup_windsurf(db_path, allow_writes)?,
+        "jetbrains" => setup_jetbrains(db_path, allow_writes, base)?,
+        "vscode" => setup_vscode(db_path, allow_writes, base)?,
+        "gemini" => setup_gemini(db_path, allow_writes, base)?,
+        "copilot" => setup_copilot(db_path, allow_writes, base)?,
+        "aider" => setup_aider(db_path, allow_writes, base)?,
+        "kiro" => setup_kiro(db_path, allow_writes, base)?,
+        "continue" => setup_continue(db_path, allow_writes, base)?,
+        "cline" => setup_cline(db_path, allow_writes, base)?,
+        "opencode" => setup_opencode(db_path, allow_writes, base)?,
+        "trae" => setup_trae(db_path, allow_writes, base)?,
+        "devin" => setup_devin(db_path, allow_writes, base)?,
+        "hermes" => setup_hermes(db_path, allow_writes, base)?,
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn run_setup(
     tool: Option<&str>,
     db_path: &Path,
@@ -16,17 +62,7 @@ pub fn run_setup(
     force_overwrite: bool,
     base: &Path,
 ) -> Result<(), anyhow::Error> {
-    let db_str = db_path.to_string_lossy();
-
-    println!("NestWeaver Setup");
-    println!("{}", "─".repeat(40));
-
-    if db_path.exists() {
-        println!("Database: {} (exists)", db_str);
-    } else {
-        println!("Database: {} (will be created on first index)", db_str);
-    }
-    println!();
+    print_setup_banner(db_path);
 
     let tools = detect_tools(base);
 
@@ -44,25 +80,7 @@ pub fn run_setup(
         }
 
         any_configured = true;
-        match t.name {
-            "claude-code" => setup_claude_code(db_path, allow_writes, force_overwrite, base)?,
-            "cursor" => setup_cursor(db_path, allow_writes, force_overwrite, base)?,
-            "codex" => setup_codex(db_path, allow_writes, base)?,
-            "windsurf" => setup_windsurf(db_path, allow_writes)?,
-            "jetbrains" => setup_jetbrains(db_path, allow_writes, base)?,
-            "vscode" => setup_vscode(db_path, allow_writes, base)?,
-            "gemini" => setup_gemini(db_path, allow_writes, base)?,
-            "copilot" => setup_copilot(db_path, allow_writes, base)?,
-            "aider" => setup_aider(db_path, allow_writes, base)?,
-            "kiro" => setup_kiro(db_path, allow_writes, base)?,
-            "continue" => setup_continue(db_path, allow_writes, base)?,
-            "cline" => setup_cline(db_path, allow_writes, base)?,
-            "opencode" => setup_opencode(db_path, allow_writes, base)?,
-            "trae" => setup_trae(db_path, allow_writes, base)?,
-            "devin" => setup_devin(db_path, allow_writes, base)?,
-            "hermes" => setup_hermes(db_path, allow_writes, base)?,
-            _ => {}
-        }
+        configure_tool(t.name, db_path, allow_writes, force_overwrite, base)?;
     }
 
     if let Some(specific) = tool
@@ -1070,27 +1088,37 @@ fn tool_already_configured(tool_name: &str, base: &Path) -> bool {
 /// Run setup automatically after first index. Only configures tools that are
 /// detected and don't already have NestWeaver configs. Non-fatal — errors are
 /// logged but don't propagate.
-pub fn run_auto_setup(db_path: &std::path::Path, base: &Path) -> Result<(), anyhow::Error> {
-    let tools = detect_tools(base);
-    if tools.is_empty() {
+pub fn run_auto_setup(
+    db_path: &std::path::Path,
+    base: &Path,
+    quiet: bool,
+) -> Result<(), anyhow::Error> {
+    // Only tools that are actually present and not yet wired up. Computed up
+    // front so we can print the banner at most once — and skip it entirely when
+    // there's nothing to configure (nw-051).
+    let to_configure: Vec<&'static str> = detect_tools(base)
+        .into_iter()
+        .filter(|t| t.detected && !tool_already_configured(t.name, base))
+        .map(|t| t.name)
+        .collect();
+    if to_configure.is_empty() {
         return Ok(());
     }
 
+    // Banner once per invocation, and suppressed under --quiet (nw-051).
+    if !quiet {
+        print_setup_banner(db_path);
+    }
+
     let mut configured = Vec::new();
-    for tool in &tools {
-        if !tool.detected {
-            continue;
-        }
-        if tool_already_configured(tool.name, base) {
-            continue;
-        }
-        match run_setup(Some(tool.name), db_path, false, false, false, base) {
-            Ok(()) => configured.push(tool.name),
-            Err(e) => tracing::debug!("auto-setup skipped {}: {e}", tool.name),
+    for name in to_configure {
+        match configure_tool(name, db_path, false, false, base) {
+            Ok(()) => configured.push(name),
+            Err(e) => tracing::debug!("auto-setup skipped {}: {e}", name),
         }
     }
 
-    if !configured.is_empty() {
+    if !configured.is_empty() && !quiet {
         eprintln!(
             "  Auto-configured NestWeaver for: {}. Run `nestweaver setup --help` to customize.",
             configured.join(", ")

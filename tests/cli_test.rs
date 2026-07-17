@@ -1390,6 +1390,89 @@ fn index_does_not_write_setup_files_into_unrelated_cwd() {
 }
 
 #[test]
+fn index_setup_prints_banner_at_most_once_with_multiple_tools() {
+    // nw-051: auto-setup used to reprint the "NestWeaver Setup" banner once per
+    // detected tool. With two tools present it must still appear exactly once.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    // Two detectable tools anchored to the repo root.
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::create_dir_all(repo.join(".claude")).unwrap();
+    let db = dir.path().join("test.lbug");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--setup",
+        ])
+        .current_dir(&repo)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let banner_count = combined.matches("NestWeaver Setup").count();
+    assert_eq!(
+        banner_count, 1,
+        "banner must print exactly once regardless of tool count, got {banner_count}:\n{combined}"
+    );
+}
+
+#[test]
+fn index_setup_quiet_suppresses_setup_banner() {
+    // nw-051: --setup --quiet should still configure tools but stay quiet.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::create_dir_all(repo.join(".claude")).unwrap();
+    let db = dir.path().join("test.lbug");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--setup",
+            "--quiet",
+        ])
+        .current_dir(&repo)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("NestWeaver Setup"),
+        "--quiet must suppress the setup banner, got:\n{combined}"
+    );
+    // Setup still happened.
+    assert!(
+        repo.join(".cursor/mcp.json").exists(),
+        "--setup must still configure tools under --quiet"
+    );
+}
+
+#[test]
 fn index_setup_flag_forces_setup_anchored_to_repo_root() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("cwd");
