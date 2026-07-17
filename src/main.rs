@@ -700,6 +700,10 @@ enum Commands {
                     opt-out for --with-git-activity"
         )]
         config: Option<PathBuf>,
+        /// Configure detected AI tool integrations at the indexed repo root after
+        /// indexing (bypasses the TTY/cwd auto-setup gate).
+        #[arg(long)]
+        setup: bool,
     },
     /// Get task-focused context: structural subgraph around seed symbols
     ///
@@ -3100,13 +3104,15 @@ fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
 /// nw-023: first-index auto-setup, gated to "human at a TTY standing in the
 /// indexed repo", writes anchored to the repo root, marker written only on an
 /// actual run so a skip never permanently disables first-run setup.
-fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig) {
+fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig, force_setup: bool) {
     let marker_path = nestweaver_engine::sidecar_path(db_path, ".setup_done");
-    if marker_path.exists() {
+    if marker_path.exists() && !force_setup {
         return;
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    if setup::should_auto_setup(std::io::stderr().is_terminal(), out.quiet, &cwd, repo_root) {
+    let gate_open =
+        setup::should_auto_setup(std::io::stderr().is_terminal(), out.quiet, &cwd, repo_root);
+    if force_setup || gate_open {
         match setup::run_auto_setup(db_path, repo_root) {
             Ok(()) => {
                 let _ = std::fs::write(&marker_path, "");
@@ -7949,6 +7955,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             with_trigrams,
             with_git_activity,
             config,
+            setup,
         } => {
             let repo_path = match repo {
                 Some(p) => p,
@@ -8006,7 +8013,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 // nw-023: setup is client-side (config files + marker, no DB access); give
                 // daemon-mode users the same gated first-index convenience as the direct path.
-                maybe_run_auto_setup(&db_path, &repo_path, out);
+                maybe_run_auto_setup(&db_path, &repo_path, out, setup);
                 return Ok((EXIT_SUCCESS, None));
             }
 
@@ -8176,7 +8183,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Auto-setup AI tool integrations on first index of this repo.
             // Uses a marker sidecar so it only fires once per db, not on every
             // incremental re-index. Non-fatal — a failure here never aborts the index.
-            maybe_run_auto_setup(&db_path, &repo_path, out);
+            maybe_run_auto_setup(&db_path, &repo_path, out, setup);
 
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",

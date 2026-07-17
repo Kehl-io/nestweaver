@@ -1388,3 +1388,44 @@ fn index_does_not_write_setup_files_into_unrelated_cwd() {
         "skip must print a hint, got: {stderr}"
     );
 }
+
+#[test]
+fn index_setup_flag_forces_setup_anchored_to_repo_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("cwd");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    // Detection anchored to the repo (base), not the cwd:
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    let db = dir.path().join("test.lbug");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--setup",
+        ])
+        .current_dir(&cwd)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    assert!(
+        repo.join(".cursor/mcp.json").exists(),
+        "--setup must write configs at the indexed repo root even from a foreign, non-TTY cwd"
+    );
+    assert!(
+        !cwd.join(".cursor/mcp.json").exists(),
+        "cwd must stay clean"
+    );
+    assert!(
+        dir.path().join("test.lbug.setup_done").exists(),
+        "a forced run counts as done"
+    );
+}
