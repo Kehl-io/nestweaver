@@ -5982,6 +5982,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 let rt =
                     tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+                // nw-029: pre-warm PageRank so the first overview/impact query never
+                // pays the lazy compute. Fire-and-forget; single-flight (nw-029 T1)
+                // makes a concurrent first query wait on this instead of duplicating
+                // it. A DB whose sidecar was loaded at open is a no-op
+                // (ensure_pagerank_loaded's is_some() fast path).
+                {
+                    let store = state.store.clone();
+                    rt.spawn_blocking(move || {
+                        store.ensure_pagerank_loaded();
+                    });
+                }
+
                 rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
             }
 

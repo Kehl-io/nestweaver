@@ -1316,6 +1316,18 @@ impl NestWeaverDaemon for DaemonService {
             state.db_path.clone(),
         );
 
+        // nw-029: pre-warm PageRank so the first overview/impact query never pays
+        // the lazy compute. Fire-and-forget; single-flight (nw-029 T1) makes a
+        // concurrent first query wait on this instead of duplicating it. A DB
+        // whose sidecar was loaded at open is a no-op (ensure_pagerank_loaded's
+        // is_some() fast path).
+        {
+            let store = state.store.clone();
+            tokio::task::spawn_blocking(move || {
+                store.ensure_pagerank_loaded();
+            });
+        }
+
         let port = if req.port > 0 { req.port as u16 } else { 3000 };
         let open_browser = req.open_browser;
 
