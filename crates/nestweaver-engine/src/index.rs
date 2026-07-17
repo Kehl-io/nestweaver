@@ -538,6 +538,23 @@ fn index_directory_with_store_inner(
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
+    // nw-029: warm PageRank at index time so first queries (UI overview, impact,
+    // repo-map, hubs) never pay the lazy compute. Mirrors the incremental path.
+    // Release-build cost is seconds even at ~50k symbols; failure is non-fatal
+    // (lazy single-flight compute remains the backstop). The `files_count > 0 ||
+    // !exists` guard keeps a no-op re-index of an already-warm DB cheap.
+    if result.files_count > 0 || !crate::sidecar_path(db_path, ".pagerank.json").exists() {
+        if let Err(e) = store.compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
+        {
+            tracing::warn!("index-time PageRank failed (non-fatal): {e}");
+        } else {
+            let pr_path = crate::sidecar_path(db_path, ".pagerank.json");
+            if let Err(e) = store.save_pagerank_cache(&pr_path) {
+                tracing::warn!("saving pagerank sidecar failed (non-fatal): {e}");
+            }
+        }
+    }
+
     store.bump_and_persist_generation();
 
     Ok(result)
@@ -4041,6 +4058,28 @@ function hello(name) { return "Hello " + name; }
         );
         // files_count tracks only files that were actually processed (parsed).
         assert_eq!(result2.files_count, 0, "no files should be re-indexed");
+    }
+
+    #[test]
+    fn full_index_writes_pagerank_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.js"),
+            "function f() { g(); }\nfunction g() {}",
+        )
+        .unwrap();
+        index_directory(&repo, &db_path, "test", "https://example.com/a", "sha").unwrap();
+        let sidecar = dir.path().join("t.lbug.pagerank.json");
+        assert!(sidecar.exists(), "full index must compute+save pagerank");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert!(
+            json.as_object().map(|o| !o.is_empty()).unwrap_or(false),
+            "sidecar must contain scores"
+        );
     }
 
     #[test]

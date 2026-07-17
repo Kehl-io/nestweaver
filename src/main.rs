@@ -3101,7 +3101,13 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
         }
     })?;
 
-    let pr_path = path.with_extension("pagerank.json");
+    // nw-029: load the PageRank sidecar from the canonical path. Every writer
+    // and `migrate_sidecar` produce `<db>.lbug.pagerank.json` via
+    // `sidecar_path(db, ".pagerank.json")`; the old `with_extension` idiom
+    // yielded `<db>.pagerank.json`, so a direct (non-daemon) `ui`/query never
+    // warm-loaded ranks. Mirror the daemon's idiom (server.rs).
+    nestweaver_engine::migrate_sidecar(path, "pagerank.json", ".pagerank.json");
+    let pr_path = nestweaver_engine::sidecar_path(path, ".pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
 
     // Load interaction memory scores so PPR can apply a small bias toward
