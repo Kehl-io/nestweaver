@@ -27,6 +27,12 @@ export function useImpactMode() {
   const ranksGeneration = useStore((s) => s.ranksGeneration);
   const requestIdRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
+  // Full query identity of the last load we kicked off. A background rank
+  // refresh (SSE pagerank:recomputed -> ranksGeneration bump) re-runs this hook
+  // with the SAME key, so we can refetch silently instead of flashing to the
+  // loading scene (nw-029). Key MUST include depth + confidence, not just
+  // workspace/target — a partial key was the original pre-T6 hang bug.
+  const queryKeyRef = useRef<string | null>(null);
   const previousLayoutRef = useRef<{ key: string; graph: Graph } | null>(
     null,
   );
@@ -39,6 +45,9 @@ export function useImpactMode() {
     if (graphMode !== "impact" || !selectedNodeId) {
       requestIdRef.current += 1;
       abortRef.current = null;
+      // Leaving impact mode: forget the last query so re-entering always reads
+      // as a new query and shows loading for its first fetch.
+      queryKeyRef.current = null;
       return;
     }
 
@@ -53,6 +62,10 @@ export function useImpactMode() {
     const layoutKey = `${requestWorkspaceId}:${targetNodeId}`;
     const requestDepth = impactDepth;
     const requestConfidence = impactConfidence;
+    // Full query identity — a change in any of these is a genuinely new query.
+    const queryKey = `${requestWorkspaceId}:${targetNodeId}:${requestDepth}:${requestConfidence}`;
+    const isNewQuery = queryKeyRef.current !== queryKey;
+    queryKeyRef.current = queryKey;
     const isCurrentRequest = () => {
       const state = useStore.getState();
       return (
@@ -66,17 +79,24 @@ export function useImpactMode() {
     };
 
     try {
-      // Show the loading scene on EVERY new query. Previously this only fired
-      // when the workspace/target changed, which silently kept the prior graph
-      // on-screen while a re-query hung — an unhonest loading state.
-      clearGraphData();
-      setSceneMetadata(
-        workspaceSceneMetadataWithResult(
-          useStore.getState().selectedWorkspace()?._meta,
-          "loading",
-          `Loading impact for ${targetNodeId}.`,
-        ),
-      );
+      // Show the loading scene for a genuinely new query, or when nothing is
+      // currently rendered. A background rank refresh of an already-displayed
+      // graph (same query key, graph present) refetches silently and swaps in,
+      // so steady-state reindexing doesn't blink a healthy graph to a spinner
+      // every debounce window (nw-029). We still clear+load on every *new*
+      // query (workspace/target/depth/confidence change), keeping the honest
+      // loading state and the pre-T6 depth/confidence-change fix intact.
+      const hasGraph = (useStore.getState().graphInstance?.order ?? 0) > 0;
+      if (isNewQuery || !hasGraph) {
+        clearGraphData();
+        setSceneMetadata(
+          workspaceSceneMetadataWithResult(
+            useStore.getState().selectedWorkspace()?._meta,
+            "loading",
+            `Loading impact for ${targetNodeId}.`,
+          ),
+        );
+      }
 
       const result = await loadImpactLens(
         targetNodeId,
