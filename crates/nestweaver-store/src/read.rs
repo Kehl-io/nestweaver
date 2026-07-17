@@ -421,7 +421,7 @@ impl GraphStore {
             conn.query(&q)
                 .map_err(|e| StoreError::Query(e.to_string()))?
         };
-        result
+        let rows: Vec<Repo> = result
             .map(|row| {
                 let uid = extract_string(&row, 0)?;
                 let url = extract_string(&row, 1)?;
@@ -441,7 +441,23 @@ impl GraphStore {
                     root_path,
                 })
             })
-            .collect()
+            .collect::<Result<_, StoreError>>()?;
+
+        // nw-043 instrumentation: a Repo row whose provenance doesn't match this
+        // handle's DB is the isolation-anomaly signature. Debug builds trace every
+        // listing with handle provenance so a recurrence in ANY suite (not just the
+        // e2e guard) is attributable to a specific handle + path. Zero cost unless
+        // RUST_LOG=nw043=trace.
+        #[cfg(debug_assertions)]
+        if let Some(db_path) = self.db_path() {
+            for r in &rows {
+                tracing::trace!(target: "nw043",
+                    db = %db_path.display(), uid = %r.uid, url = %r.url,
+                    "list_repos row provenance");
+            }
+        }
+
+        Ok(rows)
     }
 
     pub fn list_services(&self, instance_id: Option<&str>) -> Result<Vec<Service>, StoreError> {
