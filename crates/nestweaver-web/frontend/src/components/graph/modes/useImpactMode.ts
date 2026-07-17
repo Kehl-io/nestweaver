@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import type Graph from "graphology";
 import { useStore } from "../../../stores";
-import { loadImpactLens } from "../../../api/impactLens";
+import { ImpactTimeoutError, loadImpactLens } from "../../../api/impactLens";
 import { workspaceSceneMetadataWithResult } from "../../../api/workspaces";
 import { buildGraphFromImpact } from "../utils/buildGraphFromImpact";
 import { applyElkLayout } from "../utils/elkLayout";
@@ -22,16 +22,28 @@ export function useImpactMode() {
   const impactConfidence = useStore((s) => s.impactConfidence);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
+  // Re-run the current impact query once a debounced PageRank recompute lands,
+  // so a timed-out/stale graph fills in when ranks are ready (nw-029).
+  const ranksGeneration = useStore((s) => s.ranksGeneration);
   const requestIdRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
   const previousLayoutRef = useRef<{ key: string; graph: Graph } | null>(
     null,
   );
 
   const loadImpactData = useCallback(async () => {
+    // Any prior in-flight request is now superseded — abort its fetch so we
+    // don't leave a hung PageRank request running against a cold DB.
+    abortRef.current?.abort();
+
     if (graphMode !== "impact" || !selectedNodeId) {
       requestIdRef.current += 1;
+      abortRef.current = null;
       return;
     }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     setActiveLens({ lens: "impact", label: "Impact", targetUid: selectedNodeId, workspaceId: activeWorkspaceId || "all" });
 
@@ -54,31 +66,27 @@ export function useImpactMode() {
     };
 
     try {
-      const currentState = useStore.getState();
-      const previousWorkspaceId =
-        currentState.sceneMetadata?.workspace_id ??
-        currentState.activeLens.workspaceId ??
-        "all";
-      const previousTargetId = currentState.activeLens.targetUid ?? null;
-      if (
-        previousWorkspaceId !== requestWorkspaceId ||
-        previousTargetId !== targetNodeId
-      ) {
-        clearGraphData();
-        setSceneMetadata(
-          workspaceSceneMetadataWithResult(
-            currentState.selectedWorkspace()?._meta,
-            "loading",
-            `Loading impact for ${targetNodeId}.`,
-          ),
-        );
-      }
+      // Show the loading scene on EVERY new query. Previously this only fired
+      // when the workspace/target changed, which silently kept the prior graph
+      // on-screen while a re-query hung — an unhonest loading state.
+      clearGraphData();
+      setSceneMetadata(
+        workspaceSceneMetadataWithResult(
+          useStore.getState().selectedWorkspace()?._meta,
+          "loading",
+          `Loading impact for ${targetNodeId}.`,
+        ),
+      );
 
-      const result = await loadImpactLens(targetNodeId, {
-        depth: requestDepth,
-        confidence: requestConfidence,
-        workspaceId: requestWorkspaceId,
-      });
+      const result = await loadImpactLens(
+        targetNodeId,
+        {
+          depth: requestDepth,
+          confidence: requestConfidence,
+          workspaceId: requestWorkspaceId,
+        },
+        controller.signal,
+      );
       if (!isCurrentRequest()) return;
 
       const graph = buildGraphFromImpact(result);
@@ -105,7 +113,28 @@ export function useImpactMode() {
       setSceneMetadata(result._meta ?? null);
       previousLayoutRef.current = { key: layoutKey, graph };
     } catch (err) {
+      // We aborted this request (superseded query or unmount) — stay silent.
+      if (err instanceof DOMException && err.name === "AbortError") return;
       if (!isCurrentRequest()) return;
+
+      if (err instanceof ImpactTimeoutError) {
+        // The backend is likely still computing ranks for a freshly indexed
+        // workspace; the debounced pagerank:recomputed SSE will retry us.
+        setSceneMetadata(
+          workspaceSceneMetadataWithResult(
+            useStore.getState().selectedWorkspace()?._meta,
+            "timed-out",
+            "Impact timed out while ranks are computing. It will refresh automatically when ready.",
+          ),
+        );
+        notify({
+          kind: "warning",
+          title: "Impact is taking longer than expected",
+          message:
+            "The graph may be computing ranks for a freshly indexed workspace. It will refresh automatically when ready.",
+        });
+        return;
+      }
 
       console.error("Failed to load impact:", err);
       const message = loadErrorMessage(err, "Failed to load impact graph");
@@ -130,6 +159,7 @@ export function useImpactMode() {
     impactConfidence,
     impactDepth,
     notify,
+    ranksGeneration,
     selectedNodeId,
     setActiveLens,
     setGraphData,
@@ -140,6 +170,7 @@ export function useImpactMode() {
     loadImpactData();
     return () => {
       requestIdRef.current += 1;
+      abortRef.current?.abort();
     };
   }, [loadImpactData]);
 }
