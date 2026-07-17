@@ -131,6 +131,56 @@ pub fn save_filemeta_sidecar(sidecar: &FileMetaSidecar, path: &Path) -> Result<(
     Ok(())
 }
 
+/// Drop the removed repo's slices from the change-detection sidecars so a later
+/// re-index of the SAME path re-indexes its files instead of silently skipping
+/// every one as `Unchanged` (nw-048). `remove-repo` deletes the repo's graph
+/// nodes/symbols but, without this, leaves the `.filemeta` slice behind — the
+/// re-added repo (same path → same uid, unchanged files) then classifies every
+/// file `Unchanged`, so the deleted symbols are never restored and `search`
+/// finds nothing.
+///
+/// Contract:
+/// * **uid-scoped** — ONLY `repo_uid`'s slice is removed from each sidecar;
+///   other repos sharing the DB keep their slices untouched (dropping the wrong
+///   slice would be the same silent-data-loss class this fixes).
+/// * **fail-safe** — a missing, corrupt, or old-format sidecar is a no-op:
+///   `load_filemeta_sidecar` / `ResolutionDeps::load` already fail open to empty,
+///   and a save error is logged, never propagated, so `remove-repo` cannot crash
+///   on sidecar hygiene. Each sidecar is only rewritten when the slice was
+///   actually present, so a missing sidecar is never materialized.
+///
+/// The `.parsed_cache` sidecar is deliberately left alone: it is content-hash
+/// keyed and shared across repos (collision-safe), so an orphaned entry there is
+/// harmless dead space, not a correctness hazard.
+pub fn remove_repo_sidecar_slices(db_path: &Path, repo_uid: &str) {
+    // filemeta — the primary nw-048 cause. A stale slice makes every file of the
+    // re-added repo classify `Unchanged`, so its symbols are never re-indexed.
+    crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
+    let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
+    let mut sidecar = load_filemeta_sidecar(&filemeta_path);
+    if sidecar.repos.remove(repo_uid).is_some()
+        && let Err(e) = save_filemeta_sidecar(&sidecar, &filemeta_path)
+    {
+        tracing::warn!(
+            error = %e, repo_uid,
+            "remove-repo: failed to drop filemeta slice (non-fatal)"
+        );
+    }
+
+    // resolution_deps — nw-045 hygiene. An orphaned slice here is inert
+    // (correctness-safe dead space), but dropped for cleanliness while we're here.
+    let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
+    let mut deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
+    if deps.remove_repo(repo_uid)
+        && let Err(e) = deps.save(&resolution_deps_path)
+    {
+        tracing::warn!(
+            error = %e, repo_uid,
+            "remove-repo: failed to drop resolution_deps slice (non-fatal)"
+        );
+    }
+}
+
 /// "Still alive" sets returned by [`merge_save_filemeta`], used to evict the
 /// parsed-cache / resolution-deps sidecars. A named struct so the same-typed
 /// sets can't be swapped at a call site.

@@ -1950,6 +1950,12 @@ impl NestWeaverDaemon for DaemonService {
                 .delete_repo_node(&req.repo_uid)
                 .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
 
+            // nw-048: drop the removed repo's change-detection sidecar slices so a
+            // later re-index of the SAME path re-indexes its files instead of
+            // skipping them all as `Unchanged` (which would leave the deleted
+            // symbols unrestored — search finds nothing). uid-scoped + fail-safe.
+            nestweaver_engine::remove_repo_sidecar_slices(&state.db_path, &req.repo_uid);
+
             if let Some(ref tantivy) = state.tantivy
                 && tantivy.has_writer()
             {

@@ -130,6 +130,14 @@ impl ResolutionDeps {
             slice.retain(|file, _| live_files.contains(file));
         }
     }
+
+    /// Drop `r_uid`'s entire slice. Returns `true` if a slice existed. Only the
+    /// named repo's slice is removed — every other repo sharing the DB keeps its
+    /// records. Used by `remove-repo` (nw-048/nw-045) so a re-added repo starts
+    /// from a clean dependency slice instead of inheriting a stale one.
+    pub fn remove_repo(&mut self, r_uid: &str) -> bool {
+        self.repos.remove(r_uid).is_some()
+    }
 }
 
 #[cfg(test)]

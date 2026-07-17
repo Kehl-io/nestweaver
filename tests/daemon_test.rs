@@ -937,3 +937,130 @@ fn daemon_index_reaches_auto_setup_gate() {
         "daemon index must reach the gate and print the setup hint, got: {stderr}"
     );
 }
+
+/// Index a repo through the daemon under an explicit instance id so the repo
+/// uid is identical across the initial index and any re-index (the tiered
+/// change-detection sidecar is keyed by repo uid).
+fn index_via_daemon_instance(repo_dir: &Path, db_path: &Path, instance: &str) {
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            instance,
+        ])
+        .assert()
+        .success();
+}
+
+/// nw-048: `remove-repo` must drop the removed repo's change-detection sidecar
+/// slices, so a later re-index of the SAME path re-indexes its files instead of
+/// silently skipping every one as `Unchanged`. Pre-fix, the stale `.filemeta`
+/// slice survived removal → the re-index found 0 files → the symbol was never
+/// restored → search returned nothing. Driven end-to-end through the real
+/// daemon (the sole DB writer in normal operation). A fixed `--instance` keeps
+/// the repo uid stable across index/remove/re-index so the stale slice is
+/// actually consulted (an instance mismatch would mint a new uid and mask it).
+#[test]
+fn daemon_remove_repo_then_reindex_restores_symbols() {
+    const INSTANCE: &str = "nw048";
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("rr").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // Repo with a distinctive symbol name we can search for.
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    std::fs::write(repo_dir.join("m.js"), "function cleanfn() { return 1; }").unwrap();
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args([
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    let _guard = DaemonGuard::new(&db_path);
+
+    // Initial index through the daemon (auto-starts it) creates the DB + the
+    // `.filemeta` sidecar slice under a fixed instance/uid.
+    index_via_daemon_instance(&repo_dir, &db_path, INSTANCE);
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Sanity: the symbol is searchable before removal. Route the search through
+    // the daemon (its live store) — a NESTWEAVER_NO_DAEMON read-only open could
+    // observe a stale snapshot while the daemon holds the write lock.
+    daemon_cmd()
+        .args(["search", "cleanfn", "--db", &db_path.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("cleanfn"));
+
+    // Remove the repo through the daemon (normal operation). This deletes the
+    // repo's graph nodes/symbols; the fix additionally drops its `.filemeta`
+    // and `.resolution_deps` sidecar slices.
+    daemon_cmd()
+        .args([
+            "remove-repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("symbol(s) deleted"));
+
+    // Re-index the SAME path through the daemon under the SAME instance/uid.
+    // We assert on the daemon's OWN report of how many files it re-indexed,
+    // which is deterministic and needs no read-back (a post-removal read of the
+    // store can return stale rows from the daemon's in-memory query cache, and a
+    // NESTWEAVER_NO_DAEMON read taken before the forked daemon fully releases the
+    // lock observes a stale pre-removal snapshot — both would mask the bug).
+    //
+    // Pre-fix: the orphaned `.filemeta` slice makes m.js classify as `Unchanged`
+    // → the daemon re-indexes 0 files → the deleted symbol is never restored
+    // ("Indexed 0 files"). Post-fix: the slice was dropped on removal → the
+    // daemon re-indexes the file ("Indexed 1 files") and restores the symbol.
+    let reindex = daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            INSTANCE,
+        ])
+        .assert()
+        .success();
+    let reindex_out = reindex.get_output();
+    let reindex_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reindex_out.stdout),
+        String::from_utf8_lossy(&reindex_out.stderr),
+    );
+    assert!(
+        reindex_log.contains("Indexed 1 files"),
+        "re-index after remove-repo must re-index the file (nw-048); \
+         pre-fix it reports 'Indexed 0 files'. Got:\n{reindex_log}"
+    );
+}
