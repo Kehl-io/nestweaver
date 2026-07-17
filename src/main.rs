@@ -8004,6 +8004,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok::<_, anyhow::Error>(())
                 })?;
 
+                // nw-023: setup is client-side (config files + marker, no DB access); give
+                // daemon-mode users the same gated first-index convenience as the direct path.
+                maybe_run_auto_setup(&db_path, &repo_path, out);
                 return Ok((EXIT_SUCCESS, None));
             }
 

@@ -854,3 +854,86 @@ name = "repo"
         );
     }
 }
+
+/// nw-023: prove the DEFAULT daemon index path now reaches the gated auto-setup
+/// helper. Before this change, `maybe_run_auto_setup` was only wired into the
+/// `NESTWEAVER_NO_DAEMON=1` direct path, so the daemon branch (what real
+/// interactive users hit) never ran setup OR printed the hint. Here we index
+/// through the daemon from a controlled cwd and assert the gate behaved the same
+/// as the direct-path regression test: piped stderr is not a TTY, so setup is
+/// SKIPPED (no config-file pollution, no marker written) and the hint is printed.
+#[test]
+fn daemon_index_reaches_auto_setup_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let cwd = dir.path().join("cwd");
+    let db_path = dir.path().join("setup").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    // Deterministic detection surface without relying on host PATH (mirrors the
+    // direct-path regression test in cli_test.rs).
+    std::fs::create_dir_all(cwd.join(".cursor")).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+
+    // Start daemon.
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Index through the daemon (NO NESTWEAVER_NO_DAEMON) from the controlled cwd.
+    // The client process — which runs the gate — evaluates against this cwd.
+    let output = daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .current_dir(&cwd)
+        .output()
+        .expect("daemon index failed to run");
+    assert!(
+        output.status.success(),
+        "daemon index should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Skipped (non-TTY): the gate must not write setup files into the cwd...
+    for f in [
+        ".mcp.json",
+        "AGENTS.md",
+        ".claude",
+        ".codex",
+        ".github",
+        ".cursor/mcp.json",
+        "devin.json",
+    ] {
+        assert!(
+            !cwd.join(f).exists(),
+            "daemon index must not write {f} into an unrelated cwd"
+        );
+    }
+    // ...nor into the repo root...
+    assert!(
+        !repo_dir.join(".mcp.json").exists(),
+        "non-TTY daemon index must not write into the repo either"
+    );
+    // ...nor write the marker (skip ≠ done, so a future interactive index still runs setup).
+    let marker = db_path.with_file_name(format!(
+        "{}.setup_done",
+        db_path.file_name().unwrap().to_str().unwrap()
+    ));
+    assert!(
+        !marker.exists(),
+        "marker must only be written when setup actually ran, not on a skip"
+    );
+    // The hint proves the daemon branch reached the gate (previously it never did).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nestweaver setup"),
+        "daemon index must reach the gate and print the setup hint, got: {stderr}"
+    );
+}
