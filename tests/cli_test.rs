@@ -1454,6 +1454,32 @@ fn no_daemon_index_empty_instance_flag_falls_back_to_config() {
     );
 }
 
+/// nw-052b: the `--instance` flag must be validated at the CLI choke point.
+/// nw-052 rejected a colon only in a `--config`'s `instance_id` (config-load),
+/// so `--instance "a:b"` still slipped through and stamped an ambiguous uid
+/// `repo:a:b:<hash>`. Validating the RESOLVED instance in `resolve_instance_id`
+/// closes the flag path: the command now exits non-zero with a colon error.
+#[test]
+fn no_daemon_index_rejects_colon_in_instance_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    let db = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--instance")
+        .arg("a:b")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .failure()
+        .stderr(contains("colon"));
+}
+
 #[test]
 fn index_does_not_write_setup_files_into_unrelated_cwd() {
     let dir = tempfile::tempdir().unwrap();

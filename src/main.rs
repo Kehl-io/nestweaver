@@ -2727,14 +2727,22 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
 /// rule shared by `brain watch`/`brain add`/`brain refresh` and the top-level
 /// `watch`, so no path silently stamps symbols under the literal `"default"`
 /// when a `--config` names an instance.
-fn resolve_instance_id(flag: Option<String>, config: Option<&Path>) -> String {
+fn resolve_instance_id(flag: Option<String>, config: Option<&Path>) -> anyhow::Result<String> {
     // nw-047: treat an empty `--instance ""` as unset (not a literal empty
     // instance) so it falls through to the config's `instance_id` / "default".
     // This is CLI-side resolution only; the daemon's own empty=="decide" RPC
     // convention lives in a different layer and is unaffected.
-    flag.filter(|f| !f.is_empty())
+    let resolved = flag
+        .filter(|f| !f.is_empty())
         .or_else(|| load_instance_config_opt(config).map(|c| c.instance_id))
-        .unwrap_or_else(|| "default".to_string())
+        .unwrap_or_else(|| "default".to_string());
+    // nw-052b: validate the RESOLVED instance at this single CLI choke point.
+    // nw-052 only validated the config-load path, so a `--instance "a:b"` flag
+    // still slipped through and produced an ambiguous uid `repo:a:b:<hash>`.
+    // Validating here closes the flag path for every command that resolves an
+    // instance (index, watch, brain add, brain refresh).
+    nestweaver_engine::validate_instance_id(&resolved)?;
+    Ok(resolved)
 }
 
 /// Discover the `[pr_impact]` strict-gate policy from an instance config sitting
@@ -5764,7 +5772,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // (mirrors `brain watch`/`brain add`; without this, `watch --config X`
             // with no --instance stamps symbols under "default" even with the
             // daemon up — an instance mismatch of the nw-019 class).
-            let instance_id = resolve_instance_id(instance, config.as_deref());
+            let instance_id = resolve_instance_id(instance, config.as_deref())?;
 
             if let Some(hours) = refresh_wiki_hours {
                 eprintln!(
@@ -8027,7 +8035,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // treated `--instance ""` as a literal empty instance). Mirrors the
             // daemon path's nw-019 resolution so the no-daemon direct write
             // stamps nodes under the same logical instance the daemon would.
-            let instance_id = resolve_instance_id(instance, config.as_deref());
+            let instance_id = resolve_instance_id(instance, config.as_deref())?;
 
             // Identity: prefer the git origin remote when configured (used
             // only as an identity string — never fetched); fall back to a
@@ -9668,7 +9676,7 @@ fn run_brain(
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             // nw-019: --instance flag > config's instance_id > "default".
-            let instance_id_owned = resolve_instance_id(instance, config.as_deref());
+            let instance_id_owned = resolve_instance_id(instance, config.as_deref())?;
             let instance_id = instance_id_owned.as_str();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
@@ -10740,7 +10748,7 @@ fn run_brain(
             // nw-019: --instance flag > config's instance_id > "default"
             // (mirrors `brain add`/`brain watch`; fixes vaults being tagged
             // under the literal "default" instead of the config's instance).
-            let instance_id = resolve_instance_id(instance, config.as_deref());
+            let instance_id = resolve_instance_id(instance, config.as_deref())?;
             let extra_patterns = parse_ignore_flag(&ignore);
 
             // Compute vault UID for recording last_indexed_at.
@@ -14275,11 +14283,21 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
             // Load instance config if provided
             let cfg = load_instance_config_opt(config.as_deref());
 
-            // Resolve instance ID using the same hash-based algorithm the daemon uses,
-            // so the filter matches how repos are actually stored.
-            let instance_id = instance.unwrap_or_else(|| {
-                nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path)
-            });
+            // nw-053: default the recorded instance to how repos are ACTUALLY
+            // stored now. Post-nw-019 the daemon stamps repos under the config's
+            // LOGICAL `instance_id` (and the no-daemon CLI under config/"default"),
+            // NOT the db-path hash. So resolve: `--instance` flag > config's
+            // `instance_id` > db-path hash. The hash fallback survives ONLY for a
+            // no-config DB, where the logical name is unknown and the hash is the
+            // best legacy guess. (This id is recorded in the snapshot stamp and used
+            // as the default output-dir name; the snapshot's repo set is read via
+            // `list_repos(.., None)` below, so content is instance-agnostic.)
+            let instance_id = instance
+                .filter(|f| !f.is_empty())
+                .or_else(|| cfg.as_ref().map(|c| c.instance_id.clone()))
+                .unwrap_or_else(|| {
+                    nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path)
+                });
 
             // Fetch repos by reading the store directly. The quiesce guard above
             // guarantees no daemon is writing this DB, so a raw read is safe —
@@ -15504,7 +15522,7 @@ credential_method = "ssh"
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(dir.path());
         assert_eq!(
-            resolve_instance_id(Some("from-flag".to_string()), Some(cfg.as_path())),
+            resolve_instance_id(Some("from-flag".to_string()), Some(cfg.as_path())).unwrap(),
             "from-flag"
         );
     }
@@ -15518,7 +15536,7 @@ credential_method = "ssh"
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(dir.path());
         assert_eq!(
-            resolve_instance_id(None, Some(cfg.as_path())),
+            resolve_instance_id(None, Some(cfg.as_path())).unwrap(),
             "from-config"
         );
     }
@@ -15526,7 +15544,7 @@ credential_method = "ssh"
     /// Neither flag nor config → the "default" fallback.
     #[test]
     fn default_when_neither() {
-        assert_eq!(resolve_instance_id(None, None), "default");
+        assert_eq!(resolve_instance_id(None, None).unwrap(), "default");
     }
 
     /// An unparseable/missing config falls back to "default" (not a panic) when
@@ -15536,8 +15554,21 @@ credential_method = "ssh"
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.toml");
         assert_eq!(
-            resolve_instance_id(None, Some(missing.as_path())),
+            resolve_instance_id(None, Some(missing.as_path())).unwrap(),
             "default"
+        );
+    }
+
+    /// nw-052b: a colon in the `--instance` flag must be rejected at the CLI
+    /// choke point. nw-052 only validated the config-load path, so the flag
+    /// still slipped a `repo:a:b:<hash>` ambiguous uid through.
+    #[test]
+    fn flag_with_colon_is_rejected() {
+        let err = resolve_instance_id(Some("a:b".to_string()), None)
+            .expect_err("colon in --instance must be rejected");
+        assert!(
+            err.to_string().contains("colon"),
+            "error should mention the colon, got: {err}"
         );
     }
 }
