@@ -167,10 +167,16 @@ impl DaemonState {
     /// [`Identity`](nestweaver_engine::authz::Identity) extension for
     /// authenticated requests; its absence (no-auth / UDS admin paths) is
     /// treated as `Anonymous`. Uses the startup-built [`Self::permission_source`]
-    /// (never rebuilt per request). When the policy is disabled — the no-`[authz]`
-    /// single-trust-domain default — this returns [`VisibleRepos::All`] WITHOUT
-    /// listing repos, so the vast majority of RPCs (which don't even read the
-    /// result) pay nothing. Mirrors the MCP-HTTP boundary in `nestweaver-mcp`.
+    /// (never rebuilt per request).
+    ///
+    /// Returns `Result<VisibleRepos, Status>`. When the policy is disabled —
+    /// the no-`[authz]` single-trust-domain default — this returns
+    /// [`VisibleRepos::All`] WITHOUT listing repos, so the vast majority of
+    /// RPCs (which don't even read the result) pay nothing. An enabled policy
+    /// lists repos per request, retrying once on a store error; if both
+    /// attempts fail this returns `Err(Status::unavailable(..))` (nw-043 fail
+    /// loud — never a silently-redacted success), which callers propagate with
+    /// `?`. Mirrors the MCP-HTTP boundary in `nestweaver-mcp`.
     fn visible_repos_for(
         &self,
         extensions: &tonic::Extensions,
@@ -191,13 +197,7 @@ impl DaemonState {
         // indistinguishable from the nw-043 isolation anomaly, and a silent full
         // redaction reads as a valid empty result. A genuinely EMPTY listing
         // still fails closed quietly (enabled policy over ∅ ⇒ nothing visible).
-        let first = self.store.list_repos(None);
-        let retry = match &first {
-            // Never consulted when the first attempt succeeded.
-            Ok(_) => Ok(Vec::new()),
-            Err(_) => self.store.list_repos(None),
-        };
-        match classify_repo_listing(first, retry) {
+        match classify_repo_listing(self.store.list_repos(None), || self.store.list_repos(None)) {
             AuthzRepoListing::Resolve(repos) => {
                 Ok(self.permission_source.visible_repos(&identity, &repos))
             }
@@ -3350,7 +3350,12 @@ impl NestWeaverDaemon for DaemonService {
                 // mis-redacted result.
                 if matches!(visible, nestweaver_engine::authz::VisibleRepos::Only(_)) {
                     let repos = state.store.list_repos(None).map_err(|e| {
-                        Status::unavailable(format!("authz repo listing unavailable: {e:#}"))
+                        // Log the detailed chain server-side; return a generic
+                        // message so the client never sees store internals.
+                        tracing::error!(
+                            "authz: repo listing failed at pr_impact redaction point: {e:#}"
+                        );
+                        Status::unavailable("authz repo listing unavailable")
                     })?;
                     nestweaver_engine::authz::redact_blast_radius_for_visibility(
                         &mut result,

@@ -858,13 +858,7 @@ async fn handle_mcp(
                     state.admin_token.as_deref(),
                     state.auth_token.as_deref(),
                 );
-                let first = store.list_repos(None);
-                let retry = match &first {
-                    // Never consulted when the first attempt succeeded.
-                    Ok(_) => Ok(Vec::new()),
-                    Err(_) => store.list_repos(None),
-                };
-                match classify_repo_listing(first, retry) {
+                match classify_repo_listing(store.list_repos(None), || store.list_repos(None)) {
                     AuthzRepoListing::Resolve(repos) => {
                         state.permission_source.visible_repos(&identity, &repos)
                     }

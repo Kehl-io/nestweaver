@@ -5816,9 +5816,12 @@ fn tool_blast_radius(
     // this one failed — exactly the transient signature — so fail the request
     // rather than serve a mis-redacted result.
     if let Some(v @ nestweaver_engine::authz::VisibleRepos::Only(_)) = visible {
-        let repos = store
-            .list_repos(None)
-            .context("authz repo listing unavailable at redaction point")?;
+        let repos = store.list_repos(None).map_err(|e| {
+            // Log the detailed chain server-side; return a generic message so
+            // the client never sees store internals.
+            tracing::error!("authz: repo listing failed at redaction point: {e:#}");
+            anyhow!("authz repo listing unavailable")
+        })?;
         nestweaver_engine::authz::redact_blast_radius_for_visibility(&mut result, v, &repos);
     }
 
