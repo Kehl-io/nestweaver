@@ -1895,6 +1895,13 @@ impl NestWeaverDaemon for DaemonService {
                 .delete_vault_cascade(&req.vault_uid)
                 .map_err(|e| Status::internal(format!("delete_vault_cascade failed: {e:#}")))?;
 
+            // nw-054: bump the graph generation so generation-keyed in-memory
+            // caches on the live daemon store invalidate (mirrors `remove_repo`
+            // and `index`). Without this a query primed before the removal keeps
+            // satisfying subsequent lookups out of the stale cache and returns the
+            // just-deleted notes.
+            state.store.bump_and_persist_generation();
+
             if let Some(ref tantivy) = state.tantivy
                 && tantivy.has_writer()
             {
@@ -2025,6 +2032,12 @@ impl NestWeaverDaemon for DaemonService {
                 .delete_project_node(&req.project_uid)
                 .map_err(|e| Status::internal(format!("delete_project_node failed: {e:#}")))?;
 
+            // nw-054: bump the graph generation so generation-keyed in-memory
+            // caches on the live daemon store invalidate (mirrors `remove_repo`
+            // and `index`). Without this a query primed before the removal keeps
+            // serving the just-deleted project's nodes out of the stale cache.
+            state.store.bump_and_persist_generation();
+
             Ok::<_, Status>(RemoveProjectResponse { project_name })
         })
         .await
@@ -2069,6 +2082,14 @@ impl NestWeaverDaemon for DaemonService {
                     })?;
                     removed_vaults.push(vault.name.clone());
                 }
+            }
+
+            // nw-054: if anything was pruned, bump the graph generation so
+            // generation-keyed in-memory caches on the live daemon store
+            // invalidate (mirrors `remove_repo` and `index`). Guarded on the
+            // removal counts so a no-op prune doesn't needlessly invalidate.
+            if !removed_repos.is_empty() || !removed_vaults.is_empty() {
+                state.store.bump_and_persist_generation();
             }
 
             // Reindex Tantivy if anything was removed.

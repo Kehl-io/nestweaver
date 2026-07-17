@@ -1150,3 +1150,92 @@ fn daemon_remove_repo_invalidates_query_cache() {
         .success()
         .stdout(contains("No symbols found"));
 }
+
+/// nw-054 (sibling coverage): `prune-stale` deletes graph nodes for repos whose
+/// working tree has vanished, but — like `remove-repo` before the fix — it did
+/// not bump `graph_generation`. So a `search` primed before the prune kept
+/// returning the pruned symbol out of the stale generation-keyed
+/// `symbol_name_cache`. The fix bumps the generation after a prune removes
+/// anything (mirroring `remove_repo`/`index`), invalidating those caches.
+///
+/// This is the same read-back nw-054 proved for `remove-repo`, driven through
+/// the real daemon (the sole DB writer and live query store): index a repo,
+/// prime the symbol cache with a search, delete the repo's working tree so it is
+/// now stale, prune it via the daemon, then re-search and assert the symbol is
+/// gone. Pre-fix the stale cache returns "Found"; post-fix the bump forces a
+/// re-scan → "No symbols found".
+///
+/// `remove-vault` and `remove-project` take the identical one-line
+/// `bump_and_persist_generation()` fix after their deletions (they delete note
+/// and project nodes respectively); this prune-stale case exercises the shared
+/// generation-invalidation pathway end-to-end for all three.
+#[test]
+fn daemon_prune_stale_invalidates_query_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("ps54").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // Repo with a distinctive symbol name we can search for.
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    std::fs::write(repo_dir.join("m.js"), "function prunedfn() { return 1; }").unwrap();
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args([
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    let _guard = DaemonGuard::new(&db_path);
+
+    // Initial index through the daemon (auto-starts it).
+    index_via_daemon(&repo_dir, &db_path);
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Prime the daemon's in-memory `symbol_name_cache` with a search that finds
+    // the symbol (populates the cache at the current graph_generation).
+    daemon_cmd()
+        .args(["search", "prunedfn", "--db", &db_path.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("Found").and(contains("prunedfn")));
+
+    // Make the repo stale: its working tree no longer exists on disk. The DB
+    // (under db_path) is untouched — only the source tree is removed.
+    std::fs::remove_dir_all(&repo_dir).unwrap();
+
+    // Prune through the same running daemon — detects the vanished tree and
+    // deletes the repo's files + symbols.
+    daemon_cmd()
+        .args(["prune-stale", "--db", &db_path.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("Pruned").and(contains("stale source")));
+
+    // Read-back through the SAME daemon: the pruned symbol must be gone. Pre-fix
+    // the stale generation-keyed cache still returns "Found 1 symbol(s)";
+    // post-fix the generation bump invalidates it and the daemon re-scans the
+    // store → "No symbols found".
+    daemon_cmd()
+        .args(["search", "prunedfn", "--db", &db_path.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("No symbols found"));
+}
