@@ -1097,3 +1097,82 @@ pub fn run_auto_setup(db_path: &std::path::Path) -> Result<(), anyhow::Error> {
     }
     Ok(())
 }
+
+/// nw-023: auto-setup may only fire for the persona it was built for —
+/// a human at a terminal, not suppressed by --quiet, indexing the repo
+/// they are standing in. Pure so it is unit-testable without a pty.
+/// `Path::starts_with` is component-wise, so /home/u/repo2 does not
+/// count as inside /home/u/repo.
+// Wired into the `Index` command handler in a later nw-023 task; the
+// `#[cfg(test)]` gate below exercises it in the meantime.
+#[allow(dead_code)]
+pub fn should_auto_setup(
+    stderr_is_tty: bool,
+    quiet: bool,
+    cwd: &std::path::Path,
+    repo_root: &std::path::Path,
+) -> bool {
+    stderr_is_tty && !quiet && cwd.starts_with(repo_root)
+}
+
+#[cfg(test)]
+mod auto_setup_gate_tests {
+    use super::should_auto_setup;
+    use std::path::Path;
+
+    #[test]
+    fn allows_tty_interactive_cwd_inside_repo() {
+        assert!(should_auto_setup(
+            true,
+            false,
+            Path::new("/home/u/repo/subdir"),
+            Path::new("/home/u/repo")
+        ));
+    }
+    #[test]
+    fn allows_cwd_equal_to_repo_root() {
+        assert!(should_auto_setup(
+            true,
+            false,
+            Path::new("/r"),
+            Path::new("/r")
+        ));
+    }
+    #[test]
+    fn blocks_when_stderr_not_a_tty() {
+        assert!(!should_auto_setup(
+            false,
+            false,
+            Path::new("/r"),
+            Path::new("/r")
+        ));
+    }
+    #[test]
+    fn blocks_when_quiet() {
+        assert!(!should_auto_setup(
+            true,
+            true,
+            Path::new("/r"),
+            Path::new("/r")
+        ));
+    }
+    #[test]
+    fn blocks_when_cwd_outside_repo() {
+        assert!(!should_auto_setup(
+            true,
+            false,
+            Path::new("/somewhere/else"),
+            Path::new("/home/u/repo")
+        ));
+    }
+    #[test]
+    fn blocks_prefix_lookalike_dir() {
+        // /home/u/repo2 must NOT count as inside /home/u/repo
+        assert!(!should_auto_setup(
+            true,
+            false,
+            Path::new("/home/u/repo2"),
+            Path::new("/home/u/repo")
+        ));
+    }
+}
