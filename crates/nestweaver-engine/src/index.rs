@@ -60,20 +60,78 @@ pub struct CachedFileMeta {
 /// Map from repo-relative path to cached file metadata.
 pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 
-/// Load the file metadata sidecar. Returns an empty map on missing/corrupt file.
-pub fn load_filemeta_cache(path: &Path) -> FileMetaCache {
+/// Sidecar format version. v2 = per-repo keying (nw-022). v1 (implicit,
+/// unversioned flat map) fails deserialization and loads as empty — a
+/// deliberate fail-open that costs one full re-index and can never
+/// mis-classify a file.
+pub const FILEMETA_VERSION: u32 = 2;
+
+/// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
+/// repo uid, then repo-relative path. Two repos sharing one DB can never
+/// collide on a relative path (nw-022).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FileMetaSidecar {
+    pub version: u32,
+    pub repos: HashMap<String, FileMetaCache>,
+}
+
+/// Load the sidecar. Missing, corrupt, or old-format files yield an empty
+/// sidecar (every file classifies as New → full re-index, never a skip).
+pub fn load_filemeta_sidecar(path: &Path) -> FileMetaSidecar {
     match std::fs::read_to_string(path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => FileMetaCache::new(),
+        Ok(data) => match serde_json::from_str::<FileMetaSidecar>(&data) {
+            Ok(s) if s.version == FILEMETA_VERSION => s,
+            _ => FileMetaSidecar::default(),
+        },
+        Err(_) => FileMetaSidecar::default(),
     }
 }
 
 /// Save the file metadata sidecar alongside the database.
-pub fn save_filemeta_cache(cache: &FileMetaCache, path: &Path) -> Result<(), anyhow::Error> {
-    let json = serde_json::to_string(cache).with_context(|| "serialize filemeta cache")?;
+pub fn save_filemeta_sidecar(sidecar: &FileMetaSidecar, path: &Path) -> Result<(), anyhow::Error> {
+    let mut out = sidecar.clone();
+    out.version = FILEMETA_VERSION;
+    let json = serde_json::to_string(&out).with_context(|| "serialize filemeta sidecar")?;
     std::fs::write(path, json)
-        .with_context(|| format!("write filemeta cache to {}", path.display()))?;
+        .with_context(|| format!("write filemeta sidecar to {}", path.display()))?;
     Ok(())
+}
+
+/// Load-merge-save the filemeta sidecar for one repo's index run, and return
+/// the cross-repo eviction unions for the parsed-cache / resolution-deps
+/// sidecars. `drop_uids` removes slices for pruned or re-identified repos.
+/// NEVER a blind overwrite: other repos' slices are preserved (nw-022).
+fn merge_save_filemeta(
+    filemeta_path: &Path,
+    r_uid: &str,
+    new_filemeta: FileMetaCache,
+    drop_uids: &[String],
+) -> Result<
+    (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ),
+    anyhow::Error,
+> {
+    let mut sidecar = load_filemeta_sidecar(filemeta_path);
+    for uid in drop_uids {
+        sidecar.repos.remove(uid);
+    }
+    sidecar.repos.insert(r_uid.to_string(), new_filemeta);
+    // Eviction unions across ALL repos — feeding only the current repo's
+    // entries (the old behavior) evicts every other repo's parse cache.
+    let live_hashes = sidecar
+        .repos
+        .values()
+        .flat_map(|files| files.values().map(|m| m.content_hash.clone()))
+        .collect();
+    let live_files = sidecar
+        .repos
+        .values()
+        .flat_map(|files| files.keys().cloned())
+        .collect();
+    save_filemeta_sidecar(&sidecar, filemeta_path)?;
+    Ok((live_hashes, live_files))
 }
 
 /// Outcome of the tiered change detection for a single file.
@@ -353,6 +411,7 @@ fn index_directory_with_store_inner(
 ) -> Result<IndexResult, anyhow::Error> {
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
+    let r_uid = repo_uid(instance_id, repo_url);
     let mut new_filemeta = FileMetaCache::new();
 
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
@@ -366,6 +425,10 @@ fn index_directory_with_store_inner(
     // Persisted as `root_path` on the Repo node so consumers never derive
     // a disk path from the identity `url`.
     let local_root = repo_path.display().to_string();
+    // nw-010: when the run re-identifies a legacy file:// repo under its
+    // origin remote, the old uid's filemeta slice must be dropped from the
+    // sidecar alongside the graph prune.
+    let mut reidentified_old_uid: Option<String> = None;
     let result = if force {
         index_into_store_with_write_gate(
             &reader,
@@ -377,6 +440,7 @@ fn index_directory_with_store_inner(
             Some(&mut new_filemeta),
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
+            Some(&mut reidentified_old_uid),
             name,
             Some(&local_root),
             false,
@@ -384,17 +448,21 @@ fn index_directory_with_store_inner(
             || Ok::<(), anyhow::Error>(()),
         )?
     } else {
-        let filemeta_cache = load_filemeta_cache(&filemeta_path);
+        // Only this repo's slice of the sidecar feeds change detection —
+        // another repo's entry for the same rel path must never match (nw-022).
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        let repo_slice: Option<FileMetaCache> = sidecar.repos.get(&r_uid).cloned();
         index_into_store_with_write_gate(
             &reader,
             store,
             instance_id,
             repo_url,
             indexed_sha,
-            Some(&filemeta_cache),
+            repo_slice.as_ref(),
             Some(&mut new_filemeta),
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
+            Some(&mut reidentified_old_uid),
             name,
             Some(&local_root),
             false,
@@ -403,21 +471,14 @@ fn index_directory_with_store_inner(
         )?
     };
 
-    // Evict stale cache entries for deleted/renamed files before saving.
-    {
-        let live_hashes: std::collections::HashSet<String> = new_filemeta
-            .values()
-            .map(|m| m.content_hash.clone())
-            .collect();
-        parsed_cache.retain_hashes(&live_hashes);
+    // Merge this repo's fresh entries into the shared sidecar and evict
+    // parse/resolution cache entries using cross-repo live unions.
+    let drop_uids: Vec<String> = reidentified_old_uid.into_iter().collect();
+    let (live_hashes, live_files) =
+        merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &drop_uids)?;
+    parsed_cache.retain_hashes(&live_hashes);
+    resolution_deps.retain_files(&live_files);
 
-        let live_files: std::collections::HashSet<String> = new_filemeta.keys().cloned().collect();
-        resolution_deps.retain_files(&live_files);
-    }
-
-    if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
-        tracing::warn!("failed to save filemeta cache: {e}");
-    }
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
     }
@@ -428,7 +489,6 @@ fn index_directory_with_store_inner(
     let manifest = crate::manifest::parse_manifest(&reader);
     crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
     let cache_path = crate::sidecar_path(db_path, ".manifests.json");
-    let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
     let mut cache = crate::manifest::load_manifest_cache(&cache_path).unwrap_or_default();
     cache.insert(r_uid, manifest);
     if let Err(e) = crate::manifest::save_manifest_cache(&cache, &cache_path) {
@@ -512,6 +572,7 @@ where
         instance_id,
         repo_url,
         indexed_sha,
+        None,
         None,
         None,
         None,
@@ -690,6 +751,7 @@ fn index_into_store(
         new_filemeta,
         parsed_cache,
         resolution_deps,
+        None,
         name,
         root_path,
         false,
@@ -709,6 +771,7 @@ fn index_into_store_with_write_gate<G, F>(
     mut new_filemeta: Option<&mut FileMetaCache>,
     mut parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
     mut resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
+    reidentified_old_uid_out: Option<&mut Option<String>>,
     name: Option<&str>,
     root_path: Option<&str>,
     bump_generation_after_write: bool,
@@ -737,6 +800,11 @@ where
         Some(rp) => reidentified_legacy_uid(store, instance_id, rp, &r_uid)?,
         None => None,
     };
+    // Report the re-identified legacy uid so the caller can drop its filemeta
+    // slice when merge-saving the sidecar (nw-022).
+    if let Some(out) = reidentified_old_uid_out {
+        *out = reidentify_old_uid.clone();
+    }
     let filemeta_cache = if reidentify_old_uid.is_some() {
         None
     } else {
@@ -2805,9 +2873,16 @@ fn full_index_fallback(
     name: Option<&str>,
 ) -> Result<IncrementalResult, anyhow::Error> {
     // Load filemeta sidecar for tiered change detection even in fallback.
+    // nw-022 interim: only this repo's slice feeds change detection; the
+    // eviction block below is still current-run-only (next task).
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
-    let filemeta_cache = load_filemeta_cache(&filemeta_path);
+    let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
+    let filemeta_cache = load_filemeta_sidecar(&filemeta_path)
+        .repos
+        .get(&r_uid)
+        .cloned()
+        .unwrap_or_default();
     let mut new_filemeta = FileMetaCache::new();
 
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
@@ -2844,9 +2919,11 @@ fn full_index_fallback(
         resolution_deps.retain_files(&live_files);
     }
 
-    // Persist the updated filemeta sidecar.
-    if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
-        tracing::warn!("failed to save filemeta cache: {e}");
+    // Persist the updated filemeta sidecar (merge-save preserves other repos'
+    // slices; the cross-repo eviction unions it returns are unused here until
+    // this path's eviction block is restructured — next task).
+    if let Err(e) = merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &[]) {
+        tracing::warn!("failed to save filemeta sidecar: {e}");
     }
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
@@ -2859,7 +2936,6 @@ fn full_index_fallback(
     let manifest = crate::manifest::parse_manifest(&reader);
     crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
     let cache_path = crate::sidecar_path(db_path, ".manifests.json");
-    let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
     let mut cache = crate::manifest::load_manifest_cache(&cache_path).unwrap_or_default();
     cache.insert(r_uid, manifest);
     if let Err(e) = crate::manifest::save_manifest_cache(&cache, &cache_path) {
@@ -3726,33 +3802,52 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn filemeta_sidecar_round_trip() {
+    fn filemeta_sidecar_v2_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let sidecar_path = dir.path().join("test.filemeta.json");
-
-        let mut cache = FileMetaCache::new();
-        cache.insert(
-            "src/main.js".to_string(),
-            CachedFileMeta {
-                mtime_secs: 1234567890,
-                size_bytes: 42,
-                content_hash: "abc123".to_string(),
-            },
-        );
-
-        save_filemeta_cache(&cache, &sidecar_path).unwrap();
-        let loaded = load_filemeta_cache(&sidecar_path);
-        assert_eq!(loaded.len(), 1);
-        let entry = loaded.get("src/main.js").unwrap();
-        assert_eq!(entry.mtime_secs, 1234567890);
-        assert_eq!(entry.size_bytes, 42);
-        assert_eq!(entry.content_hash, "abc123");
+        let path = dir.path().join("db.lbug.filemeta.json");
+        let mut sidecar = FileMetaSidecar::default();
+        sidecar
+            .repos
+            .entry("repo:test:aaaa".into())
+            .or_default()
+            .insert(
+                "main.js".into(),
+                CachedFileMeta {
+                    mtime_secs: 1,
+                    size_bytes: 2,
+                    content_hash: "h1".into(),
+                },
+            );
+        save_filemeta_sidecar(&sidecar, &path).unwrap();
+        let loaded = load_filemeta_sidecar(&path);
+        assert_eq!(loaded.version, FILEMETA_VERSION);
+        assert_eq!(loaded.repos["repo:test:aaaa"]["main.js"].content_hash, "h1");
     }
 
     #[test]
-    fn filemeta_cache_missing_file_returns_empty() {
-        let cache = load_filemeta_cache(Path::new("/nonexistent/filemeta.json"));
-        assert!(cache.is_empty());
+    fn filemeta_sidecar_legacy_flat_format_loads_empty() {
+        // Old flat format must fail-open to empty → one-time full re-index.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+        fs::write(
+            &path,
+            r#"{"main.js":{"mtime_secs":5,"size_bytes":10,"content_hash":"abc"}}"#,
+        )
+        .unwrap();
+        let loaded = load_filemeta_sidecar(&path);
+        assert!(
+            loaded.repos.is_empty(),
+            "legacy format must load as empty, got {loaded:?}"
+        );
+    }
+
+    #[test]
+    fn filemeta_sidecar_corrupt_and_missing_load_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+        assert!(load_filemeta_sidecar(&path).repos.is_empty()); // missing
+        fs::write(&path, "not json").unwrap();
+        assert!(load_filemeta_sidecar(&path).repos.is_empty()); // corrupt
     }
 
     struct GateOrderReader {
@@ -3825,9 +3920,13 @@ function hello(name) { return "Hello " + name; }
 
         let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
         assert!(filemeta_path.exists(), "filemeta sidecar should be created");
-        let cache = load_filemeta_cache(&filemeta_path);
-        assert_eq!(cache.len(), 1, "one file should be in the cache");
-        assert!(cache.contains_key("main.js"));
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        let uid = repo_uid("test", "https://example.com/repo");
+        assert_eq!(sidecar.repos.len(), 1, "one repo slice should exist");
+        assert!(
+            sidecar.repos[&uid].contains_key("main.js"),
+            "repo slice should contain main.js, got {sidecar:?}"
+        );
     }
 
     #[test]

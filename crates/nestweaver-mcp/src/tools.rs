@@ -429,12 +429,15 @@ fn cache_bypassed(args: &Value) -> bool {
 /// alone).
 fn whole_db_scope_digest(db_path: &Path) -> u64 {
     let filemeta_path = nestweaver_engine::sidecar_path(db_path, ".filemeta.json");
-    let cache = nestweaver_engine::load_filemeta_cache(&filemeta_path);
-    nestweaver_store::cache::scope_digest_from_hashes(
-        cache
+    let sidecar = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+    // nw-022 interim: flatten every repo's slice into one (path, hash) stream.
+    // The digest is XOR-combined and order-independent, so this stays a
+    // conservative whole-DB scope; a later task makes it repo-qualified.
+    nestweaver_store::cache::scope_digest_from_hashes(sidecar.repos.values().flat_map(|files| {
+        files
             .iter()
-            .map(|(p, m)| (p.as_str(), m.content_hash.as_str())),
-    )
+            .map(|(p, m)| (p.as_str(), m.content_hash.as_str()))
+    }))
 }
 
 /// Run a cacheable tool through the F16 response cache.
