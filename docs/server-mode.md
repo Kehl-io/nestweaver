@@ -505,6 +505,38 @@ or times out, `tier` stays `"two_tier"` and `org_wide_impact` becomes
 
 ---
 
+## PageRank Cold-Start
+
+Impact, repo-map, and the UI overview rank symbols by PageRank ("CodeRank").
+NestWeaver keeps that computation off the critical path so ranks are served
+immediately in normal operation.
+
+- **Computed at index time.** A full re-index (`index --force`) and every
+  incremental update compute PageRank and persist it to `<db>.pagerank.json`.
+  A normally-indexed DB therefore serves ranks straight from the sidecar with no
+  compute on the first query.
+- **Pre-warmed on server/UI startup (nw-029 T7).** When the daemon starts
+  serving the UI it warms the rank cache up front, so the first impact request
+  never pays a compute.
+- **Lazy single-flight fallback.** A DB with no sidecar — an older DB, or one
+  whose very first `index` fell back to a full pass without writing the sidecar
+  — computes ranks once, on the first rank-consuming query. The compute is
+  single-flight: concurrent first requests block on and share the one
+  computation rather than each recomputing.
+- **The impact UI degrades gracefully.** While ranks are computing it shows a
+  loading state with a 30s timeout toast, and auto-refreshes when ranks land via
+  the `pagerank:recomputed` SSE event.
+
+**Measured cost (release build).** On a 4-repo, ~32.8k-symbol DB, the cold
+lazy compute completed in ~0.19s of total wall time (process start + store open
++ compute), and a warm query served from the sidecar in ~0.08s. PageRank is
+cheap; index time is dominated by parsing, not ranking. Note the bug report that
+prompted this work measured ~7 minutes for the first impact query — that was a
+**debug** build, which is roughly two orders of magnitude slower than release
+and not representative of deployed behavior.
+
+---
+
 ## Backup and Restore
 
 ### Create a backup

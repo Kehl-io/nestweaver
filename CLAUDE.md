@@ -161,7 +161,7 @@ nestweaver ui --watch                    # live re-indexing via filesystem watch
 Default database: `./nestweaver.lbug`. Override with `--db <path>` or `NESTWEAVER_DB` env var.
 
 Sidecar files written alongside the database:
-- `<db>.pagerank.json` — in-memory PageRank cache (written on `index`, loaded on open)
+- `<db>.pagerank.json` — PageRank score cache (computed and saved at index time on a full re-index and on incremental updates, loaded on open; a single-flight lazy compute is the fallback for DBs indexed before this or with no sidecar yet)
 - `<db>.manifests.json` — parsed manifest data (package.json, go.mod, Cargo.toml, pyproject.toml, requirements.txt, composer.json, Gemfile, pubspec.yaml, Package.swift, *.csproj, build.gradle.kts, CMakeLists.txt)
 - `<db>.filemeta.json` — per-file mtime/size/hash cache for tiered change detection (skips unchanged files on re-index)
 - `<db>.summaries.json` — hierarchical code summaries cache (symbol/file/cluster levels)
