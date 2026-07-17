@@ -69,10 +69,19 @@ pub const FILEMETA_VERSION: u32 = 2;
 /// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
 /// repo uid, then repo-relative path. Two repos sharing one DB can never
 /// collide on a relative path (nw-022).
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetaSidecar {
     pub version: u32,
     pub repos: HashMap<String, FileMetaCache>,
+}
+
+impl Default for FileMetaSidecar {
+    fn default() -> Self {
+        Self {
+            version: FILEMETA_VERSION,
+            repos: HashMap::new(),
+        }
+    }
 }
 
 /// Load the sidecar. Missing, corrupt, or old-format files yield an empty
@@ -81,20 +90,53 @@ pub fn load_filemeta_sidecar(path: &Path) -> FileMetaSidecar {
     match std::fs::read_to_string(path) {
         Ok(data) => match serde_json::from_str::<FileMetaSidecar>(&data) {
             Ok(s) if s.version == FILEMETA_VERSION => s,
-            _ => FileMetaSidecar::default(),
+            Ok(s) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    found_version = s.version,
+                    expected_version = FILEMETA_VERSION,
+                    "filemeta sidecar version mismatch; discarding (full re-index)"
+                );
+                FileMetaSidecar::default()
+            }
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "filemeta sidecar corrupt or legacy format; discarding (full re-index)"
+                );
+                FileMetaSidecar::default()
+            }
         },
-        Err(_) => FileMetaSidecar::default(),
+        Err(e) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %e,
+                "filemeta sidecar missing or unreadable; starting empty"
+            );
+            FileMetaSidecar::default()
+        }
     }
 }
 
 /// Save the file metadata sidecar alongside the database.
 pub fn save_filemeta_sidecar(sidecar: &FileMetaSidecar, path: &Path) -> Result<(), anyhow::Error> {
-    let mut out = sidecar.clone();
-    out.version = FILEMETA_VERSION;
-    let json = serde_json::to_string(&out).with_context(|| "serialize filemeta sidecar")?;
+    debug_assert_eq!(
+        sidecar.version, FILEMETA_VERSION,
+        "FileMetaSidecar::default() pins the version; never construct one by hand"
+    );
+    let json = serde_json::to_string(sidecar).with_context(|| "serialize filemeta sidecar")?;
     std::fs::write(path, json)
         .with_context(|| format!("write filemeta sidecar to {}", path.display()))?;
     Ok(())
+}
+
+/// Cross-repo "still alive" unions returned by [`merge_save_filemeta`], used
+/// to evict the parsed-cache / resolution-deps sidecars. A named struct so
+/// the two same-typed sets can't be swapped at a call site.
+struct FilemetaEvictionUnions {
+    live_hashes: std::collections::HashSet<String>,
+    live_files: std::collections::HashSet<String>,
 }
 
 /// Load-merge-save the filemeta sidecar for one repo's index run, and return
@@ -106,13 +148,7 @@ fn merge_save_filemeta(
     r_uid: &str,
     new_filemeta: FileMetaCache,
     drop_uids: &[String],
-) -> Result<
-    (
-        std::collections::HashSet<String>,
-        std::collections::HashSet<String>,
-    ),
-    anyhow::Error,
-> {
+) -> Result<FilemetaEvictionUnions, anyhow::Error> {
     let mut sidecar = load_filemeta_sidecar(filemeta_path);
     for uid in drop_uids {
         sidecar.repos.remove(uid);
@@ -131,7 +167,10 @@ fn merge_save_filemeta(
         .flat_map(|files| files.keys().cloned())
         .collect();
     save_filemeta_sidecar(&sidecar, filemeta_path)?;
-    Ok((live_hashes, live_files))
+    Ok(FilemetaEvictionUnions {
+        live_hashes,
+        live_files,
+    })
 }
 
 /// Outcome of the tiered change detection for a single file.
@@ -451,14 +490,13 @@ fn index_directory_with_store_inner(
         // Only this repo's slice of the sidecar feeds change detection —
         // another repo's entry for the same rel path must never match (nw-022).
         let sidecar = load_filemeta_sidecar(&filemeta_path);
-        let repo_slice: Option<FileMetaCache> = sidecar.repos.get(&r_uid).cloned();
         index_into_store_with_write_gate(
             &reader,
             store,
             instance_id,
             repo_url,
             indexed_sha,
-            repo_slice.as_ref(),
+            sidecar.repos.get(&r_uid),
             Some(&mut new_filemeta),
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
@@ -473,11 +511,16 @@ fn index_directory_with_store_inner(
 
     // Merge this repo's fresh entries into the shared sidecar and evict
     // parse/resolution cache entries using cross-repo live unions.
+    //
+    // A sidecar write failure fails the whole run (`?`) on purpose: the graph
+    // was already mutated, so a stale sidecar would silently re-enable
+    // skip-classification against reality on the next run — files that
+    // changed since the stale snapshot would classify Unchanged and never be
+    // re-indexed. (The fallback path stays warn-only; see full_index_fallback.)
     let drop_uids: Vec<String> = reidentified_old_uid.into_iter().collect();
-    let (live_hashes, live_files) =
-        merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &drop_uids)?;
-    parsed_cache.retain_hashes(&live_hashes);
-    resolution_deps.retain_files(&live_files);
+    let unions = merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &drop_uids)?;
+    parsed_cache.retain_hashes(&unions.live_hashes);
+    resolution_deps.retain_files(&unions.live_files);
 
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
@@ -2873,8 +2916,8 @@ fn full_index_fallback(
     name: Option<&str>,
 ) -> Result<IncrementalResult, anyhow::Error> {
     // Load filemeta sidecar for tiered change detection even in fallback.
-    // nw-022 interim: only this repo's slice feeds change detection; the
-    // eviction block below is still current-run-only (next task).
+    // Only this repo's slice feeds change detection — another repo's entry
+    // for the same rel path must never match (nw-022).
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
@@ -2893,7 +2936,10 @@ fn full_index_fallback(
 
     let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let local_root = repo_path.display().to_string();
-    let result = index_into_store(
+    // nw-022: capture a re-identified legacy file:// uid so its filemeta
+    // slice is dropped below, mirroring index_directory_with_store_inner.
+    let mut reidentified_old_uid: Option<String> = None;
+    let result = index_into_store_with_write_gate(
         &reader,
         store,
         instance_id,
@@ -2903,27 +2949,30 @@ fn full_index_fallback(
         Some(&mut new_filemeta),
         Some(&mut parsed_cache),
         Some(&mut resolution_deps),
+        Some(&mut reidentified_old_uid),
         name,
         Some(&local_root),
+        false,
+        None,
+        || Ok::<(), anyhow::Error>(()),
     )?;
 
-    // Evict stale cache entries for deleted/renamed files before saving.
-    {
-        let live_hashes: std::collections::HashSet<String> = new_filemeta
-            .values()
-            .map(|m| m.content_hash.clone())
-            .collect();
-        parsed_cache.retain_hashes(&live_hashes);
-
-        let live_files: std::collections::HashSet<String> = new_filemeta.keys().cloned().collect();
-        resolution_deps.retain_files(&live_files);
-    }
-
-    // Persist the updated filemeta sidecar (merge-save preserves other repos'
-    // slices; the cross-repo eviction unions it returns are unused here until
-    // this path's eviction block is restructured — next task).
-    if let Err(e) = merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &[]) {
-        tracing::warn!("failed to save filemeta sidecar: {e}");
+    // Merge this repo's fresh entries into the shared sidecar (preserving
+    // other repos' slices) and evict parse/resolution cache entries using the
+    // cross-repo live unions.
+    //
+    // Deliberately warn-only, unlike the primary path's `?`: this preserves
+    // the legacy incremental-entry behavior where sidecar persistence is
+    // best-effort, and a stale slice here self-heals — the next full pass
+    // falls through Tier 1/2 to Tier 3's content-hash comparison and
+    // re-indexes anything the stale snapshot would have mis-skipped.
+    let drop_uids: Vec<String> = reidentified_old_uid.into_iter().collect();
+    match merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &drop_uids) {
+        Ok(unions) => {
+            parsed_cache.retain_hashes(&unions.live_hashes);
+            resolution_deps.retain_files(&unions.live_files);
+        }
+        Err(e) => tracing::warn!("failed to save filemeta sidecar: {e}"),
     }
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
@@ -3850,6 +3899,35 @@ function hello(name) { return "Hello " + name; }
         assert!(load_filemeta_sidecar(&path).repos.is_empty()); // corrupt
     }
 
+    #[test]
+    fn filemeta_sidecar_future_version_loads_empty() {
+        // A version we don't know (e.g. written by a newer binary) must
+        // fail-open to empty — full re-index, never a mis-classification.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+        fs::write(
+            &path,
+            r#"{"version":3,"repos":{"repo:test:aaaa":{"main.js":{"mtime_secs":1,"size_bytes":2,"content_hash":"h1"}}}}"#,
+        )
+        .unwrap();
+        let loaded = load_filemeta_sidecar(&path);
+        assert!(
+            loaded.repos.is_empty(),
+            "future version must load as empty, got {loaded:?}"
+        );
+    }
+
+    #[test]
+    fn filemeta_sidecar_empty_repos_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+        let sidecar = FileMetaSidecar::default();
+        save_filemeta_sidecar(&sidecar, &path).unwrap();
+        let loaded = load_filemeta_sidecar(&path);
+        assert_eq!(loaded.version, FILEMETA_VERSION);
+        assert!(loaded.repos.is_empty());
+    }
+
     struct GateOrderReader {
         root: PathBuf,
         read_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -4033,6 +4111,155 @@ function hello(name) { return "Hello " + name; }
             "repo A's warm cache must survive repo B's index (sidecar must not be overwritten)"
         );
         assert_eq!(r3.files_count, 0);
+    }
+
+    #[test]
+    fn full_index_fallback_uses_per_repo_slice_and_merge_saves() {
+        // nw-022 T4: same two-repo collision shape as
+        // `second_repo_with_colliding_rel_path_and_mtime_is_indexed`, but driven
+        // through the incremental entry point — a non-git dir routes to
+        // full_index_fallback, which must also key change detection per repo.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.lbug");
+        let repo_a = dir.path().join("repo_a");
+        let repo_b = dir.path().join("repo_b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("main.js"), "function alpha() {}").unwrap();
+        fs::write(repo_b.join("main.js"), "function beta() {}").unwrap();
+
+        // Pin identical mtimes (don't rely on same-second scheduling).
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        for p in [repo_a.join("main.js"), repo_b.join("main.js")] {
+            fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        }
+
+        let r1 =
+            incremental_index_with_name(&repo_a, &db_path, "test", "https://example.com/a", None)
+                .unwrap();
+        assert!(r1.fell_back_to_full, "non-git dir must fall back to full");
+        assert!(r1.symbols_added >= 1, "repo A must be indexed");
+
+        // IncrementalResult carries no files_unchanged; a cross-match would
+        // classify repo B's only file Unchanged and never write its symbols,
+        // so assert on symbols_added + the store contents instead.
+        let r2 =
+            incremental_index_with_name(&repo_b, &db_path, "test", "https://example.com/b", None)
+                .unwrap();
+        assert!(r2.fell_back_to_full);
+        assert!(
+            r2.symbols_added >= 1,
+            "fallback path must not cross-match repo A's filemeta entries"
+        );
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let uid_b = repo_uid("test", "https://example.com/b");
+        let symbols = store.symbol_names_by_repo(&uid_b).unwrap();
+        assert!(
+            symbols.iter().any(|n| n == "beta"),
+            "repo B's symbol must exist in the shared DB, got {symbols:?}"
+        );
+        assert!(
+            !store.list_files_by_repo(&uid_b).unwrap().is_empty(),
+            "repo B must have File nodes"
+        );
+
+        // Merge-save: repo A's slice must survive repo B's fallback run.
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        let uid_a = repo_uid("test", "https://example.com/a");
+        assert!(
+            sidecar.repos.contains_key(&uid_a) && sidecar.repos.contains_key(&uid_b),
+            "both repo slices must be present after the fallback merge-save, got {:?}",
+            sidecar.repos.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reidentify_drops_old_uid_filemeta_slice() {
+        // nw-022 T6, primary path (index_directory): re-indexing a working
+        // tree under its origin identity must drop the legacy file:// uid's
+        // filemeta slice from the sidecar alongside the graph prune.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.js"), "function a() { return 1; }\n").unwrap();
+
+        let local_root = src.display().to_string();
+        let file_url = format!("file://{local_root}");
+        index_directory(&src, &db_path, "test", &file_url, "sha-1").unwrap();
+
+        let old_uid = repo_uid("test", &file_url);
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        assert!(
+            load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&old_uid),
+            "first pass must record the file:// slice"
+        );
+
+        let origin_url = "https://example.com/acme/demo.git";
+        index_directory(&src, &db_path, "test", origin_url, "sha-1").unwrap();
+
+        let new_uid = repo_uid("test", origin_url);
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        assert!(
+            !sidecar.repos.contains_key(&old_uid),
+            "re-identify must drop the legacy uid's slice, got {:?}",
+            sidecar.repos.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            sidecar.repos.contains_key(&new_uid),
+            "the new origin uid must have a slice"
+        );
+    }
+
+    #[test]
+    fn reidentify_drops_old_uid_filemeta_slice_fallback() {
+        // nw-022 T6, fallback path: the same re-identify hand-off driven
+        // through the incremental entry point (non-git dir →
+        // full_index_fallback) must also drop the legacy uid's slice.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.js"), "function a() { return 1; }\n").unwrap();
+
+        let local_root = src.display().to_string();
+        let file_url = format!("file://{local_root}");
+        let r1 = incremental_index_with_name(&src, &db_path, "test", &file_url, None).unwrap();
+        assert!(r1.fell_back_to_full, "non-git dir must fall back to full");
+
+        let old_uid = repo_uid("test", &file_url);
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        assert!(
+            load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&old_uid),
+            "first pass must record the file:// slice"
+        );
+
+        let origin_url = "https://example.com/acme/demo.git";
+        let r2 = incremental_index_with_name(&src, &db_path, "test", origin_url, None).unwrap();
+        assert!(r2.fell_back_to_full);
+
+        let new_uid = repo_uid("test", origin_url);
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        assert!(
+            !sidecar.repos.contains_key(&old_uid),
+            "fallback re-identify must drop the legacy uid's slice, got {:?}",
+            sidecar.repos.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            sidecar.repos.contains_key(&new_uid),
+            "the new origin uid must have a slice"
+        );
     }
 
     #[test]
