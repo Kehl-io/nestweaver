@@ -2074,6 +2074,9 @@ mod tests {
             "expected no discarded vaults, got {:?}",
             result.discarded
         );
+        // No repos in this merge — nothing to re-index.
+        assert!(result.repos_moved.is_empty());
+        assert!(!result.repos_need_reindex());
 
         // All 3 notes should survive under the new vault UID.
         let new_vault_uid = vault_uid("tgt", "/tmp/vault");
@@ -2170,5 +2173,45 @@ mod tests {
         assert_eq!(vaults.len(), 1);
         assert_eq!(vaults[0].uid, new_vault_uid);
         assert_eq!(vaults[0].instance_id, "tgt");
+    }
+
+    /// Merging an instance that owns a repo re-mints the Repo node under the
+    /// target instance but does NOT rewrite the repo's child rows (they keep
+    /// old-instance UIDs and a dangling `repo_uid`). The merge must therefore
+    /// report the repo so the caller can tell the user to force re-index it.
+    #[test]
+    fn merge_instance_ids_reports_repos_needing_reindex() {
+        use nestweaver_schema::uid::repo_uid;
+        let store = test_store();
+
+        // A repo under instance "old" with one symbol child.
+        let repo = Repo {
+            uid: repo_uid("old", "https://github.com/example/svc"),
+            url: "https://github.com/example/svc".to_string(),
+            indexed_sha: "abc123".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "old".to_string(),
+            name: Some("svc".to_string()),
+            root_path: Some("/home/kory/dev/svc".to_string()),
+        };
+        store.insert_repo(&repo).unwrap();
+        let symbol = make_symbol("sym:old:1", "handler", &repo.uid, "src/lib.rs");
+        store.insert_symbol(&symbol).unwrap();
+
+        let report = store.merge_instance_ids("old", "new").unwrap();
+
+        // The repo was re-minted → the caller must be told to re-index it.
+        assert_eq!(report.repos, 1);
+        assert_eq!(report.repos_moved.len(), 1);
+        assert_eq!(report.repos_moved[0], "svc"); // display name preferred
+        assert!(report.repos_need_reindex());
+
+        // The child symbol still carries the OLD repo_uid (orphaned until a
+        // forced re-index re-attaches it) — this is exactly why we must warn.
+        let orphan = store.lookup_symbol("sym:old:1").unwrap();
+        assert_eq!(
+            orphan.repo_uid,
+            repo_uid("old", "https://github.com/example/svc")
+        );
     }
 }

@@ -20,12 +20,32 @@ pub struct DiscardedVault {
 }
 
 /// Result of [`GraphStore::merge_instance_ids`].
+///
+/// `repos_moved` lists the identifier (display name if set, else url) of
+/// every Repo node that was re-minted under the target instance. Re-minting
+/// a Repo does **not** rewrite its child File/Symbol/Service rows: those keep
+/// UIDs embedding the old instance and a `repo_uid` pointing at the deleted
+/// node, so they are orphaned until the repo is force re-indexed. When this
+/// list is non-empty the caller MUST tell the user to re-index each repo —
+/// see [`MergeResult::repos_need_reindex`].
 #[derive(Debug)]
 pub struct MergeResult {
     pub vaults: usize,
     pub repos: usize,
     pub projects: usize,
     pub discarded: Vec<DiscardedVault>,
+    /// Identifiers of repos re-minted under the target instance. Their graph
+    /// rows (files/symbols/services) are orphaned until a forced re-index.
+    pub repos_moved: Vec<String>,
+}
+
+impl MergeResult {
+    /// True when the merge re-minted one or more Repo nodes, orphaning their
+    /// child rows. The caller should instruct the user to force re-index each
+    /// repo listed in [`MergeResult::repos_moved`].
+    pub fn repos_need_reindex(&self) -> bool {
+        !self.repos_moved.is_empty()
+    }
 }
 
 /// Result of [`GraphStore::reparent_vault`].
@@ -3123,6 +3143,7 @@ impl GraphStore {
         let mut repo_count = 0usize;
         let mut project_count = 0usize;
         let mut discarded: Vec<DiscardedVault> = Vec::new();
+        let mut repos_moved: Vec<String> = Vec::new();
 
         // Build a map of target-instance vaults keyed by root_path so we
         // can detect collisions and compare child counts.
@@ -3174,18 +3195,27 @@ impl GraphStore {
         }
         for r in self.list_repos(None)? {
             if r.instance_id == from {
+                // Identify the repo for the re-index guidance before we move
+                // `r` into the reinsert. Prefer the display name, else the url.
+                let repo_ident = r.name.clone().unwrap_or_else(|| r.url.clone());
                 let conn = self.conn()?;
                 exec_params(
                     &conn,
                     "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
                     vec![("uid", lbug::Value::String(r.uid.clone()))],
                 )?;
+                // Re-mint the Repo node under the target instance. NOTE: this
+                // does NOT rewrite the repo's child File/Symbol/Service rows,
+                // so they are orphaned (old-instance UIDs + dangling repo_uid)
+                // until a forced re-index re-attaches them. We record the repo
+                // so the caller can tell the user to re-index it.
                 self.insert_repo(&Repo {
                     uid: repo_uid(to, &r.url),
                     instance_id: to.to_string(),
                     ..r
                 })?;
                 repo_count += 1;
+                repos_moved.push(repo_ident);
             }
         }
         for p in self.list_projects()? {
@@ -3203,6 +3233,7 @@ impl GraphStore {
             repos: repo_count,
             projects: project_count,
             discarded,
+            repos_moved,
         })
     }
 

@@ -2108,6 +2108,7 @@ impl NestWeaverDaemon for DaemonService {
                 repos_reparented: result.repos as u64,
                 projects_reparented: result.projects as u64,
                 discarded_vaults,
+                repos_needing_reindex: result.repos_moved,
             })
         })
         .await

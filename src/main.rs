@@ -13603,6 +13603,21 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 for d in &result.discarded_vaults {
                     eprintln!("Note: {d}");
                 }
+                // Re-minting a Repo node under the new instance does NOT rewrite
+                // its child file/symbol/service rows — they keep old-instance
+                // UIDs and a dangling repo_uid until a forced re-index. Tell the
+                // user exactly which repos need it.
+                if !result.repos_needing_reindex.is_empty() {
+                    eprintln!(
+                        "\nNOTE: repo graph rows (files/symbols) keep their old UIDs until re-indexed."
+                    );
+                    eprintln!("Force re-index each repo listed below:");
+                    for repo in &result.repos_needing_reindex {
+                        eprintln!("  {repo}");
+                    }
+                    eprintln!("  nestweaver index --repo <path> --force");
+                    eprintln!("  nestweaver materialize-projects --config <instance.toml>");
+                }
             }
             Ok(EXIT_SUCCESS)
         }

@@ -145,6 +145,10 @@ message MergeInstanceResponse {
   uint64 repos_reparented = 2;
   uint64 projects_reparented = 3;
   repeated string discarded_vaults = 4;
+  // Identifiers (display name or url) of repos re-minted under the target
+  // instance. Their file/symbol/service rows keep old-instance UIDs and are
+  // orphaned until each repo is force re-indexed. Non-empty ⇒ warn the user.
+  repeated string repos_needing_reindex = 5;
 }
 
 message PurgeInstanceRequest {
