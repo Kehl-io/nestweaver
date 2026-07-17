@@ -430,14 +430,20 @@ fn cache_bypassed(args: &Value) -> bool {
 fn whole_db_scope_digest(db_path: &Path) -> u64 {
     let filemeta_path = nestweaver_engine::sidecar_path(db_path, ".filemeta.json");
     let sidecar = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
-    // nw-022 interim: flatten every repo's slice into one (path, hash) stream.
-    // The digest is XOR-combined and order-independent, so this stays a
-    // conservative whole-DB scope; a later task makes it repo-qualified.
-    nestweaver_store::cache::scope_digest_from_hashes(sidecar.repos.values().flat_map(|files| {
-        files
-            .iter()
-            .map(|(p, m)| (p.as_str(), m.content_hash.as_str()))
-    }))
+    // Repo-qualify each pair: identical rel paths in two repos are distinct
+    // inputs (and same-path+same-hash pairs must not XOR-cancel).
+    let pairs: Vec<(String, String)> = sidecar
+        .repos
+        .iter()
+        .flat_map(|(ruid, files)| {
+            files
+                .iter()
+                .map(move |(p, m)| (format!("{ruid}\u{0}{p}"), m.content_hash.clone()))
+        })
+        .collect();
+    nestweaver_store::cache::scope_digest_from_hashes(
+        pairs.iter().map(|(p, h)| (p.as_str(), h.as_str())),
+    )
 }
 
 /// Run a cacheable tool through the F16 response cache.
@@ -7395,6 +7401,44 @@ mod cache_dispatch_tests {
             None,
         );
         assert!(ok.is_ok(), "uncancelled flow_trace must succeed");
+    }
+
+    #[test]
+    fn whole_db_scope_digest_covers_all_repos_and_distinguishes_same_rel_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.lbug");
+        let path = nestweaver_engine::sidecar_path(&db, ".filemeta.json");
+
+        let mut s = nestweaver_engine::FileMetaSidecar::default();
+        s.repos.entry("repo:t:aaaa".into()).or_default().insert(
+            "main.js".into(),
+            nestweaver_engine::CachedFileMeta {
+                mtime_secs: 1,
+                size_bytes: 1,
+                content_hash: "h".into(),
+            },
+        );
+        nestweaver_engine::save_filemeta_sidecar(&s, &path).unwrap();
+        let one_repo = whole_db_scope_digest(&db);
+
+        // Same rel path + same hash in a SECOND repo must CHANGE the digest — if
+        // pairs weren't repo-qualified, identical (path, hash) pairs would XOR-cancel.
+        s.repos.entry("repo:t:bbbb".into()).or_default().insert(
+            "main.js".into(),
+            nestweaver_engine::CachedFileMeta {
+                mtime_secs: 1,
+                size_bytes: 1,
+                content_hash: "h".into(),
+            },
+        );
+        nestweaver_engine::save_filemeta_sidecar(&s, &path).unwrap();
+        let two_repos = whole_db_scope_digest(&db);
+
+        assert_ne!(
+            one_repo, two_repos,
+            "digest must be repo-qualified: identical rel paths across repos must not collapse"
+        );
+        assert_ne!(two_repos, 0);
     }
 }
 
