@@ -146,8 +146,35 @@ pub fn lookup_symbol(
             let known: std::collections::HashSet<&str> =
                 repos.iter().map(|r| r.instance_id.as_str()).collect();
             if !known.contains(inst) {
-                let mut valid: Vec<&str> = known.into_iter().collect();
+                let mut valid: Vec<&str> = known.iter().copied().collect();
                 valid.sort_unstable();
+                // Does `inst` name a project/vault instance? Then it's the nw-019
+                // three-conventions mismatch — repos hash the db path, projects use
+                // the logical config name, the vault uses `default`. Point the user
+                // at the consolidation fix instead of dead-ending.
+                let project_vault_instances: std::collections::HashSet<String> = store
+                    .list_projects()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| p.instance_id.clone())
+                    .chain(
+                        store
+                            .list_vaults(None)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|v| v.instance_id.clone()),
+                    )
+                    .collect();
+                if project_vault_instances.contains(inst) {
+                    let repo_inst = valid.first().copied().unwrap_or("<repo-instance>");
+                    anyhow::bail!(
+                        "instance '{inst}' names projects or vaults but no repos; repos in \
+                         this DB are indexed under: {}. To consolidate, run `nestweaver \
+                         instance merge --from {repo_inst} --to {inst}` and then force \
+                         re-index each repo.",
+                        valid.join(", ")
+                    );
+                }
                 anyhow::bail!(
                     "unknown instance '{inst}'; valid instances: {}",
                     valid.join(", ")
@@ -2852,5 +2879,95 @@ mod fusion_tests {
         let results = weighted_score_fuse(&ppr, &bm25, &[], 0.70, 0.30, 0.0);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "a");
+    }
+}
+
+#[cfg(test)]
+mod instance_validation_tests {
+    use nestweaver_schema::{Project, Repo, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
+
+    use super::lookup_symbol;
+
+    /// In-memory store holding one repo (with the given `instance_id`) plus a
+    /// symbol living in it, mirroring the live DB where repos/symbols share a
+    /// db-path-hash instance.
+    fn store_with_repo_instance(instance_id: &str) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        let repo = Repo {
+            uid: "repo:1".to_string(),
+            url: "https://github.com/example/repo".to_string(),
+            indexed_sha: "abc123".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: instance_id.to_string(),
+            name: None,
+            root_path: None,
+        };
+        store.insert_repo(&repo).unwrap();
+        let symbol = Symbol {
+            uid: "sym:1".to_string(),
+            name: "anything".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 5,
+            signature: "fn anything()".to_string(),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&symbol).unwrap();
+        store
+    }
+
+    /// Insert a Project node carrying `instance_id` — models the third
+    /// instance-id convention (logical config name) that `list-projects`
+    /// surfaces to users.
+    fn insert_test_project(store: &GraphStore, uid: &str, instance_id: &str) {
+        let project = Project {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            summary: None,
+            instance_id: instance_id.to_string(),
+        };
+        store.insert_project(&project).unwrap();
+    }
+
+    #[test]
+    fn unknown_instance_bails_with_valid_list() {
+        let store = store_with_repo_instance("c37ccf01");
+        let err = match lookup_symbol(&store, "anything", Some("nope")) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for an unknown instance"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown instance 'nope'"), "{msg}");
+        assert!(msg.contains("c37ccf01"), "{msg}");
+    }
+
+    #[test]
+    fn project_only_instance_gets_merge_guidance() {
+        // A user who saw "Instance: kory-brain" in list-projects and typed it must
+        // get the consolidation instruction, not a dead end.
+        let store = store_with_repo_instance("c37ccf01");
+        insert_test_project(&store, "proj", "kory-brain");
+        let err = match lookup_symbol(&store, "anything", Some("kory-brain")) {
+            Err(e) => e,
+            Ok(_) => panic!("expected merge guidance for a project-only instance"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("names projects or vaults"), "{msg}");
+        assert!(
+            msg.contains("instance merge --from c37ccf01 --to kory-brain"),
+            "{msg}"
+        );
     }
 }
