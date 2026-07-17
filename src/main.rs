@@ -2718,6 +2718,16 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
     }
 }
 
+/// Resolve the instance id for a command using the nw-019 precedence:
+/// `--instance` flag > config's `instance_id` > `"default"`. Centralizes the
+/// rule shared by `brain watch`/`brain add`/`brain refresh` and the top-level
+/// `watch`, so no path silently stamps symbols under the literal `"default"`
+/// when a `--config` names an instance.
+fn resolve_instance_id(flag: Option<String>, config: Option<&Path>) -> String {
+    flag.or_else(|| load_instance_config_opt(config).map(|c| c.instance_id))
+        .unwrap_or_else(|| "default".to_string())
+}
+
 /// Discover the `[pr_impact]` strict-gate policy from an instance config sitting
 /// next to the repo. Tries the known filename conventions in order — the
 /// project-dir form first, then the flat forms the CLI's `--config` help and the
@@ -5714,7 +5724,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_ERROR, None));
             }
             let db_path = resolve_index_db_path(db, &repo_path);
-            let instance_id = instance.unwrap_or_else(|| "default".to_string());
+            // nw-019: --instance flag > config's instance_id > "default"
+            // (mirrors `brain watch`/`brain add`; without this, `watch --config X`
+            // with no --instance stamps symbols under "default" even with the
+            // daemon up — an instance mismatch of the nw-019 class).
+            let instance_id = resolve_instance_id(instance, config.as_deref());
 
             if let Some(hours) = refresh_wiki_hours {
                 eprintln!(
@@ -9612,10 +9626,8 @@ fn run_brain(
             ignore,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            let instance_cfg = load_instance_config_opt(config.as_deref());
-            let instance_id_owned = instance
-                .or_else(|| instance_cfg.map(|c| c.instance_id))
-                .unwrap_or_else(|| "default".to_string());
+            // nw-019: --instance flag > config's instance_id > "default".
+            let instance_id_owned = resolve_instance_id(instance, config.as_deref());
             let instance_id = instance_id_owned.as_str();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
@@ -10687,9 +10699,7 @@ fn run_brain(
             // nw-019: --instance flag > config's instance_id > "default"
             // (mirrors `brain add`/`brain watch`; fixes vaults being tagged
             // under the literal "default" instead of the config's instance).
-            let instance_id = instance
-                .or_else(|| load_instance_config_opt(config.as_deref()).map(|c| c.instance_id))
-                .unwrap_or_else(|| "default".to_string());
+            let instance_id = resolve_instance_id(instance, config.as_deref());
             let extra_patterns = parse_ignore_flag(&ignore);
 
             // Compute vault UID for recording last_indexed_at.
@@ -15410,6 +15420,83 @@ mod pr_impact_hook_tests {
                 .unwrap()
                 .contains("echo second"),
             "a second foreign hook must get a numbered backup"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_instance_id_tests {
+    use super::*;
+
+    /// A minimal-but-valid instance config whose `instance_id` is distinct from
+    /// the literal `"default"`, so a resolution that returns "default" proves the
+    /// config was ignored.
+    const CONFIG_TOML: &str = r#"
+instance_id = "from-config"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+"#;
+
+    fn write_config(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("instance.toml");
+        std::fs::write(&p, CONFIG_TOML).unwrap();
+        p
+    }
+
+    /// The `--instance` flag always wins, even when a config names a different id.
+    #[test]
+    fn flag_wins_over_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_config(dir.path());
+        assert_eq!(
+            resolve_instance_id(Some("from-flag".to_string()), Some(cfg.as_path())),
+            "from-flag"
+        );
+    }
+
+    /// nw-019 regression guard: with NO `--instance` flag, the config's
+    /// `instance_id` must be honored — NOT the literal "default". This is the
+    /// exact bug the top-level `watch` had (`instance.unwrap_or_else(|| "default")`
+    /// ignored `--config`).
+    #[test]
+    fn config_used_when_no_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_config(dir.path());
+        assert_eq!(
+            resolve_instance_id(None, Some(cfg.as_path())),
+            "from-config"
+        );
+    }
+
+    /// Neither flag nor config → the "default" fallback.
+    #[test]
+    fn default_when_neither() {
+        assert_eq!(resolve_instance_id(None, None), "default");
+    }
+
+    /// An unparseable/missing config falls back to "default" (not a panic) when
+    /// no flag is given.
+    #[test]
+    fn default_when_config_unloadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.toml");
+        assert_eq!(
+            resolve_instance_id(None, Some(missing.as_path())),
+            "default"
         );
     }
 }
