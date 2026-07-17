@@ -123,8 +123,19 @@ pub fn bearer_auth_interceptor(
 /// user can connect. This interceptor unconditionally grants admin access
 /// so that CLI operations (shutdown, indexing, backup, etc.) work without
 /// requiring a bearer token.
+///
+/// It attaches BOTH the mutation gate ([`IsAdmin(true)`](IsAdmin)) AND the
+/// authorization [`Identity::Admin`](nestweaver_engine::authz::Identity)
+/// (nw-050). The identity is what per-repo Blast Radius scoping reads: without
+/// it an enabled `[authz]` policy would fall back to
+/// [`Identity::Anonymous`](nestweaver_engine::authz::Identity) and redact every
+/// cross-repo node away from the trusted local admin. This mirrors the TCP
+/// admin-token path in [`bearer_auth_interceptor`], keeping the authz layer the
+/// single source of truth for visibility.
 pub fn uds_admin_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
     req.extensions_mut().insert(IsAdmin(true));
+    req.extensions_mut()
+        .insert(nestweaver_engine::authz::Identity::Admin);
     Ok(req)
 }
 
@@ -242,6 +253,25 @@ mod tests {
         assert!(matches!(
             req.extensions().get::<IsAdmin>(),
             Some(IsAdmin(false))
+        ));
+    }
+
+    #[test]
+    fn uds_admin_attaches_admin_identity() {
+        use nestweaver_engine::authz::Identity;
+        // nw-050: the trusted-local-admin UDS interceptor must attach the
+        // authz Identity (not just the IsAdmin mutation gate) so an enabled
+        // `[authz]` policy scopes it to VisibleRepos::All instead of falling
+        // back to Anonymous → Only(∅).
+        let req = super::uds_admin_interceptor(Request::new(())).unwrap();
+        assert_eq!(
+            req.extensions().get::<Identity>(),
+            Some(&Identity::Admin),
+            "UDS trusted-admin must resolve to Identity::Admin"
+        );
+        assert!(matches!(
+            req.extensions().get::<IsAdmin>(),
+            Some(IsAdmin(true))
         ));
     }
 

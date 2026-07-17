@@ -7304,6 +7304,95 @@ mod startup_helper_tests {
         })
     }
 
+    /// Build a minimal `DaemonState` over the given store and permission
+    /// source, for exercising `visible_repos_for` under a real authz policy.
+    fn test_state_with_authz(
+        store: Arc<GraphStore>,
+        permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
+    ) -> Arc<DaemonState> {
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        Arc::new(DaemonState {
+            store,
+            tantivy: None,
+            db_path: std::path::PathBuf::from(":memory:"),
+            instance_id: "default".to_string(),
+            data_instance_id: "default".to_string(),
+            start_time: Instant::now(),
+            active_reads: Arc::new(AtomicU32::new(0)),
+            active_writes: Arc::new(AtomicU32::new(0)),
+            idle_notify: Arc::new(Notify::new()),
+            shutdown_tx,
+            watcher_stop: std::sync::Mutex::new(None),
+            instance_cfg: None,
+            permission_source,
+            embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            server_mode: false,
+            read_only: false,
+            indexing_active: Arc::new(AtomicBool::new(false)),
+            indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
+            indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+            safeguards: QuerySafeguards::default_server(),
+            rate_limiters: None,
+            drained: Arc::new(AtomicBool::new(false)),
+            admin_token: None,
+            admin_state: std::sync::OnceLock::new(),
+            worker_handle: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// nw-050: a UDS trusted-admin request must see ALL repos under an enabled
+    /// `[authz]` policy. The UDS interceptor is the trusted-local-admin
+    /// boundary; before the fix it attached only `IsAdmin(true)` and no
+    /// `Identity`, so `visible_repos_for` fell back to `Identity::Anonymous`,
+    /// which an enabled policy maps to `Only(∅)` — silently redacting EVERY
+    /// cross-repo blast-radius node away from the trusted local admin. The fix
+    /// makes the interceptor attach `Identity::Admin` (symmetric with the TCP
+    /// admin-token path), which resolves to `VisibleRepos::All`.
+    #[test]
+    fn uds_admin_sees_all_repos_under_enabled_policy() {
+        use nestweaver_engine::authz::{
+            PermissionSource, StaticConfigPermissionSource, VisibleRepos,
+        };
+
+        // Enabled policy: a non-empty rules map. Under it, Anonymous (and any
+        // unknown token) fails closed to Only(∅).
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "some-query-token".to_string(),
+            vec!["acme/scoped-*".to_string()],
+        );
+        let source = Arc::new(StaticConfigPermissionSource::new(rules));
+        assert!(source.is_enabled(), "precondition: policy must be enabled");
+
+        // At least one repo exists — a non-admin identity would see none of it.
+        let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+        store
+            .insert_repo(&test_repo(
+                "repo:one",
+                "https://github.com/acme/one.git",
+                None,
+            ))
+            .unwrap();
+
+        let state = test_state_with_authz(store, source);
+
+        // Run a request through the trusted-local-admin UDS interceptor.
+        let req = crate::auth::uds_admin_interceptor(Request::new(())).unwrap();
+
+        let visible = state
+            .visible_repos_for(req.extensions())
+            .expect("enabled policy over a healthy store must resolve, not fail loud");
+
+        assert_eq!(
+            visible,
+            VisibleRepos::All,
+            "a UDS trusted-admin request must see ALL repos under an enabled \
+             authz policy — not be redacted to Only(∅) via the Anonymous \
+             fallback (nw-050)"
+        );
+    }
+
     /// The admin `reindex_search` RPC rebuilds the whole Tantivy index. Like
     /// every other daemon mutation (`prune_stale`, `purge_instance`, the
     /// watcher embed write) it MUST run under the write gate — `write_mutex`
