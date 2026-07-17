@@ -5811,9 +5811,14 @@ fn tool_blast_radius(
     // building any output (both the JSON and SARIF paths), so every derived
     // count/field reflects the redacted vecs. A `None`/`All` visibility (the
     // unconfigured single-trust-domain default) is a no-op — zero behavior
-    // change unless an `[authz]` policy scopes this caller.
-    if let Some(v) = visible {
-        let repos = store.list_repos(None).unwrap_or_default();
+    // change unless an `[authz]` policy scopes this caller. nw-043: a store
+    // error at this re-list means the boundary's earlier listing succeeded and
+    // this one failed — exactly the transient signature — so fail the request
+    // rather than serve a mis-redacted result.
+    if let Some(v @ nestweaver_engine::authz::VisibleRepos::Only(_)) = visible {
+        let repos = store
+            .list_repos(None)
+            .context("authz repo listing unavailable at redaction point")?;
         nestweaver_engine::authz::redact_blast_radius_for_visibility(&mut result, v, &repos);
     }
 

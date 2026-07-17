@@ -845,25 +845,38 @@ async fn handle_mcp(
             // `All` with NO per-request repo listing — the hot path pays nothing.
             // Only an enabled policy maps the (already-validated) bearer to an
             // identity — admin token → Admin, query token → Token(<value>),
-            // anything else → Anonymous — and lists repos to resolve visibility,
-            // warning (not swallowing) on a store error. Mirrors the daemon
-            // boundary; `Some(&All)` makes blast_radius redaction a no-op.
+            // anything else → Anonymous — and lists repos to resolve visibility.
+            // nw-043: a store ERROR while listing fails the request loudly
+            // (JSON-RPC error, non-200, after one retry) instead of silently
+            // redacting everything — a silent full redaction reads as a valid
+            // empty result. Mirrors the daemon boundary; `Some(&All)` makes
+            // blast_radius redaction a no-op.
             let visible = if state.permission_source.is_enabled() {
+                use nestweaver_engine::authz::{AuthzRepoListing, classify_repo_listing};
                 let identity = resolve_identity(
                     provided_bearer,
                     state.admin_token.as_deref(),
                     state.auth_token.as_deref(),
                 );
-                let repos = match store.list_repos(None) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(
-                            "authz: list_repos failed, failing closed to no visible repos: {e:#}"
-                        );
-                        Vec::new()
-                    }
+                let first = store.list_repos(None);
+                let retry = match &first {
+                    // Never consulted when the first attempt succeeded.
+                    Ok(_) => Ok(Vec::new()),
+                    Err(_) => store.list_repos(None),
                 };
-                state.permission_source.visible_repos(&identity, &repos)
+                match classify_repo_listing(first, retry) {
+                    AuthzRepoListing::Resolve(repos) => {
+                        state.permission_source.visible_repos(&identity, &repos)
+                    }
+                    AuthzRepoListing::FailLoud(msg) => {
+                        return jsonrpc_error(
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            id.clone(),
+                            error_code::INTERNAL_ERROR,
+                            &msg,
+                        );
+                    }
+                }
             } else {
                 nestweaver_engine::authz::VisibleRepos::All
             };

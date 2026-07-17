@@ -174,29 +174,35 @@ impl DaemonState {
     fn visible_repos_for(
         &self,
         extensions: &tonic::Extensions,
-    ) -> nestweaver_engine::authz::VisibleRepos {
-        use nestweaver_engine::authz::{Identity, VisibleRepos};
+    ) -> Result<nestweaver_engine::authz::VisibleRepos, Status> {
+        use nestweaver_engine::authz::{
+            AuthzRepoListing, Identity, VisibleRepos, classify_repo_listing,
+        };
         // Disabled policy ⇒ everyone is All; skip the per-request repo listing.
         if !self.permission_source.is_enabled() {
-            return VisibleRepos::All;
+            return Ok(VisibleRepos::All);
         }
         let identity = extensions
             .get::<Identity>()
             .cloned()
             .unwrap_or(Identity::Anonymous);
-        // Fail closed on a store error (an enabled policy over an empty repo set
-        // resolves to "nothing visible"), but say so — a silent swallow here would
-        // hide a real store problem behind a redaction that looks intentional.
-        let repos = match self.store.list_repos(None) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    "authz: list_repos failed, failing closed to no visible repos: {e:#}"
-                );
-                Vec::new()
-            }
+        // nw-043: a store ERROR here must fail the RPC loudly (after one retry),
+        // never silently redact everything — a transient store error is
+        // indistinguishable from the nw-043 isolation anomaly, and a silent full
+        // redaction reads as a valid empty result. A genuinely EMPTY listing
+        // still fails closed quietly (enabled policy over ∅ ⇒ nothing visible).
+        let first = self.store.list_repos(None);
+        let retry = match &first {
+            // Never consulted when the first attempt succeeded.
+            Ok(_) => Ok(Vec::new()),
+            Err(_) => self.store.list_repos(None),
         };
-        self.permission_source.visible_repos(&identity, &repos)
+        match classify_repo_listing(first, retry) {
+            AuthzRepoListing::Resolve(repos) => {
+                Ok(self.permission_source.visible_repos(&identity, &repos))
+            }
+            AuthzRepoListing::FailLoud(msg) => Err(Status::unavailable(msg)),
+        }
     }
 }
 
@@ -699,7 +705,7 @@ macro_rules! json_rpc {
         // macro (including `blast_radius`), so their output is redacted to the
         // caller's visible repos. No `[authz]` config ⇒ `VisibleRepos::All` ⇒
         // no-op redaction (backward compatible).
-        let visible = $self.state.visible_repos_for($request.extensions());
+        let visible = $self.state.visible_repos_for($request.extensions())?;
         let req = $request.into_inner();
         $self
             .dispatch_json_tool($tool, &req.args_json, visible)
@@ -3263,29 +3269,10 @@ impl NestWeaverDaemon for DaemonService {
         // R9/R9b: resolve the caller's per-repo visibility from the request's
         // Identity extension BEFORE the request is consumed. A disabled policy
         // (no `[authz]`) short-circuits to `All` with no repo listing (zero
-        // behavior change); when enabled we list repos ONCE here and reuse that
-        // same listing for redaction below — no duplicate `list_repos`.
-        let (visible, authz_repos) = {
-            use nestweaver_engine::authz::{Identity, VisibleRepos};
-            if self.state.permission_source.is_enabled() {
-                let identity = r
-                    .extensions()
-                    .get::<Identity>()
-                    .cloned()
-                    .unwrap_or(Identity::Anonymous);
-                let repos = self.state.store.list_repos(None).unwrap_or_else(|e| {
-                    tracing::warn!("authz: list_repos failed, failing closed: {e:#}");
-                    Vec::new()
-                });
-                let v = self
-                    .state
-                    .permission_source
-                    .visible_repos(&identity, &repos);
-                (v, repos)
-            } else {
-                (VisibleRepos::All, Vec::new())
-            }
-        };
+        // behavior change). nw-043: a store error while listing fails the RPC
+        // loudly (Unavailable, after one retry inside `visible_repos_for`)
+        // instead of silently redacting everything.
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
@@ -3355,14 +3342,22 @@ impl NestWeaverDaemon for DaemonService {
                     Status::internal("blast radius analysis failed")
                 })?;
                 // R9/R9b: redact the result to the caller's visible repos before
-                // serialization, reusing the single repo listing resolved above.
-                // `VisibleRepos::All` (the no-`[authz]` default) makes this a
-                // no-op (and `authz_repos` is empty), preserving single-trust-domain.
-                nestweaver_engine::authz::redact_blast_radius_for_visibility(
-                    &mut result,
-                    &visible,
-                    &authz_repos,
-                );
+                // serialization. `VisibleRepos::All` (the no-`[authz]` default)
+                // skips the listing entirely — redaction is a no-op — preserving
+                // single-trust-domain. nw-043: a store error at this re-list means
+                // the earlier listing succeeded and this one failed — exactly the
+                // transient signature — so fail the RPC rather than serve a
+                // mis-redacted result.
+                if matches!(visible, nestweaver_engine::authz::VisibleRepos::Only(_)) {
+                    let repos = state.store.list_repos(None).map_err(|e| {
+                        Status::unavailable(format!("authz repo listing unavailable: {e:#}"))
+                    })?;
+                    nestweaver_engine::authz::redact_blast_radius_for_visibility(
+                        &mut result,
+                        &visible,
+                        &repos,
+                    );
+                }
                 serde_json::to_string(&result)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
             })
