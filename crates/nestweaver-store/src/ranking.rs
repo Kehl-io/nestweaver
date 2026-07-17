@@ -1063,15 +1063,24 @@ impl GraphStore {
     /// computation), this is a no-op.  Otherwise it computes PageRank on
     /// demand so callers never see an empty cache after a fresh index.
     pub fn ensure_pagerank_loaded(&self) {
-        let already_loaded = self
-            .pagerank_cache
-            .lock()
-            .map(|c| c.is_some())
-            .unwrap_or(false);
-        if already_loaded {
+        let loaded = |cache: &std::sync::Mutex<Option<HashMap<String, f64>>>| {
+            cache.lock().map(|c| c.is_some()).unwrap_or(false)
+        };
+        if loaded(&self.pagerank_cache) {
             return;
         }
-        tracing::info!("PageRank cache empty — computing lazily");
+        // Single-flight (nw-029): late arrivals block here while the first
+        // caller computes, then hit the double-check below and return without
+        // recomputing. The compute lock is only ever taken in this method, and
+        // only when the cache is empty, so explicit recomputes are unaffected.
+        let _flight = match self.pagerank_compute_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if loaded(&self.pagerank_cache) {
+            return;
+        }
+        tracing::info!("PageRank cache empty — computing lazily (single-flight)");
         if let Err(e) = self.compute_pagerank(0.85, 20, &GraphScope::code_only()) {
             tracing::warn!("lazy PageRank computation failed: {e}");
         }
@@ -1136,6 +1145,57 @@ mod tests {
 
     fn test_store() -> GraphStore {
         GraphStore::in_memory().unwrap()
+    }
+
+    /// Seed a store with enough symbols/edges that a full `compute_pagerank`
+    /// takes long enough for concurrent callers to genuinely race (nw-029).
+    fn seed_small_store() -> GraphStore {
+        let store = test_store();
+        let n = 400usize;
+        for i in 0..n {
+            store
+                .insert_symbol(&make_symbol(&format!("S{i}"), &format!("fn_{i}")))
+                .unwrap();
+        }
+        // Each node calls the next three (wrapping) — a dense-enough graph
+        // that the 20-iteration power method plus the DB load per compute
+        // gives a wide race window.
+        for i in 0..n {
+            for d in 1..=3usize {
+                let tgt = (i + d) % n;
+                store
+                    .insert_edge(&make_calls_edge(&format!("S{i}"), &format!("S{tgt}")))
+                    .unwrap();
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn ensure_pagerank_loaded_is_single_flight() {
+        // nw-029: N concurrent callers observing an empty cache must produce
+        // exactly ONE compute. compute_pagerank_warm bumps pagerank_generation
+        // once per completed compute, so generation is the duplicate counter.
+        let store = std::sync::Arc::new(seed_small_store());
+        let initial = store.pagerank_generation();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                s.ensure_pagerank_loaded();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            store.pagerank_generation(),
+            initial + 1,
+            "8 concurrent callers must trigger exactly one compute"
+        );
     }
 
     #[test]

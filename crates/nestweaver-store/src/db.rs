@@ -42,6 +42,10 @@ pub struct GraphStore {
     /// clients (the watcher, the MCP server, downstream tools) detect when
     /// their cached scores are stale without comparing entire score maps.
     pub(crate) pagerank_generation: AtomicU64,
+    /// Serializes the lazy PageRank compute in `ensure_pagerank_loaded` so N
+    /// concurrent first-touch callers produce exactly one compute instead of
+    /// N duplicate full computes (nw-029). Only taken when the cache is empty.
+    pub(crate) pagerank_compute_lock: Mutex<()>,
     /// Monotonic counter that bumps whenever the graph data changes (nodes
     /// or edges added/removed). Lets the web UI and other consumers detect
     /// when their view of the graph is stale without diffing the full graph.
@@ -152,6 +156,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
@@ -178,6 +183,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
@@ -203,6 +209,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
@@ -253,6 +260,7 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
