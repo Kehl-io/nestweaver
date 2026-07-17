@@ -3856,6 +3856,87 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
+    fn second_repo_with_colliding_rel_path_and_mtime_is_indexed() {
+        // nw-022 repro: two repos share ONE db. Their files share a rel path
+        // ("main.js") and an mtime second. Tier 1 (tiered_change_check) matches
+        // repo A's sidecar entry when repo B is first indexed → repo B's file
+        // is classified Unchanged and its symbols are never written.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.lbug");
+        let repo_a = dir.path().join("repo_a");
+        let repo_b = dir.path().join("repo_b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("main.js"), "function alpha() {}").unwrap();
+        fs::write(repo_b.join("main.js"), "function beta() {}").unwrap();
+
+        // Pin identical mtimes (don't rely on same-second scheduling).
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        fs::File::options()
+            .write(true)
+            .open(repo_a.join("main.js"))
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(repo_b.join("main.js"))
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+
+        let r1 =
+            index_directory(&repo_a, &db_path, "test", "https://example.com/a", "sha").unwrap();
+        assert_eq!(r1.files_count, 1);
+
+        let r2 =
+            index_directory(&repo_b, &db_path, "test", "https://example.com/b", "sha").unwrap();
+        assert_eq!(
+            r2.files_unchanged, 0,
+            "repo B must not inherit repo A's filemeta entry"
+        );
+        assert_eq!(r2.files_count, 1);
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let uid_b = repo_uid("test", "https://example.com/b");
+        let symbols = store.symbol_names_by_repo(&uid_b).unwrap();
+        assert!(
+            symbols.iter().any(|n| n == "beta"),
+            "repo B's symbol must exist in the shared DB, got {symbols:?}"
+        );
+        assert!(
+            !store.list_files_by_repo(&uid_b).unwrap().is_empty(),
+            "repo B must have File nodes"
+        );
+    }
+
+    #[test]
+    fn indexing_second_repo_preserves_first_repos_filemeta() {
+        // nw-022 second defect: the save site overwrites the whole sidecar with
+        // only the current repo's entries, destroying repo A's warm cache.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.lbug");
+        let repo_a = dir.path().join("repo_a");
+        let repo_b = dir.path().join("repo_b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("alpha.js"), "function alpha() {}").unwrap();
+        fs::write(repo_b.join("beta.js"), "function beta() {}").unwrap();
+
+        index_directory(&repo_a, &db_path, "test", "https://example.com/a", "sha").unwrap();
+        index_directory(&repo_b, &db_path, "test", "https://example.com/b", "sha").unwrap();
+
+        // Re-index repo A: it must still see its own warm entries.
+        let r3 =
+            index_directory(&repo_a, &db_path, "test", "https://example.com/a", "sha").unwrap();
+        assert_eq!(
+            r3.files_unchanged, 1,
+            "repo A's warm cache must survive repo B's index (sidecar must not be overwritten)"
+        );
+        assert_eq!(r3.files_count, 0);
+    }
+
+    #[test]
     fn reindex_prunes_removed_files() {
         // nw-009 Fix #1 regression: when a file is removed between indexes (e.g.
         // a force-push that drops it), the incremental cleanup branch only
