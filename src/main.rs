@@ -8111,12 +8111,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            // nw-029: PageRank is now computed and saved at index time on every
-            // path this command takes — full (`--force`), incremental, and the
+            // nw-029: PageRank is computed and saved at index time on every path
+            // this command takes — full (`--force`), incremental, and the
             // first-index-of-a-new-repo fallback all warm the sidecar before
-            // returning. Lazy compute (GraphStore::ensure_pagerank_loaded)
-            // remains only as a non-fatal backstop, so ranks are ready to serve.
-            out.status("PageRank computed at index time; ranks ready.");
+            // returning. The index-time compute is non-fatal (warn-only) on the
+            // full/fallback paths, and GraphStore::ensure_pagerank_loaded is a
+            // single-flight lazy backstop, so this reports the mechanism rather
+            // than asserting the sidecar was written on this particular run.
+            out.status("PageRank computed at index time (lazy compute is the fallback).");
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.
