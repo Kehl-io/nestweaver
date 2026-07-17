@@ -1893,9 +1893,9 @@ fn tool_brain_context(
         );
     }
 
-    let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
-
     let concise = is_concise(&args);
+
+    let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget, concise);
 
     let connected_json: Vec<Value> = result
         .connected
@@ -2033,11 +2033,15 @@ fn apply_recency_bias(
     });
 }
 
-fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize, usize) {
+fn budgeted_cut(
+    nodes: &[nestweaver_engine::BrainNode],
+    budget: usize,
+    concise: bool,
+) -> (usize, usize) {
     let mut used = 0usize;
     let mut taken = 0usize;
     for n in nodes {
-        let cost = render_cost(n);
+        let cost = render_cost(n, concise);
         if used + cost > budget {
             break;
         }
@@ -2047,9 +2051,15 @@ fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize
     (taken, used)
 }
 
-fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
-    // UID + title + kind + location + relevance (~10 chars) + JSON overhead
-    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
+fn render_cost(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
+    if concise {
+        // Concise renderers emit only {kind, title, location} (brain_context
+        // omits location too, but one conservative model keeps this simple).
+        (n.title.len() + n.kind.len() + n.location.len() + 50).div_ceil(4)
+    } else {
+        // UID + title + kind + location + relevance (~10 chars) + JSON overhead
+        (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
+    }
 }
 
 // ── 2. brain_search ─────────────────────────────────────────────────────────
@@ -5367,10 +5377,10 @@ fn tool_project_context(
         .seeds
         .iter()
         .filter(|n| !connected_uids.contains(n.uid.as_str()))
-        .map(render_cost)
+        .map(|n| render_cost(n, concise))
         .sum();
     let remaining_budget = token_budget.saturating_sub(seed_tokens);
-    let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget);
+    let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget, concise);
     let used_tokens = seed_tokens + connected_tokens;
 
     // 7. Load external_refs from extension sidecar.
@@ -7439,6 +7449,48 @@ mod cache_dispatch_tests {
             "digest must be repo-qualified: identical rel paths across repos must not collapse"
         );
         assert_ne!(two_repos, 0);
+    }
+
+    /// Minimal `BrainNode` for budgeting tests: sets the semantic fields the
+    /// renderers use and defaults the rest.
+    fn test_brain_node(
+        uid: &str,
+        title: &str,
+        kind: &str,
+        location: &str,
+    ) -> nestweaver_engine::BrainNode {
+        nestweaver_engine::BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            location: location.to_string(),
+            relevance: 1.0,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    #[test]
+    fn concise_budget_fits_more_nodes_than_detailed() {
+        // nw-019 part 3: render_cost charged uid+relevance for nodes the concise
+        // renderer never emits, so concise under-filled its budget.
+        let nodes: Vec<nestweaver_engine::BrainNode> = (0..200)
+            .map(|i| {
+                test_brain_node(
+                    &format!("sym:repo:c37ccf01:abcd1234:deadbeef{i:04}"), // realistic long uid
+                    &format!("symbol_{i}"),
+                    "Symbol/Function",
+                    &format!("crates/foo/src/bar_{i}.rs:42"),
+                )
+            })
+            .collect();
+        let budget = 500usize;
+        let (detailed, _) = budgeted_cut(&nodes, budget, false);
+        let (concise, _) = budgeted_cut(&nodes, budget, true);
+        assert!(
+            concise > detailed,
+            "concise must fit more nodes in the same budget: concise={concise} detailed={detailed}"
+        );
     }
 }
 
