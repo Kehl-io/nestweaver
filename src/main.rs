@@ -4998,7 +4998,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes, force)?;
+            let base = std::env::current_dir()?;
+            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes, force, &base)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -8150,7 +8151,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // incremental re-index. Non-fatal — a failure here never aborts the index.
             let marker_path = nestweaver_engine::sidecar_path(&db_path, ".setup_done");
             if !marker_path.exists() {
-                if let Err(e) = setup::run_auto_setup(&db_path) {
+                // T3 will gate this on `should_auto_setup` and anchor `base` to the
+                // indexed repo root; for now use cwd to preserve current behavior.
+                let auto_setup_base = std::env::current_dir()?;
+                if let Err(e) = setup::run_auto_setup(&db_path, &auto_setup_base) {
                     tracing::debug!("auto-setup failed (non-fatal): {e}");
                 }
                 let _ = std::fs::write(&marker_path, "");
