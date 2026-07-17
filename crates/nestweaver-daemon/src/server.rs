@@ -886,7 +886,11 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.clone(),
             output_path: std::path::PathBuf::from(&req.output_path),
             include_clones: req.include_clones,
-            instance_id: self.state.instance_id.clone(),
+            // nw-019: the manifest's instance_id is a DATA claim about the backed-up
+            // contents, so stamp the logical instance (config name when set, else the
+            // runtime hash) — not the runtime hash unconditionally. Restore keys
+            // nothing on this field (checksum + schema-compat only), so it is safe.
+            instance_id: self.state.data_instance_id.clone(),
             workspace_path: if req.include_clones {
                 self.state.db_path.parent().map(|p| p.join("workspace"))
             } else {
@@ -1424,6 +1428,13 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             Some(req.name.clone())
         };
+        // nw-019: an explicit `--instance` on the request overrides the daemon's
+        // default (config's logical name, else runtime hash); empty = daemon decides.
+        let effective_instance = if req.instance_id.is_empty() {
+            state.data_instance_id.clone()
+        } else {
+            req.instance_id.clone()
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
@@ -1509,8 +1520,9 @@ impl NestWeaverDaemon for DaemonService {
                 &state.store,
                 &repo_path,
                 &state.db_path,
-                // nw-019: stamp the config's logical instance on indexed repos.
-                &state.data_instance_id,
+                // nw-019: stamp the effective logical instance on indexed repos —
+                // an explicit request `--instance` overrides the daemon default.
+                &effective_instance,
                 &repo_url,
                 &indexed_sha,
                 force,

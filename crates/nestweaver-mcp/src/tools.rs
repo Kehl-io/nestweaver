@@ -6622,6 +6622,9 @@ fn dispatch_add_source_via_daemon(
                 force: false,
                 with_trigrams: false,
                 with_git_activity: false,
+                // nw-019: no explicit instance here — let the daemon decide
+                // (config's logical name, else runtime hash).
+                instance_id: String::new(),
             });
             let mut stream = client
                 .index_repo(req)

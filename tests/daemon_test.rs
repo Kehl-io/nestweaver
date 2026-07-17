@@ -752,3 +752,105 @@ name = "repo"
         );
     }
 }
+
+/// nw-019 T4: an explicit `nestweaver index --instance <name>` must override the
+/// daemon's default instance (the config's logical `instance_id`) when threaded
+/// through the RPC. Before T4 the `IndexRepoRequest` had no instance field, so
+/// the flag was a silent no-op through the daemon and rows kept the config name.
+///
+/// This starts a daemon WITH `--config` (logical `instance_id = "test-instance"`),
+/// indexes a repo through it WITH `--instance override-name`, then asserts every
+/// repo row carries `override-name` — the explicit flag beats the config default.
+#[test]
+fn daemon_index_instance_flag_overrides_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+
+    write_test_repo(&repo_dir);
+
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[[repos]]
+url = "file://{repo}"
+name = "repo"
+"#,
+            storage = dir.path().join("storage").display(),
+            workspace = dir.path().join("workspace").display(),
+            repo = repo_dir.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("storage")).unwrap();
+    std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
+
+    let _guard = DaemonGuard::new(&db_path);
+
+    // Index through the daemon WITH --config (default instance "test-instance")
+    // but ALSO pass an explicit --instance override-name. The flag must win.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_path.display().to_string(),
+            "--instance",
+            "override-name",
+        ])
+        .assert()
+        .success();
+
+    // List repos as JSON and inspect the stamped instance_id on every row.
+    let output = daemon_cmd()
+        .args([
+            "list-repos",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .expect("list-repos failed to run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let repos: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("list-repos --json did not emit valid JSON");
+    let arr = repos.as_array().expect("expected a JSON array of repos");
+    assert!(
+        !arr.is_empty(),
+        "expected at least one indexed repo, got none: {stdout}"
+    );
+
+    for repo in arr {
+        let iid = repo["instance_id"]
+            .as_str()
+            .expect("repo row missing instance_id");
+        assert_eq!(
+            iid, "override-name",
+            "explicit --instance should override the config's default instance_id \
+             (got '{iid}' — flag was ignored through the daemon RPC)"
+        );
+    }
+}

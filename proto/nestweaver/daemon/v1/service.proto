@@ -30,6 +30,7 @@ message IndexRepoRequest {
   bool force = 3;
   bool with_trigrams = 4;
   bool with_git_activity = 5;
+  string instance_id = 6;  // nw-019: logical instance for the indexed data. Empty = daemon decides (config name, else runtime hash).
 }
 
 message IndexVaultRequest {

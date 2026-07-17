@@ -7937,6 +7937,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     force,
                     with_trigrams,
                     with_git_activity,
+                    // nw-019: thread an explicit `--instance` through the RPC so it
+                    // overrides the daemon's default; empty lets the daemon decide.
+                    instance_id: instance.clone().unwrap_or_default(),
                 };
 
                 rt.block_on(async {
