@@ -131,12 +131,19 @@ pub fn save_filemeta_sidecar(sidecar: &FileMetaSidecar, path: &Path) -> Result<(
     Ok(())
 }
 
-/// Cross-repo "still alive" unions returned by [`merge_save_filemeta`], used
-/// to evict the parsed-cache / resolution-deps sidecars. A named struct so
-/// the two same-typed sets can't be swapped at a call site.
+/// "Still alive" sets returned by [`merge_save_filemeta`], used to evict the
+/// parsed-cache / resolution-deps sidecars. A named struct so the same-typed
+/// sets can't be swapped at a call site.
 struct FilemetaEvictionUnions {
+    /// Cross-repo union of every repo's live content hashes. The parsed cache
+    /// is content-hash keyed (collision-safe across repos), so its eviction
+    /// must be union-scoped or indexing one repo would drop another's entries.
     live_hashes: std::collections::HashSet<String>,
-    live_files: std::collections::HashSet<String>,
+    /// THIS repo's live repo-relative paths only. The resolution-deps tracker
+    /// is now per-repo keyed (nw-045), so its eviction is scoped to the repo
+    /// being indexed — never the cross-repo union (which could resurrect or
+    /// wrongly retain another repo's records on a shared rel path).
+    repo_live_files: std::collections::HashSet<String>,
 }
 
 /// Load-merge-save the filemeta sidecar for one repo's index run, and return
@@ -154,22 +161,25 @@ fn merge_save_filemeta(
         sidecar.repos.remove(uid);
     }
     sidecar.repos.insert(r_uid.to_string(), new_filemeta);
-    // Eviction unions across ALL repos — feeding only the current repo's
-    // entries (the old behavior) evicts every other repo's parse cache.
+    // Content-hash union across ALL repos — feeding only the current repo's
+    // hashes (the old behavior) evicts every other repo's parse cache.
     let live_hashes = sidecar
         .repos
         .values()
         .flat_map(|files| files.values().map(|m| m.content_hash.clone()))
         .collect();
-    let live_files = sidecar
+    // THIS repo's live rel-paths only (nw-045). The resolution-deps tracker is
+    // per-repo keyed, so its retention must be scoped to r_uid — the cross-repo
+    // union would preserve dead entries and defeats per-repo eviction.
+    let repo_live_files = sidecar
         .repos
-        .values()
-        .flat_map(|files| files.keys().cloned())
-        .collect();
+        .get(r_uid)
+        .map(|files| files.keys().cloned().collect())
+        .unwrap_or_default();
     save_filemeta_sidecar(&sidecar, filemeta_path)?;
     Ok(FilemetaEvictionUnions {
         live_hashes,
-        live_files,
+        repo_live_files,
     })
 }
 
@@ -520,7 +530,7 @@ fn index_directory_with_store_inner(
     let drop_uids: Vec<String> = reidentified_old_uid.into_iter().collect();
     let unions = merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &drop_uids)?;
     parsed_cache.retain_hashes(&unions.live_hashes);
-    resolution_deps.retain_files(&unions.live_files);
+    resolution_deps.retain_files_for_repo(&r_uid, &unions.repo_live_files);
 
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
@@ -1631,17 +1641,21 @@ where
     // When no files changed and we have prior resolution data, skip resolution
     // entirely — edges from the previous run are still valid in the DB.
     let skip_resolution = actually_changed_files.is_empty()
-        && resolution_deps.as_ref().is_some_and(|rd| !rd.is_empty());
+        && resolution_deps
+            .as_ref()
+            .is_some_and(|rd| !rd.is_empty_for_repo(&r_uid));
 
     let resolve_filter = if !skip_resolution
         && !actually_changed_files.is_empty()
         && files_unchanged > 0
-        && resolution_deps.as_ref().is_some_and(|rd| !rd.is_empty())
+        && resolution_deps
+            .as_ref()
+            .is_some_and(|rd| !rd.is_empty_for_repo(&r_uid))
     {
         let affected = resolution_deps
             .as_ref()
             .unwrap()
-            .affected_files(&actually_changed_files);
+            .affected_files_for_repo(&r_uid, &actually_changed_files);
         tracing::info!(
             changed = actually_changed_files.len(),
             affected = affected.len(),
@@ -1730,7 +1744,7 @@ where
             }
         }
         for (file, deps) in file_deps {
-            rd.set_deps(file, deps);
+            rd.set_deps_for_repo(&r_uid, file, deps);
         }
     }
 
@@ -2987,7 +3001,7 @@ fn full_index_fallback(
     match merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &drop_uids) {
         Ok(unions) => {
             parsed_cache.retain_hashes(&unions.live_hashes);
-            resolution_deps.retain_files(&unions.live_files);
+            resolution_deps.retain_files_for_repo(&r_uid, &unions.repo_live_files);
         }
         Err(e) => tracing::warn!("failed to save filemeta sidecar: {e}"),
     }
