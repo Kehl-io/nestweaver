@@ -1232,3 +1232,101 @@ fn cli_contracts_diff_clean_on_identical_specs() {
         .success()
         .stdout(contains("No API changes"));
 }
+
+/// nw-019: `brain refresh --config` (no `--instance` flag) must tag the vault
+/// under the config's `instance_id`, not the literal "default". The vault UID
+/// is `vlt:{instance}:{hash}`, so the instance is directly readable from
+/// `brain list --json`. Mirrors `brain watch`/`brain add` precedence:
+/// `--instance` flag > config's instance_id > "default".
+#[test]
+fn brain_refresh_uses_config_instance_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("brain.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Hello\n\nsome content\n").unwrap();
+
+    // Instance config declaring a non-default instance_id. Only the fields
+    // without serde defaults are required: instance_id, snapshot_storage,
+    // workspace, inference, git.
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "vault-test"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            storage = dir.path().join("storage").display(),
+            workspace = dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("storage")).unwrap();
+    std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
+
+    // Seed the DB: `brain add --config` creates the vault under the config's
+    // instance ("vlt:vault-test:..."). `brain refresh` requires an existing DB.
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Refresh with --config but NO --instance flag. Pre-fix, refresh ignored
+    // the config and resolved "default", cascade-deleting nothing and creating
+    // a spurious second "vlt:default:..." vault. Post-fix it honors the config's
+    // instance_id and re-indexes the same "vlt:vault-test:..." vault in place.
+    nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Read the vault back and assert its UID carries the config's instance.
+    let output = nestweaver_cmd()
+        .args(["brain", "list", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let uids: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uid"].as_str().unwrap())
+        .collect();
+    assert!(
+        uids.iter().any(|u| u.starts_with("vlt:vault-test:")),
+        "vault should be tagged under config instance_id 'vault-test', got uids: {uids:?}"
+    );
+    assert!(
+        !uids.iter().any(|u| u.starts_with("vlt:default:")),
+        "vault must NOT be tagged under the literal 'default' instance, got uids: {uids:?}"
+    );
+}

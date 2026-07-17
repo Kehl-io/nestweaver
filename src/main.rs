@@ -1942,13 +1942,18 @@ enum BrainCommands {
         path: PathBuf,
         #[arg(long, help = "Friendly name for the vault (default: directory name)")]
         name: Option<String>,
-        #[arg(long, help = "Instance ID")]
+        #[arg(long, help = "Instance ID (overrides --config)")]
         instance: Option<String>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) — uses its instance_id and db_path"
+        )]
+        config: Option<PathBuf>,
         #[arg(
             long,
             help = "Only re-index files modified since this timestamp (ISO 8601, e.g. 2026-05-26T00:00:00Z)"
@@ -10664,10 +10669,11 @@ fn run_brain(
             name,
             instance,
             db,
+            config,
             since,
             ignore,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());
                 return Ok((EXIT_ERROR, None));
@@ -10678,7 +10684,12 @@ fn run_brain(
                     .unwrap_or("vault")
                     .to_string()
             });
-            let instance_id = instance.unwrap_or_else(|| "default".to_string());
+            // nw-019: --instance flag > config's instance_id > "default"
+            // (mirrors `brain add`/`brain watch`; fixes vaults being tagged
+            // under the literal "default" instead of the config's instance).
+            let instance_id = instance
+                .or_else(|| load_instance_config_opt(config.as_deref()).map(|c| c.instance_id))
+                .unwrap_or_else(|| "default".to_string());
             let extra_patterns = parse_ignore_flag(&ignore);
 
             // Compute vault UID for recording last_indexed_at.
