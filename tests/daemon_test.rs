@@ -1064,3 +1064,89 @@ fn daemon_remove_repo_then_reindex_restores_symbols() {
          pre-fix it reports 'Indexed 0 files'. Got:\n{reindex_log}"
     );
 }
+
+/// nw-054: a query routed through the daemon AFTER a `remove-repo` mutation must
+/// reflect the deletion — it must NOT return the removed symbol out of a stale
+/// in-memory cache. This is the read-back the nw-048 test deliberately AVOIDED
+/// (it asserted on re-index file count instead, because a post-removal read gave
+/// a false GREEN by returning the deleted symbol).
+///
+/// Root cause: `remove_repo` deleted the graph rows but never bumped
+/// `graph_generation`. The daemon's `symbol_name_cache` (backing `search`) is
+/// keyed on that generation and had been populated by the pre-removal search, so
+/// the second search hit the cache and returned the deleted symbol. The fix
+/// bumps `graph_generation` on remove (mirroring `index`), invalidating the
+/// generation-keyed caches. Driven end-to-end through the real daemon — the sole
+/// DB writer and the live query store — with a fixed `--instance` so the repo
+/// uid is stable.
+#[test]
+fn daemon_remove_repo_invalidates_query_cache() {
+    const INSTANCE: &str = "nw054";
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("rr54").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // Repo with a distinctive symbol name we can search for.
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    std::fs::write(repo_dir.join("m.js"), "function gonefn() { return 1; }").unwrap();
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args([
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    let _guard = DaemonGuard::new(&db_path);
+
+    // Initial index through the daemon (auto-starts it) under a fixed instance.
+    index_via_daemon_instance(&repo_dir, &db_path, INSTANCE);
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Prime the daemon's in-memory `symbol_name_cache` with a search that finds
+    // the symbol (populates the cache at the current graph_generation).
+    daemon_cmd()
+        .args(["search", "gonefn", "--db", &db_path.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("Found").and(contains("gonefn")));
+
+    // Remove the repo through the daemon (normal operation).
+    daemon_cmd()
+        .args([
+            "remove-repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("symbol(s) deleted"));
+
+    // The read-back nw-048 avoided: a search through the SAME daemon must now
+    // report the symbol as gone. Pre-fix the stale generation-keyed cache still
+    // returns "Found 1 symbol(s)"; post-fix the generation bump invalidates it
+    // and the daemon re-scans the store → "No symbols found".
+    daemon_cmd()
+        .args(["search", "gonefn", "--db", &db_path.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("No symbols found"));
+}

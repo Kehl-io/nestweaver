@@ -1956,6 +1956,15 @@ impl NestWeaverDaemon for DaemonService {
             // symbols unrestored — search finds nothing). uid-scoped + fail-safe.
             nestweaver_engine::remove_repo_sidecar_slices(&state.db_path, &req.repo_uid);
 
+            // nw-054: bump the graph generation so generation-keyed caches on the
+            // live daemon store invalidate (mirrors what `index` does after a
+            // mutation). Without this, the in-memory `symbol_name_cache` — primed
+            // by a pre-removal query — keeps satisfying subsequent searches and
+            // returns the just-deleted symbols (a query serving DELETED data). The
+            // bump forces the next query to re-scan the store, which no longer
+            // holds the removed rows.
+            state.store.bump_and_persist_generation();
+
             if let Some(ref tantivy) = state.tantivy
                 && tantivy.has_writer()
             {
