@@ -3923,6 +3923,17 @@ function hello(name) { return "Hello " + name; }
         let path = dir.path().join("db.lbug.filemeta.json");
         let sidecar = FileMetaSidecar::default();
         save_filemeta_sidecar(&sidecar, &path).unwrap();
+        // Assert on the serialized bytes, not just the round-tripped struct:
+        // without the `impl Default` version pin, save would write
+        // `"version":0`, load would see the mismatch and fail-open to
+        // default() — silently satisfying the version/empty asserts below.
+        // Pinning the check to the on-disk bytes catches that regression.
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""version":2"#),
+            "a default-constructed sidecar must serialize with the current version"
+        );
         let loaded = load_filemeta_sidecar(&path);
         assert_eq!(loaded.version, FILEMETA_VERSION);
         assert!(loaded.repos.is_empty());
@@ -4181,10 +4192,76 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
+    fn full_index_fallback_eviction_uses_cross_repo_unions() {
+        // nw-022 T4, the eviction property (the graph-loss / nw-010 class):
+        // full_index_fallback feeds `parsed_cache.retain_hashes(...)` the
+        // cross-repo union of live hashes from merge_save_filemeta. If it were
+        // fed only THIS run's hashes (the pre-fix behavior), indexing repo B
+        // through the fallback path would evict repo A's parsed-cache entries.
+        // This test reverts to RED if the eviction block is fed current-run-only
+        // hashes/files instead of `unions.live_hashes` / `unions.live_files`.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.lbug");
+        let repo_a = dir.path().join("repo_a");
+        let repo_b = dir.path().join("repo_b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        // Distinct files + distinct content → distinct content hashes.
+        fs::write(repo_a.join("alpha.js"), "function alpha() { return 1; }").unwrap();
+        fs::write(repo_b.join("beta.js"), "function beta() { return 2; }").unwrap();
+
+        // Index repo A through the incremental entry point (non-git → fallback).
+        let ra =
+            incremental_index_with_name(&repo_a, &db_path, "test", "https://example.com/a", None)
+                .unwrap();
+        assert!(ra.fell_back_to_full, "non-git dir must fall back to full");
+
+        // Recover repo A's live content hash from its filemeta slice (the same
+        // hash the fallback path keys the parsed cache by) and confirm the
+        // parsed-cache entry exists after A's run.
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        let uid_a = repo_uid("test", "https://example.com/a");
+        let hash_a = load_filemeta_sidecar(&filemeta_path)
+            .repos
+            .get(&uid_a)
+            .and_then(|slice| slice.get("alpha.js"))
+            .map(|m| m.content_hash.clone())
+            .expect("repo A's filemeta slice must record alpha.js");
+
+        let parsed_cache_path = crate::sidecar_path(&db_path, ".parsed_cache.bin");
+        assert!(
+            crate::parsed_cache::ParsedCache::load(&parsed_cache_path)
+                .get(&hash_a)
+                .is_some(),
+            "repo A's parsed-cache entry must exist after its own fallback run"
+        );
+
+        // Index repo B into the SAME db through the fallback path.
+        let rb =
+            incremental_index_with_name(&repo_b, &db_path, "test", "https://example.com/b", None)
+                .unwrap();
+        assert!(rb.fell_back_to_full);
+
+        // The eviction must be union-scoped: repo A's entry survives.
+        assert!(
+            crate::parsed_cache::ParsedCache::load(&parsed_cache_path)
+                .get(&hash_a)
+                .is_some(),
+            "repo A's parsed-cache entry must survive repo B's fallback run"
+        );
+    }
+
+    #[test]
     fn reidentify_drops_old_uid_filemeta_slice() {
-        // nw-022 T6, primary path (index_directory): re-indexing a working
+        // nw-022 T6, PRIMARY path (index_directory): re-indexing a working
         // tree under its origin identity must drop the legacy file:// uid's
         // filemeta slice from the sidecar alongside the graph prune.
+        //
+        // Naming note: this is the spec-named test, but the primary-path
+        // drop_uids threading it guards already shipped in the PARENT commit
+        // (b7a0661e). Reverting THIS commit's fallback threading does NOT turn
+        // this test red — the fallback deliverable is guarded by
+        // `reidentify_drops_old_uid_filemeta_slice_fallback` below.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
@@ -4222,9 +4299,15 @@ function hello(name) { return "Hello " + name; }
 
     #[test]
     fn reidentify_drops_old_uid_filemeta_slice_fallback() {
-        // nw-022 T6, fallback path: the same re-identify hand-off driven
+        // nw-022 T6, FALLBACK path: the same re-identify hand-off driven
         // through the incremental entry point (non-git dir →
         // full_index_fallback) must also drop the legacy uid's slice.
+        //
+        // Naming note: this is the real T6 deliverable of THIS commit. It is
+        // the ONLY test that turns red if full_index_fallback's `drop_uids`
+        // threading (reidentified_old_uid → merge_save_filemeta) is reverted;
+        // the spec-named `reidentify_drops_old_uid_filemeta_slice` above only
+        // exercises the parent commit's already-fixed primary path.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
