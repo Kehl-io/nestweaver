@@ -3008,6 +3008,25 @@ fn full_index_fallback(
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
+    // nw-029: warm PageRank at index time so first queries (UI overview, impact,
+    // repo-map, hubs) never pay the lazy compute. This is the first-index-of-a-
+    // new-repo path (`nestweaver index` with no prior index / non-git dir), the
+    // most common case — without this it stayed sidecar-less. Mirrors the full
+    // and incremental paths. Release-build cost is seconds even at ~50k symbols;
+    // failure is non-fatal (lazy single-flight compute remains the backstop).
+    // The `files_count > 0 || !exists` guard keeps a no-op re-index cheap.
+    if result.files_count > 0 || !crate::sidecar_path(db_path, ".pagerank.json").exists() {
+        if let Err(e) = store.compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
+        {
+            tracing::warn!("index-time PageRank failed (non-fatal): {e}");
+        } else {
+            let pr_path = crate::sidecar_path(db_path, ".pagerank.json");
+            if let Err(e) = store.save_pagerank_cache(&pr_path) {
+                tracing::warn!("saving pagerank sidecar failed (non-fatal): {e}");
+            }
+        }
+    }
+
     // P0.2: full re-index mutated the graph; bump + persist the generation.
     store.bump_and_persist_generation();
 
@@ -4074,6 +4093,37 @@ function hello(name) { return "Hello " + name; }
         index_directory(&repo, &db_path, "test", "https://example.com/a", "sha").unwrap();
         let sidecar = dir.path().join("t.lbug.pagerank.json");
         assert!(sidecar.exists(), "full index must compute+save pagerank");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert!(
+            json.as_object().map(|o| !o.is_empty()).unwrap_or(false),
+            "sidecar must contain scores"
+        );
+    }
+
+    #[test]
+    fn first_index_of_new_repo_via_fallback_writes_pagerank_sidecar() {
+        // nw-029: the first `nestweaver index` of a new repo routes through
+        // full_index_fallback, which (pre-fix) never computed/saved the pagerank
+        // sidecar — leaving the most common case cold.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.js"),
+            "function f() { g(); }\nfunction g() {}",
+        )
+        .unwrap();
+        // drive the plain/incremental entry that falls back to full_index_fallback
+        // for a repo with no prior index (non-git dir → full fallback).
+        incremental_index_with_name(&repo, &db_path, "test", "https://example.com/a", None)
+            .unwrap();
+        let sidecar = dir.path().join("t.lbug.pagerank.json");
+        assert!(
+            sidecar.exists(),
+            "first index via fallback must compute+save pagerank"
+        );
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&sidecar).unwrap()).unwrap();
         assert!(
