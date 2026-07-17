@@ -14298,6 +14298,12 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
                 .unwrap_or_else(|| {
                     nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path)
                 });
+            // nw-052b residual: a `--instance` flag here bypasses the CLI
+            // `resolve_instance_id` validator, so reject a colon/whitespace
+            // instance before it lands in the stamp label and the
+            // `snapshot-<instance>` output-dir name. Config-derived ids are
+            // already validated at config-load; the hash fallback is always valid.
+            nestweaver_engine::validate_instance_id(&instance_id)?;
 
             // Fetch repos by reading the store directly. The quiesce guard above
             // guarantees no daemon is writing this DB, so a raw read is safe —

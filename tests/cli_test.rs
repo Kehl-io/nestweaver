@@ -242,6 +242,23 @@ fn cli_snapshot_build_and_verify() {
         .assert()
         .success()
         .stdout(contains("Snapshot verified OK"));
+
+    // nw-052b residual: a colon in the snapshot `--instance` flag must be
+    // rejected (it would otherwise land in the stamp label + output-dir name).
+    nestweaver_cmd()
+        .args([
+            "snapshot",
+            "build",
+            "--db",
+            &db_path.display().to_string(),
+            "--output",
+            &dir.path().join("snap-colon").display().to_string(),
+            "--instance",
+            "a:b",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("colon"));
 }
 
 #[test]
