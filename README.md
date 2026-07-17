@@ -445,7 +445,7 @@ nestweaver project-context "payments" --token-budget 5000
 
 Manage multiple repositories as a single graph. NestWeaver discovers cross-repo dependencies, suggests links between related symbols, and lets you query across repository boundaries.
 
-See the [Instance Config Guide](docs/guide/instance-config.md) for full configuration options.
+See the [Instance Config Guide](docs/guide/instance-config.md) for full configuration options. If an older database mixes instance_id conventions, the [Instance ID Migration Runbook](docs/guide/instance-id-migration.md) consolidates it.
 
 ```sh
 # Discover cross-repo links
