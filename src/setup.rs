@@ -1106,7 +1106,6 @@ pub fn run_auto_setup(db_path: &std::path::Path, base: &Path) -> Result<(), anyh
 /// count as inside /home/u/repo.
 // Wired into the `Index` command handler in a later nw-023 task; the
 // `#[cfg(test)]` gate below exercises it in the meantime.
-#[allow(dead_code)]
 pub fn should_auto_setup(
     stderr_is_tty: bool,
     quiet: bool,

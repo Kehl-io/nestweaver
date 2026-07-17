@@ -1330,3 +1330,61 @@ credential_method = "gh"
         "vault must NOT be tagged under the literal 'default' instance, got uids: {uids:?}"
     );
 }
+
+#[test]
+fn index_does_not_write_setup_files_into_unrelated_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("cwd");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    // Deterministic detection without relying on host PATH:
+    std::fs::create_dir_all(cwd.join(".cursor")).unwrap();
+    let db = dir.path().join("test.lbug");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .current_dir(&cwd)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    for f in [
+        ".mcp.json",
+        "AGENTS.md",
+        ".claude",
+        ".codex",
+        ".github",
+        ".cursor/mcp.json",
+        "devin.json",
+    ] {
+        assert!(
+            !cwd.join(f).exists(),
+            "index must not write {f} into an unrelated cwd"
+        );
+    }
+    // Piped output → stderr not a TTY → gate blocks even repo-root writes:
+    assert!(
+        !repo.join(".mcp.json").exists(),
+        "non-TTY index must not write into the repo either"
+    );
+    // Skipped ≠ done: marker must NOT be written, so a future interactive index still gets setup.
+    assert!(
+        !dir.path().join("test.lbug.setup_done").exists(),
+        "marker must only be written when setup actually ran"
+    );
+    // The hint must tell the user what they can do instead:
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nestweaver setup"),
+        "skip must print a hint, got: {stderr}"
+    );
+}

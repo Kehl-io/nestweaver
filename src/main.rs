@@ -3097,6 +3097,30 @@ fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
     repo_root.join("nestweaver.lbug")
 }
 
+/// nw-023: first-index auto-setup, gated to "human at a TTY standing in the
+/// indexed repo", writes anchored to the repo root, marker written only on an
+/// actual run so a skip never permanently disables first-run setup.
+fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig) {
+    let marker_path = nestweaver_engine::sidecar_path(db_path, ".setup_done");
+    if marker_path.exists() {
+        return;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if setup::should_auto_setup(std::io::stderr().is_terminal(), out.quiet, &cwd, repo_root) {
+        match setup::run_auto_setup(db_path, repo_root) {
+            Ok(()) => {
+                let _ = std::fs::write(&marker_path, "");
+            }
+            Err(e) => tracing::debug!("auto-setup failed (non-fatal): {e}"),
+        }
+    } else {
+        out.status(&format!(
+            "Tip: run `nestweaver setup` in {} to configure AI tool integrations.",
+            repo_root.display()
+        ));
+    }
+}
+
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
@@ -8149,16 +8173,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Auto-setup AI tool integrations on first index of this repo.
             // Uses a marker sidecar so it only fires once per db, not on every
             // incremental re-index. Non-fatal — a failure here never aborts the index.
-            let marker_path = nestweaver_engine::sidecar_path(&db_path, ".setup_done");
-            if !marker_path.exists() {
-                // T3 will gate this on `should_auto_setup` and anchor `base` to the
-                // indexed repo root; for now use cwd to preserve current behavior.
-                let auto_setup_base = std::env::current_dir()?;
-                if let Err(e) = setup::run_auto_setup(&db_path, &auto_setup_base) {
-                    tracing::debug!("auto-setup failed (non-fatal): {e}");
-                }
-                let _ = std::fs::write(&marker_path, "");
-            }
+            maybe_run_auto_setup(&db_path, &repo_path, out);
 
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",
