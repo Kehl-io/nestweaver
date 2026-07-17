@@ -108,7 +108,17 @@ pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
     pub db_path: PathBuf,
+    /// Runtime identity: the SHA-256-derived id of the canonical `--db` path
+    /// (see [`lifecycle::instance_id_from_db_path`]). Used ONLY for runtime
+    /// paths — sockets/pidfiles/launchd/replica locks — where the 104-byte
+    /// `sun_path` limit forbids arbitrary logical names. Never written into
+    /// graph nodes (nw-019).
     pub instance_id: String,
+    /// Graph-data identity: the config's logical `instance_id` when `--config`
+    /// was supplied, else the db-path hash. This is what gets stamped on every
+    /// repo/symbol/note we write, so users see and type one name everywhere
+    /// (nw-019). Config-less starts collapse it back onto `instance_id`.
+    pub data_instance_id: String,
     pub start_time: Instant,
     pub active_reads: Arc<AtomicU32>,
     pub active_writes: Arc<AtomicU32>,
@@ -936,8 +946,9 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
+        // nw-019: default writes to the config's logical instance, not the hash.
         let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
+            self.state.data_instance_id.clone()
         } else {
             req.instance_id.clone()
         };
@@ -1067,8 +1078,9 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
+        // nw-019: default writes to the config's logical instance, not the hash.
         let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
+            self.state.data_instance_id.clone()
         } else {
             req.instance_id.clone()
         };
@@ -1497,7 +1509,8 @@ impl NestWeaverDaemon for DaemonService {
                 &state.store,
                 &repo_path,
                 &state.db_path,
-                &state.instance_id,
+                // nw-019: stamp the config's logical instance on indexed repos.
+                &state.data_instance_id,
                 &repo_url,
                 &indexed_sha,
                 force,
@@ -1655,8 +1668,9 @@ impl NestWeaverDaemon for DaemonService {
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
+        // nw-019: default writes to the config's logical instance, not the hash.
         let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
+            self.state.data_instance_id.clone()
         } else {
             req.instance_id.clone()
         };
@@ -1759,8 +1773,9 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
+        // nw-019: default writes to the config's logical instance, not the hash.
         let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
+            self.state.data_instance_id.clone()
         } else {
             req.instance_id.clone()
         };
@@ -4402,6 +4417,12 @@ pub async fn run_server(
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
+    // nw-019: two identities. `instance_id` (db-path hash) is for RUNTIME paths
+    // only — sockets/pidfiles/launchd/replica locks (104-byte sun_path limit).
+    // `data_instance_id` (the config's logical name when we have one) is what
+    // gets written into graph nodes, so users see and type one name everywhere.
+    // Built later once `instance_cfg` is parsed; a config-less start falls back
+    // to the hash so `data_instance_id == instance_id`.
 
     // Set up daily-rolling log file via tracing-appender. This replaces
     // the manual rotate-at-startup approach and handles rotation while the
@@ -4602,6 +4623,14 @@ pub async fn run_server(
         },
     };
 
+    // nw-019: graph-data identity — the config's logical `instance_id` when we
+    // have a parsed config, else fall back to the runtime hash so a config-less
+    // daemon still has `data_instance_id == instance_id`.
+    let data_instance_id = instance_cfg
+        .as_ref()
+        .map(|c| c.instance_id.clone())
+        .unwrap_or_else(|| instance_id.clone());
+
     let is_server_mode = server_opts.is_some();
 
     // Build safeguards and rate limiters for server mode.
@@ -4685,6 +4714,7 @@ pub async fn run_server(
         db_path: db_path.clone(),
         read_only,
         instance_id: instance_id.clone(),
+        data_instance_id: data_instance_id.clone(),
         start_time: Instant::now(),
         active_reads: Arc::new(AtomicU32::new(0)),
         active_writes: Arc::new(AtomicU32::new(0)),
@@ -4939,7 +4969,10 @@ pub async fn run_server(
             && let Ok(queue) = shared_job_queue.lock()
         {
             for repo_cfg in &cfg.repos {
-                let repo_uid = nestweaver_schema::repo_uid(&instance_id, &repo_cfg.url);
+                // nw-019: look up under the same logical instance the worker
+                // stamps on the repo, or the "already indexed?" check never
+                // matches and we re-enqueue on every boot.
+                let repo_uid = nestweaver_schema::repo_uid(&data_instance_id, &repo_cfg.url);
                 let needs_initial_index = state
                     .store
                     .lookup_repo(&repo_uid)
@@ -5521,7 +5554,8 @@ pub async fn run_server(
         if !read_only {
             let worker_store = Arc::clone(&state.store);
             let worker_db = db_path.clone();
-            let worker_instance = instance_id.clone();
+            // nw-019: the worker stamps this on every repo it indexes.
+            let worker_instance = data_instance_id.clone();
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
             let worker_write_mutex = Arc::clone(&state.write_mutex);
@@ -5653,7 +5687,9 @@ pub async fn run_server(
     // (it would poll git remotes and enqueue index jobs against the snapshot).
     if server_opts.is_some() && !read_only {
         let poll_store = Arc::clone(&state.store);
-        let poll_instance = instance_id.clone();
+        // nw-019: must match the worker's stamp, or list_repos/repo_uid
+        // lookups here find nothing and the scheduler never polls the repos.
+        let poll_instance = data_instance_id.clone();
         let poll_job_queue = shared_job_queue_opt.clone();
         let poll_cfg = state.instance_cfg.clone();
         let poll_drained = Arc::clone(&state.drained);
@@ -5829,7 +5865,9 @@ pub async fn run_server(
         let metrics_active_reads = Arc::clone(&state.active_reads);
         let metrics_active_writes = Arc::clone(&state.active_writes);
         let metrics_job_queue = shared_job_queue_opt.clone();
-        let metrics_instance = instance_id.clone();
+        // nw-019: must match the worker's stamp, or the repo-count gauge
+        // filters on the wrong instance and always reads zero.
+        let metrics_instance = data_instance_id.clone();
         let metrics_mcp_sessions = mcp_session_gauge_opt.clone();
         let mut metrics_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -7228,6 +7266,7 @@ mod startup_helper_tests {
             tantivy: Some(tantivy),
             db_path,
             instance_id: "default".to_string(),
+            data_instance_id: "default".to_string(),
             start_time: Instant::now(),
             active_reads: Arc::new(AtomicU32::new(0)),
             active_writes: Arc::new(AtomicU32::new(0)),
