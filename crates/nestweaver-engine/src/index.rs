@@ -36,9 +36,10 @@ pub struct IndexResult {
     pub edges_count: usize,
     pub files_count: usize,
     pub files_unchanged: usize,
-    /// nw-055 (P1b): count of files pruned from the store because they vanished
-    /// from disk since the last index (deletions), distinct from `files_count`
-    /// (files parsed) and `files_unchanged` (files skipped as identical). A
+    /// Count of old File rows removed by the indexing transaction, distinct
+    /// from `files_count` (files parsed) and `files_unchanged` (files skipped as
+    /// identical). Forced replacement counts every old row authoritatively
+    /// deleted by `bulk_reindex_write`, including same-path replacements. A
     /// delete-only re-index has `files_count == 0` but `files_deleted > 0`; the
     /// index-time PageRank guard consults this so surviving nodes' ranks are
     /// recomputed after a deletion instead of left stale.
@@ -185,6 +186,76 @@ pub fn remove_repo_sidecar_slices(db_path: &Path, repo_uid: &str) {
             error = %e, repo_uid,
             "remove-repo: failed to drop resolution_deps slice (non-fatal)"
         );
+    }
+}
+
+/// Publish all cache and sidecar effects that must follow a successful code
+/// graph deletion. Both daemon RPC and web-admin removals call this epilogue so
+/// they cannot diverge after performing the same graph mutation.
+///
+/// The parsed cache is intentionally not touched: unlike filemeta and
+/// resolution dependencies, it is keyed by content hash and safely shared by
+/// every repo in the database.
+pub fn finalize_code_graph_deletion(
+    store: &GraphStore,
+    db_path: &Path,
+    repo_uids: &[String],
+    tantivy: Option<&nestweaver_store::TantivyIndex>,
+    operation: &str,
+) {
+    for uid in repo_uids {
+        remove_repo_sidecar_slices(db_path, uid);
+    }
+    store.bump_and_persist_generation();
+    store.invalidate_pagerank();
+
+    let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
+    if let Err(error) = std::fs::remove_file(&pagerank_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, path = %pagerank_path.display(), "failed to remove stale PageRank sidecar");
+    }
+
+    if let Some(tantivy) = tantivy
+        && tantivy.has_writer()
+    {
+        match tantivy.reindex_from_store(store) {
+            Ok(docs) => tracing::info!(docs, operation, "Tantivy reindexed after mutation"),
+            Err(error) => {
+                tracing::warn!(%error, operation, "Tantivy reindex failed after mutation")
+            }
+        }
+    }
+}
+
+fn refresh_pagerank_after_reader_index(store: &GraphStore, result: &IndexResult) {
+    if result.files_count == 0 && result.files_deleted == 0 {
+        return;
+    }
+
+    // Remove the persisted snapshot before recomputing. If computation or
+    // persistence fails, a daemon restart must fall back to a fresh lazy
+    // compute rather than reload ranks for graph rows that no longer exist.
+    let pagerank_path = store
+        .db_path()
+        .map(|db_path| crate::sidecar_path(db_path, ".pagerank.json"));
+    if let Some(path) = pagerank_path.as_ref()
+        && let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, path = %path.display(), "failed to remove stale PageRank sidecar");
+    }
+    store.invalidate_pagerank();
+
+    if let Err(error) = store.compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
+    {
+        tracing::warn!(%error, "server index-time PageRank failed; cache remains invalidated");
+        return;
+    }
+    if let Some(path) = pagerank_path
+        && let Err(error) = store.save_pagerank_cache(&path)
+    {
+        tracing::warn!(%error, path = %path.display(), "saving server PageRank sidecar failed");
     }
 }
 
@@ -1467,14 +1538,7 @@ where
     //     from seeing zero symbols while the CPU-heavy service-grouping work
     //     runs between delete and insert.
     let force_reindex = existing_repo.is_some() && files_unchanged == 0;
-    if force_reindex {
-        if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
-            files_deleted += stored_files
-                .iter()
-                .filter(|(_, path)| !present_files.contains(path))
-                .count();
-        }
-    } else if existing_repo.is_some() {
+    if !force_reindex && existing_repo.is_some() {
         // Incremental: only delete the specific files we're about to re-insert.
         for file in &all_files {
             // Remove old symbols belonging to this file.
@@ -1556,7 +1620,7 @@ where
         // Atomic delete+insert: old data is only removed within the same
         // transaction that inserts the replacement, so concurrent readers
         // never see an empty repo.
-        store
+        let (deleted_files, _) = store
             .bulk_reindex_write(
                 &r_uid,
                 &all_files,
@@ -1567,6 +1631,7 @@ where
                 &svc_sym_refs,
             )
             .context("bulk_reindex_write")?;
+        files_deleted += deleted_files;
     } else {
         store
             .bulk_index_write(
@@ -1943,18 +2008,25 @@ where
         "indexing complete"
     );
 
-    if bump_generation_after_write {
-        store.bump_and_persist_generation();
-    }
-
-    Ok(IndexResult {
+    let result = IndexResult {
         symbols_count,
         edges_count,
         files_count,
         files_unchanged,
         files_deleted,
         skipped_files,
-    })
+    };
+
+    if bump_generation_after_write {
+        // Server-mode callers return an owned write guard from
+        // acquire_write_guard. Refresh ranks and publish generation while that
+        // guard is still alive, so another mutation cannot interleave between
+        // the graph replacement and its cache epilogue.
+        refresh_pagerank_after_reader_index(store, &result);
+        store.bump_and_persist_generation();
+    }
+
+    Ok(result)
 }
 
 /// Returns true if the given path has a supported language extension.
@@ -3857,6 +3929,152 @@ function hello(name) { return "Hello " + name; }
     }
 
     // ── Tiered change detection tests ─────────────────────────────────────
+
+    #[test]
+    fn force_reindex_reports_transactional_deletion_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&src).unwrap();
+        let source_path = src.join("main.js");
+        fs::write(&source_path, "function before() { return 1; }").unwrap();
+
+        let first = index_directory_with_options(
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/repo",
+            "sha-1",
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.files_count, 1);
+
+        // The path is still present, so the old pre-count classified it as
+        // "not deleted" even though bulk_reindex_write transactionally deletes
+        // the old File row before inserting its replacement.
+        fs::write(&source_path, "function after() { return 2; }").unwrap();
+        let second = index_directory_with_options(
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/repo",
+            "sha-2",
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            second.files_deleted, 1,
+            "the result must use bulk_reindex_write's authoritative deletion count"
+        );
+    }
+
+    struct EmptyReader {
+        root: PathBuf,
+    }
+
+    impl crate::content_reader::ContentReader for EmptyReader {
+        fn read_file(&self, _rel_path: &Path) -> Result<String, anyhow::Error> {
+            // Manifest discovery probes well-known paths even when list_files
+            // is empty; model those probes as absent/empty content.
+            Ok(String::new())
+        }
+
+        fn list_files(&self) -> Result<Vec<PathBuf>, anyhow::Error> {
+            Ok(Vec::new())
+        }
+
+        fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+            Ok(None)
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn version_id(&self) -> &str {
+            "empty"
+        }
+    }
+
+    #[test]
+    fn server_full_delete_only_replacement_refreshes_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed_repo = dir.path().join("removed-repo");
+        let surviving_repo = dir.path().join("surviving-repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&removed_repo).unwrap();
+        fs::create_dir_all(&surviving_repo).unwrap();
+        fs::write(
+            removed_repo.join("removed.js"),
+            "function removed() { return 1; }",
+        )
+        .unwrap();
+        fs::write(
+            surviving_repo.join("survivor.js"),
+            "function survivor() { return 2; }",
+        )
+        .unwrap();
+
+        let removed_url = "https://example.com/removed";
+        index_directory(&removed_repo, &db_path, "test", removed_url, "sha-1").unwrap();
+        index_directory(
+            &surviving_repo,
+            &db_path,
+            "test",
+            "https://example.com/surviving",
+            "sha-1",
+        )
+        .unwrap();
+
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let removed_uid = store
+            .symbols_in_file("removed.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        assert!(store.pagerank_scores().contains_key(&removed_uid));
+
+        let reader = EmptyReader {
+            root: dir.path().join("empty-reader"),
+        };
+        let result = index_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test",
+            removed_url,
+            "sha-2",
+            None,
+            None,
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.files_deleted, 1);
+        assert!(
+            !store.pagerank_scores().contains_key(&removed_uid),
+            "the live server store must not serve the deleted symbol's stale score"
+        );
+        let persisted: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            !persisted.contains_key(&removed_uid),
+            "a daemon restart must not reload the deleted symbol from the PageRank sidecar"
+        );
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(
+            !reopened.pagerank_scores().contains_key(&removed_uid),
+            "a reopened store must not reload the deleted symbol's stale score"
+        );
+    }
 
     #[test]
     fn deleting_last_parseable_file_refreshes_pagerank() {

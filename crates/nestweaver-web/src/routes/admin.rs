@@ -491,6 +491,8 @@ pub async fn remove_repo(
     // also acquire this mutex before indexing; when it runs, it checks
     // whether the repo node still exists and skips if deleted.
     let write_mutex = state.write_mutex.clone();
+    let db_path = state.db_path.clone();
+    let tantivy = state.tantivy.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = write_mutex.as_ref().map(|m| m.blocking_lock());
         store
@@ -513,6 +515,13 @@ pub async fn remove_repo(
                 format!("delete_repo_node failed: {e}"),
             )
         })?;
+        nestweaver_engine::finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            std::slice::from_ref(&uid),
+            tantivy.as_deref(),
+            "admin repo removal",
+        );
         Ok::<_, (StatusCode, String)>(())
     })
     .await
@@ -1609,7 +1618,7 @@ mod tests {
     use axum::http::Request;
     use axum::{
         Router,
-        routing::{get, post},
+        routing::{delete, get, post},
     };
     use tower::ServiceExt;
 
@@ -1630,6 +1639,7 @@ mod tests {
             auth_token,
             device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             daemon_store: Arc::new(store),
+            tantivy: None,
             instance_id: "test".to_string(),
             start_time: std::time::Instant::now(),
             active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1887,6 +1897,7 @@ url = "https://github.com/example/existing"
             auth_token: Some("test-query-token".to_string()),
             device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             daemon_store: Arc::new(store),
+            tantivy: None,
             instance_id: "test".to_string(),
             start_time: std::time::Instant::now(),
             active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1926,6 +1937,155 @@ url = "https://github.com/example/existing"
         assert!(cfg.repos.iter().any(|repo| {
             repo.url == "https://github.com/example/new" && repo.branch.as_deref() == Some("main")
         }));
+    }
+
+    #[tokio::test]
+    async fn remove_repo_finalizes_live_caches_sidecars_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.js"),
+            "function admin_delete_target() { return 1; }",
+        )
+        .unwrap();
+
+        let repo_url = "https://example.com/admin-delete";
+        nestweaver_engine::index_directory(&src, &db_path, "test", repo_url, "sha-1").unwrap();
+        let repo_uid = nestweaver_schema::repo_uid("test", repo_url);
+        let store = Arc::new(
+            nestweaver_store::GraphStore::open_or_create(&db_path).expect("open test store"),
+        );
+
+        let pagerank_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let removed_symbol_uid = store
+            .symbols_in_file("main.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        assert!(store.pagerank_scores().contains_key(&removed_symbol_uid));
+
+        let filemeta_path = nestweaver_engine::sidecar_path(&db_path, ".filemeta.json");
+        assert!(
+            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&repo_uid)
+        );
+        let parsed_cache_path = nestweaver_engine::sidecar_path(&db_path, ".parsed_cache.bin");
+        let parsed_cache_before = std::fs::read(&parsed_cache_path).unwrap();
+
+        let resolution_deps_path =
+            nestweaver_engine::sidecar_path(&db_path, ".resolution_deps.bin");
+        let mut deps = nestweaver_engine::resolution_cache::ResolutionDeps::default();
+        deps.set_deps_for_repo(
+            &repo_uid,
+            "main.js",
+            ["dependency.js".to_string()].into_iter().collect(),
+        );
+        deps.save(&resolution_deps_path).unwrap();
+
+        let tantivy = Arc::new(
+            nestweaver_store::TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap(),
+        );
+        // Seed a search-only stale document. Shared finalization rebuilds the
+        // corpus from the graph, so this disappears iff the admin path really
+        // reconciles the live Tantivy writer after mutation.
+        tantivy
+            .update_note(
+                "note:stale-admin-delete",
+                "admin_delete_target",
+                "vault:test",
+                &["admin_delete_target".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !tantivy
+                .search("admin_delete_target", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let generation_before = store.graph_generation();
+        let state = Arc::new(AdminState {
+            admin_token: "test-admin-token".to_string(),
+            auth_token: Some("test-query-token".to_string()),
+            device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            daemon_store: Arc::clone(&store),
+            tantivy: Some(Arc::clone(&tantivy)),
+            instance_id: "test".to_string(),
+            start_time: std::time::Instant::now(),
+            active_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            mcp_sessions: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            indexing_queue_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            db_path: db_path.clone(),
+            config_path: None,
+            scheduler_tx: None,
+            webhook_allowed_repos: None,
+            webhook_repo_branches: None,
+            write_mutex: None,
+            job_queue: None,
+        });
+        let app = Router::new()
+            .route("/admin/api/repos/{id}", delete(remove_repo))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/admin/api/repos/{repo_uid}"))
+                    .header("Authorization", "Bearer test-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            store.graph_generation() > generation_before,
+            "admin deletion must publish a new graph generation"
+        );
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&repo_uid),
+            "admin deletion must remove the repo-scoped filemeta slice"
+        );
+        assert!(
+            nestweaver_engine::resolution_cache::ResolutionDeps::load(&resolution_deps_path)
+                .is_empty_for_repo(&repo_uid),
+            "admin deletion must remove the repo-scoped resolution-deps slice"
+        );
+        assert_eq!(
+            std::fs::read(&parsed_cache_path).unwrap(),
+            parsed_cache_before,
+            "the content-hash-keyed parsed cache is intentionally retained"
+        );
+        assert!(
+            !pagerank_path.exists(),
+            "admin deletion must remove the persisted PageRank cache"
+        );
+        assert!(
+            !store.pagerank_scores().contains_key(&removed_symbol_uid),
+            "admin deletion must invalidate the live PageRank cache"
+        );
+        assert!(
+            tantivy
+                .search("admin_delete_target", 10)
+                .unwrap()
+                .is_empty(),
+            "admin deletion must reconcile the text-search index"
+        );
     }
 
     // ── Device flow ─────────────────────────────────────────────────────

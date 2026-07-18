@@ -185,10 +185,11 @@ pub use guide_rules::{
 pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
     CachedFileMeta, FILEMETA_VERSION, FileMetaCache, FileMetaSidecar, IncrementalResult,
-    IndexResult, incremental_index, incremental_index_with_name, index_directory,
-    index_directory_in_memory, index_directory_with_options, index_directory_with_store,
-    index_directory_with_store_cancellable, index_with_reader, index_with_reader_and_write_gate,
-    load_filemeta_sidecar, remove_repo_sidecar_slices, save_filemeta_sidecar,
+    IndexResult, finalize_code_graph_deletion, incremental_index, incremental_index_with_name,
+    index_directory, index_directory_in_memory, index_directory_with_options,
+    index_directory_with_store, index_directory_with_store_cancellable, index_with_reader,
+    index_with_reader_and_write_gate, load_filemeta_sidecar, remove_repo_sidecar_slices,
+    save_filemeta_sidecar,
 };
 pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,

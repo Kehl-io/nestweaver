@@ -819,17 +819,13 @@ fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<PrunedRepos
 }
 
 fn finalize_code_graph_deletion(state: &DaemonState, repo_uids: &[String]) {
-    for uid in repo_uids {
-        nestweaver_engine::remove_repo_sidecar_slices(&state.db_path, uid);
-    }
-    state.store.bump_and_persist_generation();
-    state.store.invalidate_pagerank();
-    let pagerank = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-    if let Err(error) = std::fs::remove_file(&pagerank)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(%error, path = %pagerank.display(), "failed to remove stale PageRank sidecar");
-    }
+    nestweaver_engine::finalize_code_graph_deletion(
+        &state.store,
+        &state.db_path,
+        repo_uids,
+        None,
+        "code graph deletion",
+    );
 }
 
 fn rebuild_tantivy_after_mutation(state: &DaemonState, operation: &str) {
@@ -2214,18 +2210,13 @@ impl NestWeaverDaemon for DaemonService {
                 .delete_repo_node(&req.repo_uid)
                 .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
 
-            finalize_code_graph_deletion(&state, std::slice::from_ref(&req.repo_uid));
-
-            if let Some(ref tantivy) = state.tantivy
-                && tantivy.has_writer()
-            {
-                match tantivy.reindex_from_store(&state.store) {
-                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after repo removal"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tantivy reindex failed after repo removal")
-                    }
-                }
-            }
+            nestweaver_engine::finalize_code_graph_deletion(
+                &state.store,
+                &state.db_path,
+                std::slice::from_ref(&req.repo_uid),
+                state.tantivy.as_deref(),
+                "repo removal",
+            );
 
             Ok::<_, Status>(RemoveRepoResponse {
                 files_deleted: file_count as u64,
@@ -5349,6 +5340,7 @@ pub async fn run_server(
                     std::collections::HashMap::new(),
                 )),
                 daemon_store: state.store.clone(),
+                tantivy: state.tantivy.clone(),
                 instance_id: state.instance_id.clone(),
                 start_time: state.start_time,
                 active_reads: state.active_reads.clone(),

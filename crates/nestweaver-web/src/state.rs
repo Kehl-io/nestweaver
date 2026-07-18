@@ -104,6 +104,9 @@ pub struct AdminState {
     /// In-flight device-authorization grants, keyed by `device_code`.
     pub device_flow: Arc<tokio::sync::RwLock<HashMap<String, PendingDevice>>>,
     pub daemon_store: Arc<GraphStore>,
+    /// Live full-text index, when the daemon owns a writer. Code-graph
+    /// deletions rebuild it through the same finalization path as the gRPC API.
+    pub tantivy: Option<Arc<nestweaver_store::TantivyIndex>>,
     pub instance_id: String,
     pub start_time: Instant,
     pub active_reads: Arc<AtomicU32>,
