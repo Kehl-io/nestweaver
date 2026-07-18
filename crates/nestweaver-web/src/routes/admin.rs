@@ -402,6 +402,38 @@ pub async fn add_repo(
     }))
 }
 
+fn run_admin_remove_repo_with<C, D>(
+    store: &nestweaver_store::GraphStore,
+    db_path: &std::path::Path,
+    tantivy: Option<&nestweaver_store::TantivyIndex>,
+    repo_uid: &str,
+    clear_derived: C,
+    delete_repo: D,
+) -> Result<(), (StatusCode, String)>
+where
+    C: FnOnce(&nestweaver_store::GraphStore, &str) -> Result<(), (StatusCode, String)>,
+    D: FnOnce(&nestweaver_store::GraphStore, &str) -> Result<(), (StatusCode, String)>,
+{
+    store
+        .bulk_delete_repo_files_and_symbols(repo_uid)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("bulk_delete failed: {e}"),
+            )
+        })?;
+    let cascade_result = clear_derived(store, repo_uid).and_then(|()| delete_repo(store, repo_uid));
+    nestweaver_engine::finalize_code_graph_deletion(
+        store,
+        db_path,
+        &[repo_uid.to_string()],
+        tantivy,
+        "admin repo removal",
+    );
+    cascade_result?;
+    Ok(())
+}
+
 /// DELETE /admin/api/repos/:id — remove a repo.
 pub async fn remove_repo(
     _auth: AdminAuth,
@@ -495,34 +527,28 @@ pub async fn remove_repo(
     let tantivy = state.tantivy.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = write_mutex.as_ref().map(|m| m.blocking_lock());
-        store
-            .bulk_delete_repo_files_and_symbols(&uid)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("bulk_delete failed: {e}"),
-                )
-            })?;
-        store.clear_repo_derived_nodes(&uid).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("clear_derived failed: {e}"),
-            )
-        })?;
-        store.delete_repo_node(&uid).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("delete_repo_node failed: {e}"),
-            )
-        })?;
-        nestweaver_engine::finalize_code_graph_deletion(
+        run_admin_remove_repo_with(
             &store,
             &db_path,
-            std::slice::from_ref(&uid),
             tantivy.as_deref(),
-            "admin repo removal",
-        );
-        Ok::<_, (StatusCode, String)>(())
+            &uid,
+            |store, uid| {
+                store.clear_repo_derived_nodes(uid).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("clear_derived failed: {e}"),
+                    )
+                })
+            },
+            |store, uid| {
+                store.delete_repo_node(uid).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("delete_repo_node failed: {e}"),
+                    )
+                })
+            },
+        )
     })
     .await
     .map_err(|e| {
@@ -2089,6 +2115,115 @@ url = "https://github.com/example/existing"
     }
 
     // ── Device flow ─────────────────────────────────────────────────────
+
+    #[test]
+    fn admin_remove_repo_late_failure_finalizes_committed_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let repo_uid = "repo:test:web-late-remove";
+        let file_uid = nestweaver_schema::file_uid(repo_uid, "src/lib.rs");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: repo_uid.to_string(),
+                url: "https://example.test/web-late-remove".to_string(),
+                indexed_sha: "sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid.clone(),
+                path: "src/lib.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+
+        let filemeta_path = nestweaver_engine::sidecar_path(&db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(repo_uid.to_string()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let deps_path = nestweaver_engine::sidecar_path(&db_path, ".resolution_deps.bin");
+        let mut deps = nestweaver_engine::resolution_cache::ResolutionDeps::default();
+        deps.set_deps_for_repo(
+            repo_uid,
+            "src/lib.rs",
+            ["src/dep.rs".to_string()].into_iter().collect(),
+        );
+        deps.save(&deps_path).unwrap();
+
+        let pagerank_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{file_uid}":1.0}}"#)).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let tantivy =
+            nestweaver_store::TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap();
+        tantivy
+            .update_note(
+                "note:web-late-remove",
+                "web_late_remove_search_sentinel",
+                "vault:test",
+                &["web_late_remove_search_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let generation_before = store.graph_generation();
+
+        let error = run_admin_remove_repo_with(
+            &store,
+            &db_path,
+            Some(&tantivy),
+            repo_uid,
+            |store, uid| {
+                store.clear_repo_derived_nodes(uid).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("clear_derived failed: {e}"),
+                    )
+                })
+            },
+            |_store, _uid| {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "injected repo-node failure".to_string(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            store.list_files_by_repo(repo_uid).unwrap().is_empty(),
+            "precondition: the first delete transaction must have committed"
+        );
+        assert!(
+            store.lookup_repo(repo_uid).unwrap().is_some(),
+            "precondition: the injected late failure leaves the Repo row"
+        );
+        assert!(store.graph_generation() > generation_before);
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(repo_uid)
+        );
+        assert!(
+            nestweaver_engine::resolution_cache::ResolutionDeps::load(&deps_path)
+                .is_empty_for_repo(repo_uid)
+        );
+        assert!(!pagerank_path.exists());
+        assert!(!store.pagerank_scores().contains_key(&file_uid));
+        assert!(
+            tantivy
+                .search("web_late_remove_search_sentinel", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     fn device_router(state: Arc<AdminState>) -> Router {
         Router::new()

@@ -828,6 +828,42 @@ fn finalize_code_graph_deletion(state: &DaemonState, repo_uids: &[String]) {
     );
 }
 
+fn run_remove_repo_with<C, D>(
+    state: &DaemonState,
+    repo_uid: &str,
+    clear_derived: C,
+    delete_repo: D,
+) -> Result<RemoveRepoResponse, Status>
+where
+    C: FnOnce(&GraphStore, &str) -> Result<(), Status>,
+    D: FnOnce(&GraphStore, &str) -> Result<(), Status>,
+{
+    let (file_count, sym_count) = state
+        .store
+        .bulk_delete_repo_files_and_symbols(repo_uid)
+        .map_err(|e| {
+            Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}"))
+        })?;
+
+    let cascade_result =
+        clear_derived(&state.store, repo_uid).and_then(|()| delete_repo(&state.store, repo_uid));
+
+    nestweaver_engine::finalize_code_graph_deletion(
+        &state.store,
+        &state.db_path,
+        &[repo_uid.to_string()],
+        state.tantivy.as_deref(),
+        "repo removal",
+    );
+
+    cascade_result?;
+
+    Ok(RemoveRepoResponse {
+        files_deleted: file_count as u64,
+        symbols_deleted: sym_count as u64,
+    })
+}
+
 fn rebuild_tantivy_after_mutation(state: &DaemonState, operation: &str) {
     if let Some(ref tantivy) = state.tantivy
         && tantivy.has_writer()
@@ -2193,35 +2229,20 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let (file_count, sym_count) = state
-                .store
-                .bulk_delete_repo_files_and_symbols(&req.repo_uid)
-                .map_err(|e| {
-                    Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}"))
-                })?;
-
-            state
-                .store
-                .clear_repo_derived_nodes(&req.repo_uid)
-                .map_err(|e| Status::internal(format!("clear_repo_derived_nodes failed: {e:#}")))?;
-
-            state
-                .store
-                .delete_repo_node(&req.repo_uid)
-                .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
-
-            nestweaver_engine::finalize_code_graph_deletion(
-                &state.store,
-                &state.db_path,
-                std::slice::from_ref(&req.repo_uid),
-                state.tantivy.as_deref(),
-                "repo removal",
-            );
-
-            Ok::<_, Status>(RemoveRepoResponse {
-                files_deleted: file_count as u64,
-                symbols_deleted: sym_count as u64,
-            })
+            run_remove_repo_with(
+                &state,
+                &req.repo_uid,
+                |store, uid| {
+                    store.clear_repo_derived_nodes(uid).map_err(|e| {
+                        Status::internal(format!("clear_repo_derived_nodes failed: {e:#}"))
+                    })
+                },
+                |store, uid| {
+                    store
+                        .delete_repo_node(uid)
+                        .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))
+                },
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -7190,6 +7211,96 @@ mod startup_helper_tests {
 
         assert!(state.store.pagerank_generation() > before_generation);
         assert!(!after_scores.contains_key("repo:test:pagerank"));
+    }
+
+    #[test]
+    fn remove_repo_late_failure_finalizes_committed_children() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:test:late-remove";
+        let file_uid = nestweaver_schema::file_uid(repo_uid, "src/lib.rs");
+        state
+            .store
+            .insert_repo(&test_repo(
+                repo_uid,
+                "https://example.test/late-remove",
+                None,
+            ))
+            .unwrap();
+        state
+            .store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid.clone(),
+                path: "src/lib.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(repo_uid.to_string()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let deps_path = nestweaver_engine::sidecar_path(&state.db_path, ".resolution_deps.bin");
+        let mut deps = nestweaver_engine::resolution_cache::ResolutionDeps::default();
+        deps.set_deps_for_repo(
+            repo_uid,
+            "src/lib.rs",
+            ["src/dep.rs".to_string()].into_iter().collect(),
+        );
+        deps.save(&deps_path).unwrap();
+
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{file_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let tantivy = state.tantivy.as_ref().unwrap();
+        tantivy
+            .update_note(
+                "note:late-remove",
+                "late_remove_search_sentinel",
+                "vault:test",
+                &["late_remove_search_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let error = run_remove_repo_with(
+            &state,
+            repo_uid,
+            |_store, _uid| Err(Status::internal("injected derived-node failure")),
+            |_store, _uid| Ok(()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(
+            state.store.list_files_by_repo(repo_uid).unwrap().is_empty(),
+            "precondition: the first delete transaction must have committed"
+        );
+        assert!(
+            state.store.lookup_repo(repo_uid).unwrap().is_some(),
+            "precondition: the injected late failure leaves the Repo row"
+        );
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(repo_uid)
+        );
+        assert!(
+            nestweaver_engine::resolution_cache::ResolutionDeps::load(&deps_path)
+                .is_empty_for_repo(repo_uid)
+        );
+        assert!(!pagerank_path.exists());
+        assert!(!state.store.pagerank_scores().contains_key(&file_uid));
+        assert!(
+            tantivy
+                .search("late_remove_search_sentinel", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared
