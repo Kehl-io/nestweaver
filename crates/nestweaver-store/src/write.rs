@@ -22,12 +22,10 @@ pub struct DiscardedVault {
 /// Result of [`GraphStore::merge_instance_ids`].
 ///
 /// `repos_moved` lists the identifier (display name if set, else url) of
-/// every Repo node that was re-minted under the target instance. Re-minting
-/// a Repo does **not** rewrite its child File/Symbol/Service rows: those keep
-/// UIDs embedding the old instance and a `repo_uid` pointing at the deleted
-/// node, so they are orphaned until the repo is force re-indexed. When this
-/// list is non-empty the caller MUST tell the user to re-index each repo —
-/// see [`MergeResult::repos_need_reindex`].
+/// every Repo node that was re-minted under the target instance. Source code
+/// graph rows are removed before each Repo is re-minted, so the caller must
+/// force re-index every repo in this list — see
+/// [`MergeResult::repos_need_reindex`].
 #[derive(Debug)]
 pub struct MergeResult {
     pub vaults: usize,
@@ -35,14 +33,17 @@ pub struct MergeResult {
     pub projects: usize,
     pub discarded: Vec<DiscardedVault>,
     /// Identifiers of repos re-minted under the target instance. Their graph
-    /// rows (files/symbols/services) are orphaned until a forced re-index.
+    /// rows were removed and must be rebuilt by a forced re-index.
     pub repos_moved: Vec<String>,
+    /// Source repo UIDs whose derived graph rows were deleted during migration.
+    /// The daemon uses these keys to remove per-repo sidecar slices.
+    pub repo_uids_removed: Vec<String>,
 }
 
 impl MergeResult {
-    /// True when the merge re-minted one or more Repo nodes, orphaning their
-    /// child rows. The caller should instruct the user to force re-index each
-    /// repo listed in [`MergeResult::repos_moved`].
+    /// True when the merge re-minted one or more Repo nodes. The caller should
+    /// instruct the user to force re-index each repo listed in
+    /// [`MergeResult::repos_moved`].
     pub fn repos_need_reindex(&self) -> bool {
         !self.repos_moved.is_empty()
     }
@@ -3144,6 +3145,7 @@ impl GraphStore {
         let mut project_count = 0usize;
         let mut discarded: Vec<DiscardedVault> = Vec::new();
         let mut repos_moved: Vec<String> = Vec::new();
+        let mut repo_uids_removed: Vec<String> = Vec::new();
 
         // Build a map of target-instance vaults keyed by root_path so we
         // can detect collisions and compare child counts.
@@ -3198,24 +3200,24 @@ impl GraphStore {
                 // Identify the repo for the re-index guidance before we move
                 // `r` into the reinsert. Prefer the display name, else the url.
                 let repo_ident = r.name.clone().unwrap_or_else(|| r.url.clone());
-                let conn = self.conn()?;
-                exec_params(
-                    &conn,
-                    "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
-                    vec![("uid", lbug::Value::String(r.uid.clone()))],
-                )?;
-                // Re-mint the Repo node under the target instance. NOTE: this
-                // does NOT rewrite the repo's child File/Symbol/Service rows,
-                // so they are orphaned (old-instance UIDs + dangling repo_uid)
-                // until a forced re-index re-attaches them. We record the repo
-                // so the caller can tell the user to re-index it.
-                self.insert_repo(&Repo {
-                    uid: repo_uid(to, &r.url),
-                    instance_id: to.to_string(),
-                    ..r
-                })?;
+                let source_uid = r.uid.clone();
+                let target_uid = repo_uid(to, &r.url);
+
+                self.bulk_delete_repo_files_and_symbols(&source_uid)?;
+                self.clear_repo_derived_nodes(&source_uid)?;
+                self.delete_repo_node(&source_uid)?;
+
+                if self.lookup_repo(&target_uid)?.is_none() {
+                    self.insert_repo(&Repo {
+                        uid: target_uid,
+                        instance_id: to.to_string(),
+                        ..r
+                    })?;
+                }
+
                 repo_count += 1;
                 repos_moved.push(repo_ident);
+                repo_uids_removed.push(source_uid);
             }
         }
         for p in self.list_projects()? {
@@ -3234,6 +3236,7 @@ impl GraphStore {
             projects: project_count,
             discarded,
             repos_moved,
+            repo_uids_removed,
         })
     }
 

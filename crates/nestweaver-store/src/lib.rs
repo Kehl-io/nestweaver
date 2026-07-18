@@ -2175,10 +2175,8 @@ mod tests {
         assert_eq!(vaults[0].instance_id, "tgt");
     }
 
-    /// Merging an instance that owns a repo re-mints the Repo node under the
-    /// target instance but does NOT rewrite the repo's child rows (they keep
-    /// old-instance UIDs and a dangling `repo_uid`). The merge must therefore
-    /// report the repo so the caller can tell the user to force re-index it.
+    /// Merging an instance removes its derived code graph rows before re-minting
+    /// the Repo node under the target instance.
     #[test]
     fn merge_instance_ids_reports_repos_needing_reindex() {
         use nestweaver_schema::uid::repo_uid;
@@ -2206,12 +2204,56 @@ mod tests {
         assert_eq!(report.repos_moved[0], "svc"); // display name preferred
         assert!(report.repos_need_reindex());
 
-        // The child symbol still carries the OLD repo_uid (orphaned until a
-        // forced re-index re-attaches it) — this is exactly why we must warn.
-        let orphan = store.lookup_symbol("sym:old:1").unwrap();
+        assert_eq!(report.repo_uids_removed, vec![repo.uid.clone()]);
+        assert!(store.lookup_symbol("sym:old:1").is_err());
+        assert!(store.lookup_repo(&repo.uid).unwrap().is_none());
+        let target_uid = repo_uid("new", "https://github.com/example/svc");
         assert_eq!(
-            orphan.repo_uid,
-            repo_uid("old", "https://github.com/example/svc")
+            store.lookup_repo(&target_uid).unwrap().unwrap().instance_id,
+            "new"
         );
+    }
+
+    #[test]
+    fn merge_instance_ids_repo_collision_preserves_target() {
+        use nestweaver_schema::uid::repo_uid;
+        let store = test_store();
+        let url = "https://github.com/example/collision";
+        let source = Repo {
+            uid: repo_uid("old", url),
+            url: url.to_string(),
+            indexed_sha: "source-sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "old".to_string(),
+            name: Some("source".to_string()),
+            root_path: None,
+        };
+        let target = Repo {
+            uid: repo_uid("new", url),
+            url: url.to_string(),
+            indexed_sha: "target-sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "new".to_string(),
+            name: Some("target".to_string()),
+            root_path: None,
+        };
+        store.insert_repo(&source).unwrap();
+        store.insert_repo(&target).unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:old:collision",
+                "handler",
+                &source.uid,
+                "src/lib.rs",
+            ))
+            .unwrap();
+
+        let report = store.merge_instance_ids("old", "new").unwrap();
+        assert_eq!(report.repos, 1);
+        assert_eq!(report.repo_uids_removed, vec![source.uid.clone()]);
+        assert!(store.lookup_symbol("sym:old:collision").is_err());
+        let surviving = store.lookup_repo(&target.uid).unwrap().unwrap();
+        assert_eq!(surviving.indexed_sha, "target-sha");
+        assert_eq!(store.list_repos(Some("new")).unwrap().len(), 1);
     }
 }
