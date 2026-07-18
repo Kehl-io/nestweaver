@@ -1,4 +1,6 @@
 use assert_cmd::Command;
+use assert_cmd::assert::OutputAssertExt;
+use nestweaver_engine::sidecar_path;
 use predicates::str::contains;
 use std::process::Command as StdCommand;
 
@@ -1677,4 +1679,26 @@ fn index_setup_flag_forces_setup_anchored_to_repo_root() {
         dir.path().join("test.lbug.setup_done").exists(),
         "a forced run counts as done"
     );
+}
+
+#[test]
+fn index_setup_failure_does_not_write_done_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    std::fs::write(repo.join(".cursor/mcp.json"), "{ invalid json").unwrap();
+    let db = dir.path().join("test.lbug");
+
+    std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--setup")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    assert!(!sidecar_path(&db, ".setup_done").exists());
 }

@@ -1086,8 +1086,8 @@ fn tool_already_configured(tool_name: &str, base: &Path) -> bool {
 }
 
 /// Run setup automatically after first index. Only configures tools that are
-/// detected and don't already have NestWeaver configs. Non-fatal — errors are
-/// logged but don't propagate.
+/// detected and don't already have NestWeaver configs. Failures are returned
+/// so the caller can leave the completion marker absent and retry later.
 pub fn run_auto_setup(
     db_path: &std::path::Path,
     base: &Path,
@@ -1111,10 +1111,11 @@ pub fn run_auto_setup(
     }
 
     let mut configured = Vec::new();
+    let mut failures = Vec::new();
     for name in to_configure {
         match configure_tool(name, db_path, false, false, base) {
             Ok(()) => configured.push(name),
-            Err(e) => tracing::debug!("auto-setup skipped {}: {e}", name),
+            Err(error) => failures.push(format!("{name}: {error:#}")),
         }
     }
 
@@ -1123,6 +1124,9 @@ pub fn run_auto_setup(
             "  Auto-configured NestWeaver for: {}. Run `nestweaver setup --help` to customize.",
             configured.join(", ")
         );
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("auto-setup failed for {}", failures.join("; "));
     }
     Ok(())
 }
@@ -1235,5 +1239,20 @@ mod setup_base_dir_tests {
         std::fs::create_dir_all(tmp.path().join(".cursor")).unwrap();
         let tools = detect_tools(tmp.path());
         assert!(tools.iter().any(|t| t.name == "cursor" && t.detected));
+    }
+
+    #[test]
+    fn run_auto_setup_reports_partial_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(base.join(".cursor")).unwrap();
+        std::fs::write(base.join(".cursor/mcp.json"), "{ invalid json").unwrap();
+        let db = tmp.path().join("test.lbug");
+
+        let error = run_auto_setup(&db, &base, true).unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("cursor"));
+        assert!(message.contains("invalid JSON"));
     }
 }
