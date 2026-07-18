@@ -1043,62 +1043,20 @@ fn format_name(name: &str) -> &str {
     }
 }
 
-/// Check if a tool already has NestWeaver configuration in the current directory.
-/// Uses the primary config file that each tool's setup function writes.
-fn tool_already_configured(tool_name: &str, base: &Path) -> bool {
-    fn json_has_nestweaver(path: &Path) -> bool {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v.get("mcpServers")
-                    .and_then(|s| s.get("nestweaver"))
-                    .map(|_| true)
-            })
-            .unwrap_or(false)
-    }
-    fn file_contains(path: &Path, needle: &str) -> bool {
-        std::fs::read_to_string(path)
-            .map(|s| s.contains(needle))
-            .unwrap_or(false)
-    }
-    match tool_name {
-        "claude-code" => json_has_nestweaver(&base.join(".mcp.json")),
-        "cursor" => json_has_nestweaver(&base.join(".cursor/mcp.json")),
-        "codex" => file_contains(&base.join(".codex/config.toml"), "nestweaver"),
-        "windsurf" => dirs::home_dir()
-            .map(|h| json_has_nestweaver(&h.join(".codeium/windsurf/mcp_config.json")))
-            .unwrap_or(false),
-        "jetbrains" => json_has_nestweaver(&base.join(".junie/mcp/mcp.json")),
-        "vscode" => json_has_nestweaver(&base.join(".vscode/mcp.json")),
-        "gemini" => json_has_nestweaver(&base.join(".gemini/settings.json")),
-        "copilot" => json_has_nestweaver(&base.join(".github/copilot-mcp.json")),
-        "aider" => file_contains(&base.join(".aider.conf.yml"), "nestweaver"),
-        "kiro" => json_has_nestweaver(&base.join(".kiro/settings.json")),
-        "continue" => json_has_nestweaver(&base.join(".continue/config.json")),
-        "cline" => json_has_nestweaver(&base.join(".cline/settings.json")),
-        "opencode" => json_has_nestweaver(&base.join(".opencode/config.json")),
-        "trae" => json_has_nestweaver(&base.join(".trae/config.json")),
-        "devin" => json_has_nestweaver(&base.join("devin.json")),
-        "hermes" => json_has_nestweaver(&base.join(".hermes/config.json")),
-        _ => false,
-    }
-}
-
-/// Run setup automatically after first index. Only configures tools that are
-/// detected and don't already have NestWeaver configs. Failures are returned
-/// so the caller can leave the completion marker absent and retry later.
+/// Run setup automatically after first index. Every detected tool is rerun
+/// idempotently while the completion marker is absent so a retry can repair
+/// secondary artifacts written after the primary config. Failures are returned
+/// so the caller can leave the marker absent and retry later.
 pub fn run_auto_setup(
     db_path: &std::path::Path,
     base: &Path,
     quiet: bool,
 ) -> Result<(), anyhow::Error> {
-    // Only tools that are actually present and not yet wired up. Computed up
-    // front so we can print the banner at most once — and skip it entirely when
-    // there's nothing to configure (nw-051).
+    // Compute detected tools up front so we can print the banner at most once
+    // and skip it entirely when there's nothing to configure (nw-051).
     let to_configure: Vec<&'static str> = detect_tools(base)
         .into_iter()
-        .filter(|t| t.detected && !tool_already_configured(t.name, base))
+        .filter(|t| t.detected)
         .map(|t| t.name)
         .collect();
     if to_configure.is_empty() {
@@ -1254,5 +1212,29 @@ mod setup_base_dir_tests {
         let message = format!("{error:#}");
         assert!(message.contains("cursor"));
         assert!(message.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn run_auto_setup_retries_missing_secondary_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(base.join(".cursor")).unwrap();
+        let rules_path = base.join(".cursor/rules");
+        std::fs::write(&rules_path, "blocks directory creation").unwrap();
+        let db = tmp.path().join("test.lbug");
+
+        setup_cursor(&db, false, false, &base).unwrap_err();
+        let mcp_path = base.join(".cursor/mcp.json");
+        let primary_before_retry = std::fs::read_to_string(&mcp_path).unwrap();
+        assert!(!rules_path.join("nestweaver.mdc").exists());
+
+        std::fs::remove_file(&rules_path).unwrap();
+        run_auto_setup(&db, &base, true).unwrap();
+
+        assert!(rules_path.join("nestweaver.mdc").exists());
+        assert_eq!(
+            std::fs::read_to_string(mcp_path).unwrap(),
+            primary_before_retry
+        );
     }
 }

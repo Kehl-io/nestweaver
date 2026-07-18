@@ -1702,3 +1702,43 @@ fn index_setup_failure_does_not_write_done_marker() {
 
     assert!(!sidecar_path(&db, ".setup_done").exists());
 }
+
+#[test]
+fn index_setup_retries_secondary_before_writing_done_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    let rules_path = repo.join(".cursor/rules");
+    std::fs::write(&rules_path, "blocks directory creation").unwrap();
+    let db = dir.path().join("test.lbug");
+    let marker = sidecar_path(&db, ".setup_done");
+
+    std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--setup")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    assert!(repo.join(".cursor/mcp.json").exists());
+    assert!(!rules_path.join("nestweaver.mdc").exists());
+    assert!(!marker.exists());
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--setup")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    assert!(rules_path.join("nestweaver.mdc").exists());
+    assert!(marker.exists());
+}
