@@ -911,9 +911,7 @@ where
     F: FnOnce(&GraphStore, &str) -> Result<nestweaver_store::PurgeInstanceResult, anyhow::Error>,
     R: FnMut(&DaemonState, &str),
 {
-    let mut repo_uids = state
-        .store
-        .list_purge_code_repo_uids(instance_id)
+    let mut repo_uids = list_instance_code_repo_uids(&state.store, instance_id)
         .map_err(|e| Status::internal(format!("PurgeInstance failed to list code repos: {e:#}")))?;
 
     match purge(&state.store, instance_id) {
@@ -921,7 +919,11 @@ where
             repo_uids.extend(result.code_repo_uids.iter().cloned());
             repo_uids.sort();
             repo_uids.dedup();
-            let code_changed = !repo_uids.is_empty() || result.code_orphans_swept > 0;
+            let code_changed = !repo_uids.is_empty()
+                || result.repos > 0
+                || result.files > 0
+                || result.symbols > 0
+                || result.code_orphans_swept > 0;
             let changed = code_changed
                 || result.vaults > 0
                 || result.projects > 0
@@ -952,6 +954,22 @@ where
     }
 }
 
+fn list_instance_code_repo_uids(
+    store: &GraphStore,
+    instance_id: &str,
+) -> Result<Vec<String>, anyhow::Error> {
+    let mut repo_uids = store.list_purge_code_repo_uids(instance_id)?;
+    repo_uids.extend(
+        store
+            .list_repos(Some(instance_id))?
+            .into_iter()
+            .map(|repo| repo.uid),
+    );
+    repo_uids.sort();
+    repo_uids.dedup();
+    Ok(repo_uids)
+}
+
 fn run_merge_instance_with<F, R>(
     state: &DaemonState,
     from_id: &str,
@@ -963,9 +981,7 @@ where
     F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
     R: FnMut(&DaemonState, &str),
 {
-    let repo_uids = state
-        .store
-        .list_purge_code_repo_uids(from_id)
+    let repo_uids = list_instance_code_repo_uids(&state.store, from_id)
         .map_err(|e| Status::internal(format!("merge failed to list code repos: {e:#}")))?;
 
     match merge(&state.store, from_id, to_id) {
@@ -7058,6 +7074,95 @@ mod startup_helper_tests {
             std::fs::read_to_string(&pagerank_path).unwrap(),
             persisted_rank
         );
+        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+    }
+
+    #[test]
+    fn mismatched_uid_merge_error_finalizes_registered_repo() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:unexpected-owner:merge";
+        let mut repo = test_repo(repo_uid, "https://example.test/mismatched-merge", None);
+        repo.instance_id = "old".to_string();
+        state.store.insert_repo(&repo).unwrap();
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(repo_uid.to_string()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{repo_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let graph_generation = state.store.graph_generation();
+        let pagerank_generation = state.store.pagerank_generation();
+        let mut reconciliations = 0;
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, _from, _to| {
+                let repo = store.lookup_repo(repo_uid)?.unwrap();
+                delete_repo_cascade(store, &repo)?;
+                Err(anyhow::anyhow!("injected mismatched-UID merge failure"))
+            },
+            |_state, _operation| reconciliations += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(
+            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .get(repo_uid)
+                .is_none(),
+            "registered mismatched-UID repo sidecar survived merge error"
+        );
+        assert!(state.store.graph_generation() > graph_generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        let scores_after = state.store.pagerank_scores();
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+        assert!(!scores_after.contains_key(repo_uid));
+        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+    }
+
+    #[test]
+    fn mismatched_uid_purge_success_finalizes_registered_repo() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:unexpected-owner:purge";
+        let mut repo = test_repo(repo_uid, "https://example.test/mismatched-purge", None);
+        repo.instance_id = "old".to_string();
+        state.store.insert_repo(&repo).unwrap();
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(repo_uid.to_string()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{repo_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let graph_generation = state.store.graph_generation();
+        let pagerank_generation = state.store.pagerank_generation();
+        let mut reconciliations = 0;
+
+        let result = run_purge_instance_with(
+            &state,
+            "old",
+            |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
+            |_state, _operation| reconciliations += 1,
+        )
+        .unwrap();
+
+        assert_eq!(result.repos, 1, "precondition: registered repo was purged");
+        assert!(
+            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .get(repo_uid)
+                .is_none(),
+            "registered mismatched-UID repo sidecar survived purge"
+        );
+        assert!(state.store.graph_generation() > graph_generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        let scores_after = state.store.pagerank_scores();
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+        assert!(!scores_after.contains_key(repo_uid));
         assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
     }
 
