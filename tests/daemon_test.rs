@@ -202,7 +202,11 @@ fn seed_deletion_sidecars(db_path: &Path, repo_uid: &str) {
     let mut filemeta = load_filemeta_sidecar(&filemeta_path);
     filemeta.repos.entry(repo_uid.to_string()).or_default();
     save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
-    std::fs::write(sidecar_path(db_path, ".pagerank.json"), "sentinel").unwrap();
+    std::fs::write(
+        sidecar_path(db_path, ".pagerank.json"),
+        r#"{"rank-sentinel":0.75}"#,
+    )
+    .unwrap();
 }
 
 /// Index a repo through the daemon (no NESTWEAVER_NO_DAEMON).
@@ -1067,6 +1071,65 @@ fn daemon_merge_removes_source_sidecars_and_invalidates_rank() {
 }
 
 #[test]
+fn daemon_merge_rejects_self_merge_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("self-merge").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    let vault = nestweaver_schema::Vault {
+        uid: "vlt:self:one".to_string(),
+        name: "authored".to_string(),
+        root_path: "/authored".to_string(),
+        instance_id: "same".to_string(),
+    };
+    store.insert_vault(&vault).unwrap();
+    store
+        .insert_note(&nestweaver_schema::Note {
+            uid: "note:self:one".to_string(),
+            vault_uid: vault.uid.clone(),
+            file_path: "authored.md".to_string(),
+            title: "Authored".to_string(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 42,
+            content_hash: "authored-hash".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        })
+        .unwrap();
+    store
+        .insert_vault_note_edge(&vault.uid, "note:self:one")
+        .unwrap();
+    let generation_before = store.graph_generation();
+    drop(store);
+
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let error = rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .expect("connect to daemon over UDS");
+        client.merge_instance("same", "same").await.unwrap_err()
+    });
+    let status = error
+        .downcast_ref::<tonic::Status>()
+        .expect("merge RPC error should preserve tonic status");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    stop_daemon(&db_path);
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert_eq!(store.graph_generation(), generation_before);
+    assert_eq!(store.list_vaults(Some("same")).unwrap().len(), 1);
+    assert_eq!(store.list_notes(Some(&vault.uid)).unwrap().len(), 1);
+}
+
+#[test]
 fn daemon_purge_removes_repo_sidecars_and_invalidates_rank() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
@@ -1109,6 +1172,146 @@ fn daemon_purge_removes_repo_sidecars_and_invalidates_rank() {
     );
     assert!(store.graph_generation() > generation_before);
     assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
+}
+
+#[test]
+fn daemon_purge_orphan_only_code_finalizes_sidecars_and_rank() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("orphan-purge").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db_for_instance(&repo_dir, &db_path, "old");
+
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    let source_uid = store.list_repos(Some("old")).unwrap()[0].uid.clone();
+    // Simulate a partial prior mutation: only the registry row disappeared,
+    // leaving code children and their repo_uid properties behind.
+    store.delete_repo_node(&source_uid).unwrap();
+    let generation_before = store.graph_generation();
+    drop(store);
+    seed_deletion_sidecars(&db_path, &source_uid);
+
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let saw_done = rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        let mut stream = client.purge_instance("old").await.unwrap();
+        let mut saw_done = false;
+        while let Some(progress) = stream.message().await.unwrap() {
+            saw_done |= progress.phase == nestweaver_proto::Phase::Done as i32;
+        }
+        saw_done
+    });
+    assert!(saw_done);
+
+    stop_daemon(&db_path);
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert!(store.graph_generation() > generation_before);
+    assert!(
+        load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
+            .repos
+            .get(&source_uid)
+            .is_none()
+    );
+    assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
+}
+
+#[test]
+fn daemon_non_code_merge_and_purge_bump_generation_but_preserve_rank() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("non-code-instance").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    store
+        .insert_vault(&nestweaver_schema::Vault {
+            uid: "vlt:old:docs".to_string(),
+            name: "docs".to_string(),
+            root_path: "/nonexistent/docs".to_string(),
+            instance_id: "old".to_string(),
+        })
+        .unwrap();
+    store
+        .insert_project(&nestweaver_schema::Project {
+            uid: "proj:old:work".to_string(),
+            name: "work".to_string(),
+            summary: None,
+            instance_id: "old".to_string(),
+        })
+        .unwrap();
+    let before_merge = store.graph_generation();
+    drop(store);
+    std::fs::write(
+        sidecar_path(&db_path, ".pagerank.json"),
+        r#"{"rank-sentinel":0.75}"#,
+    )
+    .unwrap();
+
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        let response = client.merge_instance("old", "new").await.unwrap();
+        assert_eq!(response.vaults_reparented, 1);
+        assert_eq!(response.projects_reparented, 1);
+    });
+    stop_daemon(&db_path);
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert!(store.graph_generation() > before_merge);
+    let before_purge = store.graph_generation();
+    drop(store);
+    assert!(sidecar_path(&db_path, ".pagerank.json").exists());
+
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+    rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        let mut stream = client.purge_instance("new").await.unwrap();
+        while stream.message().await.unwrap().is_some() {}
+    });
+    stop_daemon(&db_path);
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert!(store.graph_generation() > before_purge);
+    assert!(sidecar_path(&db_path, ".pagerank.json").exists());
+}
+
+#[test]
+fn daemon_noop_merge_purge_and_prune_do_not_bump_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("noop-instance").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    let generation_before = store.graph_generation();
+    drop(store);
+
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        client.merge_instance("missing", "new").await.unwrap();
+        let mut stream = client.purge_instance("missing").await.unwrap();
+        while stream.message().await.unwrap().is_some() {}
+        let pruned = client.prune_stale().await.unwrap();
+        assert!(pruned.removed_repos.is_empty());
+        assert!(pruned.removed_vaults.is_empty());
+    });
+    stop_daemon(&db_path);
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert_eq!(store.graph_generation(), generation_before);
 }
 
 /// Index a repo through the daemon under an explicit instance id so the repo

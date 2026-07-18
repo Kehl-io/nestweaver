@@ -1872,6 +1872,31 @@ mod tests {
     }
 
     #[test]
+    fn purge_instance_reports_orphan_only_code_deletions() {
+        let store = test_store();
+        let missing_repo = "repo:ghost:orphan";
+        store
+            .insert_file(&make_file("file:repo:ghost:orphan:main", missing_repo))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:repo:ghost:orphan:handler",
+                "orphan_handler",
+                missing_repo,
+                "src/main.rs",
+            ))
+            .unwrap();
+        store
+            .insert_service(&make_service("svc:repo:ghost:orphan:api", missing_repo))
+            .unwrap();
+
+        let result = store.purge_instance("ghost").unwrap();
+        assert_eq!(result.repos, 0, "precondition: no top-level repo existed");
+        assert_eq!(result.code_orphans_swept, 3);
+        assert_eq!(result.orphans_swept, 3);
+    }
+
+    #[test]
     fn reparent_vault_preserves_notes_and_children() {
         use nestweaver_schema::{Heading, Note, NoteKind, Section, Tag, Vault};
         let store = test_store();
@@ -2082,6 +2107,43 @@ mod tests {
         let new_vault_uid = vault_uid("tgt", "/tmp/vault");
         let surviving = store.list_notes(Some(&new_vault_uid)).unwrap();
         assert_eq!(surviving.len(), 3, "expected 3 notes to survive merge");
+    }
+
+    #[test]
+    fn merge_instance_ids_rejects_self_merge_without_mutation() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+        let store = test_store();
+        let vault = Vault {
+            uid: "vlt:self:one".to_string(),
+            name: "authored".to_string(),
+            root_path: "/authored".to_string(),
+            instance_id: "same".to_string(),
+        };
+        store.insert_vault(&vault).unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:self:one".to_string(),
+                vault_uid: vault.uid.clone(),
+                file_path: "authored.md".to_string(),
+                title: "Authored".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 42,
+                content_hash: "authored-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_vault_note_edge(&vault.uid, "note:self:one")
+            .unwrap();
+
+        let error = store.merge_instance_ids("same", "same").unwrap_err();
+        assert!(error.to_string().contains("same"));
+        assert_eq!(store.list_vaults(Some("same")).unwrap().len(), 1);
+        assert_eq!(store.list_notes(Some(&vault.uid)).unwrap().len(), 1);
     }
 
     #[test]

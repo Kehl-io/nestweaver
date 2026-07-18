@@ -744,15 +744,27 @@ struct PrunedRepos {
 
 impl PrunedRepos {
     fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.uids.is_empty()
     }
 }
 
-fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<PrunedRepos, anyhow::Error> {
+fn prune_stale_repos_with<F>(
+    store: &nestweaver_store::GraphStore,
+    mut delete_repo: F,
+) -> (PrunedRepos, Option<anyhow::Error>)
+where
+    F: FnMut(&nestweaver_store::GraphStore, &nestweaver_schema::Repo) -> Result<(), anyhow::Error>,
+{
     let mut removed_repos = PrunedRepos::default();
-    let repos = store
-        .list_repos(None)
-        .map_err(|e| anyhow::anyhow!("list_repos failed: {e:#}"))?;
+    let repos = match store.list_repos(None) {
+        Ok(repos) => repos,
+        Err(error) => {
+            return (
+                removed_repos,
+                Some(anyhow::anyhow!("list_repos failed: {error:#}")),
+            );
+        }
+    };
 
     for repo in &repos {
         let Some(path) = repo.local_root() else {
@@ -765,15 +777,13 @@ fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<PrunedRepos
                 root = path,
                 "pruning stale repo: local working tree no longer exists"
             );
-            store
-                .bulk_delete_repo_files_and_symbols(&repo.uid)
-                .map_err(|e| anyhow::anyhow!("bulk_delete_repo_files_and_symbols failed: {e:#}"))?;
-            store
-                .clear_repo_derived_nodes(&repo.uid)
-                .map_err(|e| anyhow::anyhow!("clear_repo_derived_nodes failed: {e:#}"))?;
-            store
-                .delete_repo_node(&repo.uid)
-                .map_err(|e| anyhow::anyhow!("delete_repo_node failed: {e:#}"))?;
+            if let Err(error) = delete_repo(store, repo) {
+                // The cascade is multi-statement; conservatively treat the
+                // failing repo as changed so a mid-cascade error cannot leave
+                // cache or sidecar state describing deleted children.
+                removed_repos.uids.push(repo.uid.clone());
+                return (removed_repos, Some(error));
+            }
 
             removed_repos.uids.push(repo.uid.clone());
             removed_repos
@@ -781,7 +791,31 @@ fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<PrunedRepos
                 .push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
         }
     }
-    Ok(removed_repos)
+    (removed_repos, None)
+}
+
+fn delete_repo_cascade(
+    store: &nestweaver_store::GraphStore,
+    repo: &nestweaver_schema::Repo,
+) -> Result<(), anyhow::Error> {
+    store
+        .bulk_delete_repo_files_and_symbols(&repo.uid)
+        .map_err(|e| anyhow::anyhow!("bulk_delete_repo_files_and_symbols failed: {e:#}"))?;
+    store
+        .clear_repo_derived_nodes(&repo.uid)
+        .map_err(|e| anyhow::anyhow!("clear_repo_derived_nodes failed: {e:#}"))?;
+    store
+        .delete_repo_node(&repo.uid)
+        .map_err(|e| anyhow::anyhow!("delete_repo_node failed: {e:#}"))
+}
+
+#[cfg(test)]
+fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<PrunedRepos, anyhow::Error> {
+    let (removed, error) = prune_stale_repos_with(store, delete_repo_cascade);
+    match error {
+        Some(error) => Err(error),
+        None => Ok(removed),
+    }
 }
 
 fn finalize_code_graph_deletion(state: &DaemonState, repo_uids: &[String]) {
@@ -795,6 +829,121 @@ fn finalize_code_graph_deletion(state: &DaemonState, repo_uids: &[String]) {
         && error.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(%error, path = %pagerank.display(), "failed to remove stale PageRank sidecar");
+    }
+}
+
+fn rebuild_tantivy_after_mutation(state: &DaemonState, operation: &str) {
+    if let Some(ref tantivy) = state.tantivy
+        && tantivy.has_writer()
+    {
+        match tantivy.reindex_from_store(&state.store) {
+            Ok(docs) => tracing::info!(docs, operation, "Tantivy reindexed after mutation"),
+            Err(error) => {
+                tracing::warn!(%error, operation, "Tantivy reindex failed after mutation")
+            }
+        }
+    }
+}
+
+fn run_prune_stale_with<DR, DV, R>(
+    state: &DaemonState,
+    delete_repo: DR,
+    mut delete_vault: DV,
+    mut reconcile_search: R,
+) -> Result<PruneStaleResponse, Status>
+where
+    DR: FnMut(&GraphStore, &nestweaver_schema::Repo) -> Result<(), anyhow::Error>,
+    DV: FnMut(&GraphStore, &nestweaver_schema::Vault) -> Result<(), anyhow::Error>,
+    R: FnMut(&DaemonState, &str),
+{
+    let (removed_repos, mut error) = prune_stale_repos_with(&state.store, delete_repo);
+    let mut removed_vaults = Vec::new();
+    let mut vault_mutation_attempted = false;
+
+    if error.is_none() {
+        match state.store.list_vaults(None) {
+            Ok(vaults) => {
+                for vault in &vaults {
+                    if !Path::new(&vault.root_path).exists() {
+                        vault_mutation_attempted = true;
+                        if let Err(delete_error) = delete_vault(&state.store, vault) {
+                            error = Some(delete_error);
+                            break;
+                        }
+                        removed_vaults.push(vault.name.clone());
+                    }
+                }
+            }
+            Err(list_error) => {
+                error = Some(anyhow::anyhow!("list_vaults failed: {list_error:#}"));
+            }
+        }
+    }
+
+    let changed = !removed_repos.is_empty()
+        || !removed_vaults.is_empty()
+        || (error.is_some() && vault_mutation_attempted);
+    if !removed_repos.is_empty() {
+        finalize_code_graph_deletion(state, &removed_repos.uids);
+    } else if changed {
+        state.store.bump_and_persist_generation();
+    }
+    if changed {
+        reconcile_search(state, "prune_stale");
+    }
+
+    if let Some(error) = error {
+        return Err(Status::internal(format!("prune_stale failed: {error:#}")));
+    }
+    Ok(PruneStaleResponse {
+        removed_repos: removed_repos.names,
+        removed_vaults,
+    })
+}
+
+fn run_purge_instance_with<F, R>(
+    state: &DaemonState,
+    instance_id: &str,
+    purge: F,
+    mut reconcile_search: R,
+) -> Result<nestweaver_store::PurgeInstanceResult, Status>
+where
+    F: FnOnce(&GraphStore, &str) -> Result<nestweaver_store::PurgeInstanceResult, anyhow::Error>,
+    R: FnMut(&DaemonState, &str),
+{
+    let mut repo_uids = state
+        .store
+        .list_purge_code_repo_uids(instance_id)
+        .map_err(|e| Status::internal(format!("PurgeInstance failed to list code repos: {e:#}")))?;
+
+    match purge(&state.store, instance_id) {
+        Ok(result) => {
+            repo_uids.extend(result.code_repo_uids.iter().cloned());
+            repo_uids.sort();
+            repo_uids.dedup();
+            let code_changed = !repo_uids.is_empty() || result.code_orphans_swept > 0;
+            let changed = code_changed
+                || result.vaults > 0
+                || result.projects > 0
+                || result.orphans_swept > 0;
+            if code_changed {
+                finalize_code_graph_deletion(state, &repo_uids);
+            } else if changed {
+                state.store.bump_and_persist_generation();
+            }
+            if changed {
+                reconcile_search(state, "purge_instance");
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            // `purge_instance` is intentionally non-transactional. A late
+            // error can follow committed repo deletions, so reconcile every
+            // cache and persisted sidecar before surfacing the original error.
+            finalize_code_graph_deletion(state, &repo_uids);
+            reconcile_search(state, "purge_instance_error");
+            Err(Status::internal(format!("PurgeInstance failed: {error:#}")))
+        }
     }
 }
 
@@ -2090,50 +2239,17 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let mut removed_vaults = Vec::new();
-
-            // Prune stale repos (local working tree no longer exists on disk).
-            let removed_repos = prune_stale_repos(&state.store)
-                .map_err(|e| Status::internal(format!("prune stale repos failed: {e:#}")))?;
-
-            // Prune stale vaults (root_path no longer exists on disk).
-            let vaults = state
-                .store
-                .list_vaults(None)
-                .map_err(|e| Status::internal(format!("list_vaults failed: {e:#}")))?;
-
-            for vault in &vaults {
-                if !Path::new(&vault.root_path).exists() {
-                    state.store.delete_vault_cascade(&vault.uid).map_err(|e| {
-                        Status::internal(format!("delete_vault_cascade failed: {e:#}"))
-                    })?;
-                    removed_vaults.push(vault.name.clone());
-                }
-            }
-
-            if !removed_repos.is_empty() {
-                finalize_code_graph_deletion(&state, &removed_repos.uids);
-            } else if !removed_vaults.is_empty() {
-                state.store.bump_and_persist_generation();
-            }
-
-            // Reindex Tantivy if anything was removed.
-            if (!removed_repos.is_empty() || !removed_vaults.is_empty())
-                && let Some(ref tantivy) = state.tantivy
-                && tantivy.has_writer()
-            {
-                match tantivy.reindex_from_store(&state.store) {
-                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after prune_stale"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tantivy reindex failed after prune_stale")
-                    }
-                }
-            }
-
-            Ok::<_, Status>(PruneStaleResponse {
-                removed_repos: removed_repos.names,
-                removed_vaults,
-            })
+            run_prune_stale_with(
+                &state,
+                delete_repo_cascade,
+                |store, vault| {
+                    store
+                        .delete_vault_cascade(&vault.uid)
+                        .map(|_| ())
+                        .map_err(|e| anyhow::anyhow!("delete_vault_cascade failed: {e:#}"))
+                },
+                rebuild_tantivy_after_mutation,
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -2150,10 +2266,15 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
+        let req = request.into_inner();
+        if req.from_id == req.to_id {
+            return Err(Status::invalid_argument(
+                "source and target instance IDs must differ",
+            ));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
-        let req = request.into_inner();
         let state = self.state.clone();
 
         #[allow(clippy::result_large_err)]
@@ -2232,42 +2353,17 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            let repo_uids = match state.store.list_repos(Some(&instance_id)) {
-                Ok(repos) => repos.into_iter().map(|repo| repo.uid).collect::<Vec<_>>(),
-                Err(e) => {
-                    let _ = tx.blocking_send(Ok(IndexProgress {
-                        phase: Phase::Error as i32,
-                        message: format!("PurgeInstance failed to list repos: {e:#}"),
-                        files_processed: 0,
-                        files_total: 0,
-                        symbols_found: 0,
-                    }));
-                    return;
-                }
-            };
-
-            match state.store.purge_instance(&instance_id) {
+            match run_purge_instance_with(
+                &state,
+                &instance_id,
+                |store, id| {
+                    store
+                        .purge_instance(id)
+                        .map_err(|e| anyhow::anyhow!("{e:#}"))
+                },
+                rebuild_tantivy_after_mutation,
+            ) {
                 Ok(result) => {
-                    if !repo_uids.is_empty() {
-                        finalize_code_graph_deletion(&state, &repo_uids);
-                    } else if result.vaults > 0 || result.projects > 0 || result.orphans_swept > 0 {
-                        state.store.bump_and_persist_generation();
-                    }
-
-                    // Rebuild Tantivy so BM25 search reflects purged vaults.
-                    if let Some(ref tantivy) = state.tantivy
-                        && tantivy.has_writer()
-                    {
-                        match tantivy.reindex_from_store(&state.store) {
-                            Ok(n) => {
-                                tracing::info!(docs = n, "Tantivy reindexed after instance purge")
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Tantivy reindex failed after instance purge")
-                            }
-                        }
-                    }
-
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
                         message: format!(
@@ -2288,7 +2384,7 @@ impl NestWeaverDaemon for DaemonService {
                 Err(e) => {
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Error as i32,
-                        message: format!("PurgeInstance failed: {e:#}"),
+                        message: e.message().to_string(),
                         files_processed: 0,
                         files_total: 0,
                         symbols_found: 0,
@@ -6685,6 +6781,166 @@ mod startup_helper_tests {
         assert!(store.lookup_repo("repo:kept").unwrap().is_some());
         assert!(store.lookup_repo("repo:moved").unwrap().is_none());
         assert!(store.lookup_repo("repo:legacy").unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_repo_failure_finalizes_earlier_deletions_before_returning_error() {
+        let state = test_state_with_writer();
+        let missing = state.db_path.with_extension("missing-repo-root");
+        for uid in ["repo:test:first", "repo:test:second"] {
+            state
+                .store
+                .insert_repo(&test_repo(
+                    uid,
+                    &format!("https://example.test/{uid}"),
+                    Some(missing.to_str().unwrap()),
+                ))
+                .unwrap();
+        }
+        let generation = state.store.graph_generation();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"sentinel":0.5}"#).unwrap();
+
+        let mut calls = 0;
+        let mut reconciliations = 0;
+        let error = run_prune_stale_with(
+            &state,
+            |store, repo| {
+                calls += 1;
+                if calls == 1 {
+                    delete_repo_cascade(store, repo)
+                } else {
+                    Err(anyhow::anyhow!("injected second repo failure"))
+                }
+            },
+            |_store, _vault| Ok(()),
+            |_state, _operation| reconciliations += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert_eq!(calls, 2);
+        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        assert!(state.store.graph_generation() > generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        assert_eq!(state.store.list_repos(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_vault_failure_finalizes_earlier_repo_deletion() {
+        let state = test_state_with_writer();
+        let missing = state.db_path.with_extension("missing-prune-roots");
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:gone",
+                "https://example.test/gone",
+                Some(missing.to_str().unwrap()),
+            ))
+            .unwrap();
+        state
+            .store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:test:gone".to_string(),
+                name: "gone-vault".to_string(),
+                root_path: missing.display().to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let generation = state.store.graph_generation();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"sentinel":0.5}"#).unwrap();
+
+        let mut reconciliations = 0;
+        let error = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |_store, _vault| Err(anyhow::anyhow!("injected vault failure")),
+            |_state, _operation| reconciliations += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(state.store.lookup_repo("repo:test:gone").unwrap().is_none());
+        assert!(state.store.lookup_vault("vlt:test:gone").is_ok());
+        assert!(state.store.graph_generation() > generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+    }
+
+    #[test]
+    fn purge_failure_finalizes_partial_repo_deletion() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:old:partial",
+                "https://example.test/partial",
+                None,
+            ))
+            .unwrap();
+        let generation = state.store.graph_generation();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"sentinel":0.5}"#).unwrap();
+
+        let mut reconciliations = 0;
+        let error = run_purge_instance_with(
+            &state,
+            "old",
+            |store, _id| {
+                let repo = store.lookup_repo("repo:old:partial")?.unwrap();
+                delete_repo_cascade(store, &repo)?;
+                Err(anyhow::anyhow!("injected late purge failure"))
+            },
+            |_state, _operation| reconciliations += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(
+            state
+                .store
+                .lookup_repo("repo:old:partial")
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.store.graph_generation() > generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+    }
+
+    #[test]
+    fn code_deletion_invalidates_primed_in_memory_pagerank() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:pagerank",
+                "https://example.test/pagerank",
+                None,
+            ))
+            .unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"repo:test:pagerank":1.0}"#).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let before_scores = state.store.pagerank_scores();
+        let before_generation = state.store.pagerank_generation();
+        assert!(
+            before_scores.contains_key("repo:test:pagerank"),
+            "precondition: PageRank cache must be primed"
+        );
+
+        let repo = state
+            .store
+            .lookup_repo("repo:test:pagerank")
+            .unwrap()
+            .unwrap();
+        delete_repo_cascade(&state.store, &repo).unwrap();
+        finalize_code_graph_deletion(&state, &[repo.uid]);
+        let after_scores = state.store.pagerank_scores();
+
+        assert!(state.store.pagerank_generation() > before_generation);
+        assert!(!after_scores.contains_key("repo:test:pagerank"));
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared

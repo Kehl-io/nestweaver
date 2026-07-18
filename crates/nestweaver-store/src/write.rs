@@ -73,6 +73,11 @@ pub struct PurgeInstanceResult {
     pub notes: usize,
     pub projects: usize,
     pub orphans_swept: usize,
+    /// Orphaned code rows removed without a top-level Repo registry entry.
+    pub code_orphans_swept: usize,
+    /// Repo UIDs referenced by code rows removed during the purge, including
+    /// orphan-only code whose top-level Repo registry row was already absent.
+    pub code_repo_uids: Vec<String>,
 }
 
 /// Encode a Symbol's `framework_hint` as the `"framework:role"` string the
@@ -2699,6 +2704,7 @@ impl GraphStore {
     /// that left an orphan instance ID behind.
     pub fn purge_instance(&self, id: &str) -> Result<PurgeInstanceResult, StoreError> {
         let mut result = PurgeInstanceResult::default();
+        result.code_repo_uids = self.list_purge_code_repo_uids(id)?;
 
         // Repos owned by this instance — cascade delete every File,
         // Symbol, Service, and Contract that hangs off each one before
@@ -2741,23 +2747,33 @@ impl GraphStore {
         // in their UID prefix, so we can find and drop them even after
         // the parent is gone. Order matters only for telemetry — every
         // statement is `DETACH DELETE` so incident edges are cleaned.
-        for (label, prefix) in [
-            ("Symbol", format!("sym:repo:{id}:")),
-            ("File", format!("file:repo:{id}:")),
-            ("Service", format!("svc:repo:{id}:")),
-            ("Note", format!("note:vlt:{id}:")),
-            ("Heading", format!("head:note:vlt:{id}:")),
-            ("Section", format!("sec:note:vlt:{id}:")),
-            ("Tag", format!("tag:vlt:{id}:")),
+        for (label, prefix, is_code) in [
+            ("Symbol", format!("sym:repo:{id}:"), true),
+            ("File", format!("file:repo:{id}:"), true),
+            ("Service", format!("svc:repo:{id}:"), true),
+            ("Note", format!("note:vlt:{id}:"), false),
+            ("Heading", format!("head:note:vlt:{id}:"), false),
+            ("Section", format!("sec:note:vlt:{id}:"), false),
+            ("Tag", format!("tag:vlt:{id}:"), false),
             // Defensive: also catch Repo/Vault/Project rows that the
             // registry-walk above missed (e.g. stale rows whose
             // instance_id column was scrambled but whose UID is intact).
-            ("Repo", format!("repo:{id}:")),
-            ("Vault", format!("vlt:{id}:")),
-            ("Project", format!("proj:{id}:")),
+            ("Repo", format!("repo:{id}:"), true),
+            ("Vault", format!("vlt:{id}:"), false),
+            ("Project", format!("proj:{id}:"), false),
         ] {
-            result.orphans_swept += self.sweep_orphan_nodes(label, &prefix)?;
+            let swept = self.sweep_orphan_nodes(label, &prefix)?;
+            result.orphans_swept += swept;
+            if is_code {
+                result.code_orphans_swept += swept;
+            }
         }
+
+        // Contract UIDs describe API identity and do not embed the repo UID,
+        // so sweep code-orphan contracts by their repo_uid property instead.
+        let contracts = self.sweep_orphan_contracts(&format!("repo:{id}:"))?;
+        result.orphans_swept += contracts;
+        result.code_orphans_swept += contracts;
 
         Ok(result)
     }
@@ -2790,6 +2806,75 @@ impl GraphStore {
             .next()
             .unwrap_or(0);
         Ok(count)
+    }
+
+    fn sweep_orphan_contracts(&self, repo_prefix: &str) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        let Ok(mut stmt) = conn.prepare(
+            "MATCH (n:Contract) WHERE n.repo_uid STARTS WITH $p DETACH DELETE n RETURN count(n)",
+        ) else {
+            // Contract tables were introduced after the initial schema.
+            return Ok(0);
+        };
+        let rows = conn
+            .execute(
+                &mut stmt,
+                vec![("p", lbug::Value::String(repo_prefix.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("sweep Contract orphans: {e}")))?;
+        Ok(rows
+            .filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0))
+    }
+
+    /// Return every repo UID whose registry row or code children would be
+    /// affected by [`purge_instance`](Self::purge_instance). Daemon callers
+    /// use this before the non-transactional purge so sidecars can still be
+    /// reconciled if a later deletion returns an error.
+    pub fn list_purge_code_repo_uids(&self, id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        let prefix = format!("repo:{id}:");
+        let mut uids = std::collections::HashSet::new();
+
+        for label in ["Symbol", "File", "Service", "Contract"] {
+            let query = format!(
+                "MATCH (n:{label}) WHERE n.repo_uid STARTS WITH $p RETURN DISTINCT n.repo_uid"
+            );
+            let Ok(mut stmt) = conn.prepare(&query) else {
+                // Optional/legacy tables (notably Contract) may not exist.
+                continue;
+            };
+            let rows = conn
+                .execute(&mut stmt, vec![("p", lbug::Value::String(prefix.clone()))])
+                .map_err(|e| StoreError::Query(format!("list {label} purge repos: {e}")))?;
+            for row in rows {
+                if let Some(lbug::Value::String(uid)) = row.first() {
+                    uids.insert(uid.clone());
+                }
+            }
+        }
+
+        let mut stmt = conn
+            .prepare("MATCH (r:Repo) WHERE r.uid STARTS WITH $p RETURN r.uid")
+            .map_err(|e| StoreError::Query(format!("prepare purge repo UIDs: {e}")))?;
+        let rows = conn
+            .execute(&mut stmt, vec![("p", lbug::Value::String(prefix))])
+            .map_err(|e| StoreError::Query(format!("list purge repo UIDs: {e}")))?;
+        for row in rows {
+            if let Some(lbug::Value::String(uid)) = row.first() {
+                uids.insert(uid.clone());
+            }
+        }
+
+        let mut uids = uids.into_iter().collect::<Vec<_>>();
+        uids.sort();
+        Ok(uids)
     }
 
     /// Insert a single CROSS_REPO_LINK edge between two Symbol nodes.
@@ -3140,6 +3225,12 @@ impl GraphStore {
     ///
     /// Uses [`reparent_vault`] to preserve notes in the winning vault.
     pub fn merge_instance_ids(&self, from: &str, to: &str) -> Result<MergeResult, StoreError> {
+        if from == to {
+            return Err(StoreError::Query(format!(
+                "source and target instance IDs must differ (both were {from:?})"
+            )));
+        }
+
         let mut vault_count = 0usize;
         let mut repo_count = 0usize;
         let mut project_count = 0usize;
