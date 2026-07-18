@@ -734,12 +734,22 @@ type ProgressStream = tokio_stream::wrappers::ReceiverStream<Result<IndexProgres
 /// `root_path: None`) are skipped entirely: a disk-existence check cannot
 /// apply to them, and bulk-deleting them here would destroy server data.
 ///
-/// Returns the display names of the removed repos.
-fn prune_stale_repos(
-    store: &nestweaver_store::GraphStore,
-    db_path: &Path,
-) -> Result<Vec<String>, anyhow::Error> {
-    let mut removed_repos = Vec::new();
+/// Returns the display names and UIDs of the removed repos so the RPC can
+/// finalize graph and sidecar state after every graph deletion succeeds.
+#[derive(Debug, Default)]
+struct PrunedRepos {
+    names: Vec<String>,
+    uids: Vec<String>,
+}
+
+impl PrunedRepos {
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
+fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<PrunedRepos, anyhow::Error> {
+    let mut removed_repos = PrunedRepos::default();
     let repos = store
         .list_repos(None)
         .map_err(|e| anyhow::anyhow!("list_repos failed: {e:#}"))?;
@@ -765,19 +775,27 @@ fn prune_stale_repos(
                 .delete_repo_node(&repo.uid)
                 .map_err(|e| anyhow::anyhow!("delete_repo_node failed: {e:#}"))?;
 
-            // nw-048 (P1a): drop the pruned repo's change-detection sidecar
-            // slices so a later re-index of the SAME path re-indexes its files
-            // instead of skipping them all as `Unchanged` (which would leave
-            // the deleted symbols unrestored — search finds nothing). This
-            // mirrors `remove_repo`; without it, prune_stale was the remaining
-            // path that silently leaked stale filemeta slices (same class as
-            // nw-048). uid-scoped + fail-safe.
-            nestweaver_engine::remove_repo_sidecar_slices(db_path, &repo.uid);
-
-            removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
+            removed_repos.uids.push(repo.uid.clone());
+            removed_repos
+                .names
+                .push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
         }
     }
     Ok(removed_repos)
+}
+
+fn finalize_code_graph_deletion(state: &DaemonState, repo_uids: &[String]) {
+    for uid in repo_uids {
+        nestweaver_engine::remove_repo_sidecar_slices(&state.db_path, uid);
+    }
+    state.store.bump_and_persist_generation();
+    state.store.invalidate_pagerank();
+    let pagerank = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+    if let Err(error) = std::fs::remove_file(&pagerank)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, path = %pagerank.display(), "failed to remove stale PageRank sidecar");
+    }
 }
 
 #[tonic::async_trait]
@@ -1979,33 +1997,7 @@ impl NestWeaverDaemon for DaemonService {
                 .delete_repo_node(&req.repo_uid)
                 .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
 
-            // nw-048: drop the removed repo's change-detection sidecar slices so a
-            // later re-index of the SAME path re-indexes its files instead of
-            // skipping them all as `Unchanged` (which would leave the deleted
-            // symbols unrestored — search finds nothing). uid-scoped + fail-safe.
-            nestweaver_engine::remove_repo_sidecar_slices(&state.db_path, &req.repo_uid);
-
-            // nw-054: bump the graph generation so generation-keyed caches on the
-            // live daemon store invalidate (mirrors what `index` does after a
-            // mutation). Without this, the in-memory `symbol_name_cache` — primed
-            // by a pre-removal query — keeps satisfying subsequent searches and
-            // returns the just-deleted symbols (a query serving DELETED data). The
-            // bump forces the next query to re-scan the store, which no longer
-            // holds the removed rows.
-            state.store.bump_and_persist_generation();
-
-            // nw-055 (P1b): PageRank is `code_only` scope, so removing a CODE
-            // repo changes the SURVIVING nodes' ranks (their scores reflected
-            // the removed repo's edges). The generation bump above invalidates
-            // the generation-keyed caches, but the `pagerank_cache` score map
-            // is NOT generation-keyed — a rank query after this delete would
-            // serve scores computed over the pre-deletion graph. Invalidate it
-            // (next rank query recomputes via the nw-029 single-flight) and
-            // drop the stale `.pagerank.json` sidecar so a daemon restart
-            // before any query recomputes fresh instead of loading it.
-            state.store.invalidate_pagerank();
-            let pr_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-            let _ = std::fs::remove_file(&pr_path);
+            finalize_code_graph_deletion(&state, std::slice::from_ref(&req.repo_uid));
 
             if let Some(ref tantivy) = state.tantivy
                 && tantivy.has_writer()
@@ -2101,7 +2093,7 @@ impl NestWeaverDaemon for DaemonService {
             let mut removed_vaults = Vec::new();
 
             // Prune stale repos (local working tree no longer exists on disk).
-            let removed_repos = prune_stale_repos(&state.store, &state.db_path)
+            let removed_repos = prune_stale_repos(&state.store)
                 .map_err(|e| Status::internal(format!("prune stale repos failed: {e:#}")))?;
 
             // Prune stale vaults (root_path no longer exists on disk).
@@ -2119,26 +2111,10 @@ impl NestWeaverDaemon for DaemonService {
                 }
             }
 
-            // nw-054: if anything was pruned, bump the graph generation so
-            // generation-keyed in-memory caches on the live daemon store
-            // invalidate (mirrors `remove_repo` and `index`). Guarded on the
-            // removal counts so a no-op prune doesn't needlessly invalidate.
-            if !removed_repos.is_empty() || !removed_vaults.is_empty() {
-                state.store.bump_and_persist_generation();
-            }
-
-            // nw-055 (P1b): PageRank is `code_only` scope, so only a removed
-            // CODE repo changes surviving nodes' ranks. The generation bump
-            // above does NOT refresh the non-generation-keyed `pagerank_cache`
-            // score map, so invalidate it explicitly (next rank query
-            // recomputes via the nw-029 single-flight) and drop the stale
-            // `.pagerank.json` sidecar so a daemon restart before any query
-            // recomputes fresh instead of loading pre-deletion scores. Guarded
-            // on repo removal — vault-only prunes don't affect code ranks.
             if !removed_repos.is_empty() {
-                state.store.invalidate_pagerank();
-                let pr_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-                let _ = std::fs::remove_file(&pr_path);
+                finalize_code_graph_deletion(&state, &removed_repos.uids);
+            } else if !removed_vaults.is_empty() {
+                state.store.bump_and_persist_generation();
             }
 
             // Reindex Tantivy if anything was removed.
@@ -2155,7 +2131,7 @@ impl NestWeaverDaemon for DaemonService {
             }
 
             Ok::<_, Status>(PruneStaleResponse {
-                removed_repos,
+                removed_repos: removed_repos.names,
                 removed_vaults,
             })
         })
@@ -2186,6 +2162,25 @@ impl NestWeaverDaemon for DaemonService {
                 .store
                 .merge_instance_ids(&req.from_id, &req.to_id)
                 .map_err(|e| Status::internal(format!("merge_instance_ids failed: {e:#}")))?;
+
+            let changed = result.vaults > 0 || result.repos > 0 || result.projects > 0;
+            if !result.repo_uids_removed.is_empty() {
+                finalize_code_graph_deletion(&state, &result.repo_uids_removed);
+            } else if changed {
+                state.store.bump_and_persist_generation();
+            }
+
+            if changed
+                && let Some(ref tantivy) = state.tantivy
+                && tantivy.has_writer()
+            {
+                match tantivy.reindex_from_store(&state.store) {
+                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after instance merge"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Tantivy reindex failed after instance merge")
+                    }
+                }
+            }
 
             let discarded_vaults = result
                 .discarded
@@ -2237,8 +2232,28 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
+            let repo_uids = match state.store.list_repos(Some(&instance_id)) {
+                Ok(repos) => repos.into_iter().map(|repo| repo.uid).collect::<Vec<_>>(),
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("PurgeInstance failed to list repos: {e:#}"),
+                        files_processed: 0,
+                        files_total: 0,
+                        symbols_found: 0,
+                    }));
+                    return;
+                }
+            };
+
             match state.store.purge_instance(&instance_id) {
                 Ok(result) => {
+                    if !repo_uids.is_empty() {
+                        finalize_code_graph_deletion(&state, &repo_uids);
+                    } else if result.vaults > 0 || result.projects > 0 || result.orphans_swept > 0 {
+                        state.store.bump_and_persist_generation();
+                    }
+
                     // Rebuild Tantivy so BM25 search reflects purged vaults.
                     if let Some(ref tantivy) = state.tantivy
                         && tantivy.has_writer()
@@ -6616,9 +6631,7 @@ mod startup_helper_tests {
             ))
             .unwrap();
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let db_path = tmp.path().join("test.lbug");
-        let removed = prune_stale_repos(&store, &db_path).unwrap();
+        let removed = prune_stale_repos(&store).unwrap();
 
         assert!(
             removed.is_empty(),
@@ -6666,10 +6679,9 @@ mod startup_helper_tests {
             ))
             .unwrap();
 
-        let db_path = tmp.path().join("test.lbug");
-        let removed = prune_stale_repos(&store, &db_path).unwrap();
+        let removed = prune_stale_repos(&store).unwrap();
 
-        assert_eq!(removed.len(), 2, "got {removed:?}");
+        assert_eq!(removed.names.len(), 2, "got {removed:?}");
         assert!(store.lookup_repo("repo:kept").unwrap().is_some());
         assert!(store.lookup_repo("repo:moved").unwrap().is_none());
         assert!(store.lookup_repo("repo:legacy").unwrap().is_none());

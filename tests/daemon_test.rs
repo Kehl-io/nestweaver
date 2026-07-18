@@ -7,6 +7,7 @@
 //!   cargo test --test daemon_test -- --test-threads=1
 
 use assert_cmd::Command;
+use nestweaver_engine::{load_filemeta_sidecar, save_filemeta_sidecar, sidecar_path};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::io::Write;
@@ -177,6 +178,31 @@ fn create_db(repo_dir: &Path, db_path: &Path) {
         ])
         .assert()
         .success();
+}
+
+/// Create a DB whose indexed repo belongs to a specific instance.
+fn create_db_for_instance(repo_dir: &Path, db_path: &Path, instance: &str) {
+    no_daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            instance,
+        ])
+        .assert()
+        .success();
+}
+
+/// Ensure the source repo has a filemeta slice and a persisted PageRank sentinel.
+fn seed_deletion_sidecars(db_path: &Path, repo_uid: &str) {
+    let filemeta_path = sidecar_path(db_path, ".filemeta.json");
+    let mut filemeta = load_filemeta_sidecar(&filemeta_path);
+    filemeta.repos.entry(repo_uid.to_string()).or_default();
+    save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+    std::fs::write(sidecar_path(db_path, ".pagerank.json"), "sentinel").unwrap();
 }
 
 /// Index a repo through the daemon (no NESTWEAVER_NO_DAEMON).
@@ -998,6 +1024,91 @@ fn daemon_index_rpc_rejects_colon_in_instance() {
         "error should explain the colon problem, got: {}",
         status.message()
     );
+}
+
+#[test]
+fn daemon_merge_removes_source_sidecars_and_invalidates_rank() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("merge").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db_for_instance(&repo_dir, &db_path, "old");
+
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    let source_uid = store.list_repos(Some("old")).unwrap()[0].uid.clone();
+    let generation_before = store.graph_generation();
+    drop(store);
+    seed_deletion_sidecars(&db_path, &source_uid);
+
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let response = rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .expect("connect to daemon over UDS");
+        client.merge_instance("old", "new").await.unwrap()
+    });
+    assert_eq!(response.repos_reparented, 1);
+
+    stop_daemon(&db_path);
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert!(
+        load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
+            .repos
+            .get(&source_uid)
+            .is_none()
+    );
+    assert!(store.graph_generation() > generation_before);
+    assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
+}
+
+#[test]
+fn daemon_purge_removes_repo_sidecars_and_invalidates_rank() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("purge").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db_for_instance(&repo_dir, &db_path, "old");
+
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    let source_uid = store.list_repos(Some("old")).unwrap()[0].uid.clone();
+    let generation_before = store.graph_generation();
+    drop(store);
+    seed_deletion_sidecars(&db_path, &source_uid);
+
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let saw_done = rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .expect("connect to daemon over UDS");
+        let mut stream = client.purge_instance("old").await.unwrap();
+        let mut saw_done = false;
+        while let Some(progress) = stream.message().await.unwrap() {
+            saw_done |= progress.phase == nestweaver_proto::Phase::Done as i32;
+        }
+        saw_done
+    });
+    assert!(saw_done);
+
+    stop_daemon(&db_path);
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert!(
+        load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
+            .repos
+            .get(&source_uid)
+            .is_none()
+    );
+    assert!(store.graph_generation() > generation_before);
+    assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
 }
 
 /// Index a repo through the daemon under an explicit instance id so the repo
