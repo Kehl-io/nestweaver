@@ -1059,6 +1059,15 @@ pub fn run_auto_setup(
         .filter(|t| t.detected)
         .map(|t| t.name)
         .collect();
+    run_auto_setup_for_tools(db_path, base, quiet, &to_configure)
+}
+
+fn run_auto_setup_for_tools(
+    db_path: &Path,
+    base: &Path,
+    quiet: bool,
+    to_configure: &[&str],
+) -> Result<(), anyhow::Error> {
     if to_configure.is_empty() {
         return Ok(());
     }
@@ -1070,7 +1079,7 @@ pub fn run_auto_setup(
 
     let mut configured = Vec::new();
     let mut failures = Vec::new();
-    for name in to_configure {
+    for &name in to_configure {
         match configure_tool(name, db_path, false, false, base) {
             Ok(()) => configured.push(name),
             Err(error) => failures.push(format!("{name}: {error:#}")),
@@ -1207,7 +1216,7 @@ mod setup_base_dir_tests {
         std::fs::write(base.join(".cursor/mcp.json"), "{ invalid json").unwrap();
         let db = tmp.path().join("test.lbug");
 
-        let error = run_auto_setup(&db, &base, true).unwrap_err();
+        let error = run_auto_setup_for_tools(&db, &base, true, &["cursor"]).unwrap_err();
 
         let message = format!("{error:#}");
         assert!(message.contains("cursor"));
@@ -1229,7 +1238,7 @@ mod setup_base_dir_tests {
         assert!(!rules_path.join("nestweaver.mdc").exists());
 
         std::fs::remove_file(&rules_path).unwrap();
-        run_auto_setup(&db, &base, true).unwrap();
+        run_auto_setup_for_tools(&db, &base, true, &["cursor"]).unwrap();
 
         assert!(rules_path.join("nestweaver.mdc").exists());
         assert_eq!(
