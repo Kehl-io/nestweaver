@@ -189,6 +189,69 @@ pub fn remove_repo_sidecar_slices(db_path: &Path, repo_uid: &str) {
     }
 }
 
+/// Per-stage results from reconciling graph-derived sidecars after deletion.
+///
+/// The deletion finalizer keeps these failures non-fatal for now, matching its
+/// existing policy, but returning both results from this helper gives the
+/// durable-error boundary a structured seam for follow-up propagation.
+#[derive(Debug)]
+pub struct DeletedGraphStateReconciliation {
+    pub manifests_removed: Result<usize, String>,
+    pub embeddings_removed: Result<usize, String>,
+    pub clusters_invalidated: Result<bool, String>,
+}
+
+/// Reconcile repo/node-keyed derived state against the authoritative live
+/// graph. This is safe after partial multi-statement deletion: live destination
+/// or surviving rows remain in the authoritative sets and therefore retain
+/// their manifest/vector data.
+pub fn reconcile_deleted_graph_state(
+    store: &GraphStore,
+    db_path: &Path,
+) -> DeletedGraphStateReconciliation {
+    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
+    let manifests_path = crate::sidecar_path(db_path, ".manifests.json");
+    let manifests_removed = (|| -> Result<usize, anyhow::Error> {
+        if !manifests_path.exists() {
+            return Ok(0);
+        }
+        let live_repo_uids: std::collections::HashSet<String> = store
+            .list_repos(None)
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .map(|repo| repo.uid)
+            .collect();
+        let mut manifests = crate::manifest::load_manifest_cache(&manifests_path)?;
+        let before = manifests.len();
+        manifests.retain(|uid, _| live_repo_uids.contains(uid));
+        let removed = before - manifests.len();
+        if removed > 0 {
+            crate::manifest::save_manifest_cache(&manifests, &manifests_path)?;
+        }
+        Ok(removed)
+    })()
+    .map_err(|error| format!("manifest reconciliation failed: {error:#}"));
+
+    let embeddings_removed = store
+        .reconcile_embedding_index()
+        .map_err(|error| format!("embedding reconciliation failed: {error:#}"));
+    let clusters_path = crate::sidecar_path(db_path, ".clusters.json");
+    let clusters_invalidated = match std::fs::remove_file(&clusters_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cluster invalidation failed for {}: {error}",
+            clusters_path.display()
+        )),
+    };
+
+    DeletedGraphStateReconciliation {
+        manifests_removed,
+        embeddings_removed,
+        clusters_invalidated,
+    }
+}
+
 /// Publish all cache and sidecar effects that must follow a successful code
 /// graph deletion. Both daemon RPC and web-admin removals call this epilogue so
 /// they cannot diverge after performing the same graph mutation.
@@ -205,6 +268,19 @@ pub fn finalize_code_graph_deletion(
 ) {
     for uid in repo_uids {
         remove_repo_sidecar_slices(db_path, uid);
+    }
+    let reconciliation = reconcile_deleted_graph_state(store, db_path);
+    match reconciliation.manifests_removed {
+        Ok(removed) => tracing::info!(removed, operation, "manifest cache reconciled"),
+        Err(error) => tracing::warn!(%error, operation, "manifest cache reconciliation failed"),
+    }
+    match reconciliation.embeddings_removed {
+        Ok(removed) => tracing::info!(removed, operation, "embedding index reconciled"),
+        Err(error) => tracing::warn!(%error, operation, "embedding index reconciliation failed"),
+    }
+    match reconciliation.clusters_invalidated {
+        Ok(invalidated) => tracing::info!(invalidated, operation, "cluster cache reconciled"),
+        Err(error) => tracing::warn!(%error, operation, "cluster cache reconciliation failed"),
     }
     store.bump_and_persist_generation();
     store.invalidate_pagerank();
@@ -3970,6 +4046,148 @@ function hello(name) { return "Hello " + name; }
             second.files_deleted, 1,
             "the result must use bulk_reindex_write's authoritative deletion count"
         );
+    }
+
+    #[test]
+    fn deletion_finalizer_removes_phantom_manifest_suggestions_and_preserves_survivors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repos = [
+            (
+                "app",
+                "https://example.com/app",
+                r#"{"name":"@acme/app","dependencies":{"@acme/removed":"1","@acme/survivor":"1"}}"#,
+            ),
+            (
+                "removed",
+                "https://example.com/removed",
+                r#"{"name":"@acme/removed"}"#,
+            ),
+            (
+                "survivor",
+                "https://example.com/survivor",
+                r#"{"name":"@acme/survivor"}"#,
+            ),
+        ];
+        for (name, url, manifest) in repos {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join(format!("{name}.js")),
+                format!("function {name}() {{ return '{name}'; }}"),
+            )
+            .unwrap();
+            fs::write(root.join("package.json"), manifest).unwrap();
+            index_directory(&root, &db_path, "test", url, "sha").unwrap();
+        }
+
+        let removed_uid = nestweaver_schema::repo_uid("test", "https://example.com/removed");
+        let survivor_uid = nestweaver_schema::repo_uid("test", "https://example.com/survivor");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store
+            .bulk_delete_repo_files_and_symbols(&removed_uid)
+            .unwrap();
+        store.clear_repo_derived_nodes(&removed_uid).unwrap();
+        store.delete_repo_node(&removed_uid).unwrap();
+        let clusters_path = crate::sidecar_path(&db_path, ".clusters.json");
+        fs::write(&clusters_path, r#"{"communities":[]}"#).unwrap();
+
+        finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            std::slice::from_ref(&removed_uid),
+            None,
+            "manifest regression",
+        );
+
+        let manifests_path = crate::sidecar_path(&db_path, ".manifests.json");
+        let manifests = crate::load_manifest_cache(&manifests_path).unwrap();
+        let suggestions = crate::suggest_links(&store, &manifests).unwrap();
+        assert!(
+            suggestions.links.iter().all(|link| {
+                link.to != removed_uid && !link.description.contains("@acme/removed")
+            }),
+            "removed repo manifest produced a phantom suggestion: {:?}",
+            suggestions.links
+        );
+        assert!(!manifests.contains_key(&removed_uid));
+        assert!(manifests.contains_key(&survivor_uid));
+        assert!(suggestions.links.iter().any(|link| {
+            link.link_type == "package-dependency" && link.description.contains("@acme/survivor")
+        }));
+        assert!(
+            !clusters_path.exists(),
+            "node-UID-keyed cluster output must be invalidated after deletion"
+        );
+    }
+
+    #[test]
+    fn deletion_finalizer_prunes_stale_embeddings_before_vector_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        for (name, url) in [
+            ("removed", "https://example.com/removed-vector"),
+            ("survivor", "https://example.com/survivor-vector"),
+        ] {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join(format!("{name}.js")),
+                format!("function {name}() {{ return '{name}'; }}"),
+            )
+            .unwrap();
+            index_directory(&root, &db_path, "test", url, "sha").unwrap();
+        }
+
+        let removed_repo_uid =
+            nestweaver_schema::repo_uid("test", "https://example.com/removed-vector");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let removed_symbol_uid = store
+            .symbols_in_file("removed.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        let survivor_symbol_uid = store
+            .symbols_in_file("survivor.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        assert!(store.add_embedding(&removed_symbol_uid, vec![1.0, 0.0]));
+        assert!(store.add_embedding(&survivor_symbol_uid, vec![0.8, 0.6]));
+        store.flush_embedding_index().unwrap();
+        assert_eq!(
+            store.vector_search(&[1.0, 0.0], 1)[0].0,
+            removed_symbol_uid,
+            "precondition: stale vector must displace the live result"
+        );
+
+        store
+            .bulk_delete_repo_files_and_symbols(&removed_repo_uid)
+            .unwrap();
+        store.clear_repo_derived_nodes(&removed_repo_uid).unwrap();
+        store.delete_repo_node(&removed_repo_uid).unwrap();
+        finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            std::slice::from_ref(&removed_repo_uid),
+            None,
+            "embedding regression",
+        );
+
+        let live_results = store.vector_search(&[1.0, 0.0], 1);
+        assert_eq!(live_results[0].0, survivor_symbol_uid);
+        assert!(!store.has_embedding(&removed_symbol_uid));
+        assert!(store.has_embedding(&survivor_symbol_uid));
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let persisted_results = reopened.vector_search(&[1.0, 0.0], 1);
+        assert_eq!(persisted_results[0].0, survivor_symbol_uid);
+        assert!(!reopened.has_embedding(&removed_symbol_uid));
+        assert!(reopened.has_embedding(&survivor_symbol_uid));
     }
 
     struct EmptyReader {

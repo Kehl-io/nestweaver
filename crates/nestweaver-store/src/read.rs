@@ -1204,6 +1204,28 @@ impl GraphStore {
         Ok(result.count())
     }
 
+    /// Return the authoritative set of graph-node UIDs supported by the
+    /// sidecar embedding index. The embedding producers currently cover
+    /// Symbols, Notes, and Headings; querying all three protects vault data
+    /// while code-repo deletion reconciles Symbol vectors.
+    pub(crate) fn live_embedding_node_uids(&self) -> Result<HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut uids = HashSet::new();
+        for query in [
+            "MATCH (s:Symbol) RETURN s.uid",
+            "MATCH (n:Note) RETURN n.uid",
+            "MATCH (h:Heading) RETURN h.uid",
+        ] {
+            let result = conn
+                .query(query)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in result {
+                uids.insert(extract_string(&row, 0)?);
+            }
+        }
+        Ok(uids)
+    }
+
     /// Count symbols grouped by their owning repo (`repo_uid` -> count).
     /// Used by backup manifests to report per-repo symbol totals without
     /// loading full symbol rows.

@@ -3534,7 +3534,7 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
-            let cache_path = state.db_path.with_extension("manifests.json");
+            let cache_path = nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json");
             let manifests = nestweaver_engine::load_manifest_cache(&cache_path).unwrap_or_default();
             let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
                 .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
@@ -6793,6 +6793,99 @@ mod startup_helper_tests {
         }
     }
 
+    fn seed_manifest_and_embedding(
+        state: &DaemonState,
+        repo_uid: &str,
+        package_name: &str,
+    ) -> String {
+        let manifests_path = nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json");
+        let mut manifests =
+            nestweaver_engine::load_manifest_cache(&manifests_path).unwrap_or_default();
+        manifests.insert(
+            repo_uid.to_string(),
+            nestweaver_engine::ManifestInfo {
+                package_name: Some(package_name.to_string()),
+                dependencies: Vec::new(),
+                entry_files: Vec::new(),
+            },
+        );
+        nestweaver_engine::save_manifest_cache(&manifests, &manifests_path).unwrap();
+
+        let symbol_uid = format!("sym:{repo_uid}:{package_name}");
+        state
+            .store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: symbol_uid.clone(),
+                name: package_name.to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: repo_uid.to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn {package_name}()"),
+                summary: None,
+                content_hash: format!("hash:{package_name}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        assert!(state.store.add_embedding(&symbol_uid, vec![1.0, 0.0]));
+        state.store.flush_embedding_index().unwrap();
+        symbol_uid
+    }
+
+    #[tokio::test]
+    async fn suggest_links_reads_the_canonical_manifest_sidecar() {
+        let state = test_state_with_writer();
+        for (uid, url) in [
+            ("repo:test:app", "https://example.test/app"),
+            ("repo:test:dependency", "https://example.test/dependency"),
+        ] {
+            state.store.insert_repo(&test_repo(uid, url, None)).unwrap();
+        }
+        let manifests = std::collections::HashMap::from([
+            (
+                "repo:test:app".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("app-package".to_string()),
+                    dependencies: vec!["dependency-package".to_string()],
+                    entry_files: Vec::new(),
+                },
+            ),
+            (
+                "repo:test:dependency".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("dependency-package".to_string()),
+                    dependencies: Vec::new(),
+                    entry_files: Vec::new(),
+                },
+            ),
+        ]);
+        nestweaver_engine::save_manifest_cache(
+            &manifests,
+            &nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json"),
+        )
+        .unwrap();
+
+        let response = DaemonService::new(state)
+            .suggest_links_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let suggestions: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+        assert!(suggestions["links"].as_array().unwrap().iter().any(|link| {
+            link["description"] == "Depends on dependency-package (from manifest)"
+        }));
+    }
+
     /// DATA-LOSS REGRESSION GUARD: `prune_stale_repos` must NEVER delete a
     /// repo with a remote identity url and no local working tree
     /// (`root_path: None`) — e.g. a server-side bare-clone repo. The old
@@ -6880,6 +6973,9 @@ mod startup_helper_tests {
                 ))
                 .unwrap();
         }
+        let first_symbol = seed_manifest_and_embedding(&state, "repo:test:first", "first-package");
+        let second_symbol =
+            seed_manifest_and_embedding(&state, "repo:test:second", "second-package");
         let generation = state.store.graph_generation();
         let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
         std::fs::write(&pagerank_path, r#"{"sentinel":0.5}"#).unwrap();
@@ -6907,6 +7003,15 @@ mod startup_helper_tests {
         assert!(state.store.graph_generation() > generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
         assert_eq!(state.store.list_repos(None).unwrap().len(), 1);
+        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
+            &state.db_path,
+            ".manifests.json",
+        ))
+        .unwrap();
+        assert!(!manifests.contains_key("repo:test:first"));
+        assert!(manifests.contains_key("repo:test:second"));
+        assert!(!state.store.has_embedding(&first_symbol));
+        assert!(state.store.has_embedding(&second_symbol));
     }
 
     #[test]
@@ -6962,6 +7067,18 @@ mod startup_helper_tests {
                 None,
             ))
             .unwrap();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:survivor:purge",
+                "https://example.test/purge-survivor",
+                None,
+            ))
+            .unwrap();
+        let removed_symbol =
+            seed_manifest_and_embedding(&state, "repo:old:partial", "purged-package");
+        let survivor_symbol =
+            seed_manifest_and_embedding(&state, "repo:survivor:purge", "survivor-package");
         let generation = state.store.graph_generation();
         let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
         std::fs::write(&pagerank_path, r#"{"sentinel":0.5}"#).unwrap();
@@ -6990,6 +7107,15 @@ mod startup_helper_tests {
         assert!(state.store.graph_generation() > generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
         assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
+            &state.db_path,
+            ".manifests.json",
+        ))
+        .unwrap();
+        assert!(!manifests.contains_key("repo:old:partial"));
+        assert!(manifests.contains_key("repo:survivor:purge"));
+        assert!(!state.store.has_embedding(&removed_symbol));
+        assert!(state.store.has_embedding(&survivor_symbol));
     }
 
     #[test]
@@ -7004,6 +7130,9 @@ mod startup_helper_tests {
             repo.instance_id = "old".to_string();
             state.store.insert_repo(&repo).unwrap();
         }
+        let first_symbol = seed_manifest_and_embedding(&state, "repo:old:first", "first-package");
+        let second_symbol =
+            seed_manifest_and_embedding(&state, "repo:old:second", "second-package");
         let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
         let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
         filemeta
@@ -7059,6 +7188,15 @@ mod startup_helper_tests {
             "post-error rank query returned the deleted repo"
         );
         assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
+            &state.db_path,
+            ".manifests.json",
+        ))
+        .unwrap();
+        assert!(!manifests.contains_key("repo:old:first"));
+        assert!(manifests.contains_key("repo:old:second"));
+        assert!(!state.store.has_embedding(&first_symbol));
+        assert!(state.store.has_embedding(&second_symbol));
     }
 
     #[test]
@@ -7249,6 +7387,8 @@ mod startup_helper_tests {
                 content_hash: "hash".to_string(),
             })
             .unwrap();
+        let removed_symbol =
+            seed_manifest_and_embedding(&state, repo_uid, "partial-remove-package");
 
         let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
         let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
@@ -7314,6 +7454,19 @@ mod startup_helper_tests {
                 .search("late_remove_search_sentinel", 10)
                 .unwrap()
                 .is_empty()
+        );
+        assert!(
+            nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
+                &state.db_path,
+                ".manifests.json"
+            ))
+            .unwrap()
+            .contains_key(repo_uid),
+            "the live Repo row must retain its manifest after a partial delete"
+        );
+        assert!(
+            !state.store.has_embedding(&removed_symbol),
+            "the committed Symbol deletion must remove its embedding"
         );
     }
 

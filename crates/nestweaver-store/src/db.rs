@@ -533,6 +533,39 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Remove embeddings for graph nodes that no longer exist, update the
+    /// live index, and persist the repaired binary sidecar.
+    ///
+    /// The live UID set is read after graph mutation, so partial multi-step
+    /// deletes preserve vectors for nodes that survived. Once the binary
+    /// sidecar is durable, the legacy JSON fallback is removed so a later
+    /// binary read failure cannot resurrect stale vectors.
+    pub fn reconcile_embedding_index(&self) -> Result<usize, StoreError> {
+        let live_uids = self.live_embedding_node_uids()?;
+        let removed = {
+            let mut idx = self
+                .embedding_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            idx.retain_uids(&live_uids)
+        };
+
+        self.flush_embedding_index()?;
+        if let Some(db_path) = &self.db_path {
+            let legacy_path = Self::embedding_sidecar_json_for(db_path);
+            if let Err(error) = std::fs::remove_file(&legacy_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(StoreError::Query(format!(
+                    "remove legacy embedding sidecar {}: {error}",
+                    legacy_path.display()
+                )));
+            }
+        }
+
+        Ok(removed)
+    }
+
     /// Perform a vector similarity search over the embedding index.
     /// Returns `(uid, cosine_similarity)` pairs sorted descending.
     pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f64)> {

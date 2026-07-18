@@ -348,6 +348,16 @@ impl EmbeddingIndex {
     pub fn get(&self, uid: &str) -> Option<&Vec<f32>> {
         self.embeddings.get(uid)
     }
+
+    /// Retain only embeddings whose graph nodes still exist.
+    ///
+    /// Returns the number of removed vectors so callers can report and test
+    /// reconciliation without exposing the index's internal map.
+    pub(crate) fn retain_uids(&mut self, live_uids: &std::collections::HashSet<String>) -> usize {
+        let before = self.embeddings.len();
+        self.embeddings.retain(|uid, _| live_uids.contains(uid));
+        before - self.embeddings.len()
+    }
 }
 
 #[cfg(test)]

@@ -1994,6 +1994,15 @@ url = "https://github.com/example/existing"
             .unwrap()
             .uid;
         assert!(store.pagerank_scores().contains_key(&removed_symbol_uid));
+        assert!(store.add_embedding(&removed_symbol_uid, vec![1.0, 0.0]));
+        store.flush_embedding_index().unwrap();
+
+        let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
+        assert!(
+            nestweaver_engine::load_manifest_cache(&manifests_path)
+                .unwrap()
+                .contains_key(&repo_uid)
+        );
 
         let filemeta_path = nestweaver_engine::sidecar_path(&db_path, ".filemeta.json");
         assert!(
@@ -2111,6 +2120,16 @@ url = "https://github.com/example/existing"
                 .unwrap()
                 .is_empty(),
             "admin deletion must reconcile the text-search index"
+        );
+        assert!(
+            !nestweaver_engine::load_manifest_cache(&manifests_path)
+                .unwrap()
+                .contains_key(&repo_uid),
+            "admin deletion must remove the deleted repo manifest"
+        );
+        assert!(
+            !store.has_embedding(&removed_symbol_uid),
+            "admin deletion must remove the deleted symbol embedding"
         );
     }
 
