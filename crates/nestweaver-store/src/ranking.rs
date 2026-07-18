@@ -1199,6 +1199,78 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_pagerank_recomputes_after_code_deletion() {
+        // nw-055 (P1b): a code-repo deletion changes the SURVIVING nodes' ranks,
+        // but the `pagerank_cache` score map is NOT generation-keyed — a rank
+        // query after the delete would keep serving scores computed over the
+        // PRE-deletion graph. `invalidate_pagerank` drops the cache so the next
+        // rank query recomputes over the reduced graph via the nw-029
+        // single-flight. RED pre-fix (no invalidate): stale scores still list
+        // the removed repo's symbols and no recompute happens.
+        let store = test_store();
+
+        // repo-1 survivors: A -> B -> C. repo-2: D, E (deleted below).
+        for uid in ["A", "B", "C"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        for uid in ["D", "E"] {
+            let mut s = make_symbol(uid, &format!("fn_{uid}"));
+            s.repo_uid = "repo-2".to_string();
+            s.file_path = "src/other.rs".to_string();
+            store.insert_symbol(&s).unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("D", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("E", "C")).unwrap();
+
+        // Warm the cache and capture the pre-deletion state.
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let gen_before = store.pagerank_generation();
+        let scores_before = store.pagerank_scores();
+        assert!(
+            scores_before.contains_key("D") && scores_before.contains_key("E"),
+            "repo-2 symbols should be ranked before the deletion"
+        );
+
+        // Remove repo-2 from the store, then invalidate the score cache (this
+        // mirrors what remove_repo / prune_stale now do in the daemon).
+        store.bulk_delete_repo_files_and_symbols("repo-2").unwrap();
+        store.invalidate_pagerank();
+
+        // The cache is now empty — the next rank query must recompute.
+        assert!(
+            store.pagerank_cache.lock().unwrap().is_none(),
+            "invalidate_pagerank must clear the in-memory score cache"
+        );
+
+        // A rank query triggers the single-flight recompute over the reduced graph.
+        let scores_after = store.pagerank_scores();
+        let gen_after = store.pagerank_generation();
+
+        // Primary assertion: a recompute happened (invalidation fired).
+        assert!(
+            gen_after > gen_before,
+            "rank query after invalidate must recompute PageRank (gen {gen_before} -> {gen_after})"
+        );
+        // Behavioral assertion: recomputed scores reflect repo-2's absence.
+        assert!(
+            !scores_after.contains_key("D") && !scores_after.contains_key("E"),
+            "recomputed ranks must not include the deleted repo-2 symbols"
+        );
+        assert!(
+            scores_after.contains_key("A")
+                && scores_after.contains_key("B")
+                && scores_after.contains_key("C"),
+            "surviving repo-1 symbols must still be ranked"
+        );
+    }
+
+    #[test]
     fn pagerank_assigns_nonzero_scores() {
         // Graph: A->B, A->C, B->C  (C has most incoming, should rank highest)
         let store = test_store();

@@ -291,6 +291,25 @@ impl GraphStore {
         observed < self.pagerank_generation()
     }
 
+    /// nw-055 (P1b): drop the in-memory PageRank score cache so the next rank
+    /// query recomputes fresh.
+    ///
+    /// The `pagerank_cache` score map is NOT generation-keyed, so bumping the
+    /// graph generation after a deletion (which invalidates the
+    /// generation-keyed `symbol_name_cache` / `ppr_graph_cache`) does NOT
+    /// refresh these scores — a rank query after a code-repo removal would
+    /// keep serving scores computed over the pre-deletion graph (surviving
+    /// nodes' scores still reflecting the removed nodes' edges). Delete RPCs
+    /// that remove CODE repos (`remove_repo`, `prune_stale`) call this so the
+    /// next `ensure_pagerank_loaded` recomputes via the nw-029 single-flight.
+    /// Lazy (recompute on next rank query) rather than eager, matching nw-029.
+    pub fn invalidate_pagerank(&self) {
+        *self
+            .pagerank_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// Load pre-computed interaction memory scores into the in-memory cache.
     /// When present, PPR's personalization vector blends a small fraction of
     /// these scores to boost nodes the user has frequently accessed.

@@ -1301,3 +1301,119 @@ fn daemon_prune_stale_invalidates_query_cache() {
         .success()
         .stdout(contains("No symbols found"));
 }
+
+/// nw-055 (P1a): `prune-stale` must drop the pruned repo's change-detection
+/// sidecar slices — the exact data-loss class nw-048 fixed for `remove-repo`,
+/// but in the prune path. Pre-fix, `prune-stale` deleted the graph rows but left
+/// the repo's `.filemeta` slice behind. So if the working tree returns at the
+/// SAME path, the stale slice classifies its files as `Unchanged` (same size →
+/// Tier-2 skip) → a re-index finds 0 files → the symbol is never restored →
+/// search returns nothing. The fix drops the sidecar slices inside
+/// `prune_stale_repos` (uid-scoped, fail-safe), mirroring `remove_repo`.
+///
+/// Driven end-to-end through the real daemon (the sole DB writer). A fixed
+/// `--instance` keeps the repo uid stable across index/prune/re-index so the
+/// stale slice is actually consulted. We assert on the daemon's OWN re-index
+/// file count (deterministic, no read-back needed) exactly as nw-048 does.
+#[test]
+fn daemon_prune_stale_drops_sidecar_slices_so_readd_reindexes() {
+    const INSTANCE: &str = "nw055";
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("ps55").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // Helper: init a git repo at repo_dir with the distinctive symbol file.
+    let make_repo = || {
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        StdCommand::new("git")
+            .args(["init"])
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap();
+        std::fs::write(repo_dir.join("m.js"), "function readdfn() { return 1; }").unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap();
+        StdCommand::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap();
+    };
+
+    make_repo();
+
+    let _guard = DaemonGuard::new(&db_path);
+
+    // Initial index through the daemon under a fixed instance/uid creates the DB
+    // + the `.filemeta` sidecar slice.
+    index_via_daemon_instance(&repo_dir, &db_path, INSTANCE);
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Sanity: the symbol is searchable before the prune.
+    daemon_cmd()
+        .args(["search", "readdfn", "--db", &db_path.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("readdfn"));
+
+    // Make the repo stale: remove its working tree so prune-stale detects it.
+    std::fs::remove_dir_all(&repo_dir).unwrap();
+
+    // Prune through the daemon. Pre-fix this leaks the `.filemeta` slice.
+    daemon_cmd()
+        .args(["prune-stale", "--db", &db_path.display().to_string()])
+        .assert()
+        .success();
+
+    // The working tree returns at the SAME path with the SAME file (same size).
+    make_repo();
+
+    // Re-index the SAME path through the daemon under the SAME instance/uid.
+    // Pre-fix: the orphaned `.filemeta` slice makes m.js classify `Unchanged`
+    // → the daemon re-indexes 0 files → the symbol is never restored ("Indexed
+    // 0 files"). Post-fix: prune dropped the slice → the daemon re-indexes the
+    // file ("Indexed 1 files") and restores the symbol.
+    let reindex = daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            INSTANCE,
+        ])
+        .assert()
+        .success();
+    let reindex_out = reindex.get_output();
+    let reindex_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reindex_out.stdout),
+        String::from_utf8_lossy(&reindex_out.stderr),
+    );
+    assert!(
+        reindex_log.contains("Indexed 1 files"),
+        "re-index after prune-stale must re-index the file (nw-055/P1a); \
+         pre-fix it reports 'Indexed 0 files'. Got:\n{reindex_log}"
+    );
+
+    // And the symbol is searchable again through the daemon (nw-054 fixed the
+    // query cache, so this read-back is now reliable too).
+    daemon_cmd()
+        .args(["search", "readdfn", "--db", &db_path.display().to_string()])
+        .assert()
+        .success()
+        .stdout(contains("readdfn"));
+}

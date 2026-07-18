@@ -36,6 +36,13 @@ pub struct IndexResult {
     pub edges_count: usize,
     pub files_count: usize,
     pub files_unchanged: usize,
+    /// nw-055 (P1b): count of files pruned from the store because they vanished
+    /// from disk since the last index (deletions), distinct from `files_count`
+    /// (files parsed) and `files_unchanged` (files skipped as identical). A
+    /// delete-only re-index has `files_count == 0` but `files_deleted > 0`; the
+    /// index-time PageRank guard consults this so surviving nodes' ranks are
+    /// recomputed after a deletion instead of left stale.
+    pub files_deleted: usize,
     pub skipped_files: Vec<SkippedFile>,
 }
 
@@ -601,9 +608,15 @@ fn index_directory_with_store_inner(
     // nw-029: warm PageRank at index time so first queries (UI overview, impact,
     // repo-map, hubs) never pay the lazy compute. Mirrors the incremental path.
     // Release-build cost is seconds even at ~50k symbols; failure is non-fatal
-    // (lazy single-flight compute remains the backstop). The `files_count > 0 ||
-    // !exists` guard keeps a no-op re-index of an already-warm DB cheap.
-    if result.files_count > 0 || !crate::sidecar_path(db_path, ".pagerank.json").exists() {
+    // (lazy single-flight compute remains the backstop). The guard keeps a
+    // no-op re-index of an already-warm DB cheap. nw-055 (P1b): also recompute
+    // when files were DELETED (files_count == 0 but files_deleted > 0) — a
+    // delete-only re-index changes surviving nodes' ranks, so skipping it here
+    // would serve stale scores + leave a stale sidecar.
+    if result.files_count > 0
+        || result.files_deleted > 0
+        || !crate::sidecar_path(db_path, ".pagerank.json").exists()
+    {
         if let Err(e) = store.compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
         {
             tracing::warn!("index-time PageRank failed (non-fatal): {e}");
@@ -1164,6 +1177,7 @@ where
     let mut handler_files: Vec<HandlerFileData> = Vec::new();
     let mut files_count = 0usize;
     let mut files_unchanged = 0usize;
+    let mut files_deleted = 0usize;
     let mut symbols_count = 0usize;
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
     let mut actually_changed_files: std::collections::HashSet<String> =
@@ -1470,6 +1484,11 @@ where
                 if !present_files.contains(path) {
                     let _ = store.delete_symbols_in_file(&r_uid, path);
                     let _ = store.delete_file_node(f_uid);
+                    // nw-055 (P1b): a vanished file is a genuine deletion. Count
+                    // it so the index-time PageRank guard fires on a delete-only
+                    // re-index (files_count == 0) instead of leaving surviving
+                    // nodes' ranks stale.
+                    files_deleted += 1;
                 }
             }
         }
@@ -1924,6 +1943,7 @@ where
         edges_count,
         files_count,
         files_unchanged,
+        files_deleted,
         skipped_files,
     })
 }
@@ -3078,8 +3098,13 @@ fn full_index_fallback(
     // most common case — without this it stayed sidecar-less. Mirrors the full
     // and incremental paths. Release-build cost is seconds even at ~50k symbols;
     // failure is non-fatal (lazy single-flight compute remains the backstop).
-    // The `files_count > 0 || !exists` guard keeps a no-op re-index cheap.
-    if result.files_count > 0 || !crate::sidecar_path(db_path, ".pagerank.json").exists() {
+    // The guard keeps a no-op re-index cheap. nw-055 (P1b): also recompute when
+    // files were DELETED (files_count == 0 but files_deleted > 0) so a
+    // delete-only re-index refreshes surviving nodes' ranks + the sidecar.
+    if result.files_count > 0
+        || result.files_deleted > 0
+        || !crate::sidecar_path(db_path, ".pagerank.json").exists()
+    {
         if let Err(e) = store.compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
         {
             tracing::warn!("index-time PageRank failed (non-fatal): {e}");

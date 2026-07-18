@@ -735,7 +735,10 @@ type ProgressStream = tokio_stream::wrappers::ReceiverStream<Result<IndexProgres
 /// apply to them, and bulk-deleting them here would destroy server data.
 ///
 /// Returns the display names of the removed repos.
-fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<Vec<String>, anyhow::Error> {
+fn prune_stale_repos(
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+) -> Result<Vec<String>, anyhow::Error> {
     let mut removed_repos = Vec::new();
     let repos = store
         .list_repos(None)
@@ -761,6 +764,16 @@ fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<Vec<String>
             store
                 .delete_repo_node(&repo.uid)
                 .map_err(|e| anyhow::anyhow!("delete_repo_node failed: {e:#}"))?;
+
+            // nw-048 (P1a): drop the pruned repo's change-detection sidecar
+            // slices so a later re-index of the SAME path re-indexes its files
+            // instead of skipping them all as `Unchanged` (which would leave
+            // the deleted symbols unrestored — search finds nothing). This
+            // mirrors `remove_repo`; without it, prune_stale was the remaining
+            // path that silently leaked stale filemeta slices (same class as
+            // nw-048). uid-scoped + fail-safe.
+            nestweaver_engine::remove_repo_sidecar_slices(db_path, &repo.uid);
+
             removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
         }
     }
@@ -1981,6 +1994,19 @@ impl NestWeaverDaemon for DaemonService {
             // holds the removed rows.
             state.store.bump_and_persist_generation();
 
+            // nw-055 (P1b): PageRank is `code_only` scope, so removing a CODE
+            // repo changes the SURVIVING nodes' ranks (their scores reflected
+            // the removed repo's edges). The generation bump above invalidates
+            // the generation-keyed caches, but the `pagerank_cache` score map
+            // is NOT generation-keyed — a rank query after this delete would
+            // serve scores computed over the pre-deletion graph. Invalidate it
+            // (next rank query recomputes via the nw-029 single-flight) and
+            // drop the stale `.pagerank.json` sidecar so a daemon restart
+            // before any query recomputes fresh instead of loading it.
+            state.store.invalidate_pagerank();
+            let pr_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+            let _ = std::fs::remove_file(&pr_path);
+
             if let Some(ref tantivy) = state.tantivy
                 && tantivy.has_writer()
             {
@@ -2075,7 +2101,7 @@ impl NestWeaverDaemon for DaemonService {
             let mut removed_vaults = Vec::new();
 
             // Prune stale repos (local working tree no longer exists on disk).
-            let removed_repos = prune_stale_repos(&state.store)
+            let removed_repos = prune_stale_repos(&state.store, &state.db_path)
                 .map_err(|e| Status::internal(format!("prune stale repos failed: {e:#}")))?;
 
             // Prune stale vaults (root_path no longer exists on disk).
@@ -2099,6 +2125,20 @@ impl NestWeaverDaemon for DaemonService {
             // removal counts so a no-op prune doesn't needlessly invalidate.
             if !removed_repos.is_empty() || !removed_vaults.is_empty() {
                 state.store.bump_and_persist_generation();
+            }
+
+            // nw-055 (P1b): PageRank is `code_only` scope, so only a removed
+            // CODE repo changes surviving nodes' ranks. The generation bump
+            // above does NOT refresh the non-generation-keyed `pagerank_cache`
+            // score map, so invalidate it explicitly (next rank query
+            // recomputes via the nw-029 single-flight) and drop the stale
+            // `.pagerank.json` sidecar so a daemon restart before any query
+            // recomputes fresh instead of loading pre-deletion scores. Guarded
+            // on repo removal — vault-only prunes don't affect code ranks.
+            if !removed_repos.is_empty() {
+                state.store.invalidate_pagerank();
+                let pr_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+                let _ = std::fs::remove_file(&pr_path);
             }
 
             // Reindex Tantivy if anything was removed.
@@ -6576,7 +6616,9 @@ mod startup_helper_tests {
             ))
             .unwrap();
 
-        let removed = prune_stale_repos(&store).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lbug");
+        let removed = prune_stale_repos(&store, &db_path).unwrap();
 
         assert!(
             removed.is_empty(),
@@ -6624,7 +6666,8 @@ mod startup_helper_tests {
             ))
             .unwrap();
 
-        let removed = prune_stale_repos(&store).unwrap();
+        let db_path = tmp.path().join("test.lbug");
+        let removed = prune_stale_repos(&store, &db_path).unwrap();
 
         assert_eq!(removed.len(), 2, "got {removed:?}");
         assert!(store.lookup_repo("repo:kept").unwrap().is_some());
