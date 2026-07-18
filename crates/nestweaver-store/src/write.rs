@@ -2703,8 +2703,10 @@ impl GraphStore {
     /// DB. Useful for recovering from a misconfigured `instance merge`
     /// that left an orphan instance ID behind.
     pub fn purge_instance(&self, id: &str) -> Result<PurgeInstanceResult, StoreError> {
-        let mut result = PurgeInstanceResult::default();
-        result.code_repo_uids = self.list_purge_code_repo_uids(id)?;
+        let mut result = PurgeInstanceResult {
+            code_repo_uids: self.list_purge_code_repo_uids(id)?,
+            ..PurgeInstanceResult::default()
+        };
 
         // Repos owned by this instance — cascade delete every File,
         // Symbol, Service, and Contract that hangs off each one before

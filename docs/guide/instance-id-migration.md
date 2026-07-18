@@ -77,10 +77,9 @@ nestweaver instance merge --from c37ccf01 --to kory-brain   # the repo hash
 nestweaver instance merge --from default  --to kory-brain   # the vault default
 
 # 2. Re-index every repo the merge listed.
-#    Merge re-mints the Repo node under the new instance but does NOT rewrite
-#    its child File/Symbol rows — they keep their old-instance UIDs and a
-#    dangling repo_uid until a forced re-index. Merge prints the exact repos
-#    that need this; run one command per listed repo.
+#    Merge removes each source repo's graph rows. Merge prints the exact repos
+#    that need a forced re-index; re-index recreates their File/Symbol rows
+#    under the target instance. Run one command per listed repo.
 nestweaver index --repo /Users/you/dev/workspaces/acme/acme-server --force
 
 # 3. Refresh the vault and re-materialize projects under the logical name.
@@ -99,8 +98,8 @@ follow-up you must run:
 ```
 Merged 'c37ccf01' -> 'kory-brain': 0 vault(s), 2 repo(s), 0 project(s)
 
-NOTE: repo graph rows (files/symbols) keep their old UIDs until re-indexed.
-Force re-index each repo listed below:
+NOTE: source repo graph rows were removed during merge.
+Force re-index each repo listed below; this recreates them under the target instance:
   /Users/you/dev/workspaces/acme/acme-server
   /Users/you/dev/workspaces/acme/acme-client
   nestweaver index --repo <path> --force

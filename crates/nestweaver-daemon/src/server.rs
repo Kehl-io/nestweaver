@@ -231,6 +231,19 @@ fn build_daemon_permission_source(
     }
 }
 
+/// Resolve the empty RPC sentinel to the daemon's configured graph-data
+/// identity, then validate the effective ID at the trust boundary.
+fn resolve_effective_instance_id(requested: &str, configured: &str) -> Result<String, Status> {
+    let effective = if requested.is_empty() {
+        configured
+    } else {
+        requested
+    };
+    nestweaver_engine::validate_instance_id(effective)
+        .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
+    Ok(effective.to_string())
+}
+
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
 pub struct DaemonService {
     state: Arc<DaemonState>,
@@ -682,6 +695,42 @@ impl DaemonService {
         _store: Arc<nestweaver_store::GraphStore>,
     ) -> Option<Box<dyn Fn() + Send>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod instance_id_validation_tests {
+    use super::*;
+
+    #[test]
+    fn effective_instance_id_uses_request_then_configured_default() {
+        assert_eq!(
+            resolve_effective_instance_id("request-id", "configured-id").unwrap(),
+            "request-id"
+        );
+        assert_eq!(
+            resolve_effective_instance_id("", "configured-id").unwrap(),
+            "configured-id"
+        );
+    }
+
+    #[test]
+    fn effective_instance_id_rejects_every_invalid_source() {
+        for (requested, configured) in [
+            ("", ""),
+            ("a:b", "configured-id"),
+            ("has space", "configured-id"),
+            ("has\ttab", "configured-id"),
+            ("", "configured:bad"),
+            ("", "configured bad"),
+        ] {
+            let error = resolve_effective_instance_id(requested, configured).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(
+                error.message().contains("instance_id"),
+                "requested={requested:?}, configured={configured:?}: {error}"
+            );
+        }
     }
 }
 
@@ -1230,12 +1279,8 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
-        // nw-019: default writes to the config's logical instance, not the hash.
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.data_instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
 
         if !vault_path.exists() || !vault_path.is_dir() {
@@ -1362,12 +1407,8 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
-        // nw-019: default writes to the config's logical instance, not the hash.
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.data_instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
 
         if !repo_path.exists() || !repo_path.is_dir() {
             return Ok(Response::new(WatchCodeResponse {
@@ -1605,6 +1646,8 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let state = self.state.clone();
+        let watch_instance =
+            resolve_effective_instance_id(&req.watch_instance_id, &state.data_instance_id)?;
 
         let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
             state.store.clone(),
@@ -1651,16 +1694,6 @@ impl NestWeaverDaemon for DaemonService {
         if req.watch && !req.watch_repo_path.is_empty() {
             let watch_db = state.db_path.clone();
             let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
-            // nw-046: default to the daemon's logical instance (nw-019
-            // `data_instance_id`), not the literal "default" — otherwise a
-            // config daemon serving UI with --watch stamps symbols "default",
-            // a split-brain vs. how index/watch RPCs store nodes. Empty =
-            // daemon decides, mirroring index_vault/watch_code above.
-            let watch_instance = if req.watch_instance_id.is_empty() {
-                state.data_instance_id.clone()
-            } else {
-                req.watch_instance_id.clone()
-            };
             let watch_store = state.store.clone();
 
             tokio::task::spawn_blocking(move || {
@@ -1713,22 +1746,8 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             Some(req.name.clone())
         };
-        // nw-019: an explicit `--instance` on the request overrides the daemon's
-        // default (config's logical name, else runtime hash); empty = daemon decides.
-        let effective_instance = if req.instance_id.is_empty() {
-            state.data_instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
-        // nw-052 (P2a): validate the effective instance at the RPC boundary
-        // before it's stamped into `repo:<instance>:<hash>` uids. The CLI guards
-        // its own `--instance` flag, but the daemon must not trust ANY client
-        // (a future MCP/other caller could send a colon/whitespace instance and
-        // silently create an ambiguous uid). Reject with an invalid-argument
-        // status rather than sanitize so two instances can't collapse into one.
-        if let Err(e) = nestweaver_engine::validate_instance_id(&effective_instance) {
-            return Err(Status::invalid_argument(format!("{e:#}")));
-        }
+        let effective_instance =
+            resolve_effective_instance_id(&req.instance_id, &state.data_instance_id)?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
@@ -1974,12 +1993,8 @@ impl NestWeaverDaemon for DaemonService {
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
-        // nw-019: default writes to the config's logical instance, not the hash.
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.data_instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -2079,12 +2094,8 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
-        // nw-019: default writes to the config's logical instance, not the hash.
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.data_instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -2347,7 +2358,9 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let req = request.into_inner();
-        if req.from_id == req.to_id {
+        let from_id = resolve_effective_instance_id(&req.from_id, &self.state.data_instance_id)?;
+        let to_id = resolve_effective_instance_id(&req.to_id, &self.state.data_instance_id)?;
+        if from_id == to_id {
             return Err(Status::invalid_argument(
                 "source and target instance IDs must differ",
             ));
@@ -2361,8 +2374,8 @@ impl NestWeaverDaemon for DaemonService {
         let result = tokio::task::spawn_blocking(move || {
             let result = run_merge_instance_with(
                 &state,
-                &req.from_id,
-                &req.to_id,
+                &from_id,
+                &to_id,
                 |store, from_id, to_id| {
                     store
                         .merge_instance_ids(from_id, to_id)
@@ -2403,7 +2416,8 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let req = request.into_inner();
-        let instance_id = req.instance_id.clone();
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);

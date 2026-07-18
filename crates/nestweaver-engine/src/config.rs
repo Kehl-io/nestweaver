@@ -734,8 +734,13 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
 /// instance id makes those uids ambiguous for any consumer that splits on `:`.
 /// We reject rather than sanitize so two configs can't silently collapse into
 /// one instance. Whitespace is likewise rejected as a uid/path troublemaker.
-/// "default" and ordinary names (`a-b_c`, `my.instance`) remain valid.
+/// Empty IDs are rejected because every graph write must have an owning
+/// instance. "default" and ordinary names (`a-b_c`, `my.instance`) remain
+/// valid.
 pub fn validate_instance_id(instance_id: &str) -> Result<(), anyhow::Error> {
+    if instance_id.is_empty() {
+        anyhow::bail!("invalid instance_id: value must not be empty");
+    }
     if let Some(bad) = instance_id.chars().find(|c| *c == ':' || c.is_whitespace()) {
         anyhow::bail!(
             "invalid instance_id {instance_id:?}: character {bad:?} is not allowed \
@@ -1101,18 +1106,20 @@ url = "https://github.com/example/repo"
         assert!(cfg.schema_extensions.is_none());
     }
 
-    // nw-052: a colon in instance_id makes graph uids like
-    // `repo:<instance>:<hash>` ambiguous — config load must reject it.
+    // Configured instance IDs are daemon write defaults, so empty values and
+    // UID-breaking delimiters/whitespace must all be rejected at load time.
     #[test]
-    fn rejects_colon_in_instance_id() {
-        let toml = MINIMAL_TOML.replace("test-instance", "a:b:c");
-        let err = InstanceConfig::from_toml_str(&toml)
-            .expect_err("a colon-containing instance_id must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("instance_id") && msg.contains(':'),
-            "error should mention instance_id and the offending colon, got: {msg}"
-        );
+    fn rejects_invalid_instance_id() {
+        for invalid in ["", "a:b:c", "has space", "has\t tab"] {
+            let toml = MINIMAL_TOML.replace("test-instance", invalid);
+            let err = InstanceConfig::from_toml_str(&toml)
+                .expect_err("invalid instance_id must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("instance_id"),
+                "error should identify instance_id for {invalid:?}, got: {msg}"
+            );
+        }
     }
 
     // nw-052: ordinary names (and "default") must still load fine.
@@ -1123,13 +1130,19 @@ url = "https://github.com/example/repo"
         assert_eq!(cfg.instance_id, "my.instance-01_ok");
     }
 
-    // nw-052: the shared validator rejects colons/whitespace, accepts normal names.
+    // The shared validator rejects empty/colon/whitespace values and accepts
+    // ordinary logical names.
     #[test]
     fn validate_instance_id_rules() {
-        assert!(validate_instance_id("default").is_ok());
-        assert!(validate_instance_id("kory-brain").is_ok());
-        assert!(validate_instance_id("a:b").is_err());
-        assert!(validate_instance_id("has space").is_err());
+        for valid in ["default", "kory-brain", "my.instance-01_ok"] {
+            assert!(validate_instance_id(valid).is_ok(), "valid id: {valid:?}");
+        }
+        for invalid in ["", "a:b", "has space", "has\ttab"] {
+            assert!(
+                validate_instance_id(invalid).is_err(),
+                "invalid id: {invalid:?}"
+            );
+        }
     }
 
     // Bug #19: `--config` should let a command select its DB. The config

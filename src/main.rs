@@ -13711,24 +13711,42 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 for d in &result.discarded_vaults {
                     eprintln!("Note: {d}");
                 }
-                // Re-minting a Repo node under the new instance does NOT rewrite
-                // its child file/symbol/service rows — they keep old-instance
-                // UIDs and a dangling repo_uid until a forced re-index. Tell the
-                // user exactly which repos need it.
                 if !result.repos_needing_reindex.is_empty() {
-                    eprintln!(
-                        "\nNOTE: repo graph rows (files/symbols) keep their old UIDs until re-indexed."
-                    );
-                    eprintln!("Force re-index each repo listed below:");
-                    for repo in &result.repos_needing_reindex {
-                        eprintln!("  {repo}");
-                    }
-                    eprintln!("  nestweaver index --repo <path> --force");
-                    eprintln!("  nestweaver materialize-projects --config <instance.toml>");
+                    eprintln!("{}", merge_reindex_guidance(&result.repos_needing_reindex));
                 }
             }
             Ok(EXIT_SUCCESS)
         }
+    }
+}
+
+fn merge_reindex_guidance(repos: &[String]) -> String {
+    let mut guidance = String::from(
+        "\nNOTE: source repo graph rows were removed during merge.\n\
+         Force re-index each repo listed below; this recreates them under the target instance:\n",
+    );
+    for repo in repos {
+        guidance.push_str("  ");
+        guidance.push_str(repo);
+        guidance.push('\n');
+    }
+    guidance.push_str("  nestweaver index --repo <path> --force\n");
+    guidance.push_str("  nestweaver materialize-projects --config <instance.toml>");
+    guidance
+}
+
+#[cfg(test)]
+mod merge_instance_guidance_tests {
+    use super::*;
+
+    #[test]
+    fn reindex_guidance_describes_removed_then_recreated_graph_rows() {
+        let guidance = merge_reindex_guidance(&["/work/acme".to_string()]);
+
+        assert!(guidance.contains("source repo graph rows were removed"));
+        assert!(guidance.contains("recreates them under the target instance"));
+        assert!(!guidance.contains("keep their old UIDs"));
+        assert!(guidance.contains("/work/acme"));
     }
 }
 
