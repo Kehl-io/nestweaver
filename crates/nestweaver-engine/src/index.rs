@@ -209,9 +209,9 @@ pub fn reconcile_deleted_graph_state(
     store: &GraphStore,
     db_path: &Path,
 ) -> DeletedGraphStateReconciliation {
-    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
-    let manifests_path = crate::sidecar_path(db_path, ".manifests.json");
     let manifests_removed = (|| -> Result<usize, anyhow::Error> {
+        let manifests_path = crate::manifest::manifest_cache_path(db_path);
+        let mut manifests = crate::manifest::load_manifest_cache_for_db(db_path)?;
         if !manifests_path.exists() {
             return Ok(0);
         }
@@ -221,12 +221,11 @@ pub fn reconcile_deleted_graph_state(
             .into_iter()
             .map(|repo| repo.uid)
             .collect();
-        let mut manifests = crate::manifest::load_manifest_cache(&manifests_path)?;
         let before = manifests.len();
         manifests.retain(|uid, _| live_repo_uids.contains(uid));
         let removed = before - manifests.len();
         if removed > 0 {
-            crate::manifest::save_manifest_cache(&manifests, &manifests_path)?;
+            crate::manifest::save_manifest_cache_for_db(&manifests, db_path)?;
         }
         Ok(removed)
     })()
@@ -744,11 +743,9 @@ fn index_directory_with_store_inner(
     }
 
     let manifest = crate::manifest::parse_manifest(&reader);
-    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
-    let cache_path = crate::sidecar_path(db_path, ".manifests.json");
-    let mut cache = crate::manifest::load_manifest_cache(&cache_path).unwrap_or_default();
+    let mut cache = crate::manifest::load_manifest_cache_for_db(db_path).unwrap_or_default();
     cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache(&cache, &cache_path) {
+    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&cache, db_path) {
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
@@ -3246,11 +3243,9 @@ fn full_index_fallback(
 
     // Update the manifest cache sidecar (same as index_directory does).
     let manifest = crate::manifest::parse_manifest(&reader);
-    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
-    let cache_path = crate::sidecar_path(db_path, ".manifests.json");
-    let mut cache = crate::manifest::load_manifest_cache(&cache_path).unwrap_or_default();
+    let mut cache = crate::manifest::load_manifest_cache_for_db(db_path).unwrap_or_default();
     cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache(&cache, &cache_path) {
+    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&cache, db_path) {
         tracing::warn!("failed to save manifest cache: {e}");
     }
 

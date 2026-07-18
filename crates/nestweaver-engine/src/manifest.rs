@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +65,58 @@ pub fn save_manifest_cache(
     path: &Path,
 ) -> Result<(), anyhow::Error> {
     let json = serde_json::to_string(manifests)?;
-    std::fs::write(path, json)?;
+    atomic_replace_file(path, |file| file.write_all(json.as_bytes()))
+}
+
+/// Canonical manifest sidecar path for a database.
+pub fn manifest_cache_path(db_path: &Path) -> PathBuf {
+    crate::sidecar_path(db_path, ".manifests.json")
+}
+
+/// Load the canonical manifest sidecar, migrating the legacy replacement-
+/// extension path when it is the only copy present.
+pub fn load_manifest_cache_for_db(
+    db_path: &Path,
+) -> Result<HashMap<String, ManifestInfo>, anyhow::Error> {
+    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
+    load_manifest_cache(&manifest_cache_path(db_path))
+}
+
+/// Persist the canonical manifest sidecar and retire the legacy copy only
+/// after the replacement has been durably flushed and renamed into place.
+pub fn save_manifest_cache_for_db(
+    manifests: &HashMap<String, ManifestInfo>,
+    db_path: &Path,
+) -> Result<(), anyhow::Error> {
+    let canonical_path = manifest_cache_path(db_path);
+    save_manifest_cache(manifests, &canonical_path)?;
+
+    let legacy_path = db_path.with_extension("manifests.json");
+    if legacy_path != canonical_path
+        && let Err(error) = std::fs::remove_file(&legacy_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(anyhow::anyhow!(
+            "remove legacy manifest sidecar {}: {error}",
+            legacy_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_replace_file(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), anyhow::Error> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    write(temp.as_file_mut())?;
+    temp.as_file_mut().flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -627,6 +679,93 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded["r1"].package_name.as_deref(), Some("my-pkg"));
         assert!(loaded["r1"].dependencies.contains(&"dep-a".to_string()));
+    }
+
+    #[test]
+    fn save_manifest_cache_replaces_the_sidecar_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("brain.lbug.manifests.json");
+        let old_link = dir.path().join("old-manifests.json");
+        let old = HashMap::from([(
+            "repo:old".to_string(),
+            ManifestInfo {
+                package_name: Some("old-package".to_string()),
+                dependencies: Vec::new(),
+                entry_files: Vec::new(),
+            },
+        )]);
+        save_manifest_cache(&old, &cache_path).unwrap();
+        std::fs::hard_link(&cache_path, &old_link).unwrap();
+
+        let new = HashMap::from([(
+            "repo:new".to_string(),
+            ManifestInfo {
+                package_name: Some("new-package".to_string()),
+                dependencies: Vec::new(),
+                entry_files: Vec::new(),
+            },
+        )]);
+        save_manifest_cache(&new, &cache_path).unwrap();
+
+        assert_eq!(load_manifest_cache(&cache_path).unwrap().len(), 1);
+        assert!(
+            load_manifest_cache(&cache_path)
+                .unwrap()
+                .contains_key("repo:new")
+        );
+        assert_eq!(load_manifest_cache(&old_link).unwrap().len(), 1);
+        assert!(
+            load_manifest_cache(&old_link)
+                .unwrap()
+                .contains_key("repo:old")
+        );
+    }
+
+    #[test]
+    fn manifest_atomic_replace_cleans_partial_temp_after_write_error() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("brain.lbug.manifests.json");
+        std::fs::write(&cache_path, b"previous-valid-sidecar").unwrap();
+
+        let error = atomic_replace_file(&cache_path, |file| {
+            file.write_all(b"partial replacement")?;
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected write failure"));
+        assert_eq!(
+            std::fs::read(&cache_path).unwrap(),
+            b"previous-valid-sidecar"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_manifest_cache_for_db_retires_legacy_only_after_canonical_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let legacy_path = db_path.with_extension("manifests.json");
+        std::fs::write(&legacy_path, r#"{"repo:legacy":{}}"#).unwrap();
+        let manifests = HashMap::from([("repo:canonical".to_string(), ManifestInfo::default())]);
+
+        save_manifest_cache_for_db(&manifests, &db_path).unwrap();
+
+        assert!(!legacy_path.exists());
+        assert!(
+            load_manifest_cache(&manifest_cache_path(&db_path))
+                .unwrap()
+                .contains_key("repo:canonical")
+        );
+
+        std::fs::write(&legacy_path, r#"{"repo:still-safe":{}}"#).unwrap();
+        std::fs::remove_file(manifest_cache_path(&db_path)).unwrap();
+        std::fs::create_dir(manifest_cache_path(&db_path)).unwrap();
+        let error = save_manifest_cache_for_db(&manifests, &db_path).unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert!(legacy_path.exists(), "failed canonical save removed legacy");
     }
 
     #[test]

@@ -210,7 +210,10 @@ pub use investigate::{
     NeighborRef, bundle_sidecar_path, investigate, investigate_expand, investigate_hydrate,
     load_bundle, load_bundle_store, save_bundle_store,
 };
-pub use manifest::{ManifestInfo, load_manifest_cache, parse_manifest, save_manifest_cache};
+pub use manifest::{
+    ManifestInfo, load_manifest_cache, load_manifest_cache_for_db, manifest_cache_path,
+    parse_manifest, save_manifest_cache, save_manifest_cache_for_db,
+};
 pub use process::{
     AffectedProcess, AffectedSymbol, ChangeImpact, ProcessMember, ProcessResult, RiskLevel,
     detect_changes_impact, trace_processes,

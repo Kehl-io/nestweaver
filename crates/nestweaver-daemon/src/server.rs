@@ -877,6 +877,20 @@ fn finalize_code_graph_deletion(state: &DaemonState, repo_uids: &[String]) {
     );
 }
 
+fn finalize_node_graph_deletion(state: &DaemonState, operation: &str) {
+    match state.store.reconcile_embedding_index() {
+        Ok(removed) => {
+            tracing::info!(removed, operation, "reconciled deleted node embeddings")
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            operation,
+            "failed to reconcile deleted node embeddings (non-fatal)"
+        ),
+    }
+    state.store.bump_and_persist_generation();
+}
+
 fn run_remove_repo_with<C, D>(
     state: &DaemonState,
     repo_uid: &str,
@@ -967,7 +981,7 @@ where
     if !removed_repos.is_empty() {
         finalize_code_graph_deletion(state, &removed_repos.uids);
     } else if changed {
-        state.store.bump_and_persist_generation();
+        finalize_node_graph_deletion(state, "prune_stale");
     }
     if changed {
         reconcile_search(state, "prune_stale");
@@ -1012,7 +1026,7 @@ where
             if code_changed {
                 finalize_code_graph_deletion(state, &repo_uids);
             } else if changed {
-                state.store.bump_and_persist_generation();
+                finalize_node_graph_deletion(state, "purge_instance");
             }
             if changed {
                 reconcile_search(state, "purge_instance");
@@ -1025,7 +1039,7 @@ where
             // when preflight found code that may have changed; vault/project-
             // only failures still need generation and search reconciliation.
             if repo_uids.is_empty() {
-                state.store.bump_and_persist_generation();
+                finalize_node_graph_deletion(state, "purge_instance_error");
             } else {
                 finalize_code_graph_deletion(state, &repo_uids);
             }
@@ -1071,7 +1085,7 @@ where
             if !result.repo_uids_removed.is_empty() {
                 finalize_code_graph_deletion(state, &result.repo_uids_removed);
             } else if changed {
-                state.store.bump_and_persist_generation();
+                finalize_node_graph_deletion(state, "merge_instance");
             }
             if changed {
                 reconcile_search(state, "merge_instance");
@@ -1084,7 +1098,7 @@ where
             // code may have changed; otherwise preserve PageRank while still
             // invalidating graph caches and rebuilding note search.
             if repo_uids.is_empty() {
-                state.store.bump_and_persist_generation();
+                finalize_node_graph_deletion(state, "merge_instance_error");
             } else {
                 finalize_code_graph_deletion(state, &repo_uids);
             }
@@ -2200,7 +2214,7 @@ impl NestWeaverDaemon for DaemonService {
             // and `index`). Without this a query primed before the removal keeps
             // satisfying subsequent lookups out of the stale cache and returns the
             // just-deleted notes.
-            state.store.bump_and_persist_generation();
+            finalize_node_graph_deletion(&state, "remove_vault");
 
             if let Some(ref tantivy) = state.tantivy
                 && tantivy.has_writer()
@@ -6838,6 +6852,234 @@ mod startup_helper_tests {
         assert!(state.store.add_embedding(&symbol_uid, vec![1.0, 0.0]));
         state.store.flush_embedding_index().unwrap();
         symbol_uid
+    }
+
+    fn seed_vault_note_heading_embeddings(
+        state: &DaemonState,
+        vault_uid: &str,
+        instance_id: &str,
+        root_path: &str,
+    ) -> (String, String) {
+        use nestweaver_schema::{Heading, Note, NoteKind, Vault};
+
+        state
+            .store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: format!("vault-{vault_uid}"),
+                root_path: root_path.to_string(),
+                instance_id: instance_id.to_string(),
+            })
+            .unwrap();
+        let note_uid = format!("note:{vault_uid}");
+        state
+            .store
+            .insert_note(&Note {
+                uid: note_uid.clone(),
+                vault_uid: vault_uid.to_string(),
+                file_path: "note.md".to_string(),
+                title: format!("Note {vault_uid}"),
+                note_kind: NoteKind::General,
+                word_count: 3,
+                content_hash: format!("hash:{note_uid}"),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        state
+            .store
+            .insert_vault_note_edge(vault_uid, &note_uid)
+            .unwrap();
+        let heading_uid = format!("head:{vault_uid}");
+        state
+            .store
+            .insert_heading(&Heading {
+                uid: heading_uid.clone(),
+                note_uid: note_uid.clone(),
+                level: 1,
+                text: "Heading".to_string(),
+                slug: "heading".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: format!("hash:{heading_uid}"),
+                embedding: None,
+            })
+            .unwrap();
+        state
+            .store
+            .batch_insert_note_heading_edges(&[(&note_uid, &heading_uid)])
+            .unwrap();
+        assert!(state.store.add_embedding(&note_uid, vec![1.0, 0.0]));
+        assert!(state.store.add_embedding(&heading_uid, vec![0.0, 1.0]));
+        state.store.flush_embedding_index().unwrap();
+        (note_uid, heading_uid)
+    }
+
+    fn assert_embeddings_absent(state: &DaemonState, uids: &[&str]) {
+        for uid in uids {
+            assert!(
+                !state.store.has_embedding(uid),
+                "stale embedding survived for {uid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_vault_prunes_note_and_heading_embeddings() {
+        let state = test_state_with_writer();
+        let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:remove:docs",
+            "remove",
+            "/missing/remove-docs",
+        );
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(RemoveVaultRequest {
+            vault_uid: "vlt:remove:docs".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        service.remove_vault(request).await.unwrap();
+
+        assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn prune_stale_vault_prunes_note_and_heading_embeddings() {
+        let state = test_state_with_writer();
+        let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:prune:docs",
+            "prune",
+            "/definitely/missing/prune-docs",
+        );
+
+        let result = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _operation| {},
+        )
+        .unwrap();
+
+        assert_eq!(result.removed_vaults.len(), 1);
+        assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn purge_vault_only_instance_prunes_note_and_heading_embeddings() {
+        let state = test_state_with_writer();
+        let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:purge:docs",
+            "purge-source",
+            "/missing/purge-docs",
+        );
+
+        let result = run_purge_instance_with(
+            &state,
+            "purge-source",
+            |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
+            |_state, _operation| {},
+        )
+        .unwrap();
+
+        assert_eq!(result.vaults, 1);
+        assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn merge_vault_collision_prunes_discarded_note_and_heading_embeddings() {
+        let state = test_state_with_writer();
+        let root_path = "/shared/merge-docs";
+        let (source_note, source_heading) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:merge:source",
+            "merge-source",
+            root_path,
+        );
+        let (target_note, target_heading) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:merge:target",
+            "merge-target",
+            root_path,
+        );
+
+        let result = run_merge_instance_with(
+            &state,
+            "merge-source",
+            "merge-target",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _operation| {},
+        )
+        .unwrap();
+
+        assert_eq!(result.discarded.len(), 1);
+        assert_embeddings_absent(&state, &[&source_note, &source_heading]);
+        assert!(state.store.has_embedding(&target_note));
+        assert!(state.store.has_embedding(&target_heading));
+    }
+
+    #[test]
+    fn actual_repo_merge_collision_reconciles_source_and_destination_state() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let state = test_state_with_writer();
+        let url = "https://example.test/merge-collision";
+        let source_uid = repo_uid("merge-old", url);
+        let target_uid = repo_uid("merge-new", url);
+        let mut source = test_repo(&source_uid, url, None);
+        source.instance_id = "merge-old".to_string();
+        let mut target = test_repo(&target_uid, url, None);
+        target.instance_id = "merge-new".to_string();
+        state.store.insert_repo(&source).unwrap();
+        state.store.insert_repo(&target).unwrap();
+        let source_symbol = seed_manifest_and_embedding(&state, &source_uid, "source-package");
+        let target_symbol = seed_manifest_and_embedding(&state, &target_uid, "target-package");
+
+        let result = run_merge_instance_with(
+            &state,
+            "merge-old",
+            "merge-new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _operation| {},
+        )
+        .unwrap();
+
+        assert_eq!(result.repo_uids_removed, vec![source_uid.clone()]);
+        let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.db_path).unwrap();
+        assert!(!manifests.contains_key(&source_uid));
+        assert_eq!(
+            manifests[&target_uid].package_name.as_deref(),
+            Some("target-package")
+        );
+        assert!(!state.store.has_embedding(&source_symbol));
+        assert!(state.store.has_embedding(&target_symbol));
+        assert_eq!(
+            state
+                .store
+                .lookup_repo(&target_uid)
+                .unwrap()
+                .unwrap()
+                .indexed_sha,
+            target.indexed_sha
+        );
     }
 
     #[tokio::test]

@@ -21,9 +21,9 @@ use nestweaver_engine::{
     generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
     incremental_index_with_name, index_directory_with_options,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
-    lookup_symbol, record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar,
-    save_summaries, search_symbols, suggest_links, truncate_to_budget,
+    list_services, load_alias_sidecar, load_clusters, load_extensions, lookup_symbol,
+    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -4380,8 +4380,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
             let store = open_store(Some(db_path))?;
-            let cache_path = db_path.with_extension("manifests.json");
-            let manifests = load_manifest_cache(&cache_path).unwrap_or_default();
+            let manifests =
+                nestweaver_engine::load_manifest_cache_for_db(db_path).unwrap_or_default();
             let suggestions = suggest_links(&store, &manifests)?;
 
             if json {
@@ -5227,9 +5227,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Load manifest sidecar for manifest-driven entry points.
             let db_path = db.clone().unwrap_or_else(default_db_path);
-            let manifest_cache_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
             let manifests =
-                nestweaver_engine::load_manifest_cache(&manifest_cache_path).unwrap_or_default();
+                nestweaver_engine::load_manifest_cache_for_db(&db_path).unwrap_or_default();
 
             let result = nestweaver_engine::detect_dead_code_with_manifests(&store, &manifests)?;
 
@@ -10673,7 +10672,7 @@ fn run_brain(
             }
 
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
-            let manifests_path = db_path.with_extension("manifests.json");
+            let manifests_path = nestweaver_engine::manifest_cache_path(&db_path);
             let wiki_instance_id = instance_id.clone();
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
                 .with_tantivy_index(&tantivy_sidecar)

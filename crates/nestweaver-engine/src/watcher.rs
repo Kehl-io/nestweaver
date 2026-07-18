@@ -434,11 +434,22 @@ impl BrainWatcher {
                 );
                 // Load the existing cache, update this repo's entry, and save.
                 let repo_key = repo_path.to_string_lossy().into_owned();
-                match crate::manifest::load_manifest_cache(manifests_path) {
+                let canonical_manifests_path = crate::manifest::manifest_cache_path(&self.db_path);
+                let uses_canonical_path = manifests_path == &canonical_manifests_path;
+                let loaded = if uses_canonical_path {
+                    crate::manifest::load_manifest_cache_for_db(&self.db_path)
+                } else {
+                    crate::manifest::load_manifest_cache(manifests_path)
+                };
+                match loaded {
                     Ok(mut cache) => {
                         cache.insert(repo_key.clone(), manifest);
-                        if let Err(e) = crate::manifest::save_manifest_cache(&cache, manifests_path)
-                        {
+                        let saved = if uses_canonical_path {
+                            crate::manifest::save_manifest_cache_for_db(&cache, &self.db_path)
+                        } else {
+                            crate::manifest::save_manifest_cache(&cache, manifests_path)
+                        };
+                        if let Err(e) = saved {
                             tracing::warn!(
                                 "watcher: failed to save manifest cache after {}: {e}",
                                 path.display()
@@ -1010,6 +1021,43 @@ mod tests {
             fs::write(&p, content).unwrap();
         }
         (dir, root)
+    }
+
+    #[test]
+    fn canonical_manifest_watch_update_retires_legacy_sidecar() {
+        let (_dir, root) = make_vault(&[(
+            "package.json",
+            r#"{"name":"watched-package","dependencies":{"watched-dep":"1"}}"#,
+        )]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let legacy_path = db_path.with_extension("manifests.json");
+        crate::save_manifest_cache(&HashMap::new(), &legacy_path).unwrap();
+        let canonical_path = crate::manifest_cache_path(&db_path);
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_manifests_path(&canonical_path);
+
+        watcher
+            .handle_event(
+                &store,
+                None,
+                "vlt:test",
+                DebouncedEvent::new(root.join("package.json"), DebouncedEventKind::Any),
+                None,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+            )
+            .unwrap();
+
+        assert!(canonical_path.exists());
+        assert!(!legacy_path.exists());
+        let manifests = crate::load_manifest_cache_for_db(&db_path).unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            manifests.values().next().unwrap().package_name.as_deref(),
+            Some("watched-package")
+        );
     }
 
     #[test]

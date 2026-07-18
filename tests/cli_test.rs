@@ -42,6 +42,60 @@ fn cli_help_lists_commands() {
 }
 
 #[test]
+fn standalone_suggest_links_reads_canonical_manifest_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("brain.lbug");
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    for (uid, url) in [
+        ("repo:test:app", "https://example.test/app"),
+        ("repo:test:dependency", "https://example.test/dependency"),
+    ] {
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.to_string(),
+                url: url.to_string(),
+                indexed_sha: "sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+    }
+    let manifests = std::collections::HashMap::from([
+        (
+            "repo:test:app".to_string(),
+            nestweaver_engine::ManifestInfo {
+                package_name: Some("app-package".to_string()),
+                dependencies: vec!["dependency-package".to_string()],
+                entry_files: Vec::new(),
+            },
+        ),
+        (
+            "repo:test:dependency".to_string(),
+            nestweaver_engine::ManifestInfo {
+                package_name: Some("dependency-package".to_string()),
+                dependencies: Vec::new(),
+                entry_files: Vec::new(),
+            },
+        ),
+    ]);
+    nestweaver_engine::save_manifest_cache_for_db(&manifests, &db_path).unwrap();
+    drop(store);
+
+    nestweaver_cmd()
+        .args([
+            "suggest-links",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Depends on dependency-package (from manifest)"));
+}
+
+#[test]
 fn cli_index_and_search() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
