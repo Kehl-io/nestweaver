@@ -3548,8 +3548,8 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
-            let cache_path = nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json");
-            let manifests = nestweaver_engine::load_manifest_cache(&cache_path).unwrap_or_default();
+            let manifests =
+                nestweaver_engine::load_manifest_cache_for_db(&state.db_path).unwrap_or_default();
             let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
                 .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
             serde_json::to_string(&suggestions)
@@ -7126,6 +7126,57 @@ mod startup_helper_tests {
         assert!(suggestions["links"].as_array().unwrap().iter().any(|link| {
             link["description"] == "Depends on dependency-package (from manifest)"
         }));
+    }
+
+    #[tokio::test]
+    async fn suggest_links_migrates_and_reads_a_legacy_only_manifest_sidecar() {
+        let state = test_state_with_writer();
+        for (uid, url) in [
+            ("repo:test:legacy-app", "https://example.test/legacy-app"),
+            (
+                "repo:test:legacy-dependency",
+                "https://example.test/legacy-dependency",
+            ),
+        ] {
+            state.store.insert_repo(&test_repo(uid, url, None)).unwrap();
+        }
+        let manifests = std::collections::HashMap::from([
+            (
+                "repo:test:legacy-app".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("legacy-app-package".to_string()),
+                    dependencies: vec!["legacy-dependency-package".to_string()],
+                    entry_files: Vec::new(),
+                },
+            ),
+            (
+                "repo:test:legacy-dependency".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("legacy-dependency-package".to_string()),
+                    dependencies: Vec::new(),
+                    entry_files: Vec::new(),
+                },
+            ),
+        ]);
+        let legacy_path = state.db_path.with_extension("manifests.json");
+        let canonical_path = nestweaver_engine::manifest_cache_path(&state.db_path);
+        nestweaver_engine::save_manifest_cache(&manifests, &legacy_path).unwrap();
+        assert!(!canonical_path.exists());
+
+        let response = DaemonService::new(state)
+            .suggest_links_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let suggestions: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+        assert!(suggestions["links"].as_array().unwrap().iter().any(|link| {
+            link["description"] == "Depends on legacy-dependency-package (from manifest)"
+        }));
+        assert!(canonical_path.exists());
+        assert!(!legacy_path.exists());
     }
 
     /// DATA-LOSS REGRESSION GUARD: `prune_stale_repos` must NEVER delete a
