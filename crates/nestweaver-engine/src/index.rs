@@ -1426,7 +1426,9 @@ where
             url = repo_url,
             "repo re-identified under its origin remote; pruning old file:// node by uid"
         );
-        delete_repo_all_data(store, old_uid).context("delete_repo_all_data (re-identify prune)")?;
+        let (deleted_files, _) = delete_repo_all_data(store, old_uid)
+            .context("delete_repo_all_data (re-identify prune)")?;
+        files_deleted += deleted_files;
     }
 
     // Insert the Repo node if it doesn't exist yet. The target SHA is recorded
@@ -1465,7 +1467,14 @@ where
     //     from seeing zero symbols while the CPU-heavy service-grouping work
     //     runs between delete and insert.
     let force_reindex = existing_repo.is_some() && files_unchanged == 0;
-    if existing_repo.is_some() && !force_reindex {
+    if force_reindex {
+        if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
+            files_deleted += stored_files
+                .iter()
+                .filter(|(_, path)| !present_files.contains(path))
+                .count();
+        }
+    } else if existing_repo.is_some() {
         // Incremental: only delete the specific files we're about to re-insert.
         for file in &all_files {
             // Remove old symbols belonging to this file.
@@ -2140,6 +2149,7 @@ pub fn incremental_index_with_name(
                 repo_url,
                 "local",
                 name,
+                (0, 0),
             );
         }
     };
@@ -2156,6 +2166,7 @@ pub fn incremental_index_with_name(
                 repo_url,
                 &new_sha,
                 name,
+                (0, 0),
             );
         }
         Some(r) => r.indexed_sha,
@@ -2169,7 +2180,7 @@ pub fn incremental_index_with_name(
             "old SHA is not an ancestor of HEAD; falling back to full re-index"
         );
         // Delete all existing repo data before full re-index.
-        delete_repo_all_data(&store, &r_uid)
+        let deleted = delete_repo_all_data(&store, &r_uid)
             .with_context(|| "delete_repo_all_data before full re-index")?;
         return full_index_fallback(
             repo_path,
@@ -2179,6 +2190,7 @@ pub fn incremental_index_with_name(
             repo_url,
             &new_sha,
             name,
+            deleted,
         );
     }
 
@@ -2983,7 +2995,7 @@ pub(crate) fn reidentified_legacy_uid(
 pub(crate) fn delete_repo_all_data(
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
-) -> Result<(), anyhow::Error> {
+) -> Result<(usize, usize), anyhow::Error> {
     let (file_count, sym_count) = store
         .bulk_delete_repo_files_and_symbols(r_uid)
         .with_context(|| "bulk_delete_repo_files_and_symbols")?;
@@ -3002,7 +3014,7 @@ pub(crate) fn delete_repo_all_data(
         .delete_repo_node(r_uid)
         .with_context(|| "delete_repo_node")?;
 
-    Ok(())
+    Ok((file_count, sym_count))
 }
 
 /// Full index fallback — uses the already-open store to avoid double-
@@ -3015,6 +3027,7 @@ fn full_index_fallback(
     repo_url: &str,
     new_sha: &str,
     name: Option<&str>,
+    predeleted: (usize, usize),
 ) -> Result<IncrementalResult, anyhow::Error> {
     // Load filemeta sidecar for tiered change detection even in fallback.
     // Only this repo's slice feeds change detection — another repo's entry
@@ -3040,7 +3053,7 @@ fn full_index_fallback(
     // nw-022: capture a re-identified legacy file:// uid so its filemeta
     // slice is dropped below, mirroring index_directory_with_store_inner.
     let mut reidentified_old_uid: Option<String> = None;
-    let result = index_into_store_with_write_gate(
+    let mut result = index_into_store_with_write_gate(
         &reader,
         store,
         instance_id,
@@ -3057,6 +3070,7 @@ fn full_index_fallback(
         None,
         || Ok::<(), anyhow::Error>(()),
     )?;
+    result.files_deleted += predeleted.0;
 
     // Merge this repo's fresh entries into the shared sidecar (preserving
     // other repos' slices) and evict parse/resolution cache entries using the
@@ -3122,6 +3136,8 @@ fn full_index_fallback(
     Ok(IncrementalResult {
         fell_back_to_full: true,
         symbols_added: result.symbols_count,
+        files_deleted: result.files_deleted,
+        symbols_removed: predeleted.1,
         ..Default::default()
     })
 }
@@ -3841,6 +3857,190 @@ function hello(name) { return "Hello " + name; }
     }
 
     // ── Tiered change detection tests ─────────────────────────────────────
+
+    #[test]
+    fn deleting_last_parseable_file_refreshes_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed_repo = dir.path().join("removed-repo");
+        let surviving_repo = dir.path().join("surviving-repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&removed_repo).unwrap();
+        fs::create_dir_all(&surviving_repo).unwrap();
+        let removed_file = removed_repo.join("removed.js");
+        fs::write(&removed_file, "function removed() { return 1; }").unwrap();
+        fs::write(
+            surviving_repo.join("survivor.js"),
+            "function survivor() { return 2; }",
+        )
+        .unwrap();
+
+        index_directory(
+            &removed_repo,
+            &db_path,
+            "test",
+            "https://example.com/removed",
+            "abc123",
+        )
+        .unwrap();
+        index_directory(
+            &surviving_repo,
+            &db_path,
+            "test",
+            "https://example.com/surviving",
+            "abc123",
+        )
+        .unwrap();
+
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let pagerank_before: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        fs::remove_file(&removed_file).unwrap();
+
+        let result = index_directory(
+            &removed_repo,
+            &db_path,
+            "test",
+            "https://example.com/removed",
+            "abc123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files_deleted, 1,
+            "the force-reindex path must report deletion of the repo's last parseable file"
+        );
+        let pagerank_after: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            pagerank_after.len() < pagerank_before.len(),
+            "PageRank sidecar must drop the deleted repo's symbols"
+        );
+    }
+
+    #[test]
+    fn reidentify_delete_only_refreshes_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed_repo = dir.path().join("removed-repo");
+        let surviving_repo = dir.path().join("surviving-repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&removed_repo).unwrap();
+        fs::create_dir_all(&surviving_repo).unwrap();
+        let removed_file = removed_repo.join("removed.js");
+        fs::write(&removed_file, "function removed() { return 1; }").unwrap();
+        fs::write(
+            surviving_repo.join("survivor.js"),
+            "function survivor() { return 2; }",
+        )
+        .unwrap();
+
+        let local_url = format!("file://{}", removed_repo.display());
+        index_directory(&removed_repo, &db_path, "test", &local_url, "abc123").unwrap();
+        index_directory(
+            &surviving_repo,
+            &db_path,
+            "test",
+            "https://example.com/surviving",
+            "abc123",
+        )
+        .unwrap();
+
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let pagerank_before: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        fs::remove_file(&removed_file).unwrap();
+
+        let result = index_directory(
+            &removed_repo,
+            &db_path,
+            "test",
+            "https://example.com/reidentified",
+            "abc123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files_deleted, 1,
+            "re-identification must report files deleted with the old repo uid"
+        );
+        let pagerank_after: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            pagerank_after.len() < pagerank_before.len(),
+            "PageRank sidecar must drop symbols deleted during re-identification"
+        );
+    }
+
+    #[test]
+    fn non_ancestor_delete_only_fallback_refreshes_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed_repo = dir.path().join("removed-repo");
+        let surviving_repo = dir.path().join("surviving-repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&removed_repo).unwrap();
+        fs::create_dir_all(&surviving_repo).unwrap();
+        fs::write(
+            removed_repo.join("removed.js"),
+            "function removed() { return 1; }",
+        )
+        .unwrap();
+        fs::write(
+            surviving_repo.join("survivor.js"),
+            "function survivor() { return 2; }",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&removed_repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "removed.js"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+
+        let repo_url = "https://example.com/removed";
+        index_directory(&removed_repo, &db_path, "test", repo_url, &old_sha).unwrap();
+        index_directory(
+            &surviving_repo,
+            &db_path,
+            "test",
+            "https://example.com/surviving",
+            "abc123",
+        )
+        .unwrap();
+
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let pagerank_before: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        fs::remove_file(removed_repo.join("removed.js")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--amend", "--no-edit", "--allow-empty", "-q"]);
+
+        let result = incremental_index(&removed_repo, &db_path, "test", repo_url).unwrap();
+
+        assert!(result.fell_back_to_full);
+        assert_eq!(
+            result.files_deleted, 1,
+            "non-ancestor fallback must report files deleted before the full index"
+        );
+        let pagerank_after: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            pagerank_after.len() < pagerank_before.len(),
+            "PageRank sidecar must drop symbols deleted before non-ancestor fallback"
+        );
+    }
 
     #[test]
     fn tiered_check_new_file_returns_changed() {

@@ -44,7 +44,8 @@ pub struct GraphStore {
     pub(crate) pagerank_generation: AtomicU64,
     /// Serializes the lazy PageRank compute in `ensure_pagerank_loaded` so N
     /// concurrent first-touch callers produce exactly one compute instead of
-    /// N duplicate full computes (nw-029). Only taken when the cache is empty.
+    /// N duplicate full computes (nw-029). Invalidation also takes this lock so
+    /// an older in-flight lazy compute cannot republish stale scores afterward.
     pub(crate) pagerank_compute_lock: Mutex<()>,
     /// Monotonic counter that bumps whenever the graph data changes (nodes
     /// or edges added/removed). Lets the web UI and other consumers detect
@@ -304,6 +305,10 @@ impl GraphStore {
     /// next `ensure_pagerank_loaded` recomputes via the nw-029 single-flight.
     /// Lazy (recompute on next rank query) rather than eager, matching nw-029.
     pub fn invalidate_pagerank(&self) {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *self
             .pagerank_cache
             .lock()

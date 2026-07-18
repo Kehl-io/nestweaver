@@ -563,6 +563,11 @@ impl GraphStore {
         let (uids, _uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, None)?;
         let n = uids.len();
         if n == 0 {
+            *self
+                .pagerank_cache
+                .lock()
+                .map_err(|e| StoreError::Query(format!("lock: {e}")))? = Some(HashMap::new());
+            self.bump_pagerank_generation();
             return Ok(());
         }
 
@@ -1071,8 +1076,9 @@ impl GraphStore {
         }
         // Single-flight (nw-029): late arrivals block here while the first
         // caller computes, then hit the double-check below and return without
-        // recomputing. The compute lock is only ever taken in this method, and
-        // only when the cache is empty, so explicit recomputes are unaffected.
+        // recomputing. Invalidation takes the same lock before clearing the
+        // cache so an in-flight lazy compute cannot restore stale scores.
+        // Explicit recomputes are unaffected.
         let _flight = match self.pagerank_compute_lock.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -1267,6 +1273,70 @@ mod tests {
                 && scores_after.contains_key("B")
                 && scores_after.contains_key("C"),
             "surviving repo-1 symbols must still be ranked"
+        );
+    }
+
+    #[test]
+    fn invalidate_pagerank_waits_for_in_flight_lazy_compute() {
+        let store = std::sync::Arc::new(test_store());
+        let (compute_started_tx, compute_started_rx) = std::sync::mpsc::channel();
+        let (release_compute_tx, release_compute_rx) = std::sync::mpsc::channel();
+
+        let computing_store = store.clone();
+        let compute = std::thread::spawn(move || {
+            let _flight = computing_store.pagerank_compute_lock.lock().unwrap();
+            compute_started_tx.send(()).unwrap();
+            release_compute_rx.recv().unwrap();
+        });
+        compute_started_rx.recv().unwrap();
+
+        let (invalidate_started_tx, invalidate_started_rx) = std::sync::mpsc::channel();
+        let (invalidate_done_tx, invalidate_done_rx) = std::sync::mpsc::channel();
+        let invalidating_store = store.clone();
+        let invalidation = std::thread::spawn(move || {
+            invalidate_started_tx.send(()).unwrap();
+            invalidating_store.invalidate_pagerank();
+            invalidate_done_tx.send(()).unwrap();
+        });
+        invalidate_started_rx.recv().unwrap();
+
+        assert!(
+            invalidate_done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "invalidation must not complete while a lazy PageRank compute can still publish scores"
+        );
+
+        release_compute_tx.send(()).unwrap();
+        compute.join().unwrap();
+        invalidate_done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("invalidation should complete after the compute flight is released");
+        invalidation.join().unwrap();
+    }
+
+    #[test]
+    fn compute_pagerank_clears_scores_when_graph_becomes_empty() {
+        let store = test_store();
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        assert!(store.pagerank_scores().contains_key("A"));
+
+        assert_eq!(
+            store
+                .delete_symbols_in_file("repo-1", "src/lib.rs")
+                .unwrap(),
+            1
+        );
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+
+        assert!(
+            store.pagerank_scores().is_empty(),
+            "an empty graph must replace previously cached scores with an empty cache"
         );
     }
 
