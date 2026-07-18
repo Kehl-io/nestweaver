@@ -938,11 +938,63 @@ where
         }
         Err(error) => {
             // `purge_instance` is intentionally non-transactional. A late
-            // error can follow committed repo deletions, so reconcile every
-            // cache and persisted sidecar before surfacing the original error.
-            finalize_code_graph_deletion(state, &repo_uids);
+            // error can follow committed deletions. Invalidate PageRank only
+            // when preflight found code that may have changed; vault/project-
+            // only failures still need generation and search reconciliation.
+            if repo_uids.is_empty() {
+                state.store.bump_and_persist_generation();
+            } else {
+                finalize_code_graph_deletion(state, &repo_uids);
+            }
             reconcile_search(state, "purge_instance_error");
             Err(Status::internal(format!("PurgeInstance failed: {error:#}")))
+        }
+    }
+}
+
+fn run_merge_instance_with<F, R>(
+    state: &DaemonState,
+    from_id: &str,
+    to_id: &str,
+    merge: F,
+    mut reconcile_search: R,
+) -> Result<nestweaver_store::MergeResult, Status>
+where
+    F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
+    R: FnMut(&DaemonState, &str),
+{
+    let repo_uids = state
+        .store
+        .list_purge_code_repo_uids(from_id)
+        .map_err(|e| Status::internal(format!("merge failed to list code repos: {e:#}")))?;
+
+    match merge(&state.store, from_id, to_id) {
+        Ok(result) => {
+            let changed = result.vaults > 0 || result.repos > 0 || result.projects > 0;
+            if !result.repo_uids_removed.is_empty() {
+                finalize_code_graph_deletion(state, &result.repo_uids_removed);
+            } else if changed {
+                state.store.bump_and_persist_generation();
+            }
+            if changed {
+                reconcile_search(state, "merge_instance");
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            // Instance merge is multi-statement and can commit earlier source
+            // entries before a later one fails. Preflight tells us whether
+            // code may have changed; otherwise preserve PageRank while still
+            // invalidating graph caches and rebuilding note search.
+            if repo_uids.is_empty() {
+                state.store.bump_and_persist_generation();
+            } else {
+                finalize_code_graph_deletion(state, &repo_uids);
+            }
+            reconcile_search(state, "merge_instance_error");
+            Err(Status::internal(format!(
+                "merge_instance_ids failed: {error:#}"
+            )))
         }
     }
 }
@@ -2279,29 +2331,17 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let result = state
-                .store
-                .merge_instance_ids(&req.from_id, &req.to_id)
-                .map_err(|e| Status::internal(format!("merge_instance_ids failed: {e:#}")))?;
-
-            let changed = result.vaults > 0 || result.repos > 0 || result.projects > 0;
-            if !result.repo_uids_removed.is_empty() {
-                finalize_code_graph_deletion(&state, &result.repo_uids_removed);
-            } else if changed {
-                state.store.bump_and_persist_generation();
-            }
-
-            if changed
-                && let Some(ref tantivy) = state.tantivy
-                && tantivy.has_writer()
-            {
-                match tantivy.reindex_from_store(&state.store) {
-                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after instance merge"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tantivy reindex failed after instance merge")
-                    }
-                }
-            }
+            let result = run_merge_instance_with(
+                &state,
+                &req.from_id,
+                &req.to_id,
+                |store, from_id, to_id| {
+                    store
+                        .merge_instance_ids(from_id, to_id)
+                        .map_err(|e| anyhow::anyhow!("{e:#}"))
+                },
+                rebuild_tantivy_after_mutation,
+            )?;
 
             let discarded_vaults = result
                 .discarded
@@ -6906,6 +6946,118 @@ mod startup_helper_tests {
         );
         assert!(state.store.graph_generation() > generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+    }
+
+    #[test]
+    fn merge_failure_finalizes_partial_repo_deletion() {
+        let state = test_state_with_writer();
+        for suffix in ["first", "second"] {
+            let mut repo = test_repo(
+                &format!("repo:old:{suffix}"),
+                &format!("https://example.test/{suffix}"),
+                None,
+            );
+            repo.instance_id = "old".to_string();
+            state.store.insert_repo(&repo).unwrap();
+        }
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta
+            .repos
+            .entry("repo:old:first".to_string())
+            .or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"repo:old:first":1.0}"#).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let graph_generation = state.store.graph_generation();
+        let pagerank_generation = state.store.pagerank_generation();
+        let mut reconciliations = 0;
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, _from, _to| {
+                let first = store.lookup_repo("repo:old:first")?.unwrap();
+                delete_repo_cascade(store, &first)?;
+                Err(anyhow::anyhow!("injected later repo merge failure"))
+            },
+            |_state, _operation| reconciliations += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(state.store.graph_generation() > graph_generation);
+        let mut generation_path = state.db_path.as_os_str().to_owned();
+        generation_path.push(".generation");
+        assert_eq!(
+            std::fs::read_to_string(std::path::PathBuf::from(generation_path))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            state.store.graph_generation(),
+            "graph generation bump was not persisted"
+        );
+        assert!(
+            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .get("repo:old:first")
+                .is_none(),
+            "deleted repo sidecar slice survived merge error"
+        );
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        let scores_after = state.store.pagerank_scores();
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+        assert!(
+            !scores_after.contains_key("repo:old:first"),
+            "post-error rank query returned the deleted repo"
+        );
+        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+    }
+
+    #[test]
+    fn vault_only_purge_failure_preserves_pagerank() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:old:docs".to_string(),
+                name: "docs".to_string(),
+                root_path: "/missing/docs".to_string(),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        let persisted_rank = r#"{"rank-sentinel":0.75}"#;
+        std::fs::write(&pagerank_path, persisted_rank).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let scores_before = state.store.pagerank_scores();
+        let graph_generation = state.store.graph_generation();
+        let pagerank_generation = state.store.pagerank_generation();
+        let mut reconciliations = 0;
+
+        let error = run_purge_instance_with(
+            &state,
+            "old",
+            |store, _id| {
+                store.delete_vault_cascade("vlt:old:docs")?;
+                Err(anyhow::anyhow!("injected late vault purge failure"))
+            },
+            |_state, _operation| reconciliations += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(state.store.graph_generation() > graph_generation);
+        assert_eq!(state.store.pagerank_generation(), pagerank_generation);
+        assert_eq!(state.store.pagerank_scores(), scores_before);
+        assert_eq!(
+            std::fs::read_to_string(&pagerank_path).unwrap(),
+            persisted_rank
+        );
         assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
     }
 
