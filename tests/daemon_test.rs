@@ -938,6 +938,68 @@ fn daemon_index_reaches_auto_setup_gate() {
     );
 }
 
+/// nw-052 (P2a): the daemon's `index_repo` RPC must reject a colon (or
+/// whitespace) `instance_id` at the RPC BOUNDARY — before it's stamped into a
+/// `repo:<instance>:<hash>` uid. The CLI guards its own `--instance` flag and
+/// would short-circuit a `nestweaver index --instance a:b` before the daemon
+/// ever sees it, so a CLI-driven test can't isolate the server-side guard.
+/// Here we drive the low-level gRPC client directly over the daemon's UDS
+/// (admin), bypassing the CLI validation entirely — the rejection therefore
+/// proves the RPC-boundary guard protects any client (e.g. a future MCP/other
+/// caller), not just the CLI. Pre-fix this call SUCCEEDS and stamps `a:b`.
+#[test]
+fn daemon_index_rpc_rejects_colon_in_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    daemon_action_cmd(&db_path, "start").assert().success();
+    std::thread::sleep(Duration::from_secs(3));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let status = rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .expect("connect to daemon over UDS");
+        let req = nestweaver_proto::IndexRepoRequest {
+            repo_path: repo_dir.display().to_string(),
+            instance_id: "a:b".to_string(),
+            ..Default::default()
+        };
+        // The guard rejects before the stream opens, so the initial call errors.
+        // Defensively drain any stream that does open, looking for an in-band
+        // error status, so this test fails loudly if the guard ever regresses.
+        match client.inner_mut().index_repo(req).await {
+            Ok(resp) => {
+                let mut stream = resp.into_inner();
+                loop {
+                    match stream.message().await {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => break None,
+                        Err(s) => break Some(s),
+                    }
+                }
+            }
+            Err(s) => Some(s),
+        }
+    });
+
+    let status = status.expect("daemon must REJECT a colon instance_id, not accept it");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "expected invalid_argument, got: {status:?}"
+    );
+    assert!(
+        status.message().contains("colon") || status.message().contains(':'),
+        "error should explain the colon problem, got: {}",
+        status.message()
+    );
+}
+
 /// Index a repo through the daemon under an explicit instance id so the repo
 /// uid is identical across the initial index and any re-index (the tiered
 /// change-detection sidecar is keyed by repo uid).

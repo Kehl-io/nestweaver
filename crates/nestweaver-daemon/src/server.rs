@@ -1440,6 +1440,15 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.instance_id.clone()
         };
+        // nw-052 (P2a): validate the effective instance at the RPC boundary
+        // before it's stamped into `repo:<instance>:<hash>` uids. The CLI guards
+        // its own `--instance` flag, but the daemon must not trust ANY client
+        // (a future MCP/other caller could send a colon/whitespace instance and
+        // silently create an ambiguous uid). Reject with an invalid-argument
+        // status rather than sanitize so two instances can't collapse into one.
+        if let Err(e) = nestweaver_engine::validate_instance_id(&effective_instance) {
+            return Err(Status::invalid_argument(format!("{e:#}")));
+        }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 

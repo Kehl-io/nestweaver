@@ -34,6 +34,23 @@ const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
 
+// ── Daemon index-stream phases ────────────────────────────────────────────────
+// Mirror the daemon's `Phase` enum (crates/nestweaver-daemon proto): the client
+// only sees these as raw i32s on the `IndexProgress` stream. nw-052 (P2b): the
+// client must distinguish a clean terminal `Done` from an in-band `Error` (a
+// logical failure the daemon reports as `Ok(IndexProgress{phase: Error})`).
+const DAEMON_INDEX_PHASE_DONE: i32 = 5;
+const DAEMON_INDEX_PHASE_ERROR: i32 = 6;
+
+/// P2b: decide whether the daemon-mode index succeeded cleanly enough to run
+/// client-side auto-setup and return a success exit code. Only a terminal
+/// `Done` phase qualifies; an in-band `Error` phase or a truncated stream
+/// (any non-`Done` terminal phase, including the `-1` "no messages" sentinel)
+/// is a failure. Pure + total so it can be unit-tested without a live daemon.
+fn daemon_index_succeeded(terminal_phase: i32) -> bool {
+    terminal_phase == DAEMON_INDEX_PHASE_DONE
+}
+
 // ── Rich diagnostics ─────────────────────────────────────────────────────────
 
 /// CLI-layer diagnostic that wraps common `anyhow` errors with actionable help
@@ -7988,6 +8005,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             })?;
             let db_path = resolve_index_db_path(db, &repo_path);
 
+            // nw-052 (P2a): validate the `--instance` flag value BEFORE the
+            // daemon/no-daemon split so both paths reject a colon/whitespace.
+            // `resolve_instance_id` only runs on the no-daemon path, so the
+            // daemon branch below built the RPC with the RAW flag and produced
+            // an ambiguous uid `repo:a:b:<hash>`. An empty `--instance ""`
+            // stays "unset" (daemon decides / falls through to config/default).
+            if let Some(flag) = instance.as_deref().filter(|f| !f.is_empty()) {
+                nestweaver_engine::validate_instance_id(flag)?;
+            }
+
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
@@ -8006,8 +8033,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     instance_id: instance.clone().unwrap_or_default(),
                 };
 
-                rt.block_on(async {
+                // nw-052 (P2b): track the terminal phase reported IN-BAND on the
+                // stream. The `?` on `stream.message()` only catches TRANSPORT
+                // errors; a LOGICAL index failure arrives as `Ok(IndexProgress{
+                // phase: Error})` and would otherwise fall through to a success
+                // exit + auto-setup (false green for CI/scripts, and it would
+                // stamp `.setup_done` + integration files on a failed first run).
+                let terminal_phase = rt.block_on(async {
                     let mut stream = client.inner_mut().index_repo(req).await?.into_inner();
+                    let mut last_phase: i32 = -1;
                     while let Some(progress) = stream.message().await? {
                         let phase_name = match progress.phase {
                             0 => "Discovering",
@@ -8020,9 +8054,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             _ => "Unknown",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
+                        last_phase = progress.phase;
                     }
-                    Ok::<_, anyhow::Error>(())
+                    Ok::<_, anyhow::Error>(last_phase)
                 })?;
+
+                // Only a clean `Done` (phase 5) is a success. An in-band `Error`
+                // (phase 6) OR a stream that ended without ever reaching `Done`
+                // (truncated) is a failure: skip auto-setup and exit non-zero so
+                // callers/CI see the failure instead of a false green.
+                if !daemon_index_succeeded(terminal_phase) {
+                    let reason = if terminal_phase == DAEMON_INDEX_PHASE_ERROR {
+                        "daemon reported an index error"
+                    } else {
+                        "daemon index stream ended before completion"
+                    };
+                    out.status(&format!("Index failed: {reason}."));
+                    return Ok((EXIT_ERROR, None));
+                }
 
                 // nw-023: setup is client-side (config files + marker, no DB access); give
                 // daemon-mode users the same gated first-index convenience as the direct path.
@@ -15576,5 +15625,39 @@ credential_method = "ssh"
             err.to_string().contains("colon"),
             "error should mention the colon, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod daemon_index_phase_tests {
+    use super::*;
+
+    /// nw-052 (P2b): a clean terminal `Done` (phase 5) is the ONLY success. It
+    /// gates client-side auto-setup + the success exit code.
+    #[test]
+    fn done_phase_succeeds() {
+        assert!(daemon_index_succeeded(DAEMON_INDEX_PHASE_DONE));
+    }
+
+    /// An in-band `Error` (phase 6) is a LOGICAL index failure the daemon
+    /// reports as `Ok(IndexProgress{phase: Error})`. It must NOT run auto-setup
+    /// or return success — otherwise a failed index is a false green that also
+    /// stamps `.setup_done` + integration files on a first interactive run.
+    #[test]
+    fn error_phase_fails() {
+        assert!(!daemon_index_succeeded(DAEMON_INDEX_PHASE_ERROR));
+    }
+
+    /// A stream that ends without ever reaching `Done` (truncated, or the `-1`
+    /// "no messages seen" sentinel, or a mid-pipeline phase) is treated as a
+    /// failure — safer than assuming completion.
+    #[test]
+    fn truncated_or_intermediate_phases_fail() {
+        for phase in [-1, 0, 1, 2, 3, 4] {
+            assert!(
+                !daemon_index_succeeded(phase),
+                "phase {phase} is not a clean Done and must not count as success"
+            );
+        }
     }
 }
