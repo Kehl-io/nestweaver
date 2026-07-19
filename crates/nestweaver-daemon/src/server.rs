@@ -8759,6 +8759,142 @@ mod startup_helper_tests {
     }
 
     #[test]
+    fn remove_null_name_project_cleans_graph_and_sidecars_durably() {
+        use nestweaver_schema::{Note, NoteKind};
+
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:null-name-durable-remove";
+        let note_uid = "note:null-name-durable-remove";
+        state
+            .store
+            .insert_note(&Note {
+                uid: note_uid.to_string(),
+                vault_uid: "vlt:null-name-durable-remove".to_string(),
+                file_path: "null-name-durable-remove.md".to_string(),
+                title: "Null-name durable remove".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 3,
+                content_hash: "null-name-durable-remove-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        {
+            let conn = state.store.begin_transaction().unwrap();
+            conn.query(
+                "CREATE (:Project {uid: 'proj:test:null-name-durable-remove', name: NULL, summary: NULL, instance_id: 'test'})",
+            )
+            .unwrap();
+            state.store.commit_transaction(&conn).unwrap();
+        }
+        state
+            .store
+            .batch_insert_project_note_edges(&[(project_uid, note_uid)])
+            .unwrap();
+        {
+            let conn = state.store.begin_transaction().unwrap();
+            conn.query(
+                "CREATE REL TABLE FUTURE_NULL_PROJECT_EDGE(FROM Project TO Note, marker STRING)",
+            )
+            .unwrap();
+            conn.query(
+                "MATCH (p:Project {uid: 'proj:test:null-name-durable-remove'}), \
+                 (n:Note {uid: 'note:null-name-durable-remove'}) \
+                 CREATE (p)-[:FUTURE_NULL_PROJECT_EDGE {marker: 'future'}]->(n)",
+            )
+            .unwrap();
+            state.store.commit_transaction(&conn).unwrap();
+        }
+        assert_eq!(
+            state
+                .store
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| project.uid == project_uid)
+                .unwrap()
+                .name,
+            ""
+        );
+        seed_extension(
+            &state,
+            project_uid,
+            "external_refs",
+            serde_json::json!(["ticket-null-141"]),
+        );
+        assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
+        state.store.flush_embedding_index().unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let response = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            finalize_node_graph_deletion,
+        )
+        .unwrap();
+
+        assert_eq!(response.project_name, "");
+        assert!(!state.store.project_exists(project_uid).unwrap());
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(!pagerank_path.exists());
+        assert!(!state.store.pagerank_scores().contains_key(project_uid));
+        assert!(!state.store.has_embedding(project_uid));
+        assert!(
+            nestweaver_engine::get_all_properties(
+                &nestweaver_engine::load_extensions(&state.db_path),
+                project_uid,
+            )
+            .is_empty()
+        );
+        {
+            let conn = state.store.begin_transaction().unwrap();
+            for edge_type in ["PROJECT_INCLUDES_NOTE", "FUTURE_NULL_PROJECT_EDGE"] {
+                let count = conn
+                    .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN r"))
+                    .unwrap()
+                    .count();
+                assert_eq!(count, 0, "{edge_type} survived the Project delete");
+            }
+            state.store.commit_transaction(&conn).unwrap();
+        }
+
+        let db_path = state.db_path.clone();
+        let expected_generation = state.store.graph_generation();
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.project_exists(project_uid).unwrap());
+        assert_eq!(reopened.graph_generation(), expected_generation);
+        assert!(!reopened.has_embedding(project_uid));
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key(project_uid));
+        assert!(
+            nestweaver_engine::get_all_properties(
+                &nestweaver_engine::load_extensions(&db_path),
+                project_uid,
+            )
+            .is_empty()
+        );
+        let conn = reopened.begin_transaction().unwrap();
+        for edge_type in ["PROJECT_INCLUDES_NOTE", "FUTURE_NULL_PROJECT_EDGE"] {
+            let count = conn
+                .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN r"))
+                .unwrap()
+                .count();
+            assert_eq!(count, 0, "{edge_type} reappeared after reopen");
+        }
+        reopened.commit_transaction(&conn).unwrap();
+    }
+
+    #[test]
     fn missing_project_is_a_true_noop_without_finalization() {
         let state = test_state_with_writer();
         let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");

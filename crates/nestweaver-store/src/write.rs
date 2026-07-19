@@ -87,7 +87,7 @@ impl Default for ProjectCascadeQueries {
         Self {
             begin: "BEGIN TRANSACTION",
             repeat_begin: false,
-            lookup: "MATCH (p:Project {uid: $uid}) RETURN p.name",
+            lookup: "MATCH (p:Project {uid: $uid}) RETURN p.uid, p.name",
             delete: "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
             omit_delete_params: false,
             commit: "COMMIT",
@@ -102,6 +102,9 @@ impl Default for ProjectCascadeQueries {
 struct ProjectCascadeFaults {
     begin: bool,
     lookup: bool,
+    lookup_uid_mismatch: bool,
+    lookup_uid_malformed: bool,
+    lookup_name_malformed: bool,
     before_mutation: bool,
     detach: bool,
     commit: bool,
@@ -3273,13 +3276,10 @@ impl GraphStore {
                 ));
             }
         };
-        let project_name = rows.next().and_then(|row| match row.first() {
-            Some(lbug::Value::String(name)) => Some(name.clone()),
-            _ => None,
-        });
+        let lookup_row = rows.next();
         drop(rows);
 
-        let Some(project_name) = project_name else {
+        let Some(lookup_row) = lookup_row else {
             let commit = conn.query(queries.commit).and_then(|_| {
                 if queries.repeat_commit {
                     conn.query(queries.commit).map(|_| ())
@@ -3302,6 +3302,35 @@ impl GraphStore {
                 )),
             };
         };
+        let returned_uid = match lookup_row.first() {
+            Some(lbug::Value::String(returned_uid)) => returned_uid,
+            value => {
+                return Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    None,
+                    StoreError::Query(format!(
+                        "malformed Project lookup UID for {project_uid}: {value:?}"
+                    )),
+                ));
+            }
+        };
+        if returned_uid != project_uid {
+            return Err(Self::project_cascade_pre_mutation_error(
+                &conn,
+                queries.rollback,
+                project_uid,
+                None,
+                StoreError::Query(format!(
+                    "Project lookup UID mismatch: requested {project_uid}, returned {returned_uid}"
+                )),
+            ));
+        }
+        let project_name = match lookup_row.get(1) {
+            Some(lbug::Value::String(project_name)) => Some(project_name.clone()),
+            _ => None,
+        };
 
         let mut delete = match conn.prepare(queries.delete) {
             Ok(delete) => delete,
@@ -3310,7 +3339,7 @@ impl GraphStore {
                     &conn,
                     queries.rollback,
                     project_uid,
-                    Some(project_name),
+                    project_name,
                     StoreError::Query(format!("prepare Project DETACH DELETE: {error}")),
                 ));
             }
@@ -3324,7 +3353,7 @@ impl GraphStore {
             let rollback = Self::project_cascade_rollback(&conn, queries.rollback);
             return Err(DeleteProjectCascadeError {
                 project_uid: project_uid.to_string(),
-                project_name: Some(project_name),
+                project_name,
                 disposition: if rollback.is_none() {
                     ProjectMutationDisposition::ConfirmedRolledBack
                 } else {
@@ -3345,12 +3374,12 @@ impl GraphStore {
         match commit {
             Ok(_) => Ok(DeleteProjectCascadeOutcome {
                 project_uid: project_uid.to_string(),
-                project_name: Some(project_name),
+                project_name,
                 disposition: ProjectMutationDisposition::Changed,
             }),
             Err(error) => Err(DeleteProjectCascadeError {
                 project_uid: project_uid.to_string(),
-                project_name: Some(project_name),
+                project_name,
                 // A COMMIT error after a mutation is ambiguous even when a
                 // best-effort rollback subsequently reports success.
                 disposition: ProjectMutationDisposition::Ambiguous,
@@ -3397,6 +3426,15 @@ impl GraphStore {
         }
         if faults.lookup {
             queries.lookup = "INJECTED LOOKUP FAILURE";
+        }
+        if faults.lookup_uid_mismatch {
+            queries.lookup = "MATCH (p:Project {uid: $uid}) RETURN 'proj:txn:unexpected', p.name";
+        }
+        if faults.lookup_uid_malformed {
+            queries.lookup = "MATCH (p:Project {uid: $uid}) RETURN 42, p.name";
+        }
+        if faults.lookup_name_malformed {
+            queries.lookup = "MATCH (p:Project {uid: $uid}) RETURN p.uid, 42";
         }
         if faults.before_mutation {
             queries.delete = "INJECTED BEFORE MUTATION FAILURE";
@@ -4181,6 +4219,145 @@ mod tests {
                     "confirmed failure removed the edge: {faults:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn project_cascade_lookup_identity_failures_are_not_reported_as_missing() {
+        for (faults, expected_message) in [
+            (
+                ProjectCascadeFaults {
+                    lookup_uid_mismatch: true,
+                    ..Default::default()
+                },
+                "mismatch",
+            ),
+            (
+                ProjectCascadeFaults {
+                    lookup_uid_malformed: true,
+                    ..Default::default()
+                },
+                "malformed",
+            ),
+        ] {
+            let store = GraphStore::in_memory().unwrap();
+            seed_project_component(&store);
+
+            let error = store
+                .delete_project_cascade_with_faults("proj:txn:parent", faults)
+                .expect_err("an untrusted lookup identity must fail closed");
+
+            assert_eq!(
+                error.disposition,
+                ProjectMutationDisposition::ConfirmedUnchanged
+            );
+            assert!(
+                error
+                    .primary
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains(expected_message),
+                "unexpected error: {error}"
+            );
+            assert!(store.project_exists("proj:txn:parent").unwrap());
+            assert_eq!(
+                store
+                    .list_project_component_uids("proj:txn:parent")
+                    .unwrap(),
+                vec!["proj:txn:child"]
+            );
+        }
+    }
+
+    #[test]
+    fn project_cascade_non_string_name_is_optional_metadata() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let outcome = store
+            .delete_project_cascade_with_faults(
+                "proj:txn:parent",
+                ProjectCascadeFaults {
+                    lookup_name_malformed: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, ProjectMutationDisposition::Changed);
+        assert_eq!(outcome.project_uid, "proj:txn:parent");
+        assert_eq!(outcome.project_name, None);
+        assert!(!store.project_exists("proj:txn:parent").unwrap());
+        assert!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn project_cascade_deletes_null_name_project_and_incident_edges() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:null-project-delete".to_string(),
+                vault_uid: "vlt:null-project-delete".to_string(),
+                file_path: "null-project-delete.md".to_string(),
+                title: "Null project delete".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 3,
+                content_hash: "null-project-delete-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        let conn = store.conn().unwrap();
+        conn.query(
+            "CREATE (:Project {uid: 'proj:txn:null-name', name: NULL, summary: NULL, instance_id: 'txn'})",
+        )
+        .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:txn:null-name", "note:null-project-delete")])
+            .unwrap();
+        conn.query(
+            "CREATE REL TABLE FUTURE_NULL_PROJECT_EDGE(FROM Project TO Note, marker STRING)",
+        )
+        .unwrap();
+        conn.query(
+            "MATCH (p:Project {uid: 'proj:txn:null-name'}), \
+             (n:Note {uid: 'note:null-project-delete'}) \
+             CREATE (p)-[:FUTURE_NULL_PROJECT_EDGE {marker: 'future'}]->(n)",
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| project.uid == "proj:txn:null-name")
+                .unwrap()
+                .name,
+            ""
+        );
+
+        let outcome = store
+            .delete_project_cascade_with_outcome("proj:txn:null-name")
+            .unwrap();
+
+        assert_eq!(outcome.disposition, ProjectMutationDisposition::Changed);
+        assert_eq!(outcome.project_uid, "proj:txn:null-name");
+        assert_eq!(outcome.project_name, None);
+        assert!(!store.project_exists("proj:txn:null-name").unwrap());
+        for edge_type in ["PROJECT_INCLUDES_NOTE", "FUTURE_NULL_PROJECT_EDGE"] {
+            let count = conn
+                .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN r"))
+                .unwrap()
+                .count();
+            assert_eq!(count, 0, "{edge_type} survived the Project delete");
         }
     }
 
