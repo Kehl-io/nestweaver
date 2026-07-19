@@ -25,7 +25,7 @@ jobs:
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -69,7 +69,7 @@ jobs:
           cache-on-failure: true
           shared-key: build
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -115,7 +115,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
@@ -173,13 +173,13 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: build
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo

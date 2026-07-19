@@ -33,7 +33,7 @@ runs:
   using: 'composite'
   steps:
     - name: Cache NestWeaver CLI
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       id: cache-cli
       with:
         path: /usr/local/bin/nestweaver
@@ -142,7 +142,7 @@ runs:
 
     - name: Upload full report artifact
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: nestweaver-impact-report
         path: ${{ runner.temp }}/impact.json

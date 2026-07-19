@@ -49,10 +49,10 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        run: brew install openssl@3 protobuf
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
@@ -68,9 +68,9 @@ jobs:
           linker = "aarch64-linux-gnu-gcc"
           rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
           EOF
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
       - name: Build frontend
@@ -90,7 +90,7 @@ jobs:
       - name: Generate SHA-256 checksum
         run: shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ env.ARCHIVE }}
       - name: Upload release artifact
@@ -108,9 +108,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
       # The wrapper's postinstall downloads the matching release binary, so it
       # must publish only after the `build` job has uploaded the assets for
