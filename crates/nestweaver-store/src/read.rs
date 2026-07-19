@@ -1226,6 +1226,38 @@ impl GraphStore {
         Ok(uids)
     }
 
+    /// Return every UID-bearing graph node currently present. This is the
+    /// authoritative liveness set for UID-keyed external sidecars.
+    pub fn live_graph_node_uids(&self) -> Result<HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut uids = HashSet::new();
+        for query in [
+            "MATCH (n:Repo) RETURN n.uid",
+            "MATCH (n:File) RETURN n.uid",
+            "MATCH (n:Service) RETURN n.uid",
+            "MATCH (n:Symbol) RETURN n.uid",
+            "MATCH (n:Vault) RETURN n.uid",
+            "MATCH (n:Note) RETURN n.uid",
+            "MATCH (n:Heading) RETURN n.uid",
+            "MATCH (n:Section) RETURN n.uid",
+            "MATCH (n:Tag) RETURN n.uid",
+            "MATCH (n:Project) RETURN n.uid",
+            "MATCH (n:Contract) RETURN n.uid",
+            "MATCH (n:UnresolvedWikilink) RETURN n.uid",
+            "MATCH (n:TrigramPosting) RETURN n.uid",
+        ] {
+            let result = conn.query(query).map_err(|error| {
+                StoreError::Query(format!(
+                    "graph UID liveness query failed ({query}): {error}"
+                ))
+            })?;
+            for row in result {
+                uids.insert(extract_string(&row, 0)?);
+            }
+        }
+        Ok(uids)
+    }
+
     /// Count symbols grouped by their owning repo (`repo_uid` -> count).
     /// Used by backup manifests to report per-repo symbol totals without
     /// loading full symbol rows.

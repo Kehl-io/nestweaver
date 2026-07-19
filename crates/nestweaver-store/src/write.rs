@@ -3,7 +3,7 @@ use std::path::Path;
 use nestweaver_schema::{
     Contract, EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol,
     Tag, Vault,
-    uid::{file_uid, project_uid, repo_uid, symbol_uid, vault_uid},
+    uid::{file_uid, project_uid, repo_uid, service_uid, symbol_uid, vault_uid},
 };
 use serde_json;
 
@@ -151,9 +151,44 @@ pub struct InstanceUidRemap {
     pub destination_uid: String,
 }
 
+/// Stable identity used to attach authored metadata after a merge-required
+/// force re-index recreates a node under an actual (possibly line-shifted) UID.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InstanceUidHandoffIdentity {
+    File {
+        destination_repo_uid: String,
+        path: String,
+    },
+    Service {
+        destination_repo_uid: String,
+        name: String,
+    },
+    Symbol {
+        destination_repo_uid: String,
+        canonical_id: Option<String>,
+        file_path: String,
+        name: String,
+        kind: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceUidHandoff {
+    pub source_uid: String,
+    pub predicted_destination_uid: String,
+    pub identity: InstanceUidHandoffIdentity,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstanceUidMigrationPlan {
+    pub remaps: Vec<InstanceUidRemap>,
+    pub handoffs: Vec<InstanceUidHandoff>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstanceUidRemapPlanState {
     Prepared,
+    PartiallyApplied,
     Applied,
 }
 
@@ -3779,17 +3814,28 @@ impl GraphStore {
     /// Enumerate every authored extension UID that changes when `from` is
     /// merged into `to`.
     ///
-    /// Repo and Project destinations use the same semantic minting inputs as
-    /// [`merge_instance_ids`](Self::merge_instance_ids). File and Symbol rows
-    /// are deleted during the merge and require re-indexing, so their future
-    /// target UIDs are computed before deletion from their path/name/line
-    /// fields. Sorting makes collision and dedup handling deterministic when
-    /// multiple source rows map to one destination.
+    /// Every instance-derived UID that the merge invalidates is represented:
+    /// Repo, File, Service, Symbol, Vault, and Project. File, Service, and
+    /// Symbol rows are deleted during the merge and require re-indexing, so
+    /// their predicted target UIDs are computed before deletion. Sorting makes
+    /// collision and dedup handling deterministic when multiple source rows
+    /// map to one destination.
     pub fn plan_instance_uid_remaps(
         &self,
         from: &str,
         to: &str,
     ) -> Result<Vec<InstanceUidRemap>, StoreError> {
+        Ok(self.plan_instance_uid_migration(from, to)?.remaps)
+    }
+
+    /// Plan UID remaps together with semantic handoffs for rows that indexing
+    /// recreates. Handoffs are source-UID sorted and bind the predicted UID to
+    /// an instance-independent identity used after publication.
+    pub fn plan_instance_uid_migration(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<InstanceUidMigrationPlan, StoreError> {
         if from == to {
             return Err(StoreError::Query(format!(
                 "source and target instance IDs must differ (both were {from:?})"
@@ -3797,6 +3843,10 @@ impl GraphStore {
         }
 
         let mut remaps = Vec::new();
+        let mut handoffs = Vec::new();
+        // The LadybugDB Cypher subset does not support a MATCH subquery in an
+        // `IN` predicate, so enumerate once and scope by each source Repo UID.
+        let services = self.list_services(None)?;
         for repo in self.list_repos(Some(from))? {
             let destination_repo_uid = repo_uid(to, &repo.url);
             remaps.push(InstanceUidRemap {
@@ -3804,29 +3854,76 @@ impl GraphStore {
                 destination_uid: destination_repo_uid.clone(),
             });
             for (source_uid, path) in self.list_files_by_repo(&repo.uid)? {
+                let destination_uid = file_uid(&destination_repo_uid, &path);
                 remaps.push(InstanceUidRemap {
+                    source_uid: source_uid.clone(),
+                    destination_uid: destination_uid.clone(),
+                });
+                handoffs.push(InstanceUidHandoff {
                     source_uid,
-                    destination_uid: file_uid(&destination_repo_uid, &path),
+                    predicted_destination_uid: destination_uid,
+                    identity: InstanceUidHandoffIdentity::File {
+                        destination_repo_uid: destination_repo_uid.clone(),
+                        path,
+                    },
                 });
             }
             for symbol in self.lookup_symbols_by_repo(&repo.uid)? {
+                let destination_uid = symbol_uid(
+                    &destination_repo_uid,
+                    &symbol.file_path,
+                    &symbol.name,
+                    symbol.start_line,
+                );
                 remaps.push(InstanceUidRemap {
+                    source_uid: symbol.uid.clone(),
+                    destination_uid: destination_uid.clone(),
+                });
+                handoffs.push(InstanceUidHandoff {
                     source_uid: symbol.uid,
-                    destination_uid: symbol_uid(
-                        &destination_repo_uid,
-                        &symbol.file_path,
-                        &symbol.name,
-                        symbol.start_line,
-                    ),
+                    predicted_destination_uid: destination_uid,
+                    identity: InstanceUidHandoffIdentity::Symbol {
+                        destination_repo_uid: destination_repo_uid.clone(),
+                        canonical_id: symbol.canonical_id,
+                        file_path: symbol.file_path,
+                        name: symbol.name,
+                        kind: symbol.kind.to_string(),
+                    },
                 });
             }
+            for service in services
+                .iter()
+                .filter(|service| service.repo_uid == repo.uid)
+            {
+                let destination_uid = service_uid(&destination_repo_uid, &service.name);
+                remaps.push(InstanceUidRemap {
+                    source_uid: service.uid.clone(),
+                    destination_uid: destination_uid.clone(),
+                });
+                handoffs.push(InstanceUidHandoff {
+                    source_uid: service.uid.clone(),
+                    predicted_destination_uid: destination_uid,
+                    identity: InstanceUidHandoffIdentity::Service {
+                        destination_repo_uid: destination_repo_uid.clone(),
+                        name: service.name.clone(),
+                    },
+                });
+            }
+        }
+        for vault in self.list_vaults(Some(from))? {
+            remaps.push(InstanceUidRemap {
+                source_uid: vault.uid,
+                destination_uid: vault_uid(to, &vault.root_path),
+            });
         }
         for project_merge in self.plan_instance_project_merges(from, to)? {
             remaps.extend(project_merge.remaps);
         }
         remaps.sort();
         remaps.dedup();
-        Ok(remaps)
+        handoffs.sort();
+        handoffs.dedup();
+        Ok(InstanceUidMigrationPlan { remaps, handoffs })
     }
 
     fn instance_merge_node_exists(&self, label: &str, uid: &str) -> Result<bool, StoreError> {
@@ -3845,8 +3942,10 @@ impl GraphStore {
     }
 
     /// Prove whether an exact, previously journaled UID remap plan is still
-    /// prepared in the graph or has been fully applied. Any intermediate or
-    /// mismatched state fails closed.
+    /// prepared, has a provably-applied prefix/subset, or is fully applied.
+    /// Current mappings must be an exact subset of the journal, and every
+    /// missing mapping must independently prove source absence plus a live
+    /// destination (or destination root). Extras and contradictions fail closed.
     pub fn verify_instance_uid_remap_plan_state(
         &self,
         from: &str,
@@ -3862,13 +3961,26 @@ impl GraphStore {
         if current == expected {
             return Ok(InstanceUidRemapPlanState::Prepared);
         }
-        if !current.is_empty() {
+        let expected_set: std::collections::BTreeSet<_> = expected.iter().cloned().collect();
+        if expected_set.len() != expected.len() {
             return Err(StoreError::Query(
-                "current graph remap plan differs from the journaled plan".to_string(),
+                "journaled instance UID remap plan contains duplicates".to_string(),
             ));
         }
+        for mapping in &current {
+            if !expected_set.contains(mapping) {
+                return Err(StoreError::Query(format!(
+                    "current graph remap is extra or contradicts the journaled plan: {} -> {}",
+                    mapping.source_uid, mapping.destination_uid
+                )));
+            }
+        }
 
-        for mapping in expected {
+        let current_set: std::collections::BTreeSet<_> = current.iter().cloned().collect();
+        for mapping in expected
+            .iter()
+            .filter(|mapping| !current_set.contains(*mapping))
+        {
             let (source_label, destination_label, destination_root) =
                 if mapping.source_uid.starts_with("repo:")
                     && mapping.destination_uid.starts_with("repo:")
@@ -3878,6 +3990,20 @@ impl GraphStore {
                     && mapping.destination_uid.starts_with("proj:")
                 {
                     ("Project", "Project", mapping.destination_uid.clone())
+                } else if mapping.source_uid.starts_with("vlt:")
+                    && mapping.destination_uid.starts_with("vlt:")
+                {
+                    ("Vault", "Vault", mapping.destination_uid.clone())
+                } else if mapping.source_uid.starts_with("svc:repo:")
+                    && mapping.destination_uid.starts_with("svc:repo:")
+                {
+                    let parts: Vec<&str> = mapping.destination_uid.split(':').collect();
+                    if parts.len() != 5 {
+                        return Err(StoreError::Query(
+                            "journaled Service remap has invalid destination UID".to_string(),
+                        ));
+                    }
+                    ("Service", "Repo", format!("repo:{}:{}", parts[2], parts[3]))
                 } else if mapping.source_uid.starts_with("file:repo:")
                     && mapping.destination_uid.starts_with("file:repo:")
                 {
@@ -3915,7 +4041,11 @@ impl GraphStore {
                 )));
             }
         }
-        Ok(InstanceUidRemapPlanState::Applied)
+        if current.is_empty() {
+            Ok(InstanceUidRemapPlanState::Applied)
+        } else {
+            Ok(InstanceUidRemapPlanState::PartiallyApplied)
+        }
     }
 
     /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that

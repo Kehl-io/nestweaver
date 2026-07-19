@@ -37,8 +37,9 @@ pub use tantivy_index::{
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{
     DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
-    DiscardedVault, InstanceUidRemap, InstanceUidRemapPlanState, MergeResult,
-    ProjectMutationDisposition, PurgeInstanceResult,
+    DiscardedVault, InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan,
+    InstanceUidRemap, InstanceUidRemapPlanState, MergeResult, ProjectMutationDisposition,
+    PurgeInstanceResult,
 };
 
 #[cfg(test)]
@@ -2513,8 +2514,10 @@ mod tests {
 
     #[test]
     fn instance_uid_remap_plan_covers_code_and_project_collisions() {
-        use nestweaver_schema::uid::{file_uid, project_uid, repo_uid, symbol_uid};
-        use nestweaver_schema::{File, Project};
+        use nestweaver_schema::uid::{
+            file_uid, project_uid, repo_uid, service_uid, symbol_uid, vault_uid,
+        };
+        use nestweaver_schema::{File, Project, Service, Vault};
 
         let store = test_store();
         let url = "https://github.com/example/remap";
@@ -2556,6 +2559,29 @@ mod tests {
                 &source_repo_uid,
                 "src/lib.rs",
             ))
+            .unwrap();
+        let source_service_uid = service_uid(&source_repo_uid, "api");
+        store
+            .insert_service(&Service {
+                uid: source_service_uid.clone(),
+                name: "api".to_string(),
+                repo_uid: source_repo_uid.clone(),
+                summary: None,
+                summary_hash: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let vault_root = "/tmp/remap-vault";
+        let source_vault_uid = vault_uid("old", vault_root);
+        let target_vault_uid = vault_uid("new", vault_root);
+        store
+            .insert_vault(&Vault {
+                uid: source_vault_uid.clone(),
+                name: "Remap vault".to_string(),
+                root_path: vault_root.to_string(),
+                instance_id: "old".to_string(),
+            })
             .unwrap();
 
         let source_project_uid = project_uid("old", "Roadmap");
@@ -2601,8 +2627,16 @@ mod tests {
                     destination_uid: target_repo_uid.clone(),
                 },
                 InstanceUidRemap {
+                    source_uid: source_service_uid,
+                    destination_uid: service_uid(&target_repo_uid, "api"),
+                },
+                InstanceUidRemap {
                     source_uid: source_symbol_uid,
                     destination_uid: symbol_uid(&target_repo_uid, "src/lib.rs", "handler", 10,),
+                },
+                InstanceUidRemap {
+                    source_uid: source_vault_uid,
+                    destination_uid: target_vault_uid,
                 },
             ]
         );
@@ -2620,6 +2654,57 @@ mod tests {
             store
                 .verify_instance_uid_remap_plan_state("old", "new", &tampered)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn instance_uid_remap_plan_recognizes_a_proven_partial_multi_repo_application() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let store = test_store();
+        let urls = [
+            "https://github.com/example/partial-a",
+            "https://github.com/example/partial-b",
+        ];
+        for url in urls {
+            store
+                .insert_repo(&Repo {
+                    uid: repo_uid("old", url),
+                    url: url.to_string(),
+                    indexed_sha: "source".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "old".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+
+        let applied_url = urls[0];
+        let source_uid = repo_uid("old", applied_url);
+        store
+            .bulk_delete_repo_files_and_symbols(&source_uid)
+            .unwrap();
+        store.clear_repo_derived_nodes(&source_uid).unwrap();
+        store.delete_repo_node(&source_uid).unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid("new", applied_url),
+                url: applied_url.to_string(),
+                indexed_sha: "source".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "new".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::PartiallyApplied
         );
     }
 

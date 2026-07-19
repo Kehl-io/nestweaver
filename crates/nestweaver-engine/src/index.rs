@@ -548,6 +548,15 @@ fn finalize_code_graph_deletion_with_io(
             error,
         ),
     }
+    match crate::extensions::reconcile_extension_liveness(store, db_path) {
+        Ok(removed) => tracing::info!(removed, operation, "extension metadata reconciled"),
+        Err(error) => push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::ExtensionMetadata,
+            None,
+            format!("extension metadata liveness reconciliation failed: {error:#}"),
+        ),
+    }
 
     // Advance before its durable companion so live readers are safe even when
     // sidecar persistence fails, but never wrap an exhausted counter.
@@ -914,6 +923,18 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
                 format!("{error:#}"),
             ),
         }
+    }
+
+    if publication_clean
+        && let Some(db_path) = db_path
+        && let Err(error) = crate::extensions::reconcile_extension_handoffs(store, db_path)
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::ExtensionMetadata,
+            None,
+            format!("reconcile deferred extension metadata after index publication: {error:#}"),
+        );
     }
 
     if failures.is_empty() {

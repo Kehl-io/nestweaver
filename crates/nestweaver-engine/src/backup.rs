@@ -17,6 +17,7 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".interactions.json",
     ".extensions.json",
     ".extensions.migration.json",
+    ".extensions.handoff.json",
     ".aliases.json",
     ".bundles.json",
     ".generation",
@@ -1335,6 +1336,7 @@ mod tests {
     #[test]
     fn backup_sidecars_include_incomplete_extension_migration_journal() {
         assert!(SIDECAR_SUFFIXES.contains(&".extensions.migration.json"));
+        assert!(SIDECAR_SUFFIXES.contains(&".extensions.handoff.json"));
     }
 
     #[test]

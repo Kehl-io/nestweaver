@@ -954,6 +954,15 @@ fn finalize_node_graph_deletion(
             format!("{}: {error:#}", generation_path.display()),
         );
     }
+    if let Err(error) =
+        nestweaver_engine::reconcile_extension_liveness(&state.store, &state.db_path)
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+            format!("extension metadata liveness reconciliation failed: {error:#}"),
+        );
+    }
     state.store.invalidate_pagerank();
     let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
     if let Err(error) =
@@ -1666,7 +1675,7 @@ where
                 })?
         };
         if pending.graph_applied()
-            && graph_state == nestweaver_store::InstanceUidRemapPlanState::Prepared
+            && graph_state != nestweaver_store::InstanceUidRemapPlanState::Applied
         {
             return Err(Status::internal(
                 "instance migration is marked graph-applied but source graph rows remain",
@@ -1674,9 +1683,9 @@ where
         }
         pending
     } else {
-        let mappings = state
+        let plan = state
             .store
-            .plan_instance_uid_remaps(from_id, to_id)
+            .plan_instance_uid_migration(from_id, to_id)
             .map_err(|error| {
                 Status::internal(format!(
                     "merge failed to plan instance UID remaps: {error:#}"
@@ -1692,11 +1701,11 @@ where
                 Status::internal(format!("merge failed to project source vaults: {error:#}"))
             })?
             .is_empty();
-        nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+        nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
             &state.db_path,
             from_id,
             to_id,
-            &mappings,
+            &plan,
             &nestweaver_engine::InstanceMigrationFinalizerPlan {
                 repo_uids,
                 search_reconciliation_required,
@@ -4065,7 +4074,51 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "query_extensions")
+        let _guard = ConnectionGuard::read(&self.state);
+        let state = self.state.clone();
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|error| Status::invalid_argument(format!("invalid args JSON: {error}")))?;
+        let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
+            let extensions = nestweaver_engine::load_live_extensions(&state.store, &state.db_path)
+                .map_err(|error| {
+                    Status::internal(format!("query extension liveness failed: {error:#}"))
+                })?;
+            if let Some(uid) = args.get("uid").and_then(|value| value.as_str()) {
+                return Ok(serde_json::json!({
+                    "uid": uid,
+                    "properties": nestweaver_engine::get_all_properties(&extensions, uid),
+                }));
+            }
+            let key = args
+                .get("key")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    Status::invalid_argument("provide either 'uid' or both 'key' and 'value'")
+                })?;
+            let value = args.get("value").cloned().ok_or_else(|| {
+                Status::invalid_argument("'value' is required when 'key' is given")
+            })?;
+            let results: Vec<_> = nestweaver_engine::query_by_property(&extensions, key, &value)
+                .into_iter()
+                .map(|uid| {
+                    serde_json::json!({
+                        "uid": uid,
+                        "properties": extensions.get(uid).cloned().unwrap_or_default(),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "key": key,
+                "value": value,
+                "count": results.len(),
+                "results": results,
+            }))
+        })
+        .await
+        .map_err(|error| Status::internal(format!("spawn_blocking panicked: {error}")))??;
+        serde_json::to_string(&result)
+            .map(|result_json| Response::new(JsonResponse { result_json }))
+            .map_err(|error| Status::internal(format!("serialization failed: {error}")))
     }
 
     // ── Read RPCs — direct store access (no MCP tool) ──────────────
@@ -5804,6 +5857,20 @@ pub async fn run_server(
                 db_path.display()
             )
         })?;
+        nestweaver_engine::reconcile_extension_handoffs(&state.store, &state.db_path)
+            .with_context(|| {
+                format!(
+                    "failed to reconcile pending extension handoffs for {}",
+                    db_path.display()
+                )
+            })?;
+        nestweaver_engine::reconcile_extension_liveness(&state.store, &state.db_path)
+            .with_context(|| {
+                format!(
+                    "failed to reconcile extension liveness for {}",
+                    db_path.display()
+                )
+            })?;
     }
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
@@ -9585,6 +9652,68 @@ mod startup_helper_tests {
     }
 
     #[test]
+    fn repo_extension_cleanup_failure_is_retryable_and_preserves_non_graph_keys_on_reopen() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:test:extension-liveness-retry";
+        state
+            .store
+            .insert_repo(&test_repo(
+                repo_uid,
+                "https://example.test/extension-liveness-retry",
+                None,
+            ))
+            .unwrap();
+        let extension_path = nestweaver_engine::sidecar_path(&state.db_path, ".extensions.json");
+        std::fs::write(&extension_path, b"{not-json").unwrap();
+
+        let error = run_remove_repo_with(
+            &state,
+            repo_uid,
+            |store, uid| {
+                store.clear_repo_derived_nodes(uid).map_err(|error| {
+                    Status::internal(format!("clear_repo_derived_nodes failed: {error:#}"))
+                })
+            },
+            |store, uid| {
+                store.delete_repo_node(uid).map_err(|error| {
+                    Status::internal(format!("delete_repo_node failed: {error:#}"))
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("extension-metadata"));
+        assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
+        assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
+
+        let mut extensions = nestweaver_engine::ExtensionStore::new();
+        nestweaver_engine::set_property(
+            &mut extensions,
+            repo_uid,
+            "owner",
+            serde_json::json!("stale"),
+        );
+        nestweaver_engine::set_property(
+            &mut extensions,
+            "application:release-channel",
+            "owner",
+            serde_json::json!("keep"),
+        );
+        nestweaver_engine::save_extensions(&state.db_path, &extensions).unwrap();
+        assert!(finalize_code_graph_deletion(&state, &[repo_uid.to_string()]).is_empty());
+
+        let db_path = state.db_path.clone();
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let visible = nestweaver_engine::load_live_extensions(&reopened, &db_path).unwrap();
+        assert!(!visible.contains_key(repo_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&visible, "application:release-channel", "owner"),
+            Some(&serde_json::json!("keep"))
+        );
+    }
+
+    #[test]
     fn node_deletion_generation_exhaustion_is_reported_while_pagerank_is_invalidated() {
         let state = test_state_with_writer_generation(Some(u64::MAX));
         let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
@@ -9862,7 +9991,16 @@ mod startup_helper_tests {
         )
         .unwrap();
 
-        let response = DaemonService::new(state)
+        let stale_repo_uid = "repo:test:stale-query-extension";
+        seed_extension(
+            &state,
+            stale_repo_uid,
+            "owner",
+            serde_json::json!("must-not-leak"),
+        );
+
+        let service = DaemonService::new(state);
+        let response = service
             .query_extensions(Request::new(JsonRequest {
                 args_json: serde_json::json!({"uid": project_uid}).to_string(),
             }))
@@ -9873,6 +10011,32 @@ mod startup_helper_tests {
 
         assert_eq!(result["uid"], project_uid);
         assert_eq!(result["properties"], serde_json::json!({}));
+
+        let stale_response = service
+            .query_extensions(Request::new(JsonRequest {
+                args_json: serde_json::json!({"uid": stale_repo_uid}).to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let stale_result: serde_json::Value =
+            serde_json::from_str(&stale_response.result_json).unwrap();
+        assert_eq!(stale_result["properties"], serde_json::json!({}));
+
+        let filtered_response = service
+            .query_extensions(Request::new(JsonRequest {
+                args_json: serde_json::json!({
+                    "key": "owner",
+                    "value": "must-not-leak"
+                })
+                .to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let filtered_result: serde_json::Value =
+            serde_json::from_str(&filtered_response.result_json).unwrap();
+        assert_eq!(filtered_result["count"], 0);
     }
 
     #[test]

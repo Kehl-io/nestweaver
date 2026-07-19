@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 pub type ExtensionStore = HashMap<String, HashMap<String, serde_json::Value>>;
 
 const INSTANCE_MIGRATION_VERSION: u32 = 3;
+const EXTENSION_HANDOFF_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +43,34 @@ enum InstanceMigrationPhase {
 struct JournalUidRemap {
     source_uid: String,
     destination_uid: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum JournalHandoffIdentity {
+    File {
+        destination_repo_uid: String,
+        path: String,
+    },
+    Service {
+        destination_repo_uid: String,
+        name: String,
+    },
+    Symbol {
+        destination_repo_uid: String,
+        canonical_id: Option<String>,
+        file_path: String,
+        name: String,
+        kind_name: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournalHandoff {
+    source_uid: String,
+    predicted_destination_uid: String,
+    identity: JournalHandoffIdentity,
 }
 
 /// Exact post-graph reconciliation inputs captured before an instance merge.
@@ -67,8 +96,28 @@ struct InstanceExtensionMigrationJournal {
     from_id: String,
     to_id: String,
     mappings: Vec<JournalUidRemap>,
+    handoffs: Vec<JournalHandoff>,
     finalizers: InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingExtensionHandoff {
+    operation_id: String,
+    activation_generation: u64,
+    source_uid: String,
+    predicted_destination_uid: String,
+    identity: JournalHandoffIdentity,
+    properties: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExtensionHandoffJournal {
+    version: u32,
+    fingerprint: String,
+    entries: Vec<PendingExtensionHandoff>,
 }
 
 /// Durable three-phase instance migration prepared before graph mutation.
@@ -193,6 +242,76 @@ fn instance_extension_migration_journal_path(db_path: &Path) -> std::path::PathB
     std::path::PathBuf::from(path)
 }
 
+fn extension_handoff_journal_path(db_path: &Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".extensions.handoff.json");
+    std::path::PathBuf::from(path)
+}
+
+fn handoff_fingerprint(entries: &[PendingExtensionHandoff]) -> Result<String, anyhow::Error> {
+    let payload = serde_json::to_vec(&(EXTENSION_HANDOFF_VERSION, entries))?;
+    let digest = Sha256::digest(payload);
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut fingerprint, "{byte:02x}")?;
+    }
+    Ok(fingerprint)
+}
+
+fn load_extension_handoff_journal(
+    path: &Path,
+) -> Result<Option<ExtensionHandoffJournal>, anyhow::Error> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => anyhow::bail!("read extension handoff journal {}: {error}", path.display()),
+    };
+    let journal: ExtensionHandoffJournal = serde_json::from_str(&content).map_err(|error| {
+        anyhow::anyhow!(
+            "parse extension handoff journal {}: {error}",
+            path.display()
+        )
+    })?;
+    if journal.version != EXTENSION_HANDOFF_VERSION {
+        anyhow::bail!(
+            "unsupported extension handoff journal version {}",
+            journal.version
+        );
+    }
+    let mut prior: Option<(&str, &str)> = None;
+    for entry in &journal.entries {
+        let key = (entry.operation_id.as_str(), entry.source_uid.as_str());
+        if prior.is_some_and(|previous| previous >= key) {
+            anyhow::bail!("extension handoff entries are not strictly sorted");
+        }
+        prior = Some(key);
+    }
+    if journal.fingerprint != handoff_fingerprint(&journal.entries)? {
+        anyhow::bail!("extension handoff journal fingerprint mismatch");
+    }
+    Ok(Some(journal))
+}
+
+fn write_extension_handoff_journal(
+    path: &Path,
+    entries: Vec<PendingExtensionHandoff>,
+) -> Result<(), anyhow::Error> {
+    let journal = ExtensionHandoffJournal {
+        version: EXTENSION_HANDOFF_VERSION,
+        fingerprint: handoff_fingerprint(&entries)?,
+        entries,
+    };
+    let json = serde_json::to_vec_pretty(&journal)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&json))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "durably replace extension handoff journal {}: {error}",
+                path.display()
+            )
+        })
+}
+
 fn load_instance_extension_migration_journal(
     path: &Path,
 ) -> Result<Option<InstanceExtensionMigrationJournal>, anyhow::Error> {
@@ -243,6 +362,11 @@ enum ParsedUid<'a> {
         repo_hash: &'a str,
         path_hash: &'a str,
     },
+    Service {
+        instance: &'a str,
+        repo_hash: &'a str,
+        name_hash: &'a str,
+    },
     Symbol {
         instance: &'a str,
         repo_hash: &'a str,
@@ -253,6 +377,10 @@ enum ParsedUid<'a> {
     Project {
         instance: &'a str,
         name_hash: &'a str,
+    },
+    Vault {
+        instance: &'a str,
+        root_hash: &'a str,
     },
     LegacyRepo {
         instance: &'a str,
@@ -266,6 +394,9 @@ enum ParsedUid<'a> {
     LegacyProject {
         instance: &'a str,
     },
+    LegacyVault {
+        instance: &'a str,
+    },
 }
 
 impl ParsedUid<'_> {
@@ -273,12 +404,15 @@ impl ParsedUid<'_> {
         match self {
             Self::Repo { instance, .. }
             | Self::File { instance, .. }
+            | Self::Service { instance, .. }
             | Self::Symbol { instance, .. }
             | Self::Project { instance, .. }
+            | Self::Vault { instance, .. }
             | Self::LegacyRepo { instance }
             | Self::LegacyFile { instance }
             | Self::LegacySymbol { instance }
-            | Self::LegacyProject { instance } => instance,
+            | Self::LegacyProject { instance }
+            | Self::LegacyVault { instance } => instance,
         }
     }
 
@@ -286,12 +420,15 @@ impl ParsedUid<'_> {
         match self {
             Self::Repo { .. } => "Repo",
             Self::File { .. } => "File",
+            Self::Service { .. } => "Service",
             Self::Symbol { .. } => "Symbol",
             Self::Project { .. } => "Project",
+            Self::Vault { .. } => "Vault",
             Self::LegacyRepo { .. } => "Repo",
             Self::LegacyFile { .. } => "File",
             Self::LegacySymbol { .. } => "Symbol",
             Self::LegacyProject { .. } => "Project",
+            Self::LegacyVault { .. } => "Vault",
         }
     }
 
@@ -302,6 +439,7 @@ impl ParsedUid<'_> {
                 | Self::LegacyFile { .. }
                 | Self::LegacySymbol { .. }
                 | Self::LegacyProject { .. }
+                | Self::LegacyVault { .. }
         )
     }
 
@@ -314,6 +452,10 @@ impl ParsedUid<'_> {
             self,
             Self::LegacyRepo { .. } | Self::LegacyFile { .. } | Self::LegacySymbol { .. }
         )
+    }
+
+    fn is_legacy_vault(&self) -> bool {
+        matches!(self, Self::LegacyVault { .. })
     }
 }
 
@@ -349,6 +491,15 @@ fn parse_instance_migration_uid(uid: &str) -> Result<ParsedUid<'_>, anyhow::Erro
                 path_hash,
             })
         }
+        ["svc", "repo", instance, repo_hash, name_hash]
+            if !instance.is_empty() && is_uid_hash(repo_hash) && is_uid_hash(name_hash) =>
+        {
+            Ok(ParsedUid::Service {
+                instance,
+                repo_hash,
+                name_hash,
+            })
+        }
         [
             "sym",
             "repo",
@@ -380,6 +531,12 @@ fn parse_instance_migration_uid(uid: &str) -> Result<ParsedUid<'_>, anyhow::Erro
                 name_hash,
             })
         }
+        ["vlt", instance, root_hash] if !instance.is_empty() && is_uid_hash(root_hash) => {
+            Ok(ParsedUid::Vault {
+                instance,
+                root_hash,
+            })
+        }
         ["repo", instance, rest @ ..]
             if !instance.is_empty() && !rest.is_empty() && valid_legacy_parts(rest) =>
         {
@@ -399,6 +556,11 @@ fn parse_instance_migration_uid(uid: &str) -> Result<ParsedUid<'_>, anyhow::Erro
             if !instance.is_empty() && !rest.is_empty() && valid_legacy_parts(rest) =>
         {
             Ok(ParsedUid::LegacyProject { instance })
+        }
+        ["vlt", instance, rest @ ..]
+            if !instance.is_empty() && !rest.is_empty() && valid_legacy_parts(rest) =>
+        {
+            Ok(ParsedUid::LegacyVault { instance })
         }
         _ => Err(invalid()),
     }
@@ -431,6 +593,18 @@ fn validate_deterministic_destination(
             },
         ) => source_repo == destination_repo && source_path == destination_path,
         (
+            ParsedUid::Service {
+                repo_hash: source_repo,
+                name_hash: source_name,
+                ..
+            },
+            ParsedUid::Service {
+                repo_hash: destination_repo,
+                name_hash: destination_name,
+                ..
+            },
+        ) => source_repo == destination_repo && source_name == destination_name,
+        (
             ParsedUid::Symbol {
                 repo_hash: source_repo,
                 file_hash: source_file,
@@ -452,10 +626,20 @@ fn validate_deterministic_destination(
                 && source_line == destination_line
         }
         (ParsedUid::Project { .. }, ParsedUid::Project { .. }) => true,
+        (
+            ParsedUid::Vault {
+                root_hash: source, ..
+            },
+            ParsedUid::Vault {
+                root_hash: destination,
+                ..
+            },
+        ) => source == destination,
         (ParsedUid::LegacyRepo { .. }, ParsedUid::Repo { .. })
         | (ParsedUid::LegacyFile { .. }, ParsedUid::File { .. })
         | (ParsedUid::LegacySymbol { .. }, ParsedUid::Symbol { .. })
         | (ParsedUid::LegacyProject { .. }, ParsedUid::Project { .. })
+        | (ParsedUid::LegacyVault { .. }, ParsedUid::Vault { .. })
         | (ParsedUid::Project { .. }, ParsedUid::LegacyProject { .. })
         | (ParsedUid::LegacyProject { .. }, ParsedUid::LegacyProject { .. }) => true,
         _ => false,
@@ -520,7 +704,11 @@ fn validate_journal_mappings(
             );
         }
         let target_project_loser = source.is_project() && source.instance() == to_id;
-        if source.instance() != from_id && !target_project_loser && !source.is_legacy_code() {
+        if source.instance() != from_id
+            && !target_project_loser
+            && !source.is_legacy_code()
+            && !source.is_legacy_vault()
+        {
             anyhow::bail!(
                 "instance extension UID remap source belongs to {:?}, expected {:?}",
                 source.instance(),
@@ -589,6 +777,7 @@ fn plan_fingerprint(
     from_id: &str,
     to_id: &str,
     mappings: &[JournalUidRemap],
+    handoffs: &[JournalHandoff],
     finalizers: &InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
 ) -> Result<String, anyhow::Error> {
@@ -597,6 +786,7 @@ fn plan_fingerprint(
         from_id,
         to_id,
         mappings,
+        handoffs,
         finalizers,
         extension_metadata_required,
     ))?;
@@ -624,6 +814,38 @@ fn validate_instance_extension_migration_journal(
         );
     }
     validate_journal_mappings(&journal.from_id, &journal.to_id, &journal.mappings)?;
+    let mapping_pairs: BTreeSet<_> = journal
+        .mappings
+        .iter()
+        .map(|mapping| {
+            (
+                mapping.source_uid.as_str(),
+                mapping.destination_uid.as_str(),
+            )
+        })
+        .collect();
+    let mut previous_handoff: Option<&JournalHandoff> = None;
+    for handoff in &journal.handoffs {
+        if previous_handoff.is_some_and(|previous| previous >= handoff) {
+            anyhow::bail!("instance extension handoffs must be strictly sorted");
+        }
+        previous_handoff = Some(handoff);
+        if !mapping_pairs.contains(&(
+            handoff.source_uid.as_str(),
+            handoff.predicted_destination_uid.as_str(),
+        )) {
+            anyhow::bail!("instance extension handoff is not bound to an exact UID remap");
+        }
+        let kind = parse_instance_migration_uid(&handoff.source_uid)?.kind();
+        let identity_kind = match handoff.identity {
+            JournalHandoffIdentity::File { .. } => "File",
+            JournalHandoffIdentity::Service { .. } => "Service",
+            JournalHandoffIdentity::Symbol { .. } => "Symbol",
+        };
+        if kind != identity_kind {
+            anyhow::bail!("instance extension handoff kind does not match its source UID");
+        }
+    }
     validate_finalizer_plan(&journal.from_id, &journal.mappings, &journal.finalizers)?;
     if journal.mappings.is_empty()
         && journal.finalizers.repo_uids.is_empty()
@@ -638,6 +860,7 @@ fn validate_instance_extension_migration_journal(
         &journal.from_id,
         &journal.to_id,
         &journal.mappings,
+        &journal.handoffs,
         &journal.finalizers,
         journal.extension_metadata_required,
     )?;
@@ -665,6 +888,50 @@ fn canonical_journal_mappings(
     mappings.sort();
     validate_journal_mappings(from_id, to_id, &mappings)?;
     Ok(mappings)
+}
+
+fn canonical_journal_handoffs(
+    handoffs: &[nestweaver_store::InstanceUidHandoff],
+) -> Vec<JournalHandoff> {
+    let mut handoffs: Vec<_> = handoffs
+        .iter()
+        .map(|handoff| JournalHandoff {
+            source_uid: handoff.source_uid.clone(),
+            predicted_destination_uid: handoff.predicted_destination_uid.clone(),
+            identity: match &handoff.identity {
+                nestweaver_store::InstanceUidHandoffIdentity::File {
+                    destination_repo_uid,
+                    path,
+                } => JournalHandoffIdentity::File {
+                    destination_repo_uid: destination_repo_uid.clone(),
+                    path: path.clone(),
+                },
+                nestweaver_store::InstanceUidHandoffIdentity::Service {
+                    destination_repo_uid,
+                    name,
+                } => JournalHandoffIdentity::Service {
+                    destination_repo_uid: destination_repo_uid.clone(),
+                    name: name.clone(),
+                },
+                nestweaver_store::InstanceUidHandoffIdentity::Symbol {
+                    destination_repo_uid,
+                    canonical_id,
+                    file_path,
+                    name,
+                    kind,
+                } => JournalHandoffIdentity::Symbol {
+                    destination_repo_uid: destination_repo_uid.clone(),
+                    canonical_id: canonical_id.clone(),
+                    file_path: file_path.clone(),
+                    name: name.clone(),
+                    kind_name: kind.clone(),
+                },
+            },
+        })
+        .collect();
+    handoffs.sort();
+    handoffs.dedup();
+    handoffs
 }
 
 fn merge_extension_properties(
@@ -713,6 +980,7 @@ fn journal_for_plan(
     from_id: &str,
     to_id: &str,
     mappings: Vec<JournalUidRemap>,
+    handoffs: Vec<JournalHandoff>,
     finalizers: InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
     phase: InstanceMigrationPhase,
@@ -721,6 +989,7 @@ fn journal_for_plan(
         from_id,
         to_id,
         &mappings,
+        &handoffs,
         &finalizers,
         extension_metadata_required,
     )?;
@@ -732,6 +1001,7 @@ fn journal_for_plan(
         from_id: from_id.to_string(),
         to_id: to_id.to_string(),
         mappings,
+        handoffs,
         finalizers,
         extension_metadata_required,
     })
@@ -802,6 +1072,28 @@ pub fn prepare_instance_extension_migration_with_finalizers(
         from_id,
         to_id,
         mappings,
+        &[],
+        finalizers,
+        write_instance_extension_migration_journal,
+    )
+}
+
+/// Prepare an instance migration with the stable identities needed to hand
+/// authored File, Service, and Symbol metadata to the first post-merge index
+/// publication instead of trusting a predicted line-derived UID.
+pub fn prepare_instance_uid_migration_with_finalizers(
+    db_path: &Path,
+    from_id: &str,
+    to_id: &str,
+    plan: &nestweaver_store::InstanceUidMigrationPlan,
+    finalizers: &InstanceMigrationFinalizerPlan,
+) -> Result<InstanceExtensionMigration, anyhow::Error> {
+    prepare_instance_extension_migration_with_finalizers_and_write(
+        db_path,
+        from_id,
+        to_id,
+        &plan.remaps,
+        &plan.handoffs,
         finalizers,
         write_instance_extension_migration_journal,
     )
@@ -830,6 +1122,7 @@ where
         from_id,
         to_id,
         mappings,
+        &[],
         &InstanceMigrationFinalizerPlan {
             repo_uids,
             search_reconciliation_required: false,
@@ -843,6 +1136,7 @@ fn prepare_instance_extension_migration_with_finalizers_and_write<F>(
     from_id: &str,
     to_id: &str,
     mappings: &[nestweaver_store::InstanceUidRemap],
+    handoffs: &[nestweaver_store::InstanceUidHandoff],
     finalizers: &InstanceMigrationFinalizerPlan,
     write_journal: F,
 ) -> Result<InstanceExtensionMigration, anyhow::Error>
@@ -857,6 +1151,7 @@ where
         canonical_journal_mappings(from_id, to_id, mappings).map_err(|error| {
             anyhow::anyhow!("exact current graph plan does not match journal: {error}")
         })?;
+    let current_handoffs = canonical_journal_handoffs(handoffs);
     let current_finalizers = canonical_finalizer_plan(from_id, &current_mappings, finalizers)
         .map_err(|error| {
             anyhow::anyhow!("exact current finalizer plan does not match journal: {error}")
@@ -879,6 +1174,7 @@ where
         }
         if journal.phase != InstanceMigrationPhase::Prepared
             || journal.mappings != current_mappings
+            || journal.handoffs != current_handoffs
             || journal.finalizers != current_finalizers
             || journal.extension_metadata_required != extension_metadata_required
             || journal.plan_fingerprint
@@ -886,6 +1182,7 @@ where
                     from_id,
                     to_id,
                     &current_mappings,
+                    &current_handoffs,
                     &current_finalizers,
                     extension_metadata_required,
                 )?
@@ -917,6 +1214,7 @@ where
         from_id,
         to_id,
         current_mappings,
+        current_handoffs,
         current_finalizers,
         extension_metadata_required,
         InstanceMigrationPhase::Prepared,
@@ -1002,6 +1300,28 @@ pub fn finalize_instance_extension_migration(
     })
 }
 
+fn next_extension_handoff_generation(db_path: &Path) -> Result<u64, anyhow::Error> {
+    let generation_path = crate::sidecar_path(db_path, ".generation");
+    let generation = std::fs::read_to_string(&generation_path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "read graph generation {}: {error}",
+                generation_path.display()
+            )
+        })?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "parse graph generation {}: {error}",
+                generation_path.display()
+            )
+        })?;
+    generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("graph generation exhausted before extension handoff"))
+}
+
 fn finalize_instance_extension_migration_with_remove<F>(
     db_path: &Path,
     migration: &InstanceExtensionMigration,
@@ -1034,7 +1354,66 @@ where
                 extension_path.display()
             )
         })?;
-        let mut changed = merge_extension_properties(&mut store, &journal.to_id, &journal.mappings);
+        let deferred_sources: BTreeSet<&str> = journal
+            .handoffs
+            .iter()
+            .map(|handoff| handoff.source_uid.as_str())
+            .collect();
+        let pending_with_properties: Vec<_> = journal
+            .handoffs
+            .iter()
+            .filter_map(|handoff| {
+                store
+                    .get(&handoff.source_uid)
+                    .map(|properties| PendingExtensionHandoff {
+                        operation_id: journal.operation_id.clone(),
+                        activation_generation: 0,
+                        source_uid: handoff.source_uid.clone(),
+                        predicted_destination_uid: handoff.predicted_destination_uid.clone(),
+                        identity: handoff.identity.clone(),
+                        properties: properties
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                    })
+            })
+            .collect();
+        if !pending_with_properties.is_empty() {
+            let activation_generation = next_extension_handoff_generation(db_path)?;
+            let handoff_path = extension_handoff_journal_path(db_path);
+            let mut entries = load_extension_handoff_journal(&handoff_path)?
+                .map(|journal| journal.entries)
+                .unwrap_or_default();
+            for mut entry in pending_with_properties {
+                entry.activation_generation = activation_generation;
+                if let Some(existing) = entries.iter().find(|existing| {
+                    existing.operation_id == entry.operation_id
+                        && existing.source_uid == entry.source_uid
+                }) {
+                    if existing != &entry {
+                        anyhow::bail!(
+                            "existing extension handoff contradicts the reconciled migration"
+                        );
+                    }
+                } else {
+                    entries.push(entry);
+                }
+            }
+            entries.sort_by(|left, right| {
+                (&left.operation_id, &left.source_uid)
+                    .cmp(&(&right.operation_id, &right.source_uid))
+            });
+            write_extension_handoff_journal(&handoff_path, entries)?;
+        }
+
+        let immediate_mappings: Vec<_> = journal
+            .mappings
+            .iter()
+            .filter(|mapping| !deferred_sources.contains(mapping.source_uid.as_str()))
+            .cloned()
+            .collect();
+        let mut changed =
+            merge_extension_properties(&mut store, &journal.to_id, &immediate_mappings);
         for mapping in &journal.mappings {
             changed |= store.remove(&mapping.source_uid).is_some();
         }
@@ -1069,6 +1448,202 @@ where
         );
     }
     Ok(())
+}
+
+fn resolve_extension_handoff(
+    store: &nestweaver_store::GraphStore,
+    entry: &PendingExtensionHandoff,
+) -> Result<Option<String>, anyhow::Error> {
+    let mut matches = match &entry.identity {
+        JournalHandoffIdentity::File {
+            destination_repo_uid,
+            path,
+        } => store
+            .list_files_by_repo(destination_repo_uid)?
+            .into_iter()
+            .filter(|(_, candidate_path)| candidate_path == path)
+            .map(|(uid, _)| uid)
+            .collect::<Vec<_>>(),
+        JournalHandoffIdentity::Service {
+            destination_repo_uid,
+            name,
+        } => store
+            .list_services(None)?
+            .into_iter()
+            .filter(|service| service.repo_uid == *destination_repo_uid && service.name == *name)
+            .map(|service| service.uid)
+            .collect::<Vec<_>>(),
+        JournalHandoffIdentity::Symbol {
+            destination_repo_uid,
+            canonical_id,
+            file_path,
+            name,
+            kind_name,
+        } => store
+            .lookup_symbols_by_repo(destination_repo_uid)?
+            .into_iter()
+            .filter(|symbol| {
+                if let Some(canonical_id) = canonical_id {
+                    symbol.canonical_id.as_ref() == Some(canonical_id)
+                } else {
+                    symbol.file_path == *file_path
+                        && symbol.name == *name
+                        && symbol.kind.to_string() == *kind_name
+                }
+            })
+            .map(|symbol| symbol.uid)
+            .collect::<Vec<_>>(),
+    };
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        count => anyhow::bail!(
+            "extension handoff {} is ambiguous across {count} live nodes",
+            entry.source_uid
+        ),
+    }
+}
+
+/// Publish pending authored metadata after a later index generation recreates
+/// deferred nodes. Resolution is stable-identity based; zero matches remain
+/// retryable and multiple matches fail closed without mutating either sidecar.
+pub fn reconcile_extension_handoffs(
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+) -> Result<usize, anyhow::Error> {
+    let path = extension_handoff_journal_path(db_path);
+    let Some(journal) = load_extension_handoff_journal(&path)? else {
+        return Ok(0);
+    };
+    let generation = store.graph_generation();
+    let mut resolved = Vec::new();
+    for (index, entry) in journal.entries.iter().enumerate() {
+        if generation < entry.activation_generation {
+            continue;
+        }
+        if let Some(uid) = resolve_extension_handoff(store, entry)? {
+            resolved.push((index, uid));
+        }
+    }
+    if resolved.is_empty() {
+        return Ok(0);
+    }
+
+    let extension_path = sidecar_path(db_path);
+    let mut extensions = load_extensions_strict(&extension_path)?.unwrap_or_default();
+    for (index, destination_uid) in &resolved {
+        let destination = extensions.entry(destination_uid.clone()).or_default();
+        for (key, value) in &journal.entries[*index].properties {
+            destination
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    write_extension_store_durable(&extension_path, &extensions)?;
+
+    let resolved_indexes: BTreeSet<_> = resolved.iter().map(|(index, _)| *index).collect();
+    let remaining: Vec<_> = journal
+        .entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (!resolved_indexes.contains(&index)).then_some(entry))
+        .collect();
+    if remaining.is_empty() {
+        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&path).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "durably remove extension handoff journal {}: {error}",
+                    path.display()
+                )
+            },
+        )?;
+    } else {
+        write_extension_handoff_journal(&path, remaining)?;
+    }
+    Ok(resolved.len())
+}
+
+fn is_graph_node_uid(uid: &str) -> bool {
+    [
+        "repo:",
+        "file:",
+        "svc:",
+        "sym:",
+        "vlt:",
+        "note:",
+        "head:",
+        "sec:",
+        "tag:",
+        "proj:",
+        "contract:",
+        "unresolved:",
+        "tg:",
+    ]
+    .iter()
+    .any(|prefix| uid.starts_with(prefix))
+}
+
+fn is_shared_finalizer_graph_uid(uid: &str) -> bool {
+    is_graph_node_uid(uid) && !uid.starts_with("proj:")
+}
+
+fn protected_migration_source_uids(db_path: &Path) -> Result<BTreeSet<String>, anyhow::Error> {
+    let path = instance_extension_migration_journal_path(db_path);
+    Ok(load_instance_extension_migration_journal(&path)?
+        .into_iter()
+        .flat_map(|journal| journal.mappings.into_iter())
+        .map(|mapping| mapping.source_uid)
+        .collect())
+}
+
+/// Load the query-visible extension view. Graph-shaped UIDs are returned only
+/// while their authoritative graph nodes are live; application-owned keys
+/// that are not graph UIDs remain supported.
+pub fn load_live_extensions(
+    graph: &nestweaver_store::GraphStore,
+    db_path: &Path,
+) -> Result<ExtensionStore, anyhow::Error> {
+    let mut extensions = load_extensions_strict(&sidecar_path(db_path))?.unwrap_or_default();
+    let live = graph.live_graph_node_uids()?;
+    extensions.retain(|uid, _| !is_graph_node_uid(uid) || live.contains(uid));
+    Ok(extensions)
+}
+
+/// Durably remove extension entries whose shared-finalizer graph UID no longer
+/// exists. Project metadata is reconciled by its transaction-aware targeted
+/// deletion path. Sources owned by an unfinished instance-migration journal
+/// are retained so the migration finalizer can stage or publish their metadata
+/// after a crash.
+pub fn reconcile_extension_liveness(
+    graph: &nestweaver_store::GraphStore,
+    db_path: &Path,
+) -> Result<usize, anyhow::Error> {
+    let path = sidecar_path(db_path);
+    let Some(mut extensions) = load_extensions_strict(&path)? else {
+        return Ok(0);
+    };
+    let live = graph.live_graph_node_uids()?;
+    let protected = protected_migration_source_uids(db_path)?;
+    let before = extensions.len();
+    extensions.retain(|uid, _| {
+        !is_shared_finalizer_graph_uid(uid) || live.contains(uid) || protected.contains(uid)
+    });
+    let removed = before - extensions.len();
+    if removed > 0 {
+        write_extension_store_durable(&path, &extensions)?;
+    } else {
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "confirm extension liveness sidecar {}: {error}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    Ok(removed)
 }
 
 /// Remove exactly one UID from the extension sidecar and durably publish the
@@ -1218,6 +1793,117 @@ fn sidecar_path(db_path: &Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn moved_symbol_extension_handoff_is_consumed_by_real_reindex_and_survives_reopen() {
+        use nestweaver_schema::repo_uid;
+        use nestweaver_store::GraphStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        std::fs::create_dir_all(repo_path.join("src")).unwrap();
+        let source_path = repo_path.join("src/lib.rs");
+        std::fs::write(&source_path, "pub fn handler() -> u32 {\n    1\n}\n").unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        let repo_url = "https://github.com/example/extension-handoff";
+
+        crate::index::index_directory_with_options(
+            &repo_path, &db_path, "old", repo_url, "source", true, None,
+        )
+        .unwrap();
+        let store = GraphStore::open(&db_path).unwrap();
+        let source_repo_uid = repo_uid("old", repo_url);
+        let source_symbol = store
+            .lookup_symbols_by_repo(&source_repo_uid)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "handler")
+            .unwrap();
+        let canonical_id = source_symbol.canonical_id.clone().unwrap();
+        let source_uid = source_symbol.uid.clone();
+        let mut extensions = ExtensionStore::new();
+        set_property(
+            &mut extensions,
+            &source_uid,
+            "owner",
+            serde_json::json!("platform"),
+        );
+        save_extensions(&db_path, &extensions).unwrap();
+
+        let plan = store.plan_instance_uid_migration("old", "new").unwrap();
+        let prepared = prepare_instance_uid_migration_with_finalizers(
+            &db_path,
+            "old",
+            "new",
+            &plan,
+            &InstanceMigrationFinalizerPlan {
+                repo_uids: vec![source_repo_uid.clone()],
+                search_reconciliation_required: false,
+            },
+        )
+        .unwrap();
+        store.merge_instance_ids("old", "new").unwrap();
+        let graph_applied =
+            mark_instance_extension_migration_graph_applied(&db_path, &prepared).unwrap();
+        crate::index::finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            std::slice::from_ref(&source_repo_uid),
+            "test instance merge",
+        )
+        .unwrap();
+        let reconciled =
+            mark_instance_extension_migration_reconciled(&db_path, &graph_applied).unwrap();
+        finalize_instance_extension_migration(&db_path, &reconciled).unwrap();
+
+        assert!(!load_extensions(&db_path).contains_key(&source_uid));
+        assert!(extension_handoff_journal_path(&db_path).exists());
+        drop(store);
+
+        std::fs::write(
+            &source_path,
+            "// the declaration moved after the merge\n\n\npub fn handler() -> u32 {\n    2\n}\n",
+        )
+        .unwrap();
+        crate::index::index_directory_with_options(
+            &repo_path,
+            &db_path,
+            "new",
+            repo_url,
+            "destination",
+            true,
+            None,
+        )
+        .unwrap();
+
+        let reopened = GraphStore::open(&db_path).unwrap();
+        let destination_repo_uid = repo_uid("new", repo_url);
+        let destination_symbol = reopened
+            .lookup_symbols_by_repo(&destination_repo_uid)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.canonical_id.as_deref() == Some(canonical_id.as_str()))
+            .unwrap();
+        assert_ne!(destination_symbol.uid, source_uid);
+        assert_ne!(
+            destination_symbol.uid,
+            plan.handoffs[0].predicted_destination_uid
+        );
+        let reopened_extensions = load_extensions(&db_path);
+        assert_eq!(
+            get_property(&reopened_extensions, &destination_symbol.uid, "owner"),
+            Some(&serde_json::json!("platform"))
+        );
+        assert_eq!(
+            query_by_property(
+                &reopened_extensions,
+                "owner",
+                &serde_json::json!("platform")
+            ),
+            vec![destination_symbol.uid]
+        );
+        assert!(!extension_handoff_journal_path(&db_path).exists());
+    }
 
     #[test]
     fn round_trip_save_and_load() {
