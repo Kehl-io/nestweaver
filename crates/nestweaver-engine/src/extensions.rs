@@ -27,13 +27,14 @@ use sha2::{Digest, Sha256};
 /// In-memory extension store: node UID → property map.
 pub type ExtensionStore = HashMap<String, HashMap<String, serde_json::Value>>;
 
-const INSTANCE_MIGRATION_VERSION: u32 = 2;
+const INSTANCE_MIGRATION_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum InstanceMigrationPhase {
     Prepared,
     GraphApplied,
+    Reconciled,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -41,6 +42,19 @@ enum InstanceMigrationPhase {
 struct JournalUidRemap {
     source_uid: String,
     destination_uid: String,
+}
+
+/// Exact post-graph reconciliation inputs captured before an instance merge.
+///
+/// Repo UIDs are the source graph/sidecar scopes that must be purged from
+/// `.filemeta` and `.resolution_deps`. Search reconciliation is selected from
+/// the source vault projection before graph mutation, so a post-crash retry
+/// never has to infer it from an already-mutated graph.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceMigrationFinalizerPlan {
+    pub repo_uids: Vec<String>,
+    pub search_reconciliation_required: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,12 +67,14 @@ struct InstanceExtensionMigrationJournal {
     from_id: String,
     to_id: String,
     mappings: Vec<JournalUidRemap>,
+    finalizers: InstanceMigrationFinalizerPlan,
+    extension_metadata_required: bool,
 }
 
-/// Durable two-phase extension migration prepared before an instance graph
-/// merge. The journal is intentionally opaque to callers: completion must use
-/// [`finalize_instance_extension_migration`] so source keys are removed only
-/// after their destination properties have been durably published.
+/// Durable three-phase instance migration prepared before graph mutation.
+/// The journal is intentionally opaque to callers: completion must use
+/// [`finalize_instance_extension_migration`] so source extension keys are
+/// removed only after graph and derived-state reconciliation are durable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstanceExtensionMigration {
     journal: Option<InstanceExtensionMigrationJournal>,
@@ -80,9 +96,31 @@ impl InstanceExtensionMigration {
     }
 
     pub fn graph_applied(&self) -> bool {
+        self.journal.as_ref().is_some_and(|journal| {
+            matches!(
+                journal.phase,
+                InstanceMigrationPhase::GraphApplied | InstanceMigrationPhase::Reconciled
+            )
+        })
+    }
+
+    pub fn reconciled(&self) -> bool {
         self.journal
             .as_ref()
-            .is_some_and(|journal| journal.phase == InstanceMigrationPhase::GraphApplied)
+            .is_some_and(|journal| journal.phase == InstanceMigrationPhase::Reconciled)
+    }
+
+    pub fn finalizer_repo_uids(&self) -> &[String] {
+        self.journal
+            .as_ref()
+            .map(|journal| journal.finalizers.repo_uids.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn search_reconciliation_required(&self) -> bool {
+        self.journal
+            .as_ref()
+            .is_some_and(|journal| journal.finalizers.search_reconciliation_required)
     }
 
     pub fn uid_remaps(&self) -> Vec<nestweaver_store::InstanceUidRemap> {
@@ -216,6 +254,18 @@ enum ParsedUid<'a> {
         instance: &'a str,
         name_hash: &'a str,
     },
+    LegacyRepo {
+        instance: &'a str,
+    },
+    LegacyFile {
+        instance: &'a str,
+    },
+    LegacySymbol {
+        instance: &'a str,
+    },
+    LegacyProject {
+        instance: &'a str,
+    },
 }
 
 impl ParsedUid<'_> {
@@ -224,7 +274,11 @@ impl ParsedUid<'_> {
             Self::Repo { instance, .. }
             | Self::File { instance, .. }
             | Self::Symbol { instance, .. }
-            | Self::Project { instance, .. } => instance,
+            | Self::Project { instance, .. }
+            | Self::LegacyRepo { instance }
+            | Self::LegacyFile { instance }
+            | Self::LegacySymbol { instance }
+            | Self::LegacyProject { instance } => instance,
         }
     }
 
@@ -234,7 +288,32 @@ impl ParsedUid<'_> {
             Self::File { .. } => "File",
             Self::Symbol { .. } => "Symbol",
             Self::Project { .. } => "Project",
+            Self::LegacyRepo { .. } => "Repo",
+            Self::LegacyFile { .. } => "File",
+            Self::LegacySymbol { .. } => "Symbol",
+            Self::LegacyProject { .. } => "Project",
         }
+    }
+
+    fn is_legacy(&self) -> bool {
+        matches!(
+            self,
+            Self::LegacyRepo { .. }
+                | Self::LegacyFile { .. }
+                | Self::LegacySymbol { .. }
+                | Self::LegacyProject { .. }
+        )
+    }
+
+    fn is_project(&self) -> bool {
+        matches!(self, Self::Project { .. } | Self::LegacyProject { .. })
+    }
+
+    fn is_legacy_code(&self) -> bool {
+        matches!(
+            self,
+            Self::LegacyRepo { .. } | Self::LegacyFile { .. } | Self::LegacySymbol { .. }
+        )
     }
 }
 
@@ -248,6 +327,12 @@ fn is_uid_hash(value: &str) -> bool {
 fn parse_instance_migration_uid(uid: &str) -> Result<ParsedUid<'_>, anyhow::Error> {
     let parts: Vec<&str> = uid.split(':').collect();
     let invalid = || anyhow::anyhow!("non-canonical instance extension UID {uid:?}");
+    let valid_legacy_parts = |parts: &[&str]| {
+        uid.len() <= 4096
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && !part.chars().any(char::is_control))
+    };
     match parts.as_slice() {
         ["repo", instance, repo_hash] if !instance.is_empty() && is_uid_hash(repo_hash) => {
             Ok(ParsedUid::Repo {
@@ -294,6 +379,26 @@ fn parse_instance_migration_uid(uid: &str) -> Result<ParsedUid<'_>, anyhow::Erro
                 instance,
                 name_hash,
             })
+        }
+        ["repo", instance, rest @ ..]
+            if !instance.is_empty() && !rest.is_empty() && valid_legacy_parts(rest) =>
+        {
+            Ok(ParsedUid::LegacyRepo { instance })
+        }
+        ["file", "repo", instance, rest @ ..]
+            if !instance.is_empty() && !rest.is_empty() && valid_legacy_parts(rest) =>
+        {
+            Ok(ParsedUid::LegacyFile { instance })
+        }
+        ["sym", "repo", instance, rest @ ..]
+            if !instance.is_empty() && !rest.is_empty() && valid_legacy_parts(rest) =>
+        {
+            Ok(ParsedUid::LegacySymbol { instance })
+        }
+        ["proj", instance, rest @ ..]
+            if !instance.is_empty() && !rest.is_empty() && valid_legacy_parts(rest) =>
+        {
+            Ok(ParsedUid::LegacyProject { instance })
         }
         _ => Err(invalid()),
     }
@@ -347,6 +452,12 @@ fn validate_deterministic_destination(
                 && source_line == destination_line
         }
         (ParsedUid::Project { .. }, ParsedUid::Project { .. }) => true,
+        (ParsedUid::LegacyRepo { .. }, ParsedUid::Repo { .. })
+        | (ParsedUid::LegacyFile { .. }, ParsedUid::File { .. })
+        | (ParsedUid::LegacySymbol { .. }, ParsedUid::Symbol { .. })
+        | (ParsedUid::LegacyProject { .. }, ParsedUid::Project { .. })
+        | (ParsedUid::Project { .. }, ParsedUid::LegacyProject { .. })
+        | (ParsedUid::LegacyProject { .. }, ParsedUid::LegacyProject { .. }) => true,
         _ => false,
     };
     if !matches {
@@ -362,9 +473,6 @@ fn validate_journal_mappings(
 ) -> Result<(), anyhow::Error> {
     if from_id.is_empty() || to_id.is_empty() || from_id == to_id {
         anyhow::bail!("instance extension migration IDs must be non-empty and distinct");
-    }
-    if mappings.is_empty() {
-        anyhow::bail!("instance extension migration journal must contain at least one UID remap");
     }
     let mut previous_source: Option<&str> = None;
     let sources: BTreeSet<&str> = mappings
@@ -391,6 +499,12 @@ fn validate_journal_mappings(
 
         let source = parse_instance_migration_uid(&mapping.source_uid)?;
         let destination = parse_instance_migration_uid(&mapping.destination_uid)?;
+        if destination.is_legacy() && !destination.is_project() {
+            anyhow::bail!(
+                "instance extension UID remap destination is non-canonical: {}",
+                mapping.destination_uid
+            );
+        }
         if source.kind() != destination.kind() {
             anyhow::bail!(
                 "instance extension UID remap changes kind from {} to {}",
@@ -405,9 +519,8 @@ fn validate_journal_mappings(
                 to_id
             );
         }
-        let target_project_loser =
-            matches!(source, ParsedUid::Project { .. }) && source.instance() == to_id;
-        if source.instance() != from_id && !target_project_loser {
+        let target_project_loser = source.is_project() && source.instance() == to_id;
+        if source.instance() != from_id && !target_project_loser && !source.is_legacy_code() {
             anyhow::bail!(
                 "instance extension UID remap source belongs to {:?}, expected {:?}",
                 source.instance(),
@@ -421,12 +534,72 @@ fn validate_journal_mappings(
     Ok(())
 }
 
+fn validate_finalizer_plan(
+    from_id: &str,
+    mappings: &[JournalUidRemap],
+    finalizers: &InstanceMigrationFinalizerPlan,
+) -> Result<(), anyhow::Error> {
+    let mut previous_repo_uid: Option<&str> = None;
+    for repo_uid in &finalizers.repo_uids {
+        let valid_source_scope = match parse_instance_migration_uid(repo_uid) {
+            Ok(ParsedUid::Repo { instance, .. }) => instance == from_id,
+            Ok(ParsedUid::LegacyRepo { .. }) => true,
+            _ => false,
+        };
+        if !valid_source_scope {
+            anyhow::bail!("invalid source repo finalizer scope {repo_uid:?}");
+        }
+        if previous_repo_uid.is_some_and(|previous| previous >= repo_uid.as_str()) {
+            anyhow::bail!("repo finalizer scopes must be strictly UID sorted");
+        }
+        previous_repo_uid = Some(repo_uid);
+    }
+
+    let finalizer_repo_uids: BTreeSet<&str> =
+        finalizers.repo_uids.iter().map(String::as_str).collect();
+    for mapping in mappings {
+        let source = parse_instance_migration_uid(&mapping.source_uid)?;
+        if matches!(
+            source,
+            ParsedUid::Repo { .. } | ParsedUid::LegacyRepo { .. }
+        ) && !finalizer_repo_uids.contains(mapping.source_uid.as_str())
+        {
+            anyhow::bail!(
+                "repo UID remap source is missing from finalizer scopes: {}",
+                mapping.source_uid
+            );
+        }
+    }
+    Ok(())
+}
+
+fn canonical_finalizer_plan(
+    from_id: &str,
+    mappings: &[JournalUidRemap],
+    finalizers: &InstanceMigrationFinalizerPlan,
+) -> Result<InstanceMigrationFinalizerPlan, anyhow::Error> {
+    let mut canonical = finalizers.clone();
+    canonical.repo_uids.sort();
+    canonical.repo_uids.dedup();
+    validate_finalizer_plan(from_id, mappings, &canonical)?;
+    Ok(canonical)
+}
+
 fn plan_fingerprint(
     from_id: &str,
     to_id: &str,
     mappings: &[JournalUidRemap],
+    finalizers: &InstanceMigrationFinalizerPlan,
+    extension_metadata_required: bool,
 ) -> Result<String, anyhow::Error> {
-    let payload = serde_json::to_vec(&(INSTANCE_MIGRATION_VERSION, from_id, to_id, mappings))?;
+    let payload = serde_json::to_vec(&(
+        INSTANCE_MIGRATION_VERSION,
+        from_id,
+        to_id,
+        mappings,
+        finalizers,
+        extension_metadata_required,
+    ))?;
     let digest = Sha256::digest(payload);
     let mut fingerprint = String::with_capacity(digest.len() * 2);
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -451,7 +624,23 @@ fn validate_instance_extension_migration_journal(
         );
     }
     validate_journal_mappings(&journal.from_id, &journal.to_id, &journal.mappings)?;
-    let fingerprint = plan_fingerprint(&journal.from_id, &journal.to_id, &journal.mappings)?;
+    validate_finalizer_plan(&journal.from_id, &journal.mappings, &journal.finalizers)?;
+    if journal.mappings.is_empty()
+        && journal.finalizers.repo_uids.is_empty()
+        && !journal.finalizers.search_reconciliation_required
+    {
+        anyhow::bail!("instance migration journal has no graph or finalizer work");
+    }
+    if journal.extension_metadata_required && journal.mappings.is_empty() {
+        anyhow::bail!("extension metadata migration requires at least one UID remap");
+    }
+    let fingerprint = plan_fingerprint(
+        &journal.from_id,
+        &journal.to_id,
+        &journal.mappings,
+        &journal.finalizers,
+        journal.extension_metadata_required,
+    )?;
     if journal.plan_fingerprint != fingerprint {
         anyhow::bail!("instance extension migration plan fingerprint mismatch");
     }
@@ -496,9 +685,9 @@ fn merge_extension_properties(
     let mut ordered_mappings: Vec<&JournalUidRemap> = mappings.iter().collect();
     ordered_mappings.sort_by(|left, right| {
         let left_is_target_project = parse_instance_migration_uid(&left.source_uid)
-            .is_ok_and(|uid| matches!(uid, ParsedUid::Project { .. }) && uid.instance() == to_id);
+            .is_ok_and(|uid| uid.is_project() && uid.instance() == to_id);
         let right_is_target_project = parse_instance_migration_uid(&right.source_uid)
-            .is_ok_and(|uid| matches!(uid, ParsedUid::Project { .. }) && uid.instance() == to_id);
+            .is_ok_and(|uid| uid.is_project() && uid.instance() == to_id);
         (!left_is_target_project)
             .cmp(&(!right_is_target_project))
             .then_with(|| left.source_uid.cmp(&right.source_uid))
@@ -524,9 +713,17 @@ fn journal_for_plan(
     from_id: &str,
     to_id: &str,
     mappings: Vec<JournalUidRemap>,
+    finalizers: InstanceMigrationFinalizerPlan,
+    extension_metadata_required: bool,
     phase: InstanceMigrationPhase,
 ) -> Result<InstanceExtensionMigrationJournal, anyhow::Error> {
-    let plan_fingerprint = plan_fingerprint(from_id, to_id, &mappings)?;
+    let plan_fingerprint = plan_fingerprint(
+        from_id,
+        to_id,
+        &mappings,
+        &finalizers,
+        extension_metadata_required,
+    )?;
     Ok(InstanceExtensionMigrationJournal {
         version: INSTANCE_MIGRATION_VERSION,
         phase,
@@ -535,6 +732,8 @@ fn journal_for_plan(
         from_id: from_id.to_string(),
         to_id: to_id.to_string(),
         mappings,
+        finalizers,
+        extension_metadata_required,
     })
 }
 
@@ -545,7 +744,11 @@ pub fn pending_instance_extension_migration(
 ) -> Result<InstanceExtensionMigration, anyhow::Error> {
     let journal_path = instance_extension_migration_journal_path(db_path);
     let journal = load_instance_extension_migration_journal(&journal_path)?;
-    if journal.is_some() && load_extensions_strict(&sidecar_path(db_path))?.is_none() {
+    if journal
+        .as_ref()
+        .is_some_and(|journal| journal.extension_metadata_required)
+        && load_extensions_strict(&sidecar_path(db_path))?.is_none()
+    {
         anyhow::bail!(
             "instance extension migration journal {} exists but extension sidecar is missing",
             journal_path.display()
@@ -566,15 +769,45 @@ pub fn prepare_instance_extension_migration(
     to_id: &str,
     mappings: &[nestweaver_store::InstanceUidRemap],
 ) -> Result<InstanceExtensionMigration, anyhow::Error> {
-    prepare_instance_extension_migration_with_write(
+    let mut repo_uids: Vec<String> = mappings
+        .iter()
+        .filter(|mapping| mapping.source_uid.starts_with("repo:"))
+        .map(|mapping| mapping.source_uid.clone())
+        .collect();
+    repo_uids.sort();
+    repo_uids.dedup();
+    prepare_instance_extension_migration_with_finalizers(
         db_path,
         from_id,
         to_id,
         mappings,
+        &InstanceMigrationFinalizerPlan {
+            repo_uids,
+            search_reconciliation_required: false,
+        },
+    )
+}
+
+/// Durably prepare an instance migration together with its exact post-graph
+/// reconciliation context.
+pub fn prepare_instance_extension_migration_with_finalizers(
+    db_path: &Path,
+    from_id: &str,
+    to_id: &str,
+    mappings: &[nestweaver_store::InstanceUidRemap],
+    finalizers: &InstanceMigrationFinalizerPlan,
+) -> Result<InstanceExtensionMigration, anyhow::Error> {
+    prepare_instance_extension_migration_with_finalizers_and_write(
+        db_path,
+        from_id,
+        to_id,
+        mappings,
+        finalizers,
         write_instance_extension_migration_journal,
     )
 }
 
+#[cfg(test)]
 fn prepare_instance_extension_migration_with_write<F>(
     db_path: &Path,
     from_id: &str,
@@ -585,20 +818,54 @@ fn prepare_instance_extension_migration_with_write<F>(
 where
     F: FnOnce(&Path, &InstanceExtensionMigrationJournal) -> Result<(), anyhow::Error>,
 {
+    let mut repo_uids: Vec<String> = mappings
+        .iter()
+        .filter(|mapping| mapping.source_uid.starts_with("repo:"))
+        .map(|mapping| mapping.source_uid.clone())
+        .collect();
+    repo_uids.sort();
+    repo_uids.dedup();
+    prepare_instance_extension_migration_with_finalizers_and_write(
+        db_path,
+        from_id,
+        to_id,
+        mappings,
+        &InstanceMigrationFinalizerPlan {
+            repo_uids,
+            search_reconciliation_required: false,
+        },
+        write_journal,
+    )
+}
+
+fn prepare_instance_extension_migration_with_finalizers_and_write<F>(
+    db_path: &Path,
+    from_id: &str,
+    to_id: &str,
+    mappings: &[nestweaver_store::InstanceUidRemap],
+    finalizers: &InstanceMigrationFinalizerPlan,
+    write_journal: F,
+) -> Result<InstanceExtensionMigration, anyhow::Error>
+where
+    F: FnOnce(&Path, &InstanceExtensionMigrationJournal) -> Result<(), anyhow::Error>,
+{
     let extension_path = sidecar_path(db_path);
     let journal_path = instance_extension_migration_journal_path(db_path);
     let store = load_extensions_strict(&extension_path)?;
     let existing_journal = load_instance_extension_migration_journal(&journal_path)?;
-    let Some(store) = store else {
-        if existing_journal.is_some() {
-            anyhow::bail!(
-                "instance extension migration journal {} exists but extension sidecar {} is missing",
-                journal_path.display(),
-                extension_path.display()
-            );
-        }
-        return Ok(InstanceExtensionMigration { journal: None });
-    };
+    let current_mappings =
+        canonical_journal_mappings(from_id, to_id, mappings).map_err(|error| {
+            anyhow::anyhow!("exact current graph plan does not match journal: {error}")
+        })?;
+    let current_finalizers = canonical_finalizer_plan(from_id, &current_mappings, finalizers)
+        .map_err(|error| {
+            anyhow::anyhow!("exact current finalizer plan does not match journal: {error}")
+        })?;
+    let extension_metadata_required = store.as_ref().is_some_and(|store| {
+        current_mappings
+            .iter()
+            .any(|mapping| store.contains_key(&mapping.source_uid))
+    });
 
     if let Some(journal) = existing_journal {
         if journal.from_id != from_id || journal.to_id != to_id {
@@ -610,16 +877,21 @@ where
                 to_id
             );
         }
-        let current_mappings =
-            canonical_journal_mappings(from_id, to_id, mappings).map_err(|error| {
-                anyhow::anyhow!("exact current graph plan does not match journal: {error}")
-            })?;
         if journal.phase != InstanceMigrationPhase::Prepared
             || journal.mappings != current_mappings
-            || journal.plan_fingerprint != plan_fingerprint(from_id, to_id, &current_mappings)?
+            || journal.finalizers != current_finalizers
+            || journal.extension_metadata_required != extension_metadata_required
+            || journal.plan_fingerprint
+                != plan_fingerprint(
+                    from_id,
+                    to_id,
+                    &current_mappings,
+                    &current_finalizers,
+                    extension_metadata_required,
+                )?
         {
             anyhow::bail!(
-                "unfinished instance extension migration does not match the exact current graph plan"
+                "unfinished instance extension migration does not match the exact current graph and finalizer plan"
             );
         }
         nestweaver_store::durable_sidecar::sync_parent_directory_durable(&journal_path).map_err(
@@ -635,15 +907,20 @@ where
         });
     }
 
-    if mappings.is_empty()
-        || !mappings
-            .iter()
-            .any(|mapping| store.contains_key(&mapping.source_uid))
+    if current_mappings.is_empty()
+        && current_finalizers.repo_uids.is_empty()
+        && !current_finalizers.search_reconciliation_required
     {
         return Ok(InstanceExtensionMigration { journal: None });
     }
-    let mappings = canonical_journal_mappings(from_id, to_id, mappings)?;
-    let journal = journal_for_plan(from_id, to_id, mappings, InstanceMigrationPhase::Prepared)?;
+    let journal = journal_for_plan(
+        from_id,
+        to_id,
+        current_mappings,
+        current_finalizers,
+        extension_metadata_required,
+        InstanceMigrationPhase::Prepared,
+    )?;
     write_journal(&journal_path, &journal)?;
     Ok(InstanceExtensionMigration {
         journal: Some(journal),
@@ -673,6 +950,37 @@ pub fn mark_instance_extension_migration_graph_applied(
         anyhow::bail!("instance extension migration journal was not in prepared phase");
     }
     current.phase = InstanceMigrationPhase::GraphApplied;
+    write_instance_extension_migration_journal(&journal_path, &current)?;
+    Ok(InstanceExtensionMigration {
+        journal: Some(current),
+    })
+}
+
+/// Durably record that every required generation/PageRank, code-sidecar, and
+/// search-index finalizer completed. Extension metadata is not published and
+/// the recovery journal is not removed until this phase is durable.
+pub fn mark_instance_extension_migration_reconciled(
+    db_path: &Path,
+    migration: &InstanceExtensionMigration,
+) -> Result<InstanceExtensionMigration, anyhow::Error> {
+    let Some(expected) = &migration.journal else {
+        return Ok(migration.clone());
+    };
+    let journal_path = instance_extension_migration_journal_path(db_path);
+    let mut current =
+        load_instance_extension_migration_journal(&journal_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "instance extension migration journal {} disappeared before reconciliation",
+                journal_path.display()
+            )
+        })?;
+    if &current != expected {
+        anyhow::bail!("instance extension migration journal changed before reconciliation");
+    }
+    if current.phase != InstanceMigrationPhase::GraphApplied {
+        anyhow::bail!("instance extension migration journal was not graph-applied");
+    }
+    current.phase = InstanceMigrationPhase::Reconciled;
     write_instance_extension_migration_journal(&journal_path, &current)?;
     Ok(InstanceExtensionMigration {
         journal: Some(current),
@@ -716,30 +1024,31 @@ where
     if &current != journal {
         anyhow::bail!("instance extension migration journal changed before completion");
     }
-    if journal.phase != InstanceMigrationPhase::GraphApplied {
-        anyhow::bail!("instance extension migration graph is not durably marked applied");
+    if journal.phase != InstanceMigrationPhase::Reconciled {
+        anyhow::bail!("instance migration finalizers are not durably marked reconciled");
     }
-    let mut store = load_extensions_strict(&extension_path)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "extension sidecar {} disappeared during instance migration",
-            extension_path.display()
-        )
-    })?;
-    let mut changed = merge_extension_properties(&mut store, &journal.to_id, &journal.mappings);
-    for mapping in &journal.mappings {
-        changed |= store.remove(&mapping.source_uid).is_some();
-    }
-    if changed {
-        write_extension_store_durable(&extension_path, &store)?;
-    } else {
-        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&extension_path).map_err(
-            |error| {
-                anyhow::anyhow!(
-                    "confirm finalized extension sidecar {}: {error}",
-                    extension_path.display()
-                )
-            },
-        )?;
+    if journal.extension_metadata_required {
+        let mut store = load_extensions_strict(&extension_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "extension sidecar {} disappeared during instance migration",
+                extension_path.display()
+            )
+        })?;
+        let mut changed = merge_extension_properties(&mut store, &journal.to_id, &journal.mappings);
+        for mapping in &journal.mappings {
+            changed |= store.remove(&mapping.source_uid).is_some();
+        }
+        if changed {
+            write_extension_store_durable(&extension_path, &store)?;
+        } else {
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&extension_path)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "confirm finalized extension sidecar {}: {error}",
+                        extension_path.display()
+                    )
+                })?;
+        }
     }
     if let Err(error) = remove_journal(&journal_path) {
         // A durable unlink can fail after the namespace removal but before its
@@ -1087,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_migration_is_two_phase_deterministic_and_retryable() {
+    fn instance_migration_is_three_phase_deterministic_and_retryable() {
         use nestweaver_store::InstanceUidRemap;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1188,7 +1497,8 @@ mod tests {
         // validated graph-applied journal instead of accepting an empty plan.
         let retried = pending_instance_extension_migration(&db_path).unwrap();
         assert_eq!(retried, graph_applied);
-        finalize_instance_extension_migration(&db_path, &retried).unwrap();
+        let reconciled = mark_instance_extension_migration_reconciled(&db_path, &retried).unwrap();
+        finalize_instance_extension_migration(&db_path, &reconciled).unwrap();
 
         let finalized = load_extensions(&db_path);
         for source in [target_loser, source_a, source_z, source_project] {
@@ -1239,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_migration_missing_sidecar_is_noop() {
+    fn instance_migration_missing_extension_sidecar_still_journals_finalizers() {
         use nestweaver_store::InstanceUidRemap;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1255,8 +1565,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!migration.is_active());
-        finalize_instance_extension_migration(&db_path, &migration).unwrap();
+        assert!(migration.is_active());
+        assert_eq!(
+            migration.finalizer_repo_uids(),
+            &["repo:old:aaaaaaaaaaaa".to_string()]
+        );
+        let graph_applied =
+            mark_instance_extension_migration_graph_applied(&db_path, &migration).unwrap();
+        let reconciled =
+            mark_instance_extension_migration_reconciled(&db_path, &graph_applied).unwrap();
+        finalize_instance_extension_migration(&db_path, &reconciled).unwrap();
         assert!(!sidecar_path(&db_path).exists());
         assert!(!instance_extension_migration_journal_path(&db_path).exists());
     }
@@ -1304,6 +1622,64 @@ mod tests {
     }
 
     #[test]
+    fn instance_migration_journal_binds_finalizers_and_requires_reconciled_phase() {
+        use nestweaver_store::InstanceUidRemap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let source = "repo:old:aaaaaaaaaaaa";
+        let destination = "repo:new:aaaaaaaaaaaa";
+        let legacy_scope = "repo:old:legacy-source-scope";
+        let mut store = ExtensionStore::new();
+        set_property(&mut store, source, "owner", serde_json::json!("source"));
+        save_extensions(&db_path, &store).unwrap();
+
+        let migration = prepare_instance_extension_migration_with_finalizers(
+            &db_path,
+            "old",
+            "new",
+            &[InstanceUidRemap {
+                source_uid: source.to_string(),
+                destination_uid: destination.to_string(),
+            }],
+            &InstanceMigrationFinalizerPlan {
+                repo_uids: vec![source.to_string(), legacy_scope.to_string()],
+                search_reconciliation_required: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            migration.finalizer_repo_uids(),
+            &[source.to_string(), legacy_scope.to_string()]
+        );
+        assert!(migration.search_reconciliation_required());
+        let journal_path = instance_extension_migration_journal_path(&db_path);
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(journal["version"], 3);
+        assert_eq!(journal["phase"], "prepared");
+        assert_eq!(
+            journal["finalizers"]["repo_uids"],
+            serde_json::json!([source, legacy_scope])
+        );
+        assert_eq!(
+            journal["finalizers"]["search_reconciliation_required"],
+            true
+        );
+
+        let graph_applied =
+            mark_instance_extension_migration_graph_applied(&db_path, &migration).unwrap();
+        let error = finalize_instance_extension_migration(&db_path, &graph_applied).unwrap_err();
+        assert!(error.to_string().contains("reconciled"));
+        let reconciled =
+            mark_instance_extension_migration_reconciled(&db_path, &graph_applied).unwrap();
+        assert!(reconciled.reconciled());
+        finalize_instance_extension_migration(&db_path, &reconciled).unwrap();
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
     fn existing_instance_migration_journal_requires_the_exact_current_plan() {
         use nestweaver_store::InstanceUidRemap;
 
@@ -1337,14 +1713,35 @@ mod tests {
         let extra_error =
             prepare_instance_extension_migration(&db_path, "old", "new", &[first.clone(), extra])
                 .unwrap_err();
-        assert!(extra_error.to_string().contains("exact current graph plan"));
+        assert!(
+            extra_error
+                .to_string()
+                .contains("exact current graph and finalizer plan")
+        );
 
         let missing_error =
             prepare_instance_extension_migration(&db_path, "old", "new", &[]).unwrap_err();
         assert!(
             missing_error
                 .to_string()
-                .contains("exact current graph plan")
+                .contains("exact current graph and finalizer plan")
+        );
+
+        let changed_finalizer_error = prepare_instance_extension_migration_with_finalizers(
+            &db_path,
+            "old",
+            "new",
+            std::slice::from_ref(&first),
+            &InstanceMigrationFinalizerPlan {
+                repo_uids: vec![first.source_uid.clone()],
+                search_reconciliation_required: true,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            changed_finalizer_error
+                .to_string()
+                .contains("exact current graph and finalizer plan")
         );
     }
 
@@ -1408,6 +1805,25 @@ mod tests {
         fn mismatched_pair(journal: &mut serde_json::Value) {
             journal["from_id"] = serde_json::json!("other");
         }
+        fn wrong_finalizer_instance(journal: &mut serde_json::Value) {
+            journal["finalizers"]["repo_uids"][0] = serde_json::json!("repo:other:aaaaaaaaaaaa");
+        }
+        fn missing_repo_finalizer(journal: &mut serde_json::Value) {
+            journal["finalizers"]["repo_uids"] = serde_json::json!([]);
+        }
+        fn unsorted_repo_finalizers(journal: &mut serde_json::Value) {
+            journal["finalizers"]["repo_uids"] =
+                serde_json::json!(["repo:old:bbbbbbbbbbbb", "repo:old:aaaaaaaaaaaa"]);
+        }
+        fn wrong_search_finalizer(journal: &mut serde_json::Value) {
+            journal["finalizers"]["search_reconciliation_required"] = serde_json::json!(true);
+        }
+        fn wrong_extension_requirement(journal: &mut serde_json::Value) {
+            journal["extension_metadata_required"] = serde_json::json!(false);
+        }
+        fn unknown_finalizer_field(journal: &mut serde_json::Value) {
+            journal["finalizers"]["invented"] = serde_json::json!(true);
+        }
 
         type JournalTamper = fn(&mut serde_json::Value);
         type TamperCase = (&'static str, JournalTamper);
@@ -1425,6 +1841,12 @@ mod tests {
             ("duplicate", duplicate_mapping),
             ("chain", chained_project_mappings),
             ("pair", mismatched_pair),
+            ("finalizer-instance", wrong_finalizer_instance),
+            ("finalizer-missing-repo", missing_repo_finalizer),
+            ("finalizer-unsorted", unsorted_repo_finalizers),
+            ("finalizer-search", wrong_search_finalizer),
+            ("extension-required", wrong_extension_requirement),
+            ("finalizer-unknown-field", unknown_finalizer_field),
         ];
 
         for (case, tamper) in cases {
@@ -1532,9 +1954,11 @@ mod tests {
         .unwrap();
         let graph_applied =
             mark_instance_extension_migration_graph_applied(&db_path, &prepared).unwrap();
+        let reconciled =
+            mark_instance_extension_migration_reconciled(&db_path, &graph_applied).unwrap();
 
         let error =
-            finalize_instance_extension_migration_with_remove(&db_path, &graph_applied, |path| {
+            finalize_instance_extension_migration_with_remove(&db_path, &reconciled, |path| {
                 nestweaver_store::durable_sidecar::remove_file_durable_if_exists(path)?;
                 Err(std::io::Error::other(
                     "injected parent sync failure after real journal unlink",
@@ -1551,7 +1975,7 @@ mod tests {
         );
 
         let retried = pending_instance_extension_migration(&db_path).unwrap();
-        assert!(retried.graph_applied());
+        assert!(retried.reconciled());
         finalize_instance_extension_migration(&db_path, &retried).unwrap();
         assert!(!instance_extension_migration_journal_path(&db_path).exists());
     }

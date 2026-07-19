@@ -1623,59 +1623,198 @@ where
     F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
     R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
 {
-    run_merge_instance_with_extension_ops(
-        state,
-        from_id,
-        to_id,
-        merge,
-        reconcile_search,
-        |store, db_path, from_id, to_id| {
-            let pending = nestweaver_engine::pending_instance_extension_migration(db_path)?;
-            let migration = if pending.is_active() {
-                if pending.from_id() != Some(from_id) || pending.to_id() != Some(to_id) {
-                    anyhow::bail!(
-                        "pending extension migration {:?} -> {:?} conflicts with requested {from_id:?} -> {to_id:?}",
-                        pending.from_id(),
-                        pending.to_id()
-                    );
-                }
-                let state = store.verify_instance_uid_remap_plan_state(
-                    from_id,
-                    to_id,
-                    &pending.uid_remaps(),
-                )?;
-                if pending.graph_applied()
-                    && state == nestweaver_store::InstanceUidRemapPlanState::Prepared
-                {
-                    anyhow::bail!(
-                        "extension migration is marked graph-applied but source graph rows remain"
-                    );
-                }
-                pending
-            } else {
-                let mappings = store
-                    .plan_instance_uid_remaps(from_id, to_id)
-                    .map_err(anyhow::Error::from)?;
-                nestweaver_engine::prepare_instance_extension_migration(
-                    db_path, from_id, to_id, &mappings,
-                )?
-            };
-            let active = migration.is_active();
-            Ok((migration, active))
+    let mut reconcile_search = reconcile_search;
+    let pending = nestweaver_engine::pending_instance_extension_migration(&state.db_path).map_err(
+        |error| {
+            Status::internal(format!(
+                "merge_instance migration-journal preparation failed: {error:#}"
+            ))
         },
-        |db_path, migration| {
-            let graph_applied = if migration.graph_applied() {
-                migration.clone()
+    )?;
+    let migration = if pending.is_active() {
+        if pending.from_id() != Some(from_id) || pending.to_id() != Some(to_id) {
+            return Err(Status::internal(format!(
+                "pending instance migration {:?} -> {:?} conflicts with requested {from_id:?} -> {to_id:?}",
+                pending.from_id(),
+                pending.to_id()
+            )));
+        }
+        let remaps = pending.uid_remaps();
+        let graph_state = if remaps.is_empty() {
+            if state
+                .store
+                .list_vaults(Some(from_id))
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "verify pending vault migration state failed: {error:#}"
+                    ))
+                })?
+                .is_empty()
+            {
+                nestweaver_store::InstanceUidRemapPlanState::Applied
             } else {
-                nestweaver_engine::mark_instance_extension_migration_graph_applied(
-                    db_path, migration,
-                )?
+                nestweaver_store::InstanceUidRemapPlanState::Prepared
+            }
+        } else {
+            state
+                .store
+                .verify_instance_uid_remap_plan_state(from_id, to_id, &remaps)
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "verify pending instance migration graph state failed: {error:#}"
+                    ))
+                })?
+        };
+        if pending.graph_applied()
+            && graph_state == nestweaver_store::InstanceUidRemapPlanState::Prepared
+        {
+            return Err(Status::internal(
+                "instance migration is marked graph-applied but source graph rows remain",
+            ));
+        }
+        pending
+    } else {
+        let mappings = state
+            .store
+            .plan_instance_uid_remaps(from_id, to_id)
+            .map_err(|error| {
+                Status::internal(format!(
+                    "merge failed to plan instance UID remaps: {error:#}"
+                ))
+            })?;
+        let repo_uids = list_instance_code_repo_uids(&state.store, from_id).map_err(|error| {
+            Status::internal(format!("merge failed to list code repos: {error:#}"))
+        })?;
+        let search_reconciliation_required = !state
+            .store
+            .list_vaults(Some(from_id))
+            .map_err(|error| {
+                Status::internal(format!("merge failed to project source vaults: {error:#}"))
+            })?
+            .is_empty();
+        nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+            &state.db_path,
+            from_id,
+            to_id,
+            &mappings,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan {
+                repo_uids,
+                search_reconciliation_required,
+            },
+        )
+        .map_err(|error| {
+            Status::internal(format!(
+                "merge_instance migration-journal preparation failed: {error:#}"
+            ))
+        })?
+    };
+
+    if migration.reconciled() {
+        nestweaver_engine::finalize_instance_extension_migration(&state.db_path, &migration)
+            .map_err(|error| {
+                Status::internal(format!(
+                    "merge_instance extension-metadata completion failed: {error:#}"
+                ))
+            })?;
+        return Ok(empty_instance_merge_result());
+    }
+
+    let mutation = if migration.graph_applied() {
+        Ok(empty_instance_merge_result())
+    } else {
+        merge(&state.store, from_id, to_id)
+    };
+    let result = match mutation {
+        Ok(result) => result,
+        Err(error) => {
+            let mut failures = if migration.finalizer_repo_uids().is_empty() {
+                finalize_node_graph_deletion(state, "merge_instance_error")
+            } else {
+                finalize_code_graph_deletion(state, migration.finalizer_repo_uids())
             };
-            nestweaver_engine::finalize_instance_extension_migration(db_path, &graph_applied)
-        },
+            if migration.search_reconciliation_required() {
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(
+                        state,
+                        IndexedSearchMutation::Changed,
+                        "merge_instance_error",
+                    ),
+                );
+            }
+            return finish_reconciled_mutation(
+                Err(Status::internal(format!(
+                    "merge_instance_ids failed: {error:#}"
+                ))),
+                "merge_instance_error",
+                failures,
+            );
+        }
+    };
+
+    if !migration.is_active() {
+        return Ok(result);
+    }
+    let graph_applied = if migration.graph_applied() {
+        migration
+    } else {
+        nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &migration,
+        )
+        .map_err(|error| {
+            Status::internal(format!(
+                "merge_instance graph-applied journal persistence failed: {error:#}"
+            ))
+        })?
+    };
+
+    let mut failures = if graph_applied.finalizer_repo_uids().is_empty() {
+        finalize_node_graph_deletion(state, "merge_instance")
+    } else {
+        finalize_code_graph_deletion(state, graph_applied.finalizer_repo_uids())
+    };
+    if graph_applied.search_reconciliation_required() {
+        append_search_reconciliation(
+            &mut failures,
+            reconcile_search(state, IndexedSearchMutation::Changed, "merge_instance"),
+        );
+    }
+    if !failures.is_empty() {
+        return finish_reconciled_mutation(Ok(result), "merge_instance", failures);
+    }
+
+    let reconciled = nestweaver_engine::mark_instance_extension_migration_reconciled(
+        &state.db_path,
+        &graph_applied,
     )
+    .map_err(|error| {
+        Status::internal(format!(
+            "merge_instance reconciled journal persistence failed: {error:#}"
+        ))
+    })?;
+    nestweaver_engine::finalize_instance_extension_migration(&state.db_path, &reconciled).map_err(
+        |error| {
+            Status::internal(format!(
+                "merge_instance extension-metadata completion failed: {error:#}"
+            ))
+        },
+    )?;
+    Ok(result)
 }
 
+fn empty_instance_merge_result() -> nestweaver_store::MergeResult {
+    nestweaver_store::MergeResult {
+        vaults: 0,
+        repos: 0,
+        projects: 0,
+        discarded: Vec::new(),
+        repos_moved: Vec::new(),
+        repo_uids_removed: Vec::new(),
+    }
+}
+
+#[cfg(test)]
 fn run_merge_instance_with_extension_ops<F, R, P, Prepare, Complete>(
     state: &DaemonState,
     from_id: &str,
@@ -8087,6 +8226,353 @@ mod startup_helper_tests {
         assert_eq!(
             nestweaver_engine::get_property(&extensions, &destination_uid, "nested"),
             Some(&serde_json::json!({"automatic": [true, {"depth": 3}]}))
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_uses_graph_applied_journal_for_code_sidecars() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let state = test_state_with_writer();
+        let url = "https://example.test/crash-recovery-code";
+        let source_uid = repo_uid("old", url);
+        let mut repo = test_repo(&source_uid, url, None);
+        repo.instance_id = "old".to_string();
+        state.store.insert_repo(&repo).unwrap();
+
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(source_uid.clone()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let deps_path = nestweaver_engine::sidecar_path(&state.db_path, ".resolution_deps.bin");
+        let mut deps = nestweaver_engine::resolution_cache::ResolutionDeps::default();
+        deps.set_deps_for_repo(
+            &source_uid,
+            "src/lib.rs",
+            std::collections::HashSet::from(["src/dep.rs".to_string()]),
+        );
+        deps.save(&deps_path).unwrap();
+
+        let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+        let prepared = nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &mappings,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan {
+                repo_uids: vec![source_uid.clone()],
+                search_reconciliation_required: false,
+            },
+        )
+        .unwrap();
+        state.store.merge_instance_ids("old", "new").unwrap();
+        nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &prepared,
+        )
+        .unwrap();
+
+        assert!(
+            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&source_uid)
+        );
+        assert!(
+            !nestweaver_engine::resolution_cache::ResolutionDeps::load(&deps_path)
+                .is_empty_for_repo(&source_uid)
+        );
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&source_uid),
+            "post-graph recovery selected node-only finalization"
+        );
+        assert!(
+            nestweaver_engine::resolution_cache::ResolutionDeps::load(&deps_path)
+                .is_empty_for_repo(&source_uid)
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_uses_graph_applied_journal_for_tantivy() {
+        use nestweaver_schema::uid::vault_uid;
+
+        let state = test_state_with_writer();
+        let root = "/missing/crash-recovery-vault";
+        let source_vault_uid = vault_uid("old", root);
+        let (source_note_uid, _) =
+            seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
+        reconcile_search_index(
+            &state.search_reconciliation,
+            &state.store,
+            IndexedSearchMutation::Changed,
+            "seed_crash_recovery_vault",
+        )
+        .unwrap();
+
+        let prepared = nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &[],
+            &nestweaver_engine::InstanceMigrationFinalizerPlan {
+                repo_uids: Vec::new(),
+                search_reconciliation_required: true,
+            },
+        )
+        .unwrap();
+        state.store.merge_instance_ids("old", "new").unwrap();
+        nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &prepared,
+        )
+        .unwrap();
+        let destination_vault_uid = state.store.list_vaults(Some("new")).unwrap()[0].uid.clone();
+        let stale_hits = state.tantivy.as_ref().unwrap().search("Note", 10).unwrap();
+        assert!(
+            stale_hits
+                .iter()
+                .any(|hit| { hit.uid == source_note_uid && hit.vault_uid == source_vault_uid })
+        );
+        assert!(
+            !stale_hits.iter().any(|hit| {
+                hit.uid == source_note_uid && hit.vault_uid == destination_vault_uid
+            })
+        );
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        let recovered_hits = state.tantivy.as_ref().unwrap().search("Note", 10).unwrap();
+        assert!(
+            !recovered_hits
+                .iter()
+                .any(|hit| { hit.uid == source_note_uid && hit.vault_uid == source_vault_uid })
+        );
+        assert!(
+            recovered_hits
+                .iter()
+                .any(|hit| hit.uid == source_note_uid && hit.vault_uid == destination_vault_uid)
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn graph_applied_finalizer_failure_keeps_journal_for_retry() {
+        use nestweaver_schema::uid::vault_uid;
+
+        let state = test_state_with_writer();
+        let root = "/missing/retry-search-finalizer";
+        let source_vault_uid = vault_uid("old", root);
+        seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| {
+                Err(anyhow::anyhow!(
+                    "injected persisted search finalizer failure"
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("persisted search finalizer failure")
+        );
+        let pending =
+            nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
+        assert!(pending.graph_applied());
+        assert!(!pending.reconciled());
+        assert!(pending.search_reconciliation_required());
+
+        let mut retries = 0;
+        run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, mutation, _operation| {
+                retries += 1;
+                assert_eq!(mutation, IndexedSearchMutation::Changed);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(retries, 1);
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn real_code_finalizer_persistence_failure_keeps_graph_applied_journal() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let state = test_state_with_writer();
+        let url = "https://example.test/real-finalizer-retry";
+        let source_uid = repo_uid("old", url);
+        let mut repo = test_repo(&source_uid, url, None);
+        repo.instance_id = "old".to_string();
+        state.store.insert_repo(&repo).unwrap();
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        std::fs::create_dir(&generation_path).unwrap();
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.message().contains("generation-persistence"));
+        let pending =
+            nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
+        assert!(pending.graph_applied());
+        assert!(!pending.reconciled());
+        assert_eq!(pending.finalizer_repo_uids(), &[source_uid]);
+
+        std::fs::remove_dir(&generation_path).unwrap();
+        recover_pending_instance_extension_migration(&state).unwrap();
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn unavailable_search_finalizer_keeps_graph_applied_journal_until_restart_retry() {
+        use nestweaver_schema::uid::vault_uid;
+
+        let mut state = test_state_with_writer();
+        let root = "/missing/unavailable-search-retry";
+        let source_vault_uid = vault_uid("old", root);
+        seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
+        Arc::get_mut(&mut state).unwrap().search_reconciliation =
+            SearchIndexReconciliation::Unavailable("injected writer outage".to_string());
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            rebuild_tantivy_after_mutation,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("configured Tantivy index unavailable")
+        );
+        let pending =
+            nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
+        assert!(pending.graph_applied());
+        assert!(!pending.reconciled());
+        assert!(pending.search_reconciliation_required());
+
+        let tantivy = Arc::clone(state.tantivy.as_ref().unwrap());
+        Arc::get_mut(&mut state).unwrap().search_reconciliation =
+            SearchIndexReconciliation::Available(tantivy);
+        recover_pending_instance_extension_migration(&state).unwrap();
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn reconciled_retry_skips_graph_and_finalizers_then_finishes_extensions() {
+        use nestweaver_schema::uid::project_uid;
+
+        let state = test_state_with_writer();
+        let source_uid = project_uid("old", "Reconciled retry");
+        let destination_uid = project_uid("new", "Reconciled retry");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_uid.clone(),
+                name: "Reconciled retry".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        seed_extension(&state, &source_uid, "owner", serde_json::json!("source"));
+        let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+        let prepared = nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &mappings,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan::default(),
+        )
+        .unwrap();
+        state.store.merge_instance_ids("old", "new").unwrap();
+        let graph_applied = nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &prepared,
+        )
+        .unwrap();
+        assert!(finalize_node_graph_deletion(&state, "test_reconciled_retry").is_empty());
+        let pagerank_generation = state.store.pagerank_generation();
+        nestweaver_engine::mark_instance_extension_migration_reconciled(
+            &state.db_path,
+            &graph_applied,
+        )
+        .unwrap();
+        let merge_calls = std::cell::Cell::new(0);
+        let search_calls = std::cell::Cell::new(0);
+
+        run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |_store, _from, _to| {
+                merge_calls.set(merge_calls.get() + 1);
+                unreachable!("reconciled retry must not re-run graph mutation")
+            },
+            |_state, _mutation, _operation| {
+                search_calls.set(search_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(merge_calls.get(), 0);
+        assert_eq!(search_calls.get(), 0);
+        assert_eq!(state.store.pagerank_generation(), pagerank_generation);
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!extensions.contains_key(&source_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_uid, "owner"),
+            Some(&serde_json::json!("source"))
         );
         assert!(
             !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()

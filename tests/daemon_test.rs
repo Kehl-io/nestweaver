@@ -1388,6 +1388,180 @@ fn restored_pending_extension_migration_recovers_automatically_on_daemon_start()
 }
 
 #[test]
+fn daemon_start_recovers_graph_applied_code_finalizers_before_real_readd() {
+    use nestweaver_engine::resolution_cache::ResolutionDeps;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("code-crash-recovery").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db_for_instance(&repo_dir, &db_path, "old");
+
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    let source_repo = store.list_repos(Some("old")).unwrap().remove(0);
+    assert!(
+        !store
+            .lookup_symbols_by_repo(&source_repo.uid)
+            .unwrap()
+            .is_empty()
+    );
+    let filemeta_path = sidecar_path(&db_path, ".filemeta.json");
+    let mut filemeta = load_filemeta_sidecar(&filemeta_path);
+    filemeta.repos.entry(source_repo.uid.clone()).or_default();
+    save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+    let deps_path = sidecar_path(&db_path, ".resolution_deps.bin");
+    let mut deps = ResolutionDeps::default();
+    deps.set_deps_for_repo(
+        &source_repo.uid,
+        "main.js",
+        std::collections::HashSet::from(["dep.js".to_string()]),
+    );
+    deps.save(&deps_path).unwrap();
+
+    let mappings = store.plan_instance_uid_remaps("old", "new").unwrap();
+    let prepared = nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+        &db_path,
+        "old",
+        "new",
+        &mappings,
+        &nestweaver_engine::InstanceMigrationFinalizerPlan {
+            repo_uids: vec![source_repo.uid.clone()],
+            search_reconciliation_required: false,
+        },
+    )
+    .unwrap();
+    store.merge_instance_ids("old", "new").unwrap();
+    nestweaver_engine::mark_instance_extension_migration_graph_applied(&db_path, &prepared)
+        .unwrap();
+    assert!(
+        store
+            .lookup_symbols_by_repo(&source_repo.uid)
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+    assert!(
+        load_filemeta_sidecar(&filemeta_path)
+            .repos
+            .contains_key(&source_repo.uid)
+    );
+    assert!(!ResolutionDeps::load(&deps_path).is_empty_for_repo(&source_repo.uid));
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    assert!(
+        !load_filemeta_sidecar(&filemeta_path)
+            .repos
+            .contains_key(&source_repo.uid)
+    );
+    assert!(ResolutionDeps::load(&deps_path).is_empty_for_repo(&source_repo.uid));
+    assert!(!sidecar_path(&db_path, ".extensions.migration.json").exists());
+
+    // Re-add the original source scope without --force. A stale `.filemeta`
+    // slice would classify main.js as unchanged and restore no symbols.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--instance",
+            "old",
+        ])
+        .assert()
+        .success();
+    stop_daemon(&db_path);
+
+    let reopened = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert!(reopened.lookup_repo(&source_repo.uid).unwrap().is_some());
+    assert!(
+        !reopened
+            .lookup_symbols_by_repo(&source_repo.uid)
+            .unwrap()
+            .is_empty(),
+        "normal re-add treated the source repo file as unchanged"
+    );
+}
+
+#[test]
+fn daemon_start_recovers_graph_applied_vault_tantivy_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("vault-crash-recovery").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    write_test_vault(&vault_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+    daemon_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .args(["--instance", "old", "--db"])
+        .arg(&db_path)
+        .assert()
+        .success();
+    stop_daemon(&db_path);
+
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    let source_vault = store.list_vaults(Some("old")).unwrap().remove(0);
+    let source_note = store.list_notes(Some(&source_vault.uid)).unwrap().remove(0);
+    let prepared = nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+        &db_path,
+        "old",
+        "new",
+        &[],
+        &nestweaver_engine::InstanceMigrationFinalizerPlan {
+            repo_uids: Vec::new(),
+            search_reconciliation_required: true,
+        },
+    )
+    .unwrap();
+    store.merge_instance_ids("old", "new").unwrap();
+    let destination_vault = store.list_vaults(Some("new")).unwrap().remove(0);
+    nestweaver_engine::mark_instance_extension_migration_graph_applied(&db_path, &prepared)
+        .unwrap();
+    drop(store);
+
+    let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
+    let stale = nestweaver_store::TantivyIndex::open_reader_only(&tantivy_path).unwrap();
+    let stale_hits = stale.search("Hello", 10).unwrap();
+    assert!(
+        stale_hits
+            .iter()
+            .any(|hit| { hit.uid == source_note.uid && hit.vault_uid == source_vault.uid })
+    );
+    assert!(
+        !stale_hits
+            .iter()
+            .any(|hit| { hit.uid == source_note.uid && hit.vault_uid == destination_vault.uid })
+    );
+    drop(stale);
+
+    start_daemon(&db_path);
+    stop_daemon(&db_path);
+
+    let recovered = nestweaver_store::TantivyIndex::open_reader_only(&tantivy_path).unwrap();
+    let recovered_hits = recovered.search("Hello", 10).unwrap();
+    assert!(
+        !recovered_hits
+            .iter()
+            .any(|hit| { hit.uid == source_note.uid && hit.vault_uid == source_vault.uid })
+    );
+    assert!(
+        recovered_hits
+            .iter()
+            .any(|hit| { hit.uid == source_note.uid && hit.vault_uid == destination_vault.uid })
+    );
+    assert!(!sidecar_path(&db_path, ".extensions.migration.json").exists());
+}
+
+#[test]
 fn daemon_project_casefold_collision_uses_exact_graph_winner_for_extension_union() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("project-collision").join("test.lbug");
