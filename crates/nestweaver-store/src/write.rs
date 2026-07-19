@@ -3759,18 +3759,9 @@ impl GraphStore {
             tags_migrated: tags.len(),
         };
 
-        // 3. Delete old vault and all its children.
-        self.delete_vault_cascade(old_vault_uid)?;
-
-        // 4. Create new vault with updated UID and instance_id.
-        self.insert_vault(&Vault {
-            uid: new_vault_uid.to_string(),
-            name: old_vault.name,
-            root_path: old_vault.root_path,
-            instance_id: new_instance_id.to_string(),
-        })?;
-
-        // 5. Re-insert notes with updated vault_uid.
+        // Prepare all replacement rows before opening the transaction. The
+        // delete and every insert below share one commit so a crash or write
+        // error cannot leave both the old and new vault roots absent.
         let reparented_notes: Vec<Note> = notes
             .into_iter()
             .map(|n| Note {
@@ -3778,36 +3769,18 @@ impl GraphStore {
                 ..n
             })
             .collect();
-        self.batch_insert_notes(&reparented_notes)?;
-
-        // Re-create VAULT_HAS_NOTE edges.
         let vault_note_edges: Vec<(&str, &str)> = reparented_notes
             .iter()
             .map(|n| (new_vault_uid, n.uid.as_str()))
             .collect();
-        self.batch_insert_vault_note_edges(&vault_note_edges)?;
-
-        // 6. Re-insert headings (note_uid stays the same).
-        self.batch_insert_headings(&headings)?;
-
-        // Re-create NOTE_HAS_HEADING edges.
         let note_heading_edges: Vec<(&str, &str)> = headings
             .iter()
             .map(|h| (h.note_uid.as_str(), h.uid.as_str()))
             .collect();
-        self.batch_insert_note_heading_edges(&note_heading_edges)?;
-
-        // 7. Re-insert sections (note_uid stays the same).
-        self.batch_insert_sections(&sections)?;
-
-        // Re-create NOTE_HAS_SECTION edges.
         let note_section_edges: Vec<(&str, &str)> = sections
             .iter()
             .map(|s| (s.note_uid.as_str(), s.uid.as_str()))
             .collect();
-        self.batch_insert_note_section_edges(&note_section_edges)?;
-
-        // Re-create HEADING_HAS_SECTION edges where applicable.
         let heading_section_edges: Vec<(&str, &str)> = sections
             .iter()
             .filter_map(|s| {
@@ -3816,11 +3789,6 @@ impl GraphStore {
                     .map(|huid| (huid.as_str(), s.uid.as_str()))
             })
             .collect();
-        if !heading_section_edges.is_empty() {
-            self.batch_insert_heading_section_edges(&heading_section_edges)?;
-        }
-
-        // 8. Re-insert tags with updated vault_uid.
         let reparented_tags: Vec<Tag> = tags
             .into_iter()
             .map(|t| Tag {
@@ -3828,25 +3796,56 @@ impl GraphStore {
                 ..t
             })
             .collect();
-        self.batch_insert_tags(&reparented_tags)?;
-
-        // Re-create NOTE_TAGGED_WITH edges.
         let nt_edges: Vec<(&str, &str)> = note_tag_edges
             .iter()
             .map(|(nuid, tuid)| (nuid.as_str(), tuid.as_str()))
             .collect();
-        if !nt_edges.is_empty() {
-            self.batch_insert_note_tag_edges(&nt_edges)?;
-        }
-
-        // Re-create SECTION_TAGGED_WITH edges.
         let st_edges: Vec<(&str, &str)> = section_tag_edges
             .iter()
             .map(|(suid, tuid)| (suid.as_str(), tuid.as_str()))
             .collect();
-        if !st_edges.is_empty() {
-            self.batch_insert_section_tag_edges(&st_edges)?;
+
+        let txn = self.begin_transaction()?;
+        let conn = &txn;
+        // 3. Delete old vault and all its children.
+        Self::delete_vault_cascade_on(conn, old_vault_uid)?;
+
+        // 4. Create new vault with updated UID and instance_id.
+        exec_params(
+            conn,
+            "CREATE (:Vault {uid: $uid, name: $name, root_path: $rp, instance_id: $iid})",
+            vec![
+                ("uid", lbug::Value::String(new_vault_uid.to_string())),
+                ("name", lbug::Value::String(old_vault.name)),
+                ("rp", lbug::Value::String(old_vault.root_path)),
+                ("iid", lbug::Value::String(new_instance_id.to_string())),
+            ],
+        )?;
+
+        // 5. Re-insert notes with updated vault_uid and restore their edges.
+        Self::batch_insert_notes_on(conn, &reparented_notes)?;
+        Self::batch_insert_vault_note_edges_on(conn, &vault_note_edges)?;
+
+        // 6. Re-insert headings and their edges (note_uid stays the same).
+        Self::batch_insert_headings_on(conn, &headings)?;
+        Self::batch_insert_note_heading_edges_on(conn, &note_heading_edges)?;
+
+        // 7. Re-insert sections and their edges (note_uid stays the same).
+        Self::batch_insert_sections_on(conn, &sections)?;
+        Self::batch_insert_note_section_edges_on(conn, &note_section_edges)?;
+        if !heading_section_edges.is_empty() {
+            Self::batch_insert_heading_section_edges_on(conn, &heading_section_edges)?;
         }
+
+        // 8. Re-insert tags with updated vault_uid and restore tag edges.
+        Self::batch_insert_tags_on(conn, &reparented_tags)?;
+        if !nt_edges.is_empty() {
+            Self::batch_insert_note_tag_edges_on(conn, &nt_edges)?;
+        }
+        if !st_edges.is_empty() {
+            Self::batch_insert_section_tag_edges_on(conn, &st_edges)?;
+        }
+        self.commit_transaction(&txn)?;
 
         Ok(result)
     }
