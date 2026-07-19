@@ -181,8 +181,8 @@ pub use extensions::{
     mark_instance_extension_migration_reconciled, pending_instance_extension_migration,
     prepare_instance_extension_migration, prepare_instance_extension_migration_with_finalizers,
     prepare_instance_uid_migration_with_finalizers, query_by_property,
-    reconcile_extension_handoffs, reconcile_extension_liveness, record_last_indexed_at,
-    remove_extension_uid_durable, save_extensions, set_property,
+    reconcile_deleted_extension_uids, reconcile_extension_handoffs, reconcile_extension_liveness,
+    record_last_indexed_at, remove_extension_uid_durable, save_extensions, set_property,
 };
 pub use guide_rules::{
     HARD_RULES, OwnedRule, RULES_VERSION, Rule, parse_rules_override, render_owned_rules_markdown,

@@ -191,11 +191,34 @@ pub struct InstanceRepoRecovery {
     pub root_path: Option<String>,
 }
 
+/// Durable Vault payload needed to resume the delete-before-insert crash
+/// window in a non-transactional instance merge. Children are intentionally
+/// not captured: a recovered empty Vault is reindexed after the merge.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceVaultRecovery {
+    pub source_uid: String,
+    pub destination_uid: String,
+    pub name: String,
+    pub root_path: String,
+}
+
+/// Durable Project payload needed to resume the delete-before-insert crash
+/// window in a non-transactional instance merge.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceProjectRecovery {
+    pub source_uid: String,
+    pub destination_uid: String,
+    pub name: String,
+    pub summary: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InstanceUidMigrationPlan {
     pub remaps: Vec<InstanceUidRemap>,
     pub handoffs: Vec<InstanceUidHandoff>,
     pub repo_recoveries: Vec<InstanceRepoRecovery>,
+    pub vault_recoveries: Vec<InstanceVaultRecovery>,
+    pub project_recoveries: Vec<InstanceProjectRecovery>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,6 +232,7 @@ pub enum InstanceUidRemapPlanState {
 struct InstanceProjectMergePlan {
     winner: Project,
     winner_preexists: bool,
+    recovery_source_uid: Option<String>,
     source_count: usize,
     remaps: Vec<InstanceUidRemap>,
 }
@@ -427,20 +451,22 @@ impl GraphStore {
             targets.sort_by(|left, right| left.uid.cmp(&right.uid));
 
             let source_count = sources.len();
-            let (winner, winner_preexists) = if let Some(target) = targets.first() {
-                (target.clone(), true)
-            } else {
-                let source = &sources[0];
-                (
-                    Project {
-                        uid: project_uid(to, &source.name),
-                        name: source.name.clone(),
-                        summary: source.summary.clone(),
-                        instance_id: to.to_string(),
-                    },
-                    false,
-                )
-            };
+            let (winner, winner_preexists, recovery_source_uid) =
+                if let Some(target) = targets.first() {
+                    (target.clone(), true, None)
+                } else {
+                    let source = &sources[0];
+                    (
+                        Project {
+                            uid: project_uid(to, &source.name),
+                            name: source.name.clone(),
+                            summary: source.summary.clone(),
+                            instance_id: to.to_string(),
+                        },
+                        false,
+                        Some(source.uid.clone()),
+                    )
+                };
 
             let mut remaps: Vec<InstanceUidRemap> = targets
                 .into_iter()
@@ -455,6 +481,7 @@ impl GraphStore {
             plans.push(InstanceProjectMergePlan {
                 winner,
                 winner_preexists,
+                recovery_source_uid,
                 source_count,
                 remaps,
             });
@@ -3858,6 +3885,8 @@ impl GraphStore {
         let mut remaps = Vec::new();
         let mut handoffs = Vec::new();
         let mut repo_recoveries = Vec::new();
+        let mut vault_recoveries = Vec::new();
+        let mut project_recoveries = Vec::new();
         // The LadybugDB Cypher subset does not support a MATCH subquery in an
         // `IN` predicate, so enumerate once and scope by each source Repo UID.
         let services = self.list_services(None)?;
@@ -3933,12 +3962,27 @@ impl GraphStore {
             }
         }
         for vault in self.list_vaults(Some(from))? {
+            let destination_uid = vault_uid(to, &vault.root_path);
             remaps.push(InstanceUidRemap {
+                source_uid: vault.uid.clone(),
+                destination_uid: destination_uid.clone(),
+            });
+            vault_recoveries.push(InstanceVaultRecovery {
                 source_uid: vault.uid,
-                destination_uid: vault_uid(to, &vault.root_path),
+                destination_uid,
+                name: vault.name,
+                root_path: vault.root_path,
             });
         }
         for project_merge in self.plan_instance_project_merges(from, to)? {
+            if let Some(source_uid) = project_merge.recovery_source_uid.clone() {
+                project_recoveries.push(InstanceProjectRecovery {
+                    source_uid,
+                    destination_uid: project_merge.winner.uid.clone(),
+                    name: project_merge.winner.name.clone(),
+                    summary: project_merge.winner.summary.clone(),
+                });
+            }
             remaps.extend(project_merge.remaps);
         }
         remaps.sort();
@@ -3947,10 +3991,16 @@ impl GraphStore {
         handoffs.dedup();
         repo_recoveries.sort();
         repo_recoveries.dedup();
+        vault_recoveries.sort();
+        vault_recoveries.dedup();
+        project_recoveries.sort();
+        project_recoveries.dedup();
         Ok(InstanceUidMigrationPlan {
             remaps,
             handoffs,
             repo_recoveries,
+            vault_recoveries,
+            project_recoveries,
         })
     }
 
@@ -3985,6 +4035,58 @@ impl GraphStore {
                 root_path: recovery.root_path.clone(),
             })?;
             restored += 1;
+        }
+        Ok(restored)
+    }
+
+    /// Restore target Repo, Vault, and Project roots whose source row was
+    /// committed deleted before the corresponding target insert. Recovered
+    /// code and Vault roots are intentionally empty and require re-indexing.
+    pub fn recover_missing_instance_roots(
+        &self,
+        to: &str,
+        repo_recoveries: &[InstanceRepoRecovery],
+        vault_recoveries: &[InstanceVaultRecovery],
+        project_recoveries: &[InstanceProjectRecovery],
+    ) -> Result<usize, StoreError> {
+        let mut restored = self.recover_missing_instance_repos(to, repo_recoveries)?;
+        for recovery in vault_recoveries {
+            if vault_uid(to, &recovery.root_path) != recovery.destination_uid {
+                return Err(StoreError::Query(format!(
+                    "vault recovery destination is not deterministic: {}",
+                    recovery.destination_uid
+                )));
+            }
+            if !self.list_vaults(None)?.iter().any(|vault| {
+                vault.uid == recovery.source_uid || vault.uid == recovery.destination_uid
+            }) {
+                self.insert_vault(&Vault {
+                    uid: recovery.destination_uid.clone(),
+                    name: recovery.name.clone(),
+                    root_path: recovery.root_path.clone(),
+                    instance_id: to.to_string(),
+                })?;
+                restored += 1;
+            }
+        }
+        for recovery in project_recoveries {
+            if project_uid(to, &recovery.name) != recovery.destination_uid {
+                return Err(StoreError::Query(format!(
+                    "project recovery destination is not deterministic: {}",
+                    recovery.destination_uid
+                )));
+            }
+            if !self.list_projects()?.iter().any(|project| {
+                project.uid == recovery.source_uid || project.uid == recovery.destination_uid
+            }) {
+                self.insert_project(&Project {
+                    uid: recovery.destination_uid.clone(),
+                    name: recovery.name.clone(),
+                    summary: recovery.summary.clone(),
+                    instance_id: to.to_string(),
+                })?;
+                restored += 1;
+            }
         }
         Ok(restored)
     }
@@ -4040,20 +4142,34 @@ impl GraphStore {
         }
 
         let current_set: std::collections::BTreeSet<_> = current.iter().cloned().collect();
-        let mut missing_repo_destinations = std::collections::BTreeSet::new();
+        let mut missing_root_destinations = std::collections::BTreeSet::new();
         for mapping in expected
             .iter()
             .filter(|mapping| !current_set.contains(*mapping))
-            .filter(|mapping| {
-                mapping.source_uid.starts_with("repo:")
-                    && mapping.destination_uid.starts_with("repo:")
-            })
         {
-            let source_live = self.instance_merge_node_exists("Repo", &mapping.source_uid)?;
-            let destination_live =
-                self.instance_merge_node_exists("Repo", &mapping.destination_uid)?;
-            if !source_live && !destination_live {
-                missing_repo_destinations.insert(mapping.destination_uid.clone());
+            let root_label = if mapping.source_uid.starts_with("repo:")
+                && mapping.destination_uid.starts_with("repo:")
+            {
+                Some("Repo")
+            } else if mapping.source_uid.starts_with("vlt:")
+                && mapping.destination_uid.starts_with("vlt:")
+            {
+                Some("Vault")
+            } else if mapping.source_uid.starts_with("proj:")
+                && mapping.destination_uid.starts_with("proj:")
+            {
+                Some("Project")
+            } else {
+                None
+            };
+            if let Some(root_label) = root_label {
+                let source_live =
+                    self.instance_merge_node_exists(root_label, &mapping.source_uid)?;
+                let destination_live =
+                    self.instance_merge_node_exists(root_label, &mapping.destination_uid)?;
+                if !source_live && !destination_live {
+                    missing_root_destinations.insert(mapping.destination_uid.clone());
+                }
             }
         }
         for mapping in expected
@@ -4115,14 +4231,14 @@ impl GraphStore {
                 )));
             }
             if !self.instance_merge_node_exists(destination_label, &destination_root)?
-                && !missing_repo_destinations.contains(&destination_root)
+                && !missing_root_destinations.contains(&destination_root)
             {
                 return Err(StoreError::Query(format!(
                     "journaled destination root does not exist: {destination_root}"
                 )));
             }
         }
-        if current.is_empty() && missing_repo_destinations.is_empty() {
+        if current.is_empty() && missing_root_destinations.is_empty() {
             Ok(InstanceUidRemapPlanState::Applied)
         } else {
             Ok(InstanceUidRemapPlanState::PartiallyApplied)
@@ -4225,11 +4341,15 @@ impl GraphStore {
             }
         }
         for project_merge in project_merges {
-            for mapping in &project_merge.remaps {
-                self.delete_project_node(&mapping.source_uid)?;
-            }
+            // Publish a newly minted winner before deleting its source. If a
+            // process stops between these statements, the durable migration
+            // journal can safely retry the source deletion; deleting first
+            // would leave both roots absent and require reconstruction.
             if !project_merge.winner_preexists {
                 self.insert_project(&project_merge.winner)?;
+            }
+            for mapping in &project_merge.remaps {
+                self.delete_project_node(&mapping.source_uid)?;
             }
             project_count += project_merge.source_count;
         }

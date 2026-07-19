@@ -890,6 +890,25 @@ fn finalize_code_graph_deletion(
     }
 }
 
+fn reconcile_deleted_extension_uids(
+    state: &DaemonState,
+    deleted_uids: &[String],
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+) {
+    match nestweaver_engine::reconcile_deleted_extension_uids(
+        &state.store,
+        &state.db_path,
+        deleted_uids,
+    ) {
+        Ok(removed) => tracing::info!(removed, "targeted extension metadata reconciled"),
+        Err(error) => push_reconciliation_failure(
+            failures,
+            nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+            format!("targeted extension metadata reconciliation failed: {error:#}"),
+        ),
+    }
+}
+
 fn push_reconciliation_failure(
     failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
     stage: nestweaver_engine::DeletionReconciliationStage,
@@ -1467,6 +1486,7 @@ where
     let search_rows_before = indexed_search_rows_before(state);
     let (removed_repos, mut error) = prune_stale_repos_with(&state.store, delete_repo);
     let mut removed_vaults = Vec::new();
+    let mut removed_vault_uids = Vec::new();
     let mut vault_mutation_attempted = false;
 
     if error.is_none() {
@@ -1480,6 +1500,7 @@ where
                             break;
                         }
                         removed_vaults.push(vault.name.clone());
+                        removed_vault_uids.push(vault.uid.clone());
                     }
                 }
             }
@@ -1499,6 +1520,7 @@ where
     } else {
         Vec::new()
     };
+    reconcile_deleted_extension_uids(state, &removed_vault_uids, &mut failures);
     let search_mutation = if changed {
         indexed_search_mutation(search_rows_before, &state.store)
     } else {
@@ -1534,6 +1556,19 @@ where
     let search_rows_before = indexed_search_rows_before(state);
     let mut repo_uids = list_instance_code_repo_uids(&state.store, instance_id)
         .map_err(|e| Status::internal(format!("PurgeInstance failed to list code repos: {e:#}")))?;
+    let vault_prefix = format!("vlt:{instance_id}:");
+    let mut vault_uids: Vec<_> = state
+        .store
+        .list_vaults(None)
+        .map_err(|error| {
+            Status::internal(format!("PurgeInstance failed to list Vaults: {error:#}"))
+        })?
+        .into_iter()
+        .filter(|vault| vault.instance_id == instance_id || vault.uid.starts_with(&vault_prefix))
+        .map(|vault| vault.uid)
+        .collect();
+    vault_uids.sort();
+    vault_uids.dedup();
     let project_prefix = format!("proj:{instance_id}:");
     let mut project_uids: Vec<_> = state
         .store
@@ -1571,6 +1606,7 @@ where
             } else {
                 Vec::new()
             };
+            reconcile_deleted_extension_uids(state, &vault_uids, &mut failures);
             reconcile_deleted_project_extensions(state, &project_uids, &mut failures);
             let search_mutation = if changed {
                 indexed_search_mutation(search_rows_before, &state.store)
@@ -1595,6 +1631,7 @@ where
             } else {
                 finalize_code_graph_deletion(state, &repo_uids)
             };
+            reconcile_deleted_extension_uids(state, &vault_uids, &mut failures);
             reconcile_deleted_project_extensions(state, &project_uids, &mut failures);
             let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
             if search_mutation != IndexedSearchMutation::Unchanged {
@@ -1713,10 +1750,15 @@ where
         }
         state
             .store
-            .recover_missing_instance_repos(to_id, &pending.repo_recoveries())
+            .recover_missing_instance_roots(
+                to_id,
+                &pending.repo_recoveries(),
+                &pending.vault_recoveries(),
+                &pending.project_recoveries(),
+            )
             .map_err(|error| {
                 Status::internal(format!(
-                    "recover pending instance Repo insertion failed: {error:#}"
+                    "recover pending instance root insertion failed: {error:#}"
                 ))
             })?;
         let remaps = pending.uid_remaps();
@@ -1998,6 +2040,7 @@ fn run_remove_vault_with_projection(
     let mut failures = Vec::new();
     if !confirmed_noop {
         failures = finalize_node_graph_deletion(state, "remove_vault");
+        reconcile_deleted_extension_uids(state, &[vault_uid.to_string()], &mut failures);
         let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
         if search_mutation != IndexedSearchMutation::Unchanged {
             append_search_reconciliation(
@@ -7879,6 +7922,67 @@ mod startup_helper_tests {
     }
 
     #[test]
+    fn remove_vault_targeted_extension_cleanup_preserves_unrelated_note_keys() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+
+        let state = test_state_with_writer();
+        let vault_uid = "vlt:remove:scoped";
+        let note_uid = format!("note:{vault_uid}:dead");
+        state
+            .store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "scoped".to_string(),
+                root_path: "/missing/scoped-vault".to_string(),
+                instance_id: "remove".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_note(&Note {
+                uid: note_uid.clone(),
+                vault_uid: vault_uid.to_string(),
+                file_path: "dead.md".to_string(),
+                title: "Dead".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "dead".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        state
+            .store
+            .insert_vault_note_edge(vault_uid, &note_uid)
+            .unwrap();
+
+        let unrelated = "note:vlt:unrelated:aaaaaaaaaaaa";
+        let mut extensions = nestweaver_engine::load_extensions(&state.db_path);
+        nestweaver_engine::set_property(
+            &mut extensions,
+            &note_uid,
+            "owner",
+            serde_json::json!("dead"),
+        );
+        nestweaver_engine::set_property(
+            &mut extensions,
+            unrelated,
+            "owner",
+            serde_json::json!("keep"),
+        );
+        nestweaver_engine::save_extensions(&state.db_path, &extensions).unwrap();
+
+        run_remove_vault_with_projection(&state, vault_uid, None).unwrap();
+
+        let reopened = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!reopened.contains_key(&note_uid));
+        assert!(reopened.contains_key(unrelated));
+    }
+
+    #[test]
     fn nonexistent_vault_skips_all_reconciliation_after_unknown_preflight() {
         let state = test_state_with_writer();
         let tantivy = state.tantivy.as_ref().unwrap();
@@ -8467,6 +8571,113 @@ mod startup_helper_tests {
                 "owner",
             ),
             Some(&serde_json::json!("preserve-on-recovery"))
+        );
+    }
+
+    #[test]
+    fn startup_recovery_restores_vault_and_project_deleted_before_destination_insert() {
+        use nestweaver_schema::uid::{project_uid, vault_uid};
+
+        let state = test_state_with_writer();
+        let vault_root = "/tmp/startup-vault-delete-before-insert";
+        let source_vault_uid = vault_uid("old", vault_root);
+        let destination_vault_uid = vault_uid("new", vault_root);
+        state
+            .store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: source_vault_uid.clone(),
+                name: "Startup vault recovery".to_string(),
+                root_path: vault_root.to_string(),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        let source_project_uid = project_uid("old", "Startup project recovery");
+        let destination_project_uid = project_uid("new", "Startup project recovery");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_project_uid.clone(),
+                name: "Startup project recovery".to_string(),
+                summary: Some("recover project metadata".to_string()),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        seed_extension(
+            &state,
+            &source_vault_uid,
+            "owner",
+            serde_json::json!("vault-owner"),
+        );
+        seed_extension(
+            &state,
+            &source_project_uid,
+            "owner",
+            serde_json::json!("project-owner"),
+        );
+
+        let plan = state
+            .store
+            .plan_instance_uid_migration("old", "new")
+            .unwrap();
+        nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &plan,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan::default(),
+        )
+        .unwrap();
+        state.store.delete_vault_cascade(&source_vault_uid).unwrap();
+        state
+            .store
+            .delete_project_node(&source_project_uid)
+            .unwrap();
+        assert!(
+            state
+                .store
+                .list_vaults(None)
+                .unwrap()
+                .iter()
+                .all(|vault| vault.uid != destination_vault_uid)
+        );
+        assert!(
+            !state
+                .store
+                .project_exists(&destination_project_uid)
+                .unwrap()
+        );
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        let recovered_vault = state
+            .store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .find(|vault| vault.uid == destination_vault_uid)
+            .expect("startup recovery must restore the missing destination Vault");
+        assert_eq!(recovered_vault.instance_id, "new");
+        assert_eq!(recovered_vault.root_path, vault_root);
+        assert!(
+            state
+                .store
+                .project_exists(&destination_project_uid)
+                .unwrap()
+        );
+        assert!(!state.store.project_exists(&source_project_uid).unwrap());
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_vault_uid, "owner"),
+            Some(&serde_json::json!("vault-owner"))
+        );
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_project_uid, "owner"),
+            Some(&serde_json::json!("project-owner"))
+        );
+        assert!(!extensions.contains_key(&source_vault_uid));
+        assert!(!extensions.contains_key(&source_project_uid));
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
         );
     }
 

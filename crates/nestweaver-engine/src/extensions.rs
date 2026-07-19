@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 /// In-memory extension store: node UID → property map.
 pub type ExtensionStore = HashMap<String, HashMap<String, serde_json::Value>>;
 
-const INSTANCE_MIGRATION_VERSION: u32 = 4;
+const INSTANCE_MIGRATION_VERSION: u32 = 5;
 const EXTENSION_HANDOFF_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,6 +84,24 @@ struct JournalRepoRecovery {
     root_path: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournalVaultRecovery {
+    source_uid: String,
+    destination_uid: String,
+    name: String,
+    root_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournalProjectRecovery {
+    source_uid: String,
+    destination_uid: String,
+    name: String,
+    summary: Option<String>,
+}
+
 /// Exact post-graph reconciliation inputs captured before an instance merge.
 ///
 /// Repo UIDs are the source graph/sidecar scopes that must be purged from
@@ -109,6 +127,8 @@ struct InstanceExtensionMigrationJournal {
     mappings: Vec<JournalUidRemap>,
     handoffs: Vec<JournalHandoff>,
     repo_recoveries: Vec<JournalRepoRecovery>,
+    vault_recoveries: Vec<JournalVaultRecovery>,
+    project_recoveries: Vec<JournalProjectRecovery>,
     finalizers: InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
 }
@@ -214,6 +234,42 @@ impl InstanceExtensionMigration {
                         staleness_commits_behind: recovery.staleness_commits_behind,
                         name: recovery.name.clone(),
                         root_path: recovery.root_path.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn vault_recoveries(&self) -> Vec<nestweaver_store::InstanceVaultRecovery> {
+        self.journal
+            .as_ref()
+            .map(|journal| {
+                journal
+                    .vault_recoveries
+                    .iter()
+                    .map(|recovery| nestweaver_store::InstanceVaultRecovery {
+                        source_uid: recovery.source_uid.clone(),
+                        destination_uid: recovery.destination_uid.clone(),
+                        name: recovery.name.clone(),
+                        root_path: recovery.root_path.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn project_recoveries(&self) -> Vec<nestweaver_store::InstanceProjectRecovery> {
+        self.journal
+            .as_ref()
+            .map(|journal| {
+                journal
+                    .project_recoveries
+                    .iter()
+                    .map(|recovery| nestweaver_store::InstanceProjectRecovery {
+                        source_uid: recovery.source_uid.clone(),
+                        destination_uid: recovery.destination_uid.clone(),
+                        name: recovery.name.clone(),
+                        summary: recovery.summary.clone(),
                     })
                     .collect()
             })
@@ -811,6 +867,8 @@ fn plan_fingerprint(
     mappings: &[JournalUidRemap],
     handoffs: &[JournalHandoff],
     repo_recoveries: &[JournalRepoRecovery],
+    vault_recoveries: &[JournalVaultRecovery],
+    project_recoveries: &[JournalProjectRecovery],
     finalizers: &InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
 ) -> Result<String, anyhow::Error> {
@@ -821,6 +879,8 @@ fn plan_fingerprint(
         mappings,
         handoffs,
         repo_recoveries,
+        vault_recoveries,
+        project_recoveries,
         finalizers,
         extension_metadata_required,
     ))?;
@@ -900,6 +960,46 @@ fn validate_instance_extension_migration_journal(
             anyhow::bail!("instance Repo recovery identity is not deterministic");
         }
     }
+    let mut previous_vault_recovery: Option<&JournalVaultRecovery> = None;
+    for recovery in &journal.vault_recoveries {
+        if previous_vault_recovery.is_some_and(|previous| previous >= recovery) {
+            anyhow::bail!("instance Vault recoveries must be strictly sorted");
+        }
+        previous_vault_recovery = Some(recovery);
+        if !mapping_pairs.contains(&(
+            recovery.source_uid.as_str(),
+            recovery.destination_uid.as_str(),
+        )) {
+            anyhow::bail!("instance Vault recovery is not bound to an exact UID remap");
+        }
+        if parse_instance_migration_uid(&recovery.source_uid)?.kind() != "Vault"
+            || parse_instance_migration_uid(&recovery.destination_uid)?.kind() != "Vault"
+            || nestweaver_schema::vault_uid(&journal.to_id, &recovery.root_path)
+                != recovery.destination_uid
+        {
+            anyhow::bail!("instance Vault recovery identity is not deterministic");
+        }
+    }
+    let mut previous_project_recovery: Option<&JournalProjectRecovery> = None;
+    for recovery in &journal.project_recoveries {
+        if previous_project_recovery.is_some_and(|previous| previous >= recovery) {
+            anyhow::bail!("instance Project recoveries must be strictly sorted");
+        }
+        previous_project_recovery = Some(recovery);
+        if !mapping_pairs.contains(&(
+            recovery.source_uid.as_str(),
+            recovery.destination_uid.as_str(),
+        )) {
+            anyhow::bail!("instance Project recovery is not bound to an exact UID remap");
+        }
+        if parse_instance_migration_uid(&recovery.source_uid)?.kind() != "Project"
+            || parse_instance_migration_uid(&recovery.destination_uid)?.kind() != "Project"
+            || nestweaver_schema::project_uid(&journal.to_id, &recovery.name)
+                != recovery.destination_uid
+        {
+            anyhow::bail!("instance Project recovery identity is not deterministic");
+        }
+    }
     validate_finalizer_plan(&journal.from_id, &journal.mappings, &journal.finalizers)?;
     if journal.mappings.is_empty()
         && journal.finalizers.repo_uids.is_empty()
@@ -916,6 +1016,8 @@ fn validate_instance_extension_migration_journal(
         &journal.mappings,
         &journal.handoffs,
         &journal.repo_recoveries,
+        &journal.vault_recoveries,
+        &journal.project_recoveries,
         &journal.finalizers,
         journal.extension_metadata_required,
     )?;
@@ -1008,6 +1110,40 @@ fn canonical_repo_recoveries(
     recoveries
 }
 
+fn canonical_vault_recoveries(
+    recoveries: &[nestweaver_store::InstanceVaultRecovery],
+) -> Vec<JournalVaultRecovery> {
+    let mut recoveries: Vec<_> = recoveries
+        .iter()
+        .map(|recovery| JournalVaultRecovery {
+            source_uid: recovery.source_uid.clone(),
+            destination_uid: recovery.destination_uid.clone(),
+            name: recovery.name.clone(),
+            root_path: recovery.root_path.clone(),
+        })
+        .collect();
+    recoveries.sort();
+    recoveries.dedup();
+    recoveries
+}
+
+fn canonical_project_recoveries(
+    recoveries: &[nestweaver_store::InstanceProjectRecovery],
+) -> Vec<JournalProjectRecovery> {
+    let mut recoveries: Vec<_> = recoveries
+        .iter()
+        .map(|recovery| JournalProjectRecovery {
+            source_uid: recovery.source_uid.clone(),
+            destination_uid: recovery.destination_uid.clone(),
+            name: recovery.name.clone(),
+            summary: recovery.summary.clone(),
+        })
+        .collect();
+    recoveries.sort();
+    recoveries.dedup();
+    recoveries
+}
+
 fn merge_extension_properties(
     store: &mut ExtensionStore,
     to_id: &str,
@@ -1056,6 +1192,8 @@ fn journal_for_plan(
     mappings: Vec<JournalUidRemap>,
     handoffs: Vec<JournalHandoff>,
     repo_recoveries: Vec<JournalRepoRecovery>,
+    vault_recoveries: Vec<JournalVaultRecovery>,
+    project_recoveries: Vec<JournalProjectRecovery>,
     finalizers: InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
     phase: InstanceMigrationPhase,
@@ -1066,6 +1204,8 @@ fn journal_for_plan(
         &mappings,
         &handoffs,
         &repo_recoveries,
+        &vault_recoveries,
+        &project_recoveries,
         &finalizers,
         extension_metadata_required,
     )?;
@@ -1079,6 +1219,8 @@ fn journal_for_plan(
         mappings,
         handoffs,
         repo_recoveries,
+        vault_recoveries,
+        project_recoveries,
         finalizers,
         extension_metadata_required,
     })
@@ -1151,6 +1293,8 @@ pub fn prepare_instance_extension_migration_with_finalizers(
         mappings,
         &[],
         &[],
+        &[],
+        &[],
         finalizers,
         write_instance_extension_migration_journal,
     )
@@ -1173,6 +1317,8 @@ pub fn prepare_instance_uid_migration_with_finalizers(
         &plan.remaps,
         &plan.handoffs,
         &plan.repo_recoveries,
+        &plan.vault_recoveries,
+        &plan.project_recoveries,
         finalizers,
         write_instance_extension_migration_journal,
     )
@@ -1203,6 +1349,8 @@ where
         mappings,
         &[],
         &[],
+        &[],
+        &[],
         &InstanceMigrationFinalizerPlan {
             repo_uids,
             search_reconciliation_required: false,
@@ -1218,6 +1366,8 @@ fn prepare_instance_extension_migration_with_finalizers_and_write<F>(
     mappings: &[nestweaver_store::InstanceUidRemap],
     handoffs: &[nestweaver_store::InstanceUidHandoff],
     repo_recoveries: &[nestweaver_store::InstanceRepoRecovery],
+    vault_recoveries: &[nestweaver_store::InstanceVaultRecovery],
+    project_recoveries: &[nestweaver_store::InstanceProjectRecovery],
     finalizers: &InstanceMigrationFinalizerPlan,
     write_journal: F,
 ) -> Result<InstanceExtensionMigration, anyhow::Error>
@@ -1234,6 +1384,8 @@ where
         })?;
     let current_handoffs = canonical_journal_handoffs(handoffs);
     let current_repo_recoveries = canonical_repo_recoveries(repo_recoveries);
+    let current_vault_recoveries = canonical_vault_recoveries(vault_recoveries);
+    let current_project_recoveries = canonical_project_recoveries(project_recoveries);
     let current_finalizers = canonical_finalizer_plan(from_id, &current_mappings, finalizers)
         .map_err(|error| {
             anyhow::anyhow!("exact current finalizer plan does not match journal: {error}")
@@ -1258,6 +1410,8 @@ where
             || journal.mappings != current_mappings
             || journal.handoffs != current_handoffs
             || journal.repo_recoveries != current_repo_recoveries
+            || journal.vault_recoveries != current_vault_recoveries
+            || journal.project_recoveries != current_project_recoveries
             || journal.finalizers != current_finalizers
             || journal.extension_metadata_required != extension_metadata_required
             || journal.plan_fingerprint
@@ -1267,6 +1421,8 @@ where
                     &current_mappings,
                     &current_handoffs,
                     &current_repo_recoveries,
+                    &current_vault_recoveries,
+                    &current_project_recoveries,
                     &current_finalizers,
                     extension_metadata_required,
                 )?
@@ -1300,6 +1456,8 @@ where
         current_mappings,
         current_handoffs,
         current_repo_recoveries,
+        current_vault_recoveries,
+        current_project_recoveries,
         current_finalizers,
         extension_metadata_required,
         InstanceMigrationPhase::Prepared,
@@ -1650,28 +1808,12 @@ pub fn reconcile_extension_handoffs(
     Ok(resolved.len())
 }
 
-fn is_graph_node_uid(uid: &str) -> bool {
-    [
-        "repo:",
-        "file:",
-        "svc:",
-        "sym:",
-        "vlt:",
-        "note:",
-        "head:",
-        "sec:",
-        "tag:",
-        "proj:",
-        "contract:",
-        "unresolved:",
-        "tg:",
-    ]
-    .iter()
-    .any(|prefix| uid.starts_with(prefix))
-}
-
 fn is_shared_finalizer_graph_uid(uid: &str) -> bool {
-    is_graph_node_uid(uid) && !uid.starts_with("proj:")
+    // Only canonical instance-derived UIDs are safe for broad liveness
+    // cleanup. Prefix-shaped application keys (for example
+    // `note:vlt:unrelated:...`) are intentionally opaque metadata and must
+    // survive a merge or restart even when no graph node currently matches.
+    !uid.starts_with("proj:") && parse_instance_migration_uid(uid).is_ok()
 }
 
 fn protected_migration_source_uids(db_path: &Path) -> Result<BTreeSet<String>, anyhow::Error> {
@@ -1692,7 +1834,34 @@ pub fn load_live_extensions(
 ) -> Result<ExtensionStore, anyhow::Error> {
     let mut extensions = load_extensions_strict(&sidecar_path(db_path))?.unwrap_or_default();
     let live = graph.live_graph_node_uids()?;
-    extensions.retain(|uid, _| !is_graph_node_uid(uid) || live.contains(uid));
+    // A reminted File/Service/Symbol may not exist until the requested
+    // post-merge re-index. Keep its pending handoff metadata visible under
+    // the predicted UID while that durable handoff waits for publication.
+    let pending_handoffs =
+        load_extension_handoff_journal(&extension_handoff_journal_path(db_path))?
+            .map(|journal| {
+                journal
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.predicted_destination_uid, entry.properties))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    let pending_destinations: BTreeSet<String> = pending_handoffs
+        .iter()
+        .map(|(uid, _)| uid.clone())
+        .collect();
+    for (uid, properties) in pending_handoffs {
+        let destination = extensions.entry(uid).or_default();
+        for (key, value) in properties {
+            destination.entry(key).or_insert(value);
+        }
+    }
+    extensions.retain(|uid, _| {
+        !is_shared_finalizer_graph_uid(uid)
+            || live.contains(uid)
+            || pending_destinations.contains(uid)
+    });
     Ok(extensions)
 }
 
@@ -1723,6 +1892,94 @@ pub fn reconcile_extension_liveness(
             |error| {
                 anyhow::anyhow!(
                     "confirm extension liveness sidecar {}: {error}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    Ok(removed)
+}
+
+/// Remove extension metadata for graph roots that a deletion finalizer has
+/// already proven absent. Unlike broad liveness reconciliation, this method
+/// also removes non-canonical descendants (notes, headings, sections, and
+/// tags) whose UIDs intentionally do not carry the instance-migration shape.
+///
+/// The root is checked against the live graph before any sidecar mutation. A
+/// rollback or an ambiguous deletion therefore leaves its metadata intact.
+/// Descendants are scoped by the exact proven root UID; similarly-shaped
+/// application keys under another root remain untouched.
+pub fn reconcile_deleted_extension_uids(
+    graph: &nestweaver_store::GraphStore,
+    db_path: &Path,
+    deleted_uids: &[String],
+) -> Result<usize, anyhow::Error> {
+    if deleted_uids.is_empty() {
+        return Ok(0);
+    }
+    let live = graph.live_graph_node_uids()?;
+    let protected = protected_migration_source_uids(db_path)?;
+    let mut scopes: Vec<(String, Vec<String>)> = Vec::new();
+    for root_uid in deleted_uids {
+        // A caller may pass a stale or legacy identifier that is not a graph
+        // root we can safely scope. Broad liveness reconciliation remains the
+        // fallback for those opaque keys; targeted cleanup simply ignores it.
+        let Ok(parsed) = parse_instance_migration_uid(root_uid) else {
+            continue;
+        };
+        // A caller may have observed a deletion before a rollback became
+        // visible. Never remove metadata while the authoritative root is
+        // still present.
+        if live.contains(root_uid) {
+            continue;
+        }
+        let mut prefixes = Vec::new();
+        match parsed.kind() {
+            "Repo" => {
+                prefixes.extend([
+                    format!("file:{root_uid}:"),
+                    format!("svc:{root_uid}:"),
+                    format!("sym:{root_uid}:"),
+                ]);
+            }
+            "Vault" => {
+                prefixes.extend([
+                    format!("note:{root_uid}:"),
+                    format!("head:note:{root_uid}:"),
+                    format!("sec:note:{root_uid}:"),
+                    format!("tag:{root_uid}:"),
+                ]);
+            }
+            "Project" | "File" | "Service" | "Symbol" => {}
+            _ => {}
+        }
+        scopes.push((root_uid.clone(), prefixes));
+    }
+    if scopes.is_empty() {
+        return Ok(0);
+    }
+
+    let path = sidecar_path(db_path);
+    let Some(mut extensions) = load_extensions_strict(&path)? else {
+        return Ok(0);
+    };
+    let before = extensions.len();
+    extensions.retain(|uid, _| {
+        if protected.contains(uid) {
+            return true;
+        }
+        !scopes.iter().any(|(root_uid, prefixes)| {
+            uid == root_uid || prefixes.iter().any(|prefix| uid.starts_with(prefix))
+        })
+    });
+    let removed = before - extensions.len();
+    if removed > 0 {
+        write_extension_store_durable(&path, &extensions)?;
+    } else {
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "confirm targeted extension liveness sidecar {}: {error}",
                     path.display()
                 )
             },

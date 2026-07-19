@@ -37,9 +37,10 @@ pub use tantivy_index::{
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{
     DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
-    DiscardedVault, InstanceRepoRecovery, InstanceUidHandoff, InstanceUidHandoffIdentity,
-    InstanceUidMigrationPlan, InstanceUidRemap, InstanceUidRemapPlanState, MergeResult,
-    ProjectMutationDisposition, PurgeInstanceResult,
+    DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery, InstanceUidHandoff,
+    InstanceUidHandoffIdentity, InstanceUidMigrationPlan, InstanceUidRemap,
+    InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult, ProjectMutationDisposition,
+    PurgeInstanceResult,
 };
 
 #[cfg(test)]
@@ -2752,6 +2753,82 @@ mod tests {
         assert_eq!(recovered.name.as_deref(), Some("recover-me"));
         assert_eq!(recovered.root_path.as_deref(), Some("/tmp/recover-me"));
         assert_eq!(recovered.indexed_sha, "");
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::Applied
+        );
+    }
+
+    #[test]
+    fn instance_uid_remap_plan_recovers_vault_and_project_deleted_before_destination_insert() {
+        use nestweaver_schema::uid::{project_uid, vault_uid};
+        use nestweaver_schema::{Project, Vault};
+
+        let store = test_store();
+        let vault_root = "/tmp/vault-insert-crash";
+        let source_vault_uid = vault_uid("old", vault_root);
+        let destination_vault_uid = vault_uid("new", vault_root);
+        store
+            .insert_vault(&Vault {
+                uid: source_vault_uid.clone(),
+                name: "Recover vault".to_string(),
+                root_path: vault_root.to_string(),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+
+        let source_project_uid = project_uid("old", "Recover project");
+        let destination_project_uid = project_uid("new", "Recover project");
+        store
+            .insert_project(&Project {
+                uid: source_project_uid.clone(),
+                name: "Recover project".to_string(),
+                summary: Some("source summary".to_string()),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+
+        let plan = store.plan_instance_uid_migration("old", "new").unwrap();
+        store.delete_vault_cascade(&source_vault_uid).unwrap();
+        store.delete_project_node(&source_project_uid).unwrap();
+
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::PartiallyApplied
+        );
+        assert_eq!(
+            store
+                .recover_missing_instance_roots(
+                    "new",
+                    &plan.repo_recoveries,
+                    &plan.vault_recoveries,
+                    &plan.project_recoveries,
+                )
+                .unwrap(),
+            2
+        );
+
+        let recovered_vault = store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .find(|vault| vault.uid == destination_vault_uid)
+            .expect("destination vault should be restored");
+        assert_eq!(recovered_vault.name, "Recover vault");
+        assert_eq!(recovered_vault.root_path, vault_root);
+        assert_eq!(recovered_vault.instance_id, "new");
+        let recovered_project = store
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.uid == destination_project_uid)
+            .expect("destination project should be restored");
+        assert_eq!(recovered_project.summary.as_deref(), Some("source summary"));
+        assert_eq!(recovered_project.instance_id, "new");
         assert_eq!(
             store
                 .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
