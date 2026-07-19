@@ -104,12 +104,41 @@ pub struct StagedBackup {
 /// gather manifest stats. Reuses the caller's live connection — it never opens a
 /// second one. It also owns the store's publication lease through checkpoint,
 /// copy, and statistics collection, so UI watchers and other publishers cannot
-/// mutate the graph mid-copy. An inherited dirty publication is rejected.
+/// mutate the graph mid-copy. The configured path must resolve to this store;
+/// all database and sidecar reads derive from `store.db_path()`. An inherited
+/// dirty publication is rejected.
 /// The returned [`StagedBackup`] is packaged lock-free by [`package_staged`].
 pub fn stage_backup_from_store(
     store: &nestweaver_store::GraphStore,
     config: &BackupConfig,
 ) -> anyhow::Result<StagedBackup> {
+    let store_db_path = store
+        .db_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot back up an in-memory graph store"))?;
+    let configured_db = std::fs::canonicalize(&config.db_path).with_context(|| {
+        format!(
+            "failed to resolve configured backup database {}",
+            config.db_path.display()
+        )
+    })?;
+    let opened_db = std::fs::canonicalize(store_db_path).with_context(|| {
+        format!(
+            "failed to resolve opened backup database {}",
+            store_db_path.display()
+        )
+    })?;
+    if configured_db != opened_db {
+        anyhow::bail!(
+            "configured backup database {} does not match opened store {}",
+            config.db_path.display(),
+            store_db_path.display()
+        );
+    }
+    let staged_db_filename = config
+        .db_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("db_path has no filename"))?;
+
     let start = Instant::now();
     let pause_start = Instant::now();
     let publication = store
@@ -129,7 +158,8 @@ pub fn stage_backup_from_store(
 
     // Copy files while the caller holds the write lock (sidecars are non-atomic).
     copy_db_files(
-        &config.db_path,
+        store_db_path,
+        staged_db_filename,
         staging.path(),
         config.include_clones,
         config.workspace_path.as_deref(),
@@ -439,16 +469,13 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
 /// Copy the database file and all existing sidecars into the staging directory.
 fn copy_db_files(
     db_path: &Path,
+    staged_db_filename: &std::ffi::OsStr,
     staging: &Path,
     include_clones: bool,
     workspace_path: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let db_filename = db_path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("db_path has no filename"))?;
-
     // Copy the main database file.
-    std::fs::copy(db_path, staging.join(db_filename))?;
+    std::fs::copy(db_path, staging.join(staged_db_filename))?;
 
     // Copy known sidecars (skip missing ones silently).
     for suffix in SIDECAR_SUFFIXES {
@@ -457,7 +484,7 @@ fn copy_db_files(
             continue;
         }
         let dest_name = {
-            let mut s = db_filename.to_owned();
+            let mut s = staged_db_filename.to_owned();
             s.push(suffix);
             s
         };
@@ -471,7 +498,7 @@ fn copy_db_files(
     // Copy WAL if it still exists (should be gone after CHECKPOINT, but be safe).
     let wal = crate::sidecar_path(db_path, ".wal");
     if wal.exists() {
-        let mut wal_dest = db_filename.to_owned();
+        let mut wal_dest = staged_db_filename.to_owned();
         wal_dest.push(".wal");
         std::fs::copy(&wal, staging.join(&wal_dest))?;
     }
@@ -843,6 +870,98 @@ mod tests {
         assert!(output.exists());
         assert_eq!(result.manifest.instance_id, "test");
         assert_eq!(backup_inspect(&output).unwrap().instance_id, "test");
+    }
+
+    #[test]
+    fn stage_rejects_store_and_config_database_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_a_path = dir.path().join("a.lbug");
+        let store_b_path = dir.path().join("b.lbug");
+        let store_a = nestweaver_store::GraphStore::create(&store_a_path).unwrap();
+        let store_b = nestweaver_store::GraphStore::create(&store_b_path).unwrap();
+        let dirty_b = crate::index::establish_index_publication_marker_with_io(
+            &store_b,
+            Some(&store_b_path),
+            "mismatched backup source",
+            &crate::index::FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        store_b
+            .insert_symbol(&backup_symbol("sym:backup:mismatched", "mismatched"))
+            .unwrap();
+
+        let config = BackupConfig {
+            db_path: store_b_path.clone(),
+            output_path: dir.path().join("must-not-exist.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+        let error = match stage_backup_from_store(&store_a, &config) {
+            Ok(_) => panic!("mismatched store and config unexpectedly produced a staged backup"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("does not match"));
+        assert!(
+            crate::sidecar_path(&store_b_path, ".index-dirty").exists(),
+            "rejecting the mismatch must not alter the actual config database"
+        );
+        assert!(store_b.is_index_publication_dirty());
+        drop(dirty_b);
+    }
+
+    #[test]
+    fn stage_accepts_relative_path_to_the_opened_store() {
+        let current_dir = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&current_dir).unwrap();
+        let store_path = dir.path().join("relative.lbug");
+        let relative_path = store_path.strip_prefix(&current_dir).unwrap().to_path_buf();
+        let store = nestweaver_store::GraphStore::create(&store_path).unwrap();
+        let config = BackupConfig {
+            db_path: relative_path,
+            output_path: dir.path().join("relative.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+
+        let staged = stage_backup_from_store(&store, &config).unwrap();
+        let result = package_staged(&config, staged).unwrap();
+        assert_eq!(result.manifest.repo_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_accepts_symlink_equivalent_path_and_copies_store_sidecars() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("real.lbug");
+        let alias_path = dir.path().join("alias.lbug");
+        let store = nestweaver_store::GraphStore::create(&store_path).unwrap();
+        let store_sidecar = crate::sidecar_path(&store_path, ".aliases.json");
+        std::fs::write(&store_sidecar, r#"{"sentinel":"from-store"}"#).unwrap();
+        symlink(&store_path, &alias_path).unwrap();
+
+        let output = dir.path().join("alias.nwsnap.zst");
+        let config = BackupConfig {
+            db_path: alias_path,
+            output_path: output,
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+        let staged = stage_backup_from_store(&store, &config).unwrap();
+        let result = package_staged(&config, staged).unwrap();
+
+        assert!(
+            result
+                .manifest
+                .checksums
+                .contains_key("alias.lbug.aliases.json"),
+            "an equivalent config alias must stage sidecars located beside the store path"
+        );
     }
 
     #[test]
