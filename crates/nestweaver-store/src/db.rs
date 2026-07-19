@@ -437,12 +437,15 @@ impl GraphStore {
     }
 
     /// Whether an indexing writer durably marked graph publication incomplete.
-    /// While this marker exists, canonical generation and PageRank sidecars may
-    /// predate the committed graph and must not be treated as authoritative.
+    /// While this marker exists, or its state cannot be determined, canonical
+    /// generation and PageRank sidecars may predate the committed graph and
+    /// must not be treated as authoritative.
     pub fn is_index_publication_dirty(&self) -> bool {
-        self.db_path
-            .as_ref()
-            .is_some_and(|path| Self::index_publication_marker_for(path).exists())
+        self.db_path.as_ref().is_some_and(|path| {
+            Self::index_publication_marker_for(path)
+                .try_exists()
+                .unwrap_or(true)
+        })
     }
 
     fn index_publication_marker_for(db_path: &Path) -> PathBuf {
@@ -1245,6 +1248,37 @@ mod tests {
         assert!(
             !reopened.pagerank_scores().contains_key("stale"),
             "a dirty publication must not load canonical PageRank from before the graph commit"
+        );
+    }
+
+    #[test]
+    fn unreadable_index_publication_marker_fails_closed_for_generation_and_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = PathBuf::from(format!("{}.generation", db_path.display()));
+        let pagerank_path = PathBuf::from(format!("{}.pagerank.json", db_path.display()));
+        let dirty_path = PathBuf::from(format!("{}.index-dirty", db_path.display()));
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            for _ in 0..7 {
+                store.bump_graph_generation();
+            }
+            store.save_graph_generation(&generation_path).unwrap();
+        }
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        std::fs::create_dir(&dirty_path).unwrap();
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            reopened.graph_generation(),
+            u64::MAX,
+            "an unreadable marker must select the reserved fail-closed generation"
+        );
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(
+            !reopened.pagerank_scores().contains_key("stale"),
+            "an unreadable marker must make canonical PageRank non-authoritative"
         );
     }
 
