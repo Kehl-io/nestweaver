@@ -43,6 +43,76 @@ fn daemon_action_cmd(db_path: &Path, action: &str) -> Command {
     cmd
 }
 
+/// Start a daemon and wait until its Unix socket is accepting connections.
+///
+/// Fork-based `daemon start` returns before the child binds the socket. Tests
+/// must synchronize on readiness instead of guessing how long startup takes,
+/// especially when the workspace suite starts several daemons in parallel.
+fn start_daemon(db_path: &Path) {
+    daemon_action_cmd(db_path, "start").assert().success();
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(db_path);
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    let readiness = wait_for_daemon_readiness(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || std::os::unix::net::UnixStream::connect(&socket).map(drop),
+        || stop_daemon(db_path),
+    );
+    let Err(last_error) = readiness else {
+        return;
+    };
+
+    let log_path = nestweaver_daemon::log_path(&instance_id);
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|error| format!("<could not read {}: {error}>", log_path.display()));
+    panic!(
+        "daemon socket {} did not accept connections within 10s (last error: {}); log:\n{}",
+        socket.display(),
+        last_error,
+        log
+    );
+}
+
+fn wait_for_daemon_readiness(
+    timeout: Duration,
+    retry_interval: Duration,
+    mut connect: impl FnMut() -> std::io::Result<()>,
+    cleanup: impl FnOnce(),
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match connect() {
+            Ok(()) => return Ok(()),
+            Err(error) if std::time::Instant::now() >= deadline => {
+                cleanup();
+                return Err(error);
+            }
+            Err(_) => std::thread::sleep(retry_interval),
+        }
+    }
+}
+
+#[test]
+fn daemon_readiness_timeout_runs_cleanup_before_returning_error() {
+    let cleaned = std::cell::Cell::new(false);
+    let error = wait_for_daemon_readiness(
+        Duration::ZERO,
+        Duration::ZERO,
+        || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not ready",
+            ))
+        },
+        || cleaned.set(true),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(cleaned.get());
+}
+
 /// Create a minimal git repo with a JS file for indexing.
 fn write_test_repo(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
@@ -237,8 +307,7 @@ fn daemon_start_stop() {
     let _guard = DaemonGuard::new(&db_path);
 
     // Start daemon.
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     // Status: should report running.
     daemon_action_cmd(&db_path, "status")
@@ -293,8 +362,7 @@ fn daemon_index_and_query() {
     let _guard = DaemonGuard::new(&db_path);
 
     // Start daemon.
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     // Index through the daemon.
     index_via_daemon(&repo_dir, &db_path);
@@ -337,8 +405,7 @@ fn daemon_crash_recovery() {
     let _guard = DaemonGuard::new(&db_path);
 
     // Start daemon.
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     // Read PID from pidfile and kill with SIGKILL.
     let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
@@ -385,8 +452,7 @@ fn daemon_concurrent_mcp() {
     let _guard = DaemonGuard::new(&db_path);
 
     // Start daemon.
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     // Launch two MCP brain_status queries simultaneously.
     let db1 = db_path.clone();
@@ -431,8 +497,7 @@ fn daemon_mcp_brain_add_source() {
     let _guard = DaemonGuard::new(&db_path);
 
     // Start daemon.
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     // Use brain_add_source MCP tool to add the vault.
     let add_output = mcp_tool_call(
@@ -653,10 +718,10 @@ fn daemon_shutdown_rpc_exits_cleanly() {
     write_test_repo(&repo_dir);
     create_db(&repo_dir, &db_path);
 
-    // Start the daemon.
-    daemon_action_cmd(&db_path, "start").assert().success();
+    let _guard = DaemonGuard::new(&db_path);
 
-    std::thread::sleep(Duration::from_secs(1));
+    // Start the daemon.
+    start_daemon(&db_path);
 
     // Verify daemon is running.
     daemon_action_cmd(&db_path, "status").assert().success();
@@ -909,8 +974,7 @@ fn daemon_index_reaches_auto_setup_gate() {
     let _guard = DaemonGuard::new(&db_path);
 
     // Start daemon.
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     // Index through the daemon (NO NESTWEAVER_NO_DAEMON) from the controlled cwd.
     // The client process — which runs the gate — evaluates against this cwd.
@@ -986,8 +1050,7 @@ fn daemon_index_rpc_rejects_colon_in_instance() {
     create_db(&repo_dir, &db_path);
 
     let _guard = DaemonGuard::new(&db_path);
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let status = rt.block_on(async {
@@ -1046,8 +1109,7 @@ fn daemon_merge_removes_source_sidecars_and_invalidates_rank() {
     seed_deletion_sidecars(&db_path, &source_uid);
 
     let _guard = DaemonGuard::new(&db_path);
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let response = rt.block_on(async {
@@ -1106,8 +1168,7 @@ fn daemon_merge_rejects_self_merge_without_mutation() {
     drop(store);
 
     let _guard = DaemonGuard::new(&db_path);
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let error = rt.block_on(async {
@@ -1144,8 +1205,7 @@ fn daemon_purge_removes_repo_sidecars_and_invalidates_rank() {
     seed_deletion_sidecars(&db_path, &source_uid);
 
     let _guard = DaemonGuard::new(&db_path);
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let saw_done = rt.block_on(async {
@@ -1191,8 +1251,7 @@ fn daemon_purge_orphan_only_code_finalizes_sidecars_and_rank() {
     seed_deletion_sidecars(&db_path, &source_uid);
 
     let _guard = DaemonGuard::new(&db_path);
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let saw_done = rt.block_on(async {
         let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
@@ -1249,8 +1308,7 @@ fn daemon_non_code_merge_and_purge_bump_generation_and_invalidate_rank() {
     .unwrap();
 
     let _guard = DaemonGuard::new(&db_path);
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
@@ -1273,8 +1331,7 @@ fn daemon_non_code_merge_and_purge_bump_generation_and_invalidate_rank() {
     )
     .unwrap();
 
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
     rt.block_on(async {
         let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
             .await
@@ -1298,8 +1355,7 @@ fn daemon_noop_merge_purge_and_prune_do_not_bump_generation() {
     drop(store);
 
     let _guard = DaemonGuard::new(&db_path);
-    daemon_action_cmd(&db_path, "start").assert().success();
-    std::thread::sleep(Duration::from_secs(3));
+    start_daemon(&db_path);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)

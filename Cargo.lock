@@ -4319,6 +4319,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "thiserror 2.0.19",
+ "toml",
  "tracing",
  "zstd",
 ]

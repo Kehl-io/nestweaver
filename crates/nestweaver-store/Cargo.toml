@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 nestweaver-algorithms = { workspace = true }
 nestweaver-schema = { workspace = true }
-lbug = "0.18"
+lbug = "=0.18.2"
 lru = "0.18"
 tantivy = { version = "0.26", default-features = false, features = ["mmap", "stopwords", "lz4-compression", "stemmer"] }
 regex = "1.12"
@@ -29,6 +29,9 @@ tempfile = { workspace = true }
 # tree-sitter-sequel 0.3.x requires cc ~1.2.1; keep the workspace build
 # dependency on the same resolvable line until that grammar relaxes its bound.
 cc = "~1.2"
+serde_json = { workspace = true }
+toml = "1.1"
 
 [dev-dependencies]
 tempfile = "3"
+toml = "1.1"
