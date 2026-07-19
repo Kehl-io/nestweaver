@@ -36,8 +36,8 @@ pub use tantivy_index::{
 };
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{
-    DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome, DiscardedVault, MergeResult,
-    PurgeInstanceResult,
+    DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
+    DiscardedVault, MergeResult, ProjectMutationDisposition, PurgeInstanceResult,
 };
 
 #[cfg(test)]
@@ -46,7 +46,7 @@ mod tests {
         EdgeType, File, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Tag, Vault, Visibility,
     };
 
-    use super::GraphStore;
+    use super::{GraphStore, ProjectMutationDisposition};
 
     fn make_repo(uid: &str) -> Repo {
         Repo {
@@ -197,20 +197,30 @@ mod tests {
         store
             .insert_project_parent_edge("proj:test:child", "proj:test:target", 1.0)
             .unwrap();
+        let conn = store.conn().unwrap();
+        conn.query("CREATE REL TABLE FUTURE_PROJECT_TO_NOTE(FROM Project TO Note, marker STRING)")
+            .unwrap();
+        conn.query(
+            "MATCH (p:Project {uid: 'proj:test:target'}), \
+             (n:Note {uid: 'note:project-delete'}) \
+             CREATE (p)-[:FUTURE_PROJECT_TO_NOTE {marker: 'future'}]->(n)",
+        )
+        .unwrap();
 
         let outcome = store
             .delete_project_cascade_with_outcome("proj:test:target")
             .unwrap();
 
-        assert!(outcome.changed);
+        assert_eq!(outcome.disposition, ProjectMutationDisposition::Changed);
+        assert_eq!(outcome.project_uid, "proj:test:target");
         assert_eq!(outcome.project_name.as_deref(), Some("Target"));
         assert_eq!(store.list_projects().unwrap().len(), 2);
-        let conn = store.conn().unwrap();
         for edge_type in [
             "PROJECT_INCLUDES_NOTE",
             "PROJECT_INCLUDES_SYMBOL",
             "PROJECT_HAS_COMPONENT",
             "PROJECT_HAS_PARENT",
+            "FUTURE_PROJECT_TO_NOTE",
         ] {
             let rows = conn
                 .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN count(r)"))
@@ -224,11 +234,48 @@ mod tests {
                 .unwrap_or_default();
             assert_eq!(count, 0, "{edge_type} survived the project delete");
         }
+        let surviving_project_uids: std::collections::HashSet<_> = store
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.uid)
+            .collect();
+        assert_eq!(
+            surviving_project_uids,
+            std::collections::HashSet::from([
+                "proj:test:parent".to_string(),
+                "proj:test:child".to_string(),
+            ])
+        );
+        for (label, uid) in [
+            ("Note", "note:project-delete"),
+            ("Symbol", "sym:project-delete"),
+        ] {
+            let mut rows = conn
+                .query(&format!(
+                    "MATCH (n:{label} {{uid: '{uid}'}}) RETURN count(n)"
+                ))
+                .unwrap();
+            assert_eq!(
+                rows.next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(count)) => Some(*count),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                1,
+                "unrelated {label} {uid} did not survive"
+            );
+        }
 
         let missing = store
             .delete_project_cascade_with_outcome("proj:test:missing")
             .unwrap();
-        assert!(!missing.changed);
+        assert_eq!(
+            missing.disposition,
+            ProjectMutationDisposition::ConfirmedUnchanged
+        );
+        assert_eq!(missing.project_uid, "proj:test:missing");
         assert_eq!(missing.project_name, None);
     }
 

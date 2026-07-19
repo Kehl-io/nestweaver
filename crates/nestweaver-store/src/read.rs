@@ -1818,6 +1818,24 @@ impl GraphStore {
             .collect()
     }
 
+    /// Return whether a Project UID is currently present in the graph.
+    ///
+    /// This narrow lookup is used to resolve an ambiguous delete transaction
+    /// before removing UID-scoped sidecar metadata.
+    pub fn project_exists(&self, project_uid: &str) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("MATCH (p:Project {uid: $uid}) RETURN p.uid")
+            .map_err(|error| StoreError::Query(format!("prepare Project liveness: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut stmt,
+                vec![("uid", lbug::Value::String(project_uid.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("execute Project liveness: {error}")))?;
+        Ok(rows.next().is_some())
+    }
+
     /// List all Contract nodes, optionally filtered to a single repo.
     pub fn list_contracts(&self, repo_uid: Option<&str>) -> Result<Vec<Contract>, StoreError> {
         let conn = self.conn()?;

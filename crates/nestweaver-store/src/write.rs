@@ -17,11 +17,95 @@ pub struct DeleteVaultCascadeOutcome {
     pub changed: bool,
 }
 
-/// Confirmed graph mutation performed by an atomic Project cascade.
+/// What the store can prove about a Project cascade after the transaction
+/// attempt completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectMutationDisposition {
+    /// No graph mutation was attempted (including a missing Project).
+    ConfirmedUnchanged,
+    /// A mutation was attempted and a subsequent rollback succeeded.
+    ConfirmedRolledBack,
+    /// The transaction committed successfully.
+    Changed,
+    /// The database may have committed or a required rollback could not be
+    /// confirmed. Callers must reconcile against graph liveness.
+    Ambiguous,
+}
+
+/// Confirmed result of an atomic Project cascade.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteProjectCascadeOutcome {
+    pub project_uid: String,
     pub project_name: Option<String>,
-    pub changed: bool,
+    pub disposition: ProjectMutationDisposition,
+}
+
+/// A failed Project cascade together with the strongest mutation guarantee
+/// the store can make.
+#[derive(Debug)]
+pub struct DeleteProjectCascadeError {
+    pub project_uid: String,
+    pub project_name: Option<String>,
+    pub disposition: ProjectMutationDisposition,
+    pub primary: StoreError,
+    pub rollback: Option<StoreError>,
+}
+
+impl std::fmt::Display for DeleteProjectCascadeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Project cascade deletion for {} ({:?}) failed: {}",
+            self.project_uid, self.disposition, self.primary
+        )?;
+        if let Some(project_name) = &self.project_name {
+            write!(formatter, "; project_name={project_name}")?;
+        }
+        if let Some(rollback) = &self.rollback {
+            write!(formatter, "; rollback failed: {rollback}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DeleteProjectCascadeError {}
+
+#[derive(Clone, Copy)]
+struct ProjectCascadeQueries {
+    begin: &'static str,
+    repeat_begin: bool,
+    lookup: &'static str,
+    delete: &'static str,
+    omit_delete_params: bool,
+    commit: &'static str,
+    repeat_commit: bool,
+    rollback: &'static str,
+}
+
+impl Default for ProjectCascadeQueries {
+    fn default() -> Self {
+        Self {
+            begin: "BEGIN TRANSACTION",
+            repeat_begin: false,
+            lookup: "MATCH (p:Project {uid: $uid}) RETURN p.name",
+            delete: "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
+            omit_delete_params: false,
+            commit: "COMMIT",
+            repeat_commit: false,
+            rollback: "ROLLBACK",
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ProjectCascadeFaults {
+    begin: bool,
+    lookup: bool,
+    before_mutation: bool,
+    detach: bool,
+    commit: bool,
+    rollback: bool,
 }
 
 /// A vault whose notes were discarded during a collision in instance merge.
@@ -3125,64 +3209,206 @@ impl GraphStore {
     pub fn delete_project_cascade_with_outcome(
         &self,
         project_uid: &str,
-    ) -> Result<DeleteProjectCascadeOutcome, StoreError> {
-        self.delete_project_cascade_with_hook(project_uid, || Ok(()))
+    ) -> Result<DeleteProjectCascadeOutcome, DeleteProjectCascadeError> {
+        self.delete_project_cascade_with_queries(project_uid, ProjectCascadeQueries::default())
     }
 
-    fn delete_project_cascade_with_hook<F>(
+    fn delete_project_cascade_with_queries(
         &self,
         project_uid: &str,
-        before_commit: F,
-    ) -> Result<DeleteProjectCascadeOutcome, StoreError>
-    where
-        F: FnOnce() -> Result<(), StoreError>,
-    {
-        let conn = self.begin_transaction().map_err(|error| {
-            StoreError::Query(format!(
-                "begin Project cascade deletion for {project_uid}: {error}"
-            ))
+        queries: ProjectCascadeQueries,
+    ) -> Result<DeleteProjectCascadeOutcome, DeleteProjectCascadeError> {
+        let conn = self.conn().map_err(|error| DeleteProjectCascadeError {
+            project_uid: project_uid.to_string(),
+            project_name: None,
+            disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+            primary: StoreError::Query(format!("open connection before Project cascade: {error}")),
+            rollback: None,
         })?;
-        let mutation = (|| {
-            let mut lookup = conn
-                .prepare("MATCH (p:Project {uid: $uid}) RETURN p.name")
-                .map_err(|error| {
-                    StoreError::Query(format!("prepare Project lookup before delete: {error}"))
-                })?;
-            let mut rows = conn
-                .execute(
-                    &mut lookup,
-                    vec![("uid", lbug::Value::String(project_uid.to_string()))],
-                )
-                .map_err(|error| {
-                    StoreError::Query(format!("execute Project lookup before delete: {error}"))
-                })?;
-            let project_name = rows.next().and_then(|row| match row.first() {
-                Some(lbug::Value::String(name)) => Some(name.clone()),
-                _ => None,
+        if let Err(error) = conn.query(queries.begin) {
+            return Err(DeleteProjectCascadeError {
+                project_uid: project_uid.to_string(),
+                project_name: None,
+                disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+                primary: StoreError::Query(format!("begin Project cascade: {error}")),
+                rollback: None,
             });
-            drop(rows);
-
-            let Some(project_name) = project_name else {
-                return Ok(DeleteProjectCascadeOutcome {
-                    project_name: None,
-                    changed: false,
-                });
-            };
-
-            exec_params(
+        }
+        if queries.repeat_begin
+            && let Err(error) = conn.query(queries.begin)
+        {
+            return Err(Self::project_cascade_pre_mutation_error(
                 &conn,
-                "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
-                vec![("uid", lbug::Value::String(project_uid.to_string()))],
-            )
-            .map_err(|error| StoreError::Query(format!("delete Project node: {error}")))?;
-            before_commit()?;
-            Ok(DeleteProjectCascadeOutcome {
-                project_name: Some(project_name),
-                changed: true,
-            })
-        })();
+                queries.rollback,
+                project_uid,
+                None,
+                StoreError::Query(format!("begin Project cascade: {error}")),
+            ));
+        }
 
-        self.finish_project_transaction(&conn, mutation, "Project cascade deletion")
+        let mut lookup = match conn.prepare(queries.lookup) {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                return Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    None,
+                    StoreError::Query(format!("prepare Project lookup: {error}")),
+                ));
+            }
+        };
+        let mut rows = match conn.execute(
+            &mut lookup,
+            vec![("uid", lbug::Value::String(project_uid.to_string()))],
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    None,
+                    StoreError::Query(format!("execute Project lookup: {error}")),
+                ));
+            }
+        };
+        let project_name = rows.next().and_then(|row| match row.first() {
+            Some(lbug::Value::String(name)) => Some(name.clone()),
+            _ => None,
+        });
+        drop(rows);
+
+        let Some(project_name) = project_name else {
+            let commit = conn.query(queries.commit).and_then(|_| {
+                if queries.repeat_commit {
+                    conn.query(queries.commit).map(|_| ())
+                } else {
+                    Ok(())
+                }
+            });
+            return match commit {
+                Ok(_) => Ok(DeleteProjectCascadeOutcome {
+                    project_uid: project_uid.to_string(),
+                    project_name: None,
+                    disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+                }),
+                Err(error) => Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    None,
+                    StoreError::Query(format!("commit read-only Project lookup: {error}")),
+                )),
+            };
+        };
+
+        let mut delete = match conn.prepare(queries.delete) {
+            Ok(delete) => delete,
+            Err(error) => {
+                return Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    Some(project_name),
+                    StoreError::Query(format!("prepare Project DETACH DELETE: {error}")),
+                ));
+            }
+        };
+        let delete_params = if queries.omit_delete_params {
+            Vec::new()
+        } else {
+            vec![("uid", lbug::Value::String(project_uid.to_string()))]
+        };
+        if let Err(error) = conn.execute(&mut delete, delete_params) {
+            let rollback = Self::project_cascade_rollback(&conn, queries.rollback);
+            return Err(DeleteProjectCascadeError {
+                project_uid: project_uid.to_string(),
+                project_name: Some(project_name),
+                disposition: if rollback.is_none() {
+                    ProjectMutationDisposition::ConfirmedRolledBack
+                } else {
+                    ProjectMutationDisposition::Ambiguous
+                },
+                primary: StoreError::Query(format!("execute Project DETACH DELETE: {error}")),
+                rollback,
+            });
+        }
+
+        let commit = conn.query(queries.commit).and_then(|_| {
+            if queries.repeat_commit {
+                conn.query(queries.commit).map(|_| ())
+            } else {
+                Ok(())
+            }
+        });
+        match commit {
+            Ok(_) => Ok(DeleteProjectCascadeOutcome {
+                project_uid: project_uid.to_string(),
+                project_name: Some(project_name),
+                disposition: ProjectMutationDisposition::Changed,
+            }),
+            Err(error) => Err(DeleteProjectCascadeError {
+                project_uid: project_uid.to_string(),
+                project_name: Some(project_name),
+                // A COMMIT error after a mutation is ambiguous even when a
+                // best-effort rollback subsequently reports success.
+                disposition: ProjectMutationDisposition::Ambiguous,
+                primary: StoreError::Query(format!("commit Project cascade: {error}")),
+                rollback: Self::project_cascade_rollback(&conn, queries.rollback),
+            }),
+        }
+    }
+
+    fn project_cascade_pre_mutation_error(
+        conn: &lbug::Connection<'_>,
+        rollback_query: &str,
+        project_uid: &str,
+        project_name: Option<String>,
+        primary: StoreError,
+    ) -> DeleteProjectCascadeError {
+        DeleteProjectCascadeError {
+            project_uid: project_uid.to_string(),
+            project_name,
+            disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+            primary,
+            rollback: Self::project_cascade_rollback(conn, rollback_query),
+        }
+    }
+
+    fn project_cascade_rollback(
+        conn: &lbug::Connection<'_>,
+        rollback_query: &str,
+    ) -> Option<StoreError> {
+        conn.query(rollback_query)
+            .err()
+            .map(|error| StoreError::Query(format!("rollback Project cascade: {error}")))
+    }
+
+    #[cfg(test)]
+    fn delete_project_cascade_with_faults(
+        &self,
+        project_uid: &str,
+        faults: ProjectCascadeFaults,
+    ) -> Result<DeleteProjectCascadeOutcome, DeleteProjectCascadeError> {
+        let mut queries = ProjectCascadeQueries::default();
+        if faults.begin {
+            queries.repeat_begin = true;
+        }
+        if faults.lookup {
+            queries.lookup = "INJECTED LOOKUP FAILURE";
+        }
+        if faults.before_mutation {
+            queries.delete = "INJECTED BEFORE MUTATION FAILURE";
+        }
+        queries.omit_delete_params = faults.detach;
+        if faults.commit {
+            queries.repeat_commit = true;
+        }
+        if faults.rollback {
+            queries.rollback = "INJECTED ROLLBACK FAILURE";
+        }
+        self.delete_project_cascade_with_queries(project_uid, queries)
     }
 
     fn finish_project_transaction<T>(
@@ -3222,7 +3448,8 @@ impl GraphStore {
 
     /// Delete the Project node itself (and any remaining edges).
     pub fn delete_project_node(&self, project_uid: &str) -> Result<(), StoreError> {
-        self.delete_project_cascade_with_outcome(project_uid)?;
+        self.delete_project_cascade_with_outcome(project_uid)
+            .map_err(|error| StoreError::Query(error.to_string()))?;
         Ok(())
     }
 
@@ -3860,30 +4087,123 @@ mod tests {
     }
 
     #[test]
-    fn project_cascade_mid_operation_failure_rolls_back_node_and_edges() {
+    fn project_cascade_fault_matrix_reports_transaction_disposition() {
+        for (faults, expected, name_known) in [
+            (
+                ProjectCascadeFaults {
+                    begin: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::ConfirmedUnchanged,
+                false,
+            ),
+            (
+                ProjectCascadeFaults {
+                    lookup: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::ConfirmedUnchanged,
+                false,
+            ),
+            (
+                ProjectCascadeFaults {
+                    before_mutation: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::ConfirmedUnchanged,
+                true,
+            ),
+            (
+                ProjectCascadeFaults {
+                    detach: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::ConfirmedRolledBack,
+                true,
+            ),
+            (
+                ProjectCascadeFaults {
+                    commit: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::Ambiguous,
+                true,
+            ),
+            (
+                ProjectCascadeFaults {
+                    detach: true,
+                    rollback: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::Ambiguous,
+                true,
+            ),
+        ] {
+            let store = GraphStore::in_memory().unwrap();
+            seed_project_component(&store);
+
+            let error = store
+                .delete_project_cascade_with_faults("proj:txn:parent", faults)
+                .unwrap_err();
+
+            assert_eq!(error.project_uid, "proj:txn:parent");
+            assert_eq!(error.disposition, expected, "{faults:?}");
+            assert_eq!(error.project_name.is_some(), name_known, "{faults:?}");
+            assert!(!error.primary.to_string().is_empty());
+            if faults.rollback {
+                assert!(
+                    error.rollback.as_ref().is_some_and(|rollback| rollback
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("injected")),
+                    "rollback context missing: {error}"
+                );
+            }
+
+            if matches!(
+                expected,
+                ProjectMutationDisposition::ConfirmedUnchanged
+                    | ProjectMutationDisposition::ConfirmedRolledBack
+            ) {
+                assert!(
+                    store
+                        .list_projects()
+                        .unwrap()
+                        .iter()
+                        .any(|project| project.uid == "proj:txn:parent"),
+                    "confirmed failure removed the Project: {faults:?}"
+                );
+                assert_eq!(
+                    store
+                        .list_project_component_uids("proj:txn:parent")
+                        .unwrap(),
+                    vec!["proj:txn:child"],
+                    "confirmed failure removed the edge: {faults:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_project_commit_failure_is_confirmed_unchanged() {
         let store = GraphStore::in_memory().unwrap();
-        seed_project_component(&store);
 
         let error = store
-            .delete_project_cascade_with_hook("proj:txn:parent", || {
-                Err(StoreError::Query("injected before commit".to_string()))
-            })
+            .delete_project_cascade_with_faults(
+                "proj:txn:missing",
+                ProjectCascadeFaults {
+                    commit: true,
+                    ..Default::default()
+                },
+            )
             .unwrap_err();
 
-        assert!(error.to_string().contains("injected before commit"));
-        assert!(
-            store
-                .list_projects()
-                .unwrap()
-                .iter()
-                .any(|project| project.uid == "proj:txn:parent")
-        );
         assert_eq!(
-            store
-                .list_project_component_uids("proj:txn:parent")
-                .unwrap(),
-            vec!["proj:txn:child"]
+            error.disposition,
+            ProjectMutationDisposition::ConfirmedUnchanged
         );
+        assert_eq!(error.project_uid, "proj:txn:missing");
+        assert_eq!(error.project_name, None);
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! `serde_json::Value`. Any JSON value is valid (string, number, boolean, etc.).
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 /// In-memory extension store: node UID → property map.
@@ -45,6 +46,53 @@ pub fn save_extensions(db_path: &Path, store: &ExtensionStore) -> Result<(), any
     std::fs::write(&tmp_path, json)?;
     std::fs::rename(&tmp_path, &path)?;
     Ok(())
+}
+
+/// Remove exactly one UID from the extension sidecar and durably publish the
+/// replacement. Missing sidecars and missing UIDs are confirmed no-ops.
+///
+/// Unlike [`load_extensions`], this mutation path is strict: unreadable or
+/// malformed input is returned as an error so cleanup can never overwrite
+/// unrelated metadata with an empty map.
+pub fn remove_extension_uid_durable(db_path: &Path, uid: &str) -> Result<bool, anyhow::Error> {
+    let path = sidecar_path(db_path);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read extension sidecar {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut store: ExtensionStore = serde_json::from_str(&content)
+        .map_err(|error| anyhow::anyhow!("parse extension sidecar {}: {error}", path.display()))?;
+    if store.remove(uid).is_none() {
+        // A prior atomic replacement may have reached the canonical path but
+        // failed its final parent-directory sync. Re-syncing the namespace on
+        // an already-absent retry confirms that replacement without rewriting
+        // unrelated metadata.
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "confirm durable extension metadata state for {uid} in {}: {error}",
+                    path.display()
+                )
+            },
+        )?;
+        return Ok(false);
+    }
+
+    let json = serde_json::to_vec_pretty(&store)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| file.write_all(&json))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "durably remove extension metadata for {uid} from {}: {error}",
+                path.display()
+            )
+        })?;
+    Ok(true)
 }
 
 /// Set a single property on a node. Creates the node entry if absent.
@@ -279,5 +327,48 @@ mod tests {
             Some(ts),
             "timestamp should survive unrelated property writes"
         );
+    }
+
+    #[test]
+    fn durable_uid_removal_preserves_unrelated_metadata_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let mut store = ExtensionStore::new();
+        set_property(
+            &mut store,
+            "proj:test:remove",
+            "external_refs",
+            serde_json::json!(["ticket-1"]),
+        );
+        set_property(
+            &mut store,
+            "proj:test:keep",
+            "tags",
+            serde_json::json!(["keep"]),
+        );
+        save_extensions(&db_path, &store).unwrap();
+
+        assert!(remove_extension_uid_durable(&db_path, "proj:test:remove").unwrap());
+        assert!(!remove_extension_uid_durable(&db_path, "proj:test:remove").unwrap());
+
+        let reopened = load_extensions(&db_path);
+        assert!(!reopened.contains_key("proj:test:remove"));
+        assert_eq!(
+            get_property(&reopened, "proj:test:keep", "tags"),
+            Some(&serde_json::json!(["keep"]))
+        );
+    }
+
+    #[test]
+    fn durable_uid_removal_propagates_corrupt_input_without_rewriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let extension_path = sidecar_path(&db_path);
+        std::fs::write(&extension_path, b"{not-json").unwrap();
+
+        let error = remove_extension_uid_durable(&db_path, "proj:test:remove").unwrap_err();
+
+        assert!(error.to_string().contains("parse extension sidecar"));
+        assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
     }
 }

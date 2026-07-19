@@ -1305,10 +1305,12 @@ where
     )
 }
 
-fn run_remove_project_with<D, F>(
+fn run_remove_project_with<D, L, C, F>(
     state: &DaemonState,
     project_uid: &str,
     delete_project: D,
+    project_exists: L,
+    cleanup_extensions: C,
     finalize: F,
 ) -> Result<RemoveProjectResponse, Status>
 where
@@ -1317,30 +1319,98 @@ where
         &str,
     ) -> Result<
         nestweaver_store::DeleteProjectCascadeOutcome,
-        nestweaver_store::StoreError,
+        nestweaver_store::DeleteProjectCascadeError,
     >,
+    L: FnOnce(&GraphStore, &str) -> Result<bool, nestweaver_store::StoreError>,
+    C: FnOnce(&Path, &str) -> Result<bool, anyhow::Error>,
     F: FnOnce(&DaemonState, &str) -> Vec<nestweaver_engine::DeletionReconciliationFailure>,
 {
-    let mutation = delete_project(&state.store, project_uid)
-        .map_err(|error| Status::internal(format!("delete Project cascade failed: {error:#}")));
-    let confirmed_noop = matches!(&mutation, Ok(outcome) if !outcome.changed);
-    let failures = if confirmed_noop {
-        Vec::new()
-    } else {
-        // A transaction commit error is ambiguous: the graph may already be
-        // durable even when the client did not receive confirmation. Finalize
-        // every changed or errored attempt so no stale generation, embedding,
-        // or PageRank state can survive a possibly-committed delete.
-        finalize(state, "project removal")
-    };
+    enum ExtensionCleanup {
+        No,
+        Yes,
+        CheckLiveness,
+    }
 
-    finish_reconciled_mutation(
-        mutation.map(|outcome| RemoveProjectResponse {
-            project_name: outcome.project_name.unwrap_or_default(),
-        }),
-        "project removal",
-        failures,
-    )
+    let deletion = delete_project(&state.store, project_uid);
+    let (mutation, finalize_needed, mut extension_cleanup) = match deletion {
+        Ok(outcome) => {
+            let finalize_needed = matches!(
+                outcome.disposition,
+                nestweaver_store::ProjectMutationDisposition::Changed
+                    | nestweaver_store::ProjectMutationDisposition::Ambiguous
+            );
+            let cleanup = match outcome.disposition {
+                nestweaver_store::ProjectMutationDisposition::Changed
+                | nestweaver_store::ProjectMutationDisposition::ConfirmedUnchanged => {
+                    ExtensionCleanup::Yes
+                }
+                nestweaver_store::ProjectMutationDisposition::Ambiguous => {
+                    ExtensionCleanup::CheckLiveness
+                }
+                nestweaver_store::ProjectMutationDisposition::ConfirmedRolledBack => {
+                    ExtensionCleanup::No
+                }
+            };
+            (
+                Ok(RemoveProjectResponse {
+                    project_name: outcome.project_name.unwrap_or_default(),
+                }),
+                finalize_needed,
+                cleanup,
+            )
+        }
+        Err(error) => {
+            let (finalize_needed, cleanup) = match error.disposition {
+                nestweaver_store::ProjectMutationDisposition::ConfirmedUnchanged
+                | nestweaver_store::ProjectMutationDisposition::ConfirmedRolledBack => {
+                    (false, ExtensionCleanup::No)
+                }
+                nestweaver_store::ProjectMutationDisposition::Changed => {
+                    (true, ExtensionCleanup::Yes)
+                }
+                nestweaver_store::ProjectMutationDisposition::Ambiguous => {
+                    (true, ExtensionCleanup::CheckLiveness)
+                }
+            };
+            (
+                Err(Status::internal(format!(
+                    "delete Project cascade failed: {error}"
+                ))),
+                finalize_needed,
+                cleanup,
+            )
+        }
+    };
+    let mut failures = Vec::new();
+
+    if matches!(extension_cleanup, ExtensionCleanup::CheckLiveness) {
+        extension_cleanup = match project_exists(&state.store, project_uid) {
+            Ok(true) => ExtensionCleanup::No,
+            Ok(false) => ExtensionCleanup::Yes,
+            Err(error) => {
+                push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::GraphLiveness,
+                    format!("Project {project_uid} liveness query failed: {error:#}"),
+                );
+                ExtensionCleanup::No
+            }
+        };
+    }
+    if matches!(extension_cleanup, ExtensionCleanup::Yes)
+        && let Err(error) = cleanup_extensions(&state.db_path, project_uid)
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+            format!("Project {project_uid}: {error:#}"),
+        );
+    }
+    if finalize_needed {
+        failures.extend(finalize(state, "project removal"));
+    }
+
+    finish_reconciled_mutation(mutation, "project removal", failures)
 }
 
 fn rebuild_tantivy_after_mutation(
@@ -2778,6 +2848,8 @@ impl NestWeaverDaemon for DaemonService {
                 &state,
                 &req.project_uid,
                 |store, uid| store.delete_project_cascade_with_outcome(uid),
+                |store, uid| store.project_exists(uid),
+                nestweaver_engine::remove_extension_uid_durable,
                 finalize_node_graph_deletion,
             )
         })
@@ -7283,6 +7355,27 @@ mod startup_helper_tests {
             .unwrap();
     }
 
+    fn seed_extension(state: &DaemonState, uid: &str, key: &str, value: serde_json::Value) {
+        let mut extensions = nestweaver_engine::load_extensions(&state.db_path);
+        nestweaver_engine::set_property(&mut extensions, uid, key, value);
+        nestweaver_engine::save_extensions(&state.db_path, &extensions).unwrap();
+    }
+
+    fn project_delete_error(
+        uid: &str,
+        name: Option<&str>,
+        disposition: nestweaver_store::ProjectMutationDisposition,
+        message: &str,
+    ) -> nestweaver_store::DeleteProjectCascadeError {
+        nestweaver_store::DeleteProjectCascadeError {
+            project_uid: uid.to_string(),
+            project_name: name.map(str::to_string),
+            disposition,
+            primary: nestweaver_store::StoreError::Query(message.to_string()),
+            rollback: None,
+        }
+    }
+
     fn seed_vault_note_heading_embeddings(
         state: &DaemonState,
         vault_uid: &str,
@@ -8603,6 +8696,18 @@ mod startup_helper_tests {
         let state = test_state_with_writer();
         let project_uid = "proj:test:durable-remove";
         seed_project(&state, project_uid, "Durable remove");
+        seed_extension(
+            &state,
+            project_uid,
+            "external_refs",
+            serde_json::json!(["ticket-141"]),
+        );
+        seed_extension(
+            &state,
+            "proj:test:unrelated-metadata",
+            "tags",
+            serde_json::json!(["keep"]),
+        );
         assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
         state.store.flush_embedding_index().unwrap();
         let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
@@ -8614,6 +8719,8 @@ mod startup_helper_tests {
             &state,
             project_uid,
             |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
             finalize_node_graph_deletion,
         )
         .unwrap();
@@ -8623,10 +8730,19 @@ mod startup_helper_tests {
         assert!(!pagerank_path.exists());
         assert!(!state.store.pagerank_scores().contains_key(project_uid));
         assert!(!state.store.has_embedding(project_uid));
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(
+            nestweaver_engine::get_all_properties(&extensions, project_uid).is_empty(),
+            "query_extensions UID lookup must not expose removed Project metadata"
+        );
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, "proj:test:unrelated-metadata", "tags"),
+            Some(&serde_json::json!(["keep"])),
+            "Project cleanup must preserve unrelated extension entries"
+        );
 
         let db_path = state.db_path.clone();
         let expected_generation = state.store.graph_generation();
-        state.store.checkpoint().unwrap();
         drop(state);
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         assert!(
@@ -8637,6 +8753,7 @@ mod startup_helper_tests {
                 .all(|project| project.uid != project_uid)
         );
         assert_eq!(reopened.graph_generation(), expected_generation);
+        assert!(!reopened.has_embedding(project_uid));
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(!reopened.pagerank_scores().contains_key(project_uid));
     }
@@ -8653,6 +8770,8 @@ mod startup_helper_tests {
             &state,
             "proj:test:missing",
             |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
             |_state, _operation| {
                 finalized.set(true);
                 Vec::new()
@@ -8664,6 +8783,40 @@ mod startup_helper_tests {
         assert!(!finalized.get());
         assert_eq!(state.store.graph_generation(), generation_before);
         assert!(pagerank_path.exists());
+    }
+
+    #[tokio::test]
+    async fn removed_project_metadata_is_absent_from_query_extensions_rpc() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:query-extensions";
+        seed_project(&state, project_uid, "Query extensions");
+        seed_extension(
+            &state,
+            project_uid,
+            "external_refs",
+            serde_json::json!(["visible-before-delete"]),
+        );
+        run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            finalize_node_graph_deletion,
+        )
+        .unwrap();
+
+        let response = DaemonService::new(state)
+            .query_extensions(Request::new(JsonRequest {
+                args_json: serde_json::json!({"uid": project_uid}).to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let result: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+
+        assert_eq!(result["uid"], project_uid);
+        assert_eq!(result["properties"], serde_json::json!({}));
     }
 
     #[test]
@@ -8678,6 +8831,8 @@ mod startup_helper_tests {
             &state,
             project_uid,
             |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
             finalize_node_graph_deletion,
         )
         .unwrap_err();
@@ -8717,6 +8872,8 @@ mod startup_helper_tests {
                 &state,
                 &project_uid,
                 |store, uid| store.delete_project_cascade_with_outcome(uid),
+                |store, uid| store.project_exists(uid),
+                nestweaver_engine::remove_extension_uid_durable,
                 finalize_node_graph_deletion,
             )
             .unwrap_err();
@@ -8748,10 +8905,15 @@ mod startup_helper_tests {
             &state,
             "proj:test:aggregate-errors",
             |_store, _uid| {
-                Err(nestweaver_store::StoreError::Query(
-                    "injected graph mutation failure".to_string(),
+                Err(project_delete_error(
+                    "proj:test:aggregate-errors",
+                    None,
+                    nestweaver_store::ProjectMutationDisposition::Ambiguous,
+                    "injected graph mutation failure",
                 ))
             },
+            |_store, _uid| Ok(false),
+            |_db_path, _uid| Ok(false),
             |_state, _operation| {
                 vec![nestweaver_engine::DeletionReconciliationFailure {
                     stage: nestweaver_engine::DeletionReconciliationStage::PersistedPageRank,
@@ -8765,6 +8927,254 @@ mod startup_helper_tests {
         assert!(error.message().contains("injected graph mutation failure"));
         assert!(error.message().contains("persisted-pagerank"));
         assert!(error.message().contains("injected durable unlink failure"));
+    }
+
+    #[test]
+    fn confirmed_project_rollback_does_not_reconcile_or_mutate_sidecars() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:confirmed-rollback";
+        seed_project(&state, project_uid, "Confirmed rollback");
+        seed_extension(
+            &state,
+            project_uid,
+            "aliases",
+            serde_json::json!(["still-live"]),
+        );
+        assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
+        state.store.flush_embedding_index().unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = state.store.graph_generation();
+        let pagerank_generation_before = state.store.pagerank_generation();
+        let liveness_called = std::cell::Cell::new(false);
+        let cleanup_called = std::cell::Cell::new(false);
+        let finalizer_called = std::cell::Cell::new(false);
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |_store, uid| {
+                Err(project_delete_error(
+                    uid,
+                    Some("Confirmed rollback"),
+                    nestweaver_store::ProjectMutationDisposition::ConfirmedRolledBack,
+                    "injected DETACH failure followed by rollback",
+                ))
+            },
+            |_store, _uid| {
+                liveness_called.set(true);
+                Ok(true)
+            },
+            |_db_path, _uid| {
+                cleanup_called.set(true);
+                Ok(false)
+            },
+            |_state, _operation| {
+                finalizer_called.set(true);
+                Vec::new()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("ConfirmedRolledBack"));
+        assert!(!liveness_called.get());
+        assert!(!cleanup_called.get());
+        assert!(!finalizer_called.get());
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert_eq!(
+            state.store.pagerank_generation(),
+            pagerank_generation_before
+        );
+        assert!(pagerank_path.exists());
+        assert!(state.store.has_embedding(project_uid));
+        assert!(
+            !nestweaver_engine::get_all_properties(
+                &nestweaver_engine::load_extensions(&state.db_path),
+                project_uid,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn confirmed_unchanged_project_error_does_not_run_reconciliation() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:confirmed-unchanged";
+        seed_project(&state, project_uid, "Confirmed unchanged");
+        seed_extension(
+            &state,
+            project_uid,
+            "tags",
+            serde_json::json!(["still-live"]),
+        );
+        let generation_before = state.store.graph_generation();
+        let cleanup_called = std::cell::Cell::new(false);
+        let finalizer_called = std::cell::Cell::new(false);
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |_store, uid| {
+                Err(project_delete_error(
+                    uid,
+                    None,
+                    nestweaver_store::ProjectMutationDisposition::ConfirmedUnchanged,
+                    "injected lookup failure",
+                ))
+            },
+            |_store, _uid| panic!("confirmed unchanged must not query liveness"),
+            |_db_path, _uid| {
+                cleanup_called.set(true);
+                Ok(false)
+            },
+            |_state, _operation| {
+                finalizer_called.set(true);
+                Vec::new()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("ConfirmedUnchanged"));
+        assert!(!cleanup_called.get());
+        assert!(!finalizer_called.get());
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert!(state.store.project_exists(project_uid).unwrap());
+        assert!(nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid));
+    }
+
+    #[test]
+    fn ambiguous_project_delete_reconciles_and_uses_graph_liveness_for_extensions() {
+        for graph_present in [false, true] {
+            let state = test_state_with_writer();
+            let project_uid = format!("proj:test:ambiguous-{graph_present}");
+            if graph_present {
+                seed_project(&state, &project_uid, "Ambiguous present");
+            }
+            seed_extension(
+                &state,
+                &project_uid,
+                "features",
+                serde_json::json!(["flag"]),
+            );
+            let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+            std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+            let generation_before = state.store.graph_generation();
+
+            let error = run_remove_project_with(
+                &state,
+                &project_uid,
+                |_store, uid| {
+                    Err(project_delete_error(
+                        uid,
+                        Some("Ambiguous"),
+                        nestweaver_store::ProjectMutationDisposition::Ambiguous,
+                        "injected ambiguous commit result",
+                    ))
+                },
+                |store, uid| store.project_exists(uid),
+                nestweaver_engine::remove_extension_uid_durable,
+                finalize_node_graph_deletion,
+            )
+            .unwrap_err();
+
+            assert!(error.message().contains("injected ambiguous commit result"));
+            assert!(state.store.graph_generation() > generation_before);
+            assert!(!pagerank_path.exists());
+            assert_eq!(
+                nestweaver_engine::load_extensions(&state.db_path).contains_key(&project_uid),
+                graph_present,
+                "extension liveness decision disagreed with graph state"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_liveness_failure_preserves_extensions_and_aggregates_error() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:liveness-failure";
+        seed_extension(&state, project_uid, "tags", serde_json::json!(["preserve"]));
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |_store, uid| {
+                Err(project_delete_error(
+                    uid,
+                    None,
+                    nestweaver_store::ProjectMutationDisposition::Ambiguous,
+                    "ambiguous delete",
+                ))
+            },
+            |_store, _uid| {
+                Err(nestweaver_store::StoreError::Query(
+                    "injected liveness query failure".to_string(),
+                ))
+            },
+            nestweaver_engine::remove_extension_uid_durable,
+            finalize_node_graph_deletion,
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("ambiguous delete"));
+        assert!(error.message().contains("graph-liveness"));
+        assert!(error.message().contains("injected liveness query failure"));
+        assert!(
+            nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid),
+            "metadata must be preserved when graph liveness is unknown"
+        );
+    }
+
+    #[test]
+    fn project_extension_cleanup_failure_is_retryable_and_survives_reopen() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:extension-retry";
+        seed_project(&state, project_uid, "Extension retry");
+        seed_extension(
+            &state,
+            project_uid,
+            "external_refs",
+            serde_json::json!(["retry-me"]),
+        );
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            |_db_path, _uid| anyhow::bail!("injected extension cleanup failure"),
+            finalize_node_graph_deletion,
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("extension-metadata"));
+        assert!(
+            error
+                .message()
+                .contains("injected extension cleanup failure")
+        );
+        assert!(nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid));
+
+        let finalized_on_retry = std::cell::Cell::new(false);
+        let response = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            |_state, _operation| {
+                finalized_on_retry.set(true);
+                Vec::new()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.project_name, "");
+        assert!(!finalized_on_retry.get());
+        assert!(!nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid));
+        let db_path = state.db_path.clone();
+        drop(state);
+        assert!(!nestweaver_engine::load_extensions(&db_path).contains_key(project_uid));
     }
 
     #[test]
