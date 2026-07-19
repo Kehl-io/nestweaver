@@ -59,6 +59,12 @@ async fn spa_fallback(request: Request) -> Response {
             .into_response();
     }
 
+    // API typos must remain machine-readable HTTP failures. Returning the SPA
+    // shell here turns an unknown endpoint into a misleading 200 response.
+    if path == "/api" || path.starts_with("/api/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     // Paths with file extensions that weren't found should 404
     if has_file_extension(path) {
         return StatusCode::NOT_FOUND.into_response();
@@ -341,5 +347,17 @@ mod frontend_assets_tests {
             checked > 0,
             "expected index.html to reference at least one /assets/* file"
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_api_path_does_not_fall_back_to_spa() {
+        let request = Request::builder()
+            .uri("/api/v1/does-not-exist")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = spa_fallback(request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

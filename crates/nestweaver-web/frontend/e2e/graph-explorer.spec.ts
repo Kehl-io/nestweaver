@@ -215,6 +215,19 @@ test.describe("Graph Explorer", () => {
       seeds: [firstSymbol.uid],
       limit: 50,
     });
+
+    await page
+      .getByRole("tablist", { name: "Result representation" })
+      .getByRole("tab", { name: "Table" })
+      .click();
+    const table = page.getByRole("region", { name: "Node table view" });
+    await expect(table).toBeVisible();
+    await expect(
+      table.getByRole("button", {
+        name: new RegExp(`^${escapeRegExp(firstSymbol.name)},`),
+      }),
+    ).toBeVisible();
+    await expect(table.getByText("Unsupported or limited")).toHaveCount(0);
   });
 
   test("selected overview node exposes contextual actions", async ({

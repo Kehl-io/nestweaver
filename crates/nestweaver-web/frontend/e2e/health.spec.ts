@@ -21,8 +21,8 @@ test.describe("App Health", () => {
     expect(errors).toEqual([]);
   });
 
-  test("unknown API route does not return 500", async ({ request }) => {
+  test("unknown API route returns 404", async ({ request }) => {
     const response = await request.get("/api/v1/nonexistent");
-    expect(response.status()).not.toBeGreaterThanOrEqual(500);
+    expect(response.status()).toBe(404);
   });
 });
