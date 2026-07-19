@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -58,7 +59,8 @@ impl ResolutionDeps {
             repos: self.repos.clone(),
         };
         let data = rmp_serde::to_vec(&file).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        std::fs::write(path, data).map_err(|e| anyhow::anyhow!("write: {e}"))?;
+        crate::manifest::atomic_replace_file(path, |file| file.write_all(&data))
+            .map_err(|e| anyhow::anyhow!("write: {e:#}"))?;
         Ok(())
     }
 

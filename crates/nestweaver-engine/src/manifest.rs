@@ -104,7 +104,7 @@ pub fn save_manifest_cache_for_db(
     Ok(())
 }
 
-fn atomic_replace_file(
+pub(crate) fn atomic_replace_file(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<(), anyhow::Error> {

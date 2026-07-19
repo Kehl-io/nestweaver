@@ -423,15 +423,24 @@ where
             )
         })?;
     let cascade_result = clear_derived(store, repo_uid).and_then(|()| delete_repo(store, repo_uid));
-    nestweaver_engine::finalize_code_graph_deletion(
+    let reconciliation = nestweaver_engine::finalize_code_graph_deletion(
         store,
         db_path,
         &[repo_uid.to_string()],
         tantivy,
         "admin repo removal",
     );
-    cascade_result?;
-    Ok(())
+    match (cascade_result, reconciliation) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(mutation), Ok(())) => Err(mutation),
+        (Ok(()), Err(reconciliation)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            reconciliation.to_string(),
+        )),
+        (Err((status, mutation)), Err(reconciliation)) => {
+            Err((status, format!("{mutation}; {reconciliation}")))
+        }
+    }
 }
 
 /// DELETE /admin/api/repos/:id — remove a repo.
@@ -2242,6 +2251,38 @@ url = "https://github.com/example/existing"
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn admin_remove_repo_preserves_mutation_and_tantivy_rebuild_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        drop(nestweaver_store::TantivyIndex::open_or_create(&tantivy_path).unwrap());
+        let reader = nestweaver_store::TantivyIndex::open_reader_only(&tantivy_path).unwrap();
+        let generation_before = store.graph_generation();
+
+        let error = run_admin_remove_repo_with(
+            &store,
+            &db_path,
+            Some(&reader),
+            "repo:test:web-search-failure",
+            |_store, _uid| Ok(()),
+            |_store, _uid| {
+                Err((
+                    StatusCode::CONFLICT,
+                    "injected admin mutation failure".to_string(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("injected admin mutation failure"));
+        assert!(error.1.contains("search-index"));
+        assert!(error.1.contains("writer unavailable"));
+        assert!(store.graph_generation() > generation_before);
     }
 
     fn device_router(state: Arc<AdminState>) -> Router {

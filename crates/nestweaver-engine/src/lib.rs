@@ -184,7 +184,8 @@ pub use guide_rules::{
 };
 pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
-    CachedFileMeta, DeletedGraphStateReconciliation, FILEMETA_VERSION, FileMetaCache,
+    CachedFileMeta, DeletedGraphStateReconciliation, DeletionReconciliationError,
+    DeletionReconciliationFailure, DeletionReconciliationStage, FILEMETA_VERSION, FileMetaCache,
     FileMetaSidecar, IncrementalResult, IndexResult, finalize_code_graph_deletion,
     incremental_index, incremental_index_with_name, index_directory, index_directory_in_memory,
     index_directory_with_options, index_directory_with_store,

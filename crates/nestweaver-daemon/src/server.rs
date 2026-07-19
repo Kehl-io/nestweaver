@@ -867,28 +867,90 @@ fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<PrunedRepos
     }
 }
 
-fn finalize_code_graph_deletion(state: &DaemonState, repo_uids: &[String]) {
-    nestweaver_engine::finalize_code_graph_deletion(
+fn finalize_code_graph_deletion(
+    state: &DaemonState,
+    repo_uids: &[String],
+) -> Vec<nestweaver_engine::DeletionReconciliationFailure> {
+    match nestweaver_engine::finalize_code_graph_deletion(
         &state.store,
         &state.db_path,
         repo_uids,
         None,
         "code graph deletion",
-    );
+    ) {
+        Ok(()) => Vec::new(),
+        Err(error) => error.failures,
+    }
 }
 
-fn finalize_node_graph_deletion(state: &DaemonState, operation: &str) {
+fn push_reconciliation_failure(
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+    stage: nestweaver_engine::DeletionReconciliationStage,
+    message: impl Into<String>,
+) {
+    failures.push(nestweaver_engine::DeletionReconciliationFailure {
+        stage,
+        repo_uid: None,
+        message: message.into(),
+    });
+}
+
+fn finalize_node_graph_deletion(
+    state: &DaemonState,
+    operation: &str,
+) -> Vec<nestweaver_engine::DeletionReconciliationFailure> {
+    let mut failures = Vec::new();
     match state.store.reconcile_embedding_index() {
         Ok(removed) => {
             tracing::info!(removed, operation, "reconciled deleted node embeddings")
         }
-        Err(error) => tracing::warn!(
-            %error,
-            operation,
-            "failed to reconcile deleted node embeddings (non-fatal)"
+        Err(error) => push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::EmbeddingIndex,
+            format!("embedding reconciliation failed: {error:#}"),
         ),
     }
-    state.store.bump_and_persist_generation();
+    state.store.bump_graph_generation();
+    let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+    if let Err(error) = state.store.save_graph_generation(&generation_path) {
+        push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::GenerationPersistence,
+            format!("{}: {error:#}", generation_path.display()),
+        );
+    }
+    failures
+}
+
+fn finish_reconciled_mutation<T>(
+    mutation: Result<T, Status>,
+    operation: &str,
+    failures: Vec<nestweaver_engine::DeletionReconciliationFailure>,
+) -> Result<T, Status> {
+    if failures.is_empty() {
+        return mutation;
+    }
+    let reconciliation = nestweaver_engine::DeletionReconciliationError::new(operation, failures);
+    match mutation {
+        Ok(_) => Err(Status::internal(reconciliation.to_string())),
+        Err(mutation) => Err(Status::new(
+            mutation.code(),
+            format!("{}; {reconciliation}", mutation.message()),
+        )),
+    }
+}
+
+fn append_search_reconciliation(
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+    result: Result<(), anyhow::Error>,
+) {
+    if let Err(error) = result {
+        push_reconciliation_failure(
+            failures,
+            nestweaver_engine::DeletionReconciliationStage::SearchIndex,
+            format!("{error:#}"),
+        );
+    }
 }
 
 fn run_remove_repo_with<C, D>(
@@ -911,33 +973,38 @@ where
     let cascade_result =
         clear_derived(&state.store, repo_uid).and_then(|()| delete_repo(&state.store, repo_uid));
 
-    nestweaver_engine::finalize_code_graph_deletion(
+    let reconciliation = nestweaver_engine::finalize_code_graph_deletion(
         &state.store,
         &state.db_path,
         &[repo_uid.to_string()],
         state.tantivy.as_deref(),
         "repo removal",
-    );
+    )
+    .err()
+    .map(|error| error.failures)
+    .unwrap_or_default();
 
-    cascade_result?;
-
-    Ok(RemoveRepoResponse {
-        files_deleted: file_count as u64,
-        symbols_deleted: sym_count as u64,
-    })
+    finish_reconciled_mutation(
+        cascade_result.map(|()| RemoveRepoResponse {
+            files_deleted: file_count as u64,
+            symbols_deleted: sym_count as u64,
+        }),
+        "repo removal",
+        reconciliation,
+    )
 }
 
-fn rebuild_tantivy_after_mutation(state: &DaemonState, operation: &str) {
-    if let Some(ref tantivy) = state.tantivy
-        && tantivy.has_writer()
-    {
-        match tantivy.reindex_from_store(&state.store) {
-            Ok(docs) => tracing::info!(docs, operation, "Tantivy reindexed after mutation"),
-            Err(error) => {
-                tracing::warn!(%error, operation, "Tantivy reindex failed after mutation")
-            }
-        }
+fn rebuild_tantivy_after_mutation(
+    state: &DaemonState,
+    operation: &str,
+) -> Result<(), anyhow::Error> {
+    if let Some(ref tantivy) = state.tantivy {
+        let docs = tantivy
+            .reindex_from_store(&state.store)
+            .map_err(anyhow::Error::from)?;
+        tracing::info!(docs, operation, "Tantivy reindexed after mutation");
     }
+    Ok(())
 }
 
 fn run_prune_stale_with<DR, DV, R>(
@@ -949,7 +1016,7 @@ fn run_prune_stale_with<DR, DV, R>(
 where
     DR: FnMut(&GraphStore, &nestweaver_schema::Repo) -> Result<(), anyhow::Error>,
     DV: FnMut(&GraphStore, &nestweaver_schema::Vault) -> Result<(), anyhow::Error>,
-    R: FnMut(&DaemonState, &str),
+    R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
 {
     let (removed_repos, mut error) = prune_stale_repos_with(&state.store, delete_repo);
     let mut removed_vaults = Vec::new();
@@ -978,22 +1045,25 @@ where
     let changed = !removed_repos.is_empty()
         || !removed_vaults.is_empty()
         || (error.is_some() && vault_mutation_attempted);
-    if !removed_repos.is_empty() {
-        finalize_code_graph_deletion(state, &removed_repos.uids);
+    let mut failures = if !removed_repos.is_empty() {
+        finalize_code_graph_deletion(state, &removed_repos.uids)
     } else if changed {
-        finalize_node_graph_deletion(state, "prune_stale");
-    }
+        finalize_node_graph_deletion(state, "prune_stale")
+    } else {
+        Vec::new()
+    };
     if changed {
-        reconcile_search(state, "prune_stale");
+        append_search_reconciliation(&mut failures, reconcile_search(state, "prune_stale"));
     }
 
-    if let Some(error) = error {
-        return Err(Status::internal(format!("prune_stale failed: {error:#}")));
-    }
-    Ok(PruneStaleResponse {
-        removed_repos: removed_repos.names,
-        removed_vaults,
-    })
+    let mutation = match error {
+        Some(error) => Err(Status::internal(format!("prune_stale failed: {error:#}"))),
+        None => Ok(PruneStaleResponse {
+            removed_repos: removed_repos.names,
+            removed_vaults,
+        }),
+    };
+    finish_reconciled_mutation(mutation, "prune_stale", failures)
 }
 
 fn run_purge_instance_with<F, R>(
@@ -1004,7 +1074,7 @@ fn run_purge_instance_with<F, R>(
 ) -> Result<nestweaver_store::PurgeInstanceResult, Status>
 where
     F: FnOnce(&GraphStore, &str) -> Result<nestweaver_store::PurgeInstanceResult, anyhow::Error>,
-    R: FnMut(&DaemonState, &str),
+    R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
 {
     let mut repo_uids = list_instance_code_repo_uids(&state.store, instance_id)
         .map_err(|e| Status::internal(format!("PurgeInstance failed to list code repos: {e:#}")))?;
@@ -1023,28 +1093,40 @@ where
                 || result.vaults > 0
                 || result.projects > 0
                 || result.orphans_swept > 0;
-            if code_changed {
-                finalize_code_graph_deletion(state, &repo_uids);
+            let mut failures = if code_changed {
+                finalize_code_graph_deletion(state, &repo_uids)
             } else if changed {
-                finalize_node_graph_deletion(state, "purge_instance");
-            }
+                finalize_node_graph_deletion(state, "purge_instance")
+            } else {
+                Vec::new()
+            };
             if changed {
-                reconcile_search(state, "purge_instance");
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(state, "purge_instance"),
+                );
             }
-            Ok(result)
+            finish_reconciled_mutation(Ok(result), "purge_instance", failures)
         }
         Err(error) => {
             // `purge_instance` is intentionally non-transactional. A late
             // error can follow committed deletions. Invalidate PageRank only
             // when preflight found code that may have changed; vault/project-
             // only failures still need generation and search reconciliation.
-            if repo_uids.is_empty() {
-                finalize_node_graph_deletion(state, "purge_instance_error");
+            let mut failures = if repo_uids.is_empty() {
+                finalize_node_graph_deletion(state, "purge_instance_error")
             } else {
-                finalize_code_graph_deletion(state, &repo_uids);
-            }
-            reconcile_search(state, "purge_instance_error");
-            Err(Status::internal(format!("PurgeInstance failed: {error:#}")))
+                finalize_code_graph_deletion(state, &repo_uids)
+            };
+            append_search_reconciliation(
+                &mut failures,
+                reconcile_search(state, "purge_instance_error"),
+            );
+            finish_reconciled_mutation(
+                Err(Status::internal(format!("PurgeInstance failed: {error:#}"))),
+                "purge_instance_error",
+                failures,
+            )
         }
     }
 }
@@ -1074,38 +1156,53 @@ fn run_merge_instance_with<F, R>(
 ) -> Result<nestweaver_store::MergeResult, Status>
 where
     F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
-    R: FnMut(&DaemonState, &str),
+    R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
 {
     let repo_uids = list_instance_code_repo_uids(&state.store, from_id)
         .map_err(|e| Status::internal(format!("merge failed to list code repos: {e:#}")))?;
 
     match merge(&state.store, from_id, to_id) {
         Ok(result) => {
-            let changed = result.vaults > 0 || result.repos > 0 || result.projects > 0;
-            if !result.repo_uids_removed.is_empty() {
-                finalize_code_graph_deletion(state, &result.repo_uids_removed);
+            let changed = !result.repo_uids_removed.is_empty()
+                || result.vaults > 0
+                || result.repos > 0
+                || result.projects > 0;
+            let mut failures = if !result.repo_uids_removed.is_empty() {
+                finalize_code_graph_deletion(state, &result.repo_uids_removed)
             } else if changed {
-                finalize_node_graph_deletion(state, "merge_instance");
-            }
+                finalize_node_graph_deletion(state, "merge_instance")
+            } else {
+                Vec::new()
+            };
             if changed {
-                reconcile_search(state, "merge_instance");
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(state, "merge_instance"),
+                );
             }
-            Ok(result)
+            finish_reconciled_mutation(Ok(result), "merge_instance", failures)
         }
         Err(error) => {
             // Instance merge is multi-statement and can commit earlier source
             // entries before a later one fails. Preflight tells us whether
             // code may have changed; otherwise preserve PageRank while still
             // invalidating graph caches and rebuilding note search.
-            if repo_uids.is_empty() {
-                finalize_node_graph_deletion(state, "merge_instance_error");
+            let mut failures = if repo_uids.is_empty() {
+                finalize_node_graph_deletion(state, "merge_instance_error")
             } else {
-                finalize_code_graph_deletion(state, &repo_uids);
-            }
-            reconcile_search(state, "merge_instance_error");
-            Err(Status::internal(format!(
-                "merge_instance_ids failed: {error:#}"
-            )))
+                finalize_code_graph_deletion(state, &repo_uids)
+            };
+            append_search_reconciliation(
+                &mut failures,
+                reconcile_search(state, "merge_instance_error"),
+            );
+            finish_reconciled_mutation(
+                Err(Status::internal(format!(
+                    "merge_instance_ids failed: {error:#}"
+                ))),
+                "merge_instance_error",
+                failures,
+            )
         }
     }
 }
@@ -2204,32 +2301,29 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let notes_deleted = state
+            let mutation = state
                 .store
                 .delete_vault_cascade(&req.vault_uid)
-                .map_err(|e| Status::internal(format!("delete_vault_cascade failed: {e:#}")))?;
+                .map_err(|e| Status::internal(format!("delete_vault_cascade failed: {e:#}")));
 
             // nw-054: bump the graph generation so generation-keyed in-memory
             // caches on the live daemon store invalidate (mirrors `remove_repo`
             // and `index`). Without this a query primed before the removal keeps
             // satisfying subsequent lookups out of the stale cache and returns the
             // just-deleted notes.
-            finalize_node_graph_deletion(&state, "remove_vault");
+            let mut failures = finalize_node_graph_deletion(&state, "remove_vault");
+            append_search_reconciliation(
+                &mut failures,
+                rebuild_tantivy_after_mutation(&state, "remove_vault"),
+            );
 
-            if let Some(ref tantivy) = state.tantivy
-                && tantivy.has_writer()
-            {
-                match tantivy.reindex_from_store(&state.store) {
-                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after vault removal"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tantivy reindex failed after vault removal")
-                    }
-                }
-            }
-
-            Ok::<_, Status>(RemoveVaultResponse {
-                notes_deleted: notes_deleted as u64,
-            })
+            finish_reconciled_mutation(
+                mutation.map(|notes_deleted| RemoveVaultResponse {
+                    notes_deleted: notes_deleted as u64,
+                }),
+                "remove_vault",
+                failures,
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -6947,6 +7041,52 @@ mod startup_helper_tests {
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
     }
 
+    #[tokio::test]
+    async fn typed_remove_vault_surfaces_embedding_persistence_failure() {
+        let state = test_state_with_writer();
+        let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:remove:embedding-failure",
+            "remove-embedding-failure",
+            "/missing/remove-embedding-failure",
+        );
+        let embedding_path = state.store.embedding_sidecar_path().unwrap();
+        std::fs::remove_file(&embedding_path).unwrap();
+        std::fs::create_dir(&embedding_path).unwrap();
+        let tantivy = state.tantivy.as_ref().unwrap();
+        tantivy
+            .update_note(
+                "note:stale-vault-reconciliation",
+                "stale_vault_reconciliation_sentinel",
+                "vlt:remove:embedding-failure",
+                &["stale_vault_reconciliation_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let generation_before = state.store.graph_generation();
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(RemoveVaultRequest {
+            vault_uid: "vlt:remove:embedding-failure".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let error = service.remove_vault(request).await.unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("embedding-index"));
+        assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(
+            tantivy
+                .search("stale_vault_reconciliation_sentinel", 10)
+                .unwrap()
+                .is_empty(),
+            "search rebuild must run after embedding persistence failure"
+        );
+    }
+
     #[test]
     fn prune_stale_vault_prunes_note_and_heading_embeddings() {
         let state = test_state_with_writer();
@@ -6966,12 +7106,102 @@ mod startup_helper_tests {
                     .map(|_| ())
                     .map_err(anyhow::Error::from)
             },
-            |_state, _operation| {},
+            |_state, _operation| Ok(()),
         )
         .unwrap();
 
         assert_eq!(result.removed_vaults.len(), 1);
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn prune_surfaces_search_reconciliation_failure_after_other_finalizers() {
+        let state = test_state_with_writer();
+        seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:prune:search-failure",
+            "prune-search-failure",
+            "/definitely/missing/prune-search-failure",
+        );
+        let generation_before = state.store.graph_generation();
+
+        let error = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _operation| Err(anyhow::anyhow!("injected Tantivy rebuild failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("search-index"));
+        assert!(error.message().contains("injected Tantivy rebuild failure"));
+        assert!(
+            state.store.graph_generation() > generation_before,
+            "generation finalization must precede the surfaced search failure"
+        );
+    }
+
+    #[test]
+    fn purge_preserves_mutation_error_and_appends_reconciliation_failure() {
+        let state = test_state_with_writer();
+
+        let error = run_purge_instance_with(
+            &state,
+            "partial",
+            |_store, _id| Err(anyhow::anyhow!("injected committed mutation failure")),
+            |_state, _operation| Err(anyhow::anyhow!("injected search failure")),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .message()
+                .contains("injected committed mutation failure")
+        );
+        assert!(error.message().contains("search-index"));
+        assert!(error.message().contains("injected search failure"));
+    }
+
+    #[test]
+    fn merge_surfaces_search_reconciliation_failure_after_committed_mutation() {
+        let state = test_state_with_writer();
+        seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:merge:search-failure",
+            "merge-search-source",
+            "/missing/merge-search-failure",
+        );
+
+        let error = run_merge_instance_with(
+            &state,
+            "merge-search-source",
+            "merge-search-target",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _operation| Err(anyhow::anyhow!("injected merge search failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("search-index"));
+        assert!(error.message().contains("injected merge search failure"));
+        assert!(
+            state
+                .store
+                .list_vaults(Some("merge-search-source"))
+                .unwrap()
+                .is_empty(),
+            "source vault mutation must have committed before reconciliation failed"
+        );
     }
 
     #[test]
@@ -6988,7 +7218,7 @@ mod startup_helper_tests {
             &state,
             "purge-source",
             |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
-            |_state, _operation| {},
+            |_state, _operation| Ok(()),
         )
         .unwrap();
 
@@ -7022,7 +7252,7 @@ mod startup_helper_tests {
                     .merge_instance_ids(from, to)
                     .map_err(anyhow::Error::from)
             },
-            |_state, _operation| {},
+            |_state, _operation| Ok(()),
         )
         .unwrap();
 
@@ -7058,7 +7288,7 @@ mod startup_helper_tests {
                     .merge_instance_ids(from, to)
                     .map_err(anyhow::Error::from)
             },
-            |_state, _operation| {},
+            |_state, _operation| Ok(()),
         )
         .unwrap();
 
@@ -7286,7 +7516,10 @@ mod startup_helper_tests {
                 }
             },
             |_store, _vault| Ok(()),
-            |_state, _operation| reconciliations += 1,
+            |_state, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
         )
         .unwrap_err();
 
@@ -7337,7 +7570,10 @@ mod startup_helper_tests {
             &state,
             delete_repo_cascade,
             |_store, _vault| Err(anyhow::anyhow!("injected vault failure")),
-            |_state, _operation| reconciliations += 1,
+            |_state, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
         )
         .unwrap_err();
 
@@ -7385,7 +7621,10 @@ mod startup_helper_tests {
                 delete_repo_cascade(store, &repo)?;
                 Err(anyhow::anyhow!("injected late purge failure"))
             },
-            |_state, _operation| reconciliations += 1,
+            |_state, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
         )
         .unwrap_err();
 
@@ -7449,7 +7688,10 @@ mod startup_helper_tests {
                 delete_repo_cascade(store, &first)?;
                 Err(anyhow::anyhow!("injected later repo merge failure"))
             },
-            |_state, _operation| reconciliations += 1,
+            |_state, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
         )
         .unwrap_err();
 
@@ -7520,7 +7762,10 @@ mod startup_helper_tests {
                 store.delete_vault_cascade("vlt:old:docs")?;
                 Err(anyhow::anyhow!("injected late vault purge failure"))
             },
-            |_state, _operation| reconciliations += 1,
+            |_state, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
         )
         .unwrap_err();
 
@@ -7562,7 +7807,10 @@ mod startup_helper_tests {
                 delete_repo_cascade(store, &repo)?;
                 Err(anyhow::anyhow!("injected mismatched-UID merge failure"))
             },
-            |_state, _operation| reconciliations += 1,
+            |_state, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
         )
         .unwrap_err();
 
@@ -7604,7 +7852,10 @@ mod startup_helper_tests {
             &state,
             "old",
             |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
-            |_state, _operation| reconciliations += 1,
+            |_state, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
         )
         .unwrap();
 
@@ -7656,6 +7907,44 @@ mod startup_helper_tests {
 
         assert!(state.store.pagerank_generation() > before_generation);
         assert!(!after_scores.contains_key("repo:test:pagerank"));
+    }
+
+    #[test]
+    fn typed_remove_repo_surfaces_required_generation_persistence_failure() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:test:typed-reconciliation-failure";
+        state
+            .store
+            .insert_repo(&test_repo(
+                repo_uid,
+                "https://example.test/typed-reconciliation-failure",
+                None,
+            ))
+            .unwrap();
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        std::fs::create_dir(&generation_path).unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let error = run_remove_repo_with(
+            &state,
+            repo_uid,
+            |store, uid| {
+                store.clear_repo_derived_nodes(uid).map_err(|error| {
+                    Status::internal(format!("clear_repo_derived_nodes failed: {error:#}"))
+                })
+            },
+            |store, uid| {
+                store.delete_repo_node(uid).map_err(|error| {
+                    Status::internal(format!("delete_repo_node failed: {error:#}"))
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("generation-persistence"));
+        assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
+        assert!(state.store.graph_generation() > generation_before);
     }
 
     #[test]

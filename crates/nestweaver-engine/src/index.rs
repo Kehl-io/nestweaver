@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -134,9 +135,145 @@ pub fn save_filemeta_sidecar(sidecar: &FileMetaSidecar, path: &Path) -> Result<(
         "FileMetaSidecar::default() pins the version; never construct one by hand"
     );
     let json = serde_json::to_string(sidecar).with_context(|| "serialize filemeta sidecar")?;
-    std::fs::write(path, json)
+    crate::manifest::atomic_replace_file(path, |file| file.write_all(json.as_bytes()))
         .with_context(|| format!("write filemeta sidecar to {}", path.display()))?;
     Ok(())
+}
+
+/// A required durable stage in post-deletion reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionReconciliationStage {
+    FileMetadata,
+    ResolutionDependencies,
+    ManifestCache,
+    EmbeddingIndex,
+    LegacyRetirement,
+    ClusterCache,
+    GenerationPersistence,
+    PersistedPageRank,
+    SearchIndex,
+}
+
+impl std::fmt::Display for DeletionReconciliationStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::FileMetadata => "filemeta",
+            Self::ResolutionDependencies => "resolution-deps",
+            Self::ManifestCache => "manifest-cache",
+            Self::EmbeddingIndex => "embedding-index",
+            Self::LegacyRetirement => "legacy-retirement",
+            Self::ClusterCache => "cluster-cache",
+            Self::GenerationPersistence => "generation-persistence",
+            Self::PersistedPageRank => "persisted-pagerank",
+            Self::SearchIndex => "search-index",
+        };
+        formatter.write_str(name)
+    }
+}
+
+/// One failed stage from a reconciliation run. Errors are strings because the
+/// finalizer crosses `anyhow`, store, filesystem, and Tantivy error domains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionReconciliationFailure {
+    pub stage: DeletionReconciliationStage,
+    pub repo_uid: Option<String>,
+    pub message: String,
+}
+
+/// Aggregate returned only after every safe reconciliation stage has run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionReconciliationError {
+    pub operation: String,
+    pub failures: Vec<DeletionReconciliationFailure>,
+}
+
+impl DeletionReconciliationError {
+    pub fn new(operation: impl Into<String>, failures: Vec<DeletionReconciliationFailure>) -> Self {
+        debug_assert!(!failures.is_empty());
+        Self {
+            operation: operation.into(),
+            failures,
+        }
+    }
+
+    pub fn single(
+        operation: impl Into<String>,
+        stage: DeletionReconciliationStage,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            operation,
+            vec![DeletionReconciliationFailure {
+                stage,
+                repo_uid: None,
+                message: message.into(),
+            }],
+        )
+    }
+}
+
+impl std::fmt::Display for DeletionReconciliationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} reconciliation failed in {} stage(s)",
+            self.operation,
+            self.failures.len()
+        )?;
+        for failure in &self.failures {
+            write!(formatter, "; {}", failure.stage)?;
+            if let Some(repo_uid) = &failure.repo_uid {
+                write!(formatter, "[{repo_uid}]")?;
+            }
+            write!(formatter, ": {}", failure.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DeletionReconciliationError {}
+
+trait DeletionReconciliationIo {
+    fn save_filemeta(&self, sidecar: &FileMetaSidecar, path: &Path) -> Result<(), anyhow::Error>;
+    fn save_resolution_deps(
+        &self,
+        deps: &crate::resolution_cache::ResolutionDeps,
+        path: &Path,
+    ) -> Result<(), anyhow::Error>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+}
+
+struct FileSystemDeletionReconciliationIo;
+
+impl DeletionReconciliationIo for FileSystemDeletionReconciliationIo {
+    fn save_filemeta(&self, sidecar: &FileMetaSidecar, path: &Path) -> Result<(), anyhow::Error> {
+        save_filemeta_sidecar(sidecar, path)
+    }
+
+    fn save_resolution_deps(
+        &self,
+        deps: &crate::resolution_cache::ResolutionDeps,
+        path: &Path,
+    ) -> Result<(), anyhow::Error> {
+        deps.save(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
+}
+
+fn push_reconciliation_failure(
+    failures: &mut Vec<DeletionReconciliationFailure>,
+    stage: DeletionReconciliationStage,
+    repo_uid: Option<&str>,
+    message: impl Into<String>,
+) {
+    failures.push(DeletionReconciliationFailure {
+        stage,
+        repo_uid: repo_uid.map(str::to_owned),
+        message: message.into(),
+    });
 }
 
 /// Drop the removed repo's slices from the change-detection sidecars so a later
@@ -151,49 +288,77 @@ pub fn save_filemeta_sidecar(sidecar: &FileMetaSidecar, path: &Path) -> Result<(
 /// * **uid-scoped** — ONLY `repo_uid`'s slice is removed from each sidecar;
 ///   other repos sharing the DB keep their slices untouched (dropping the wrong
 ///   slice would be the same silent-data-loss class this fixes).
-/// * **fail-safe** — a missing, corrupt, or old-format sidecar is a no-op:
+/// * **fail-open input** — a missing, corrupt, or old-format sidecar is a no-op:
 ///   `load_filemeta_sidecar` / `ResolutionDeps::load` already fail open to empty,
-///   and a save error is logged, never propagated, so `remove-repo` cannot crash
-///   on sidecar hygiene. Each sidecar is only rewritten when the slice was
-///   actually present, so a missing sidecar is never materialized.
+///   and each sidecar is only rewritten when the slice was actually present.
+/// * **required output** — once a stale slice is found, failure to durably save
+///   its removal is returned. A caller must not report successful deletion while
+///   stale change-detection state can survive or be reused by the same repo UID.
 ///
 /// The `.parsed_cache` sidecar is deliberately left alone: it is content-hash
 /// keyed and shared across repos (collision-safe), so an orphaned entry there is
 /// harmless dead space, not a correctness hazard.
-pub fn remove_repo_sidecar_slices(db_path: &Path, repo_uid: &str) {
+pub fn remove_repo_sidecar_slices(
+    db_path: &Path,
+    repo_uid: &str,
+) -> Result<(), DeletionReconciliationError> {
+    let mut failures = Vec::new();
+    remove_repo_sidecar_slices_with_io(
+        db_path,
+        repo_uid,
+        &FileSystemDeletionReconciliationIo,
+        &mut failures,
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(DeletionReconciliationError::new("repo sidecar", failures))
+    }
+}
+
+fn remove_repo_sidecar_slices_with_io(
+    db_path: &Path,
+    repo_uid: &str,
+    io: &dyn DeletionReconciliationIo,
+    failures: &mut Vec<DeletionReconciliationFailure>,
+) {
     // filemeta — the primary nw-048 cause. A stale slice makes every file of the
     // re-added repo classify `Unchanged`, so its symbols are never re-indexed.
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     let mut sidecar = load_filemeta_sidecar(&filemeta_path);
     if sidecar.repos.remove(repo_uid).is_some()
-        && let Err(e) = save_filemeta_sidecar(&sidecar, &filemeta_path)
+        && let Err(error) = io.save_filemeta(&sidecar, &filemeta_path)
     {
-        tracing::warn!(
-            error = %e, repo_uid,
-            "remove-repo: failed to drop filemeta slice (non-fatal)"
+        push_reconciliation_failure(
+            failures,
+            DeletionReconciliationStage::FileMetadata,
+            Some(repo_uid),
+            format!("{}: {error:#}", filemeta_path.display()),
         );
     }
 
-    // resolution_deps — nw-045 hygiene. An orphaned slice here is inert
-    // (correctness-safe dead space), but dropped for cleanliness while we're here.
+    // resolution_deps — nw-045. Consumers fail open on unreadable input, but a
+    // durable slice for a deleted UID can influence a later same-UID incremental
+    // resolution, so a discovered slice is required output rather than hygiene.
     let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
     let mut deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
     if deps.remove_repo(repo_uid)
-        && let Err(e) = deps.save(&resolution_deps_path)
+        && let Err(error) = io.save_resolution_deps(&deps, &resolution_deps_path)
     {
-        tracing::warn!(
-            error = %e, repo_uid,
-            "remove-repo: failed to drop resolution_deps slice (non-fatal)"
+        push_reconciliation_failure(
+            failures,
+            DeletionReconciliationStage::ResolutionDependencies,
+            Some(repo_uid),
+            format!("{}: {error:#}", resolution_deps_path.display()),
         );
     }
 }
 
 /// Per-stage results from reconciling graph-derived sidecars after deletion.
 ///
-/// The deletion finalizer keeps these failures non-fatal for now, matching its
-/// existing policy, but returning both results from this helper gives the
-/// durable-error boundary a structured seam for follow-up propagation.
+/// The deletion finalizer consumes every result, continues through the other
+/// safe stages, then returns all required-stage failures in one aggregate.
 #[derive(Debug)]
 pub struct DeletedGraphStateReconciliation {
     pub manifests_removed: Result<usize, String>,
@@ -208,6 +373,14 @@ pub struct DeletedGraphStateReconciliation {
 pub fn reconcile_deleted_graph_state(
     store: &GraphStore,
     db_path: &Path,
+) -> DeletedGraphStateReconciliation {
+    reconcile_deleted_graph_state_with_io(store, db_path, &FileSystemDeletionReconciliationIo)
+}
+
+fn reconcile_deleted_graph_state_with_io(
+    store: &GraphStore,
+    db_path: &Path,
+    io: &dyn DeletionReconciliationIo,
 ) -> DeletedGraphStateReconciliation {
     let manifests_removed = (|| -> Result<usize, anyhow::Error> {
         let manifests_path = crate::manifest::manifest_cache_path(db_path);
@@ -235,7 +408,7 @@ pub fn reconcile_deleted_graph_state(
         .reconcile_embedding_index()
         .map_err(|error| format!("embedding reconciliation failed: {error:#}"));
     let clusters_path = crate::sidecar_path(db_path, ".clusters.json");
-    let clusters_invalidated = match std::fs::remove_file(&clusters_path) {
+    let clusters_invalidated = match io.remove_file(&clusters_path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!(
@@ -251,9 +424,11 @@ pub fn reconcile_deleted_graph_state(
     }
 }
 
-/// Publish all cache and sidecar effects that must follow a successful code
-/// graph deletion. Both daemon RPC and web-admin removals call this epilogue so
-/// they cannot diverge after performing the same graph mutation.
+/// Publish all cache and sidecar effects that must follow committed code graph
+/// mutation, including a partially successful cascade. Both daemon RPC and
+/// web-admin removals call this epilogue so they cannot diverge after the same
+/// mutation. Required-stage failures are returned together only after every
+/// safe stage has been attempted.
 ///
 /// The parsed cache is intentionally not touched: unlike filemeta and
 /// resolution dependencies, it is keyed by content hash and safely shared by
@@ -264,42 +439,105 @@ pub fn finalize_code_graph_deletion(
     repo_uids: &[String],
     tantivy: Option<&nestweaver_store::TantivyIndex>,
     operation: &str,
-) {
+) -> Result<(), DeletionReconciliationError> {
+    finalize_code_graph_deletion_with_io(
+        store,
+        db_path,
+        repo_uids,
+        tantivy,
+        operation,
+        &FileSystemDeletionReconciliationIo,
+    )
+}
+
+fn finalize_code_graph_deletion_with_io(
+    store: &GraphStore,
+    db_path: &Path,
+    repo_uids: &[String],
+    tantivy: Option<&nestweaver_store::TantivyIndex>,
+    operation: &str,
+    io: &dyn DeletionReconciliationIo,
+) -> Result<(), DeletionReconciliationError> {
+    let mut failures = Vec::new();
     for uid in repo_uids {
-        remove_repo_sidecar_slices(db_path, uid);
+        remove_repo_sidecar_slices_with_io(db_path, uid, io, &mut failures);
     }
-    let reconciliation = reconcile_deleted_graph_state(store, db_path);
+    let reconciliation = reconcile_deleted_graph_state_with_io(store, db_path, io);
     match reconciliation.manifests_removed {
         Ok(removed) => tracing::info!(removed, operation, "manifest cache reconciled"),
-        Err(error) => tracing::warn!(%error, operation, "manifest cache reconciliation failed"),
+        Err(error) => {
+            let stage = if error.contains("legacy manifest sidecar") {
+                DeletionReconciliationStage::LegacyRetirement
+            } else {
+                DeletionReconciliationStage::ManifestCache
+            };
+            push_reconciliation_failure(&mut failures, stage, None, error);
+        }
     }
     match reconciliation.embeddings_removed {
         Ok(removed) => tracing::info!(removed, operation, "embedding index reconciled"),
-        Err(error) => tracing::warn!(%error, operation, "embedding index reconciliation failed"),
+        Err(error) => {
+            let stage = if error.contains("legacy embedding sidecar") {
+                DeletionReconciliationStage::LegacyRetirement
+            } else {
+                DeletionReconciliationStage::EmbeddingIndex
+            };
+            push_reconciliation_failure(&mut failures, stage, None, error);
+        }
     }
     match reconciliation.clusters_invalidated {
         Ok(invalidated) => tracing::info!(invalidated, operation, "cluster cache reconciled"),
-        Err(error) => tracing::warn!(%error, operation, "cluster cache reconciliation failed"),
+        Err(error) => push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::ClusterCache,
+            None,
+            error,
+        ),
     }
-    store.bump_and_persist_generation();
+
+    // The in-memory generation and PageRank invalidations are required but
+    // infallible. Run them before their durable companions so live readers are
+    // safe even when sidecar persistence fails.
+    store.bump_graph_generation();
+    let generation_path = crate::sidecar_path(db_path, ".generation");
+    if let Err(error) = store.save_graph_generation(&generation_path) {
+        push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::GenerationPersistence,
+            None,
+            format!("{}: {error:#}", generation_path.display()),
+        );
+    }
     store.invalidate_pagerank();
 
     let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
-    if let Err(error) = std::fs::remove_file(&pagerank_path)
+    if let Err(error) = io.remove_file(&pagerank_path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        tracing::warn!(%error, path = %pagerank_path.display(), "failed to remove stale PageRank sidecar");
+        push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::PersistedPageRank,
+            None,
+            format!("{}: {error}", pagerank_path.display()),
+        );
     }
 
-    if let Some(tantivy) = tantivy
-        && tantivy.has_writer()
-    {
+    if let Some(tantivy) = tantivy {
         match tantivy.reindex_from_store(store) {
             Ok(docs) => tracing::info!(docs, operation, "Tantivy reindexed after mutation"),
-            Err(error) => {
-                tracing::warn!(%error, operation, "Tantivy reindex failed after mutation")
-            }
+            Err(error) => push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::SearchIndex,
+                None,
+                error.to_string(),
+            ),
         }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(DeletionReconciliationError::new(operation, failures))
     }
 }
 
@@ -4093,7 +4331,8 @@ function hello(name) { return "Hello " + name; }
             std::slice::from_ref(&removed_uid),
             None,
             "manifest regression",
-        );
+        )
+        .unwrap();
 
         let manifests_path = crate::sidecar_path(&db_path, ".manifests.json");
         let manifests = crate::load_manifest_cache(&manifests_path).unwrap();
@@ -4171,7 +4410,8 @@ function hello(name) { return "Hello " + name; }
             std::slice::from_ref(&removed_repo_uid),
             None,
             "embedding regression",
-        );
+        )
+        .unwrap();
 
         let live_results = store.vector_search(&[1.0, 0.0], 1);
         assert_eq!(live_results[0].0, survivor_symbol_uid);
@@ -4183,6 +4423,154 @@ function hello(name) { return "Hello " + name; }
         assert_eq!(persisted_results[0].0, survivor_symbol_uid);
         assert!(!reopened.has_embedding(&removed_symbol_uid));
         assert!(reopened.has_embedding(&survivor_symbol_uid));
+    }
+
+    struct InjectedDeletionIo {
+        fail_save: PathBuf,
+        fail_remove: PathBuf,
+    }
+
+    impl DeletionReconciliationIo for InjectedDeletionIo {
+        fn save_filemeta(
+            &self,
+            sidecar: &FileMetaSidecar,
+            path: &Path,
+        ) -> Result<(), anyhow::Error> {
+            if path == self.fail_save {
+                anyhow::bail!("injected filemeta save failure");
+            }
+            save_filemeta_sidecar(sidecar, path)
+        }
+
+        fn save_resolution_deps(
+            &self,
+            deps: &crate::resolution_cache::ResolutionDeps,
+            path: &Path,
+        ) -> Result<(), anyhow::Error> {
+            deps.save(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            if path == self.fail_remove {
+                return Err(std::io::Error::other("injected sidecar removal failure"));
+            }
+            std::fs::remove_file(path)
+        }
+    }
+
+    #[test]
+    fn deletion_finalizer_aggregates_failures_and_runs_every_later_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_uid = "repo:test:aggregate-reconciliation".to_string();
+
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        let mut filemeta = FileMetaSidecar::default();
+        filemeta.repos.entry(repo_uid.clone()).or_default();
+        save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+
+        let clusters_path = crate::sidecar_path(&db_path, ".clusters.json");
+        fs::write(&clusters_path, r#"{"communities":[]}"#).unwrap();
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        fs::create_dir(&generation_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"deleted":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_generation = store.pagerank_generation();
+
+        let tantivy_path = dir.path().join("tantivy");
+        drop(nestweaver_store::TantivyIndex::open_or_create(&tantivy_path).unwrap());
+        let reader = nestweaver_store::TantivyIndex::open_reader_only(&tantivy_path).unwrap();
+        let io = InjectedDeletionIo {
+            fail_save: filemeta_path.clone(),
+            fail_remove: clusters_path.clone(),
+        };
+
+        let error = finalize_code_graph_deletion_with_io(
+            &store,
+            &db_path,
+            std::slice::from_ref(&repo_uid),
+            Some(&reader),
+            "aggregate regression",
+            &io,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .failures
+                .iter()
+                .map(|failure| failure.stage)
+                .collect::<Vec<_>>(),
+            vec![
+                DeletionReconciliationStage::FileMetadata,
+                DeletionReconciliationStage::ClusterCache,
+                DeletionReconciliationStage::GenerationPersistence,
+                DeletionReconciliationStage::SearchIndex,
+            ]
+        );
+        assert!(
+            load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&repo_uid),
+            "failed filemeta save must leave the durable stale slice visible"
+        );
+        assert!(
+            clusters_path.exists(),
+            "injected removal failure must be real"
+        );
+        assert!(
+            generation_path.is_dir(),
+            "injected generation persistence failure must remain observable"
+        );
+        assert!(
+            !pagerank_path.exists(),
+            "persisted PageRank invalidation must run after earlier failures"
+        );
+        assert!(
+            !store.pagerank_scores().contains_key("deleted"),
+            "live PageRank invalidation must discard the primed stale score"
+        );
+        assert!(store.pagerank_generation() > pagerank_generation);
+    }
+
+    #[test]
+    fn deletion_finalizer_classifies_legacy_retirement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_uid = "repo:test:legacy-retirement".to_string();
+        let manifests_path = crate::manifest::manifest_cache_path(&db_path);
+        let manifests =
+            HashMap::from([(repo_uid.clone(), crate::manifest::ManifestInfo::default())]);
+        crate::manifest::save_manifest_cache(&manifests, &manifests_path).unwrap();
+        let legacy_path = db_path.with_extension("manifests.json");
+        fs::create_dir(&legacy_path).unwrap();
+
+        let error = finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            &[repo_uid],
+            None,
+            "legacy retirement regression",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.failures.len(), 1);
+        assert_eq!(
+            error.failures[0].stage,
+            DeletionReconciliationStage::LegacyRetirement
+        );
+        assert!(
+            error.failures[0]
+                .message
+                .contains("legacy manifest sidecar")
+        );
+        assert!(
+            crate::sidecar_path(&db_path, ".generation").exists(),
+            "later generation persistence must still run"
+        );
     }
 
     struct EmptyReader {

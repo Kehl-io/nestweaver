@@ -29,7 +29,7 @@ fn remove_repo(store: &GraphStore, db: &Path, uid: &str) {
     store.bulk_delete_repo_files_and_symbols(uid).unwrap();
     store.clear_repo_derived_nodes(uid).unwrap();
     store.delete_repo_node(uid).unwrap();
-    remove_repo_sidecar_slices(db, uid);
+    remove_repo_sidecar_slices(db, uid).unwrap();
 }
 
 /// End-to-end nw-048 guard: after remove-repo drops the sidecar slice, a
@@ -159,7 +159,7 @@ fn slice_drop_is_uid_scoped() {
     deps.save(&rd_path).unwrap();
 
     // Drop only A.
-    remove_repo_sidecar_slices(&db, a);
+    remove_repo_sidecar_slices(&db, a).unwrap();
 
     let fm = load_filemeta_sidecar(&sidecar_path(&db, ".filemeta.json"));
     assert!(!fm.repos.contains_key(a), "A filemeta slice removed");
@@ -182,7 +182,7 @@ fn slice_drop_is_fail_safe() {
 
     // Missing sidecars: no panic, and nothing is created (the uid isn't present,
     // so there's nothing to drop and no reason to write an empty sidecar).
-    remove_repo_sidecar_slices(&db, "repo:default:whatever");
+    remove_repo_sidecar_slices(&db, "repo:default:whatever").unwrap();
     assert!(!fm_path.exists(), "missing filemeta not materialized");
     assert!(
         !rd_path.exists(),
@@ -193,7 +193,7 @@ fn slice_drop_is_fail_safe() {
     // uid isn't present, so the file is left untouched rather than clobbered.
     std::fs::write(&fm_path, b"{ this is not valid json").unwrap();
     std::fs::write(&rd_path, b"\x00not-msgpack").unwrap();
-    remove_repo_sidecar_slices(&db, "repo:default:whatever");
+    remove_repo_sidecar_slices(&db, "repo:default:whatever").unwrap();
     assert_eq!(
         std::fs::read(&fm_path).unwrap(),
         b"{ this is not valid json"
