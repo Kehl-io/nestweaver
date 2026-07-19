@@ -861,6 +861,10 @@ fn canonical_finalizer_plan(
     Ok(canonical)
 }
 
+// Keep the fingerprint inputs explicit: this tuple is the journal's tamper
+// detection schema, so each persisted field must remain visible at the call
+// site instead of being hidden in an unstructured parameter bundle.
+#[allow(clippy::too_many_arguments)]
 fn plan_fingerprint(
     from_id: &str,
     to_id: &str,
@@ -1186,6 +1190,9 @@ fn merge_extension_properties(
     changed
 }
 
+// Journal construction mirrors the persisted migration fields one-for-one;
+// retaining that shape makes it harder to omit a field from the fingerprint.
+#[allow(clippy::too_many_arguments)]
 fn journal_for_plan(
     from_id: &str,
     to_id: &str,
@@ -1359,6 +1366,10 @@ where
     )
 }
 
+// This private plumbing function keeps each graph-derived input and the
+// injectable durable writer explicit so recovery tests can bind and replay an
+// exact plan without an intermediate, lossy parameter object.
+#[allow(clippy::too_many_arguments)]
 fn prepare_instance_extension_migration_with_finalizers_and_write<F>(
     db_path: &Path,
     from_id: &str,
