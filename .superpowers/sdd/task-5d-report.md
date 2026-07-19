@@ -16,9 +16,10 @@ primary error and include the aggregate reconciliation details.
   merge, and instance purge now surface required repair failures consistently.
 - Partial mutation errors preserve their original gRPC code/message or HTTP
   status/message and append the reconciliation aggregate.
-- Search reconciliation is gated by before/after fingerprints of the exact
-  Note/Heading/Section/Tag rows Tantivy indexes. Code/project-only mutations do
-  not rebuild or false-fail search.
+- Search reconciliation compares before/after fingerprints of the exact
+  Note/Heading/Section/Tag documents Tantivy indexes. Proven-unchanged
+  code/project-only mutations do not rebuild or false-fail search; an unknown
+  projection conservatively repairs when a writer is available.
 - Filemeta and resolution-dependency rewrites now use the existing flushed,
   sibling-temp-file atomic replacement helper.
 
@@ -36,14 +37,15 @@ primary error and include the aggregate reconciliation details.
 | Generation sidecar persistence | Required | Other processes must observe the mutation generation. |
 | Live PageRank invalidation | Required, infallible for every graph deletion | Prevents live stale graph-node scores; graph generation does not invalidate the independent PageRank cache. |
 | Persisted PageRank removal | Required for every graph deletion | No reliable scope discriminator proves persisted ranks exclude vault/project nodes. Absence is success. |
-| Tantivy rebuild | Required only when indexed Note/Heading/Section/Tag rows changed | Available writers rebuild; configured-but-unavailable/corrupt startup state surfaces `search-index`; disabled/read-only state is intentional. Code/project-only deletion is not applicable. |
+| Tantivy rebuild | Required when indexed Note/Heading/Section/Tag documents changed or projection comparison is unknown | Available writers rebuild; configured-but-unavailable/corrupt startup state surfaces `search-index`; disabled/read-only state skips projection and repair intentionally. Proven-unchanged code/project-only deletion is not applicable. |
 | Parsed cache | Intentionally retained | It is content-hash keyed and repo independent. |
 | Missing/corrupt fail-open input or absent removable sidecar | Best-effort / not applicable | It cannot preserve a known stale slice; consumers fall back to safe recomputation and deletion absence is the desired state. |
 
 Manifest, embedding, and legacy retirement remain ordered internally: a failed
 canonical write never removes the recovery copy. Independent later stages still
 run. Vault-only finalization requires embedding persistence, generation and
-PageRank invalidation, and search rebuild only when indexed rows changed.
+PageRank invalidation, and search rebuild when indexed documents changed or
+their comparison cannot be completed safely.
 Code-only manifest/cluster/PageRank stages still run, while Tantivy is not
 applicable.
 
@@ -65,6 +67,21 @@ applicable.
 - Purge and web combined-error regressions perform real committed graph
   deletion, force a real generation-sidecar failure, and assert the original
   mutation code/status/message remains primary.
+
+## Review 2 corrections
+
+- Replaced the boolean search projection result with explicit `Unchanged`,
+  `Changed`, and `Unknown` states and threaded that state through every vault,
+  prune, purge, and merge reconciliation caller.
+- Intentionally disabled search now skips both projection reads. Available
+  search rebuilds on `Unknown` and does not surface the projection-read failure
+  when repair succeeds; configured-unavailable search surfaces its retained
+  startup failure for both `Changed` and `Unknown` mutations.
+- Added a deterministic failed-preflight regression with a real writer and
+  stale Tantivy document, proving the later authoritative rebuild is attempted.
+- Corrected daemon startup, purge/merge PageRank, and web `AdminState` comments
+  to reflect reader fallback, universal deletion invalidation, and code-only
+  admin deletion behavior.
 
 ## TDD evidence
 
@@ -98,6 +115,12 @@ Review 1 RED/GREEN evidence:
 - RED: first full daemon run after count-based gating — 6 failures; the merge reparent regression returned success because equal row counts hid changed indexed fields. Replacing counts with full indexed-row fingerprints fixed it.
 - RED: `cargo test -q -p nestweaver-daemon indexed_search_fingerprint_ignores_non_tantivy_note_metadata` — the whole-row fingerprint changed for non-indexed Note metadata; exact Tantivy document projection fixed it.
 - GREEN: store embedding 4/4; engine deletion finalizers 5/5; repo-sidecar integration 3/3; daemon 130/130.
+
+Review 2 RED/GREEN evidence:
+
+- RED: `cargo test -q -p nestweaver-daemon available_search_repairs_after_unknown_preflight_projection --no-run` — exit 101 because the tri-state mutation type and disabled preflight seam did not exist and projection errors still required an aggregate failure sink.
+- GREEN: unknown available repair 1/1; disabled projection skip 1/1; configured-unavailable tri-state 1/1; focused daemon search 7/7, prune 6/6, purge 5/5, merge 5/5; focused web admin removal 2/2.
+- GREEN: relevant daemon/web Clippy with warnings denied, `cargo fmt --all --check`, and `git diff --check` passed.
 
 Final validation:
 

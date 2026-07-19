@@ -968,6 +968,13 @@ struct IndexedSearchDocument {
     note_uid: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexedSearchMutation {
+    Unchanged,
+    Changed,
+    Unknown,
+}
+
 fn indexed_section_lines(lines: &[&str], start: u32, end: u32) -> String {
     if start == 0 || start as usize > lines.len() {
         return String::new();
@@ -1078,31 +1085,63 @@ fn indexed_search_rows(
     Ok(documents)
 }
 
-fn indexed_search_rows_changed(
-    before: Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>,
-    store: &GraphStore,
-    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
-) -> bool {
-    match (before, indexed_search_rows(store)) {
-        (Ok(before), Ok(after)) => before != after,
-        (Err(error), _) | (_, Err(error)) => {
-            push_reconciliation_failure(
-                failures,
-                nestweaver_engine::DeletionReconciliationStage::SearchIndex,
-                format!("failed to determine indexed document mutation: {error:#}"),
-            );
-            false
+fn indexed_search_rows_before_with<F>(
+    search: &SearchIndexReconciliation,
+    project: F,
+) -> Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>>
+where
+    F: FnOnce() -> Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>,
+{
+    match search {
+        SearchIndexReconciliation::Disabled => None,
+        SearchIndexReconciliation::Available(_) | SearchIndexReconciliation::Unavailable(_) => {
+            Some(project())
         }
+    }
+}
+
+fn indexed_search_rows_before(
+    state: &DaemonState,
+) -> Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>> {
+    indexed_search_rows_before_with(&state.search_reconciliation, || {
+        indexed_search_rows(&state.store)
+    })
+}
+
+fn indexed_search_mutation(
+    before: Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>>,
+    store: &GraphStore,
+) -> IndexedSearchMutation {
+    match before {
+        None => IndexedSearchMutation::Unchanged,
+        Some(Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                "indexed search mutation preflight is unknown; repairing conservatively"
+            );
+            IndexedSearchMutation::Unknown
+        }
+        Some(Ok(before)) => match indexed_search_rows(store) {
+            Ok(after) if before == after => IndexedSearchMutation::Unchanged,
+            Ok(_) => IndexedSearchMutation::Changed,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "indexed search mutation postflight is unknown; repairing conservatively"
+                );
+                IndexedSearchMutation::Unknown
+            }
+        },
     }
 }
 
 fn reconcile_search_index(
     state: &SearchIndexReconciliation,
     store: &GraphStore,
-    indexed_rows_changed: bool,
+    mutation: IndexedSearchMutation,
     operation: &str,
 ) -> Result<(), anyhow::Error> {
-    if !indexed_rows_changed {
+    if mutation == IndexedSearchMutation::Unchanged {
         return Ok(());
     }
     match state {
@@ -1258,9 +1297,15 @@ where
 
 fn rebuild_tantivy_after_mutation(
     state: &DaemonState,
+    mutation: IndexedSearchMutation,
     operation: &str,
 ) -> Result<(), anyhow::Error> {
-    reconcile_search_index(&state.search_reconciliation, &state.store, true, operation)
+    reconcile_search_index(
+        &state.search_reconciliation,
+        &state.store,
+        mutation,
+        operation,
+    )
 }
 
 fn run_prune_stale_with<DR, DV, R>(
@@ -1272,9 +1317,9 @@ fn run_prune_stale_with<DR, DV, R>(
 where
     DR: FnMut(&GraphStore, &nestweaver_schema::Repo) -> Result<(), anyhow::Error>,
     DV: FnMut(&GraphStore, &nestweaver_schema::Vault) -> Result<(), anyhow::Error>,
-    R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
+    R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
 {
-    let search_rows_before = indexed_search_rows(&state.store);
+    let search_rows_before = indexed_search_rows_before(state);
     let (removed_repos, mut error) = prune_stale_repos_with(&state.store, delete_repo);
     let mut removed_vaults = Vec::new();
     let mut vault_mutation_attempted = false;
@@ -1309,10 +1354,16 @@ where
     } else {
         Vec::new()
     };
-    let indexed_rows_changed =
-        indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
-    if indexed_rows_changed {
-        append_search_reconciliation(&mut failures, reconcile_search(state, "prune_stale"));
+    let search_mutation = if changed {
+        indexed_search_mutation(search_rows_before, &state.store)
+    } else {
+        IndexedSearchMutation::Unchanged
+    };
+    if search_mutation != IndexedSearchMutation::Unchanged {
+        append_search_reconciliation(
+            &mut failures,
+            reconcile_search(state, search_mutation, "prune_stale"),
+        );
     }
 
     let mutation = match error {
@@ -1333,9 +1384,9 @@ fn run_purge_instance_with<F, R>(
 ) -> Result<nestweaver_store::PurgeInstanceResult, Status>
 where
     F: FnOnce(&GraphStore, &str) -> Result<nestweaver_store::PurgeInstanceResult, anyhow::Error>,
-    R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
+    R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
 {
-    let search_rows_before = indexed_search_rows(&state.store);
+    let search_rows_before = indexed_search_rows_before(state);
     let mut repo_uids = list_instance_code_repo_uids(&state.store, instance_id)
         .map_err(|e| Status::internal(format!("PurgeInstance failed to list code repos: {e:#}")))?;
 
@@ -1360,32 +1411,34 @@ where
             } else {
                 Vec::new()
             };
-            let indexed_rows_changed =
-                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
-            if indexed_rows_changed {
+            let search_mutation = if changed {
+                indexed_search_mutation(search_rows_before, &state.store)
+            } else {
+                IndexedSearchMutation::Unchanged
+            };
+            if search_mutation != IndexedSearchMutation::Unchanged {
                 append_search_reconciliation(
                     &mut failures,
-                    reconcile_search(state, "purge_instance"),
+                    reconcile_search(state, search_mutation, "purge_instance"),
                 );
             }
             finish_reconciled_mutation(Ok(result), "purge_instance", failures)
         }
         Err(error) => {
             // `purge_instance` is intentionally non-transactional. A late
-            // error can follow committed deletions. Invalidate PageRank only
-            // when preflight found code that may have changed; vault/project-
-            // only failures still need generation and search reconciliation.
+            // error can follow committed deletions. Both finalizers invalidate
+            // PageRank; the code-repo preflight only selects whether code
+            // sidecars also require reconciliation.
             let mut failures = if repo_uids.is_empty() {
                 finalize_node_graph_deletion(state, "purge_instance_error")
             } else {
                 finalize_code_graph_deletion(state, &repo_uids)
             };
-            let indexed_rows_changed =
-                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
-            if indexed_rows_changed {
+            let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+            if search_mutation != IndexedSearchMutation::Unchanged {
                 append_search_reconciliation(
                     &mut failures,
-                    reconcile_search(state, "purge_instance_error"),
+                    reconcile_search(state, search_mutation, "purge_instance_error"),
                 );
             }
             finish_reconciled_mutation(
@@ -1422,9 +1475,9 @@ fn run_merge_instance_with<F, R>(
 ) -> Result<nestweaver_store::MergeResult, Status>
 where
     F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
-    R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
+    R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
 {
-    let search_rows_before = indexed_search_rows(&state.store);
+    let search_rows_before = indexed_search_rows_before(state);
     let repo_uids = list_instance_code_repo_uids(&state.store, from_id)
         .map_err(|e| Status::internal(format!("merge failed to list code repos: {e:#}")))?;
 
@@ -1441,32 +1494,34 @@ where
             } else {
                 Vec::new()
             };
-            let indexed_rows_changed =
-                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
-            if indexed_rows_changed {
+            let search_mutation = if changed {
+                indexed_search_mutation(search_rows_before, &state.store)
+            } else {
+                IndexedSearchMutation::Unchanged
+            };
+            if search_mutation != IndexedSearchMutation::Unchanged {
                 append_search_reconciliation(
                     &mut failures,
-                    reconcile_search(state, "merge_instance"),
+                    reconcile_search(state, search_mutation, "merge_instance"),
                 );
             }
             finish_reconciled_mutation(Ok(result), "merge_instance", failures)
         }
         Err(error) => {
             // Instance merge is multi-statement and can commit earlier source
-            // entries before a later one fails. Preflight tells us whether
-            // code may have changed; otherwise preserve PageRank while still
-            // invalidating graph caches and rebuilding note search.
+            // entries before a later one fails. Both finalizers invalidate
+            // PageRank; the code-repo preflight only selects whether code
+            // sidecars also require reconciliation.
             let mut failures = if repo_uids.is_empty() {
                 finalize_node_graph_deletion(state, "merge_instance_error")
             } else {
                 finalize_code_graph_deletion(state, &repo_uids)
             };
-            let indexed_rows_changed =
-                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
-            if indexed_rows_changed {
+            let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+            if search_mutation != IndexedSearchMutation::Unchanged {
                 append_search_reconciliation(
                     &mut failures,
-                    reconcile_search(state, "merge_instance_error"),
+                    reconcile_search(state, search_mutation, "merge_instance_error"),
                 );
             }
             finish_reconciled_mutation(
@@ -2574,7 +2629,7 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let search_rows_before = indexed_search_rows(&state.store);
+            let search_rows_before = indexed_search_rows_before(&state);
             let mutation = state
                 .store
                 .delete_vault_cascade(&req.vault_uid)
@@ -2586,12 +2641,11 @@ impl NestWeaverDaemon for DaemonService {
             // satisfying subsequent lookups out of the stale cache and returns the
             // just-deleted notes.
             let mut failures = finalize_node_graph_deletion(&state, "remove_vault");
-            let indexed_rows_changed =
-                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
-            if indexed_rows_changed {
+            let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+            if search_mutation != IndexedSearchMutation::Unchanged {
                 append_search_reconciliation(
                     &mut failures,
-                    rebuild_tantivy_after_mutation(&state, "remove_vault"),
+                    rebuild_tantivy_after_mutation(&state, search_mutation, "remove_vault"),
                 );
             }
 
@@ -5201,14 +5255,14 @@ pub async fn run_server(
         store.load_interaction_cache(scores);
     }
 
-    // Open the Tantivy index. A read-only snapshot replica never mutates its
-    // index, so it opens reader-only and never acquires a writer lock — this
-    // matches the read-only store open and keeps a replica from holding a
-    // writer on its (private) materialized copy. The read-write daemon opens
-    // with a writer so it can update the index after indexing operations
-    // (vault/repo), falling back to reader-only when the writer lock is held by
-    // another process (e.g. a running brain watcher), and finally to None when
-    // the index doesn't exist at all.
+    // Open the Tantivy index. A read-only snapshot replica intentionally
+    // disables search reconciliation and uses a reader when one is available.
+    // A read-write daemon requests a writer for vault indexing and deletion
+    // repair. If that writer is unavailable, a reader can still serve queries,
+    // but the explicit unavailable reconciliation state makes a later indexed
+    // mutation fail instead of silently skipping repair. When neither handle
+    // opens, queries use substring fallback and indexed mutations still surface
+    // the configured-index failure.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
     let (tantivy, search_reconciliation) = open_search_index(&tantivy_path, read_only);
 
@@ -7339,7 +7393,7 @@ mod startup_helper_tests {
                     .map(|_| ())
                     .map_err(anyhow::Error::from)
             },
-            |_state, _operation| Ok(()),
+            |_state, _mutation, _operation| Ok(()),
         )
         .unwrap();
 
@@ -7367,7 +7421,9 @@ mod startup_helper_tests {
                     .map(|_| ())
                     .map_err(anyhow::Error::from)
             },
-            |_state, _operation| Err(anyhow::anyhow!("injected Tantivy rebuild failure")),
+            |_state, _mutation, _operation| {
+                Err(anyhow::anyhow!("injected Tantivy rebuild failure"))
+            },
         )
         .unwrap_err();
 
@@ -7409,7 +7465,7 @@ mod startup_helper_tests {
                 delete_repo_cascade(store, &repo)?;
                 Err(anyhow::anyhow!("real committed purge mutation failure"))
             },
-            |_state, _operation| {
+            |_state, _mutation, _operation| {
                 search_reconciliations += 1;
                 Ok(())
             },
@@ -7448,7 +7504,7 @@ mod startup_helper_tests {
                     .merge_instance_ids(from, to)
                     .map_err(anyhow::Error::from)
             },
-            |_state, _operation| Err(anyhow::anyhow!("injected merge search failure")),
+            |_state, _mutation, _operation| Err(anyhow::anyhow!("injected merge search failure")),
         )
         .unwrap_err();
 
@@ -7479,7 +7535,7 @@ mod startup_helper_tests {
             &state,
             "purge-source",
             |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
-            |_state, _operation| Ok(()),
+            |_state, _mutation, _operation| Ok(()),
         )
         .unwrap();
 
@@ -7513,7 +7569,7 @@ mod startup_helper_tests {
                     .merge_instance_ids(from, to)
                     .map_err(anyhow::Error::from)
             },
-            |_state, _operation| Ok(()),
+            |_state, _mutation, _operation| Ok(()),
         )
         .unwrap();
 
@@ -7549,7 +7605,7 @@ mod startup_helper_tests {
                     .merge_instance_ids(from, to)
                     .map_err(anyhow::Error::from)
             },
-            |_state, _operation| Ok(()),
+            |_state, _mutation, _operation| Ok(()),
         )
         .unwrap();
 
@@ -7777,7 +7833,7 @@ mod startup_helper_tests {
                 }
             },
             |_store, _vault| Ok(()),
-            |_state, _operation| {
+            |_state, _mutation, _operation| {
                 reconciliations += 1;
                 Ok(())
             },
@@ -7834,7 +7890,7 @@ mod startup_helper_tests {
             &state,
             delete_repo_cascade,
             |_store, _vault| Err(anyhow::anyhow!("injected vault failure")),
-            |_state, _operation| {
+            |_state, _mutation, _operation| {
                 reconciliations += 1;
                 Ok(())
             },
@@ -7888,7 +7944,7 @@ mod startup_helper_tests {
                 delete_repo_cascade(store, &repo)?;
                 Err(anyhow::anyhow!("injected late purge failure"))
             },
-            |_state, _operation| {
+            |_state, _mutation, _operation| {
                 reconciliations += 1;
                 Ok(())
             },
@@ -7958,7 +8014,7 @@ mod startup_helper_tests {
                 delete_repo_cascade(store, &first)?;
                 Err(anyhow::anyhow!("injected later repo merge failure"))
             },
-            |_state, _operation| {
+            |_state, _mutation, _operation| {
                 reconciliations += 1;
                 Ok(())
             },
@@ -8034,7 +8090,7 @@ mod startup_helper_tests {
                 store.delete_vault_cascade("vlt:old:docs")?;
                 Err(anyhow::anyhow!("injected late vault purge failure"))
             },
-            |_state, _operation| {
+            |_state, _mutation, _operation| {
                 reconciliations += 1;
                 Ok(())
             },
@@ -8060,8 +8116,22 @@ mod startup_helper_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open_or_create(&dir.path().join("test.lbug")).unwrap();
 
-        assert!(reconcile_search_index(&state, &store, false, "code-only").is_ok());
-        let error = reconcile_search_index(&state, &store, true, "vault-delete").unwrap_err();
+        assert!(
+            reconcile_search_index(
+                &state,
+                &store,
+                IndexedSearchMutation::Unchanged,
+                "code-only",
+            )
+            .is_ok()
+        );
+        let error = reconcile_search_index(
+            &state,
+            &store,
+            IndexedSearchMutation::Changed,
+            "vault-delete",
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -8069,12 +8139,82 @@ mod startup_helper_tests {
         );
         assert!(
             reconcile_search_index(
+                &state,
+                &store,
+                IndexedSearchMutation::Unknown,
+                "vault-delete-unknown",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("configured Tantivy index is corrupt")
+        );
+        assert!(
+            reconcile_search_index(
                 &SearchIndexReconciliation::Disabled,
                 &store,
-                true,
+                IndexedSearchMutation::Changed,
                 "disabled"
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn disabled_search_skips_projection_preflight() {
+        let projection = indexed_search_rows_before_with(
+            &SearchIndexReconciliation::Disabled,
+            || -> Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error> {
+                panic!("disabled search must not read the graph projection")
+            },
+        );
+
+        assert!(projection.is_none());
+    }
+
+    #[test]
+    fn available_search_repairs_after_unknown_preflight_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let tantivy = Arc::new(TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap());
+        tantivy
+            .update_note(
+                "note:deleted-before-repair",
+                "unknown_projection_repair_sentinel",
+                "vlt:deleted-before-repair",
+                &["unknown_projection_repair_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !tantivy
+                .search("unknown_projection_repair_sentinel", 10)
+                .unwrap()
+                .is_empty()
+        );
+        let comparison = indexed_search_mutation(
+            Some(Err(anyhow::anyhow!(
+                "deterministic preflight projection failure"
+            ))),
+            &store,
+        );
+
+        assert_eq!(comparison, IndexedSearchMutation::Unknown);
+        reconcile_search_index(
+            &SearchIndexReconciliation::Available(tantivy.clone()),
+            &store,
+            comparison,
+            "unknown_projection_repair",
+        )
+        .unwrap();
+        assert!(
+            tantivy
+                .search("unknown_projection_repair_sentinel", 10)
+                .unwrap()
+                .is_empty(),
+            "available search must repair after an unknown preflight projection"
         );
     }
 
@@ -8175,7 +8315,7 @@ mod startup_helper_tests {
                 delete_repo_cascade(store, &repo)?;
                 Err(anyhow::anyhow!("injected mismatched-UID merge failure"))
             },
-            |_state, _operation| {
+            |_state, _mutation, _operation| {
                 reconciliations += 1;
                 Ok(())
             },
@@ -8223,7 +8363,7 @@ mod startup_helper_tests {
             &state,
             "old",
             |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
-            |_state, _operation| {
+            |_state, _mutation, _operation| {
                 reconciliations += 1;
                 Ok(())
             },

@@ -104,8 +104,9 @@ pub struct AdminState {
     /// In-flight device-authorization grants, keyed by `device_code`.
     pub device_flow: Arc<tokio::sync::RwLock<HashMap<String, PendingDevice>>>,
     pub daemon_store: Arc<GraphStore>,
-    /// Live full-text index, when the daemon owns a writer. Code-graph
-    /// deletions rebuild it through the same finalization path as the gRPC API.
+    /// Live full-text query handle, which may be writer-backed or a reader
+    /// fallback. Admin repo deletion is code-only and leaves vault search
+    /// untouched; indexed vault mutation repair remains daemon-owned.
     pub tantivy: Option<Arc<nestweaver_store::TantivyIndex>>,
     pub instance_id: String,
     pub start_time: Instant,
