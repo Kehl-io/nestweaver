@@ -36,7 +36,6 @@ dirs = "6"
 governor = { version = "0.8", features = ["dashmap"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 futures = { workspace = true }
 hyper-util = { workspace = true }
 # ACME (Let's Encrypt) auto-TLS. n0-computer fork, 0.9.x: ring backend, pins

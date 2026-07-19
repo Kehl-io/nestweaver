@@ -4826,12 +4826,13 @@ fn build_self_signed_acceptor(
     let bundle = nestweaver_engine::tls::generate_tls_bundle(server_names, 397, false)
         .context("generate interim self-signed certificate")?;
 
-    let certs = rustls_pemfile::certs(&mut bundle.server_cert_pem.as_bytes())
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    let certs = CertificateDer::pem_slice_iter(bundle.server_cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .context("parse interim self-signed certificate PEM")?;
-    let key = rustls_pemfile::private_key(&mut bundle.server_key_pem.as_bytes())
-        .context("parse interim self-signed key PEM")?
-        .context("no private key in generated self-signed bundle")?;
+    let key = PrivateKeyDer::from_pem_slice(bundle.server_key_pem.as_bytes())
+        .context("parse interim self-signed key PEM")?;
 
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
@@ -5978,12 +5979,13 @@ pub async fn run_server(
                     tonic::transport::Identity::from_pem(cert_pem.clone(), key_pem.clone());
                 let tonic_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
 
-                let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+                use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+                let certs = CertificateDer::pem_slice_iter(&cert_pem)
                     .collect::<Result<Vec<_>, _>>()
                     .context("parse TLS certificate PEM")?;
-                let key = rustls_pemfile::private_key(&mut &key_pem[..])
-                    .context("parse TLS private key PEM")?
-                    .context("no private key found in PEM")?;
+                let key =
+                    PrivateKeyDer::from_pem_slice(&key_pem).context("parse TLS private key PEM")?;
                 let mut server_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
@@ -9082,12 +9084,12 @@ mod startup_helper_tests {
         // Build the acceptor from the SAME bundle the client trusts so cert
         // verification succeeds (build_self_signed_acceptor mints its own CA).
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let certs = rustls_pemfile::certs(&mut bundle.server_cert_pem.as_bytes())
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+        let certs = CertificateDer::pem_slice_iter(bundle.server_cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let key = rustls_pemfile::private_key(&mut bundle.server_key_pem.as_bytes())
-            .unwrap()
-            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(bundle.server_key_pem.as_bytes()).unwrap();
         let mut server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
@@ -9104,7 +9106,7 @@ mod startup_helper_tests {
 
         // Client trusts the generated CA and connects to `localhost`.
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut bundle.ca_cert_pem.as_bytes()) {
+        for cert in CertificateDer::pem_slice_iter(bundle.ca_cert_pem.as_bytes()) {
             roots.add(cert.unwrap()).unwrap();
         }
         let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
