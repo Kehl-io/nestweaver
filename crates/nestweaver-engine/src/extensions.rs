@@ -17,12 +17,47 @@
 //! Each top-level key is a node UID; the value is a map of property name →
 //! `serde_json::Value`. Any JSON value is valid (string, number, boolean, etc.).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// In-memory extension store: node UID → property map.
 pub type ExtensionStore = HashMap<String, HashMap<String, serde_json::Value>>;
+
+const INSTANCE_MIGRATION_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournalUidRemap {
+    source_uid: String,
+    destination_uid: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstanceExtensionMigrationJournal {
+    version: u32,
+    from_id: String,
+    to_id: String,
+    mappings: Vec<JournalUidRemap>,
+}
+
+/// Durable two-phase extension migration prepared before an instance graph
+/// merge. The journal is intentionally opaque to callers: completion must use
+/// [`finalize_instance_extension_migration`] so source keys are removed only
+/// after their destination properties have been durably published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceExtensionMigration {
+    journal: Option<InstanceExtensionMigrationJournal>,
+}
+
+impl InstanceExtensionMigration {
+    pub fn is_active(&self) -> bool {
+        self.journal.is_some()
+    }
+}
 
 /// Load the extension sidecar for a database at `db_path`.
 ///
@@ -41,10 +76,314 @@ pub fn load_extensions(db_path: &Path) -> ExtensionStore {
 /// Uses a write-then-rename pattern so readers never observe a partial file.
 pub fn save_extensions(db_path: &Path, store: &ExtensionStore) -> Result<(), anyhow::Error> {
     let path = sidecar_path(db_path);
-    let tmp_path = path.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(store)?;
-    std::fs::write(&tmp_path, json)?;
-    std::fs::rename(&tmp_path, &path)?;
+    write_extension_store_durable(&path, store)
+}
+
+fn load_extensions_strict(path: &Path) -> Result<Option<ExtensionStore>, anyhow::Error> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read extension sidecar {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("parse extension sidecar {}: {error}", path.display()))
+}
+
+fn write_extension_store_durable(path: &Path, store: &ExtensionStore) -> Result<(), anyhow::Error> {
+    let json = serde_json::to_vec_pretty(store)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&json))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "durably replace extension sidecar {}: {error}",
+                path.display()
+            )
+        })
+}
+
+fn instance_extension_migration_journal_path(db_path: &Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".extensions.migration.json");
+    std::path::PathBuf::from(path)
+}
+
+fn load_instance_extension_migration_journal(
+    path: &Path,
+) -> Result<Option<InstanceExtensionMigrationJournal>, anyhow::Error> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read instance extension migration journal {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let journal: InstanceExtensionMigrationJournal =
+        serde_json::from_str(&content).map_err(|error| {
+            anyhow::anyhow!(
+                "parse instance extension migration journal {}: {error}",
+                path.display()
+            )
+        })?;
+    if journal.version != INSTANCE_MIGRATION_VERSION {
+        anyhow::bail!(
+            "unsupported instance extension migration journal version {} in {}",
+            journal.version,
+            path.display()
+        );
+    }
+    validate_journal_mappings(&journal.mappings)?;
+    Ok(Some(journal))
+}
+
+fn write_instance_extension_migration_journal(
+    path: &Path,
+    journal: &InstanceExtensionMigrationJournal,
+) -> Result<(), anyhow::Error> {
+    let json = serde_json::to_vec_pretty(journal)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&json))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "durably replace instance extension migration journal {}: {error}",
+                path.display()
+            )
+        })
+}
+
+fn validate_journal_mappings(mappings: &[JournalUidRemap]) -> Result<(), anyhow::Error> {
+    if mappings.is_empty() {
+        anyhow::bail!("instance extension migration journal must contain at least one UID remap");
+    }
+    let mut by_source = BTreeMap::new();
+    let sources: BTreeSet<&str> = mappings
+        .iter()
+        .map(|mapping| mapping.source_uid.as_str())
+        .collect();
+    for mapping in mappings {
+        if mapping.source_uid.is_empty() || mapping.destination_uid.is_empty() {
+            anyhow::bail!("instance extension UID remaps must not contain empty UIDs");
+        }
+        if mapping.source_uid == mapping.destination_uid {
+            anyhow::bail!(
+                "instance extension UID remap source equals destination: {}",
+                mapping.source_uid
+            );
+        }
+        if sources.contains(mapping.destination_uid.as_str()) {
+            anyhow::bail!(
+                "instance extension UID remap chains are unsupported: {} is also a source",
+                mapping.destination_uid
+            );
+        }
+        if let Some(existing) = by_source.insert(&mapping.source_uid, &mapping.destination_uid)
+            && existing != &mapping.destination_uid
+        {
+            anyhow::bail!(
+                "instance extension UID {} maps to both {} and {}",
+                mapping.source_uid,
+                existing,
+                mapping.destination_uid
+            );
+        }
+    }
+    Ok(())
+}
+
+fn merge_extension_properties(store: &mut ExtensionStore, mappings: &[JournalUidRemap]) -> bool {
+    let source_properties: BTreeMap<String, HashMap<String, serde_json::Value>> = mappings
+        .iter()
+        .filter_map(|mapping| {
+            store
+                .get(&mapping.source_uid)
+                .cloned()
+                .map(|properties| (mapping.source_uid.clone(), properties))
+        })
+        .collect();
+    let mut changed = false;
+    for mapping in mappings {
+        let Some(properties) = source_properties.get(&mapping.source_uid) else {
+            continue;
+        };
+        let destination = store.entry(mapping.destination_uid.clone()).or_default();
+        let mut property_names: Vec<&String> = properties.keys().collect();
+        property_names.sort();
+        for name in property_names {
+            if !destination.contains_key(name) {
+                destination.insert(name.clone(), properties[name].clone());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Durably stage authored extension properties before an instance graph merge.
+///
+/// Destination properties win exact key conflicts. Otherwise source
+/// properties fill missing keys. Mappings are processed by sorted source UID,
+/// so many-to-one collisions are deterministic. Source entries remain in the
+/// sidecar until graph mutation succeeds. A durable journal preserves the
+/// mapping even if the graph merge partially commits and source rows vanish.
+pub fn prepare_instance_extension_migration(
+    db_path: &Path,
+    from_id: &str,
+    to_id: &str,
+    mappings: &[nestweaver_store::InstanceUidRemap],
+) -> Result<InstanceExtensionMigration, anyhow::Error> {
+    let extension_path = sidecar_path(db_path);
+    let journal_path = instance_extension_migration_journal_path(db_path);
+    let existing_journal = load_instance_extension_migration_journal(&journal_path)?;
+    if existing_journal.is_none() {
+        // A prior journal unlink may have reached the canonical namespace but
+        // failed its final directory sync. Confirming the absent namespace on
+        // every new preparation makes a retry durable without needing a
+        // source graph row to rediscover the old plan.
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&journal_path).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "confirm absent instance extension migration journal {}: {error}",
+                    journal_path.display()
+                )
+            },
+        )?;
+    }
+    let Some(mut store) = load_extensions_strict(&extension_path)? else {
+        if existing_journal.is_some() {
+            anyhow::bail!(
+                "instance extension migration journal {} exists but extension sidecar {} is missing",
+                journal_path.display(),
+                extension_path.display()
+            );
+        }
+        return Ok(InstanceExtensionMigration { journal: None });
+    };
+
+    if let Some(journal) = &existing_journal
+        && (journal.from_id != from_id || journal.to_id != to_id)
+    {
+        anyhow::bail!(
+            "unfinished instance extension migration {} -> {} conflicts with requested {} -> {}",
+            journal.from_id,
+            journal.to_id,
+            from_id,
+            to_id
+        );
+    }
+
+    let mut combined: BTreeMap<String, String> = existing_journal
+        .as_ref()
+        .into_iter()
+        .flat_map(|journal| journal.mappings.iter())
+        .map(|mapping| (mapping.source_uid.clone(), mapping.destination_uid.clone()))
+        .collect();
+    for mapping in mappings {
+        if !store.contains_key(&mapping.source_uid) {
+            continue;
+        }
+        if let Some(existing) =
+            combined.insert(mapping.source_uid.clone(), mapping.destination_uid.clone())
+            && existing != mapping.destination_uid
+        {
+            anyhow::bail!(
+                "instance extension UID {} maps to both {} and {}",
+                mapping.source_uid,
+                existing,
+                mapping.destination_uid
+            );
+        }
+    }
+    if combined.is_empty() {
+        return Ok(InstanceExtensionMigration { journal: None });
+    }
+
+    let mappings: Vec<JournalUidRemap> = combined
+        .into_iter()
+        .map(|(source_uid, destination_uid)| JournalUidRemap {
+            source_uid,
+            destination_uid,
+        })
+        .collect();
+    validate_journal_mappings(&mappings)?;
+    let journal = InstanceExtensionMigrationJournal {
+        version: INSTANCE_MIGRATION_VERSION,
+        from_id: from_id.to_string(),
+        to_id: to_id.to_string(),
+        mappings,
+    };
+    if existing_journal.as_ref() != Some(&journal) {
+        write_instance_extension_migration_journal(&journal_path, &journal)?;
+    }
+    if merge_extension_properties(&mut store, &journal.mappings) {
+        write_extension_store_durable(&extension_path, &store)?;
+    } else {
+        // Confirm a complete canonical replacement from an earlier attempt
+        // whose final parent sync may have failed.
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&extension_path).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "confirm staged extension sidecar {}: {error}",
+                    extension_path.display()
+                )
+            },
+        )?;
+    }
+    Ok(InstanceExtensionMigration {
+        journal: Some(journal),
+    })
+}
+
+/// Complete a staged instance extension migration after graph success.
+///
+/// The destination merge is re-applied before source removal, making retries
+/// idempotent if a prior attempt published one sidecar replacement but failed
+/// its final directory sync. The journal is durably unlinked only after the
+/// replacement without source keys is durable.
+pub fn finalize_instance_extension_migration(
+    db_path: &Path,
+    migration: &InstanceExtensionMigration,
+) -> Result<(), anyhow::Error> {
+    let Some(journal) = &migration.journal else {
+        return Ok(());
+    };
+    let extension_path = sidecar_path(db_path);
+    let journal_path = instance_extension_migration_journal_path(db_path);
+    let mut store = load_extensions_strict(&extension_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "extension sidecar {} disappeared during instance migration",
+            extension_path.display()
+        )
+    })?;
+    let mut changed = merge_extension_properties(&mut store, &journal.mappings);
+    for mapping in &journal.mappings {
+        changed |= store.remove(&mapping.source_uid).is_some();
+    }
+    if changed {
+        write_extension_store_durable(&extension_path, &store)?;
+    } else {
+        nestweaver_store::durable_sidecar::sync_parent_directory_durable(&extension_path).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "confirm finalized extension sidecar {}: {error}",
+                    extension_path.display()
+                )
+            },
+        )?;
+    }
+    nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&journal_path).map_err(
+        |error| {
+            anyhow::anyhow!(
+                "durably remove instance extension migration journal {}: {error}",
+                journal_path.display()
+            )
+        },
+    )?;
     Ok(())
 }
 
@@ -370,5 +709,160 @@ mod tests {
 
         assert!(error.to_string().contains("parse extension sidecar"));
         assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn instance_migration_is_two_phase_deterministic_and_retryable() {
+        use nestweaver_store::InstanceUidRemap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let destination = "repo:new:aaaaaaaaaaaa";
+        let source_a = "repo:old:aaaaaaaaaaaa";
+        let source_z = "repo:old:zzzzzzzzzzzz";
+        let source_project = "proj:old:bbbbbbbbbbbb";
+        let destination_project = "proj:new:bbbbbbbbbbbb";
+        let unrelated = "note:vlt:other:cccccccccccc";
+        let malformed = "repo:old:not:a:canonical:uid";
+
+        let mut store = ExtensionStore::new();
+        set_property(
+            &mut store,
+            destination,
+            "owner",
+            serde_json::json!("destination-wins"),
+        );
+        set_property(
+            &mut store,
+            source_z,
+            "owner",
+            serde_json::json!("source-loses"),
+        );
+        set_property(
+            &mut store,
+            source_z,
+            "fill",
+            serde_json::json!({"from": "z", "nested": [1, {"ok": true}]}),
+        );
+        set_property(
+            &mut store,
+            source_a,
+            "fill",
+            serde_json::json!({"from": "a", "nested": [2, {"ok": false}]}),
+        );
+        set_property(
+            &mut store,
+            source_project,
+            "project-only",
+            serde_json::json!([{"deep": [1, 2, 3]}]),
+        );
+        set_property(&mut store, unrelated, "keep", serde_json::json!(true));
+        set_property(&mut store, malformed, "keep", serde_json::json!("verbatim"));
+        save_extensions(&db_path, &store).unwrap();
+
+        let mappings = vec![
+            InstanceUidRemap {
+                source_uid: source_z.to_string(),
+                destination_uid: destination.to_string(),
+            },
+            InstanceUidRemap {
+                source_uid: source_project.to_string(),
+                destination_uid: destination_project.to_string(),
+            },
+            InstanceUidRemap {
+                source_uid: source_a.to_string(),
+                destination_uid: destination.to_string(),
+            },
+        ];
+        let migration =
+            prepare_instance_extension_migration(&db_path, "old", "new", &mappings).unwrap();
+
+        let staged = load_extensions(&db_path);
+        assert!(staged.contains_key(source_a));
+        assert!(staged.contains_key(source_z));
+        assert_eq!(
+            get_property(&staged, destination, "owner"),
+            Some(&serde_json::json!("destination-wins"))
+        );
+        assert_eq!(
+            get_property(&staged, destination, "fill"),
+            Some(&serde_json::json!({"from": "a", "nested": [2, {"ok": false}]}))
+        );
+        assert_eq!(
+            get_property(&staged, destination_project, "project-only"),
+            Some(&serde_json::json!([{"deep": [1, 2, 3]}]))
+        );
+        assert_eq!(
+            get_property(&staged, unrelated, "keep"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            get_property(&staged, malformed, "keep"),
+            Some(&serde_json::json!("verbatim"))
+        );
+
+        // Simulate a crash after graph mutation: source graph rows are gone,
+        // so the retry contributes no freshly-computed mappings.
+        let retried = prepare_instance_extension_migration(&db_path, "old", "new", &[]).unwrap();
+        assert_eq!(retried, migration);
+        finalize_instance_extension_migration(&db_path, &retried).unwrap();
+
+        let finalized = load_extensions(&db_path);
+        for source in [source_a, source_z, source_project] {
+            assert!(!finalized.contains_key(source));
+        }
+        assert!(finalized.contains_key(destination));
+        assert!(finalized.contains_key(destination_project));
+        assert!(finalized.contains_key(unrelated));
+        assert!(finalized.contains_key(malformed));
+        assert!(!instance_extension_migration_journal_path(&db_path).exists());
+    }
+
+    #[test]
+    fn instance_migration_fails_closed_on_corrupt_sidecar() {
+        use nestweaver_store::InstanceUidRemap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let extension_path = sidecar_path(&db_path);
+        std::fs::write(&extension_path, b"{not-json").unwrap();
+
+        let error = prepare_instance_extension_migration(
+            &db_path,
+            "old",
+            "new",
+            &[InstanceUidRemap {
+                source_uid: "repo:old:aaaaaaaaaaaa".to_string(),
+                destination_uid: "repo:new:aaaaaaaaaaaa".to_string(),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("parse extension sidecar"));
+        assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
+        assert!(!instance_extension_migration_journal_path(&db_path).exists());
+    }
+
+    #[test]
+    fn instance_migration_missing_sidecar_is_noop() {
+        use nestweaver_store::InstanceUidRemap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let migration = prepare_instance_extension_migration(
+            &db_path,
+            "old",
+            "new",
+            &[InstanceUidRemap {
+                source_uid: "repo:old:aaaaaaaaaaaa".to_string(),
+                destination_uid: "repo:new:aaaaaaaaaaaa".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert!(!migration.is_active());
+        finalize_instance_extension_migration(&db_path, &migration).unwrap();
+        assert!(!sidecar_path(&db_path).exists());
+        assert!(!instance_extension_migration_journal_path(&db_path).exists());
     }
 }

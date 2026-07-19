@@ -3,7 +3,7 @@ use std::path::Path;
 use nestweaver_schema::{
     Contract, EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol,
     Tag, Vault,
-    uid::{project_uid, repo_uid, vault_uid},
+    uid::{file_uid, project_uid, repo_uid, symbol_uid, vault_uid},
 };
 use serde_json;
 
@@ -139,6 +139,16 @@ pub struct MergeResult {
     /// Source repo UIDs whose derived graph rows were deleted during migration.
     /// The daemon uses these keys to remove per-repo sidecar slices.
     pub repo_uids_removed: Vec<String>,
+}
+
+/// A deterministic source-to-destination UID mapping produced by an instance
+/// merge. File and Symbol rows are removed by the merge and rebuilt by the
+/// required re-index, but their target UIDs are still deterministic from the
+/// graph rows present at merge preflight.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceUidRemap {
+    pub source_uid: String,
+    pub destination_uid: String,
 }
 
 impl MergeResult {
@@ -3686,6 +3696,66 @@ impl GraphStore {
         }
 
         Ok(result)
+    }
+
+    /// Enumerate every authored extension UID that changes when `from` is
+    /// merged into `to`.
+    ///
+    /// Repo and Project destinations use the same semantic minting inputs as
+    /// [`merge_instance_ids`](Self::merge_instance_ids). File and Symbol rows
+    /// are deleted during the merge and require re-indexing, so their future
+    /// target UIDs are computed before deletion from their path/name/line
+    /// fields. Sorting makes collision and dedup handling deterministic when
+    /// multiple source rows map to one destination.
+    pub fn plan_instance_uid_remaps(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<InstanceUidRemap>, StoreError> {
+        if from == to {
+            return Err(StoreError::Query(format!(
+                "source and target instance IDs must differ (both were {from:?})"
+            )));
+        }
+
+        let mut remaps = Vec::new();
+        for repo in self.list_repos(Some(from))? {
+            let destination_repo_uid = repo_uid(to, &repo.url);
+            remaps.push(InstanceUidRemap {
+                source_uid: repo.uid.clone(),
+                destination_uid: destination_repo_uid.clone(),
+            });
+            for (source_uid, path) in self.list_files_by_repo(&repo.uid)? {
+                remaps.push(InstanceUidRemap {
+                    source_uid,
+                    destination_uid: file_uid(&destination_repo_uid, &path),
+                });
+            }
+            for symbol in self.lookup_symbols_by_repo(&repo.uid)? {
+                remaps.push(InstanceUidRemap {
+                    source_uid: symbol.uid,
+                    destination_uid: symbol_uid(
+                        &destination_repo_uid,
+                        &symbol.file_path,
+                        &symbol.name,
+                        symbol.start_line,
+                    ),
+                });
+            }
+        }
+        for project in self
+            .list_projects()?
+            .into_iter()
+            .filter(|project| project.instance_id == from)
+        {
+            remaps.push(InstanceUidRemap {
+                source_uid: project.uid,
+                destination_uid: project_uid(to, &project.name),
+            });
+        }
+        remaps.sort();
+        remaps.dedup();
+        Ok(remaps)
     }
 
     /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that

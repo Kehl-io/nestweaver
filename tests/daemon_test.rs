@@ -1132,6 +1132,179 @@ fn daemon_merge_removes_source_sidecars_and_invalidates_rank() {
 }
 
 #[test]
+fn daemon_merge_migrates_authored_extensions_for_every_reminted_code_uid() {
+    use nestweaver_schema::uid::{file_uid, project_uid, repo_uid, symbol_uid};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("extension-merge").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db_for_instance(&repo_dir, &db_path, "old");
+
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    let source_repo = store.list_repos(Some("old")).unwrap().remove(0);
+    let source_file = store
+        .list_files_by_repo(&source_repo.uid)
+        .unwrap()
+        .remove(0);
+    let source_symbol = store
+        .lookup_symbols_by_repo(&source_repo.uid)
+        .unwrap()
+        .remove(0);
+    let source_project_uid = project_uid("old", "Extension migration");
+    store
+        .insert_project(&nestweaver_schema::Project {
+            uid: source_project_uid.clone(),
+            name: "Extension migration".to_string(),
+            summary: None,
+            instance_id: "old".to_string(),
+        })
+        .unwrap();
+
+    let target_repo_uid = repo_uid("new", &source_repo.url);
+    store
+        .insert_repo(&nestweaver_schema::Repo {
+            uid: target_repo_uid.clone(),
+            instance_id: "new".to_string(),
+            indexed_sha: "target-sha".to_string(),
+            name: Some("target collision".to_string()),
+            ..source_repo.clone()
+        })
+        .unwrap();
+    let target_file_uid = file_uid(&target_repo_uid, &source_file.1);
+    let target_symbol_uid = symbol_uid(
+        &target_repo_uid,
+        &source_symbol.file_path,
+        &source_symbol.name,
+        source_symbol.start_line,
+    );
+    let target_project_uid = project_uid("new", "Extension migration");
+    let unrelated_uid = "note:vlt:unrelated:aaaaaaaaaaaa";
+
+    let mut extensions = nestweaver_engine::ExtensionStore::new();
+    nestweaver_engine::set_property(
+        &mut extensions,
+        &source_repo.uid,
+        "owner",
+        serde_json::json!("source-owner"),
+    );
+    nestweaver_engine::set_property(
+        &mut extensions,
+        &source_repo.uid,
+        "source-only",
+        serde_json::json!({"nested": [1, {"preserved": true}]}),
+    );
+    nestweaver_engine::set_property(
+        &mut extensions,
+        &source_file.0,
+        "kind",
+        serde_json::json!("file"),
+    );
+    nestweaver_engine::set_property(
+        &mut extensions,
+        &source_symbol.uid,
+        "kind",
+        serde_json::json!("symbol"),
+    );
+    nestweaver_engine::set_property(
+        &mut extensions,
+        &source_project_uid,
+        "kind",
+        serde_json::json!("project"),
+    );
+    nestweaver_engine::set_property(
+        &mut extensions,
+        &target_repo_uid,
+        "owner",
+        serde_json::json!("destination-owner"),
+    );
+    nestweaver_engine::set_property(
+        &mut extensions,
+        unrelated_uid,
+        "keep",
+        serde_json::json!(true),
+    );
+    nestweaver_engine::save_extensions(&db_path, &extensions).unwrap();
+    let generation_before = store.graph_generation();
+    drop(store);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let response = rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        client.merge_instance("old", "new").await.unwrap()
+    });
+    assert_eq!(response.repos_reparented, 1);
+    assert_eq!(response.projects_reparented, 1);
+    stop_daemon(&db_path);
+
+    let reopened = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    assert!(reopened.graph_generation() > generation_before);
+    drop(reopened);
+    let migrated = nestweaver_engine::load_extensions(&db_path);
+    for source_uid in [
+        source_repo.uid.as_str(),
+        source_file.0.as_str(),
+        source_symbol.uid.as_str(),
+        source_project_uid.as_str(),
+    ] {
+        assert!(
+            !migrated.contains_key(source_uid),
+            "old key survived: {source_uid}"
+        );
+    }
+    assert_eq!(
+        nestweaver_engine::get_property(&migrated, &target_repo_uid, "owner"),
+        Some(&serde_json::json!("destination-owner"))
+    );
+    assert_eq!(
+        nestweaver_engine::get_property(&migrated, &target_repo_uid, "source-only"),
+        Some(&serde_json::json!({"nested": [1, {"preserved": true}]}))
+    );
+    assert_eq!(
+        nestweaver_engine::get_property(&migrated, unrelated_uid, "keep"),
+        Some(&serde_json::json!(true))
+    );
+    assert!(!sidecar_path(&db_path, ".extensions.migration.json").exists());
+
+    // Reopen through a fresh daemon and exercise the actual query_extensions
+    // RPC, proving the migrated target UIDs are visible across process restart.
+    start_daemon(&db_path);
+    rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        for (uid, key, expected) in [
+            (
+                &target_repo_uid,
+                "owner",
+                serde_json::json!("destination-owner"),
+            ),
+            (&target_file_uid, "kind", serde_json::json!("file")),
+            (&target_symbol_uid, "kind", serde_json::json!("symbol")),
+            (&target_project_uid, "kind", serde_json::json!("project")),
+        ] {
+            let response = client
+                .inner_mut()
+                .query_extensions(nestweaver_proto::JsonRequest {
+                    args_json: serde_json::json!({"uid": uid}).to_string(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            let result: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+            assert_eq!(result["uid"], uid.as_str());
+            assert_eq!(result["properties"][key], expected);
+        }
+    });
+    stop_daemon(&db_path);
+}
+
+#[test]
 fn daemon_merge_rejects_self_merge_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("self-merge").join("test.lbug");

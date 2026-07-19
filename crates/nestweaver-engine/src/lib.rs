@@ -175,9 +175,10 @@ pub use eval::{
 pub use export::{export_cypher, export_graphml, export_mermaid};
 pub use export_graph::export_in_memory_graph;
 pub use extensions::{
-    ExtensionStore, get_all_properties, get_last_indexed_at, get_property, load_extensions,
-    query_by_property, record_last_indexed_at, remove_extension_uid_durable, save_extensions,
-    set_property,
+    ExtensionStore, InstanceExtensionMigration, finalize_instance_extension_migration,
+    get_all_properties, get_last_indexed_at, get_property, load_extensions,
+    prepare_instance_extension_migration, query_by_property, record_last_indexed_at,
+    remove_extension_uid_durable, save_extensions, set_property,
 };
 pub use guide_rules::{
     HARD_RULES, OwnedRule, RULES_VERSION, Rule, parse_rules_override, render_owned_rules_markdown,

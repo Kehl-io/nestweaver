@@ -16,6 +16,7 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".cochange.json",
     ".interactions.json",
     ".extensions.json",
+    ".extensions.migration.json",
     ".aliases.json",
     ".bundles.json",
     ".generation",
@@ -1329,6 +1330,11 @@ mod tests {
         let result = backup_save(&config).unwrap();
         assert!(output.exists());
         assert_eq!(result.manifest.instance_id, "bare-test");
+    }
+
+    #[test]
+    fn backup_sidecars_include_incomplete_extension_migration_journal() {
+        assert!(SIDECAR_SUFFIXES.contains(&".extensions.migration.json"));
     }
 
     #[test]

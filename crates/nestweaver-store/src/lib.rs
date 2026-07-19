@@ -37,7 +37,7 @@ pub use tantivy_index::{
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{
     DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
-    DiscardedVault, MergeResult, ProjectMutationDisposition, PurgeInstanceResult,
+    DiscardedVault, InstanceUidRemap, MergeResult, ProjectMutationDisposition, PurgeInstanceResult,
 };
 
 #[cfg(test)]
@@ -46,7 +46,7 @@ mod tests {
         EdgeType, File, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Tag, Vault, Visibility,
     };
 
-    use super::{GraphStore, ProjectMutationDisposition};
+    use super::{GraphStore, InstanceUidRemap, ProjectMutationDisposition};
 
     fn make_repo(uid: &str) -> Repo {
         Repo {
@@ -2508,5 +2508,96 @@ mod tests {
         let surviving = store.lookup_repo(&target.uid).unwrap().unwrap();
         assert_eq!(surviving.indexed_sha, "target-sha");
         assert_eq!(store.list_repos(Some("new")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn instance_uid_remap_plan_covers_code_and_project_collisions() {
+        use nestweaver_schema::uid::{file_uid, project_uid, repo_uid, symbol_uid};
+        use nestweaver_schema::{File, Project};
+
+        let store = test_store();
+        let url = "https://github.com/example/remap";
+        let source_repo_uid = repo_uid("old", url);
+        let target_repo_uid = repo_uid("new", url);
+        let source_repo = Repo {
+            uid: source_repo_uid.clone(),
+            url: url.to_string(),
+            indexed_sha: "source-sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "old".to_string(),
+            name: Some("source".to_string()),
+            root_path: None,
+        };
+        let target_repo = Repo {
+            uid: target_repo_uid.clone(),
+            instance_id: "new".to_string(),
+            indexed_sha: "target-sha".to_string(),
+            name: Some("target".to_string()),
+            ..source_repo.clone()
+        };
+        store.insert_repo(&source_repo).unwrap();
+        store.insert_repo(&target_repo).unwrap();
+
+        let source_file_uid = file_uid(&source_repo_uid, "src/lib.rs");
+        store
+            .insert_file(&File {
+                uid: source_file_uid.clone(),
+                path: "src/lib.rs".to_string(),
+                repo_uid: source_repo_uid.clone(),
+                content_hash: "file-hash".to_string(),
+            })
+            .unwrap();
+        let source_symbol_uid = symbol_uid(&source_repo_uid, "src/lib.rs", "handler", 10);
+        store
+            .insert_symbol(&make_symbol(
+                &source_symbol_uid,
+                "handler",
+                &source_repo_uid,
+                "src/lib.rs",
+            ))
+            .unwrap();
+
+        let source_project_uid = project_uid("old", "Roadmap");
+        let target_project_uid = project_uid("new", "Roadmap");
+        store
+            .insert_project(&Project {
+                uid: source_project_uid.clone(),
+                name: "Roadmap".to_string(),
+                summary: Some("source".to_string()),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_project(&Project {
+                uid: target_project_uid.clone(),
+                name: "Roadmap".to_string(),
+                summary: Some("target".to_string()),
+                instance_id: "new".to_string(),
+            })
+            .unwrap();
+
+        let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+
+        assert_eq!(
+            plan,
+            vec![
+                InstanceUidRemap {
+                    source_uid: source_file_uid,
+                    destination_uid: file_uid(&target_repo_uid, "src/lib.rs"),
+                },
+                InstanceUidRemap {
+                    source_uid: source_project_uid,
+                    destination_uid: target_project_uid,
+                },
+                InstanceUidRemap {
+                    source_uid: source_repo_uid,
+                    destination_uid: target_repo_uid.clone(),
+                },
+                InstanceUidRemap {
+                    source_uid: source_symbol_uid,
+                    destination_uid: symbol_uid(&target_repo_uid, "src/lib.rs", "handler", 10,),
+                },
+            ]
+        );
     }
 }

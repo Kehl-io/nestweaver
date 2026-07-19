@@ -1589,29 +1589,79 @@ fn run_merge_instance_with<F, R>(
     from_id: &str,
     to_id: &str,
     merge: F,
-    mut reconcile_search: R,
+    reconcile_search: R,
 ) -> Result<nestweaver_store::MergeResult, Status>
 where
     F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
     R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
 {
+    run_merge_instance_with_extension_ops(
+        state,
+        from_id,
+        to_id,
+        merge,
+        reconcile_search,
+        |store, db_path, from_id, to_id| {
+            let mappings = store
+                .plan_instance_uid_remaps(from_id, to_id)
+                .map_err(anyhow::Error::from)?;
+            let migration = nestweaver_engine::prepare_instance_extension_migration(
+                db_path, from_id, to_id, &mappings,
+            )?;
+            let active = migration.is_active();
+            Ok((migration, active))
+        },
+        nestweaver_engine::finalize_instance_extension_migration,
+    )
+}
+
+fn run_merge_instance_with_extension_ops<F, R, P, Prepare, Complete>(
+    state: &DaemonState,
+    from_id: &str,
+    to_id: &str,
+    merge: F,
+    mut reconcile_search: R,
+    prepare_extensions: Prepare,
+    complete_extensions: Complete,
+) -> Result<nestweaver_store::MergeResult, Status>
+where
+    F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
+    R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
+    Prepare: FnOnce(&GraphStore, &Path, &str, &str) -> Result<(P, bool), anyhow::Error>,
+    Complete: FnOnce(&Path, &P) -> Result<(), anyhow::Error>,
+{
     let search_rows_before = indexed_search_rows_before(state);
     let repo_uids = list_instance_code_repo_uids(&state.store, from_id)
         .map_err(|e| Status::internal(format!("merge failed to list code repos: {e:#}")))?;
+    let (extension_migration, extension_migration_active) =
+        prepare_extensions(&state.store, &state.db_path, from_id, to_id).map_err(|error| {
+            Status::internal(format!(
+                "merge_instance extension-metadata preparation failed: {error:#}"
+            ))
+        })?;
 
     match merge(&state.store, from_id, to_id) {
         Ok(result) => {
             let changed = !result.repo_uids_removed.is_empty()
                 || result.vaults > 0
                 || result.repos > 0
-                || result.projects > 0;
-            let mut failures = if !result.repo_uids_removed.is_empty() {
+                || result.projects > 0
+                || extension_migration_active;
+            let mut failures = Vec::new();
+            if let Err(error) = complete_extensions(&state.db_path, &extension_migration) {
+                push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+                    format!("instance {from_id} -> {to_id}: {error:#}"),
+                );
+            }
+            failures.extend(if !result.repo_uids_removed.is_empty() {
                 finalize_code_graph_deletion(state, &result.repo_uids_removed)
             } else if changed {
                 finalize_node_graph_deletion(state, "merge_instance")
             } else {
                 Vec::new()
-            };
+            });
             let search_mutation = if changed {
                 indexed_search_mutation(search_rows_before, &state.store)
             } else {
@@ -7725,6 +7775,204 @@ mod startup_helper_tests {
                 .is_empty(),
             "source vault mutation must have committed before reconciliation failed"
         );
+    }
+
+    #[test]
+    fn merge_extension_prepare_failure_prevents_graph_mutation() {
+        let state = test_state_with_writer();
+        seed_project(&state, "proj:old:prepare", "Prepare failure");
+        let merge_called = std::cell::Cell::new(false);
+        let generation_before = state.store.graph_generation();
+
+        let error = run_merge_instance_with_extension_ops(
+            &state,
+            "old",
+            "new",
+            |_store, _from, _to| {
+                merge_called.set(true);
+                unreachable!("graph mutation must not run after extension prepare failure")
+            },
+            |_state, _mutation, _operation| Ok(()),
+            |_store, _db_path, _from, _to| {
+                Err::<((), bool), _>(anyhow::anyhow!("injected atomic prepare write failure"))
+            },
+            |_db_path, _migration| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("extension-metadata"));
+        assert!(
+            error
+                .message()
+                .contains("injected atomic prepare write failure")
+        );
+        assert!(!merge_called.get());
+        assert!(state.store.project_exists("proj:old:prepare").unwrap());
+        assert_eq!(state.store.graph_generation(), generation_before);
+    }
+
+    #[test]
+    fn merge_extension_finalize_failure_surfaces_after_graph_and_finalizers() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:old:finalize".to_string(),
+                name: "Finalize failure".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let error = run_merge_instance_with_extension_ops(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+            |_store, _db_path, _from, _to| Ok(((), true)),
+            |_db_path, _migration| Err(anyhow::anyhow!("injected atomic finalize write failure")),
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("extension-metadata"));
+        assert!(
+            error
+                .message()
+                .contains("injected atomic finalize write failure")
+        );
+        assert!(!state.store.project_exists("proj:old:finalize").unwrap());
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json").exists(),
+            "node finalizer must still invalidate PageRank"
+        );
+    }
+
+    #[test]
+    fn merge_extension_finalize_failure_retries_from_durable_journal() {
+        use nestweaver_schema::uid::project_uid;
+
+        let state = test_state_with_writer();
+        let source_uid = project_uid("old", "Retry migration");
+        let destination_uid = project_uid("new", "Retry migration");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_uid.clone(),
+                name: "Retry migration".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        seed_extension(
+            &state,
+            &source_uid,
+            "nested",
+            serde_json::json!({"retry": [true, {"depth": 2}]}),
+        );
+
+        let first_error = run_merge_instance_with_extension_ops(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+            |store, db_path, from, to| {
+                let mappings = store.plan_instance_uid_remaps(from, to)?;
+                let migration = nestweaver_engine::prepare_instance_extension_migration(
+                    db_path, from, to, &mappings,
+                )?;
+                let active = migration.is_active();
+                Ok((migration, active))
+            },
+            |_db_path, _migration| {
+                Err(anyhow::anyhow!(
+                    "injected post-graph extension write failure"
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(first_error.message().contains("extension-metadata"));
+        assert!(!state.store.project_exists(&source_uid).unwrap());
+        let staged = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(staged.contains_key(&source_uid));
+        assert!(staged.contains_key(&destination_uid));
+        assert!(
+            nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+
+        // The graph no longer contains the source Project, so this retry can
+        // succeed only by loading the persisted mapping journal.
+        let retried = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(retried.projects, 0);
+        let finalized = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!finalized.contains_key(&source_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&finalized, &destination_uid, "nested"),
+            Some(&serde_json::json!({"retry": [true, {"depth": 2}]}))
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn corrupt_extension_sidecar_prevents_real_merge_mutation() {
+        use nestweaver_schema::uid::project_uid;
+
+        let state = test_state_with_writer();
+        let source_uid = project_uid("old", "Corrupt extension");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_uid.clone(),
+                name: "Corrupt extension".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        let extension_path = nestweaver_engine::sidecar_path(&state.db_path, ".extensions.json");
+        std::fs::write(&extension_path, b"{not-json").unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("parse extension sidecar"));
+        assert!(state.store.project_exists(&source_uid).unwrap());
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
     }
 
     #[test]
