@@ -1061,10 +1061,9 @@ fn daemon_merge_removes_source_sidecars_and_invalidates_rank() {
     stop_daemon(&db_path);
     let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
     assert!(
-        load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
+        !load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
             .repos
-            .get(&source_uid)
-            .is_none()
+            .contains_key(&source_uid)
     );
     assert!(store.graph_generation() > generation_before);
     assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
@@ -1165,10 +1164,9 @@ fn daemon_purge_removes_repo_sidecars_and_invalidates_rank() {
     stop_daemon(&db_path);
     let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
     assert!(
-        load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
+        !load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
             .repos
-            .get(&source_uid)
-            .is_none()
+            .contains_key(&source_uid)
     );
     assert!(store.graph_generation() > generation_before);
     assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
@@ -1213,10 +1211,9 @@ fn daemon_purge_orphan_only_code_finalizes_sidecars_and_rank() {
     let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
     assert!(store.graph_generation() > generation_before);
     assert!(
-        load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
+        !load_filemeta_sidecar(&sidecar_path(&db_path, ".filemeta.json"))
             .repos
-            .get(&source_uid)
-            .is_none()
+            .contains_key(&source_uid)
     );
     assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
 }

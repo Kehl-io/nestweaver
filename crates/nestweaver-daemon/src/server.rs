@@ -8108,10 +8108,9 @@ mod startup_helper_tests {
             "graph generation bump was not persisted"
         );
         assert!(
-            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
                 .repos
-                .get("repo:old:first")
-                .is_none(),
+                .contains_key("repo:old:first"),
             "deleted repo sidecar slice survived merge error"
         );
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
@@ -8397,10 +8396,9 @@ mod startup_helper_tests {
 
         assert_eq!(error.code(), tonic::Code::Internal);
         assert!(
-            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
                 .repos
-                .get(repo_uid)
-                .is_none(),
+                .contains_key(repo_uid),
             "registered mismatched-UID repo sidecar survived merge error"
         );
         assert!(state.store.graph_generation() > graph_generation);
@@ -8445,10 +8443,9 @@ mod startup_helper_tests {
 
         assert_eq!(result.repos, 1, "precondition: registered repo was purged");
         assert!(
-            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
                 .repos
-                .get(repo_uid)
-                .is_none(),
+                .contains_key(repo_uid),
             "registered mismatched-UID repo sidecar survived purge"
         );
         assert!(state.store.graph_generation() > graph_generation);
