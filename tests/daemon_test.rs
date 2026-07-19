@@ -1219,7 +1219,7 @@ fn daemon_purge_orphan_only_code_finalizes_sidecars_and_rank() {
 }
 
 #[test]
-fn daemon_non_code_merge_and_purge_bump_generation_but_preserve_rank() {
+fn daemon_non_code_merge_and_purge_bump_generation_and_invalidate_rank() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("non-code-instance").join("test.lbug");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -1265,7 +1265,13 @@ fn daemon_non_code_merge_and_purge_bump_generation_but_preserve_rank() {
     assert!(store.graph_generation() > before_merge);
     let before_purge = store.graph_generation();
     drop(store);
-    assert!(sidecar_path(&db_path, ".pagerank.json").exists());
+    assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
+
+    std::fs::write(
+        sidecar_path(&db_path, ".pagerank.json"),
+        r#"{"rank-sentinel":0.75}"#,
+    )
+    .unwrap();
 
     daemon_action_cmd(&db_path, "start").assert().success();
     std::thread::sleep(Duration::from_secs(3));
@@ -1279,7 +1285,7 @@ fn daemon_non_code_merge_and_purge_bump_generation_but_preserve_rank() {
     stop_daemon(&db_path);
     let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
     assert!(store.graph_generation() > before_purge);
-    assert!(sidecar_path(&db_path, ".pagerank.json").exists());
+    assert!(!sidecar_path(&db_path, ".pagerank.json").exists());
 }
 
 #[test]
