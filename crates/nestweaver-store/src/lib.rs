@@ -37,7 +37,8 @@ pub use tantivy_index::{
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{
     DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
-    DiscardedVault, InstanceUidRemap, MergeResult, ProjectMutationDisposition, PurgeInstanceResult,
+    DiscardedVault, InstanceUidRemap, InstanceUidRemapPlanState, MergeResult,
+    ProjectMutationDisposition, PurgeInstanceResult,
 };
 
 #[cfg(test)]
@@ -2577,6 +2578,12 @@ mod tests {
             .unwrap();
 
         let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::Prepared
+        );
 
         assert_eq!(
             plan,
@@ -2599,5 +2606,173 @@ mod tests {
                 },
             ]
         );
+        store.merge_instance_ids("old", "new").unwrap();
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::Applied
+        );
+
+        let mut tampered = plan;
+        tampered[0].destination_uid = "file:repo:new:ffffffffffff:ffffffffffff".to_string();
+        assert!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &tampered)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn project_collision_plan_and_merge_are_order_independent() {
+        use nestweaver_schema::Project;
+
+        type ProjectSnapshot = (String, String, Option<String>, String);
+        type RunResult = (Vec<InstanceUidRemap>, Vec<ProjectSnapshot>);
+
+        fn run(reverse: bool) -> RunResult {
+            let store = test_store();
+            let target_winner_uid = "proj:new:000000000001";
+            let target_loser_uid = "proj:new:ffffffffffff";
+            let mut projects = vec![
+                Project {
+                    uid: target_winner_uid.to_string(),
+                    name: "Roadmap".to_string(),
+                    summary: Some("stable target winner".to_string()),
+                    instance_id: "new".to_string(),
+                },
+                Project {
+                    uid: target_loser_uid.to_string(),
+                    name: "ROADMAP".to_string(),
+                    summary: Some("legacy target loser".to_string()),
+                    instance_id: "new".to_string(),
+                },
+                Project {
+                    uid: "proj:old:111111111111".to_string(),
+                    name: "roadmap".to_string(),
+                    summary: Some("source lower".to_string()),
+                    instance_id: "old".to_string(),
+                },
+                Project {
+                    uid: "proj:old:222222222222".to_string(),
+                    name: "RoadMap".to_string(),
+                    summary: Some("source mixed".to_string()),
+                    instance_id: "old".to_string(),
+                },
+            ];
+            if reverse {
+                projects.reverse();
+            }
+            for project in projects {
+                store.insert_project(&project).unwrap();
+            }
+
+            let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+            let result = store.merge_instance_ids("old", "new").unwrap();
+            assert_eq!(result.projects, 2);
+            let mut surviving: Vec<_> = store
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .map(|project| {
+                    (
+                        project.uid,
+                        project.name,
+                        project.summary,
+                        project.instance_id,
+                    )
+                })
+                .collect();
+            surviving.sort();
+            (plan, surviving)
+        }
+
+        let (forward_plan, forward_projects) = run(false);
+        let (reverse_plan, reverse_projects) = run(true);
+        let winner = "proj:new:000000000001";
+        let expected_plan = vec![
+            InstanceUidRemap {
+                source_uid: "proj:new:ffffffffffff".to_string(),
+                destination_uid: winner.to_string(),
+            },
+            InstanceUidRemap {
+                source_uid: "proj:old:111111111111".to_string(),
+                destination_uid: winner.to_string(),
+            },
+            InstanceUidRemap {
+                source_uid: "proj:old:222222222222".to_string(),
+                destination_uid: winner.to_string(),
+            },
+        ];
+        assert_eq!(forward_plan, expected_plan);
+        assert_eq!(reverse_plan, expected_plan);
+        assert_eq!(forward_projects, reverse_projects);
+        assert_eq!(forward_projects.len(), 1);
+        assert_eq!(forward_projects[0].0, winner);
+        assert_eq!(forward_projects[0].1, "Roadmap");
+        assert_eq!(
+            forward_projects[0].2.as_deref(),
+            Some("stable target winner")
+        );
+    }
+
+    #[test]
+    fn project_source_only_case_variants_choose_lexical_reminted_uid() {
+        use nestweaver_schema::Project;
+        use nestweaver_schema::uid::project_uid;
+
+        type ProjectSnapshot = (String, String, Option<String>);
+        type RunResult = (Vec<InstanceUidRemap>, Vec<ProjectSnapshot>);
+
+        fn run(reverse: bool) -> RunResult {
+            let store = test_store();
+            let mut projects = vec![
+                Project {
+                    uid: "proj:old:aaaaaaaaaaaa".to_string(),
+                    name: "Alpha".to_string(),
+                    summary: Some("upper".to_string()),
+                    instance_id: "old".to_string(),
+                },
+                Project {
+                    uid: "proj:old:bbbbbbbbbbbb".to_string(),
+                    name: "alpha".to_string(),
+                    summary: Some("lower".to_string()),
+                    instance_id: "old".to_string(),
+                },
+            ];
+            if reverse {
+                projects.reverse();
+            }
+            for project in projects {
+                store.insert_project(&project).unwrap();
+            }
+            let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+            store.merge_instance_ids("old", "new").unwrap();
+            let mut projects: Vec<_> = store
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .map(|project| (project.uid, project.name, project.summary))
+                .collect();
+            projects.sort();
+            (plan, projects)
+        }
+
+        let upper_uid = project_uid("new", "Alpha");
+        let lower_uid = project_uid("new", "alpha");
+        let expected_winner = upper_uid.min(lower_uid);
+        let (forward_plan, forward_projects) = run(false);
+        let (reverse_plan, reverse_projects) = run(true);
+
+        assert_eq!(forward_plan, reverse_plan);
+        assert_eq!(forward_projects, reverse_projects);
+        assert_eq!(forward_projects.len(), 1);
+        assert_eq!(forward_projects[0].0, expected_winner);
+        assert!(
+            forward_plan
+                .iter()
+                .all(|mapping| mapping.destination_uid == expected_winner)
+        );
+        assert_eq!(forward_plan.len(), 2);
     }
 }

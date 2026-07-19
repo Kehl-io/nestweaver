@@ -1305,6 +1305,220 @@ fn daemon_merge_migrates_authored_extensions_for_every_reminted_code_uid() {
 }
 
 #[test]
+fn restored_pending_extension_migration_recovers_automatically_on_daemon_start() {
+    use nestweaver_schema::uid::project_uid;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_data = dir.path().join("source-data");
+    let source_db = source_data.join("test.lbug");
+    std::fs::create_dir_all(&source_data).unwrap();
+    let store = nestweaver_store::GraphStore::open_or_create(&source_db).unwrap();
+    let source_uid = project_uid("old", "Restored migration");
+    let destination_uid = project_uid("new", "Restored migration");
+    store
+        .insert_project(&nestweaver_schema::Project {
+            uid: source_uid.clone(),
+            name: "Restored migration".to_string(),
+            summary: None,
+            instance_id: "old".to_string(),
+        })
+        .unwrap();
+    let mut extensions = nestweaver_engine::ExtensionStore::new();
+    nestweaver_engine::set_property(
+        &mut extensions,
+        &source_uid,
+        "nested",
+        serde_json::json!({"backup": [true, {"path-independent": true}]}),
+    );
+    nestweaver_engine::save_extensions(&source_db, &extensions).unwrap();
+    let mappings = store.plan_instance_uid_remaps("old", "new").unwrap();
+    nestweaver_engine::prepare_instance_extension_migration(&source_db, "old", "new", &mappings)
+        .unwrap();
+    drop(store);
+
+    let snapshot = dir.path().join("pending.nwsnap.zst");
+    nestweaver_engine::backup_save(&nestweaver_engine::BackupConfig {
+        db_path: source_db,
+        output_path: snapshot.clone(),
+        include_clones: false,
+        instance_id: "backup-source".to_string(),
+        workspace_path: None,
+    })
+    .unwrap();
+    let restored_data = dir.path().join("restored-data");
+    nestweaver_engine::backup_restore(&nestweaver_engine::RestoreConfig {
+        snapshot_path: snapshot,
+        data_dir: restored_data.clone(),
+    })
+    .unwrap();
+    let restored_db = restored_data.join("test.lbug");
+    assert!(sidecar_path(&restored_db, ".extensions.migration.json").exists());
+
+    let _guard = DaemonGuard::new(&restored_db);
+    start_daemon(&restored_db);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&restored_db)
+            .await
+            .unwrap();
+        let response = client
+            .inner_mut()
+            .query_extensions(nestweaver_proto::JsonRequest {
+                args_json: serde_json::json!({"uid": destination_uid}).to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let result: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+        assert_eq!(
+            result["properties"]["nested"],
+            serde_json::json!({"backup": [true, {"path-independent": true}]})
+        );
+    });
+    stop_daemon(&restored_db);
+
+    let reopened = nestweaver_store::GraphStore::open(&restored_db).unwrap();
+    assert!(!reopened.project_exists(&source_uid).unwrap());
+    assert!(reopened.project_exists(&destination_uid).unwrap());
+    drop(reopened);
+    let migrated = nestweaver_engine::load_extensions(&restored_db);
+    assert!(!migrated.contains_key(&source_uid));
+    assert!(migrated.contains_key(&destination_uid));
+    assert!(!sidecar_path(&restored_db, ".extensions.migration.json").exists());
+}
+
+#[test]
+fn daemon_project_casefold_collision_uses_exact_graph_winner_for_extension_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("project-collision").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    let winner_uid = "proj:new:000000000001";
+    let target_loser_uid = "proj:new:ffffffffffff";
+    let source_first_uid = "proj:old:111111111111";
+    let source_second_uid = "proj:old:222222222222";
+    // Reverse the natural winner/precedence order to prove DB insertion order
+    // does not select the graph survivor or extension conflict winner.
+    for project in [
+        nestweaver_schema::Project {
+            uid: source_second_uid.to_string(),
+            name: "RoadMap".to_string(),
+            summary: Some("source second".to_string()),
+            instance_id: "old".to_string(),
+        },
+        nestweaver_schema::Project {
+            uid: source_first_uid.to_string(),
+            name: "roadmap".to_string(),
+            summary: Some("source first".to_string()),
+            instance_id: "old".to_string(),
+        },
+        nestweaver_schema::Project {
+            uid: target_loser_uid.to_string(),
+            name: "ROADMAP".to_string(),
+            summary: Some("target loser".to_string()),
+            instance_id: "new".to_string(),
+        },
+        nestweaver_schema::Project {
+            uid: winner_uid.to_string(),
+            name: "Roadmap".to_string(),
+            summary: Some("target winner".to_string()),
+            instance_id: "new".to_string(),
+        },
+    ] {
+        store.insert_project(&project).unwrap();
+    }
+    let mut extensions = nestweaver_engine::ExtensionStore::new();
+    for (uid, key, value) in [
+        (winner_uid, "priority", serde_json::json!("winner")),
+        (
+            target_loser_uid,
+            "priority",
+            serde_json::json!("target-loser"),
+        ),
+        (
+            target_loser_uid,
+            "target-only",
+            serde_json::json!({"legacy": true}),
+        ),
+        (
+            source_first_uid,
+            "priority",
+            serde_json::json!("source-first"),
+        ),
+        (
+            source_first_uid,
+            "source-only",
+            serde_json::json!({"source": 1}),
+        ),
+        (
+            source_second_uid,
+            "source-only",
+            serde_json::json!({"source": 2}),
+        ),
+    ] {
+        nestweaver_engine::set_property(&mut extensions, uid, key, value);
+    }
+    nestweaver_engine::save_extensions(&db_path, &extensions).unwrap();
+    drop(store);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let response = rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        client.merge_instance("old", "new").await.unwrap()
+    });
+    assert_eq!(response.projects_reparented, 2);
+    stop_daemon(&db_path);
+
+    let reopened = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    let projects = reopened.list_projects().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].uid, winner_uid);
+    assert_eq!(projects[0].name, "Roadmap");
+    assert_eq!(projects[0].summary.as_deref(), Some("target winner"));
+    drop(reopened);
+    let migrated = nestweaver_engine::load_extensions(&db_path);
+    for loser in [target_loser_uid, source_first_uid, source_second_uid] {
+        assert!(!migrated.contains_key(loser), "loser survived: {loser}");
+    }
+    assert_eq!(
+        nestweaver_engine::get_property(&migrated, winner_uid, "priority"),
+        Some(&serde_json::json!("winner"))
+    );
+    assert_eq!(
+        nestweaver_engine::get_property(&migrated, winner_uid, "target-only"),
+        Some(&serde_json::json!({"legacy": true}))
+    );
+    assert_eq!(
+        nestweaver_engine::get_property(&migrated, winner_uid, "source-only"),
+        Some(&serde_json::json!({"source": 1}))
+    );
+
+    start_daemon(&db_path);
+    rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        let response = client
+            .inner_mut()
+            .query_extensions(nestweaver_proto::JsonRequest {
+                args_json: serde_json::json!({"uid": winner_uid}).to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let result: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+        assert_eq!(result["properties"]["priority"], "winner");
+        assert_eq!(result["properties"]["target-only"]["legacy"], true);
+        assert_eq!(result["properties"]["source-only"]["source"], 1);
+    });
+    stop_daemon(&db_path);
+}
+
+#[test]
 fn daemon_merge_rejects_self_merge_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("self-merge").join("test.lbug");

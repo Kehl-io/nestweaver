@@ -1584,6 +1584,34 @@ fn list_instance_code_repo_uids(
     Ok(repo_uids)
 }
 
+fn recover_pending_instance_extension_migration(state: &DaemonState) -> Result<(), anyhow::Error> {
+    let pending = nestweaver_engine::pending_instance_extension_migration(&state.db_path)?;
+    if !pending.is_active() {
+        return Ok(());
+    }
+    let from_id = pending
+        .from_id()
+        .ok_or_else(|| anyhow::anyhow!("pending extension migration is missing source instance"))?
+        .to_string();
+    let to_id = pending
+        .to_id()
+        .ok_or_else(|| anyhow::anyhow!("pending extension migration is missing target instance"))?
+        .to_string();
+    run_merge_instance_with(
+        state,
+        &from_id,
+        &to_id,
+        |store, from_id, to_id| {
+            store
+                .merge_instance_ids(from_id, to_id)
+                .map_err(anyhow::Error::from)
+        },
+        rebuild_tantivy_after_mutation,
+    )
+    .map(|_| ())
+    .map_err(|status| anyhow::anyhow!("startup extension migration recovery failed: {status}"))
+}
+
 fn run_merge_instance_with<F, R>(
     state: &DaemonState,
     from_id: &str,
@@ -1602,16 +1630,49 @@ where
         merge,
         reconcile_search,
         |store, db_path, from_id, to_id| {
-            let mappings = store
-                .plan_instance_uid_remaps(from_id, to_id)
-                .map_err(anyhow::Error::from)?;
-            let migration = nestweaver_engine::prepare_instance_extension_migration(
-                db_path, from_id, to_id, &mappings,
-            )?;
+            let pending = nestweaver_engine::pending_instance_extension_migration(db_path)?;
+            let migration = if pending.is_active() {
+                if pending.from_id() != Some(from_id) || pending.to_id() != Some(to_id) {
+                    anyhow::bail!(
+                        "pending extension migration {:?} -> {:?} conflicts with requested {from_id:?} -> {to_id:?}",
+                        pending.from_id(),
+                        pending.to_id()
+                    );
+                }
+                let state = store.verify_instance_uid_remap_plan_state(
+                    from_id,
+                    to_id,
+                    &pending.uid_remaps(),
+                )?;
+                if pending.graph_applied()
+                    && state == nestweaver_store::InstanceUidRemapPlanState::Prepared
+                {
+                    anyhow::bail!(
+                        "extension migration is marked graph-applied but source graph rows remain"
+                    );
+                }
+                pending
+            } else {
+                let mappings = store
+                    .plan_instance_uid_remaps(from_id, to_id)
+                    .map_err(anyhow::Error::from)?;
+                nestweaver_engine::prepare_instance_extension_migration(
+                    db_path, from_id, to_id, &mappings,
+                )?
+            };
             let active = migration.is_active();
             Ok((migration, active))
         },
-        nestweaver_engine::finalize_instance_extension_migration,
+        |db_path, migration| {
+            let graph_applied = if migration.graph_applied() {
+                migration.clone()
+            } else {
+                nestweaver_engine::mark_instance_extension_migration_graph_applied(
+                    db_path, migration,
+                )?
+            };
+            nestweaver_engine::finalize_instance_extension_migration(db_path, &graph_applied)
+        },
     )
 }
 
@@ -5585,6 +5646,15 @@ pub async fn run_server(
         worker_handle: std::sync::Mutex::new(None),
     });
 
+    if !read_only {
+        recover_pending_instance_extension_migration(&state).with_context(|| {
+            format!(
+                "failed to recover pending instance extension migration for {}",
+                db_path.display()
+            )
+        })?;
+    }
+
     // Pre-warm PPR adjacency cache so the first PPR query after startup
     // hits the cache instead of spending ~350ms rebuilding from the DB.
     {
@@ -7906,7 +7976,7 @@ mod startup_helper_tests {
         assert!(!state.store.project_exists(&source_uid).unwrap());
         let staged = nestweaver_engine::load_extensions(&state.db_path);
         assert!(staged.contains_key(&source_uid));
-        assert!(staged.contains_key(&destination_uid));
+        assert!(!staged.contains_key(&destination_uid));
         assert!(
             nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
         );
@@ -7973,6 +8043,110 @@ mod startup_helper_tests {
         assert!(state.store.project_exists(&source_uid).unwrap());
         assert_eq!(state.store.graph_generation(), generation_before);
         assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn startup_recovery_automatically_finishes_a_prepared_extension_migration() {
+        use nestweaver_schema::uid::project_uid;
+
+        let state = test_state_with_writer();
+        let source_uid = project_uid("old", "Startup recovery");
+        let destination_uid = project_uid("new", "Startup recovery");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_uid.clone(),
+                name: "Startup recovery".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        seed_extension(
+            &state,
+            &source_uid,
+            "nested",
+            serde_json::json!({"automatic": [true, {"depth": 3}]}),
+        );
+        let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+        nestweaver_engine::prepare_instance_extension_migration(
+            &state.db_path,
+            "old",
+            "new",
+            &mappings,
+        )
+        .unwrap();
+        let generation_before = state.store.graph_generation();
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        assert!(!state.store.project_exists(&source_uid).unwrap());
+        assert!(state.store.project_exists(&destination_uid).unwrap());
+        assert!(state.store.graph_generation() > generation_before);
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!extensions.contains_key(&source_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_uid, "nested"),
+            Some(&serde_json::json!({"automatic": [true, {"depth": 3}]}))
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_fails_closed_on_corrupt_versioned_or_mismatched_journal() {
+        use nestweaver_schema::uid::project_uid;
+
+        for case in ["corrupt", "version", "pair"] {
+            let state = test_state_with_writer();
+            let source_uid = project_uid("old", &format!("Startup blocked {case}"));
+            let destination_uid = project_uid("new", &format!("Startup blocked {case}"));
+            state
+                .store
+                .insert_project(&nestweaver_schema::Project {
+                    uid: source_uid.clone(),
+                    name: format!("Startup blocked {case}"),
+                    summary: None,
+                    instance_id: "old".to_string(),
+                })
+                .unwrap();
+            seed_extension(&state, &source_uid, "must-stay", serde_json::json!(true));
+            let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+            nestweaver_engine::prepare_instance_extension_migration(
+                &state.db_path,
+                "old",
+                "new",
+                &mappings,
+            )
+            .unwrap();
+            let journal_path =
+                nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json");
+            if case == "corrupt" {
+                std::fs::write(&journal_path, b"{not-json").unwrap();
+            } else {
+                let mut journal: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+                if case == "version" {
+                    journal["version"] = serde_json::json!(999);
+                } else {
+                    journal["from_id"] = serde_json::json!("other");
+                }
+                std::fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap())
+                    .unwrap();
+            }
+            let generation_before = state.store.graph_generation();
+
+            assert!(
+                recover_pending_instance_extension_migration(&state).is_err(),
+                "startup accepted {case} journal"
+            );
+            assert!(state.store.project_exists(&source_uid).unwrap());
+            assert!(!state.store.project_exists(&destination_uid).unwrap());
+            assert_eq!(state.store.graph_generation(), generation_before);
+            let extensions = nestweaver_engine::load_extensions(&state.db_path);
+            assert!(extensions.contains_key(&source_uid));
+            assert!(!extensions.contains_key(&destination_uid));
+        }
     }
 
     #[test]

@@ -177,6 +177,7 @@ pub use export_graph::export_in_memory_graph;
 pub use extensions::{
     ExtensionStore, InstanceExtensionMigration, finalize_instance_extension_migration,
     get_all_properties, get_last_indexed_at, get_property, load_extensions,
+    mark_instance_extension_migration_graph_applied, pending_instance_extension_migration,
     prepare_instance_extension_migration, query_by_property, record_last_indexed_at,
     remove_extension_uid_durable, save_extensions, set_property,
 };

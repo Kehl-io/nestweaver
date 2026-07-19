@@ -151,6 +151,20 @@ pub struct InstanceUidRemap {
     pub destination_uid: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstanceUidRemapPlanState {
+    Prepared,
+    Applied,
+}
+
+#[derive(Clone, Debug)]
+struct InstanceProjectMergePlan {
+    winner: Project,
+    winner_preexists: bool,
+    source_count: usize,
+    remaps: Vec<InstanceUidRemap>,
+}
+
 impl MergeResult {
     /// True when the merge re-minted one or more Repo nodes. The caller should
     /// instruct the user to force re-index each repo listed in
@@ -336,6 +350,70 @@ fn exec_params(
 }
 
 impl GraphStore {
+    fn plan_instance_project_merges(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<InstanceProjectMergePlan>, StoreError> {
+        let mut groups: std::collections::BTreeMap<String, (Vec<Project>, Vec<Project>)> =
+            std::collections::BTreeMap::new();
+        for project in self.list_projects()? {
+            let entry = groups.entry(project.name.to_lowercase()).or_default();
+            if project.instance_id == from {
+                entry.0.push(project);
+            } else if project.instance_id == to {
+                entry.1.push(project);
+            }
+        }
+
+        let mut plans = Vec::new();
+        for (_casefolded_name, (mut sources, mut targets)) in groups {
+            if sources.is_empty() {
+                continue;
+            }
+            sources.sort_by(|left, right| {
+                project_uid(to, &left.name)
+                    .cmp(&project_uid(to, &right.name))
+                    .then_with(|| left.uid.cmp(&right.uid))
+            });
+            targets.sort_by(|left, right| left.uid.cmp(&right.uid));
+
+            let source_count = sources.len();
+            let (winner, winner_preexists) = if let Some(target) = targets.first() {
+                (target.clone(), true)
+            } else {
+                let source = &sources[0];
+                (
+                    Project {
+                        uid: project_uid(to, &source.name),
+                        name: source.name.clone(),
+                        summary: source.summary.clone(),
+                        instance_id: to.to_string(),
+                    },
+                    false,
+                )
+            };
+
+            let mut remaps: Vec<InstanceUidRemap> = targets
+                .into_iter()
+                .skip(1)
+                .chain(sources)
+                .map(|project| InstanceUidRemap {
+                    source_uid: project.uid,
+                    destination_uid: winner.uid.clone(),
+                })
+                .collect();
+            remaps.sort();
+            plans.push(InstanceProjectMergePlan {
+                winner,
+                winner_preexists,
+                source_count,
+                remaps,
+            });
+        }
+        Ok(plans)
+    }
+
     pub fn insert_repo(&self, repo: &Repo) -> Result<(), StoreError> {
         let conn = self.conn()?;
         exec_params(
@@ -3743,19 +3821,101 @@ impl GraphStore {
                 });
             }
         }
-        for project in self
-            .list_projects()?
-            .into_iter()
-            .filter(|project| project.instance_id == from)
-        {
-            remaps.push(InstanceUidRemap {
-                source_uid: project.uid,
-                destination_uid: project_uid(to, &project.name),
-            });
+        for project_merge in self.plan_instance_project_merges(from, to)? {
+            remaps.extend(project_merge.remaps);
         }
         remaps.sort();
         remaps.dedup();
         Ok(remaps)
+    }
+
+    fn instance_merge_node_exists(&self, label: &str, uid: &str) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        let query = format!("MATCH (n:{label} {{uid: $uid}}) RETURN n.uid");
+        let mut statement = conn
+            .prepare(&query)
+            .map_err(|error| StoreError::Query(format!("prepare {label} liveness: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![("uid", lbug::Value::String(uid.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("execute {label} liveness: {error}")))?;
+        Ok(rows.next().is_some())
+    }
+
+    /// Prove whether an exact, previously journaled UID remap plan is still
+    /// prepared in the graph or has been fully applied. Any intermediate or
+    /// mismatched state fails closed.
+    pub fn verify_instance_uid_remap_plan_state(
+        &self,
+        from: &str,
+        to: &str,
+        expected: &[InstanceUidRemap],
+    ) -> Result<InstanceUidRemapPlanState, StoreError> {
+        if expected.is_empty() {
+            return Err(StoreError::Query(
+                "cannot verify an empty instance UID remap plan".to_string(),
+            ));
+        }
+        let current = self.plan_instance_uid_remaps(from, to)?;
+        if current == expected {
+            return Ok(InstanceUidRemapPlanState::Prepared);
+        }
+        if !current.is_empty() {
+            return Err(StoreError::Query(
+                "current graph remap plan differs from the journaled plan".to_string(),
+            ));
+        }
+
+        for mapping in expected {
+            let (source_label, destination_label, destination_root) =
+                if mapping.source_uid.starts_with("repo:")
+                    && mapping.destination_uid.starts_with("repo:")
+                {
+                    ("Repo", "Repo", mapping.destination_uid.clone())
+                } else if mapping.source_uid.starts_with("proj:")
+                    && mapping.destination_uid.starts_with("proj:")
+                {
+                    ("Project", "Project", mapping.destination_uid.clone())
+                } else if mapping.source_uid.starts_with("file:repo:")
+                    && mapping.destination_uid.starts_with("file:repo:")
+                {
+                    let parts: Vec<&str> = mapping.destination_uid.split(':').collect();
+                    if parts.len() != 5 {
+                        return Err(StoreError::Query(
+                            "journaled File remap has invalid destination UID".to_string(),
+                        ));
+                    }
+                    ("File", "Repo", format!("repo:{}:{}", parts[2], parts[3]))
+                } else if mapping.source_uid.starts_with("sym:repo:")
+                    && mapping.destination_uid.starts_with("sym:repo:")
+                {
+                    let parts: Vec<&str> = mapping.destination_uid.split(':').collect();
+                    if parts.len() != 7 {
+                        return Err(StoreError::Query(
+                            "journaled Symbol remap has invalid destination UID".to_string(),
+                        ));
+                    }
+                    ("Symbol", "Repo", format!("repo:{}:{}", parts[2], parts[3]))
+                } else {
+                    return Err(StoreError::Query(
+                        "journaled remap changes node kind or uses an unsupported UID".to_string(),
+                    ));
+                };
+            if self.instance_merge_node_exists(source_label, &mapping.source_uid)? {
+                return Err(StoreError::Query(format!(
+                    "journaled source node still exists after non-matching plan: {}",
+                    mapping.source_uid
+                )));
+            }
+            if !self.instance_merge_node_exists(destination_label, &destination_root)? {
+                return Err(StoreError::Query(format!(
+                    "journaled destination root does not exist: {destination_root}"
+                )));
+            }
+        }
+        Ok(InstanceUidRemapPlanState::Applied)
     }
 
     /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that
@@ -3772,6 +3932,7 @@ impl GraphStore {
             )));
         }
 
+        let project_merges = self.plan_instance_project_merges(from, to)?;
         let mut vault_count = 0usize;
         let mut repo_count = 0usize;
         let mut project_count = 0usize;
@@ -3852,15 +4013,14 @@ impl GraphStore {
                 repo_uids_removed.push(source_uid);
             }
         }
-        for p in self.list_projects()? {
-            if p.instance_id == from {
-                self.upsert_project(&Project {
-                    uid: project_uid(to, &p.name),
-                    instance_id: to.to_string(),
-                    ..p
-                })?;
-                project_count += 1;
+        for project_merge in project_merges {
+            for mapping in &project_merge.remaps {
+                self.delete_project_node(&mapping.source_uid)?;
             }
+            if !project_merge.winner_preexists {
+                self.insert_project(&project_merge.winner)?;
+            }
+            project_count += project_merge.source_count;
         }
         Ok(MergeResult {
             vaults: vault_count,
