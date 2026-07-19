@@ -92,14 +92,15 @@ pub fn save_manifest_cache_for_db(
     save_manifest_cache(manifests, &canonical_path)?;
 
     let legacy_path = db_path.with_extension("manifests.json");
-    if legacy_path != canonical_path
-        && let Err(error) = std::fs::remove_file(&legacy_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(anyhow::anyhow!(
-            "remove legacy manifest sidecar {}: {error}",
-            legacy_path.display()
-        ));
+    if legacy_path != canonical_path {
+        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&legacy_path).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "durably remove legacy manifest sidecar {}: {error}",
+                    legacy_path.display()
+                )
+            },
+        )?;
     }
     Ok(())
 }
@@ -108,16 +109,7 @@ pub(crate) fn atomic_replace_file(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<(), anyhow::Error> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    write(temp.as_file_mut())?;
-    temp.as_file_mut().flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    nestweaver_store::durable_sidecar::atomic_replace_file(path, write).map_err(Into::into)
 }
 
 /// Load a `HashMap<repo_uid, ManifestInfo>` from a JSON sidecar file.

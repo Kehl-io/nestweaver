@@ -1553,6 +1553,99 @@ fn no_daemon_index_rejects_colon_in_instance_flag() {
         .stderr(contains("colon"));
 }
 
+fn write_disabled_watch_config(path: &std::path::Path) {
+    let root = path.parent().unwrap();
+    let storage = root.join("storage");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&storage).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        path,
+        format!(
+            r#"instance_id = "cfg-watch"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[watch]
+enabled = false
+"#,
+            storage.display(),
+            workspace.display()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn no_daemon_brain_watch_rejects_invalid_instance_before_graph_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db = dir.path().join("brain.lbug");
+    let config = dir.path().join("instance.toml");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("note.md"), "# note").unwrap();
+    write_disabled_watch_config(&config);
+
+    nestweaver_cmd()
+        .args(["brain", "watch"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .arg("--config")
+        .arg(&config)
+        .arg("--instance")
+        .arg("a:b")
+        .assert()
+        .failure()
+        .stderr(contains("colon"));
+
+    assert!(!db.exists(), "invalid instance must not create the graph");
+    assert!(
+        !std::path::PathBuf::from(format!("{}.lock", db.display())).exists(),
+        "invalid instance must not publish a watcher lock"
+    );
+}
+
+#[test]
+fn no_daemon_brain_watch_accepts_empty_and_valid_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db = dir.path().join("brain.lbug");
+    let config = dir.path().join("instance.toml");
+    std::fs::create_dir_all(&vault).unwrap();
+    write_disabled_watch_config(&config);
+
+    for instance in ["", "valid-watch"] {
+        nestweaver_cmd()
+            .args(["brain", "watch"])
+            .arg(&vault)
+            .arg("--db")
+            .arg(&db)
+            .arg("--config")
+            .arg(&config)
+            .arg("--instance")
+            .arg(instance)
+            .assert()
+            .success()
+            .stderr(contains("Watching disabled"));
+    }
+}
+
 #[test]
 fn index_does_not_write_setup_files_into_unrelated_cwd() {
     let dir = tempfile::tempdir().unwrap();

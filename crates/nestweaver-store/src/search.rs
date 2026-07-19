@@ -365,18 +365,7 @@ fn atomic_replace_file(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<(), anyhow::Error> {
-    use std::io::Write;
-
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    write(temp.as_file_mut())?;
-    temp.as_file_mut().flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    crate::durable_sidecar::atomic_replace_file(path, write).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -846,6 +835,24 @@ mod tests {
         assert!(error.to_string().contains("injected write failure"));
         assert_eq!(std::fs::read(&path).unwrap(), b"previous-valid-sidecar");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn binary_save_reports_parent_sync_failure_and_reopens_complete_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        let mut idx = EmbeddingIndex::new();
+        assert!(idx.add("sym:durable", vec![1.0, 0.0], false));
+
+        let error = crate::durable_sidecar::with_test_fault(
+            crate::durable_sidecar::TestFault::ParentSync,
+            || idx.save_binary(&path),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("sync parent after replacing"));
+        let reopened = EmbeddingIndex::load_binary(&path).unwrap();
+        assert_eq!(reopened.get("sym:durable"), Some(&vec![1.0, 0.0]));
     }
 
     #[test]

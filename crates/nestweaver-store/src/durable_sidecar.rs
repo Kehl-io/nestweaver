@@ -200,7 +200,7 @@ fn remove_file_durable_with_ops(
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TestFault {
+pub(crate) enum TestFault {
     TempSync,
     Persist,
     ParentSync,
@@ -213,7 +213,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn with_test_fault<T>(fault: TestFault, action: impl FnOnce() -> T) -> T {
+pub(crate) fn with_test_fault<T>(fault: TestFault, action: impl FnOnce() -> T) -> T {
     TEST_FAULT.with(|active| {
         let previous = active.replace(Some(fault));
         let result = action();

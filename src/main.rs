@@ -8450,6 +8450,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         match unsafe { daemonize.start() } {
                             Ok(()) => {
                                 // We are now the daemon process.
+                                // daemonize2's pidfile flock was acquired before
+                                // the fork and is inherited by this child. Mark
+                                // that ownership only after `start()` returns in
+                                // the child so run_server does not self-conflict
+                                // by opening and flocking the same pidfile again.
+                                unsafe {
+                                    std::env::set_var("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD", "1");
+                                }
                                 let idle = if idle_timeout > 0 {
                                     Some(std::time::Duration::from_secs(idle_timeout))
                                 } else {
@@ -10545,14 +10553,10 @@ fn run_brain(
                     .unwrap_or("vault")
                     .to_string()
             });
-            // Instance ID priority: --instance flag > config's instance_id > "default"
+            // Resolve and validate the same instance precedence as brain add,
+            // brain refresh, top-level index, and top-level watch.
+            let instance_id = resolve_instance_id(instance, config.as_deref())?;
             let instance_cfg = load_instance_config_opt(config.as_deref());
-            let instance_id = instance.unwrap_or_else(|| {
-                instance_cfg
-                    .as_ref()
-                    .map(|c| c.instance_id.clone())
-                    .unwrap_or_else(|| "default".to_string())
-            });
 
             if let Some(hours) = refresh_wiki_hours {
                 out.status(&format!(

@@ -5099,8 +5099,9 @@ fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
 
 /// Claim the exclusive per-instance lock — the pidfile flock that makes an
 /// `instance_id` single-owner on this host — and return the pidfile handle
-/// whose lifetime holds the lock (dropping it releases the lock). `None` in
-/// fork mode, where `daemonize2` already holds the flock (acquired pre-fork).
+/// whose lifetime holds the lock (dropping it releases the lock). `None` only
+/// in a daemonize child that proves the inherited daemonize2 pidfile belongs to
+/// its own PID.
 ///
 /// Acquired **before** snapshot materialization so a duplicate replica started
 /// with the identical `--db` (hence identical `instance_id` and
@@ -5109,8 +5110,18 @@ fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
 /// same pidfile hold independent open-file descriptions, so `flock(LOCK_EX)`
 /// from a second process fails even though the first holder is also us-shaped.
 fn claim_instance_lock(instance_id: &str) -> Result<Option<std::fs::File>, anyhow::Error> {
-    // Fork mode: the flock is already held by daemonize2 (acquired pre-fork).
-    if std::env::var("NESTWEAVER_DAEMON_FORK").is_ok() {
+    // daemonize2 acquired this flock before forking and the child inherited
+    // its open file description. Opening the pidfile again would conflict with
+    // that inherited lock. The launcher marks only the real daemonize child;
+    // matching the file's PID prevents an inherited/user-set environment value
+    // from disabling duplicate-daemon exclusion for a normal `daemon run`.
+    let inherited_daemonize_lock = std::env::var("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD").as_deref()
+        == Ok("1")
+        && std::fs::read_to_string(lifecycle::pidfile_path(instance_id))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            == Some(std::process::id());
+    if inherited_daemonize_lock {
         return Ok(None);
     }
     // The pidfile lives in the per-instance runtime dir (created on demand).
@@ -5545,7 +5556,8 @@ pub async fn run_server(
     // duplicate replica on the identical `--db` shares this instance id (and its
     // `replica-work-<id>` dir), so rejecting it here stops its materialize copy
     // from truncating a live sibling's working copy. Held for the process
-    // lifetime; released on drop. (In fork mode daemonize2 already holds it.)
+    // lifetime; released on drop. A daemonize child proves it inherited the
+    // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
 
     // Snapshot replica: materialize the snapshot into a private working copy and

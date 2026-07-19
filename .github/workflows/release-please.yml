@@ -49,10 +49,10 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev pkg-config protobuf-compiler
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install openssl@3 protobuf
+        run: brew install protobuf
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
@@ -76,11 +76,66 @@ jobs:
       - name: Build frontend
         run: npm ci && npm run build
         working-directory: crates/nestweaver-web/frontend
+      - name: Build target OpenSSL
+        shell: bash
+        run: |
+          cargo build --locked --release --target "${{ matrix.target }}" -p openssl-sys
+          OPENSSL_INSTALL="$(find "target/${{ matrix.target }}/release/build" -type d -path '*/openssl-sys-*/out/openssl-build/install' -print -quit)"
+          test -n "$OPENSSL_INSTALL"
+          OPENSSL_INSTALL="$(cd "$OPENSSL_INSTALL" && pwd)"
+          test -f "$OPENSSL_INSTALL/lib/libssl.a"
+          test -f "$OPENSSL_INSTALL/lib/libcrypto.a"
+          test -f "$OPENSSL_INSTALL/include/openssl/ssl.h"
+          echo "OPENSSL_DIR=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
+          echo "OPENSSL_ROOT_DIR=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
+          echo "OPENSSL_LIB_DIR=$OPENSSL_INSTALL/lib" >> "$GITHUB_ENV"
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_INSTALL/include" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
           LBUG_BUILD_FROM_SOURCE: "1"
+      - name: Verify release binary
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/nestweaver"
+          FILE_INFO="$(file "$BIN")"
+          echo "$FILE_INFO"
+
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu) echo "$FILE_INFO" | grep -q 'x86-64' ;;
+            aarch64-unknown-linux-gnu) echo "$FILE_INFO" | grep -Eq 'ARM aarch64|ARM64' ;;
+            x86_64-apple-darwin) echo "$FILE_INFO" | grep -q 'x86_64' ;;
+            aarch64-apple-darwin) echo "$FILE_INFO" | grep -Eq 'arm64|ARM64' ;;
+          esac
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            otool -L "$BIN" | tee linked-libraries.txt
+            if grep -Eq '/opt/homebrew|/usr/local|libssl|libcrypto' linked-libraries.txt; then
+              echo "release binary has a non-system OpenSSL dependency" >&2
+              exit 1
+            fi
+          else
+            readelf -d "$BIN" | tee linked-libraries.txt
+            if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' linked-libraries.txt; then
+              echo "release binary has a dynamic OpenSSL dependency" >&2
+              exit 1
+            fi
+          fi
+
+          HOST="$(uname -s)-$(uname -m)"
+          case "$HOST:${{ matrix.target }}" in
+            Linux-x86_64:x86_64-unknown-linux-gnu|Darwin-x86_64:x86_64-apple-darwin|Darwin-arm64:aarch64-apple-darwin)
+              "$BIN" --version
+              ;;
+          esac
       - name: Package binary
         run: |
           BIN="target/${{ matrix.target }}/release/nestweaver"

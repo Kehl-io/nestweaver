@@ -27,6 +27,17 @@ fn daemon_cmd() -> Command {
     cmd
 }
 
+/// Build a daemon command with the same environment a user gets from a normal
+/// shell. Temp database paths select the fork backend on macOS without the
+/// test-only `NESTWEAVER_DAEMON_FORK` override.
+fn normal_daemon_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    cmd.env_remove("NESTWEAVER_NO_DAEMON");
+    cmd.env_remove("NESTWEAVER_DAEMON_FORK");
+    cmd.env_remove("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD");
+    cmd
+}
+
 /// Helper: build a `Command` with `NESTWEAVER_NO_DAEMON=1` for initial DB
 /// creation (before daemon tests).
 fn no_daemon_cmd() -> Command {
@@ -324,6 +335,74 @@ fn daemon_start_stop() {
         .assert()
         .success()
         .stdout(contains("not running"));
+}
+
+#[test]
+fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("normal-start").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let _guard = DaemonGuard::new(&db_path);
+
+    let mut start = normal_daemon_cmd();
+    start
+        .arg("--no-embed")
+        .args(["daemon", "--db", &db_path.display().to_string(), "start"])
+        .assert()
+        .success();
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    wait_for_daemon_readiness(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || std::os::unix::net::UnixStream::connect(&socket).map(drop),
+        || {
+            let mut stop = normal_daemon_cmd();
+            let _ = stop
+                .arg("--no-embed")
+                .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+                .output();
+        },
+    )
+    .expect("normal daemon start must leave a live child accepting connections");
+
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let first_pid = std::fs::read_to_string(&pidfile).expect("live daemon must own a pidfile");
+
+    let mut second = normal_daemon_cmd();
+    second
+        .arg("--no-embed")
+        .args(["daemon", "--db", &db_path.display().to_string(), "start"])
+        .assert()
+        .success()
+        .stderr(contains("already running"));
+    assert_eq!(
+        std::fs::read_to_string(&pidfile).unwrap(),
+        first_pid,
+        "a rejected second start must not replace the live daemon owner"
+    );
+
+    let mut status = normal_daemon_cmd();
+    status
+        .arg("--no-embed")
+        .args(["daemon", "--db", &db_path.display().to_string(), "status"])
+        .assert()
+        .success()
+        .stdout(contains("running"));
+
+    let mut stop = normal_daemon_cmd();
+    stop.arg("--no-embed")
+        .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+        .assert()
+        .success();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while (pidfile.exists() || socket.exists()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!pidfile.exists(), "clean stop must retire the pidfile");
+    assert!(!socket.exists(), "clean stop must retire the socket");
 }
 
 #[test]
