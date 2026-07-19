@@ -55,6 +55,8 @@ fn kind_rank(kind: SymbolKind, kind_priority: &[String]) -> usize {
 /// Stored in `GraphStore::symbol_name_cache` to avoid repeated full-table
 /// scans in `search_symbols_by_name`. Valid as long as `generation` matches
 /// the current `graph_generation`; stale once any reindex bumps that counter.
+/// Dirty index publications never consume or populate this cache, even when
+/// the live dirty generation happens to match an entry.
 pub(crate) struct SymbolNameCached {
     /// The `graph_generation` value at cache-fill time.
     pub generation: u64,
@@ -539,6 +541,66 @@ impl GraphStore {
         Ok(edges)
     }
 
+    /// Snapshot the generation and consult the cache while serialized with
+    /// dirty-marker transitions. The publication barrier is always acquired
+    /// before `symbol_name_cache`, matching cache invalidation's lock order.
+    fn begin_symbol_name_cache_query(&self) -> (u64, Option<std::sync::Arc<SymbolNameCached>>) {
+        let _publication = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = self.graph_generation();
+        if self.is_index_publication_dirty() {
+            return (generation, None);
+        }
+
+        let cached = self
+            .symbol_name_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|entry| entry.generation == generation)
+            .map(std::sync::Arc::clone);
+        (generation, cached)
+    }
+
+    /// Publish a completed full-table query only if the graph is still the
+    /// same clean generation that the query began against. Rechecking dirty
+    /// state and generation while holding the publication barrier makes the
+    /// check-and-fill atomic with marker establishment/retirement.
+    fn finalize_symbol_name_cache_query(
+        &self,
+        query_generation: u64,
+        symbols: Vec<(String, nestweaver_schema::Symbol)>,
+    ) -> std::sync::Arc<SymbolNameCached> {
+        let candidate = std::sync::Arc::new(SymbolNameCached {
+            generation: query_generation,
+            symbols,
+        });
+        let _publication = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current_generation = self.graph_generation();
+        if self.is_index_publication_dirty() || current_generation != query_generation {
+            return candidate;
+        }
+
+        let mut cached = self
+            .symbol_name_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = cached
+            .as_ref()
+            .filter(|entry| entry.generation == current_generation)
+        {
+            return std::sync::Arc::clone(entry);
+        }
+
+        *cached = Some(std::sync::Arc::clone(&candidate));
+        candidate
+    }
+
     /// Search symbols whose name contains `query` (case-insensitive substring match).
     /// Returns up to `limit` results.
     ///
@@ -562,26 +624,12 @@ impl GraphStore {
         seed_resolution: &SeedResolutionConfig,
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
         let needle = query.to_lowercase();
-        let cur_gen = self.graph_generation();
-
-        // --- Step 1: check the cache (hold the lock only briefly) -----------
-        // On a hit we clone the Arc (cheap ref-count bump) rather than the
-        // entire symbol Vec, so the lock is released before any filtering work.
-        let cached_symbols: Option<std::sync::Arc<SymbolNameCached>> = {
-            let guard = self
-                .symbol_name_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref c) = *guard {
-                if c.generation == cur_gen {
-                    Some(std::sync::Arc::clone(c))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        // --- Step 1: coherently snapshot publication state + cache ----------
+        // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
+        // publications always bypass hits. The DB query itself remains outside
+        // the publication barrier so an index writer is never blocked by a
+        // full-table scan.
+        let (query_generation, cached_symbols) = self.begin_symbol_name_cache_query();
 
         // --- Step 2: on cache miss, query the DB then populate the cache ----
         let entry: std::sync::Arc<SymbolNameCached> = if let Some(arc) = cached_symbols {
@@ -603,28 +651,7 @@ impl GraphStore {
                 }
             }
 
-            // Store the populated cache (re-check generation under the lock in
-            // case another thread raced us, preferring the newer fill).
-            let mut guard = self
-                .symbol_name_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let current_gen = self.graph_generation();
-            let should_update = match &*guard {
-                None => true,
-                Some(c) => c.generation != current_gen,
-            };
-            if should_update {
-                let arc = std::sync::Arc::new(SymbolNameCached {
-                    generation: current_gen,
-                    symbols: all,
-                });
-                *guard = Some(std::sync::Arc::clone(&arc));
-                arc
-            } else {
-                // Another thread raced us and filled the cache; use its entry.
-                std::sync::Arc::clone(guard.as_ref().unwrap())
-            }
+            self.finalize_symbol_name_cache_query(query_generation, all)
         };
 
         // --- Step 3: filter and rank the in-memory list ----------------------
@@ -672,6 +699,8 @@ impl GraphStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier, mpsc};
+
     use nestweaver_schema::{Symbol, SymbolKind, Visibility};
 
     use super::{compute_path_factor, kind_rank};
@@ -880,6 +909,239 @@ mod tests {
             2,
             "after generation bump the cache should be refreshed and include the new symbol"
         );
+    }
+
+    #[test]
+    fn symbol_name_cache_bypasses_hits_and_fills_while_publication_is_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store
+            .insert_symbol(&make_symbol("fresh", "NeedleFresh"))
+            .unwrap();
+
+        store.with_index_publication_rank_barrier(|| {
+            std::fs::write(&marker_path, b"dirty").unwrap();
+            store.reserve_index_publication_generation().unwrap();
+        });
+
+        let poisoned = Arc::new(super::SymbolNameCached {
+            generation: store.graph_generation(),
+            symbols: vec![("needlestale".into(), make_symbol("stale", "NeedleStale"))],
+        });
+        *store.symbol_name_cache.lock().unwrap() = Some(Arc::clone(&poisoned));
+
+        let results = store
+            .search_symbols_by_name("needle", 10, &no_rules())
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|symbol| symbol.uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh"],
+            "dirty readers must query the database instead of using a matching cache entry"
+        );
+        let cached = store.symbol_name_cache.lock().unwrap();
+        assert!(
+            Arc::ptr_eq(cached.as_ref().unwrap(), &poisoned),
+            "a dirty-window query must not replace or refill the cache"
+        );
+    }
+
+    #[test]
+    fn symbol_name_cache_bypasses_cache_after_dirty_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            store
+                .insert_symbol(&make_symbol("fresh", "ReopenFresh"))
+                .unwrap();
+            store.bump_and_persist_generation();
+        }
+        std::fs::write(&marker_path, b"dirty").unwrap();
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let poisoned = Arc::new(super::SymbolNameCached {
+            generation: reopened.graph_generation(),
+            symbols: vec![("reopenstale".into(), make_symbol("stale", "ReopenStale"))],
+        });
+        *reopened.symbol_name_cache.lock().unwrap() = Some(Arc::clone(&poisoned));
+
+        let results = reopened
+            .search_symbols_by_name("reopen", 10, &no_rules())
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|symbol| symbol.uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh"]
+        );
+        assert!(Arc::ptr_eq(
+            reopened.symbol_name_cache.lock().unwrap().as_ref().unwrap(),
+            &poisoned
+        ));
+    }
+
+    #[test]
+    fn symbol_name_cache_does_not_fill_when_publication_turns_dirty_during_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let query_generation = store.graph_generation();
+
+        store.with_index_publication_rank_barrier(|| {
+            std::fs::write(&marker_path, b"dirty").unwrap();
+            store.reserve_index_publication_generation().unwrap();
+        });
+
+        store.finalize_symbol_name_cache_query(
+            query_generation,
+            vec![("old".into(), make_symbol("old", "Old"))],
+        );
+
+        assert!(
+            store.symbol_name_cache.lock().unwrap().is_none(),
+            "a query that began clean must not fill after publication becomes dirty"
+        );
+    }
+
+    #[test]
+    fn symbol_name_cache_does_not_fill_when_generation_changes_during_fetch() {
+        let store = GraphStore::in_memory().unwrap();
+        let query_generation = store.graph_generation();
+        store.bump_graph_generation();
+
+        store.finalize_symbol_name_cache_query(
+            query_generation,
+            vec![("old".into(), make_symbol("old", "Old"))],
+        );
+
+        assert!(
+            store.symbol_name_cache.lock().unwrap().is_none(),
+            "a query result from an older generation must not be published"
+        );
+    }
+
+    #[test]
+    fn symbol_name_cache_dirty_query_cannot_fill_after_clean_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&make_symbol("new", "New")).unwrap();
+        store.with_index_publication_rank_barrier(|| {
+            std::fs::write(&marker_path, b"dirty").unwrap();
+            store.reserve_index_publication_generation().unwrap();
+        });
+        let dirty_generation = store.graph_generation();
+
+        store.with_index_publication_rank_barrier(|| {
+            store.publish_clean_index_publication_generation().unwrap();
+            std::fs::remove_file(&marker_path).unwrap();
+            store.complete_index_publication_generation();
+        });
+
+        store.finalize_symbol_name_cache_query(
+            dirty_generation,
+            vec![("old".into(), make_symbol("old", "Old"))],
+        );
+        assert!(store.symbol_name_cache.lock().unwrap().is_none());
+
+        let results = store
+            .search_symbols_by_name("new", 10, &no_rules())
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].uid, "new");
+        assert_eq!(
+            store
+                .symbol_name_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
+            store.graph_generation(),
+            "the first query after clean publication must fill only the final generation"
+        );
+    }
+
+    #[test]
+    fn symbol_name_cache_reader_writer_race_never_publishes_pre_commit_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        store
+            .insert_symbol(&make_symbol("old", "TargetOld"))
+            .unwrap();
+        let query_generation = store.graph_generation();
+        let writer_holds_barrier = Arc::new(Barrier::new(2));
+        let release_writer = Arc::new(Barrier::new(2));
+
+        let writer = {
+            let store = Arc::clone(&store);
+            let marker_path = marker_path.clone();
+            let writer_holds_barrier = Arc::clone(&writer_holds_barrier);
+            let release_writer = Arc::clone(&release_writer);
+            std::thread::spawn(move || {
+                store.with_index_publication_rank_barrier(|| {
+                    std::fs::write(&marker_path, b"dirty").unwrap();
+                    store.reserve_index_publication_generation().unwrap();
+                    writer_holds_barrier.wait();
+                    release_writer.wait();
+                    store
+                        .insert_symbol(&make_symbol("new", "TargetNew"))
+                        .unwrap();
+                    store.publish_clean_index_publication_generation().unwrap();
+                    std::fs::remove_file(&marker_path).unwrap();
+                    store.complete_index_publication_generation();
+                });
+            })
+        };
+        writer_holds_barrier.wait();
+
+        let (reader_started_tx, reader_started_rx) = mpsc::channel();
+        let (reader_done_tx, reader_done_rx) = mpsc::channel();
+        let reader = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                reader_started_tx.send(()).unwrap();
+                store.finalize_symbol_name_cache_query(
+                    query_generation,
+                    vec![("targetold".into(), make_symbol("old", "TargetOld"))],
+                );
+                reader_done_tx.send(()).unwrap();
+            })
+        };
+        reader_started_rx.recv().unwrap();
+        assert!(
+            matches!(reader_done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "cache publication must wait behind an active publication transition"
+        );
+        release_writer.wait();
+        writer.join().unwrap();
+        reader.join().unwrap();
+        reader_done_rx.recv().unwrap();
+
+        assert!(
+            store.symbol_name_cache.lock().unwrap().is_none(),
+            "a blocked pre-commit reader must reject its result after the writer publishes"
+        );
+        let results = store
+            .search_symbols_by_name("target", 10, &no_rules())
+            .unwrap();
+        let mut uids = results
+            .iter()
+            .map(|symbol| symbol.uid.as_str())
+            .collect::<Vec<_>>();
+        uids.sort_unstable();
+        assert_eq!(uids, vec!["new", "old"]);
     }
 
     // ── Finding #7 — seed_resolution scoring + kind tiebreak ────────────

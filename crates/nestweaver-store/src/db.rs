@@ -51,10 +51,12 @@ pub struct GraphStore {
     /// clients (the watcher, the MCP server, downstream tools) detect when
     /// their cached scores are stale without comparing entire score maps.
     pub(crate) pagerank_generation: AtomicU64,
-    /// Serializes the lazy PageRank compute in `ensure_pagerank_loaded` so N
-    /// concurrent first-touch callers produce exactly one compute instead of
-    /// N duplicate full computes (nw-029). Invalidation also takes this lock so
-    /// an older in-flight lazy compute cannot republish stale scores afterward.
+    /// Serializes lazy PageRank computation and graph-publication cache state.
+    /// `ensure_pagerank_loaded` uses it so N concurrent first-touch callers
+    /// produce exactly one compute instead of N duplicate full computes
+    /// (nw-029). Dirty-marker transitions, invalidation, and generation-keyed
+    /// cache fills also take it so in-flight readers cannot republish stale
+    /// state after an index publication transition.
     pub(crate) pagerank_compute_lock: Mutex<()>,
     /// Monotonic counter that bumps whenever the graph data changes (nodes
     /// or edges added/removed). Lets the web UI and other consumers detect
@@ -350,10 +352,10 @@ impl GraphStore {
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    /// Run a publication marker transition while excluding PageRank readers
-    /// and computations, then discard rank and generation-keyed caches before
-    /// releasing them. Establishment and retirement both use this barrier so
-    /// no dirty-window state can survive publication.
+    /// Run a publication marker transition while excluding PageRank readers,
+    /// computations, and generation-keyed cache publication, then discard
+    /// caches before releasing them. Establishment and retirement both use
+    /// this barrier so no dirty-window state can survive publication.
     pub fn with_index_publication_rank_barrier<T>(&self, operation: impl FnOnce() -> T) -> T {
         let _flight = self
             .pagerank_compute_lock
