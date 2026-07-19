@@ -1100,16 +1100,14 @@ impl GraphStore {
         let legacy_retirement = if canonical_persistence.is_ok() {
             self.db_path.as_ref().map(|db_path| {
                 let legacy_path = Self::embedding_sidecar_json_for(db_path);
-                let existed = legacy_path.exists();
-                if let Err(error) = std::fs::remove_file(&legacy_path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(StoreError::Query(format!(
-                        "remove legacy embedding sidecar {}: {error}",
-                        legacy_path.display()
-                    )));
-                }
-                Ok(existed)
+                crate::durable_sidecar::remove_file_durable_if_exists(&legacy_path).map_err(
+                    |error| {
+                        StoreError::Query(format!(
+                            "remove legacy embedding sidecar {}: {error}",
+                            legacy_path.display()
+                        ))
+                    },
+                )
             })
         } else {
             None
@@ -1895,5 +1893,28 @@ mod tests {
 
         assert!(result.canonical_persistence.is_ok());
         assert!(result.legacy_retirement.unwrap().is_err());
+    }
+
+    #[test]
+    fn embedding_reconciliation_surfaces_durable_legacy_retirement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let legacy_path = GraphStore::embedding_sidecar_json_for(&db_path);
+        std::fs::write(&legacy_path, b"legacy").unwrap();
+
+        let result = crate::durable_sidecar::with_test_fault(
+            crate::durable_sidecar::TestFault::Remove,
+            || store.reconcile_embedding_index_stages(),
+        )
+        .unwrap();
+
+        assert!(result.canonical_persistence.is_ok());
+        let retirement = result.legacy_retirement.unwrap().unwrap_err();
+        assert!(retirement.to_string().contains("legacy embedding sidecar"));
+        assert!(
+            legacy_path.exists(),
+            "failed retirement must preserve fallback"
+        );
     }
 }
