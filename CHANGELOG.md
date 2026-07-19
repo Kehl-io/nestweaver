@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.5.1](https://github.com/Kehl-io/nestweaver/compare/v2.5.0...v2.5.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* **release:** synchronize Cargo lockfile in release PRs ([17619a0](https://github.com/Kehl-io/nestweaver/commit/17619a0b09708bec4d30631e08b999ed3fbb2458))
+* **release:** synchronize Cargo lockfile in release PRs ([ed5c404](https://github.com/Kehl-io/nestweaver/commit/ed5c404ad295c9b1bce1b20d13722fd5ec0100e3))
+
 ## [2.5.0](https://github.com/Kehl-io/nestweaver/compare/v2.4.0...v2.5.0) (2026-07-19)
 
 
