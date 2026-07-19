@@ -22,7 +22,7 @@ jobs:
     permissions:
       pull-requests: write          # required for PR comments
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0            # full history needed for diff
       - uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v1
@@ -244,14 +244,14 @@ jobs:
   blast-radius:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }   # need the merge-base
       # ... install nestweaver and build/restore the index (nestweaver.lbug) ...
       - name: Blast radius (SARIF)
         run: |
           base="$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD)"
           nestweaver pr-impact --base "$base" --sarif > blast-radius.sarif
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: blast-radius.sarif
           category: nestweaver-blast-radius

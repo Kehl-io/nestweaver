@@ -429,11 +429,20 @@ fn cache_bypassed(args: &Value) -> bool {
 /// alone).
 fn whole_db_scope_digest(db_path: &Path) -> u64 {
     let filemeta_path = nestweaver_engine::sidecar_path(db_path, ".filemeta.json");
-    let cache = nestweaver_engine::load_filemeta_cache(&filemeta_path);
+    let sidecar = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+    // Repo-qualify each pair: identical rel paths in two repos are distinct
+    // inputs (and same-path+same-hash pairs must not XOR-cancel).
+    let pairs: Vec<(String, String)> = sidecar
+        .repos
+        .iter()
+        .flat_map(|(ruid, files)| {
+            files
+                .iter()
+                .map(move |(p, m)| (format!("{ruid}\u{0}{p}"), m.content_hash.clone()))
+        })
+        .collect();
     nestweaver_store::cache::scope_digest_from_hashes(
-        cache
-            .iter()
-            .map(|(p, m)| (p.as_str(), m.content_hash.as_str())),
+        pairs.iter().map(|(p, h)| (p.as_str(), h.as_str())),
     )
 }
 
@@ -504,6 +513,9 @@ fn maybe_cached(
     let Ok(db_path) = current_db_path(store) else {
         return dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible);
     };
+    if store.is_index_publication_dirty() {
+        return dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible);
+    }
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
     // Fold the caller's repo-visibility into the cache key so a redacted
@@ -529,7 +541,10 @@ fn maybe_cached(
         cache.get(key, generation, scope_digest)
     });
 
-    if let Some(bytes) = hit_bytes {
+    if let Some(bytes) = hit_bytes
+        && !store.is_index_publication_dirty()
+        && store.graph_generation() == generation
+    {
         CACHE_HITS.with(|c| c.set(c.get() + 1));
         // No save() on hit — LRU timestamp update is not worth a disk round-trip.
         let value: Value =
@@ -539,6 +554,9 @@ fn maybe_cached(
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
     let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)?;
+    if store.is_index_publication_dirty() || store.graph_generation() != generation {
+        return Ok(result);
+    }
     match serde_json::to_vec(&result) {
         Ok(bytes) => {
             // Insert into the in-process cache, then decide whether to flush.
@@ -1884,9 +1902,9 @@ fn tool_brain_context(
         );
     }
 
-    let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget);
-
     let concise = is_concise(&args);
+
+    let (cut, used_tokens) = budgeted_cut(&result.connected, token_budget, concise);
 
     let connected_json: Vec<Value> = result
         .connected
@@ -2024,11 +2042,15 @@ fn apply_recency_bias(
     });
 }
 
-fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize, usize) {
+fn budgeted_cut(
+    nodes: &[nestweaver_engine::BrainNode],
+    budget: usize,
+    concise: bool,
+) -> (usize, usize) {
     let mut used = 0usize;
     let mut taken = 0usize;
     for n in nodes {
-        let cost = render_cost(n);
+        let cost = render_cost(n, concise);
         if used + cost > budget {
             break;
         }
@@ -2038,9 +2060,15 @@ fn budgeted_cut(nodes: &[nestweaver_engine::BrainNode], budget: usize) -> (usize
     (taken, used)
 }
 
-fn render_cost(n: &nestweaver_engine::BrainNode) -> usize {
-    // UID + title + kind + location + relevance (~10 chars) + JSON overhead
-    (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
+fn render_cost(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
+    if concise {
+        // Concise renderers emit only {kind, title, location} (brain_context
+        // omits location too, but one conservative model keeps this simple).
+        (n.title.len() + n.kind.len() + n.location.len() + 50).div_ceil(4)
+    } else {
+        // UID + title + kind + location + relevance (~10 chars) + JSON overhead
+        (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
+    }
 }
 
 // ── 2. brain_search ─────────────────────────────────────────────────────────
@@ -3631,8 +3659,8 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
     };
     let sock = rt_dir.join("daemon.sock");
 
-    // If the socket already exists, the daemon is running — return immediately.
-    if sock.exists() {
+    // The socket inode can appear before the daemon starts accepting connections.
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         return Ok(sock);
     }
 
@@ -3650,22 +3678,22 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {e}"))?;
 
-    // Poll for the socket to appear (up to 5s, same as autostart.rs).
+    // Poll for the socket to accept connections (up to 5s, same as autostart.rs).
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(5);
     let mut delay = std::time::Duration::from_millis(50);
     while start.elapsed() < timeout {
-        if sock.exists() {
+        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
             return Ok(sock);
         }
         std::thread::sleep(delay);
         delay = (delay * 2).min(std::time::Duration::from_millis(500));
     }
-    if sock.exists() {
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         return Ok(sock);
     }
     Err(anyhow::anyhow!(
-        "daemon socket did not appear within 5s at {}",
+        "daemon socket did not accept connections within 5s at {}",
         sock.display()
     ))
 }
@@ -5358,10 +5386,10 @@ fn tool_project_context(
         .seeds
         .iter()
         .filter(|n| !connected_uids.contains(n.uid.as_str()))
-        .map(render_cost)
+        .map(|n| render_cost(n, concise))
         .sum();
     let remaining_budget = token_budget.saturating_sub(seed_tokens);
-    let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget);
+    let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget, concise);
     let used_tokens = seed_tokens + connected_tokens;
 
     // 7. Load external_refs from extension sidecar.
@@ -5811,9 +5839,17 @@ fn tool_blast_radius(
     // building any output (both the JSON and SARIF paths), so every derived
     // count/field reflects the redacted vecs. A `None`/`All` visibility (the
     // unconfigured single-trust-domain default) is a no-op — zero behavior
-    // change unless an `[authz]` policy scopes this caller.
-    if let Some(v) = visible {
-        let repos = store.list_repos(None).unwrap_or_default();
+    // change unless an `[authz]` policy scopes this caller. nw-043: a store
+    // error at this re-list means the boundary's earlier listing succeeded and
+    // this one failed — exactly the transient signature — so fail the request
+    // rather than serve a mis-redacted result.
+    if let Some(v @ nestweaver_engine::authz::VisibleRepos::Only(_)) = visible {
+        let repos = store.list_repos(None).map_err(|e| {
+            // Log the detailed chain server-side; return a generic message so
+            // the client never sees store internals.
+            tracing::error!("authz: repo listing failed at redaction point: {e:#}");
+            anyhow!("authz repo listing unavailable")
+        })?;
         nestweaver_engine::authz::redact_blast_radius_for_visibility(&mut result, v, &repos);
     }
 
@@ -6527,13 +6563,41 @@ pub fn dispatch_via_daemon(
 /// 1. `.git/` present → code repo (IndexRepo)
 /// 2. `.obsidian/` present OR contains `.md` files → vault/markdown (IndexVault)
 #[cfg(feature = "daemon")]
+#[derive(Clone, Copy)]
+enum DaemonIndexSource {
+    Repo,
+    Vault,
+}
+
+#[cfg(feature = "daemon")]
+impl DaemonIndexSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Repo => "repository",
+            Self::Vault => "vault",
+        }
+    }
+}
+
+#[cfg(feature = "daemon")]
+async fn consume_daemon_index_progress<S>(
+    source: DaemonIndexSource,
+    mut stream: S,
+) -> Result<String, anyhow::Error>
+where
+    S: tokio_stream::Stream<Item = Result<nestweaver_proto::IndexProgress, tonic::Status>> + Unpin,
+{
+    nestweaver_proto::consume_index_progress(&mut stream, |_| {})
+        .await
+        .map_err(|error| anyhow::anyhow!("{} index failed: {error}", source.label()))
+}
+
+#[cfg(feature = "daemon")]
 fn dispatch_add_source_via_daemon(
     client: &mut DaemonGrpcClient,
     rt: &tokio::runtime::Runtime,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    use tokio_stream::StreamExt;
-
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -6570,18 +6634,12 @@ fn dispatch_add_source_via_daemon(
                 extra_ignore_patterns: vec![],
                 instance_id: instance_id.clone(),
             });
-            let mut stream = client
+            let stream = client
                 .index_vault(req)
                 .await
                 .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
                 .into_inner();
-
-            let mut last_msg = String::new();
-            while let Some(progress) = stream.next().await {
-                let progress =
-                    progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
-                last_msg = progress.message;
-            }
+            let last_msg = consume_daemon_index_progress(DaemonIndexSource::Vault, stream).await?;
             Ok(serde_json::json!({
                 "status": "indexed",
                 "path": path,
@@ -6595,19 +6653,16 @@ fn dispatch_add_source_via_daemon(
                 force: false,
                 with_trigrams: false,
                 with_git_activity: false,
+                // nw-019: no explicit instance here — let the daemon decide
+                // (config's logical name, else runtime hash).
+                instance_id: String::new(),
             });
-            let mut stream = client
+            let stream = client
                 .index_repo(req)
                 .await
                 .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
                 .into_inner();
-
-            let mut last_msg = String::new();
-            while let Some(progress) = stream.next().await {
-                let progress =
-                    progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
-                last_msg = progress.message;
-            }
+            let last_msg = consume_daemon_index_progress(DaemonIndexSource::Repo, stream).await?;
             Ok(serde_json::json!({
                 "status": "indexed",
                 "path": path,
@@ -6619,6 +6674,144 @@ fn dispatch_add_source_via_daemon(
 }
 
 // ── F10: investigate bundle primitive ─────────────────────────────────────
+
+#[cfg(all(test, feature = "daemon"))]
+mod daemon_index_progress_tests {
+    use super::*;
+    use nestweaver_proto::{IndexProgress, Phase};
+
+    fn progress(phase: Phase, message: &str) -> Result<IndexProgress, tonic::Status> {
+        Ok(IndexProgress {
+            phase: phase as i32,
+            message: message.to_string(),
+            ..Default::default()
+        })
+    }
+
+    async fn outcome_for(
+        source: DaemonIndexSource,
+        events: Vec<Result<IndexProgress, tonic::Status>>,
+    ) -> Result<String, anyhow::Error> {
+        consume_daemon_index_progress(source, tokio_stream::iter(events)).await
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_accept_only_a_done_terminated_stream() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let message = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Discovering, "scanning"),
+                    progress(Phase::Writing, "writing"),
+                    progress(Phase::Done, "indexed successfully"),
+                ],
+            )
+            .await
+            .expect("Done must be accepted");
+
+            assert_eq!(message, "indexed successfully");
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_reject_an_explicit_error_with_its_message() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let error = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Discovering, "scanning"),
+                    progress(Phase::Error, "parser exploded"),
+                ],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(source.label()));
+            assert!(error.contains("parser exploded"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_reject_empty_and_truncated_streams() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let empty = outcome_for(source, vec![]).await.unwrap_err().to_string();
+            assert!(empty.contains(source.label()));
+            assert!(empty.contains("empty"), "unexpected error: {empty}");
+
+            let truncated =
+                outcome_for(source, vec![progress(Phase::Discovering, "still scanning")])
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            assert!(truncated.contains(source.label()));
+            assert!(
+                truncated.contains("before completion"),
+                "unexpected error: {truncated}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_preserve_transport_errors() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let error = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Discovering, "scanning"),
+                    Err(tonic::Status::unavailable("connection reset")),
+                ],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(source.label()));
+            assert!(error.contains("connection reset"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_reject_events_after_done() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let error = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Done, "done"),
+                    progress(Phase::Writing, "late write"),
+                ],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(source.label()));
+            assert!(error.contains("after terminal Done"));
+            assert!(error.contains("late write"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_reject_events_after_error() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let error = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Error, "first failure"),
+                    progress(Phase::Done, "late done"),
+                ],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(source.label()));
+            assert!(error.contains("after terminal Error"));
+            assert!(error.contains("first failure"));
+            assert!(error.contains("late done"));
+        }
+    }
+}
 
 /// Resolve the source root for body reads: explicit `root` arg, else cwd.
 fn arg_root(args: &Value) -> std::path::PathBuf {
@@ -7201,6 +7394,82 @@ mod cache_dispatch_tests {
     }
 
     #[test]
+    fn dirty_generation_cache_entry_misses_after_clean_publication() {
+        reset_session();
+        let (dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let marker_path = nestweaver_engine::sidecar_path(&db_path, ".index-dirty");
+        fs::write(&marker_path, b"dirty").unwrap();
+
+        let dirty_store = GraphStore::open(&db_path).unwrap();
+        let dirty_generation = dirty_store.graph_generation();
+        let args = json!({ "limit": 5 });
+        let key = nestweaver_store::cache::ResponseCache::key("hub_nodes", &args);
+        let scope_digest = whole_db_scope_digest(&db_path);
+        let dirty_response = br#"{"dirty":true}"#;
+        let mut cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        cache.insert(
+            key,
+            "hub_nodes",
+            dirty_response,
+            dirty_generation,
+            scope_digest,
+        );
+        cache.save();
+        drop(dirty_store);
+
+        let src = dir.path().join("repo");
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory_with_options(
+            &src, &db_path, "test", &repo_url, "local", true, None,
+        )
+        .unwrap();
+
+        let clean_store = GraphStore::open(&db_path).unwrap();
+        assert!(
+            clean_store.graph_generation() > dirty_generation,
+            "clean publication must advance beyond the dirty reservation"
+        );
+        reset_session();
+        let result = dispatch(&clean_store, None, "hub_nodes", args, None).unwrap();
+        assert_ne!(
+            result,
+            serde_json::from_slice::<Value>(dirty_response).unwrap()
+        );
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 1);
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn dirty_publication_bypasses_response_cache() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        fs::write(
+            nestweaver_engine::sidecar_path(&db_path, ".index-dirty"),
+            b"dirty",
+        )
+        .unwrap();
+        let store = GraphStore::open(&db_path).unwrap();
+        let args = json!({ "limit": 5 });
+
+        let _ = dispatch(&store, None, "hub_nodes", args.clone(), None).unwrap();
+        let _ = dispatch(&store, None, "hub_nodes", args, None).unwrap();
+        flush_response_cache();
+
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 0);
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(cache.is_empty(), "dirty responses must not be retained");
+    }
+
+    #[test]
     fn bypass_always_misses() {
         reset_session();
         let (_dir, db_path) = index_on_disk();
@@ -7384,6 +7653,86 @@ mod cache_dispatch_tests {
             None,
         );
         assert!(ok.is_ok(), "uncancelled flow_trace must succeed");
+    }
+
+    #[test]
+    fn whole_db_scope_digest_covers_all_repos_and_distinguishes_same_rel_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.lbug");
+        let path = nestweaver_engine::sidecar_path(&db, ".filemeta.json");
+
+        let mut s = nestweaver_engine::FileMetaSidecar::default();
+        s.repos.entry("repo:t:aaaa".into()).or_default().insert(
+            "main.js".into(),
+            nestweaver_engine::CachedFileMeta {
+                mtime_secs: 1,
+                size_bytes: 1,
+                content_hash: "h".into(),
+            },
+        );
+        nestweaver_engine::save_filemeta_sidecar(&s, &path).unwrap();
+        let one_repo = whole_db_scope_digest(&db);
+
+        // Same rel path + same hash in a SECOND repo must CHANGE the digest — if
+        // pairs weren't repo-qualified, identical (path, hash) pairs would XOR-cancel.
+        s.repos.entry("repo:t:bbbb".into()).or_default().insert(
+            "main.js".into(),
+            nestweaver_engine::CachedFileMeta {
+                mtime_secs: 1,
+                size_bytes: 1,
+                content_hash: "h".into(),
+            },
+        );
+        nestweaver_engine::save_filemeta_sidecar(&s, &path).unwrap();
+        let two_repos = whole_db_scope_digest(&db);
+
+        assert_ne!(
+            one_repo, two_repos,
+            "digest must be repo-qualified: identical rel paths across repos must not collapse"
+        );
+        assert_ne!(two_repos, 0);
+    }
+
+    /// Minimal `BrainNode` for budgeting tests: sets the semantic fields the
+    /// renderers use and defaults the rest.
+    fn test_brain_node(
+        uid: &str,
+        title: &str,
+        kind: &str,
+        location: &str,
+    ) -> nestweaver_engine::BrainNode {
+        nestweaver_engine::BrainNode {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            location: location.to_string(),
+            relevance: 1.0,
+            inline_body: None,
+            body_complete: true,
+        }
+    }
+
+    #[test]
+    fn concise_budget_fits_more_nodes_than_detailed() {
+        // nw-019 part 3: render_cost charged uid+relevance for nodes the concise
+        // renderer never emits, so concise under-filled its budget.
+        let nodes: Vec<nestweaver_engine::BrainNode> = (0..200)
+            .map(|i| {
+                test_brain_node(
+                    &format!("sym:repo:c37ccf01:abcd1234:deadbeef{i:04}"), // realistic long uid
+                    &format!("symbol_{i}"),
+                    "Symbol/Function",
+                    &format!("crates/foo/src/bar_{i}.rs:42"),
+                )
+            })
+            .collect();
+        let budget = 500usize;
+        let (detailed, _) = budgeted_cut(&nodes, budget, false);
+        let (concise, _) = budgeted_cut(&nodes, budget, true);
+        assert!(
+            concise > detailed,
+            "concise must fit more nodes in the same budget: concise={concise} detailed={detailed}"
+        );
     }
 }
 

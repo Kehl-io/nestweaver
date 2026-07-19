@@ -4,39 +4,69 @@
 // This is only needed when lbug is statically linked (the default).
 // If LBUG_SHARED is set, the dynamic lbug already includes these.
 
+mod build_support;
+
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-fn lbug_src_dir() -> Option<PathBuf> {
-    // Locate the lbug crate in the cargo registry and return its lbug-src/ dir.
-    let cargo_home = std::env::var("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut p = dirs_home().unwrap_or_else(|| PathBuf::from("."));
-            p.push(".cargo");
-            p
-        });
+const LBUG_ABI_VERSION: &str = "0.18.2";
+const LBUG_SOURCE_MANIFEST_ENV: &str = "NESTWEAVER_LBUG_SOURCE_MANIFEST";
 
-    let registry_src = cargo_home.join("registry").join("src");
-    if let Ok(indices) = std::fs::read_dir(&registry_src) {
-        for index in indices.flatten() {
-            if let Ok(entries) = std::fs::read_dir(index.path()) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    if name.to_string_lossy().starts_with("lbug-") {
-                        let candidate = entry.path().join("lbug-src");
-                        if candidate.is_dir() {
-                            return Some(candidate);
-                        }
-                    }
-                }
-            }
-        }
+fn lbug_src_dir() -> Result<PathBuf, String> {
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .ok_or_else(|| "CARGO_MANIFEST_DIR is not set".to_string())?,
+    );
+    let manifest_path = manifest_dir.join("Cargo.toml");
+
+    if let Some(override_path) = std::env::var_os(LBUG_SOURCE_MANIFEST_ENV) {
+        let override_path = PathBuf::from(override_path);
+        let override_path = if override_path.is_absolute() {
+            override_path
+        } else {
+            manifest_dir.join(override_path)
+        };
+        println!("cargo:rerun-if-changed={}", override_path.display());
+        return build_support::validate_source_manifest_override(
+            &override_path,
+            "lbug",
+            LBUG_ABI_VERSION,
+            "lbug-src",
+        );
     }
-    None
-}
 
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    let out_dir =
+        PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| "OUT_DIR is not set".to_string())?);
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let resolution = build_support::cargo_metadata_for_dependency(
+        cargo,
+        &manifest_path,
+        &out_dir,
+        "lbug",
+        LBUG_ABI_VERSION,
+    )?;
+    let dependency = build_support::resolved_dependency_source(
+        &resolution.json,
+        &resolution.resolution_manifest,
+        "lbug",
+        "lbug-src",
+    )?;
+    if dependency.version != LBUG_ABI_VERSION {
+        return Err(format!(
+            "Cargo resolved {} at version {}; expected the pinned ABI version {LBUG_ABI_VERSION}",
+            dependency.package_id, dependency.version
+        ));
+    }
+
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        dependency.manifest_path.display()
+    );
+    if !resolution.used_isolated_resolver {
+        println!("cargo:rerun-if-changed={}", resolution.lockfile.display());
+    }
+    Ok(dependency.source_dir)
 }
 
 /// Glob all .c / .cpp / .cc files in `dir` (non-recursive unless `recursive`).
@@ -62,10 +92,14 @@ fn collect_sources(dir: &Path, recursive: bool) -> Vec<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-env-changed=LBUG_SHARED");
     println!("cargo:rerun-if-env-changed=LBUG_BUILD_FROM_SOURCE");
+    // A validated source-manifest override supports vendored/offline builds
+    // without falling back to Cargo cache layout assumptions.
+    println!("cargo:rerun-if-env-changed={LBUG_SOURCE_MANIFEST_ENV}");
     // Only needed for the static link case.
     if std::env::var("LBUG_SHARED").is_ok() {
         return;
     }
+
     // When lbug is built FROM SOURCE (LBUG_BUILD_FROM_SOURCE), its own build
     // compiles AND links every one of these third_party libraries. Compiling them
     // here too duplicates each static global — e.g. antlr4's `COMPLETE_CHAR_SET`,
@@ -79,12 +113,9 @@ fn main() {
         return;
     }
 
-    let Some(lbug_src) = lbug_src_dir() else {
-        println!(
-            "cargo:warning=nestweaver-store/build.rs: could not locate lbug-src/; bundled deps may be missing"
-        );
-        return;
-    };
+    let lbug_src = lbug_src_dir().unwrap_or_else(|error| {
+        panic!("nestweaver-store requires the bundled lbug libraries: {error}")
+    });
 
     let tp = lbug_src.join("third_party");
 

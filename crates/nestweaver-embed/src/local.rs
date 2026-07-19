@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::api::sync::Api;
+use hf_hub::{HFClientSync, split_id};
 use tokenizers::Tokenizer;
 use tracing::info;
 
@@ -15,17 +15,24 @@ pub struct LocalModel {
 
 impl LocalModel {
     pub fn load(config: &crate::EmbedConfig) -> Result<Self> {
-        let api = Api::new()?;
-        let repo = api.model(config.model_id.clone());
+        let client = HFClientSync::new()?;
+        let (owner, name) = split_id(&config.model_id);
+        let repo = client.model(owner, name);
 
         let config_path = repo
-            .get("config.json")
+            .download_file()
+            .filename("config.json")
+            .send()
             .context("Failed to download config.json")?;
         let tokenizer_path = repo
-            .get("tokenizer.json")
+            .download_file()
+            .filename("tokenizer.json")
+            .send()
             .context("Failed to download tokenizer.json")?;
         let weights_path = repo
-            .get("model.safetensors")
+            .download_file()
+            .filename("model.safetensors")
+            .send()
             .context("Failed to download model weights")?;
 
         let config_str = std::fs::read_to_string(&config_path)?;
@@ -35,8 +42,8 @@ impl LocalModel {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
-        // Try each candidate device. Metal can panic in candle 0.10
-        // when the compiler service is unavailable (common in daemons),
+        // Try each candidate device. Metal can panic when the compiler service
+        // is unavailable (common in daemons),
         // so wrap each attempt in catch_unwind.
         for device in candidate_devices() {
             info!(device = ?device, model = %config.model_id, "Loading embedding model");
@@ -150,12 +157,20 @@ fn candidate_devices() -> Vec<Device> {
 /// WITHOUT building the model. Lets a caller bound a cold-cache download with a timeout so
 /// a slow/unreachable HuggingFace can't hang startup. A no-op (fast) when already cached.
 pub fn prefetch_model(model_id: &str) -> Result<()> {
-    let api = Api::new()?;
-    let repo = api.model(model_id.to_string());
-    repo.get("config.json").context("prefetch config.json")?;
-    repo.get("tokenizer.json")
+    let client = HFClientSync::new()?;
+    let (owner, name) = split_id(model_id);
+    let repo = client.model(owner, name);
+    repo.download_file()
+        .filename("config.json")
+        .send()
+        .context("prefetch config.json")?;
+    repo.download_file()
+        .filename("tokenizer.json")
+        .send()
         .context("prefetch tokenizer.json")?;
-    repo.get("model.safetensors")
+    repo.download_file()
+        .filename("model.safetensors")
+        .send()
         .context("prefetch model.safetensors")?;
     Ok(())
 }

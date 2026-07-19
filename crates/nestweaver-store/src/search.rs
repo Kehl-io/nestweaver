@@ -128,34 +128,35 @@ impl EmbeddingIndex {
         let dim = self.dimension().unwrap_or(0);
         let count = self.embeddings.len() as u32;
 
-        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        atomic_replace_file(path, |raw_file| {
+            let mut file = std::io::BufWriter::new(raw_file);
 
-        // Header
-        file.write_all(b"NWEM")?;
-        file.write_all(&1u32.to_le_bytes())?; // version
-        file.write_all(&(dim as u32).to_le_bytes())?;
-        file.write_all(&count.to_le_bytes())?;
+            // Header
+            file.write_all(b"NWEM")?;
+            file.write_all(&1u32.to_le_bytes())?; // version
+            file.write_all(&(dim as u32).to_le_bytes())?;
+            file.write_all(&count.to_le_bytes())?;
 
-        // Collect keys in deterministic order
-        let mut entries: Vec<(&String, &Vec<f32>)> = self.embeddings.iter().collect();
-        entries.sort_by_key(|(k, _)| k.as_str());
+            // Collect keys in deterministic order
+            let mut entries: Vec<(&String, &Vec<f32>)> = self.embeddings.iter().collect();
+            entries.sort_by_key(|(k, _)| k.as_str());
 
-        // UID table
-        for (uid, _) in &entries {
-            let bytes = uid.as_bytes();
-            file.write_all(&(bytes.len() as u16).to_le_bytes())?;
-            file.write_all(bytes)?;
-        }
-
-        // Vectors (contiguous f32 LE)
-        for (_, vec) in &entries {
-            for &val in vec.iter() {
-                file.write_all(&val.to_le_bytes())?;
+            // UID table
+            for (uid, _) in &entries {
+                let bytes = uid.as_bytes();
+                file.write_all(&(bytes.len() as u16).to_le_bytes())?;
+                file.write_all(bytes)?;
             }
-        }
 
-        file.flush()?;
-        Ok(())
+            // Vectors (contiguous f32 LE)
+            for (_, vec) in &entries {
+                for &val in vec.iter() {
+                    file.write_all(&val.to_le_bytes())?;
+                }
+            }
+
+            file.flush()
+        })
     }
 
     /// Read the index from the compact binary sidecar format.
@@ -348,6 +349,23 @@ impl EmbeddingIndex {
     pub fn get(&self, uid: &str) -> Option<&Vec<f32>> {
         self.embeddings.get(uid)
     }
+
+    /// Retain only embeddings whose graph nodes still exist.
+    ///
+    /// Returns the number of removed vectors so callers can report and test
+    /// reconciliation without exposing the index's internal map.
+    pub(crate) fn retain_uids(&mut self, live_uids: &std::collections::HashSet<String>) -> usize {
+        let before = self.embeddings.len();
+        self.embeddings.retain(|uid, _| live_uids.contains(uid));
+        before - self.embeddings.len()
+    }
+}
+
+fn atomic_replace_file(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), anyhow::Error> {
+    crate::durable_sidecar::atomic_replace_file(path, write).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -775,6 +793,66 @@ mod tests {
             let rt = loaded.get(uid).unwrap();
             assert_eq!(orig, rt, "round-trip mismatch for {uid}");
         }
+    }
+
+    #[test]
+    fn binary_save_replaces_the_sidecar_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        let old_link = dir.path().join("old-embeddings.bin");
+
+        let mut old = EmbeddingIndex::new();
+        assert!(old.add("note:old", vec![1.0, 0.0], false));
+        old.save_binary(&path).unwrap();
+        std::fs::hard_link(&path, &old_link).unwrap();
+
+        let mut new = EmbeddingIndex::new();
+        assert!(new.add("head:new", vec![0.0, 1.0], false));
+        new.save_binary(&path).unwrap();
+
+        let current = EmbeddingIndex::load_binary(&path).unwrap();
+        assert!(current.get("head:new").is_some());
+        assert!(current.get("note:old").is_none());
+        let old_snapshot = EmbeddingIndex::load_binary(&old_link).unwrap();
+        assert!(old_snapshot.get("note:old").is_some());
+        assert!(old_snapshot.get("head:new").is_none());
+    }
+
+    #[test]
+    fn binary_atomic_replace_cleans_partial_temp_after_write_error() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        std::fs::write(&path, b"previous-valid-sidecar").unwrap();
+
+        let error = atomic_replace_file(&path, |file| {
+            file.write_all(b"partial replacement")?;
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected write failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous-valid-sidecar");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn binary_save_reports_parent_sync_failure_and_reopens_complete_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        let mut idx = EmbeddingIndex::new();
+        assert!(idx.add("sym:durable", vec![1.0, 0.0], false));
+
+        let error = crate::durable_sidecar::with_test_fault(
+            crate::durable_sidecar::TestFault::ParentSync,
+            || idx.save_binary(&path),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("sync parent after replacing"));
+        let reopened = EmbeddingIndex::load_binary(&path).unwrap();
+        assert_eq!(reopened.get("sym:durable"), Some(&vec![1.0, 0.0]));
     }
 
     #[test]

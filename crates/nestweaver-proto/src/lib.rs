@@ -3,3 +3,228 @@ pub mod nestweaver_daemon_v1 {
 }
 
 pub use nestweaver_daemon_v1::*;
+
+/// Fail-closed state machine for daemon indexing progress streams.
+///
+/// gRPC transport success does not imply that indexing succeeded: logical
+/// failures are reported in-band as [`Phase::Error`]. Consumers must also
+/// reject streams that end without [`Phase::Done`] and malformed streams that
+/// continue after a terminal event.
+#[derive(Debug, Default)]
+pub struct IndexProgressTracker {
+    seen_event: bool,
+    last_phase: Option<i32>,
+    last_message: String,
+    terminal: Option<(Phase, String)>,
+}
+
+impl IndexProgressTracker {
+    /// Record one in-band progress event.
+    pub fn observe(&mut self, progress: &IndexProgress) -> Result<(), IndexProgressError> {
+        if let Some((terminal, terminal_message)) = &self.terminal {
+            return Err(IndexProgressError::AfterTerminal {
+                terminal: match terminal {
+                    Phase::Done => "Done",
+                    Phase::Error => "Error",
+                    _ => "unknown terminal phase",
+                },
+                terminal_message: terminal_message.clone(),
+                phase: progress.phase,
+                message: progress.message.clone(),
+            });
+        }
+
+        self.seen_event = true;
+        self.last_phase = Some(progress.phase);
+        self.last_message.clone_from(&progress.message);
+
+        if let Ok(phase) = Phase::try_from(progress.phase)
+            && matches!(phase, Phase::Done | Phase::Error)
+        {
+            self.terminal = Some((phase, progress.message.clone()));
+        }
+
+        Ok(())
+    }
+
+    /// Classify end-of-stream. Only a terminal `Done` is successful.
+    pub fn finish(self) -> Result<String, IndexProgressError> {
+        match self.terminal {
+            Some((Phase::Done, message)) => Ok(message),
+            Some((Phase::Error, message)) => Err(IndexProgressError::Reported { message }),
+            Some((phase, _)) => Err(IndexProgressError::Truncated {
+                last_phase: phase as i32,
+                last_message: self.last_message,
+            }),
+            None if !self.seen_event => Err(IndexProgressError::Empty),
+            None => Err(IndexProgressError::Truncated {
+                last_phase: self.last_phase.unwrap_or(-1),
+                last_message: self.last_message,
+            }),
+        }
+    }
+}
+
+/// Logical protocol failures detected while consuming an index stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexProgressError {
+    Empty,
+    Truncated {
+        last_phase: i32,
+        last_message: String,
+    },
+    Reported {
+        message: String,
+    },
+    AfterTerminal {
+        terminal: &'static str,
+        terminal_message: String,
+        phase: i32,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for IndexProgressError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(formatter, "index progress stream was empty"),
+            Self::Truncated {
+                last_phase,
+                last_message,
+            } => write!(
+                formatter,
+                "index progress stream ended before completion (last phase {last_phase}: {last_message})"
+            ),
+            Self::Reported { message } => {
+                write!(formatter, "daemon reported an index error: {message}")
+            }
+            Self::AfterTerminal {
+                terminal,
+                terminal_message,
+                phase,
+                message,
+            } => write!(
+                formatter,
+                "index progress event after terminal {terminal} ({terminal_message}); late phase {phase}: {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IndexProgressError {}
+
+/// Consume a daemon index stream to EOF while reporting each non-transport
+/// event to the caller. This keeps terminal-state semantics identical for CLI
+/// and MCP callers while allowing each frontend to render progress differently.
+pub async fn consume_index_progress<S, F>(
+    mut stream: S,
+    mut on_progress: F,
+) -> Result<String, IndexProgressStreamError>
+where
+    S: tokio_stream::Stream<Item = Result<IndexProgress, tonic::Status>> + Unpin,
+    F: FnMut(&IndexProgress),
+{
+    use tokio_stream::StreamExt;
+
+    let mut tracker = IndexProgressTracker::default();
+    while let Some(progress) = stream.next().await {
+        let progress = progress.map_err(IndexProgressStreamError::Transport)?;
+        tracker
+            .observe(&progress)
+            .map_err(IndexProgressStreamError::Protocol)?;
+        on_progress(&progress);
+    }
+
+    tracker.finish().map_err(IndexProgressStreamError::Protocol)
+}
+
+#[derive(Debug)]
+pub enum IndexProgressStreamError {
+    Transport(tonic::Status),
+    Protocol(IndexProgressError),
+}
+
+impl std::fmt::Display for IndexProgressStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(status) => {
+                write!(
+                    formatter,
+                    "index progress transport error: {}",
+                    status.message()
+                )
+            }
+            Self::Protocol(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for IndexProgressStreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(status) => Some(status),
+            Self::Protocol(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod index_progress_tracker_tests {
+    use super::*;
+
+    fn progress(phase: Phase, message: &str) -> IndexProgress {
+        IndexProgress {
+            phase: phase as i32,
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn done_is_the_only_successful_terminal_state() {
+        let mut tracker = IndexProgressTracker::default();
+        tracker
+            .observe(&progress(Phase::Discovering, "scanning"))
+            .unwrap();
+        tracker.observe(&progress(Phase::Done, "complete")).unwrap();
+
+        assert_eq!(tracker.finish().unwrap(), "complete");
+    }
+
+    #[test]
+    fn error_empty_and_truncated_streams_fail_closed() {
+        let error = IndexProgressTracker::default().finish().unwrap_err();
+        assert!(matches!(error, IndexProgressError::Empty));
+
+        let mut truncated = IndexProgressTracker::default();
+        truncated
+            .observe(&progress(Phase::Writing, "not finished"))
+            .unwrap();
+        assert!(matches!(
+            truncated.finish().unwrap_err(),
+            IndexProgressError::Truncated { .. }
+        ));
+
+        let mut failed = IndexProgressTracker::default();
+        failed
+            .observe(&progress(Phase::Error, "parser exploded"))
+            .unwrap();
+        assert!(matches!(
+            failed.finish().unwrap_err(),
+            IndexProgressError::Reported { message } if message == "parser exploded"
+        ));
+    }
+
+    #[test]
+    fn any_event_after_a_terminal_event_is_rejected() {
+        for terminal in [Phase::Done, Phase::Error] {
+            let mut tracker = IndexProgressTracker::default();
+            tracker.observe(&progress(terminal, "terminal")).unwrap();
+
+            assert!(matches!(
+                tracker.observe(&progress(Phase::Writing, "late")),
+                Err(IndexProgressError::AfterTerminal { .. })
+            ));
+        }
+    }
+}

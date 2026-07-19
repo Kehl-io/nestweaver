@@ -104,11 +104,29 @@ impl Drop for ConnectionGuard {
 }
 
 /// Shared state held by the daemon process.
+#[derive(Clone)]
+enum SearchIndexReconciliation {
+    Disabled,
+    Available(Arc<TantivyIndex>),
+    Unavailable(String),
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
+    search_reconciliation: SearchIndexReconciliation,
     pub db_path: PathBuf,
+    /// Runtime identity: the SHA-256-derived id of the canonical `--db` path
+    /// (see [`lifecycle::instance_id_from_db_path`]). Used ONLY for runtime
+    /// paths — sockets/pidfiles/launchd/replica locks — where the 104-byte
+    /// `sun_path` limit forbids arbitrary logical names. Never written into
+    /// graph nodes (nw-019).
     pub instance_id: String,
+    /// Graph-data identity: the config's logical `instance_id` when `--config`
+    /// was supplied, else the db-path hash. This is what gets stamped on every
+    /// repo/symbol/note we write, so users see and type one name everywhere
+    /// (nw-019). Config-less starts collapse it back onto `instance_id`.
+    pub data_instance_id: String,
     pub start_time: Instant,
     pub active_reads: Arc<AtomicU32>,
     pub active_writes: Arc<AtomicU32>,
@@ -167,36 +185,42 @@ impl DaemonState {
     /// [`Identity`](nestweaver_engine::authz::Identity) extension for
     /// authenticated requests; its absence (no-auth / UDS admin paths) is
     /// treated as `Anonymous`. Uses the startup-built [`Self::permission_source`]
-    /// (never rebuilt per request). When the policy is disabled — the no-`[authz]`
-    /// single-trust-domain default — this returns [`VisibleRepos::All`] WITHOUT
-    /// listing repos, so the vast majority of RPCs (which don't even read the
-    /// result) pay nothing. Mirrors the MCP-HTTP boundary in `nestweaver-mcp`.
+    /// (never rebuilt per request).
+    ///
+    /// Returns `Result<VisibleRepos, Status>`. When the policy is disabled —
+    /// the no-`[authz]` single-trust-domain default — this returns
+    /// [`VisibleRepos::All`] WITHOUT listing repos, so the vast majority of
+    /// RPCs (which don't even read the result) pay nothing. An enabled policy
+    /// lists repos per request, retrying once on a store error; if both
+    /// attempts fail this returns `Err(Status::unavailable(..))` (nw-043 fail
+    /// loud — never a silently-redacted success), which callers propagate with
+    /// `?`. Mirrors the MCP-HTTP boundary in `nestweaver-mcp`.
     fn visible_repos_for(
         &self,
         extensions: &tonic::Extensions,
-    ) -> nestweaver_engine::authz::VisibleRepos {
-        use nestweaver_engine::authz::{Identity, VisibleRepos};
+    ) -> Result<nestweaver_engine::authz::VisibleRepos, Status> {
+        use nestweaver_engine::authz::{
+            AuthzRepoListing, Identity, VisibleRepos, classify_repo_listing,
+        };
         // Disabled policy ⇒ everyone is All; skip the per-request repo listing.
         if !self.permission_source.is_enabled() {
-            return VisibleRepos::All;
+            return Ok(VisibleRepos::All);
         }
         let identity = extensions
             .get::<Identity>()
             .cloned()
             .unwrap_or(Identity::Anonymous);
-        // Fail closed on a store error (an enabled policy over an empty repo set
-        // resolves to "nothing visible"), but say so — a silent swallow here would
-        // hide a real store problem behind a redaction that looks intentional.
-        let repos = match self.store.list_repos(None) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    "authz: list_repos failed, failing closed to no visible repos: {e:#}"
-                );
-                Vec::new()
+        // nw-043: a store ERROR here must fail the RPC loudly (after one retry),
+        // never silently redact everything — a transient store error is
+        // indistinguishable from the nw-043 isolation anomaly, and a silent full
+        // redaction reads as a valid empty result. A genuinely EMPTY listing
+        // still fails closed quietly (enabled policy over ∅ ⇒ nothing visible).
+        match classify_repo_listing(self.store.list_repos(None), || self.store.list_repos(None)) {
+            AuthzRepoListing::Resolve(repos) => {
+                Ok(self.permission_source.visible_repos(&identity, &repos))
             }
-        };
-        self.permission_source.visible_repos(&identity, &repos)
+            AuthzRepoListing::FailLoud(msg) => Err(Status::unavailable(msg)),
+        }
     }
 }
 
@@ -213,6 +237,19 @@ fn build_daemon_permission_source(
             std::collections::HashMap::new(),
         )),
     }
+}
+
+/// Resolve the empty RPC sentinel to the daemon's configured graph-data
+/// identity, then validate the effective ID at the trust boundary.
+fn resolve_effective_instance_id(requested: &str, configured: &str) -> Result<String, Status> {
+    let effective = if requested.is_empty() {
+        configured
+    } else {
+        requested
+    };
+    nestweaver_engine::validate_instance_id(effective)
+        .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
+    Ok(effective.to_string())
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -669,6 +706,42 @@ impl DaemonService {
     }
 }
 
+#[cfg(test)]
+mod instance_id_validation_tests {
+    use super::*;
+
+    #[test]
+    fn effective_instance_id_uses_request_then_configured_default() {
+        assert_eq!(
+            resolve_effective_instance_id("request-id", "configured-id").unwrap(),
+            "request-id"
+        );
+        assert_eq!(
+            resolve_effective_instance_id("", "configured-id").unwrap(),
+            "configured-id"
+        );
+    }
+
+    #[test]
+    fn effective_instance_id_rejects_every_invalid_source() {
+        for (requested, configured) in [
+            ("", ""),
+            ("a:b", "configured-id"),
+            ("has space", "configured-id"),
+            ("has\ttab", "configured-id"),
+            ("", "configured:bad"),
+            ("", "configured bad"),
+        ] {
+            let error = resolve_effective_instance_id(requested, configured).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(
+                error.message().contains("instance_id"),
+                "requested={requested:?}, configured={configured:?}: {error}"
+            );
+        }
+    }
+}
+
 // ── Trait impl ──────────────────────────────────────────────────────
 
 /// Tools that mutate server state and require admin-level auth via gRPC.
@@ -699,7 +772,7 @@ macro_rules! json_rpc {
         // macro (including `blast_radius`), so their output is redacted to the
         // caller's visible repos. No `[authz]` config ⇒ `VisibleRepos::All` ⇒
         // no-op redaction (backward compatible).
-        let visible = $self.state.visible_repos_for($request.extensions());
+        let visible = $self.state.visible_repos_for($request.extensions())?;
         let req = $request.into_inner();
         $self
             .dispatch_json_tool($tool, &req.args_json, visible)
@@ -718,12 +791,37 @@ type ProgressStream = tokio_stream::wrappers::ReceiverStream<Result<IndexProgres
 /// `root_path: None`) are skipped entirely: a disk-existence check cannot
 /// apply to them, and bulk-deleting them here would destroy server data.
 ///
-/// Returns the display names of the removed repos.
-fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<Vec<String>, anyhow::Error> {
-    let mut removed_repos = Vec::new();
-    let repos = store
-        .list_repos(None)
-        .map_err(|e| anyhow::anyhow!("list_repos failed: {e:#}"))?;
+/// Returns the display names and UIDs of the removed repos so the RPC can
+/// finalize graph and sidecar state after every graph deletion succeeds.
+#[derive(Debug, Default)]
+struct PrunedRepos {
+    names: Vec<String>,
+    uids: Vec<String>,
+}
+
+impl PrunedRepos {
+    fn is_empty(&self) -> bool {
+        self.uids.is_empty()
+    }
+}
+
+fn prune_stale_repos_with<F>(
+    store: &nestweaver_store::GraphStore,
+    mut delete_repo: F,
+) -> (PrunedRepos, Option<anyhow::Error>)
+where
+    F: FnMut(&nestweaver_store::GraphStore, &nestweaver_schema::Repo) -> Result<(), anyhow::Error>,
+{
+    let mut removed_repos = PrunedRepos::default();
+    let repos = match store.list_repos(None) {
+        Ok(repos) => repos,
+        Err(error) => {
+            return (
+                removed_repos,
+                Some(anyhow::anyhow!("list_repos failed: {error:#}")),
+            );
+        }
+    };
 
     for repo in &repos {
         let Some(path) = repo.local_root() else {
@@ -736,19 +834,1229 @@ fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<Vec<String>
                 root = path,
                 "pruning stale repo: local working tree no longer exists"
             );
-            store
-                .bulk_delete_repo_files_and_symbols(&repo.uid)
-                .map_err(|e| anyhow::anyhow!("bulk_delete_repo_files_and_symbols failed: {e:#}"))?;
-            store
-                .clear_repo_derived_nodes(&repo.uid)
-                .map_err(|e| anyhow::anyhow!("clear_repo_derived_nodes failed: {e:#}"))?;
-            store
-                .delete_repo_node(&repo.uid)
-                .map_err(|e| anyhow::anyhow!("delete_repo_node failed: {e:#}"))?;
-            removed_repos.push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
+            if let Err(error) = delete_repo(store, repo) {
+                // The cascade is multi-statement; conservatively treat the
+                // failing repo as changed so a mid-cascade error cannot leave
+                // cache or sidecar state describing deleted children.
+                removed_repos.uids.push(repo.uid.clone());
+                return (removed_repos, Some(error));
+            }
+
+            removed_repos.uids.push(repo.uid.clone());
+            removed_repos
+                .names
+                .push(repo.name.clone().unwrap_or_else(|| repo.url.clone()));
         }
     }
-    Ok(removed_repos)
+    (removed_repos, None)
+}
+
+fn delete_repo_cascade(
+    store: &nestweaver_store::GraphStore,
+    repo: &nestweaver_schema::Repo,
+) -> Result<(), anyhow::Error> {
+    store
+        .bulk_delete_repo_files_and_symbols(&repo.uid)
+        .map_err(|e| anyhow::anyhow!("bulk_delete_repo_files_and_symbols failed: {e:#}"))?;
+    store
+        .clear_repo_derived_nodes(&repo.uid)
+        .map_err(|e| anyhow::anyhow!("clear_repo_derived_nodes failed: {e:#}"))?;
+    store
+        .delete_repo_node(&repo.uid)
+        .map_err(|e| anyhow::anyhow!("delete_repo_node failed: {e:#}"))
+}
+
+#[cfg(test)]
+fn prune_stale_repos(store: &nestweaver_store::GraphStore) -> Result<PrunedRepos, anyhow::Error> {
+    let (removed, error) = prune_stale_repos_with(store, delete_repo_cascade);
+    match error {
+        Some(error) => Err(error),
+        None => Ok(removed),
+    }
+}
+
+fn finalize_code_graph_deletion(
+    state: &DaemonState,
+    repo_uids: &[String],
+) -> Vec<nestweaver_engine::DeletionReconciliationFailure> {
+    match nestweaver_engine::finalize_code_graph_deletion(
+        &state.store,
+        &state.db_path,
+        repo_uids,
+        "code graph deletion",
+    ) {
+        Ok(()) => Vec::new(),
+        Err(error) => error.failures,
+    }
+}
+
+fn reconcile_deleted_extension_uids(
+    state: &DaemonState,
+    deleted_uids: &[String],
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+) {
+    match nestweaver_engine::reconcile_deleted_extension_uids(
+        &state.store,
+        &state.db_path,
+        deleted_uids,
+    ) {
+        Ok(removed) => tracing::info!(removed, "targeted extension metadata reconciled"),
+        Err(error) => push_reconciliation_failure(
+            failures,
+            nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+            format!("targeted extension metadata reconciliation failed: {error:#}"),
+        ),
+    }
+}
+
+fn push_reconciliation_failure(
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+    stage: nestweaver_engine::DeletionReconciliationStage,
+    message: impl Into<String>,
+) {
+    failures.push(nestweaver_engine::DeletionReconciliationFailure {
+        stage,
+        repo_uid: None,
+        message: message.into(),
+    });
+}
+
+fn finalize_node_graph_deletion(
+    state: &DaemonState,
+    operation: &str,
+) -> Vec<nestweaver_engine::DeletionReconciliationFailure> {
+    let mut failures = Vec::new();
+    match state.store.reconcile_embedding_index_stages() {
+        Err(error) => push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::EmbeddingIndex,
+            format!("embedding live-set reconciliation failed: {error:#}"),
+        ),
+        Ok(result) => {
+            match result.canonical_persistence {
+                Ok(()) => tracing::info!(
+                    removed = result.removed,
+                    operation,
+                    "reconciled deleted node embeddings"
+                ),
+                Err(error) => push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::EmbeddingIndex,
+                    format!("embedding persistence failed: {error:#}"),
+                ),
+            }
+            if let Some(Err(error)) = result.legacy_retirement {
+                push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::LegacyRetirement,
+                    format!("legacy embedding retirement failed: {error:#}"),
+                );
+            }
+        }
+    }
+    let generation_advanced = match state.store.try_bump_graph_generation() {
+        Ok(_) => true,
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                nestweaver_engine::DeletionReconciliationStage::GenerationPersistence,
+                format!("advance graph generation: {error:#}"),
+            );
+            false
+        }
+    };
+    let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+    if generation_advanced && let Err(error) = state.store.save_graph_generation(&generation_path) {
+        push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::GenerationPersistence,
+            format!("{}: {error:#}", generation_path.display()),
+        );
+    }
+    if let Err(error) =
+        nestweaver_engine::reconcile_extension_liveness(&state.store, &state.db_path)
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+            format!("extension metadata liveness reconciliation failed: {error:#}"),
+        );
+    }
+    state.store.invalidate_pagerank();
+    let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+    if let Err(error) =
+        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&pagerank_path)
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::PersistedPageRank,
+            format!("{}: {error}", pagerank_path.display()),
+        );
+    }
+    failures
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct IndexedSearchDocument {
+    uid: String,
+    kind: &'static str,
+    title: String,
+    body: String,
+    vault_uid: String,
+    note_uid: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexedSearchMutation {
+    Unchanged,
+    Changed,
+    Unknown,
+}
+
+fn indexed_section_lines(lines: &[&str], start: u32, end: u32) -> String {
+    if start == 0 || start as usize > lines.len() {
+        return String::new();
+    }
+    let end = (end as usize).min(lines.len());
+    let start = (start - 1) as usize;
+    if start >= end {
+        return String::new();
+    }
+    lines[start..end].join("\n")
+}
+
+fn indexed_search_rows(
+    store: &GraphStore,
+) -> Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error> {
+    use std::collections::{HashMap, HashSet};
+
+    let notes = store.list_notes(None)?;
+    let headings = store.list_all_headings()?;
+    let sections = store.list_all_sections()?;
+    let mut headings_by_note: HashMap<&str, Vec<_>> = HashMap::new();
+    for heading in &headings {
+        headings_by_note
+            .entry(heading.note_uid.as_str())
+            .or_default()
+            .push(heading);
+    }
+    let mut sections_by_note: HashMap<&str, Vec<_>> = HashMap::new();
+    for section in &sections {
+        sections_by_note
+            .entry(section.note_uid.as_str())
+            .or_default()
+            .push(section);
+    }
+
+    let mut documents = HashSet::new();
+    for note in &notes {
+        let note_headings = headings_by_note
+            .get(note.uid.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let note_sections = sections_by_note
+            .get(note.uid.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let body_from_disk = store.lookup_vault(&note.vault_uid).ok().and_then(|vault| {
+            let path = std::path::Path::new(&vault.root_path).join(&note.file_path);
+            std::fs::read_to_string(path).ok()
+        });
+        documents.insert(IndexedSearchDocument {
+            uid: note.uid.clone(),
+            kind: "note",
+            title: note.title.clone(),
+            body: body_from_disk.clone().unwrap_or_else(|| note.title.clone()),
+            vault_uid: note.vault_uid.clone(),
+            note_uid: note.uid.clone(),
+        });
+        for heading in note_headings {
+            documents.insert(IndexedSearchDocument {
+                uid: heading.uid.clone(),
+                kind: "heading",
+                title: heading.text.clone(),
+                body: heading.text.clone(),
+                vault_uid: note.vault_uid.clone(),
+                note_uid: note.uid.clone(),
+            });
+        }
+        let body_lines: Vec<&str> = body_from_disk
+            .as_deref()
+            .map(|body| body.lines().collect())
+            .unwrap_or_default();
+        for section in note_sections {
+            let title = section
+                .heading_uid
+                .as_deref()
+                .and_then(|heading_uid| {
+                    note_headings
+                        .iter()
+                        .find(|heading| heading.uid == heading_uid)
+                })
+                .map(|heading| heading.text.clone())
+                .unwrap_or_default();
+            let body = if section.text_content.is_empty() {
+                indexed_section_lines(&body_lines, section.start_line, section.end_line)
+            } else {
+                section.text_content.clone()
+            };
+            documents.insert(IndexedSearchDocument {
+                uid: section.uid.clone(),
+                kind: "section",
+                title,
+                body,
+                vault_uid: note.vault_uid.clone(),
+                note_uid: note.uid.clone(),
+            });
+        }
+    }
+    for tag in store.list_tags(None)? {
+        documents.insert(IndexedSearchDocument {
+            uid: tag.uid,
+            kind: "tag",
+            title: tag.name.clone(),
+            body: tag.name,
+            vault_uid: tag.vault_uid,
+            note_uid: String::new(),
+        });
+    }
+    Ok(documents)
+}
+
+fn indexed_search_rows_before_with<F>(
+    search: &SearchIndexReconciliation,
+    project: F,
+) -> Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>>
+where
+    F: FnOnce() -> Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>,
+{
+    match search {
+        SearchIndexReconciliation::Disabled => None,
+        SearchIndexReconciliation::Available(_) | SearchIndexReconciliation::Unavailable(_) => {
+            Some(project())
+        }
+    }
+}
+
+fn indexed_search_rows_before(
+    state: &DaemonState,
+) -> Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>> {
+    indexed_search_rows_before_with(&state.search_reconciliation, || {
+        indexed_search_rows(&state.store)
+    })
+}
+
+fn indexed_search_mutation(
+    before: Option<Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>>,
+    store: &GraphStore,
+) -> IndexedSearchMutation {
+    match before {
+        None => IndexedSearchMutation::Unchanged,
+        Some(Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                "indexed search mutation preflight is unknown; repairing conservatively"
+            );
+            IndexedSearchMutation::Unknown
+        }
+        Some(Ok(before)) => match indexed_search_rows(store) {
+            Ok(after) if before == after => IndexedSearchMutation::Unchanged,
+            Ok(_) => IndexedSearchMutation::Changed,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "indexed search mutation postflight is unknown; repairing conservatively"
+                );
+                IndexedSearchMutation::Unknown
+            }
+        },
+    }
+}
+
+fn reconcile_search_index(
+    state: &SearchIndexReconciliation,
+    store: &GraphStore,
+    mutation: IndexedSearchMutation,
+    operation: &str,
+) -> Result<(), anyhow::Error> {
+    if mutation == IndexedSearchMutation::Unchanged {
+        return Ok(());
+    }
+    match state {
+        SearchIndexReconciliation::Disabled => Ok(()),
+        SearchIndexReconciliation::Available(tantivy) => {
+            let docs = tantivy.reindex_from_store(store)?;
+            tracing::info!(docs, operation, "Tantivy reindexed after mutation");
+            Ok(())
+        }
+        SearchIndexReconciliation::Unavailable(reason) => {
+            anyhow::bail!("configured Tantivy index unavailable: {reason}")
+        }
+    }
+}
+
+fn open_search_index(
+    tantivy_path: &Path,
+    read_only: bool,
+) -> (Option<Arc<TantivyIndex>>, SearchIndexReconciliation) {
+    if read_only {
+        return match TantivyIndex::open_reader_only(tantivy_path) {
+            Ok(index) => {
+                tracing::info!(
+                    docs = index.doc_count(),
+                    path = %tantivy_path.display(),
+                    "Tantivy index open (replica, reader-only)"
+                );
+                (Some(Arc::new(index)), SearchIndexReconciliation::Disabled)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not open Tantivy index reader — search will use substring fallback"
+                );
+                (None, SearchIndexReconciliation::Disabled)
+            }
+        };
+    }
+
+    match TantivyIndex::open_or_create(tantivy_path) {
+        Ok(index) => {
+            tracing::info!(
+                docs = index.doc_count(),
+                path = %tantivy_path.display(),
+                "Tantivy index open (read-write)"
+            );
+            let index = Arc::new(index);
+            (
+                Some(Arc::clone(&index)),
+                SearchIndexReconciliation::Available(index),
+            )
+        }
+        Err(writer_error) => match TantivyIndex::open_reader_only(tantivy_path) {
+            Ok(index) => {
+                tracing::info!(
+                    docs = index.doc_count(),
+                    path = %tantivy_path.display(),
+                    "Tantivy index open (reader-only fallback)"
+                );
+                (
+                    Some(Arc::new(index)),
+                    SearchIndexReconciliation::Unavailable(format!(
+                        "writer open failed: {writer_error}"
+                    )),
+                )
+            }
+            Err(reader_error) => {
+                tracing::warn!(
+                    error = %reader_error,
+                    "could not open Tantivy index — search will use substring fallback"
+                );
+                (
+                    None,
+                    SearchIndexReconciliation::Unavailable(format!(
+                        "writer open failed: {writer_error}; reader open failed: {reader_error}"
+                    )),
+                )
+            }
+        },
+    }
+}
+
+fn finish_reconciled_mutation<T>(
+    mutation: Result<T, Status>,
+    operation: &str,
+    failures: Vec<nestweaver_engine::DeletionReconciliationFailure>,
+) -> Result<T, Status> {
+    if failures.is_empty() {
+        return mutation;
+    }
+    let reconciliation = nestweaver_engine::DeletionReconciliationError::new(operation, failures);
+    match mutation {
+        Ok(_) => Err(Status::internal(reconciliation.to_string())),
+        Err(mutation) => Err(Status::new(
+            mutation.code(),
+            format!("{}; {reconciliation}", mutation.message()),
+        )),
+    }
+}
+
+fn append_search_reconciliation(
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+    result: Result<(), anyhow::Error>,
+) {
+    if let Err(error) = result {
+        push_reconciliation_failure(
+            failures,
+            nestweaver_engine::DeletionReconciliationStage::SearchIndex,
+            format!("{error:#}"),
+        );
+    }
+}
+
+fn run_remove_repo_with<C, D>(
+    state: &DaemonState,
+    repo_uid: &str,
+    clear_derived: C,
+    delete_repo: D,
+) -> Result<RemoveRepoResponse, Status>
+where
+    C: FnOnce(&GraphStore, &str) -> Result<(), Status>,
+    D: FnOnce(&GraphStore, &str) -> Result<(), Status>,
+{
+    run_remove_repo_with_bulk(
+        state,
+        repo_uid,
+        |store, uid| {
+            store.bulk_delete_repo_files_and_symbols(uid).map_err(|e| {
+                Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}"))
+            })
+        },
+        clear_derived,
+        delete_repo,
+    )
+}
+
+fn run_remove_repo_with_bulk<B, C, D>(
+    state: &DaemonState,
+    repo_uid: &str,
+    bulk_delete: B,
+    clear_derived: C,
+    delete_repo: D,
+) -> Result<RemoveRepoResponse, Status>
+where
+    B: FnOnce(&GraphStore, &str) -> Result<(usize, usize), Status>,
+    C: FnOnce(&GraphStore, &str) -> Result<(), Status>,
+    D: FnOnce(&GraphStore, &str) -> Result<(), Status>,
+{
+    let mutation = match bulk_delete(&state.store, repo_uid) {
+        Ok((file_count, sym_count)) => clear_derived(&state.store, repo_uid)
+            .and_then(|()| delete_repo(&state.store, repo_uid))
+            .map(|()| RemoveRepoResponse {
+                files_deleted: file_count as u64,
+                symbols_deleted: sym_count as u64,
+            }),
+        Err(error) => Err(error),
+    };
+
+    let reconciliation = nestweaver_engine::finalize_code_graph_deletion(
+        &state.store,
+        &state.db_path,
+        &[repo_uid.to_string()],
+        "repo removal",
+    )
+    .err()
+    .map(|error| error.failures)
+    .unwrap_or_default();
+
+    finish_reconciled_mutation(mutation, "repo removal", reconciliation)
+}
+
+fn run_remove_project_with<D, L, C, F>(
+    state: &DaemonState,
+    project_uid: &str,
+    delete_project: D,
+    project_exists: L,
+    cleanup_extensions: C,
+    finalize: F,
+) -> Result<RemoveProjectResponse, Status>
+where
+    D: FnOnce(
+        &GraphStore,
+        &str,
+    ) -> Result<
+        nestweaver_store::DeleteProjectCascadeOutcome,
+        nestweaver_store::DeleteProjectCascadeError,
+    >,
+    L: FnOnce(&GraphStore, &str) -> Result<bool, nestweaver_store::StoreError>,
+    C: FnOnce(&Path, &str) -> Result<bool, anyhow::Error>,
+    F: FnOnce(&DaemonState, &str) -> Vec<nestweaver_engine::DeletionReconciliationFailure>,
+{
+    enum ExtensionCleanup {
+        No,
+        Yes,
+        CheckLiveness,
+    }
+
+    let deletion = delete_project(&state.store, project_uid);
+    let (mutation, finalize_needed, mut extension_cleanup) = match deletion {
+        Ok(outcome) => {
+            let finalize_needed = matches!(
+                outcome.disposition,
+                nestweaver_store::ProjectMutationDisposition::Changed
+                    | nestweaver_store::ProjectMutationDisposition::Ambiguous
+            );
+            let cleanup = match outcome.disposition {
+                nestweaver_store::ProjectMutationDisposition::Changed
+                | nestweaver_store::ProjectMutationDisposition::ConfirmedUnchanged => {
+                    ExtensionCleanup::Yes
+                }
+                nestweaver_store::ProjectMutationDisposition::Ambiguous => {
+                    ExtensionCleanup::CheckLiveness
+                }
+                nestweaver_store::ProjectMutationDisposition::ConfirmedRolledBack => {
+                    ExtensionCleanup::No
+                }
+            };
+            (
+                Ok(RemoveProjectResponse {
+                    project_name: outcome.project_name.unwrap_or_default(),
+                }),
+                finalize_needed,
+                cleanup,
+            )
+        }
+        Err(error) => {
+            let (finalize_needed, cleanup) = match error.disposition {
+                nestweaver_store::ProjectMutationDisposition::ConfirmedUnchanged
+                | nestweaver_store::ProjectMutationDisposition::ConfirmedRolledBack => {
+                    (false, ExtensionCleanup::No)
+                }
+                nestweaver_store::ProjectMutationDisposition::Changed => {
+                    (true, ExtensionCleanup::Yes)
+                }
+                nestweaver_store::ProjectMutationDisposition::Ambiguous => {
+                    (true, ExtensionCleanup::CheckLiveness)
+                }
+            };
+            (
+                Err(Status::internal(format!(
+                    "delete Project cascade failed: {error}"
+                ))),
+                finalize_needed,
+                cleanup,
+            )
+        }
+    };
+    let mut failures = Vec::new();
+
+    if matches!(extension_cleanup, ExtensionCleanup::CheckLiveness) {
+        extension_cleanup = match project_exists(&state.store, project_uid) {
+            Ok(true) => ExtensionCleanup::No,
+            Ok(false) => ExtensionCleanup::Yes,
+            Err(error) => {
+                push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::GraphLiveness,
+                    format!("Project {project_uid} liveness query failed: {error:#}"),
+                );
+                ExtensionCleanup::No
+            }
+        };
+    }
+    if matches!(extension_cleanup, ExtensionCleanup::Yes)
+        && let Err(error) = cleanup_extensions(&state.db_path, project_uid)
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+            format!("Project {project_uid}: {error:#}"),
+        );
+    }
+    if finalize_needed {
+        failures.extend(finalize(state, "project removal"));
+    }
+
+    finish_reconciled_mutation(mutation, "project removal", failures)
+}
+
+fn rebuild_tantivy_after_mutation(
+    state: &DaemonState,
+    mutation: IndexedSearchMutation,
+    operation: &str,
+) -> Result<(), anyhow::Error> {
+    reconcile_search_index(
+        &state.search_reconciliation,
+        &state.store,
+        mutation,
+        operation,
+    )
+}
+
+fn run_prune_stale_with<DR, DV, R>(
+    state: &DaemonState,
+    delete_repo: DR,
+    mut delete_vault: DV,
+    mut reconcile_search: R,
+) -> Result<PruneStaleResponse, Status>
+where
+    DR: FnMut(&GraphStore, &nestweaver_schema::Repo) -> Result<(), anyhow::Error>,
+    DV: FnMut(&GraphStore, &nestweaver_schema::Vault) -> Result<(), anyhow::Error>,
+    R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
+{
+    let search_rows_before = indexed_search_rows_before(state);
+    let (removed_repos, mut error) = prune_stale_repos_with(&state.store, delete_repo);
+    let mut removed_vaults = Vec::new();
+    let mut removed_vault_uids = Vec::new();
+    let mut vault_mutation_attempted = false;
+
+    if error.is_none() {
+        match state.store.list_vaults(None) {
+            Ok(vaults) => {
+                for vault in &vaults {
+                    if !Path::new(&vault.root_path).exists() {
+                        vault_mutation_attempted = true;
+                        if let Err(delete_error) = delete_vault(&state.store, vault) {
+                            error = Some(delete_error);
+                            break;
+                        }
+                        removed_vaults.push(vault.name.clone());
+                        removed_vault_uids.push(vault.uid.clone());
+                    }
+                }
+            }
+            Err(list_error) => {
+                error = Some(anyhow::anyhow!("list_vaults failed: {list_error:#}"));
+            }
+        }
+    }
+
+    let changed = !removed_repos.is_empty()
+        || !removed_vaults.is_empty()
+        || (error.is_some() && vault_mutation_attempted);
+    let mut failures = if !removed_repos.is_empty() {
+        finalize_code_graph_deletion(state, &removed_repos.uids)
+    } else if changed {
+        finalize_node_graph_deletion(state, "prune_stale")
+    } else {
+        Vec::new()
+    };
+    reconcile_deleted_extension_uids(state, &removed_vault_uids, &mut failures);
+    let search_mutation = if changed {
+        indexed_search_mutation(search_rows_before, &state.store)
+    } else {
+        IndexedSearchMutation::Unchanged
+    };
+    if search_mutation != IndexedSearchMutation::Unchanged {
+        append_search_reconciliation(
+            &mut failures,
+            reconcile_search(state, search_mutation, "prune_stale"),
+        );
+    }
+
+    let mutation = match error {
+        Some(error) => Err(Status::internal(format!("prune_stale failed: {error:#}"))),
+        None => Ok(PruneStaleResponse {
+            removed_repos: removed_repos.names,
+            removed_vaults,
+        }),
+    };
+    finish_reconciled_mutation(mutation, "prune_stale", failures)
+}
+
+fn run_purge_instance_with<F, R>(
+    state: &DaemonState,
+    instance_id: &str,
+    purge: F,
+    mut reconcile_search: R,
+) -> Result<nestweaver_store::PurgeInstanceResult, Status>
+where
+    F: FnOnce(&GraphStore, &str) -> Result<nestweaver_store::PurgeInstanceResult, anyhow::Error>,
+    R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
+{
+    let search_rows_before = indexed_search_rows_before(state);
+    let mut repo_uids = list_instance_code_repo_uids(&state.store, instance_id)
+        .map_err(|e| Status::internal(format!("PurgeInstance failed to list code repos: {e:#}")))?;
+    let vault_prefix = format!("vlt:{instance_id}:");
+    let mut vault_uids: Vec<_> = state
+        .store
+        .list_vaults(None)
+        .map_err(|error| {
+            Status::internal(format!("PurgeInstance failed to list Vaults: {error:#}"))
+        })?
+        .into_iter()
+        .filter(|vault| vault.instance_id == instance_id || vault.uid.starts_with(&vault_prefix))
+        .map(|vault| vault.uid)
+        .collect();
+    vault_uids.sort();
+    vault_uids.dedup();
+    let project_prefix = format!("proj:{instance_id}:");
+    let mut project_uids: Vec<_> = state
+        .store
+        .list_projects()
+        .map_err(|error| {
+            Status::internal(format!("PurgeInstance failed to list Projects: {error:#}"))
+        })?
+        .into_iter()
+        .filter(|project| {
+            project.instance_id == instance_id || project.uid.starts_with(&project_prefix)
+        })
+        .map(|project| project.uid)
+        .collect();
+    project_uids.sort();
+    project_uids.dedup();
+
+    match purge(&state.store, instance_id) {
+        Ok(result) => {
+            repo_uids.extend(result.code_repo_uids.iter().cloned());
+            repo_uids.sort();
+            repo_uids.dedup();
+            let code_changed = !repo_uids.is_empty()
+                || result.repos > 0
+                || result.files > 0
+                || result.symbols > 0
+                || result.code_orphans_swept > 0;
+            let changed = code_changed
+                || result.vaults > 0
+                || result.projects > 0
+                || result.orphans_swept > 0;
+            let mut failures = if code_changed {
+                finalize_code_graph_deletion(state, &repo_uids)
+            } else if changed {
+                finalize_node_graph_deletion(state, "purge_instance")
+            } else {
+                Vec::new()
+            };
+            reconcile_deleted_extension_uids(state, &vault_uids, &mut failures);
+            reconcile_deleted_project_extensions(state, &project_uids, &mut failures);
+            let search_mutation = if changed {
+                indexed_search_mutation(search_rows_before, &state.store)
+            } else {
+                IndexedSearchMutation::Unchanged
+            };
+            if search_mutation != IndexedSearchMutation::Unchanged {
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(state, search_mutation, "purge_instance"),
+                );
+            }
+            finish_reconciled_mutation(Ok(result), "purge_instance", failures)
+        }
+        Err(error) => {
+            // `purge_instance` is intentionally non-transactional. A late
+            // error can follow committed deletions. Both finalizers invalidate
+            // PageRank; the code-repo preflight only selects whether code
+            // sidecars also require reconciliation.
+            let mut failures = if repo_uids.is_empty() {
+                finalize_node_graph_deletion(state, "purge_instance_error")
+            } else {
+                finalize_code_graph_deletion(state, &repo_uids)
+            };
+            reconcile_deleted_extension_uids(state, &vault_uids, &mut failures);
+            reconcile_deleted_project_extensions(state, &project_uids, &mut failures);
+            let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+            if search_mutation != IndexedSearchMutation::Unchanged {
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(state, search_mutation, "purge_instance_error"),
+                );
+            }
+            finish_reconciled_mutation(
+                Err(Status::internal(format!("PurgeInstance failed: {error:#}"))),
+                "purge_instance_error",
+                failures,
+            )
+        }
+    }
+}
+
+fn reconcile_deleted_project_extensions(
+    state: &DaemonState,
+    project_uids: &[String],
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+) {
+    for project_uid in project_uids {
+        match state.store.project_exists(project_uid) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(error) =
+                    nestweaver_engine::remove_extension_uid_durable(&state.db_path, project_uid)
+                {
+                    push_reconciliation_failure(
+                        failures,
+                        nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+                        format!("Project {project_uid}: {error:#}"),
+                    );
+                }
+            }
+            Err(error) => push_reconciliation_failure(
+                failures,
+                nestweaver_engine::DeletionReconciliationStage::GraphLiveness,
+                format!("Project {project_uid} liveness query failed: {error:#}"),
+            ),
+        }
+    }
+}
+
+fn list_instance_code_repo_uids(
+    store: &GraphStore,
+    instance_id: &str,
+) -> Result<Vec<String>, anyhow::Error> {
+    let mut repo_uids = store.list_purge_code_repo_uids(instance_id)?;
+    repo_uids.extend(
+        store
+            .list_repos(Some(instance_id))?
+            .into_iter()
+            .map(|repo| repo.uid),
+    );
+    repo_uids.sort();
+    repo_uids.dedup();
+    Ok(repo_uids)
+}
+
+fn recover_pending_instance_extension_migration(state: &DaemonState) -> Result<(), anyhow::Error> {
+    let pending = nestweaver_engine::pending_instance_extension_migration(&state.db_path)?;
+    if !pending.is_active() {
+        return Ok(());
+    }
+    let from_id = pending
+        .from_id()
+        .ok_or_else(|| anyhow::anyhow!("pending extension migration is missing source instance"))?
+        .to_string();
+    let to_id = pending
+        .to_id()
+        .ok_or_else(|| anyhow::anyhow!("pending extension migration is missing target instance"))?
+        .to_string();
+    run_merge_instance_with(
+        state,
+        &from_id,
+        &to_id,
+        |store, from_id, to_id| {
+            store
+                .merge_instance_ids(from_id, to_id)
+                .map_err(anyhow::Error::from)
+        },
+        rebuild_tantivy_after_mutation,
+    )
+    .map(|_| ())
+    .map_err(|status| anyhow::anyhow!("startup extension migration recovery failed: {status}"))
+}
+
+fn run_merge_instance_with<F, R>(
+    state: &DaemonState,
+    from_id: &str,
+    to_id: &str,
+    merge: F,
+    reconcile_search: R,
+) -> Result<nestweaver_store::MergeResult, Status>
+where
+    F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
+    R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
+{
+    let mut reconcile_search = reconcile_search;
+    let pending = nestweaver_engine::pending_instance_extension_migration(&state.db_path).map_err(
+        |error| {
+            Status::internal(format!(
+                "merge_instance migration-journal preparation failed: {error:#}"
+            ))
+        },
+    )?;
+    let migration = if pending.is_active() {
+        if pending.from_id() != Some(from_id) || pending.to_id() != Some(to_id) {
+            return Err(Status::internal(format!(
+                "pending instance migration {:?} -> {:?} conflicts with requested {from_id:?} -> {to_id:?}",
+                pending.from_id(),
+                pending.to_id()
+            )));
+        }
+        state
+            .store
+            .recover_missing_instance_roots(
+                to_id,
+                &pending.repo_recoveries(),
+                &pending.vault_recoveries(),
+                &pending.project_recoveries(),
+            )
+            .map_err(|error| {
+                Status::internal(format!(
+                    "recover pending instance root insertion failed: {error:#}"
+                ))
+            })?;
+        let remaps = pending.uid_remaps();
+        let graph_state = if remaps.is_empty() {
+            if state
+                .store
+                .list_vaults(Some(from_id))
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "verify pending vault migration state failed: {error:#}"
+                    ))
+                })?
+                .is_empty()
+            {
+                nestweaver_store::InstanceUidRemapPlanState::Applied
+            } else {
+                nestweaver_store::InstanceUidRemapPlanState::Prepared
+            }
+        } else {
+            state
+                .store
+                .verify_instance_uid_remap_plan_state(from_id, to_id, &remaps)
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "verify pending instance migration graph state failed: {error:#}"
+                    ))
+                })?
+        };
+        if pending.graph_applied()
+            && graph_state != nestweaver_store::InstanceUidRemapPlanState::Applied
+        {
+            return Err(Status::internal(
+                "instance migration is marked graph-applied but source graph rows remain",
+            ));
+        }
+        pending
+    } else {
+        let plan = state
+            .store
+            .plan_instance_uid_migration(from_id, to_id)
+            .map_err(|error| {
+                Status::internal(format!(
+                    "merge failed to plan instance UID remaps: {error:#}"
+                ))
+            })?;
+        let repo_uids = list_instance_code_repo_uids(&state.store, from_id).map_err(|error| {
+            Status::internal(format!("merge failed to list code repos: {error:#}"))
+        })?;
+        let search_reconciliation_required = !state
+            .store
+            .list_vaults(Some(from_id))
+            .map_err(|error| {
+                Status::internal(format!("merge failed to project source vaults: {error:#}"))
+            })?
+            .is_empty();
+        nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
+            &state.db_path,
+            from_id,
+            to_id,
+            &plan,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan {
+                repo_uids,
+                search_reconciliation_required,
+            },
+        )
+        .map_err(|error| {
+            Status::internal(format!(
+                "merge_instance migration-journal preparation failed: {error:#}"
+            ))
+        })?
+    };
+
+    if migration.reconciled() {
+        nestweaver_engine::finalize_instance_extension_migration(&state.db_path, &migration)
+            .map_err(|error| {
+                Status::internal(format!(
+                    "merge_instance extension-metadata completion failed: {error:#}"
+                ))
+            })?;
+        return Ok(empty_instance_merge_result());
+    }
+
+    let mutation = if migration.graph_applied() {
+        Ok(empty_instance_merge_result())
+    } else {
+        merge(&state.store, from_id, to_id)
+    };
+    let result = match mutation {
+        Ok(result) => result,
+        Err(error) => {
+            let mut failures = if migration.finalizer_repo_uids().is_empty() {
+                finalize_node_graph_deletion(state, "merge_instance_error")
+            } else {
+                finalize_code_graph_deletion(state, migration.finalizer_repo_uids())
+            };
+            if migration.search_reconciliation_required() {
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(
+                        state,
+                        IndexedSearchMutation::Changed,
+                        "merge_instance_error",
+                    ),
+                );
+            }
+            return finish_reconciled_mutation(
+                Err(Status::internal(format!(
+                    "merge_instance_ids failed: {error:#}"
+                ))),
+                "merge_instance_error",
+                failures,
+            );
+        }
+    };
+
+    if !migration.is_active() {
+        return Ok(result);
+    }
+    let graph_applied = if migration.graph_applied() {
+        migration
+    } else {
+        nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &migration,
+        )
+        .map_err(|error| {
+            Status::internal(format!(
+                "merge_instance graph-applied journal persistence failed: {error:#}"
+            ))
+        })?
+    };
+
+    let mut failures = if graph_applied.finalizer_repo_uids().is_empty() {
+        finalize_node_graph_deletion(state, "merge_instance")
+    } else {
+        finalize_code_graph_deletion(state, graph_applied.finalizer_repo_uids())
+    };
+    if graph_applied.search_reconciliation_required() {
+        append_search_reconciliation(
+            &mut failures,
+            reconcile_search(state, IndexedSearchMutation::Changed, "merge_instance"),
+        );
+    }
+    if !failures.is_empty() {
+        return finish_reconciled_mutation(Ok(result), "merge_instance", failures);
+    }
+
+    let reconciled = nestweaver_engine::mark_instance_extension_migration_reconciled(
+        &state.db_path,
+        &graph_applied,
+    )
+    .map_err(|error| {
+        Status::internal(format!(
+            "merge_instance reconciled journal persistence failed: {error:#}"
+        ))
+    })?;
+    nestweaver_engine::finalize_instance_extension_migration(&state.db_path, &reconciled).map_err(
+        |error| {
+            Status::internal(format!(
+                "merge_instance extension-metadata completion failed: {error:#}"
+            ))
+        },
+    )?;
+    Ok(result)
+}
+
+fn empty_instance_merge_result() -> nestweaver_store::MergeResult {
+    nestweaver_store::MergeResult {
+        vaults: 0,
+        repos: 0,
+        projects: 0,
+        discarded: Vec::new(),
+        repos_moved: Vec::new(),
+        repo_uids_removed: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+fn run_merge_instance_with_extension_ops<F, R, P, Prepare, Complete>(
+    state: &DaemonState,
+    from_id: &str,
+    to_id: &str,
+    merge: F,
+    mut reconcile_search: R,
+    prepare_extensions: Prepare,
+    complete_extensions: Complete,
+) -> Result<nestweaver_store::MergeResult, Status>
+where
+    F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
+    R: FnMut(&DaemonState, IndexedSearchMutation, &str) -> Result<(), anyhow::Error>,
+    Prepare: FnOnce(&GraphStore, &Path, &str, &str) -> Result<(P, bool), anyhow::Error>,
+    Complete: FnOnce(&Path, &P) -> Result<(), anyhow::Error>,
+{
+    let search_rows_before = indexed_search_rows_before(state);
+    let repo_uids = list_instance_code_repo_uids(&state.store, from_id)
+        .map_err(|e| Status::internal(format!("merge failed to list code repos: {e:#}")))?;
+    let (extension_migration, extension_migration_active) =
+        prepare_extensions(&state.store, &state.db_path, from_id, to_id).map_err(|error| {
+            Status::internal(format!(
+                "merge_instance extension-metadata preparation failed: {error:#}"
+            ))
+        })?;
+
+    match merge(&state.store, from_id, to_id) {
+        Ok(result) => {
+            let changed = !result.repo_uids_removed.is_empty()
+                || result.vaults > 0
+                || result.repos > 0
+                || result.projects > 0
+                || extension_migration_active;
+            let mut failures = Vec::new();
+            if let Err(error) = complete_extensions(&state.db_path, &extension_migration) {
+                push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+                    format!("instance {from_id} -> {to_id}: {error:#}"),
+                );
+            }
+            failures.extend(if !result.repo_uids_removed.is_empty() {
+                finalize_code_graph_deletion(state, &result.repo_uids_removed)
+            } else if changed {
+                finalize_node_graph_deletion(state, "merge_instance")
+            } else {
+                Vec::new()
+            });
+            let search_mutation = if changed {
+                indexed_search_mutation(search_rows_before, &state.store)
+            } else {
+                IndexedSearchMutation::Unchanged
+            };
+            if search_mutation != IndexedSearchMutation::Unchanged {
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(state, search_mutation, "merge_instance"),
+                );
+            }
+            finish_reconciled_mutation(Ok(result), "merge_instance", failures)
+        }
+        Err(error) => {
+            // Instance merge is multi-statement and can commit earlier source
+            // entries before a later one fails. Both finalizers invalidate
+            // PageRank; the code-repo preflight only selects whether code
+            // sidecars also require reconciliation.
+            let mut failures = if repo_uids.is_empty() {
+                finalize_node_graph_deletion(state, "merge_instance_error")
+            } else {
+                finalize_code_graph_deletion(state, &repo_uids)
+            };
+            let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+            if search_mutation != IndexedSearchMutation::Unchanged {
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(state, search_mutation, "merge_instance_error"),
+                );
+            }
+            finish_reconciled_mutation(
+                Err(Status::internal(format!(
+                    "merge_instance_ids failed: {error:#}"
+                ))),
+                "merge_instance_error",
+                failures,
+            )
+        }
+    }
+}
+
+fn run_remove_vault_with_projection(
+    state: &DaemonState,
+    vault_uid: &str,
+    search_rows_before: Option<
+        Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>,
+    >,
+) -> Result<RemoveVaultResponse, Status> {
+    let mutation = state
+        .store
+        .delete_vault_cascade_with_outcome(vault_uid)
+        .map_err(|error| Status::internal(format!("delete_vault_cascade failed: {error:#}")));
+    let confirmed_noop = matches!(&mutation, Ok(outcome) if !outcome.changed);
+    let mut failures = Vec::new();
+    if !confirmed_noop {
+        failures = finalize_node_graph_deletion(state, "remove_vault");
+        reconcile_deleted_extension_uids(state, &[vault_uid.to_string()], &mut failures);
+        let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+        if search_mutation != IndexedSearchMutation::Unchanged {
+            append_search_reconciliation(
+                &mut failures,
+                rebuild_tantivy_after_mutation(state, search_mutation, "remove_vault"),
+            );
+        }
+    }
+
+    finish_reconciled_mutation(
+        mutation.map(|outcome| RemoveVaultResponse {
+            notes_deleted: outcome.notes_deleted as u64,
+        }),
+        "remove_vault",
+        failures,
+    )
 }
 
 #[tonic::async_trait]
@@ -870,7 +2178,11 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.clone(),
             output_path: std::path::PathBuf::from(&req.output_path),
             include_clones: req.include_clones,
-            instance_id: self.state.instance_id.clone(),
+            // nw-019: the manifest's instance_id is a DATA claim about the backed-up
+            // contents, so stamp the logical instance (config name when set, else the
+            // runtime hash) — not the runtime hash unconditionally. Restore keys
+            // nothing on this field (checksum + schema-compat only), so it is safe.
+            instance_id: self.state.data_instance_id.clone(),
             workspace_path: if req.include_clones {
                 self.state.db_path.parent().map(|p| p.join("workspace"))
             } else {
@@ -930,11 +2242,8 @@ impl NestWeaverDaemon for DaemonService {
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
 
         if !vault_path.exists() || !vault_path.is_dir() {
@@ -1061,11 +2370,8 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
 
         if !repo_path.exists() || !repo_path.is_dir() {
             return Ok(Response::new(WatchCodeResponse {
@@ -1303,12 +2609,26 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let state = self.state.clone();
+        let watch_instance =
+            resolve_effective_instance_id(&req.watch_instance_id, &state.data_instance_id)?;
 
         let app_state = nestweaver_web::state::AppState::new_with_arc_tantivy(
             state.store.clone(),
             state.tantivy.clone(),
             state.db_path.clone(),
         );
+
+        // nw-029: pre-warm PageRank so the first overview/impact query never pays
+        // the lazy compute. Fire-and-forget; single-flight (nw-029 T1) makes a
+        // concurrent first query wait on this instead of duplicating it. A DB
+        // whose sidecar was loaded at open is a no-op (ensure_pagerank_loaded's
+        // is_some() fast path).
+        {
+            let store = state.store.clone();
+            tokio::task::spawn_blocking(move || {
+                store.ensure_pagerank_loaded();
+            });
+        }
 
         let port = if req.port > 0 { req.port as u16 } else { 3000 };
         let open_browser = req.open_browser;
@@ -1337,11 +2657,6 @@ impl NestWeaverDaemon for DaemonService {
         if req.watch && !req.watch_repo_path.is_empty() {
             let watch_db = state.db_path.clone();
             let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
-            let watch_instance = if req.watch_instance_id.is_empty() {
-                "default".to_string()
-            } else {
-                req.watch_instance_id.clone()
-            };
             let watch_store = state.store.clone();
 
             tokio::task::spawn_blocking(move || {
@@ -1394,6 +2709,8 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             Some(req.name.clone())
         };
+        let effective_instance =
+            resolve_effective_instance_id(&req.instance_id, &state.data_instance_id)?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
 
@@ -1479,7 +2796,9 @@ impl NestWeaverDaemon for DaemonService {
                 &state.store,
                 &repo_path,
                 &state.db_path,
-                &state.instance_id,
+                // nw-019: stamp the effective logical instance on indexed repos —
+                // an explicit request `--instance` overrides the daemon default.
+                &effective_instance,
                 &repo_url,
                 &indexed_sha,
                 force,
@@ -1637,11 +2956,8 @@ impl NestWeaverDaemon for DaemonService {
         let vault_path = PathBuf::from(&req.vault_path);
         let vault_name = req.vault_name.clone();
         let extra_patterns = req.extra_ignore_patterns.clone();
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -1741,11 +3057,8 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
-        let instance_id = if req.instance_id.is_empty() {
-            self.state.instance_id.clone()
-        } else {
-            req.instance_id.clone()
-        };
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -1840,25 +3153,8 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let notes_deleted = state
-                .store
-                .delete_vault_cascade(&req.vault_uid)
-                .map_err(|e| Status::internal(format!("delete_vault_cascade failed: {e:#}")))?;
-
-            if let Some(ref tantivy) = state.tantivy
-                && tantivy.has_writer()
-            {
-                match tantivy.reindex_from_store(&state.store) {
-                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after vault removal"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tantivy reindex failed after vault removal")
-                    }
-                }
-            }
-
-            Ok::<_, Status>(RemoveVaultResponse {
-                notes_deleted: notes_deleted as u64,
-            })
+            let search_rows_before = indexed_search_rows_before(&state);
+            run_remove_vault_with_projection(&state, &req.vault_uid, search_rows_before)
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -1883,38 +3179,20 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let (file_count, sym_count) = state
-                .store
-                .bulk_delete_repo_files_and_symbols(&req.repo_uid)
-                .map_err(|e| {
-                    Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}"))
-                })?;
-
-            state
-                .store
-                .clear_repo_derived_nodes(&req.repo_uid)
-                .map_err(|e| Status::internal(format!("clear_repo_derived_nodes failed: {e:#}")))?;
-
-            state
-                .store
-                .delete_repo_node(&req.repo_uid)
-                .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))?;
-
-            if let Some(ref tantivy) = state.tantivy
-                && tantivy.has_writer()
-            {
-                match tantivy.reindex_from_store(&state.store) {
-                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after repo removal"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tantivy reindex failed after repo removal")
-                    }
-                }
-            }
-
-            Ok::<_, Status>(RemoveRepoResponse {
-                files_deleted: file_count as u64,
-                symbols_deleted: sym_count as u64,
-            })
+            run_remove_repo_with(
+                &state,
+                &req.repo_uid,
+                |store, uid| {
+                    store.clear_repo_derived_nodes(uid).map_err(|e| {
+                        Status::internal(format!("clear_repo_derived_nodes failed: {e:#}"))
+                    })
+                },
+                |store, uid| {
+                    store
+                        .delete_repo_node(uid)
+                        .map_err(|e| Status::internal(format!("delete_repo_node failed: {e:#}")))
+                },
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -1939,28 +3217,14 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            // Look up project name before deleting.
-            let projects = state
-                .store
-                .list_projects()
-                .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
-            let project_name = projects
-                .iter()
-                .find(|p| p.uid == req.project_uid)
-                .map(|p| p.name.clone())
-                .unwrap_or_default();
-
-            state
-                .store
-                .delete_project_edges(&req.project_uid)
-                .map_err(|e| Status::internal(format!("delete_project_edges failed: {e:#}")))?;
-
-            state
-                .store
-                .delete_project_node(&req.project_uid)
-                .map_err(|e| Status::internal(format!("delete_project_node failed: {e:#}")))?;
-
-            Ok::<_, Status>(RemoveProjectResponse { project_name })
+            run_remove_project_with(
+                &state,
+                &req.project_uid,
+                |store, uid| store.delete_project_cascade_with_outcome(uid),
+                |store, uid| store.project_exists(uid),
+                nestweaver_engine::remove_extension_uid_durable,
+                finalize_node_graph_deletion,
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -1985,44 +3249,17 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let mut removed_vaults = Vec::new();
-
-            // Prune stale repos (local working tree no longer exists on disk).
-            let removed_repos = prune_stale_repos(&state.store)
-                .map_err(|e| Status::internal(format!("prune stale repos failed: {e:#}")))?;
-
-            // Prune stale vaults (root_path no longer exists on disk).
-            let vaults = state
-                .store
-                .list_vaults(None)
-                .map_err(|e| Status::internal(format!("list_vaults failed: {e:#}")))?;
-
-            for vault in &vaults {
-                if !Path::new(&vault.root_path).exists() {
-                    state.store.delete_vault_cascade(&vault.uid).map_err(|e| {
-                        Status::internal(format!("delete_vault_cascade failed: {e:#}"))
-                    })?;
-                    removed_vaults.push(vault.name.clone());
-                }
-            }
-
-            // Reindex Tantivy if anything was removed.
-            if (!removed_repos.is_empty() || !removed_vaults.is_empty())
-                && let Some(ref tantivy) = state.tantivy
-                && tantivy.has_writer()
-            {
-                match tantivy.reindex_from_store(&state.store) {
-                    Ok(n) => tracing::info!(docs = n, "Tantivy reindexed after prune_stale"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tantivy reindex failed after prune_stale")
-                    }
-                }
-            }
-
-            Ok::<_, Status>(PruneStaleResponse {
-                removed_repos,
-                removed_vaults,
-            })
+            run_prune_stale_with(
+                &state,
+                delete_repo_cascade,
+                |store, vault| {
+                    store
+                        .delete_vault_cascade(&vault.uid)
+                        .map(|_| ())
+                        .map_err(|e| anyhow::anyhow!("delete_vault_cascade failed: {e:#}"))
+                },
+                rebuild_tantivy_after_mutation,
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -2039,18 +3276,32 @@ impl NestWeaverDaemon for DaemonService {
         {
             return Err(Status::permission_denied("admin token required"));
         }
+        let req = request.into_inner();
+        let from_id = resolve_effective_instance_id(&req.from_id, &self.state.data_instance_id)?;
+        let to_id = resolve_effective_instance_id(&req.to_id, &self.state.data_instance_id)?;
+        if from_id == to_id {
+            return Err(Status::invalid_argument(
+                "source and target instance IDs must differ",
+            ));
+        }
         let _write_lock = self.state.write_mutex.lock().await;
         let _guard = ConnectionGuard::write(&self.state);
 
-        let req = request.into_inner();
         let state = self.state.clone();
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let result = state
-                .store
-                .merge_instance_ids(&req.from_id, &req.to_id)
-                .map_err(|e| Status::internal(format!("merge_instance_ids failed: {e:#}")))?;
+            let result = run_merge_instance_with(
+                &state,
+                &from_id,
+                &to_id,
+                |store, from_id, to_id| {
+                    store
+                        .merge_instance_ids(from_id, to_id)
+                        .map_err(|e| anyhow::anyhow!("{e:#}"))
+                },
+                rebuild_tantivy_after_mutation,
+            )?;
 
             let discarded_vaults = result
                 .discarded
@@ -2063,6 +3314,7 @@ impl NestWeaverDaemon for DaemonService {
                 repos_reparented: result.repos as u64,
                 projects_reparented: result.projects as u64,
                 discarded_vaults,
+                repos_needing_reindex: result.repos_moved,
             })
         })
         .await
@@ -2083,7 +3335,8 @@ impl NestWeaverDaemon for DaemonService {
             return Err(Status::permission_denied("admin token required"));
         }
         let req = request.into_inner();
-        let instance_id = req.instance_id.clone();
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
         let state = self.state.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
@@ -2101,22 +3354,17 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            match state.store.purge_instance(&instance_id) {
+            match run_purge_instance_with(
+                &state,
+                &instance_id,
+                |store, id| {
+                    store
+                        .purge_instance(id)
+                        .map_err(|e| anyhow::anyhow!("{e:#}"))
+                },
+                rebuild_tantivy_after_mutation,
+            ) {
                 Ok(result) => {
-                    // Rebuild Tantivy so BM25 search reflects purged vaults.
-                    if let Some(ref tantivy) = state.tantivy
-                        && tantivy.has_writer()
-                    {
-                        match tantivy.reindex_from_store(&state.store) {
-                            Ok(n) => {
-                                tracing::info!(docs = n, "Tantivy reindexed after instance purge")
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Tantivy reindex failed after instance purge")
-                            }
-                        }
-                    }
-
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
                         message: format!(
@@ -2137,7 +3385,7 @@ impl NestWeaverDaemon for DaemonService {
                 Err(e) => {
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Error as i32,
-                        message: format!("PurgeInstance failed: {e:#}"),
+                        message: e.message().to_string(),
                         files_processed: 0,
                         files_total: 0,
                         symbols_found: 0,
@@ -2940,7 +4188,51 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        json_rpc!(self, r, "query_extensions")
+        let _guard = ConnectionGuard::read(&self.state);
+        let state = self.state.clone();
+        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
+            .map_err(|error| Status::invalid_argument(format!("invalid args JSON: {error}")))?;
+        let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
+            let extensions = nestweaver_engine::load_live_extensions(&state.store, &state.db_path)
+                .map_err(|error| {
+                    Status::internal(format!("query extension liveness failed: {error:#}"))
+                })?;
+            if let Some(uid) = args.get("uid").and_then(|value| value.as_str()) {
+                return Ok(serde_json::json!({
+                    "uid": uid,
+                    "properties": nestweaver_engine::get_all_properties(&extensions, uid),
+                }));
+            }
+            let key = args
+                .get("key")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    Status::invalid_argument("provide either 'uid' or both 'key' and 'value'")
+                })?;
+            let value = args.get("value").cloned().ok_or_else(|| {
+                Status::invalid_argument("'value' is required when 'key' is given")
+            })?;
+            let results: Vec<_> = nestweaver_engine::query_by_property(&extensions, key, &value)
+                .into_iter()
+                .map(|uid| {
+                    serde_json::json!({
+                        "uid": uid,
+                        "properties": extensions.get(uid).cloned().unwrap_or_default(),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "key": key,
+                "value": value,
+                "count": results.len(),
+                "results": results,
+            }))
+        })
+        .await
+        .map_err(|error| Status::internal(format!("spawn_blocking panicked: {error}")))??;
+        serde_json::to_string(&result)
+            .map(|result_json| Response::new(JsonResponse { result_json }))
+            .map_err(|error| Status::internal(format!("serialization failed: {error}")))
     }
 
     // ── Read RPCs — direct store access (no MCP tool) ──────────────
@@ -3205,8 +4497,8 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
         let result = tokio::task::spawn_blocking(move || {
-            let cache_path = state.db_path.with_extension("manifests.json");
-            let manifests = nestweaver_engine::load_manifest_cache(&cache_path).unwrap_or_default();
+            let manifests =
+                nestweaver_engine::load_manifest_cache_for_db(&state.db_path).unwrap_or_default();
             let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
                 .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
             serde_json::to_string(&suggestions)
@@ -3263,29 +4555,10 @@ impl NestWeaverDaemon for DaemonService {
         // R9/R9b: resolve the caller's per-repo visibility from the request's
         // Identity extension BEFORE the request is consumed. A disabled policy
         // (no `[authz]`) short-circuits to `All` with no repo listing (zero
-        // behavior change); when enabled we list repos ONCE here and reuse that
-        // same listing for redaction below — no duplicate `list_repos`.
-        let (visible, authz_repos) = {
-            use nestweaver_engine::authz::{Identity, VisibleRepos};
-            if self.state.permission_source.is_enabled() {
-                let identity = r
-                    .extensions()
-                    .get::<Identity>()
-                    .cloned()
-                    .unwrap_or(Identity::Anonymous);
-                let repos = self.state.store.list_repos(None).unwrap_or_else(|e| {
-                    tracing::warn!("authz: list_repos failed, failing closed: {e:#}");
-                    Vec::new()
-                });
-                let v = self
-                    .state
-                    .permission_source
-                    .visible_repos(&identity, &repos);
-                (v, repos)
-            } else {
-                (VisibleRepos::All, Vec::new())
-            }
-        };
+        // behavior change). nw-043: a store error while listing fails the RPC
+        // loudly (Unavailable, after one retry inside `visible_repos_for`)
+        // instead of silently redacting everything.
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
             .map_err(|e| Status::invalid_argument(format!("invalid args JSON: {e}")))?;
 
@@ -3355,14 +4628,27 @@ impl NestWeaverDaemon for DaemonService {
                     Status::internal("blast radius analysis failed")
                 })?;
                 // R9/R9b: redact the result to the caller's visible repos before
-                // serialization, reusing the single repo listing resolved above.
-                // `VisibleRepos::All` (the no-`[authz]` default) makes this a
-                // no-op (and `authz_repos` is empty), preserving single-trust-domain.
-                nestweaver_engine::authz::redact_blast_radius_for_visibility(
-                    &mut result,
-                    &visible,
-                    &authz_repos,
-                );
+                // serialization. `VisibleRepos::All` (the no-`[authz]` default)
+                // skips the listing entirely — redaction is a no-op — preserving
+                // single-trust-domain. nw-043: a store error at this re-list means
+                // the earlier listing succeeded and this one failed — exactly the
+                // transient signature — so fail the RPC rather than serve a
+                // mis-redacted result.
+                if matches!(visible, nestweaver_engine::authz::VisibleRepos::Only(_)) {
+                    let repos = state.store.list_repos(None).map_err(|e| {
+                        // Log the detailed chain server-side; return a generic
+                        // message so the client never sees store internals.
+                        tracing::error!(
+                            "authz: repo listing failed at pr_impact redaction point: {e:#}"
+                        );
+                        Status::unavailable("authz repo listing unavailable")
+                    })?;
+                    nestweaver_engine::authz::redact_blast_radius_for_visibility(
+                        &mut result,
+                        &visible,
+                        &repos,
+                    );
+                }
                 serde_json::to_string(&result)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
             })
@@ -3980,8 +5266,9 @@ fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
 
 /// Claim the exclusive per-instance lock — the pidfile flock that makes an
 /// `instance_id` single-owner on this host — and return the pidfile handle
-/// whose lifetime holds the lock (dropping it releases the lock). `None` in
-/// fork mode, where `daemonize2` already holds the flock (acquired pre-fork).
+/// whose lifetime holds the lock (dropping it releases the lock). `None` only
+/// in a daemonize child that proves the inherited daemonize2 pidfile belongs to
+/// its own PID.
 ///
 /// Acquired **before** snapshot materialization so a duplicate replica started
 /// with the identical `--db` (hence identical `instance_id` and
@@ -3990,8 +5277,18 @@ fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
 /// same pidfile hold independent open-file descriptions, so `flock(LOCK_EX)`
 /// from a second process fails even though the first holder is also us-shaped.
 fn claim_instance_lock(instance_id: &str) -> Result<Option<std::fs::File>, anyhow::Error> {
-    // Fork mode: the flock is already held by daemonize2 (acquired pre-fork).
-    if std::env::var("NESTWEAVER_DAEMON_FORK").is_ok() {
+    // daemonize2 acquired this flock before forking and the child inherited
+    // its open file description. Opening the pidfile again would conflict with
+    // that inherited lock. The launcher marks only the real daemonize child;
+    // matching the file's PID prevents an inherited/user-set environment value
+    // from disabling duplicate-daemon exclusion for a normal `daemon run`.
+    let inherited_daemonize_lock = std::env::var("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD").as_deref()
+        == Ok("1")
+        && std::fs::read_to_string(lifecycle::pidfile_path(instance_id))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            == Some(std::process::id());
+    if inherited_daemonize_lock {
         return Ok(None);
     }
     // The pidfile lives in the per-instance runtime dir (created on demand).
@@ -4055,12 +5352,13 @@ fn build_self_signed_acceptor(
     let bundle = nestweaver_engine::tls::generate_tls_bundle(server_names, 397, false)
         .context("generate interim self-signed certificate")?;
 
-    let certs = rustls_pemfile::certs(&mut bundle.server_cert_pem.as_bytes())
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    let certs = CertificateDer::pem_slice_iter(bundle.server_cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .context("parse interim self-signed certificate PEM")?;
-    let key = rustls_pemfile::private_key(&mut bundle.server_key_pem.as_bytes())
-        .context("parse interim self-signed key PEM")?
-        .context("no private key in generated self-signed bundle")?;
+    let key = PrivateKeyDer::from_pem_slice(bundle.server_key_pem.as_bytes())
+        .context("parse interim self-signed key PEM")?;
 
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
@@ -4390,6 +5688,12 @@ pub async fn run_server(
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
+    // nw-019: two identities. `instance_id` (db-path hash) is for RUNTIME paths
+    // only — sockets/pidfiles/launchd/replica locks (104-byte sun_path limit).
+    // `data_instance_id` (the config's logical name when we have one) is what
+    // gets written into graph nodes, so users see and type one name everywhere.
+    // Built later once `instance_cfg` is parsed; a config-less start falls back
+    // to the hash so `data_instance_id == instance_id`.
 
     // Set up daily-rolling log file via tracing-appender. This replaces
     // the manual rotate-at-startup approach and handles rotation while the
@@ -4419,7 +5723,8 @@ pub async fn run_server(
     // duplicate replica on the identical `--db` shares this instance id (and its
     // `replica-work-<id>` dir), so rejecting it here stops its materialize copy
     // from truncating a live sibling's working copy. Held for the process
-    // lifetime; released on drop. (In fork mode daemonize2 already holds it.)
+    // lifetime; released on drop. A daemonize child proves it inherited the
+    // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
 
     // Snapshot replica: materialize the snapshot into a private working copy and
@@ -4486,62 +5791,16 @@ pub async fn run_server(
         store.load_interaction_cache(scores);
     }
 
-    // Open the Tantivy index. A read-only snapshot replica never mutates its
-    // index, so it opens reader-only and never acquires a writer lock — this
-    // matches the read-only store open and keeps a replica from holding a
-    // writer on its (private) materialized copy. The read-write daemon opens
-    // with a writer so it can update the index after indexing operations
-    // (vault/repo), falling back to reader-only when the writer lock is held by
-    // another process (e.g. a running brain watcher), and finally to None when
-    // the index doesn't exist at all.
+    // Open the Tantivy index. A read-only snapshot replica intentionally
+    // disables search reconciliation and uses a reader when one is available.
+    // A read-write daemon requests a writer for vault indexing and deletion
+    // repair. If that writer is unavailable, a reader can still serve queries,
+    // but the explicit unavailable reconciliation state makes a later indexed
+    // mutation fail instead of silently skipping repair. When neither handle
+    // opens, queries use substring fallback and indexed mutations still surface
+    // the configured-index failure.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
-    let tantivy = if read_only {
-        match TantivyIndex::open_reader_only(&tantivy_path) {
-            Ok(idx) => {
-                tracing::info!(
-                    docs = idx.doc_count(),
-                    path = %tantivy_path.display(),
-                    "Tantivy index open (replica, reader-only)"
-                );
-                Some(Arc::new(idx))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "could not open Tantivy index reader — search will use substring fallback"
-                );
-                None
-            }
-        }
-    } else {
-        match TantivyIndex::open_or_create(&tantivy_path) {
-            Ok(idx) => {
-                tracing::info!(
-                    docs = idx.doc_count(),
-                    path = %tantivy_path.display(),
-                    "Tantivy index open (read-write)"
-                );
-                Some(Arc::new(idx))
-            }
-            Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
-                Ok(idx) => {
-                    tracing::info!(
-                        docs = idx.doc_count(),
-                        path = %tantivy_path.display(),
-                        "Tantivy index open (reader-only fallback)"
-                    );
-                    Some(Arc::new(idx))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "could not open Tantivy index — search will use substring fallback"
-                    );
-                    None
-                }
-            },
-        }
-    };
+    let (tantivy, search_reconciliation) = open_search_index(&tantivy_path, read_only);
 
     let idle_notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -4589,6 +5848,14 @@ pub async fn run_server(
             }
         },
     };
+
+    // nw-019: graph-data identity — the config's logical `instance_id` when we
+    // have a parsed config, else fall back to the runtime hash so a config-less
+    // daemon still has `data_instance_id == instance_id`.
+    let data_instance_id = instance_cfg
+        .as_ref()
+        .map(|c| c.instance_id.clone())
+        .unwrap_or_else(|| instance_id.clone());
 
     let is_server_mode = server_opts.is_some();
 
@@ -4670,9 +5937,11 @@ pub async fn run_server(
         store: Arc::new(store),
 
         tantivy,
+        search_reconciliation,
         db_path: db_path.clone(),
         read_only,
         instance_id: instance_id.clone(),
+        data_instance_id: data_instance_id.clone(),
         start_time: Instant::now(),
         active_reads: Arc::new(AtomicU32::new(0)),
         active_writes: Arc::new(AtomicU32::new(0)),
@@ -4694,6 +5963,29 @@ pub async fn run_server(
         admin_state: std::sync::OnceLock::new(),
         worker_handle: std::sync::Mutex::new(None),
     });
+
+    if !read_only {
+        recover_pending_instance_extension_migration(&state).with_context(|| {
+            format!(
+                "failed to recover pending instance extension migration for {}",
+                db_path.display()
+            )
+        })?;
+        nestweaver_engine::reconcile_extension_handoffs(&state.store, &state.db_path)
+            .with_context(|| {
+                format!(
+                    "failed to reconcile pending extension handoffs for {}",
+                    db_path.display()
+                )
+            })?;
+        nestweaver_engine::reconcile_extension_liveness(&state.store, &state.db_path)
+            .with_context(|| {
+                format!(
+                    "failed to reconcile extension liveness for {}",
+                    db_path.display()
+                )
+            })?;
+    }
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
     // hits the cache instead of spending ~350ms rebuilding from the DB.
@@ -4927,7 +6219,10 @@ pub async fn run_server(
             && let Ok(queue) = shared_job_queue.lock()
         {
             for repo_cfg in &cfg.repos {
-                let repo_uid = nestweaver_schema::repo_uid(&instance_id, &repo_cfg.url);
+                // nw-019: look up under the same logical instance the worker
+                // stamps on the repo, or the "already indexed?" check never
+                // matches and we re-enqueue on every boot.
+                let repo_uid = nestweaver_schema::repo_uid(&data_instance_id, &repo_cfg.url);
                 let needs_initial_index = state
                     .store
                     .lookup_repo(&repo_uid)
@@ -5034,6 +6329,7 @@ pub async fn run_server(
                     std::collections::HashMap::new(),
                 )),
                 daemon_store: state.store.clone(),
+                tantivy: state.tantivy.clone(),
                 instance_id: state.instance_id.clone(),
                 start_time: state.start_time,
                 active_reads: state.active_reads.clone(),
@@ -5233,12 +6529,13 @@ pub async fn run_server(
                     tonic::transport::Identity::from_pem(cert_pem.clone(), key_pem.clone());
                 let tonic_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
 
-                let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+                use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+                let certs = CertificateDer::pem_slice_iter(&cert_pem)
                     .collect::<Result<Vec<_>, _>>()
                     .context("parse TLS certificate PEM")?;
-                let key = rustls_pemfile::private_key(&mut &key_pem[..])
-                    .context("parse TLS private key PEM")?
-                    .context("no private key found in PEM")?;
+                let key =
+                    PrivateKeyDer::from_pem_slice(&key_pem).context("parse TLS private key PEM")?;
                 let mut server_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
@@ -5509,7 +6806,8 @@ pub async fn run_server(
         if !read_only {
             let worker_store = Arc::clone(&state.store);
             let worker_db = db_path.clone();
-            let worker_instance = instance_id.clone();
+            // nw-019: the worker stamps this on every repo it indexes.
+            let worker_instance = data_instance_id.clone();
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
             let worker_write_mutex = Arc::clone(&state.write_mutex);
@@ -5641,7 +6939,9 @@ pub async fn run_server(
     // (it would poll git remotes and enqueue index jobs against the snapshot).
     if server_opts.is_some() && !read_only {
         let poll_store = Arc::clone(&state.store);
-        let poll_instance = instance_id.clone();
+        // nw-019: must match the worker's stamp, or list_repos/repo_uid
+        // lookups here find nothing and the scheduler never polls the repos.
+        let poll_instance = data_instance_id.clone();
         let poll_job_queue = shared_job_queue_opt.clone();
         let poll_cfg = state.instance_cfg.clone();
         let poll_drained = Arc::clone(&state.drained);
@@ -5817,7 +7117,9 @@ pub async fn run_server(
         let metrics_active_reads = Arc::clone(&state.active_reads);
         let metrics_active_writes = Arc::clone(&state.active_writes);
         let metrics_job_queue = shared_job_queue_opt.clone();
-        let metrics_instance = instance_id.clone();
+        // nw-019: must match the worker's stamp, or the repo-count gauge
+        // filters on the wrong instance and always reads zero.
+        let metrics_instance = data_instance_id.clone();
         let metrics_mcp_sessions = mcp_session_gauge_opt.clone();
         let mut metrics_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -6446,6 +7748,1595 @@ mod startup_helper_tests {
         }
     }
 
+    fn seed_manifest_and_embedding(
+        state: &DaemonState,
+        repo_uid: &str,
+        package_name: &str,
+    ) -> String {
+        let manifests_path = nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json");
+        let mut manifests =
+            nestweaver_engine::load_manifest_cache(&manifests_path).unwrap_or_default();
+        manifests.insert(
+            repo_uid.to_string(),
+            nestweaver_engine::ManifestInfo {
+                package_name: Some(package_name.to_string()),
+                dependencies: Vec::new(),
+                entry_files: Vec::new(),
+            },
+        );
+        nestweaver_engine::save_manifest_cache(&manifests, &manifests_path).unwrap();
+
+        let symbol_uid = format!("sym:{repo_uid}:{package_name}");
+        state
+            .store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: symbol_uid.clone(),
+                name: package_name.to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: repo_uid.to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn {package_name}()"),
+                summary: None,
+                content_hash: format!("hash:{package_name}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        assert!(state.store.add_embedding(&symbol_uid, vec![1.0, 0.0]));
+        state.store.flush_embedding_index().unwrap();
+        symbol_uid
+    }
+
+    fn seed_project(state: &DaemonState, uid: &str, name: &str) {
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: uid.to_string(),
+                name: name.to_string(),
+                summary: None,
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+    }
+
+    fn seed_extension(state: &DaemonState, uid: &str, key: &str, value: serde_json::Value) {
+        let mut extensions = nestweaver_engine::load_extensions(&state.db_path);
+        nestweaver_engine::set_property(&mut extensions, uid, key, value);
+        nestweaver_engine::save_extensions(&state.db_path, &extensions).unwrap();
+    }
+
+    fn project_delete_error(
+        uid: &str,
+        name: Option<&str>,
+        disposition: nestweaver_store::ProjectMutationDisposition,
+        message: &str,
+    ) -> nestweaver_store::DeleteProjectCascadeError {
+        nestweaver_store::DeleteProjectCascadeError {
+            project_uid: uid.to_string(),
+            project_name: name.map(str::to_string),
+            disposition,
+            primary: nestweaver_store::StoreError::Query(message.to_string()),
+            rollback: None,
+        }
+    }
+
+    fn seed_vault_note_heading_embeddings(
+        state: &DaemonState,
+        vault_uid: &str,
+        instance_id: &str,
+        root_path: &str,
+    ) -> (String, String) {
+        use nestweaver_schema::{Heading, Note, NoteKind, Vault};
+
+        state
+            .store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: format!("vault-{vault_uid}"),
+                root_path: root_path.to_string(),
+                instance_id: instance_id.to_string(),
+            })
+            .unwrap();
+        let note_uid = format!("note:{vault_uid}");
+        state
+            .store
+            .insert_note(&Note {
+                uid: note_uid.clone(),
+                vault_uid: vault_uid.to_string(),
+                file_path: "note.md".to_string(),
+                title: format!("Note {vault_uid}"),
+                note_kind: NoteKind::General,
+                word_count: 3,
+                content_hash: format!("hash:{note_uid}"),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        state
+            .store
+            .insert_vault_note_edge(vault_uid, &note_uid)
+            .unwrap();
+        let heading_uid = format!("head:{vault_uid}");
+        state
+            .store
+            .insert_heading(&Heading {
+                uid: heading_uid.clone(),
+                note_uid: note_uid.clone(),
+                level: 1,
+                text: "Heading".to_string(),
+                slug: "heading".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: format!("hash:{heading_uid}"),
+                embedding: None,
+            })
+            .unwrap();
+        state
+            .store
+            .batch_insert_note_heading_edges(&[(&note_uid, &heading_uid)])
+            .unwrap();
+        assert!(state.store.add_embedding(&note_uid, vec![1.0, 0.0]));
+        assert!(state.store.add_embedding(&heading_uid, vec![0.0, 1.0]));
+        state.store.flush_embedding_index().unwrap();
+        (note_uid, heading_uid)
+    }
+
+    fn assert_embeddings_absent(state: &DaemonState, uids: &[&str]) {
+        for uid in uids {
+            assert!(
+                !state.store.has_embedding(uid),
+                "stale embedding survived for {uid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_vault_prunes_note_and_heading_embeddings() {
+        let state = test_state_with_writer();
+        let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:remove:docs",
+            "remove",
+            "/missing/remove-docs",
+        );
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(RemoveVaultRequest {
+            vault_uid: "vlt:remove:docs".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        service.remove_vault(request).await.unwrap();
+
+        assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn remove_vault_targeted_extension_cleanup_preserves_unrelated_note_keys() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+
+        let state = test_state_with_writer();
+        let vault_uid = "vlt:remove:scoped";
+        let note_uid = format!("note:{vault_uid}:dead");
+        state
+            .store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "scoped".to_string(),
+                root_path: "/missing/scoped-vault".to_string(),
+                instance_id: "remove".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_note(&Note {
+                uid: note_uid.clone(),
+                vault_uid: vault_uid.to_string(),
+                file_path: "dead.md".to_string(),
+                title: "Dead".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "dead".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        state
+            .store
+            .insert_vault_note_edge(vault_uid, &note_uid)
+            .unwrap();
+
+        let unrelated = "note:vlt:unrelated:aaaaaaaaaaaa";
+        let mut extensions = nestweaver_engine::load_extensions(&state.db_path);
+        nestweaver_engine::set_property(
+            &mut extensions,
+            &note_uid,
+            "owner",
+            serde_json::json!("dead"),
+        );
+        nestweaver_engine::set_property(
+            &mut extensions,
+            unrelated,
+            "owner",
+            serde_json::json!("keep"),
+        );
+        nestweaver_engine::save_extensions(&state.db_path, &extensions).unwrap();
+
+        run_remove_vault_with_projection(&state, vault_uid, None).unwrap();
+
+        let reopened = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!reopened.contains_key(&note_uid));
+        assert!(reopened.contains_key(unrelated));
+    }
+
+    #[test]
+    fn nonexistent_vault_skips_all_reconciliation_after_unknown_preflight() {
+        let state = test_state_with_writer();
+        let tantivy = state.tantivy.as_ref().unwrap();
+        tantivy
+            .update_note(
+                "note:nonexistent-vault-noop",
+                "nonexistent_vault_noop_sentinel",
+                "vlt:nonexistent-vault-noop",
+                &["nonexistent_vault_noop_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            state
+                .store
+                .add_embedding("note:nonexistent-vault-noop", vec![1.0, 0.0])
+        );
+        state.store.flush_embedding_index().unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"nonexistent-vault-noop":0.5}"#).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let response = run_remove_vault_with_projection(
+            &state,
+            "vlt:does-not-exist",
+            Some(Err(anyhow::anyhow!(
+                "deterministic preflight projection failure"
+            ))),
+        )
+        .unwrap();
+
+        assert_eq!(response.notes_deleted, 0);
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert!(pagerank_path.exists());
+        assert!(state.store.has_embedding("note:nonexistent-vault-noop"));
+        assert!(
+            !tantivy
+                .search("nonexistent_vault_noop_sentinel", 10)
+                .unwrap()
+                .is_empty(),
+            "confirmed no-op must not rebuild available search"
+        );
+
+        let mut unavailable = test_state_with_writer();
+        Arc::get_mut(&mut unavailable)
+            .unwrap()
+            .search_reconciliation =
+            SearchIndexReconciliation::Unavailable("configured search unavailable".to_string());
+        let generation_before = unavailable.store.graph_generation();
+        let response = run_remove_vault_with_projection(
+            &unavailable,
+            "vlt:still-does-not-exist",
+            Some(Err(anyhow::anyhow!(
+                "deterministic preflight projection failure"
+            ))),
+        )
+        .unwrap();
+        assert_eq!(response.notes_deleted, 0);
+        assert_eq!(unavailable.store.graph_generation(), generation_before);
+    }
+
+    #[tokio::test]
+    async fn typed_remove_vault_surfaces_embedding_persistence_failure() {
+        let state = test_state_with_writer();
+        let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:remove:embedding-failure",
+            "remove-embedding-failure",
+            "/missing/remove-embedding-failure",
+        );
+        let embedding_path = state.store.embedding_sidecar_path().unwrap();
+        std::fs::remove_file(&embedding_path).unwrap();
+        std::fs::create_dir(&embedding_path).unwrap();
+        let tantivy = state.tantivy.as_ref().unwrap();
+        tantivy
+            .update_note(
+                "note:stale-vault-reconciliation",
+                "stale_vault_reconciliation_sentinel",
+                "vlt:remove:embedding-failure",
+                &["stale_vault_reconciliation_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let generation_before = state.store.graph_generation();
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(RemoveVaultRequest {
+            vault_uid: "vlt:remove:embedding-failure".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let error = service.remove_vault(request).await.unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("embedding-index"));
+        assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(
+            tantivy
+                .search("stale_vault_reconciliation_sentinel", 10)
+                .unwrap()
+                .is_empty(),
+            "search rebuild must run after embedding persistence failure"
+        );
+    }
+
+    #[test]
+    fn prune_stale_vault_prunes_note_and_heading_embeddings() {
+        let state = test_state_with_writer();
+        let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:prune:docs",
+            "prune",
+            "/definitely/missing/prune-docs",
+        );
+
+        let result = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.removed_vaults.len(), 1);
+        assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn prune_surfaces_search_reconciliation_failure_after_other_finalizers() {
+        let state = test_state_with_writer();
+        seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:prune:search-failure",
+            "prune-search-failure",
+            "/definitely/missing/prune-search-failure",
+        );
+        let generation_before = state.store.graph_generation();
+
+        let error = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| {
+                Err(anyhow::anyhow!("injected Tantivy rebuild failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("search-index"));
+        assert!(error.message().contains("injected Tantivy rebuild failure"));
+        assert!(
+            state.store.graph_generation() > generation_before,
+            "generation finalization must precede the surfaced search failure"
+        );
+    }
+
+    #[test]
+    fn purge_preserves_real_mutation_error_and_appends_real_reconciliation_failure() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:partial:real-purge-error";
+        let file_uid = nestweaver_schema::file_uid(repo_uid, "src/lib.rs");
+        let mut repo = test_repo(repo_uid, "https://example.test/real-purge-error", None);
+        repo.instance_id = "partial".to_string();
+        state.store.insert_repo(&repo).unwrap();
+        state
+            .store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid,
+                path: "src/lib.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        std::fs::create_dir(&generation_path).unwrap();
+        let mut search_reconciliations = 0;
+
+        let error = run_purge_instance_with(
+            &state,
+            "partial",
+            |store, _id| {
+                let repo = store.lookup_repo(repo_uid)?.unwrap();
+                delete_repo_cascade(store, &repo)?;
+                Err(anyhow::anyhow!("real committed purge mutation failure"))
+            },
+            |_state, _mutation, _operation| {
+                search_reconciliations += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .message()
+                .contains("real committed purge mutation failure")
+        );
+        assert!(error.message().contains("generation-persistence"));
+        assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
+        assert_eq!(
+            search_reconciliations, 0,
+            "code-only purge changed no indexed documents"
+        );
+    }
+
+    #[test]
+    fn merge_surfaces_search_reconciliation_failure_after_committed_mutation() {
+        let state = test_state_with_writer();
+        seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:merge:search-failure",
+            "merge-search-source",
+            "/missing/merge-search-failure",
+        );
+
+        let error = run_merge_instance_with(
+            &state,
+            "merge-search-source",
+            "merge-search-target",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Err(anyhow::anyhow!("injected merge search failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("search-index"));
+        assert!(error.message().contains("injected merge search failure"));
+        assert!(
+            state
+                .store
+                .list_vaults(Some("merge-search-source"))
+                .unwrap()
+                .is_empty(),
+            "source vault mutation must have committed before reconciliation failed"
+        );
+    }
+
+    #[test]
+    fn merge_extension_prepare_failure_prevents_graph_mutation() {
+        let state = test_state_with_writer();
+        seed_project(&state, "proj:old:prepare", "Prepare failure");
+        let merge_called = std::cell::Cell::new(false);
+        let generation_before = state.store.graph_generation();
+
+        let error = run_merge_instance_with_extension_ops(
+            &state,
+            "old",
+            "new",
+            |_store, _from, _to| {
+                merge_called.set(true);
+                unreachable!("graph mutation must not run after extension prepare failure")
+            },
+            |_state, _mutation, _operation| Ok(()),
+            |_store, _db_path, _from, _to| {
+                Err::<((), bool), _>(anyhow::anyhow!("injected atomic prepare write failure"))
+            },
+            |_db_path, _migration| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("extension-metadata"));
+        assert!(
+            error
+                .message()
+                .contains("injected atomic prepare write failure")
+        );
+        assert!(!merge_called.get());
+        assert!(state.store.project_exists("proj:old:prepare").unwrap());
+        assert_eq!(state.store.graph_generation(), generation_before);
+    }
+
+    #[test]
+    fn merge_extension_finalize_failure_surfaces_after_graph_and_finalizers() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:old:finalize".to_string(),
+                name: "Finalize failure".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let error = run_merge_instance_with_extension_ops(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+            |_store, _db_path, _from, _to| Ok(((), true)),
+            |_db_path, _migration| Err(anyhow::anyhow!("injected atomic finalize write failure")),
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("extension-metadata"));
+        assert!(
+            error
+                .message()
+                .contains("injected atomic finalize write failure")
+        );
+        assert!(!state.store.project_exists("proj:old:finalize").unwrap());
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json").exists(),
+            "node finalizer must still invalidate PageRank"
+        );
+    }
+
+    #[test]
+    fn merge_extension_finalize_failure_retries_from_durable_journal() {
+        use nestweaver_schema::uid::project_uid;
+
+        let state = test_state_with_writer();
+        let source_uid = project_uid("old", "Retry migration");
+        let destination_uid = project_uid("new", "Retry migration");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_uid.clone(),
+                name: "Retry migration".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        seed_extension(
+            &state,
+            &source_uid,
+            "nested",
+            serde_json::json!({"retry": [true, {"depth": 2}]}),
+        );
+
+        let first_error = run_merge_instance_with_extension_ops(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+            |store, db_path, from, to| {
+                let mappings = store.plan_instance_uid_remaps(from, to)?;
+                let migration = nestweaver_engine::prepare_instance_extension_migration(
+                    db_path, from, to, &mappings,
+                )?;
+                let active = migration.is_active();
+                Ok((migration, active))
+            },
+            |_db_path, _migration| {
+                Err(anyhow::anyhow!(
+                    "injected post-graph extension write failure"
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(first_error.message().contains("extension-metadata"));
+        assert!(!state.store.project_exists(&source_uid).unwrap());
+        let staged = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(staged.contains_key(&source_uid));
+        assert!(!staged.contains_key(&destination_uid));
+        assert!(
+            nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+
+        // The graph no longer contains the source Project, so this retry can
+        // succeed only by loading the persisted mapping journal.
+        let retried = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(retried.projects, 0);
+        let finalized = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!finalized.contains_key(&source_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&finalized, &destination_uid, "nested"),
+            Some(&serde_json::json!({"retry": [true, {"depth": 2}]}))
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn corrupt_extension_sidecar_prevents_real_merge_mutation() {
+        use nestweaver_schema::uid::project_uid;
+
+        let state = test_state_with_writer();
+        let source_uid = project_uid("old", "Corrupt extension");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_uid.clone(),
+                name: "Corrupt extension".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        let extension_path = nestweaver_engine::sidecar_path(&state.db_path, ".extensions.json");
+        std::fs::write(&extension_path, b"{not-json").unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("parse extension sidecar"));
+        assert!(state.store.project_exists(&source_uid).unwrap());
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn startup_recovery_automatically_finishes_a_prepared_extension_migration() {
+        use nestweaver_schema::uid::project_uid;
+
+        let state = test_state_with_writer();
+        let source_uid = project_uid("old", "Startup recovery");
+        let destination_uid = project_uid("new", "Startup recovery");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_uid.clone(),
+                name: "Startup recovery".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        seed_extension(
+            &state,
+            &source_uid,
+            "nested",
+            serde_json::json!({"automatic": [true, {"depth": 3}]}),
+        );
+        let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+        nestweaver_engine::prepare_instance_extension_migration(
+            &state.db_path,
+            "old",
+            "new",
+            &mappings,
+        )
+        .unwrap();
+        let generation_before = state.store.graph_generation();
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        assert!(!state.store.project_exists(&source_uid).unwrap());
+        assert!(state.store.project_exists(&destination_uid).unwrap());
+        assert!(state.store.graph_generation() > generation_before);
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!extensions.contains_key(&source_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_uid, "nested"),
+            Some(&serde_json::json!({"automatic": [true, {"depth": 3}]}))
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_restores_repo_deleted_before_destination_insert() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let state = test_state_with_writer();
+        let db_path = state.db_path.clone();
+        let url = "https://example.test/repo-delete-before-insert";
+        let source_uid = repo_uid("old", url);
+        let destination_uid = repo_uid("new", url);
+        let mut repo = test_repo(&source_uid, url, Some("/work/repo-delete-before-insert"));
+        repo.instance_id = "old".to_string();
+        repo.name = Some("crash-window".to_string());
+        repo.staleness_commits_behind = 7;
+        state.store.insert_repo(&repo).unwrap();
+        seed_extension(
+            &state,
+            &source_uid,
+            "owner",
+            serde_json::json!("preserve-on-recovery"),
+        );
+
+        let plan = state
+            .store
+            .plan_instance_uid_migration("old", "new")
+            .unwrap();
+        nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &plan,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan {
+                repo_uids: vec![source_uid.clone()],
+                search_reconciliation_required: false,
+            },
+        )
+        .unwrap();
+
+        state
+            .store
+            .bulk_delete_repo_files_and_symbols(&source_uid)
+            .unwrap();
+        state.store.clear_repo_derived_nodes(&source_uid).unwrap();
+        state.store.delete_repo_node(&source_uid).unwrap();
+        assert!(state.store.lookup_repo(&source_uid).unwrap().is_none());
+        assert!(state.store.lookup_repo(&destination_uid).unwrap().is_none());
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        let recovered = state
+            .store
+            .lookup_repo(&destination_uid)
+            .unwrap()
+            .expect("startup recovery must restore the missing destination Repo");
+        assert_eq!(recovered.instance_id, "new");
+        assert_eq!(recovered.url, url);
+        assert_eq!(recovered.indexed_sha, "");
+        assert_eq!(recovered.staleness_commits_behind, 7);
+        assert_eq!(recovered.name.as_deref(), Some("crash-window"));
+        assert_eq!(
+            recovered.root_path.as_deref(),
+            Some("/work/repo-delete-before-insert")
+        );
+        assert!(state.store.lookup_repo(&source_uid).unwrap().is_none());
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!extensions.contains_key(&source_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_uid, "owner"),
+            Some(&serde_json::json!("preserve-on-recovery"))
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let recovered = reopened.lookup_repo(&destination_uid).unwrap().unwrap();
+        assert_eq!(recovered.indexed_sha, "");
+        assert_eq!(recovered.name.as_deref(), Some("crash-window"));
+        assert_eq!(
+            nestweaver_engine::get_property(
+                &nestweaver_engine::load_extensions(&db_path),
+                &destination_uid,
+                "owner",
+            ),
+            Some(&serde_json::json!("preserve-on-recovery"))
+        );
+    }
+
+    #[test]
+    fn startup_recovery_restores_vault_and_project_deleted_before_destination_insert() {
+        use nestweaver_schema::uid::{project_uid, vault_uid};
+
+        let state = test_state_with_writer();
+        let vault_root = "/tmp/startup-vault-delete-before-insert";
+        let source_vault_uid = vault_uid("old", vault_root);
+        let destination_vault_uid = vault_uid("new", vault_root);
+        state
+            .store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: source_vault_uid.clone(),
+                name: "Startup vault recovery".to_string(),
+                root_path: vault_root.to_string(),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        let source_project_uid = project_uid("old", "Startup project recovery");
+        let destination_project_uid = project_uid("new", "Startup project recovery");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_project_uid.clone(),
+                name: "Startup project recovery".to_string(),
+                summary: Some("recover project metadata".to_string()),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        seed_extension(
+            &state,
+            &source_vault_uid,
+            "owner",
+            serde_json::json!("vault-owner"),
+        );
+        seed_extension(
+            &state,
+            &source_project_uid,
+            "owner",
+            serde_json::json!("project-owner"),
+        );
+
+        let plan = state
+            .store
+            .plan_instance_uid_migration("old", "new")
+            .unwrap();
+        nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &plan,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan::default(),
+        )
+        .unwrap();
+        state.store.delete_vault_cascade(&source_vault_uid).unwrap();
+        state
+            .store
+            .delete_project_node(&source_project_uid)
+            .unwrap();
+        assert!(
+            state
+                .store
+                .list_vaults(None)
+                .unwrap()
+                .iter()
+                .all(|vault| vault.uid != destination_vault_uid)
+        );
+        assert!(
+            !state
+                .store
+                .project_exists(&destination_project_uid)
+                .unwrap()
+        );
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        let recovered_vault = state
+            .store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .find(|vault| vault.uid == destination_vault_uid)
+            .expect("startup recovery must restore the missing destination Vault");
+        assert_eq!(recovered_vault.instance_id, "new");
+        assert_eq!(recovered_vault.root_path, vault_root);
+        assert!(
+            state
+                .store
+                .project_exists(&destination_project_uid)
+                .unwrap()
+        );
+        assert!(!state.store.project_exists(&source_project_uid).unwrap());
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_vault_uid, "owner"),
+            Some(&serde_json::json!("vault-owner"))
+        );
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_project_uid, "owner"),
+            Some(&serde_json::json!("project-owner"))
+        );
+        assert!(!extensions.contains_key(&source_vault_uid));
+        assert!(!extensions.contains_key(&source_project_uid));
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_uses_graph_applied_journal_for_code_sidecars() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let state = test_state_with_writer();
+        let url = "https://example.test/crash-recovery-code";
+        let source_uid = repo_uid("old", url);
+        let mut repo = test_repo(&source_uid, url, None);
+        repo.instance_id = "old".to_string();
+        state.store.insert_repo(&repo).unwrap();
+
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(source_uid.clone()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let deps_path = nestweaver_engine::sidecar_path(&state.db_path, ".resolution_deps.bin");
+        let mut deps = nestweaver_engine::resolution_cache::ResolutionDeps::default();
+        deps.set_deps_for_repo(
+            &source_uid,
+            "src/lib.rs",
+            std::collections::HashSet::from(["src/dep.rs".to_string()]),
+        );
+        deps.save(&deps_path).unwrap();
+
+        let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+        let prepared = nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &mappings,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan {
+                repo_uids: vec![source_uid.clone()],
+                search_reconciliation_required: false,
+            },
+        )
+        .unwrap();
+        state.store.merge_instance_ids("old", "new").unwrap();
+        nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &prepared,
+        )
+        .unwrap();
+
+        assert!(
+            nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&source_uid)
+        );
+        assert!(
+            !nestweaver_engine::resolution_cache::ResolutionDeps::load(&deps_path)
+                .is_empty_for_repo(&source_uid)
+        );
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&source_uid),
+            "post-graph recovery selected node-only finalization"
+        );
+        assert!(
+            nestweaver_engine::resolution_cache::ResolutionDeps::load(&deps_path)
+                .is_empty_for_repo(&source_uid)
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_uses_graph_applied_journal_for_tantivy() {
+        use nestweaver_schema::uid::vault_uid;
+
+        let state = test_state_with_writer();
+        let root = "/missing/crash-recovery-vault";
+        let source_vault_uid = vault_uid("old", root);
+        let (source_note_uid, _) =
+            seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
+        reconcile_search_index(
+            &state.search_reconciliation,
+            &state.store,
+            IndexedSearchMutation::Changed,
+            "seed_crash_recovery_vault",
+        )
+        .unwrap();
+
+        let prepared = nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &[],
+            &nestweaver_engine::InstanceMigrationFinalizerPlan {
+                repo_uids: Vec::new(),
+                search_reconciliation_required: true,
+            },
+        )
+        .unwrap();
+        state.store.merge_instance_ids("old", "new").unwrap();
+        nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &prepared,
+        )
+        .unwrap();
+        let destination_vault_uid = state.store.list_vaults(Some("new")).unwrap()[0].uid.clone();
+        let stale_hits = state.tantivy.as_ref().unwrap().search("Note", 10).unwrap();
+        assert!(
+            stale_hits
+                .iter()
+                .any(|hit| { hit.uid == source_note_uid && hit.vault_uid == source_vault_uid })
+        );
+        assert!(
+            !stale_hits.iter().any(|hit| {
+                hit.uid == source_note_uid && hit.vault_uid == destination_vault_uid
+            })
+        );
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        let recovered_hits = state.tantivy.as_ref().unwrap().search("Note", 10).unwrap();
+        assert!(
+            !recovered_hits
+                .iter()
+                .any(|hit| { hit.uid == source_note_uid && hit.vault_uid == source_vault_uid })
+        );
+        assert!(
+            recovered_hits
+                .iter()
+                .any(|hit| hit.uid == source_note_uid && hit.vault_uid == destination_vault_uid)
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn graph_applied_finalizer_failure_keeps_journal_for_retry() {
+        use nestweaver_schema::uid::vault_uid;
+
+        let state = test_state_with_writer();
+        let root = "/missing/retry-search-finalizer";
+        let source_vault_uid = vault_uid("old", root);
+        seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| {
+                Err(anyhow::anyhow!(
+                    "injected persisted search finalizer failure"
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("persisted search finalizer failure")
+        );
+        let pending =
+            nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
+        assert!(pending.graph_applied());
+        assert!(!pending.reconciled());
+        assert!(pending.search_reconciliation_required());
+
+        let mut retries = 0;
+        run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, mutation, _operation| {
+                retries += 1;
+                assert_eq!(mutation, IndexedSearchMutation::Changed);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(retries, 1);
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn real_code_finalizer_persistence_failure_keeps_graph_applied_journal() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let state = test_state_with_writer();
+        let url = "https://example.test/real-finalizer-retry";
+        let source_uid = repo_uid("old", url);
+        let mut repo = test_repo(&source_uid, url, None);
+        repo.instance_id = "old".to_string();
+        state.store.insert_repo(&repo).unwrap();
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        std::fs::create_dir(&generation_path).unwrap();
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.message().contains("generation-persistence"));
+        let pending =
+            nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
+        assert!(pending.graph_applied());
+        assert!(!pending.reconciled());
+        assert_eq!(pending.finalizer_repo_uids(), &[source_uid]);
+
+        std::fs::remove_dir(&generation_path).unwrap();
+        recover_pending_instance_extension_migration(&state).unwrap();
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn unavailable_search_finalizer_keeps_graph_applied_journal_until_restart_retry() {
+        use nestweaver_schema::uid::vault_uid;
+
+        let mut state = test_state_with_writer();
+        let root = "/missing/unavailable-search-retry";
+        let source_vault_uid = vault_uid("old", root);
+        seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
+        Arc::get_mut(&mut state).unwrap().search_reconciliation =
+            SearchIndexReconciliation::Unavailable("injected writer outage".to_string());
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            rebuild_tantivy_after_mutation,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("configured Tantivy index unavailable")
+        );
+        let pending =
+            nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
+        assert!(pending.graph_applied());
+        assert!(!pending.reconciled());
+        assert!(pending.search_reconciliation_required());
+
+        let tantivy = Arc::clone(state.tantivy.as_ref().unwrap());
+        Arc::get_mut(&mut state).unwrap().search_reconciliation =
+            SearchIndexReconciliation::Available(tantivy);
+        recover_pending_instance_extension_migration(&state).unwrap();
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn reconciled_retry_skips_graph_and_finalizers_then_finishes_extensions() {
+        use nestweaver_schema::uid::project_uid;
+
+        let state = test_state_with_writer();
+        let source_uid = project_uid("old", "Reconciled retry");
+        let destination_uid = project_uid("new", "Reconciled retry");
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: source_uid.clone(),
+                name: "Reconciled retry".to_string(),
+                summary: None,
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        seed_extension(&state, &source_uid, "owner", serde_json::json!("source"));
+        let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+        let prepared = nestweaver_engine::prepare_instance_extension_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &mappings,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan::default(),
+        )
+        .unwrap();
+        state.store.merge_instance_ids("old", "new").unwrap();
+        let graph_applied = nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &prepared,
+        )
+        .unwrap();
+        assert!(finalize_node_graph_deletion(&state, "test_reconciled_retry").is_empty());
+        let pagerank_generation = state.store.pagerank_generation();
+        nestweaver_engine::mark_instance_extension_migration_reconciled(
+            &state.db_path,
+            &graph_applied,
+        )
+        .unwrap();
+        let merge_calls = std::cell::Cell::new(0);
+        let search_calls = std::cell::Cell::new(0);
+
+        run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |_store, _from, _to| {
+                merge_calls.set(merge_calls.get() + 1);
+                unreachable!("reconciled retry must not re-run graph mutation")
+            },
+            |_state, _mutation, _operation| {
+                search_calls.set(search_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(merge_calls.get(), 0);
+        assert_eq!(search_calls.get(), 0);
+        assert_eq!(state.store.pagerank_generation(), pagerank_generation);
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!extensions.contains_key(&source_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_uid, "owner"),
+            Some(&serde_json::json!("source"))
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_fails_closed_on_corrupt_versioned_or_mismatched_journal() {
+        use nestweaver_schema::uid::project_uid;
+
+        for case in ["corrupt", "version", "pair"] {
+            let state = test_state_with_writer();
+            let source_uid = project_uid("old", &format!("Startup blocked {case}"));
+            let destination_uid = project_uid("new", &format!("Startup blocked {case}"));
+            state
+                .store
+                .insert_project(&nestweaver_schema::Project {
+                    uid: source_uid.clone(),
+                    name: format!("Startup blocked {case}"),
+                    summary: None,
+                    instance_id: "old".to_string(),
+                })
+                .unwrap();
+            seed_extension(&state, &source_uid, "must-stay", serde_json::json!(true));
+            let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+            nestweaver_engine::prepare_instance_extension_migration(
+                &state.db_path,
+                "old",
+                "new",
+                &mappings,
+            )
+            .unwrap();
+            let journal_path =
+                nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json");
+            if case == "corrupt" {
+                std::fs::write(&journal_path, b"{not-json").unwrap();
+            } else {
+                let mut journal: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+                if case == "version" {
+                    journal["version"] = serde_json::json!(999);
+                } else {
+                    journal["from_id"] = serde_json::json!("other");
+                }
+                std::fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap())
+                    .unwrap();
+            }
+            let generation_before = state.store.graph_generation();
+
+            assert!(
+                recover_pending_instance_extension_migration(&state).is_err(),
+                "startup accepted {case} journal"
+            );
+            assert!(state.store.project_exists(&source_uid).unwrap());
+            assert!(!state.store.project_exists(&destination_uid).unwrap());
+            assert_eq!(state.store.graph_generation(), generation_before);
+            let extensions = nestweaver_engine::load_extensions(&state.db_path);
+            assert!(extensions.contains_key(&source_uid));
+            assert!(!extensions.contains_key(&destination_uid));
+        }
+    }
+
+    #[test]
+    fn purge_vault_only_instance_prunes_note_and_heading_embeddings() {
+        let state = test_state_with_writer();
+        let (note_uid, heading_uid) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:purge:docs",
+            "purge-source",
+            "/missing/purge-docs",
+        );
+
+        let result = run_purge_instance_with(
+            &state,
+            "purge-source",
+            |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.vaults, 1);
+        assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn purge_instance_durably_removes_deleted_project_extensions_only() {
+        let state = test_state_with_writer();
+        let removed_uid = "proj:purge-projects:removed";
+        let retained_uid = "proj:other:retained";
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: removed_uid.to_string(),
+                name: "Removed".to_string(),
+                summary: None,
+                instance_id: "purge-projects".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: retained_uid.to_string(),
+                name: "Retained".to_string(),
+                summary: None,
+                instance_id: "other".to_string(),
+            })
+            .unwrap();
+        seed_extension(&state, removed_uid, "owner", serde_json::json!("remove"));
+        seed_extension(&state, retained_uid, "owner", serde_json::json!("keep"));
+
+        let result = run_purge_instance_with(
+            &state,
+            "purge-projects",
+            |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.projects, 1);
+        let db_path = state.db_path.clone();
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let extensions = nestweaver_engine::load_extensions(&db_path);
+        assert!(!extensions.contains_key(removed_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, retained_uid, "owner"),
+            Some(&serde_json::json!("keep"))
+        );
+        assert!(!reopened.project_exists(removed_uid).unwrap());
+        assert!(reopened.project_exists(retained_uid).unwrap());
+    }
+
+    #[test]
+    fn merge_vault_collision_prunes_discarded_note_and_heading_embeddings() {
+        let state = test_state_with_writer();
+        let root_path = "/shared/merge-docs";
+        let (source_note, source_heading) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:merge:source",
+            "merge-source",
+            root_path,
+        );
+        let (target_note, target_heading) = seed_vault_note_heading_embeddings(
+            &state,
+            "vlt:merge:target",
+            "merge-target",
+            root_path,
+        );
+
+        let result = run_merge_instance_with(
+            &state,
+            "merge-source",
+            "merge-target",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.discarded.len(), 1);
+        assert_embeddings_absent(&state, &[&source_note, &source_heading]);
+        assert!(state.store.has_embedding(&target_note));
+        assert!(state.store.has_embedding(&target_heading));
+    }
+
+    #[test]
+    fn actual_repo_merge_collision_reconciles_source_and_destination_state() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let state = test_state_with_writer();
+        let url = "https://example.test/merge-collision";
+        let source_uid = repo_uid("merge-old", url);
+        let target_uid = repo_uid("merge-new", url);
+        let mut source = test_repo(&source_uid, url, None);
+        source.instance_id = "merge-old".to_string();
+        let mut target = test_repo(&target_uid, url, None);
+        target.instance_id = "merge-new".to_string();
+        state.store.insert_repo(&source).unwrap();
+        state.store.insert_repo(&target).unwrap();
+        let source_symbol = seed_manifest_and_embedding(&state, &source_uid, "source-package");
+        let target_symbol = seed_manifest_and_embedding(&state, &target_uid, "target-package");
+
+        let result = run_merge_instance_with(
+            &state,
+            "merge-old",
+            "merge-new",
+            |store, from, to| {
+                store
+                    .merge_instance_ids(from, to)
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.repo_uids_removed, vec![source_uid.clone()]);
+        let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.db_path).unwrap();
+        assert!(!manifests.contains_key(&source_uid));
+        assert_eq!(
+            manifests[&target_uid].package_name.as_deref(),
+            Some("target-package")
+        );
+        assert!(!state.store.has_embedding(&source_symbol));
+        assert!(state.store.has_embedding(&target_symbol));
+        assert_eq!(
+            state
+                .store
+                .lookup_repo(&target_uid)
+                .unwrap()
+                .unwrap()
+                .indexed_sha,
+            target.indexed_sha
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_links_reads_the_canonical_manifest_sidecar() {
+        let state = test_state_with_writer();
+        for (uid, url) in [
+            ("repo:test:app", "https://example.test/app"),
+            ("repo:test:dependency", "https://example.test/dependency"),
+        ] {
+            state.store.insert_repo(&test_repo(uid, url, None)).unwrap();
+        }
+        let manifests = std::collections::HashMap::from([
+            (
+                "repo:test:app".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("app-package".to_string()),
+                    dependencies: vec!["dependency-package".to_string()],
+                    entry_files: Vec::new(),
+                },
+            ),
+            (
+                "repo:test:dependency".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("dependency-package".to_string()),
+                    dependencies: Vec::new(),
+                    entry_files: Vec::new(),
+                },
+            ),
+        ]);
+        nestweaver_engine::save_manifest_cache(
+            &manifests,
+            &nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json"),
+        )
+        .unwrap();
+
+        let response = DaemonService::new(state)
+            .suggest_links_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let suggestions: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+        assert!(suggestions["links"].as_array().unwrap().iter().any(|link| {
+            link["description"] == "Depends on dependency-package (from manifest)"
+        }));
+    }
+
+    #[tokio::test]
+    async fn suggest_links_migrates_and_reads_a_legacy_only_manifest_sidecar() {
+        let state = test_state_with_writer();
+        for (uid, url) in [
+            ("repo:test:legacy-app", "https://example.test/legacy-app"),
+            (
+                "repo:test:legacy-dependency",
+                "https://example.test/legacy-dependency",
+            ),
+        ] {
+            state.store.insert_repo(&test_repo(uid, url, None)).unwrap();
+        }
+        let manifests = std::collections::HashMap::from([
+            (
+                "repo:test:legacy-app".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("legacy-app-package".to_string()),
+                    dependencies: vec!["legacy-dependency-package".to_string()],
+                    entry_files: Vec::new(),
+                },
+            ),
+            (
+                "repo:test:legacy-dependency".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("legacy-dependency-package".to_string()),
+                    dependencies: Vec::new(),
+                    entry_files: Vec::new(),
+                },
+            ),
+        ]);
+        let legacy_path = state.db_path.with_extension("manifests.json");
+        let canonical_path = nestweaver_engine::manifest_cache_path(&state.db_path);
+        nestweaver_engine::save_manifest_cache(&manifests, &legacy_path).unwrap();
+        assert!(!canonical_path.exists());
+
+        let response = DaemonService::new(state)
+            .suggest_links_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let suggestions: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+        assert!(suggestions["links"].as_array().unwrap().iter().any(|link| {
+            link["description"] == "Depends on legacy-dependency-package (from manifest)"
+        }));
+        assert!(canonical_path.exists());
+        assert!(!legacy_path.exists());
+    }
+
     /// DATA-LOSS REGRESSION GUARD: `prune_stale_repos` must NEVER delete a
     /// repo with a remote identity url and no local working tree
     /// (`root_path: None`) — e.g. a server-side bare-clone repo. The old
@@ -6513,10 +9404,1574 @@ mod startup_helper_tests {
 
         let removed = prune_stale_repos(&store).unwrap();
 
-        assert_eq!(removed.len(), 2, "got {removed:?}");
+        assert_eq!(removed.names.len(), 2, "got {removed:?}");
         assert!(store.lookup_repo("repo:kept").unwrap().is_some());
         assert!(store.lookup_repo("repo:moved").unwrap().is_none());
         assert!(store.lookup_repo("repo:legacy").unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_repo_failure_finalizes_earlier_deletions_before_returning_error() {
+        let state = test_state_with_writer();
+        let missing = state.db_path.with_extension("missing-repo-root");
+        for uid in ["repo:test:first", "repo:test:second"] {
+            state
+                .store
+                .insert_repo(&test_repo(
+                    uid,
+                    &format!("https://example.test/{uid}"),
+                    Some(missing.to_str().unwrap()),
+                ))
+                .unwrap();
+        }
+        let first_symbol = seed_manifest_and_embedding(&state, "repo:test:first", "first-package");
+        let second_symbol =
+            seed_manifest_and_embedding(&state, "repo:test:second", "second-package");
+        let generation = state.store.graph_generation();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"sentinel":0.5}"#).unwrap();
+
+        let mut calls = 0;
+        let mut reconciliations = 0;
+        let error = run_prune_stale_with(
+            &state,
+            |store, repo| {
+                calls += 1;
+                if calls == 1 {
+                    delete_repo_cascade(store, repo)
+                } else {
+                    Err(anyhow::anyhow!("injected second repo failure"))
+                }
+            },
+            |_store, _vault| Ok(()),
+            |_state, _mutation, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert_eq!(calls, 2);
+        assert_eq!(
+            reconciliations, 0,
+            "code-only prune must not rebuild vault document search"
+        );
+        assert!(state.store.graph_generation() > generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        assert_eq!(state.store.list_repos(None).unwrap().len(), 1);
+        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
+            &state.db_path,
+            ".manifests.json",
+        ))
+        .unwrap();
+        assert!(!manifests.contains_key("repo:test:first"));
+        assert!(manifests.contains_key("repo:test:second"));
+        assert!(!state.store.has_embedding(&first_symbol));
+        assert!(state.store.has_embedding(&second_symbol));
+    }
+
+    #[test]
+    fn prune_vault_failure_finalizes_earlier_repo_deletion() {
+        let state = test_state_with_writer();
+        let missing = state.db_path.with_extension("missing-prune-roots");
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:gone",
+                "https://example.test/gone",
+                Some(missing.to_str().unwrap()),
+            ))
+            .unwrap();
+        state
+            .store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:test:gone".to_string(),
+                name: "gone-vault".to_string(),
+                root_path: missing.display().to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let generation = state.store.graph_generation();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"sentinel":0.5}"#).unwrap();
+
+        let mut reconciliations = 0;
+        let error = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |_store, _vault| Err(anyhow::anyhow!("injected vault failure")),
+            |_state, _mutation, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(state.store.lookup_repo("repo:test:gone").unwrap().is_none());
+        assert!(state.store.lookup_vault("vlt:test:gone").is_ok());
+        assert!(state.store.graph_generation() > generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        assert_eq!(
+            reconciliations, 0,
+            "repo deletion plus an empty-vault failure changes no indexed document rows"
+        );
+    }
+
+    #[test]
+    fn purge_failure_finalizes_partial_repo_deletion() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:old:partial",
+                "https://example.test/partial",
+                None,
+            ))
+            .unwrap();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:survivor:purge",
+                "https://example.test/purge-survivor",
+                None,
+            ))
+            .unwrap();
+        let removed_symbol =
+            seed_manifest_and_embedding(&state, "repo:old:partial", "purged-package");
+        let survivor_symbol =
+            seed_manifest_and_embedding(&state, "repo:survivor:purge", "survivor-package");
+        let generation = state.store.graph_generation();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"sentinel":0.5}"#).unwrap();
+
+        let mut reconciliations = 0;
+        let error = run_purge_instance_with(
+            &state,
+            "old",
+            |store, _id| {
+                let repo = store.lookup_repo("repo:old:partial")?.unwrap();
+                delete_repo_cascade(store, &repo)?;
+                Err(anyhow::anyhow!("injected late purge failure"))
+            },
+            |_state, _mutation, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(
+            state
+                .store
+                .lookup_repo("repo:old:partial")
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.store.graph_generation() > generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        assert_eq!(
+            reconciliations, 0,
+            "code-only purge must not rebuild Tantivy"
+        );
+        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
+            &state.db_path,
+            ".manifests.json",
+        ))
+        .unwrap();
+        assert!(!manifests.contains_key("repo:old:partial"));
+        assert!(manifests.contains_key("repo:survivor:purge"));
+        assert!(!state.store.has_embedding(&removed_symbol));
+        assert!(state.store.has_embedding(&survivor_symbol));
+    }
+
+    #[test]
+    fn merge_failure_finalizes_partial_repo_deletion() {
+        let state = test_state_with_writer();
+        for suffix in ["first", "second"] {
+            let mut repo = test_repo(
+                &format!("repo:old:{suffix}"),
+                &format!("https://example.test/{suffix}"),
+                None,
+            );
+            repo.instance_id = "old".to_string();
+            state.store.insert_repo(&repo).unwrap();
+        }
+        let first_symbol = seed_manifest_and_embedding(&state, "repo:old:first", "first-package");
+        let second_symbol =
+            seed_manifest_and_embedding(&state, "repo:old:second", "second-package");
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta
+            .repos
+            .entry("repo:old:first".to_string())
+            .or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"repo:old:first":1.0}"#).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let graph_generation = state.store.graph_generation();
+        let pagerank_generation = state.store.pagerank_generation();
+        let mut reconciliations = 0;
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, _from, _to| {
+                let first = store.lookup_repo("repo:old:first")?.unwrap();
+                delete_repo_cascade(store, &first)?;
+                Err(anyhow::anyhow!("injected later repo merge failure"))
+            },
+            |_state, _mutation, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(state.store.graph_generation() > graph_generation);
+        let mut generation_path = state.db_path.as_os_str().to_owned();
+        generation_path.push(".generation");
+        assert_eq!(
+            std::fs::read_to_string(std::path::PathBuf::from(generation_path))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            state.store.graph_generation(),
+            "graph generation bump was not persisted"
+        );
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key("repo:old:first"),
+            "deleted repo sidecar slice survived merge error"
+        );
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        let scores_after = state.store.pagerank_scores();
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+        assert!(
+            !scores_after.contains_key("repo:old:first"),
+            "post-error rank query returned the deleted repo"
+        );
+        assert_eq!(
+            reconciliations, 0,
+            "code-only merge must not rebuild Tantivy"
+        );
+        let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
+            &state.db_path,
+            ".manifests.json",
+        ))
+        .unwrap();
+        assert!(!manifests.contains_key("repo:old:first"));
+        assert!(manifests.contains_key("repo:old:second"));
+        assert!(!state.store.has_embedding(&first_symbol));
+        assert!(state.store.has_embedding(&second_symbol));
+    }
+
+    #[test]
+    fn vault_only_purge_failure_invalidates_live_and_persisted_pagerank() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:old:docs".to_string(),
+                name: "docs".to_string(),
+                root_path: "/missing/docs".to_string(),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        let persisted_rank = r#"{"rank-sentinel":0.75}"#;
+        std::fs::write(&pagerank_path, persisted_rank).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let graph_generation = state.store.graph_generation();
+        let pagerank_generation = state.store.pagerank_generation();
+        let mut reconciliations = 0;
+
+        let error = run_purge_instance_with(
+            &state,
+            "old",
+            |store, _id| {
+                store.delete_vault_cascade("vlt:old:docs")?;
+                Err(anyhow::anyhow!("injected late vault purge failure"))
+            },
+            |_state, _mutation, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(state.store.graph_generation() > graph_generation);
+        assert!(!pagerank_path.exists());
+        assert!(!state.store.pagerank_scores().contains_key("rank-sentinel"));
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+        assert_eq!(
+            reconciliations, 0,
+            "an empty vault changes PageRank state but no indexed document rows"
+        );
+    }
+
+    #[test]
+    fn configured_unavailable_search_errors_only_after_indexed_rows_change() {
+        let state = SearchIndexReconciliation::Unavailable(
+            "configured Tantivy index is corrupt".to_string(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("test.lbug")).unwrap();
+
+        assert!(
+            reconcile_search_index(
+                &state,
+                &store,
+                IndexedSearchMutation::Unchanged,
+                "code-only",
+            )
+            .is_ok()
+        );
+        let error = reconcile_search_index(
+            &state,
+            &store,
+            IndexedSearchMutation::Changed,
+            "vault-delete",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("configured Tantivy index is corrupt")
+        );
+        assert!(
+            reconcile_search_index(
+                &state,
+                &store,
+                IndexedSearchMutation::Unknown,
+                "vault-delete-unknown",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("configured Tantivy index is corrupt")
+        );
+        assert!(
+            reconcile_search_index(
+                &SearchIndexReconciliation::Disabled,
+                &store,
+                IndexedSearchMutation::Changed,
+                "disabled"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn disabled_search_skips_projection_preflight() {
+        let projection = indexed_search_rows_before_with(
+            &SearchIndexReconciliation::Disabled,
+            || -> Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error> {
+                panic!("disabled search must not read the graph projection")
+            },
+        );
+
+        assert!(projection.is_none());
+    }
+
+    #[test]
+    fn available_search_repairs_after_unknown_preflight_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let tantivy = Arc::new(TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap());
+        tantivy
+            .update_note(
+                "note:deleted-before-repair",
+                "unknown_projection_repair_sentinel",
+                "vlt:deleted-before-repair",
+                &["unknown_projection_repair_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !tantivy
+                .search("unknown_projection_repair_sentinel", 10)
+                .unwrap()
+                .is_empty()
+        );
+        let comparison = indexed_search_mutation(
+            Some(Err(anyhow::anyhow!(
+                "deterministic preflight projection failure"
+            ))),
+            &store,
+        );
+
+        assert_eq!(comparison, IndexedSearchMutation::Unknown);
+        reconcile_search_index(
+            &SearchIndexReconciliation::Available(tantivy.clone()),
+            &store,
+            comparison,
+            "unknown_projection_repair",
+        )
+        .unwrap();
+        assert!(
+            tantivy
+                .search("unknown_projection_repair_sentinel", 10)
+                .unwrap()
+                .is_empty(),
+            "available search must repair after an unknown preflight projection"
+        );
+    }
+
+    #[test]
+    fn indexed_search_fingerprint_ignores_non_tantivy_note_metadata() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+
+        let state = test_state_with_writer();
+        let vault_uid = "vlt:fingerprint:metadata";
+        let note_uid = "note:fingerprint:metadata";
+        state
+            .store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "fingerprint metadata".to_string(),
+                root_path: "/missing/fingerprint-metadata".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let mut note = Note {
+            uid: note_uid.to_string(),
+            vault_uid: vault_uid.to_string(),
+            file_path: "note.md".to_string(),
+            title: "Indexed title".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "old-hash".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        state.store.insert_note(&note).unwrap();
+        state
+            .store
+            .insert_vault_note_edge(vault_uid, note_uid)
+            .unwrap();
+        let before = indexed_search_rows(&state.store).unwrap();
+
+        state.store.delete_note_cascade(note_uid).unwrap();
+        note.note_kind = NoteKind::Design;
+        note.word_count = 99;
+        note.content_hash = "new-hash".to_string();
+        note.frontmatter = Some("private: metadata".to_string());
+        note.modified_at = Some("2026-07-18".to_string());
+        note.pagerank_score = Some(0.75);
+        state.store.insert_note(&note).unwrap();
+        state
+            .store
+            .insert_vault_note_edge(vault_uid, note_uid)
+            .unwrap();
+
+        assert_eq!(before, indexed_search_rows(&state.store).unwrap());
+    }
+
+    #[test]
+    fn production_startup_preserves_configured_but_writer_unavailable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        let _writer = TantivyIndex::open_or_create(&tantivy_path).unwrap();
+
+        let (reader, state) = open_search_index(&tantivy_path, false);
+
+        assert!(reader.is_some(), "reader fallback should remain queryable");
+        match state {
+            SearchIndexReconciliation::Unavailable(reason) => {
+                assert!(reason.contains("writer open failed"));
+            }
+            _ => panic!("writer lock must remain explicit unavailable mutation state"),
+        }
+    }
+
+    #[test]
+    fn mismatched_uid_merge_error_finalizes_registered_repo() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:unexpected-owner:merge";
+        let mut repo = test_repo(repo_uid, "https://example.test/mismatched-merge", None);
+        repo.instance_id = "old".to_string();
+        state.store.insert_repo(&repo).unwrap();
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(repo_uid.to_string()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{repo_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let graph_generation = state.store.graph_generation();
+        let pagerank_generation = state.store.pagerank_generation();
+        let mut reconciliations = 0;
+
+        let error = run_merge_instance_with(
+            &state,
+            "old",
+            "new",
+            |store, _from, _to| {
+                let repo = store.lookup_repo(repo_uid)?.unwrap();
+                delete_repo_cascade(store, &repo)?;
+                Err(anyhow::anyhow!("injected mismatched-UID merge failure"))
+            },
+            |_state, _mutation, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(repo_uid),
+            "registered mismatched-UID repo sidecar survived merge error"
+        );
+        assert!(state.store.graph_generation() > graph_generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        let scores_after = state.store.pagerank_scores();
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+        assert!(!scores_after.contains_key(repo_uid));
+        assert_eq!(
+            reconciliations, 0,
+            "code-only merge must not rebuild Tantivy"
+        );
+    }
+
+    #[test]
+    fn mismatched_uid_purge_success_finalizes_registered_repo() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:unexpected-owner:purge";
+        let mut repo = test_repo(repo_uid, "https://example.test/mismatched-purge", None);
+        repo.instance_id = "old".to_string();
+        state.store.insert_repo(&repo).unwrap();
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(repo_uid.to_string()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{repo_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let graph_generation = state.store.graph_generation();
+        let pagerank_generation = state.store.pagerank_generation();
+        let mut reconciliations = 0;
+
+        let result = run_purge_instance_with(
+            &state,
+            "old",
+            |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
+            |_state, _mutation, _operation| {
+                reconciliations += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.repos, 1, "precondition: registered repo was purged");
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(repo_uid),
+            "registered mismatched-UID repo sidecar survived purge"
+        );
+        assert!(state.store.graph_generation() > graph_generation);
+        assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
+        let scores_after = state.store.pagerank_scores();
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+        assert!(!scores_after.contains_key(repo_uid));
+        assert_eq!(
+            reconciliations, 0,
+            "code-only purge must not rebuild Tantivy"
+        );
+    }
+
+    #[test]
+    fn code_deletion_invalidates_primed_in_memory_pagerank() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:test:pagerank",
+                "https://example.test/pagerank",
+                None,
+            ))
+            .unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"repo:test:pagerank":1.0}"#).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let before_scores = state.store.pagerank_scores();
+        let before_generation = state.store.pagerank_generation();
+        assert!(
+            before_scores.contains_key("repo:test:pagerank"),
+            "precondition: PageRank cache must be primed"
+        );
+
+        let repo = state
+            .store
+            .lookup_repo("repo:test:pagerank")
+            .unwrap()
+            .unwrap();
+        delete_repo_cascade(&state.store, &repo).unwrap();
+        finalize_code_graph_deletion(&state, &[repo.uid]);
+        let after_scores = state.store.pagerank_scores();
+
+        assert!(state.store.pagerank_generation() > before_generation);
+        assert!(!after_scores.contains_key("repo:test:pagerank"));
+    }
+
+    #[test]
+    fn typed_remove_repo_surfaces_required_generation_persistence_failure() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:test:typed-reconciliation-failure";
+        state
+            .store
+            .insert_repo(&test_repo(
+                repo_uid,
+                "https://example.test/typed-reconciliation-failure",
+                None,
+            ))
+            .unwrap();
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        std::fs::create_dir(&generation_path).unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let error = run_remove_repo_with(
+            &state,
+            repo_uid,
+            |store, uid| {
+                store.clear_repo_derived_nodes(uid).map_err(|error| {
+                    Status::internal(format!("clear_repo_derived_nodes failed: {error:#}"))
+                })
+            },
+            |store, uid| {
+                store.delete_repo_node(uid).map_err(|error| {
+                    Status::internal(format!("delete_repo_node failed: {error:#}"))
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("generation-persistence"));
+        assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
+        assert!(state.store.graph_generation() > generation_before);
+    }
+
+    #[test]
+    fn repo_extension_cleanup_failure_is_retryable_and_preserves_non_graph_keys_on_reopen() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:test:extension-liveness-retry";
+        state
+            .store
+            .insert_repo(&test_repo(
+                repo_uid,
+                "https://example.test/extension-liveness-retry",
+                None,
+            ))
+            .unwrap();
+        let extension_path = nestweaver_engine::sidecar_path(&state.db_path, ".extensions.json");
+        std::fs::write(&extension_path, b"{not-json").unwrap();
+
+        let error = run_remove_repo_with(
+            &state,
+            repo_uid,
+            |store, uid| {
+                store.clear_repo_derived_nodes(uid).map_err(|error| {
+                    Status::internal(format!("clear_repo_derived_nodes failed: {error:#}"))
+                })
+            },
+            |store, uid| {
+                store.delete_repo_node(uid).map_err(|error| {
+                    Status::internal(format!("delete_repo_node failed: {error:#}"))
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("extension-metadata"));
+        assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
+        assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
+
+        let mut extensions = nestweaver_engine::ExtensionStore::new();
+        nestweaver_engine::set_property(
+            &mut extensions,
+            repo_uid,
+            "owner",
+            serde_json::json!("stale"),
+        );
+        nestweaver_engine::set_property(
+            &mut extensions,
+            "application:release-channel",
+            "owner",
+            serde_json::json!("keep"),
+        );
+        nestweaver_engine::save_extensions(&state.db_path, &extensions).unwrap();
+        assert!(finalize_code_graph_deletion(&state, &[repo_uid.to_string()]).is_empty());
+
+        let db_path = state.db_path.clone();
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let visible = nestweaver_engine::load_live_extensions(&reopened, &db_path).unwrap();
+        assert!(!visible.contains_key(repo_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&visible, "application:release-channel", "owner"),
+            Some(&serde_json::json!("keep"))
+        );
+    }
+
+    #[test]
+    fn node_deletion_generation_exhaustion_is_reported_while_pagerank_is_invalidated() {
+        let state = test_state_with_writer_generation(Some(u64::MAX));
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_generation = state.store.pagerank_generation();
+
+        let failures = finalize_node_graph_deletion(&state, "generation exhaustion regression");
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].stage,
+            nestweaver_engine::DeletionReconciliationStage::GenerationPersistence
+        );
+        assert!(failures[0].message.contains("exhaust"));
+        assert_eq!(state.store.graph_generation(), u64::MAX);
+        assert_eq!(
+            std::fs::read_to_string(generation_path).unwrap(),
+            u64::MAX.to_string()
+        );
+        assert!(!pagerank_path.exists());
+        assert!(state.store.pagerank_scores().is_empty());
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+    }
+
+    #[test]
+    fn remove_project_persists_generation_invalidates_pagerank_and_survives_reopen() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:durable-remove";
+        seed_project(&state, project_uid, "Durable remove");
+        seed_extension(
+            &state,
+            project_uid,
+            "external_refs",
+            serde_json::json!(["ticket-141"]),
+        );
+        seed_extension(
+            &state,
+            "proj:test:unrelated-metadata",
+            "tags",
+            serde_json::json!(["keep"]),
+        );
+        assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
+        state.store.flush_embedding_index().unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let response = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            finalize_node_graph_deletion,
+        )
+        .unwrap();
+
+        assert_eq!(response.project_name, "Durable remove");
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(!pagerank_path.exists());
+        assert!(!state.store.pagerank_scores().contains_key(project_uid));
+        assert!(!state.store.has_embedding(project_uid));
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(
+            nestweaver_engine::get_all_properties(&extensions, project_uid).is_empty(),
+            "query_extensions UID lookup must not expose removed Project metadata"
+        );
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, "proj:test:unrelated-metadata", "tags"),
+            Some(&serde_json::json!(["keep"])),
+            "Project cleanup must preserve unrelated extension entries"
+        );
+
+        let db_path = state.db_path.clone();
+        let expected_generation = state.store.graph_generation();
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            reopened
+                .list_projects()
+                .unwrap()
+                .iter()
+                .all(|project| project.uid != project_uid)
+        );
+        assert_eq!(reopened.graph_generation(), expected_generation);
+        assert!(!reopened.has_embedding(project_uid));
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key(project_uid));
+    }
+
+    #[test]
+    fn remove_null_name_project_cleans_graph_and_sidecars_durably() {
+        use nestweaver_schema::{Note, NoteKind};
+
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:null-name-durable-remove";
+        let note_uid = "note:null-name-durable-remove";
+        state
+            .store
+            .insert_note(&Note {
+                uid: note_uid.to_string(),
+                vault_uid: "vlt:null-name-durable-remove".to_string(),
+                file_path: "null-name-durable-remove.md".to_string(),
+                title: "Null-name durable remove".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 3,
+                content_hash: "null-name-durable-remove-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        {
+            let conn = state.store.begin_transaction().unwrap();
+            conn.query(
+                "CREATE (:Project {uid: 'proj:test:null-name-durable-remove', name: NULL, summary: NULL, instance_id: 'test'})",
+            )
+            .unwrap();
+            state.store.commit_transaction(&conn).unwrap();
+        }
+        state
+            .store
+            .batch_insert_project_note_edges(&[(project_uid, note_uid)])
+            .unwrap();
+        {
+            let conn = state.store.begin_transaction().unwrap();
+            conn.query(
+                "CREATE REL TABLE FUTURE_NULL_PROJECT_EDGE(FROM Project TO Note, marker STRING)",
+            )
+            .unwrap();
+            conn.query(
+                "MATCH (p:Project {uid: 'proj:test:null-name-durable-remove'}), \
+                 (n:Note {uid: 'note:null-name-durable-remove'}) \
+                 CREATE (p)-[:FUTURE_NULL_PROJECT_EDGE {marker: 'future'}]->(n)",
+            )
+            .unwrap();
+            state.store.commit_transaction(&conn).unwrap();
+        }
+        assert_eq!(
+            state
+                .store
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| project.uid == project_uid)
+                .unwrap()
+                .name,
+            ""
+        );
+        seed_extension(
+            &state,
+            project_uid,
+            "external_refs",
+            serde_json::json!(["ticket-null-141"]),
+        );
+        assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
+        state.store.flush_embedding_index().unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let response = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            finalize_node_graph_deletion,
+        )
+        .unwrap();
+
+        assert_eq!(response.project_name, "");
+        assert!(!state.store.project_exists(project_uid).unwrap());
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(!pagerank_path.exists());
+        assert!(!state.store.pagerank_scores().contains_key(project_uid));
+        assert!(!state.store.has_embedding(project_uid));
+        assert!(
+            nestweaver_engine::get_all_properties(
+                &nestweaver_engine::load_extensions(&state.db_path),
+                project_uid,
+            )
+            .is_empty()
+        );
+        {
+            let conn = state.store.begin_transaction().unwrap();
+            for edge_type in ["PROJECT_INCLUDES_NOTE", "FUTURE_NULL_PROJECT_EDGE"] {
+                let count = conn
+                    .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN r"))
+                    .unwrap()
+                    .count();
+                assert_eq!(count, 0, "{edge_type} survived the Project delete");
+            }
+            state.store.commit_transaction(&conn).unwrap();
+        }
+
+        let db_path = state.db_path.clone();
+        let expected_generation = state.store.graph_generation();
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.project_exists(project_uid).unwrap());
+        assert_eq!(reopened.graph_generation(), expected_generation);
+        assert!(!reopened.has_embedding(project_uid));
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key(project_uid));
+        assert!(
+            nestweaver_engine::get_all_properties(
+                &nestweaver_engine::load_extensions(&db_path),
+                project_uid,
+            )
+            .is_empty()
+        );
+        let conn = reopened.begin_transaction().unwrap();
+        for edge_type in ["PROJECT_INCLUDES_NOTE", "FUTURE_NULL_PROJECT_EDGE"] {
+            let count = conn
+                .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN r"))
+                .unwrap()
+                .count();
+            assert_eq!(count, 0, "{edge_type} reappeared after reopen");
+        }
+        reopened.commit_transaction(&conn).unwrap();
+    }
+
+    #[test]
+    fn missing_project_is_a_true_noop_without_finalization() {
+        let state = test_state_with_writer();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"still-valid":1.0}"#).unwrap();
+        let generation_before = state.store.graph_generation();
+        let finalized = std::cell::Cell::new(false);
+
+        let response = run_remove_project_with(
+            &state,
+            "proj:test:missing",
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            |_state, _operation| {
+                finalized.set(true);
+                Vec::new()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.project_name, "");
+        assert!(!finalized.get());
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert!(pagerank_path.exists());
+    }
+
+    #[tokio::test]
+    async fn removed_project_metadata_is_absent_from_query_extensions_rpc() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:query-extensions";
+        seed_project(&state, project_uid, "Query extensions");
+        seed_extension(
+            &state,
+            project_uid,
+            "external_refs",
+            serde_json::json!(["visible-before-delete"]),
+        );
+        run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            finalize_node_graph_deletion,
+        )
+        .unwrap();
+
+        let stale_repo_uid = "repo:test:stale-query-extension";
+        seed_extension(
+            &state,
+            stale_repo_uid,
+            "owner",
+            serde_json::json!("must-not-leak"),
+        );
+
+        let service = DaemonService::new(state);
+        let response = service
+            .query_extensions(Request::new(JsonRequest {
+                args_json: serde_json::json!({"uid": project_uid}).to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let result: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+
+        assert_eq!(result["uid"], project_uid);
+        assert_eq!(result["properties"], serde_json::json!({}));
+
+        let stale_response = service
+            .query_extensions(Request::new(JsonRequest {
+                args_json: serde_json::json!({"uid": stale_repo_uid}).to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let stale_result: serde_json::Value =
+            serde_json::from_str(&stale_response.result_json).unwrap();
+        assert_eq!(stale_result["properties"], serde_json::json!({}));
+
+        let filtered_response = service
+            .query_extensions(Request::new(JsonRequest {
+                args_json: serde_json::json!({
+                    "key": "owner",
+                    "value": "must-not-leak"
+                })
+                .to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let filtered_result: serde_json::Value =
+            serde_json::from_str(&filtered_response.result_json).unwrap();
+        assert_eq!(filtered_result["count"], 0);
+    }
+
+    #[test]
+    fn remove_project_surfaces_generation_exhaustion_after_committed_delete() {
+        let state = test_state_with_writer_generation(Some(u64::MAX));
+        let project_uid = "proj:test:exhausted-remove";
+        seed_project(&state, project_uid, "Exhausted remove");
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            finalize_node_graph_deletion,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("generation-persistence"));
+        assert!(error.message().contains("exhaust"));
+        assert!(
+            state
+                .store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .all(|project| project.uid != project_uid)
+        );
+        assert!(!pagerank_path.exists());
+    }
+
+    #[test]
+    fn remove_project_surfaces_generation_save_and_pagerank_unlink_failures() {
+        for failure in ["generation", "pagerank"] {
+            let state = test_state_with_writer();
+            let project_uid = format!("proj:test:{failure}-failure");
+            seed_project(&state, &project_uid, failure);
+            let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+            let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+            if failure == "generation" {
+                if generation_path.exists() {
+                    std::fs::remove_file(&generation_path).unwrap();
+                }
+                std::fs::create_dir(&generation_path).unwrap();
+            } else {
+                std::fs::create_dir(&pagerank_path).unwrap();
+            }
+
+            let error = run_remove_project_with(
+                &state,
+                &project_uid,
+                |store, uid| store.delete_project_cascade_with_outcome(uid),
+                |store, uid| store.project_exists(uid),
+                nestweaver_engine::remove_extension_uid_durable,
+                finalize_node_graph_deletion,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(
+                error.message().contains(if failure == "generation" {
+                    "generation-persistence"
+                } else {
+                    "persisted-pagerank"
+                }),
+                "unexpected {failure} error: {error}"
+            );
+            assert!(
+                state
+                    .store
+                    .list_projects()
+                    .unwrap()
+                    .iter()
+                    .all(|project| project.uid != project_uid)
+            );
+        }
+    }
+
+    #[test]
+    fn remove_project_aggregates_graph_and_finalizer_errors() {
+        let state = test_state_with_writer();
+        let error = run_remove_project_with(
+            &state,
+            "proj:test:aggregate-errors",
+            |_store, _uid| {
+                Err(project_delete_error(
+                    "proj:test:aggregate-errors",
+                    None,
+                    nestweaver_store::ProjectMutationDisposition::Ambiguous,
+                    "injected graph mutation failure",
+                ))
+            },
+            |_store, _uid| Ok(false),
+            |_db_path, _uid| Ok(false),
+            |_state, _operation| {
+                vec![nestweaver_engine::DeletionReconciliationFailure {
+                    stage: nestweaver_engine::DeletionReconciliationStage::PersistedPageRank,
+                    repo_uid: None,
+                    message: "injected durable unlink failure".to_string(),
+                }]
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("injected graph mutation failure"));
+        assert!(error.message().contains("persisted-pagerank"));
+        assert!(error.message().contains("injected durable unlink failure"));
+    }
+
+    #[test]
+    fn confirmed_project_rollback_does_not_reconcile_or_mutate_sidecars() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:confirmed-rollback";
+        seed_project(&state, project_uid, "Confirmed rollback");
+        seed_extension(
+            &state,
+            project_uid,
+            "aliases",
+            serde_json::json!(["still-live"]),
+        );
+        assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
+        state.store.flush_embedding_index().unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = state.store.graph_generation();
+        let pagerank_generation_before = state.store.pagerank_generation();
+        let liveness_called = std::cell::Cell::new(false);
+        let cleanup_called = std::cell::Cell::new(false);
+        let finalizer_called = std::cell::Cell::new(false);
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |_store, uid| {
+                Err(project_delete_error(
+                    uid,
+                    Some("Confirmed rollback"),
+                    nestweaver_store::ProjectMutationDisposition::ConfirmedRolledBack,
+                    "injected DETACH failure followed by rollback",
+                ))
+            },
+            |_store, _uid| {
+                liveness_called.set(true);
+                Ok(true)
+            },
+            |_db_path, _uid| {
+                cleanup_called.set(true);
+                Ok(false)
+            },
+            |_state, _operation| {
+                finalizer_called.set(true);
+                Vec::new()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("ConfirmedRolledBack"));
+        assert!(!liveness_called.get());
+        assert!(!cleanup_called.get());
+        assert!(!finalizer_called.get());
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert_eq!(
+            state.store.pagerank_generation(),
+            pagerank_generation_before
+        );
+        assert!(pagerank_path.exists());
+        assert!(state.store.has_embedding(project_uid));
+        assert!(
+            !nestweaver_engine::get_all_properties(
+                &nestweaver_engine::load_extensions(&state.db_path),
+                project_uid,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn confirmed_unchanged_project_error_does_not_run_reconciliation() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:confirmed-unchanged";
+        seed_project(&state, project_uid, "Confirmed unchanged");
+        seed_extension(
+            &state,
+            project_uid,
+            "tags",
+            serde_json::json!(["still-live"]),
+        );
+        let generation_before = state.store.graph_generation();
+        let cleanup_called = std::cell::Cell::new(false);
+        let finalizer_called = std::cell::Cell::new(false);
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |_store, uid| {
+                Err(project_delete_error(
+                    uid,
+                    None,
+                    nestweaver_store::ProjectMutationDisposition::ConfirmedUnchanged,
+                    "injected lookup failure",
+                ))
+            },
+            |_store, _uid| panic!("confirmed unchanged must not query liveness"),
+            |_db_path, _uid| {
+                cleanup_called.set(true);
+                Ok(false)
+            },
+            |_state, _operation| {
+                finalizer_called.set(true);
+                Vec::new()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("ConfirmedUnchanged"));
+        assert!(!cleanup_called.get());
+        assert!(!finalizer_called.get());
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert!(state.store.project_exists(project_uid).unwrap());
+        assert!(nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid));
+    }
+
+    #[test]
+    fn ambiguous_project_delete_reconciles_and_uses_graph_liveness_for_extensions() {
+        for graph_present in [false, true] {
+            let state = test_state_with_writer();
+            let project_uid = format!("proj:test:ambiguous-{graph_present}");
+            if graph_present {
+                seed_project(&state, &project_uid, "Ambiguous present");
+            }
+            seed_extension(
+                &state,
+                &project_uid,
+                "features",
+                serde_json::json!(["flag"]),
+            );
+            let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+            std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+            let generation_before = state.store.graph_generation();
+
+            let error = run_remove_project_with(
+                &state,
+                &project_uid,
+                |_store, uid| {
+                    Err(project_delete_error(
+                        uid,
+                        Some("Ambiguous"),
+                        nestweaver_store::ProjectMutationDisposition::Ambiguous,
+                        "injected ambiguous commit result",
+                    ))
+                },
+                |store, uid| store.project_exists(uid),
+                nestweaver_engine::remove_extension_uid_durable,
+                finalize_node_graph_deletion,
+            )
+            .unwrap_err();
+
+            assert!(error.message().contains("injected ambiguous commit result"));
+            assert!(state.store.graph_generation() > generation_before);
+            assert!(!pagerank_path.exists());
+            assert_eq!(
+                nestweaver_engine::load_extensions(&state.db_path).contains_key(&project_uid),
+                graph_present,
+                "extension liveness decision disagreed with graph state"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_liveness_failure_preserves_extensions_and_aggregates_error() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:liveness-failure";
+        seed_extension(&state, project_uid, "tags", serde_json::json!(["preserve"]));
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |_store, uid| {
+                Err(project_delete_error(
+                    uid,
+                    None,
+                    nestweaver_store::ProjectMutationDisposition::Ambiguous,
+                    "ambiguous delete",
+                ))
+            },
+            |_store, _uid| {
+                Err(nestweaver_store::StoreError::Query(
+                    "injected liveness query failure".to_string(),
+                ))
+            },
+            nestweaver_engine::remove_extension_uid_durable,
+            finalize_node_graph_deletion,
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("ambiguous delete"));
+        assert!(error.message().contains("graph-liveness"));
+        assert!(error.message().contains("injected liveness query failure"));
+        assert!(
+            nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid),
+            "metadata must be preserved when graph liveness is unknown"
+        );
+    }
+
+    #[test]
+    fn project_extension_cleanup_failure_is_retryable_and_survives_reopen() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:extension-retry";
+        seed_project(&state, project_uid, "Extension retry");
+        seed_extension(
+            &state,
+            project_uid,
+            "external_refs",
+            serde_json::json!(["retry-me"]),
+        );
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            |_db_path, _uid| anyhow::bail!("injected extension cleanup failure"),
+            finalize_node_graph_deletion,
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("extension-metadata"));
+        assert!(
+            error
+                .message()
+                .contains("injected extension cleanup failure")
+        );
+        assert!(nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid));
+
+        let finalized_on_retry = std::cell::Cell::new(false);
+        let response = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |store, uid| store.project_exists(uid),
+            nestweaver_engine::remove_extension_uid_durable,
+            |_state, _operation| {
+                finalized_on_retry.set(true);
+                Vec::new()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.project_name, "");
+        assert!(!finalized_on_retry.get());
+        assert!(!nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid));
+        let db_path = state.db_path.clone();
+        drop(state);
+        assert!(!nestweaver_engine::load_extensions(&db_path).contains_key(project_uid));
+    }
+
+    #[test]
+    fn remove_repo_late_failure_finalizes_committed_children() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:test:late-remove";
+        let file_uid = nestweaver_schema::file_uid(repo_uid, "src/lib.rs");
+        state
+            .store
+            .insert_repo(&test_repo(
+                repo_uid,
+                "https://example.test/late-remove",
+                None,
+            ))
+            .unwrap();
+        state
+            .store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid.clone(),
+                path: "src/lib.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        let removed_symbol =
+            seed_manifest_and_embedding(&state, repo_uid, "partial-remove-package");
+
+        let filemeta_path = nestweaver_engine::sidecar_path(&state.db_path, ".filemeta.json");
+        let mut filemeta = nestweaver_engine::load_filemeta_sidecar(&filemeta_path);
+        filemeta.repos.entry(repo_uid.to_string()).or_default();
+        nestweaver_engine::save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+        let deps_path = nestweaver_engine::sidecar_path(&state.db_path, ".resolution_deps.bin");
+        let mut deps = nestweaver_engine::resolution_cache::ResolutionDeps::default();
+        deps.set_deps_for_repo(
+            repo_uid,
+            "src/lib.rs",
+            ["src/dep.rs".to_string()].into_iter().collect(),
+        );
+        deps.save(&deps_path).unwrap();
+
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{file_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let tantivy = state.tantivy.as_ref().unwrap();
+        tantivy
+            .update_note(
+                "note:late-remove",
+                "late_remove_search_sentinel",
+                "vault:test",
+                &["late_remove_search_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let error = run_remove_repo_with(
+            &state,
+            repo_uid,
+            |_store, _uid| Err(Status::internal("injected derived-node failure")),
+            |_store, _uid| Ok(()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(
+            state.store.list_files_by_repo(repo_uid).unwrap().is_empty(),
+            "precondition: the first delete transaction must have committed"
+        );
+        assert!(
+            state.store.lookup_repo(repo_uid).unwrap().is_some(),
+            "precondition: the injected late failure leaves the Repo row"
+        );
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(
+            !nestweaver_engine::load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(repo_uid)
+        );
+        assert!(
+            nestweaver_engine::resolution_cache::ResolutionDeps::load(&deps_path)
+                .is_empty_for_repo(repo_uid)
+        );
+        assert!(!pagerank_path.exists());
+        assert!(!state.store.pagerank_scores().contains_key(&file_uid));
+        assert!(
+            !tantivy
+                .search("late_remove_search_sentinel", 10)
+                .unwrap()
+                .is_empty(),
+            "code-only remove must not rebuild unrelated vault search documents"
+        );
+        assert!(
+            nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
+                &state.db_path,
+                ".manifests.json"
+            ))
+            .unwrap()
+            .contains_key(repo_uid),
+            "the live Repo row must retain its manifest after a partial delete"
+        );
+        assert!(
+            !state.store.has_embedding(&removed_symbol),
+            "the committed Symbol deletion must remove its embedding"
+        );
+    }
+
+    #[test]
+    fn remove_repo_bulk_error_finalizes_ambiguous_partial_deletion_extensions() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:test:bulk-error";
+        let file_uid = nestweaver_schema::file_uid(repo_uid, "src/lib.rs");
+        state
+            .store
+            .insert_repo(&test_repo(
+                repo_uid,
+                "https://example.test/bulk-error",
+                None,
+            ))
+            .unwrap();
+        state
+            .store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid.clone(),
+                path: "src/lib.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        seed_extension(&state, repo_uid, "owner", serde_json::json!("keep-live"));
+        seed_extension(&state, &file_uid, "owner", serde_json::json!("remove-dead"));
+        let generation_before = state.store.graph_generation();
+
+        let error = run_remove_repo_with_bulk(
+            &state,
+            repo_uid,
+            |store, uid| {
+                store.bulk_delete_repo_files_and_symbols(uid).unwrap();
+                Err(Status::internal(
+                    "injected ambiguous error after bulk commit",
+                ))
+            },
+            |_store, _uid| panic!("later stages must not run after bulk error"),
+            |_store, _uid| panic!("later stages must not run after bulk error"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .message()
+                .contains("ambiguous error after bulk commit")
+        );
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(state.store.lookup_repo(repo_uid).unwrap().is_some());
+        assert!(state.store.list_files_by_repo(repo_uid).unwrap().is_empty());
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(extensions.contains_key(repo_uid));
+        assert!(!extensions.contains_key(&file_uid));
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared
@@ -6964,12 +11419,12 @@ mod startup_helper_tests {
         // Build the acceptor from the SAME bundle the client trusts so cert
         // verification succeeds (build_self_signed_acceptor mints its own CA).
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let certs = rustls_pemfile::certs(&mut bundle.server_cert_pem.as_bytes())
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+        let certs = CertificateDer::pem_slice_iter(bundle.server_cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let key = rustls_pemfile::private_key(&mut bundle.server_key_pem.as_bytes())
-            .unwrap()
-            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(bundle.server_key_pem.as_bytes()).unwrap();
         let mut server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
@@ -6986,7 +11441,7 @@ mod startup_helper_tests {
 
         // Client trusts the generated CA and connects to `localhost`.
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut bundle.ca_cert_pem.as_bytes()) {
+        for cert in CertificateDer::pem_slice_iter(bundle.ca_cert_pem.as_bytes()) {
             roots.add(cert.unwrap()).unwrap();
         }
         let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
@@ -7204,8 +11659,16 @@ mod startup_helper_tests {
     /// Build a minimal `DaemonState` with a writer-mode Tantivy index for
     /// exercising admin mutation RPCs in isolation.
     fn test_state_with_writer() -> Arc<DaemonState> {
+        test_state_with_writer_generation(None)
+    }
+
+    fn test_state_with_writer_generation(generation: Option<u64>) -> Arc<DaemonState> {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("brain.lbug");
+        if let Some(generation) = generation {
+            let generation_path = nestweaver_engine::sidecar_path(&db_path, ".generation");
+            std::fs::write(generation_path, generation.to_string()).unwrap();
+        }
         let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
         let tantivy = Arc::new(TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap());
         // Keep the temp dir alive for the duration of the test process.
@@ -7213,9 +11676,11 @@ mod startup_helper_tests {
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         Arc::new(DaemonState {
             store,
-            tantivy: Some(tantivy),
+            tantivy: Some(Arc::clone(&tantivy)),
+            search_reconciliation: SearchIndexReconciliation::Available(tantivy),
             db_path,
             instance_id: "default".to_string(),
+            data_instance_id: "default".to_string(),
             start_time: Instant::now(),
             active_reads: Arc::new(AtomicU32::new(0)),
             active_writes: Arc::new(AtomicU32::new(0)),
@@ -7238,6 +11703,96 @@ mod startup_helper_tests {
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Build a minimal `DaemonState` over the given store and permission
+    /// source, for exercising `visible_repos_for` under a real authz policy.
+    fn test_state_with_authz(
+        store: Arc<GraphStore>,
+        permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
+    ) -> Arc<DaemonState> {
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        Arc::new(DaemonState {
+            store,
+            tantivy: None,
+            search_reconciliation: SearchIndexReconciliation::Disabled,
+            db_path: std::path::PathBuf::from(":memory:"),
+            instance_id: "default".to_string(),
+            data_instance_id: "default".to_string(),
+            start_time: Instant::now(),
+            active_reads: Arc::new(AtomicU32::new(0)),
+            active_writes: Arc::new(AtomicU32::new(0)),
+            idle_notify: Arc::new(Notify::new()),
+            shutdown_tx,
+            watcher_stop: std::sync::Mutex::new(None),
+            instance_cfg: None,
+            permission_source,
+            embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            server_mode: false,
+            read_only: false,
+            indexing_active: Arc::new(AtomicBool::new(false)),
+            indexing_repo: Arc::new(tokio::sync::RwLock::new(String::new())),
+            indexing_queue_depth: Arc::new(AtomicU32::new(0)),
+            safeguards: QuerySafeguards::default_server(),
+            rate_limiters: None,
+            drained: Arc::new(AtomicBool::new(false)),
+            admin_token: None,
+            admin_state: std::sync::OnceLock::new(),
+            worker_handle: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// nw-050: a UDS trusted-admin request must see ALL repos under an enabled
+    /// `[authz]` policy. The UDS interceptor is the trusted-local-admin
+    /// boundary; before the fix it attached only `IsAdmin(true)` and no
+    /// `Identity`, so `visible_repos_for` fell back to `Identity::Anonymous`,
+    /// which an enabled policy maps to `Only(∅)` — silently redacting EVERY
+    /// cross-repo blast-radius node away from the trusted local admin. The fix
+    /// makes the interceptor attach `Identity::Admin` (symmetric with the TCP
+    /// admin-token path), which resolves to `VisibleRepos::All`.
+    #[test]
+    fn uds_admin_sees_all_repos_under_enabled_policy() {
+        use nestweaver_engine::authz::{
+            PermissionSource, StaticConfigPermissionSource, VisibleRepos,
+        };
+
+        // Enabled policy: a non-empty rules map. Under it, Anonymous (and any
+        // unknown token) fails closed to Only(∅).
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "some-query-token".to_string(),
+            vec!["acme/scoped-*".to_string()],
+        );
+        let source = Arc::new(StaticConfigPermissionSource::new(rules));
+        assert!(source.is_enabled(), "precondition: policy must be enabled");
+
+        // At least one repo exists — a non-admin identity would see none of it.
+        let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+        store
+            .insert_repo(&test_repo(
+                "repo:one",
+                "https://github.com/acme/one.git",
+                None,
+            ))
+            .unwrap();
+
+        let state = test_state_with_authz(store, source);
+
+        // Run a request through the trusted-local-admin UDS interceptor.
+        let req = crate::auth::uds_admin_interceptor(Request::new(())).unwrap();
+
+        let visible = state
+            .visible_repos_for(req.extensions())
+            .expect("enabled policy over a healthy store must resolve, not fail loud");
+
+        assert_eq!(
+            visible,
+            VisibleRepos::All,
+            "a UDS trusted-admin request must see ALL repos under an enabled \
+             authz policy — not be redacted to Only(∅) via the Anonymous \
+             fallback (nw-050)"
+        );
     }
 
     /// The admin `reindex_search` RPC rebuilds the whole Tantivy index. Like
@@ -7274,6 +11829,29 @@ mod startup_helper_tests {
              (drain-visible + backup-safe); it returned without waiting"
         );
 
+        drop(gate);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_project_holds_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let gate = state.write_mutex.clone().lock_owned().await;
+        let mut request = Request::new(RemoveProjectRequest {
+            project_uid: "proj:test:write-gate".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            service.remove_project(request),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "remove_project must serialize with the daemon write gate"
+        );
         drop(gate);
     }
 

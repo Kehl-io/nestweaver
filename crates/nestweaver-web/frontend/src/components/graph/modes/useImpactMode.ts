@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import type Graph from "graphology";
 import { useStore } from "../../../stores";
-import { loadImpactLens } from "../../../api/impactLens";
+import { ImpactTimeoutError, loadImpactLens } from "../../../api/impactLens";
 import { workspaceSceneMetadataWithResult } from "../../../api/workspaces";
 import { buildGraphFromImpact } from "../utils/buildGraphFromImpact";
 import { applyElkLayout } from "../utils/elkLayout";
@@ -22,16 +22,40 @@ export function useImpactMode() {
   const impactConfidence = useStore((s) => s.impactConfidence);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
+  // Re-run the current impact query once a debounced PageRank recompute lands,
+  // so a timed-out/stale graph fills in when ranks are ready (nw-029).
+  const ranksGeneration = useStore((s) => s.ranksGeneration);
   const requestIdRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+  // Full query identity of the last load we kicked off. A background rank
+  // refresh (SSE pagerank:recomputed -> ranksGeneration bump) re-runs this hook
+  // with the SAME key, so we can refetch silently instead of flashing to the
+  // loading scene (nw-029). Key MUST include depth + confidence, not just
+  // workspace/target — a partial key was the original pre-T6 hang bug.
+  const queryKeyRef = useRef<string | null>(null);
   const previousLayoutRef = useRef<{ key: string; graph: Graph } | null>(
     null,
   );
 
   const loadImpactData = useCallback(async () => {
+    // `ranksGeneration` is an invalidation token: the graph query itself does
+    // not send it, but a new generation must rerun this callback.
+    void ranksGeneration;
+    // Any prior in-flight request is now superseded — abort its fetch so we
+    // don't leave a hung PageRank request running against a cold DB.
+    abortRef.current?.abort();
+
     if (graphMode !== "impact" || !selectedNodeId) {
       requestIdRef.current += 1;
+      abortRef.current = null;
+      // Leaving impact mode: forget the last query so re-entering always reads
+      // as a new query and shows loading for its first fetch.
+      queryKeyRef.current = null;
       return;
     }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     setActiveLens({ lens: "impact", label: "Impact", targetUid: selectedNodeId, workspaceId: activeWorkspaceId || "all" });
 
@@ -41,6 +65,10 @@ export function useImpactMode() {
     const layoutKey = `${requestWorkspaceId}:${targetNodeId}`;
     const requestDepth = impactDepth;
     const requestConfidence = impactConfidence;
+    // Full query identity — a change in any of these is a genuinely new query.
+    const queryKey = `${requestWorkspaceId}:${targetNodeId}:${requestDepth}:${requestConfidence}`;
+    const isNewQuery = queryKeyRef.current !== queryKey;
+    queryKeyRef.current = queryKey;
     const isCurrentRequest = () => {
       const state = useStore.getState();
       return (
@@ -54,31 +82,34 @@ export function useImpactMode() {
     };
 
     try {
-      const currentState = useStore.getState();
-      const previousWorkspaceId =
-        currentState.sceneMetadata?.workspace_id ??
-        currentState.activeLens.workspaceId ??
-        "all";
-      const previousTargetId = currentState.activeLens.targetUid ?? null;
-      if (
-        previousWorkspaceId !== requestWorkspaceId ||
-        previousTargetId !== targetNodeId
-      ) {
+      // Show the loading scene for a genuinely new query, or when nothing is
+      // currently rendered. A background rank refresh of an already-displayed
+      // graph (same query key, graph present) refetches silently and swaps in,
+      // so steady-state reindexing doesn't blink a healthy graph to a spinner
+      // every debounce window (nw-029). We still clear+load on every *new*
+      // query (workspace/target/depth/confidence change), keeping the honest
+      // loading state and the pre-T6 depth/confidence-change fix intact.
+      const hasGraph = (useStore.getState().graphInstance?.order ?? 0) > 0;
+      if (isNewQuery || !hasGraph) {
         clearGraphData();
         setSceneMetadata(
           workspaceSceneMetadataWithResult(
-            currentState.selectedWorkspace()?._meta,
+            useStore.getState().selectedWorkspace()?._meta,
             "loading",
             `Loading impact for ${targetNodeId}.`,
           ),
         );
       }
 
-      const result = await loadImpactLens(targetNodeId, {
-        depth: requestDepth,
-        confidence: requestConfidence,
-        workspaceId: requestWorkspaceId,
-      });
+      const result = await loadImpactLens(
+        targetNodeId,
+        {
+          depth: requestDepth,
+          confidence: requestConfidence,
+          workspaceId: requestWorkspaceId,
+        },
+        controller.signal,
+      );
       if (!isCurrentRequest()) return;
 
       const graph = buildGraphFromImpact(result);
@@ -105,7 +136,28 @@ export function useImpactMode() {
       setSceneMetadata(result._meta ?? null);
       previousLayoutRef.current = { key: layoutKey, graph };
     } catch (err) {
+      // We aborted this request (superseded query or unmount) — stay silent.
+      if (err instanceof DOMException && err.name === "AbortError") return;
       if (!isCurrentRequest()) return;
+
+      if (err instanceof ImpactTimeoutError) {
+        // The backend is likely still computing ranks for a freshly indexed
+        // workspace; the debounced pagerank:recomputed SSE will retry us.
+        setSceneMetadata(
+          workspaceSceneMetadataWithResult(
+            useStore.getState().selectedWorkspace()?._meta,
+            "timed-out",
+            "Impact timed out while ranks are computing. It will refresh automatically when ready.",
+          ),
+        );
+        notify({
+          kind: "warning",
+          title: "Impact is taking longer than expected",
+          message:
+            "The graph may be computing ranks for a freshly indexed workspace. It will refresh automatically when ready.",
+        });
+        return;
+      }
 
       console.error("Failed to load impact:", err);
       const message = loadErrorMessage(err, "Failed to load impact graph");
@@ -130,6 +182,7 @@ export function useImpactMode() {
     impactConfidence,
     impactDepth,
     notify,
+    ranksGeneration,
     selectedNodeId,
     setActiveLens,
     setGraphData,
@@ -140,6 +193,7 @@ export function useImpactMode() {
     loadImpactData();
     return () => {
       requestIdRef.current += 1;
+      abortRef.current?.abort();
     };
   }, [loadImpactData]);
 }

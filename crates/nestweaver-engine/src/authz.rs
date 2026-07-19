@@ -285,6 +285,53 @@ pub fn redact_blast_radius_for_visibility(
     // name no repos; we add no notification that would reveal a hidden repo.
 }
 
+/// nw-043: how an enabled authz policy responds to the repo listing.
+/// - `Resolve(repos)` → resolve visibility (an empty store legitimately
+///   resolves to "nothing visible" — fail closed, unchanged).
+/// - `FailLoud(_)`    → the caller must FAIL LOUD (Unavailable), never serve a
+///   silently-redacted 200: a transient store error is indistinguishable from
+///   the nw-043 isolation anomaly, and silent full redaction reads as a valid
+///   empty result.
+#[derive(Debug)]
+pub enum AuthzRepoListing {
+    /// Both/either listing attempt succeeded — resolve visibility against it.
+    Resolve(Vec<Repo>),
+    /// Both listing attempts errored — the boundary must fail the request.
+    FailLoud(String),
+}
+
+/// Classify the outcome of the per-request authz repo listing (nw-043).
+///
+/// Pure policy decision, unit-testable without fault-injecting the store. The
+/// `retry` closure is invoked ONLY when the first attempt errored (a single
+/// retry to ride out a transient store anomaly); for an `Ok` first attempt it
+/// is never called — lazy evaluation is enforced by the `FnOnce` type. On a
+/// double failure both errors are logged server-side and the client-facing
+/// message stays generic (no store internals leak).
+pub fn classify_repo_listing(
+    result: Result<Vec<Repo>, nestweaver_store::StoreError>,
+    retry: impl FnOnce() -> Result<Vec<Repo>, nestweaver_store::StoreError>,
+) -> AuthzRepoListing {
+    match result {
+        Ok(repos) => AuthzRepoListing::Resolve(repos),
+        Err(first) => match retry() {
+            Ok(repos) => {
+                tracing::error!(
+                    "authz: list_repos failed then succeeded on retry (nw-043 anomaly \
+                     candidate): first error: {first:#}"
+                );
+                AuthzRepoListing::Resolve(repos)
+            }
+            Err(second) => {
+                tracing::error!(
+                    "authz: repo listing failed twice; first: {first:#}; second: {second:#}"
+                );
+                AuthzRepoListing::FailLoud("authz repo listing unavailable".to_string())
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +455,51 @@ mod tests {
         let repos = [repo("repo:a", "github.com/acme/billing")];
         let v = src.visible_repos(&Identity::Anonymous, &repos);
         assert_eq!(v, VisibleRepos::Only(HashSet::new()));
+    }
+
+    // --- classify_repo_listing (nw-043) --------------------------------------
+
+    fn qerr() -> nestweaver_store::StoreError {
+        nestweaver_store::StoreError::Query("boom".to_string())
+    }
+
+    #[test]
+    fn authz_listing_error_twice_fails_loud() {
+        let r = classify_repo_listing(Err(qerr()), || Err(qerr()));
+        assert!(matches!(r, AuthzRepoListing::FailLoud(_)));
+    }
+
+    #[test]
+    fn authz_listing_error_then_success_resolves_with_retry_result() {
+        let r = classify_repo_listing(Err(qerr()), || {
+            Ok(vec![repo("repo:t:aaaa", "github.com/t/aaaa")])
+        });
+        match r {
+            AuthzRepoListing::Resolve(repos) => assert_eq!(repos.len(), 1),
+            _ => panic!("retry success must resolve"),
+        }
+    }
+
+    #[test]
+    fn authz_listing_empty_store_still_fails_closed_quietly() {
+        // A genuinely empty store under an enabled policy resolves to Only(∅) —
+        // that behavior is intentional and unchanged.
+        let r = classify_repo_listing(Ok(vec![]), || Ok(vec![]));
+        assert!(matches!(r, AuthzRepoListing::Resolve(v) if v.is_empty()));
+    }
+
+    #[test]
+    fn authz_listing_ok_first_never_invokes_retry() {
+        // If a future edit consults the retry on an Ok first attempt, both
+        // boundaries would resolve to a poisoned/empty listing → full silent
+        // redaction — the exact bug class this fn exists to kill.
+        let r = classify_repo_listing(Ok(vec![repo("repo:t:aaaa", "github.com/t/aaaa")]), || {
+            panic!("retry must not be invoked when the first listing succeeded")
+        });
+        match r {
+            AuthzRepoListing::Resolve(repos) => assert_eq!(repos.len(), 1),
+            _ => panic!("Ok first attempt must resolve"),
+        }
     }
 
     // --- redact_blast_radius_for_visibility ---------------------------------

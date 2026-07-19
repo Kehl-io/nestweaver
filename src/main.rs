@@ -21,9 +21,9 @@ use nestweaver_engine::{
     generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
     incremental_index_with_name, index_directory_with_options,
     index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_extensions, load_manifest_cache,
-    lookup_symbol, record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar,
-    save_summaries, search_symbols, suggest_links, truncate_to_budget,
+    list_services, load_alias_sidecar, load_clusters, load_extensions, lookup_symbol,
+    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -33,6 +33,21 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
+
+// ── Daemon index-stream phases ────────────────────────────────────────────────
+/// Drain one daemon index stream with the shared fail-closed terminal-state
+/// classifier while letting each CLI command preserve its progress rendering.
+async fn consume_cli_index_progress<S, F>(stream: S, on_progress: F) -> anyhow::Result<String>
+where
+    S: tonic::codegen::tokio_stream::Stream<
+            Item = Result<nestweaver_proto::IndexProgress, tonic::Status>,
+        > + Unpin,
+    F: FnMut(&nestweaver_proto::IndexProgress),
+{
+    nestweaver_proto::consume_index_progress(stream, on_progress)
+        .await
+        .map_err(Into::into)
+}
 
 // ── Rich diagnostics ─────────────────────────────────────────────────────────
 
@@ -700,6 +715,10 @@ enum Commands {
                     opt-out for --with-git-activity"
         )]
         config: Option<PathBuf>,
+        /// Configure detected AI tool integrations at the indexed repo root after
+        /// indexing (bypasses the TTY/cwd auto-setup gate).
+        #[arg(long)]
+        setup: bool,
     },
     /// Get task-focused context: structural subgraph around seed symbols
     ///
@@ -1942,13 +1961,18 @@ enum BrainCommands {
         path: PathBuf,
         #[arg(long, help = "Friendly name for the vault (default: directory name)")]
         name: Option<String>,
-        #[arg(long, help = "Instance ID")]
+        #[arg(long, help = "Instance ID (overrides --config)")]
         instance: Option<String>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Path to instance config (TOML) — uses its instance_id and db_path"
+        )]
+        config: Option<PathBuf>,
         #[arg(
             long,
             help = "Only re-index files modified since this timestamp (ISO 8601, e.g. 2026-05-26T00:00:00Z)"
@@ -2713,6 +2737,29 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
     }
 }
 
+/// Resolve the instance id for a command using the nw-019 precedence:
+/// `--instance` flag > config's `instance_id` > `"default"`. Centralizes the
+/// rule shared by `brain watch`/`brain add`/`brain refresh` and the top-level
+/// `watch`, so no path silently stamps symbols under the literal `"default"`
+/// when a `--config` names an instance.
+fn resolve_instance_id(flag: Option<String>, config: Option<&Path>) -> anyhow::Result<String> {
+    // nw-047: treat an empty `--instance ""` as unset (not a literal empty
+    // instance) so it falls through to the config's `instance_id` / "default".
+    // This is CLI-side resolution only; the daemon's own empty=="decide" RPC
+    // convention lives in a different layer and is unaffected.
+    let resolved = flag
+        .filter(|f| !f.is_empty())
+        .or_else(|| load_instance_config_opt(config).map(|c| c.instance_id))
+        .unwrap_or_else(|| "default".to_string());
+    // nw-052b: validate the RESOLVED instance at this single CLI choke point.
+    // nw-052 only validated the config-load path, so a `--instance "a:b"` flag
+    // still slipped through and produced an ambiguous uid `repo:a:b:<hash>`.
+    // Validating here closes the flag path for every command that resolves an
+    // instance (index, watch, brain add, brain refresh).
+    nestweaver_engine::validate_instance_id(&resolved)?;
+    Ok(resolved)
+}
+
 /// Discover the `[pr_impact]` strict-gate policy from an instance config sitting
 /// next to the repo. Tries the known filename conventions in order — the
 /// project-dir form first, then the flat forms the CLI's `--config` help and the
@@ -3082,6 +3129,32 @@ fn resolve_index_db_path(db: Option<PathBuf>, repo_root: &Path) -> PathBuf {
     repo_root.join("nestweaver.lbug")
 }
 
+/// nw-023: first-index auto-setup, gated to "human at a TTY standing in the
+/// indexed repo", writes anchored to the repo root, marker written only on an
+/// actual run so a skip never permanently disables first-run setup.
+fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig, force_setup: bool) {
+    let marker_path = nestweaver_engine::sidecar_path(db_path, ".setup_done");
+    if marker_path.exists() && !force_setup {
+        return;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let gate_open =
+        setup::should_auto_setup(std::io::stderr().is_terminal(), out.quiet, &cwd, repo_root);
+    if force_setup || gate_open {
+        match setup::run_auto_setup(db_path, repo_root, out.quiet) {
+            Ok(()) => {
+                let _ = std::fs::write(&marker_path, "");
+            }
+            Err(e) => tracing::debug!("auto-setup failed (non-fatal): {e}"),
+        }
+    } else {
+        out.status(&format!(
+            "Tip: run `nestweaver setup` in {} to configure AI tool integrations.",
+            repo_root.display()
+        ));
+    }
+}
+
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
@@ -3101,7 +3174,13 @@ fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
         }
     })?;
 
-    let pr_path = path.with_extension("pagerank.json");
+    // nw-029: load the PageRank sidecar from the canonical path. Every writer
+    // and `migrate_sidecar` produce `<db>.lbug.pagerank.json` via
+    // `sidecar_path(db, ".pagerank.json")`; the old `with_extension` idiom
+    // yielded `<db>.pagerank.json`, so a direct (non-daemon) `ui`/query never
+    // warm-loaded ranks. Mirror the daemon's idiom (server.rs).
+    nestweaver_engine::migrate_sidecar(path, "pagerank.json", ".pagerank.json");
+    let pr_path = nestweaver_engine::sidecar_path(path, ".pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
 
     // Load interaction memory scores so PPR can apply a small bias toward
@@ -4299,8 +4378,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
             let store = open_store(Some(db_path))?;
-            let cache_path = db_path.with_extension("manifests.json");
-            let manifests = load_manifest_cache(&cache_path).unwrap_or_default();
+            let manifests =
+                nestweaver_engine::load_manifest_cache_for_db(db_path).unwrap_or_default();
             let suggestions = suggest_links(&store, &manifests)?;
 
             if json {
@@ -4977,7 +5056,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes, force)?;
+            let base = std::env::current_dir()?;
+            setup::run_setup(tool.as_deref(), &db_path, all, allow_writes, force, &base)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -5145,9 +5225,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Load manifest sidecar for manifest-driven entry points.
             let db_path = db.clone().unwrap_or_else(default_db_path);
-            let manifest_cache_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
             let manifests =
-                nestweaver_engine::load_manifest_cache(&manifest_cache_path).unwrap_or_default();
+                nestweaver_engine::load_manifest_cache_for_db(&db_path).unwrap_or_default();
 
             let result = nestweaver_engine::detect_dead_code_with_manifests(&store, &manifests)?;
 
@@ -5703,7 +5782,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_ERROR, None));
             }
             let db_path = resolve_index_db_path(db, &repo_path);
-            let instance_id = instance.unwrap_or_else(|| "default".to_string());
+            // nw-019: --instance flag > config's instance_id > "default"
+            // (mirrors `brain watch`/`brain add`; without this, `watch --config X`
+            // with no --instance stamps symbols under "default" even with the
+            // daemon up — an instance mismatch of the nw-019 class).
+            let instance_id = resolve_instance_id(instance, config.as_deref())?;
 
             if let Some(hours) = refresh_wiki_hours {
                 eprintln!(
@@ -5976,6 +6059,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
                 let rt =
                     tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+                // nw-029: pre-warm PageRank so the first overview/impact query never
+                // pays the lazy compute. Fire-and-forget; single-flight (nw-029 T1)
+                // makes a concurrent first query wait on this instead of duplicating
+                // it. A DB whose sidecar was loaded at open is a no-op
+                // (ensure_pagerank_loaded's is_some() fast path).
+                {
+                    let store = state.store.clone();
+                    rt.spawn_blocking(move || {
+                        store.ensure_pagerank_loaded();
+                    });
+                }
+
                 rt.block_on(nestweaver_web::start_server(state, port, !no_open))?;
             }
 
@@ -7886,6 +7982,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             with_trigrams,
             with_git_activity,
             config,
+            setup,
         } => {
             let repo_path = match repo {
                 Some(p) => p,
@@ -7905,6 +8002,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             })?;
             let db_path = resolve_index_db_path(db, &repo_path);
 
+            // nw-052 (P2a): validate the `--instance` flag value BEFORE the
+            // daemon/no-daemon split so both paths reject a colon/whitespace.
+            // `resolve_instance_id` only runs on the no-daemon path, so the
+            // daemon branch below built the RPC with the RAW flag and produced
+            // an ambiguous uid `repo:a:b:<hash>`. An empty `--instance ""`
+            // stays "unset" (daemon decides / falls through to config/default).
+            if let Some(flag) = instance.as_deref().filter(|f| !f.is_empty()) {
+                nestweaver_engine::validate_instance_id(flag)?;
+            }
+
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
@@ -7918,11 +8025,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     force,
                     with_trigrams,
                     with_git_activity,
+                    // nw-019: thread an explicit `--instance` through the RPC so it
+                    // overrides the daemon's default; empty lets the daemon decide.
+                    instance_id: instance.clone().unwrap_or_default(),
                 };
 
-                rt.block_on(async {
-                    let mut stream = client.inner_mut().index_repo(req).await?.into_inner();
-                    while let Some(progress) = stream.message().await? {
+                let index_result = rt.block_on(async {
+                    let stream = client.inner_mut().index_repo(req).await?.into_inner();
+                    consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
                             0 => "Discovering",
                             1 => "Parsing",
@@ -7934,14 +8044,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             _ => "Unknown",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
-                    }
-                    Ok::<_, anyhow::Error>(())
-                })?;
+                    })
+                    .await
+                });
 
+                // Logical failures arrive in-band. Empty, truncated, malformed,
+                // and transport-failed streams must also skip auto-setup.
+                if let Err(error) = index_result {
+                    out.status(&format!("Index failed: {error}"));
+                    return Ok((EXIT_ERROR, None));
+                }
+
+                // nw-023: setup is client-side (config files + marker, no DB access); give
+                // daemon-mode users the same gated first-index convenience as the direct path.
+                maybe_run_auto_setup(&db_path, &repo_path, out, setup);
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            let instance_id = instance.as_deref().unwrap_or("default");
+            // nw-047: resolve `--instance` > config `instance_id` > "default"
+            // (was `instance.unwrap_or("default")`, which ignored the config and
+            // treated `--instance ""` as a literal empty instance). Mirrors the
+            // daemon path's nw-019 resolution so the no-daemon direct write
+            // stamps nodes under the same logical instance the daemon would.
+            let instance_id = resolve_instance_id(instance, config.as_deref())?;
 
             // Identity: prefer the git origin remote when configured (used
             // only as an identity string — never fetched); fall back to a
@@ -7979,7 +8104,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let result = index_directory_with_options(
                     &repo_path,
                     &db_path,
-                    instance_id,
+                    &instance_id,
                     &repo_url,
                     &indexed_sha,
                     true,
@@ -8007,7 +8132,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let inc = incremental_index_with_name(
                     &repo_path,
                     &db_path,
-                    instance_id,
+                    &instance_id,
                     &repo_url,
                     name.as_deref(),
                 )
@@ -8035,9 +8160,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
-            // PageRank is deferred to first query (lazy evaluation in
-            // GraphStore::ensure_pagerank_loaded) so the index path stays fast.
-            out.status("PageRank will be computed on first query.");
+            // nw-029: PageRank is computed and saved at index time on every path
+            // this command takes — full (`--force`), incremental, and the
+            // first-index-of-a-new-repo fallback all warm the sidecar before
+            // returning. The index-time compute is non-fatal (warn-only) on the
+            // full/fallback paths, and GraphStore::ensure_pagerank_loaded is a
+            // single-flight lazy backstop, so this reports the mechanism rather
+            // than asserting the sidecar was written on this particular run.
+            out.status("PageRank computed at index time (lazy compute is the fallback).");
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.
@@ -8104,13 +8234,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Auto-setup AI tool integrations on first index of this repo.
             // Uses a marker sidecar so it only fires once per db, not on every
             // incremental re-index. Non-fatal — a failure here never aborts the index.
-            let marker_path = nestweaver_engine::sidecar_path(&db_path, ".setup_done");
-            if !marker_path.exists() {
-                if let Err(e) = setup::run_auto_setup(&db_path) {
-                    tracing::debug!("auto-setup failed (non-fatal): {e}");
-                }
-                let _ = std::fs::write(&marker_path, "");
-            }
+            maybe_run_auto_setup(&db_path, &repo_path, out, setup);
 
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",
@@ -8326,6 +8450,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         match unsafe { daemonize.start() } {
                             Ok(()) => {
                                 // We are now the daemon process.
+                                // daemonize2's pidfile flock was acquired before
+                                // the fork and is inherited by this child. Mark
+                                // that ownership only after `start()` returns in
+                                // the child so run_server does not self-conflict
+                                // by opening and flocking the same pidfile again.
+                                unsafe {
+                                    std::env::set_var("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD", "1");
+                                }
                                 let idle = if idle_timeout > 0 {
                                     Some(std::time::Duration::from_secs(idle_timeout))
                                 } else {
@@ -9582,10 +9714,8 @@ fn run_brain(
             ignore,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            let instance_cfg = load_instance_config_opt(config.as_deref());
-            let instance_id_owned = instance
-                .or_else(|| instance_cfg.map(|c| c.instance_id))
-                .unwrap_or_else(|| "default".to_string());
+            // nw-019: --instance flag > config's instance_id > "default".
+            let instance_id_owned = resolve_instance_id(instance, config.as_deref())?;
             let instance_id = instance_id_owned.as_str();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
@@ -9633,8 +9763,8 @@ fn run_brain(
                     instance_id: instance_id.to_string(),
                 };
                 rt.block_on(async {
-                    let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
-                    while let Some(progress) = stream.message().await? {
+                    let stream = client.inner_mut().index_vault(req).await?.into_inner();
+                    consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
                             0 => "Discovering",
                             1 => "Parsing",
@@ -9646,8 +9776,8 @@ fn run_brain(
                             _ => "Unknown",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
-                    }
-                    Ok::<_, anyhow::Error>(())
+                    })
+                    .await
                 })?;
                 return Ok((EXIT_SUCCESS, None));
             }
@@ -10423,14 +10553,10 @@ fn run_brain(
                     .unwrap_or("vault")
                     .to_string()
             });
-            // Instance ID priority: --instance flag > config's instance_id > "default"
+            // Resolve and validate the same instance precedence as brain add,
+            // brain refresh, top-level index, and top-level watch.
+            let instance_id = resolve_instance_id(instance, config.as_deref())?;
             let instance_cfg = load_instance_config_opt(config.as_deref());
-            let instance_id = instance.unwrap_or_else(|| {
-                instance_cfg
-                    .as_ref()
-                    .map(|c| c.instance_id.clone())
-                    .unwrap_or_else(|| "default".to_string())
-            });
 
             if let Some(hours) = refresh_wiki_hours {
                 out.status(&format!(
@@ -10533,7 +10659,7 @@ fn run_brain(
             }
 
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
-            let manifests_path = db_path.with_extension("manifests.json");
+            let manifests_path = nestweaver_engine::manifest_cache_path(&db_path);
             let wiki_instance_id = instance_id.clone();
             let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
                 .with_tantivy_index(&tantivy_sidecar)
@@ -10639,10 +10765,11 @@ fn run_brain(
             name,
             instance,
             db,
+            config,
             since,
             ignore,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());
                 return Ok((EXIT_ERROR, None));
@@ -10653,7 +10780,10 @@ fn run_brain(
                     .unwrap_or("vault")
                     .to_string()
             });
-            let instance_id = instance.unwrap_or_else(|| "default".to_string());
+            // nw-019: --instance flag > config's instance_id > "default"
+            // (mirrors `brain add`/`brain watch`; fixes vaults being tagged
+            // under the literal "default" instead of the config's instance).
+            let instance_id = resolve_instance_id(instance, config.as_deref())?;
             let extra_patterns = parse_ignore_flag(&ignore);
 
             // Compute vault UID for recording last_indexed_at.
@@ -10674,16 +10804,16 @@ fn run_brain(
                     instance_id: instance_id.to_string(),
                 };
                 rt.block_on(async {
-                    let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
-                    while let Some(progress) = stream.message().await? {
+                    let stream = client.inner_mut().index_vault(req).await?.into_inner();
+                    consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
                             5 => "Done",
                             6 => "Error",
                             _ => "Progress",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
-                    }
-                    Ok::<_, anyhow::Error>(())
+                    })
+                    .await
                 })?;
                 return Ok((EXIT_SUCCESS, None));
             }
@@ -13567,9 +13697,42 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 for d in &result.discarded_vaults {
                     eprintln!("Note: {d}");
                 }
+                if !result.repos_needing_reindex.is_empty() {
+                    eprintln!("{}", merge_reindex_guidance(&result.repos_needing_reindex));
+                }
             }
             Ok(EXIT_SUCCESS)
         }
+    }
+}
+
+fn merge_reindex_guidance(repos: &[String]) -> String {
+    let mut guidance = String::from(
+        "\nNOTE: source repo graph rows were removed during merge.\n\
+         Force re-index each repo listed below; this recreates them under the target instance:\n",
+    );
+    for repo in repos {
+        guidance.push_str("  ");
+        guidance.push_str(repo);
+        guidance.push('\n');
+    }
+    guidance.push_str("  nestweaver index --repo <path> --force\n");
+    guidance.push_str("  nestweaver materialize-projects --config <instance.toml>");
+    guidance
+}
+
+#[cfg(test)]
+mod merge_instance_guidance_tests {
+    use super::*;
+
+    #[test]
+    fn reindex_guidance_describes_removed_then_recreated_graph_rows() {
+        let guidance = merge_reindex_guidance(&["/work/acme".to_string()]);
+
+        assert!(guidance.contains("source repo graph rows were removed"));
+        assert!(guidance.contains("recreates them under the target instance"));
+        assert!(!guidance.contains("keep their old UIDs"));
+        assert!(guidance.contains("/work/acme"));
     }
 }
 
@@ -13912,7 +14075,7 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
 
-    match std::fs::read_to_string(&pidfile) {
+    let daemon_check: anyhow::Result<()> = match std::fs::read_to_string(&pidfile) {
         // No pidfile → nothing claims this DB → quiesced.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         // Present but unreadable → cannot confirm the daemon is stopped → fail closed.
@@ -13939,6 +14102,35 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
                 db_path.display(),
             ),
             // Dead/stale pid → daemon is gone → quiesced.
+            Ok(_) => Ok(()),
+        },
+    };
+    daemon_check?;
+
+    // Standalone `code watch` and `brain watch` processes do not own a daemon
+    // pidfile. They publish their PID in `<db>.lock`; apply the same fail-closed
+    // quiescence check so snapshot build cannot race those writers either.
+    let watcher_lock = nestweaver_engine::sidecar_path(db_path, ".lock");
+    match std::fs::read_to_string(&watcher_lock) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => anyhow::bail!(
+            "a watcher lock exists at {} but could not be read ({error}) — refusing to build a \
+             possibly-torn snapshot. Stop the standalone watcher or remove its stale lock, then \
+             retry.",
+            watcher_lock.display(),
+        ),
+        Ok(contents) => match contents.trim().parse::<i32>() {
+            Err(_) => anyhow::bail!(
+                "a watcher lock exists at {} but could not be parsed — refusing to build a \
+                 possibly-torn snapshot. Stop the standalone watcher or remove its stale lock, \
+                 then retry.",
+                watcher_lock.display(),
+            ),
+            Ok(pid) if nestweaver_client::autostart::is_process_alive(pid) => anyhow::bail!(
+                "a standalone watcher (pid {pid}) is writing this database {} — stop it before \
+                 building a snapshot.",
+                db_path.display(),
+            ),
             Ok(_) => Ok(()),
         },
     }
@@ -14173,11 +14365,27 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
             // Load instance config if provided
             let cfg = load_instance_config_opt(config.as_deref());
 
-            // Resolve instance ID using the same hash-based algorithm the daemon uses,
-            // so the filter matches how repos are actually stored.
-            let instance_id = instance.unwrap_or_else(|| {
-                nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path)
-            });
+            // nw-053: default the recorded instance to how repos are ACTUALLY
+            // stored now. Post-nw-019 the daemon stamps repos under the config's
+            // LOGICAL `instance_id` (and the no-daemon CLI under config/"default"),
+            // NOT the db-path hash. So resolve: `--instance` flag > config's
+            // `instance_id` > db-path hash. The hash fallback survives ONLY for a
+            // no-config DB, where the logical name is unknown and the hash is the
+            // best legacy guess. (This id is recorded in the snapshot stamp and used
+            // as the default output-dir name; the snapshot's repo set is read via
+            // `list_repos(.., None)` below, so content is instance-agnostic.)
+            let instance_id = instance
+                .filter(|f| !f.is_empty())
+                .or_else(|| cfg.as_ref().map(|c| c.instance_id.clone()))
+                .unwrap_or_else(|| {
+                    nestweaver_daemon::lifecycle::instance_id_from_db_path(&db_path)
+                });
+            // nw-052b residual: a `--instance` flag here bypasses the CLI
+            // `resolve_instance_id` validator, so reject a colon/whitespace
+            // instance before it lands in the stamp label and the
+            // `snapshot-<instance>` output-dir name. Config-derived ids are
+            // already validated at config-load; the hash fallback is always valid.
+            nestweaver_engine::validate_instance_id(&instance_id)?;
 
             // Fetch repos by reading the store directly. The quiesce guard above
             // guarantees no daemon is writing this DB, so a raw read is safe —
@@ -14815,6 +15023,31 @@ mod snapshot_build_guard_tests {
             .expect_err("build must refuse when the pidfile cannot be parsed");
         assert!(err.to_string().contains("pidfile"), "err was: {err}");
     }
+
+    #[test]
+    fn snapshot_build_refuses_live_or_unparseable_standalone_watcher_lock() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (_data_dir, db, _pidfile) = fixture();
+        let watcher_lock = nestweaver_engine::sidecar_path(&db, ".lock");
+
+        std::fs::write(&watcher_lock, std::process::id().to_string()).unwrap();
+        let error = ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect_err("build must refuse while a standalone watcher is live");
+        assert!(error.to_string().contains("watcher"), "err was: {error}");
+
+        std::fs::write(&watcher_lock, "not-a-pid").unwrap();
+        let error = ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect_err("build must fail closed on an unparseable watcher lock");
+        assert!(
+            error.to_string().contains("watcher lock"),
+            "err was: {error}"
+        );
+
+        std::fs::write(&watcher_lock, i32::MAX.to_string()).unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("a stale watcher lock must not block snapshot build");
+    }
 }
 
 #[cfg(test)]
@@ -15360,5 +15593,177 @@ mod pr_impact_hook_tests {
                 .contains("echo second"),
             "a second foreign hook must get a numbered backup"
         );
+    }
+}
+
+#[cfg(test)]
+mod resolve_instance_id_tests {
+    use super::*;
+
+    /// A minimal-but-valid instance config whose `instance_id` is distinct from
+    /// the literal `"default"`, so a resolution that returns "default" proves the
+    /// config was ignored.
+    const CONFIG_TOML: &str = r#"
+instance_id = "from-config"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+"#;
+
+    fn write_config(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("instance.toml");
+        std::fs::write(&p, CONFIG_TOML).unwrap();
+        p
+    }
+
+    /// The `--instance` flag always wins, even when a config names a different id.
+    #[test]
+    fn flag_wins_over_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_config(dir.path());
+        assert_eq!(
+            resolve_instance_id(Some("from-flag".to_string()), Some(cfg.as_path())).unwrap(),
+            "from-flag"
+        );
+    }
+
+    /// nw-019 regression guard: with NO `--instance` flag, the config's
+    /// `instance_id` must be honored — NOT the literal "default". This is the
+    /// exact bug the top-level `watch` had (`instance.unwrap_or_else(|| "default")`
+    /// ignored `--config`).
+    #[test]
+    fn config_used_when_no_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_config(dir.path());
+        assert_eq!(
+            resolve_instance_id(None, Some(cfg.as_path())).unwrap(),
+            "from-config"
+        );
+    }
+
+    /// Neither flag nor config → the "default" fallback.
+    #[test]
+    fn default_when_neither() {
+        assert_eq!(resolve_instance_id(None, None).unwrap(), "default");
+    }
+
+    /// An unparseable/missing config falls back to "default" (not a panic) when
+    /// no flag is given.
+    #[test]
+    fn default_when_config_unloadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.toml");
+        assert_eq!(
+            resolve_instance_id(None, Some(missing.as_path())).unwrap(),
+            "default"
+        );
+    }
+
+    /// nw-052b: a colon in the `--instance` flag must be rejected at the CLI
+    /// choke point. nw-052 only validated the config-load path, so the flag
+    /// still slipped a `repo:a:b:<hash>` ambiguous uid through.
+    #[test]
+    fn flag_with_colon_is_rejected() {
+        let err = resolve_instance_id(Some("a:b".to_string()), None)
+            .expect_err("colon in --instance must be rejected");
+        assert!(
+            err.to_string().contains("colon"),
+            "error should mention the colon, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod daemon_index_phase_tests {
+    use super::*;
+
+    fn progress(
+        phase: nestweaver_proto::Phase,
+        message: &str,
+    ) -> Result<nestweaver_proto::IndexProgress, tonic::Status> {
+        Ok(nestweaver_proto::IndexProgress {
+            phase: phase as i32,
+            message: message.to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn cli_consumer_forwards_progress_and_requires_done() {
+        let mut forwarded = Vec::new();
+        let message = consume_cli_index_progress(
+            tonic::codegen::tokio_stream::iter(vec![
+                progress(nestweaver_proto::Phase::Discovering, "scanning"),
+                progress(nestweaver_proto::Phase::Done, "complete"),
+            ]),
+            |event| forwarded.push(event.message.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(message, "complete");
+        assert_eq!(forwarded, ["scanning", "complete"]);
+    }
+
+    #[tokio::test]
+    async fn cli_consumer_rejects_logical_and_transport_failures() {
+        let logical = consume_cli_index_progress(
+            tonic::codegen::tokio_stream::iter(vec![progress(
+                nestweaver_proto::Phase::Error,
+                "parser exploded",
+            )]),
+            |_| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(logical.contains("parser exploded"));
+
+        let transport = consume_cli_index_progress(
+            tonic::codegen::tokio_stream::iter(vec![Err(tonic::Status::unavailable(
+                "connection reset",
+            ))]),
+            |_| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(transport.contains("connection reset"));
+
+        let mut forwarded = Vec::new();
+        let malformed = consume_cli_index_progress(
+            tonic::codegen::tokio_stream::iter(vec![
+                progress(nestweaver_proto::Phase::Done, "done"),
+                progress(nestweaver_proto::Phase::Writing, "late"),
+            ]),
+            |event| forwarded.push(event.message.clone()),
+        )
+        .await;
+        assert!(malformed.is_err());
+        assert_eq!(forwarded, ["done"], "late events must not be forwarded");
+
+        for events in [
+            vec![],
+            vec![progress(nestweaver_proto::Phase::Writing, "truncated")],
+        ] {
+            assert!(
+                consume_cli_index_progress(tonic::codegen::tokio_stream::iter(events), |_| {})
+                    .await
+                    .is_err()
+            );
+        }
     }
 }

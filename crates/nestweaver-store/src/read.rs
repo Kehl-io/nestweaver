@@ -421,7 +421,7 @@ impl GraphStore {
             conn.query(&q)
                 .map_err(|e| StoreError::Query(e.to_string()))?
         };
-        result
+        let rows: Vec<Repo> = result
             .map(|row| {
                 let uid = extract_string(&row, 0)?;
                 let url = extract_string(&row, 1)?;
@@ -441,7 +441,23 @@ impl GraphStore {
                     root_path,
                 })
             })
-            .collect()
+            .collect::<Result<_, StoreError>>()?;
+
+        // nw-043 instrumentation: a Repo row whose provenance doesn't match this
+        // handle's DB is the isolation-anomaly signature. Debug builds trace every
+        // listing with handle provenance so a recurrence in ANY suite (not just the
+        // e2e guard) is attributable to a specific handle + path. Zero cost unless
+        // RUST_LOG=nw043=trace.
+        #[cfg(debug_assertions)]
+        if let Some(db_path) = self.db_path() {
+            for r in &rows {
+                tracing::trace!(target: "nw043",
+                    db = %db_path.display(), uid = %r.uid, url = %r.url,
+                    "list_repos row provenance");
+            }
+        }
+
+        Ok(rows)
     }
 
     pub fn list_services(&self, instance_id: Option<&str>) -> Result<Vec<Service>, StoreError> {
@@ -1188,6 +1204,60 @@ impl GraphStore {
         Ok(result.count())
     }
 
+    /// Return the authoritative set of graph-node UIDs supported by the
+    /// sidecar embedding index. The embedding producers currently cover
+    /// Symbols, Notes, and Headings; querying all three protects vault data
+    /// while code-repo deletion reconciles Symbol vectors.
+    pub(crate) fn live_embedding_node_uids(&self) -> Result<HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut uids = HashSet::new();
+        for query in [
+            "MATCH (s:Symbol) RETURN s.uid",
+            "MATCH (n:Note) RETURN n.uid",
+            "MATCH (h:Heading) RETURN h.uid",
+        ] {
+            let result = conn
+                .query(query)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in result {
+                uids.insert(extract_string(&row, 0)?);
+            }
+        }
+        Ok(uids)
+    }
+
+    /// Return every UID-bearing graph node currently present. This is the
+    /// authoritative liveness set for UID-keyed external sidecars.
+    pub fn live_graph_node_uids(&self) -> Result<HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut uids = HashSet::new();
+        for query in [
+            "MATCH (n:Repo) RETURN n.uid",
+            "MATCH (n:File) RETURN n.uid",
+            "MATCH (n:Service) RETURN n.uid",
+            "MATCH (n:Symbol) RETURN n.uid",
+            "MATCH (n:Vault) RETURN n.uid",
+            "MATCH (n:Note) RETURN n.uid",
+            "MATCH (n:Heading) RETURN n.uid",
+            "MATCH (n:Section) RETURN n.uid",
+            "MATCH (n:Tag) RETURN n.uid",
+            "MATCH (n:Project) RETURN n.uid",
+            "MATCH (n:Contract) RETURN n.uid",
+            "MATCH (n:UnresolvedWikilink) RETURN n.uid",
+            "MATCH (n:TrigramPosting) RETURN n.uid",
+        ] {
+            let result = conn.query(query).map_err(|error| {
+                StoreError::Query(format!(
+                    "graph UID liveness query failed ({query}): {error}"
+                ))
+            })?;
+            for row in result {
+                uids.insert(extract_string(&row, 0)?);
+            }
+        }
+        Ok(uids)
+    }
+
     /// Count symbols grouped by their owning repo (`repo_uid` -> count).
     /// Used by backup manifests to report per-repo symbol totals without
     /// loading full symbol rows.
@@ -1780,6 +1850,24 @@ impl GraphStore {
             .collect()
     }
 
+    /// Return whether a Project UID is currently present in the graph.
+    ///
+    /// This narrow lookup is used to resolve an ambiguous delete transaction
+    /// before removing UID-scoped sidecar metadata.
+    pub fn project_exists(&self, project_uid: &str) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("MATCH (p:Project {uid: $uid}) RETURN p.uid")
+            .map_err(|error| StoreError::Query(format!("prepare Project liveness: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut stmt,
+                vec![("uid", lbug::Value::String(project_uid.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("execute Project liveness: {error}")))?;
+        Ok(rows.next().is_some())
+    }
+
     /// List all Contract nodes, optionally filtered to a single repo.
     pub fn list_contracts(&self, repo_uid: Option<&str>) -> Result<Vec<Contract>, StoreError> {
         let conn = self.conn()?;
@@ -1945,6 +2033,14 @@ impl GraphStore {
         project_uid: &str,
         limit: usize,
     ) -> Result<Vec<String>, StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Ok(vec![]);
+        }
         if limit == 0 {
             return Ok(vec![]);
         }

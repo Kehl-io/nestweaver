@@ -8,26 +8,63 @@ struct ToolSetup {
     detected: bool,
 }
 
-pub fn run_setup(
-    tool: Option<&str>,
-    db_path: &Path,
-    force_all: bool,
-    allow_writes: bool,
-    force_overwrite: bool,
-) -> Result<(), anyhow::Error> {
+/// Print the one-time "NestWeaver Setup" banner (title + separator + database
+/// line). Hoisted out of `run_setup` so a per-tool loop (auto-setup) prints it
+/// at most once per invocation instead of once per detected tool (nw-051).
+fn print_setup_banner(db_path: &Path) {
     let db_str = db_path.to_string_lossy();
-
     println!("NestWeaver Setup");
     println!("{}", "─".repeat(40));
-
     if db_path.exists() {
         println!("Database: {} (exists)", db_str);
     } else {
         println!("Database: {} (will be created on first index)", db_str);
     }
     println!();
+}
 
-    let tools = detect_tools();
+/// Configure a single tool by name. Does NOT print the banner — callers own
+/// banner printing so it happens once per invocation (nw-051).
+fn configure_tool(
+    name: &str,
+    db_path: &Path,
+    allow_writes: bool,
+    force_overwrite: bool,
+    base: &Path,
+) -> Result<(), anyhow::Error> {
+    match name {
+        "claude-code" => setup_claude_code(db_path, allow_writes, force_overwrite, base)?,
+        "cursor" => setup_cursor(db_path, allow_writes, force_overwrite, base)?,
+        "codex" => setup_codex(db_path, allow_writes, base)?,
+        "windsurf" => setup_windsurf(db_path, allow_writes)?,
+        "jetbrains" => setup_jetbrains(db_path, allow_writes, base)?,
+        "vscode" => setup_vscode(db_path, allow_writes, base)?,
+        "gemini" => setup_gemini(db_path, allow_writes, base)?,
+        "copilot" => setup_copilot(db_path, allow_writes, base)?,
+        "aider" => setup_aider(db_path, allow_writes, base)?,
+        "kiro" => setup_kiro(db_path, allow_writes, base)?,
+        "continue" => setup_continue(db_path, allow_writes, base)?,
+        "cline" => setup_cline(db_path, allow_writes, base)?,
+        "opencode" => setup_opencode(db_path, allow_writes, base)?,
+        "trae" => setup_trae(db_path, allow_writes, base)?,
+        "devin" => setup_devin(db_path, allow_writes, base)?,
+        "hermes" => setup_hermes(db_path, allow_writes, base)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn run_setup(
+    tool: Option<&str>,
+    db_path: &Path,
+    force_all: bool,
+    allow_writes: bool,
+    force_overwrite: bool,
+    base: &Path,
+) -> Result<(), anyhow::Error> {
+    print_setup_banner(db_path);
+
+    let tools = detect_tools(base);
 
     let mut any_configured = false;
     for t in &tools {
@@ -43,25 +80,7 @@ pub fn run_setup(
         }
 
         any_configured = true;
-        match t.name {
-            "claude-code" => setup_claude_code(db_path, allow_writes, force_overwrite)?,
-            "cursor" => setup_cursor(db_path, allow_writes, force_overwrite)?,
-            "codex" => setup_codex(db_path, allow_writes)?,
-            "windsurf" => setup_windsurf(db_path, allow_writes)?,
-            "jetbrains" => setup_jetbrains(db_path, allow_writes)?,
-            "vscode" => setup_vscode(db_path, allow_writes)?,
-            "gemini" => setup_gemini(db_path, allow_writes)?,
-            "copilot" => setup_copilot(db_path, allow_writes)?,
-            "aider" => setup_aider(db_path, allow_writes)?,
-            "kiro" => setup_kiro(db_path, allow_writes)?,
-            "continue" => setup_continue(db_path, allow_writes)?,
-            "cline" => setup_cline(db_path, allow_writes)?,
-            "opencode" => setup_opencode(db_path, allow_writes)?,
-            "trae" => setup_trae(db_path, allow_writes)?,
-            "devin" => setup_devin(db_path, allow_writes)?,
-            "hermes" => setup_hermes(db_path, allow_writes)?,
-            _ => {}
-        }
+        configure_tool(t.name, db_path, allow_writes, force_overwrite, base)?;
     }
 
     if let Some(specific) = tool
@@ -81,15 +100,15 @@ pub fn run_setup(
     Ok(())
 }
 
-fn detect_tools() -> Vec<ToolSetup> {
+fn detect_tools(base: &Path) -> Vec<ToolSetup> {
     vec![
         ToolSetup {
             name: "claude-code",
-            detected: Path::new(".claude").exists() || which_exists("claude"),
+            detected: base.join(".claude").exists() || which_exists("claude"),
         },
         ToolSetup {
             name: "cursor",
-            detected: Path::new(".cursor").exists(),
+            detected: base.join(".cursor").exists(),
         },
         ToolSetup {
             name: "codex",
@@ -101,53 +120,53 @@ fn detect_tools() -> Vec<ToolSetup> {
         },
         ToolSetup {
             name: "jetbrains",
-            detected: Path::new(".idea").exists() || Path::new(".junie").exists(),
+            detected: base.join(".idea").exists() || base.join(".junie").exists(),
         },
         ToolSetup {
             name: "vscode",
-            detected: Path::new(".vscode").exists(),
+            detected: base.join(".vscode").exists(),
         },
         ToolSetup {
             name: "gemini",
-            detected: Path::new(".gemini").exists() || which_exists("gemini"),
+            detected: base.join(".gemini").exists() || which_exists("gemini"),
         },
         ToolSetup {
             name: "copilot",
-            detected: Path::new(".github/copilot-mcp.json").exists()
-                || Path::new(".github/copilot-instructions.md").exists()
+            detected: base.join(".github/copilot-mcp.json").exists()
+                || base.join(".github/copilot-instructions.md").exists()
                 || which_exists("gh"),
         },
         ToolSetup {
             name: "aider",
-            detected: Path::new(".aider.conf.yml").exists() || which_exists("aider"),
+            detected: base.join(".aider.conf.yml").exists() || which_exists("aider"),
         },
         ToolSetup {
             name: "kiro",
-            detected: Path::new(".kiro").exists() || which_exists("kiro"),
+            detected: base.join(".kiro").exists() || which_exists("kiro"),
         },
         ToolSetup {
             name: "continue",
-            detected: Path::new(".continue").exists(),
+            detected: base.join(".continue").exists(),
         },
         ToolSetup {
             name: "cline",
-            detected: Path::new(".cline").exists(),
+            detected: base.join(".cline").exists(),
         },
         ToolSetup {
             name: "opencode",
-            detected: Path::new(".opencode").exists() || which_exists("opencode"),
+            detected: base.join(".opencode").exists() || which_exists("opencode"),
         },
         ToolSetup {
             name: "trae",
-            detected: Path::new(".trae").exists(),
+            detected: base.join(".trae").exists(),
         },
         ToolSetup {
             name: "devin",
-            detected: Path::new("devin.json").exists() || which_exists("devin"),
+            detected: base.join("devin.json").exists() || which_exists("devin"),
         },
         ToolSetup {
             name: "hermes",
-            detected: Path::new(".hermes").exists() || which_exists("hermes"),
+            detected: base.join(".hermes").exists() || which_exists("hermes"),
         },
     ]
 }
@@ -182,27 +201,28 @@ fn setup_claude_code(
     db_path: &Path,
     allow_writes: bool,
     force_overwrite: bool,
+    base: &Path,
 ) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".claude")?;
-    let mcp_path = Path::new(".mcp.json");
+    std::fs::create_dir_all(base.join(".claude"))?;
+    let mcp_path = base.join(".mcp.json");
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(mcp_path, "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(&mcp_path, "nestweaver", &mcp_config)?;
 
-    std::fs::create_dir_all(".claude/skills/nestweaver")?;
-    let skill_path = Path::new(".claude/skills/nestweaver/SKILL.md");
+    std::fs::create_dir_all(base.join(".claude/skills/nestweaver"))?;
+    let skill_path = base.join(".claude/skills/nestweaver/SKILL.md");
     let skill_status = if skill_path.exists() && !force_overwrite {
         "already exists (not overwritten)"
     } else {
-        std::fs::write(skill_path, generate_skill_content())?;
+        std::fs::write(&skill_path, generate_skill_content())?;
         "skill written"
     };
 
     // Install Claude Code hooks in .claude/settings.json
-    let hooks_status = install_claude_hooks(&db_str)?;
+    let hooks_status = install_claude_hooks(&db_str, base)?;
 
     print_result(
         "Claude Code",
@@ -227,10 +247,10 @@ fn setup_claude_code(
 /// Adds a SessionStart hook that prints brain status so the agent knows
 /// NestWeaver is available, and a PreToolUse hook for Bash that suggests
 /// graph alternatives when the agent falls back to grep/find.
-fn install_claude_hooks(db_str: &str) -> Result<&'static str, anyhow::Error> {
-    let settings_path = Path::new(".claude/settings.json");
+fn install_claude_hooks(db_str: &str, base: &Path) -> Result<&'static str, anyhow::Error> {
+    let settings_path = base.join(".claude/settings.json");
     let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(settings_path)?;
+        let content = std::fs::read_to_string(&settings_path)?;
         serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
     } else {
         serde_json::json!({})
@@ -306,9 +326,9 @@ fn install_claude_hooks(db_str: &str) -> Result<&'static str, anyhow::Error> {
         }));
     }
 
-    std::fs::create_dir_all(".claude")?;
+    std::fs::create_dir_all(base.join(".claude"))?;
     let formatted = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(settings_path, formatted)?;
+    std::fs::write(&settings_path, formatted)?;
 
     Ok("hooks installed")
 }
@@ -317,21 +337,22 @@ fn setup_cursor(
     db_path: &Path,
     allow_writes: bool,
     force_overwrite: bool,
+    base: &Path,
 ) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".cursor")?;
+    std::fs::create_dir_all(base.join(".cursor"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args_lite(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(Path::new(".cursor/mcp.json"), "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(&base.join(".cursor/mcp.json"), "nestweaver", &mcp_config)?;
 
-    std::fs::create_dir_all(".cursor/rules")?;
-    let rule_path = Path::new(".cursor/rules/nestweaver.mdc");
+    std::fs::create_dir_all(base.join(".cursor/rules"))?;
+    let rule_path = base.join(".cursor/rules/nestweaver.mdc");
     let rule_status = if rule_path.exists() && !force_overwrite {
         "already exists (not overwritten)"
     } else {
-        std::fs::write(rule_path, generate_cursor_rule_content())?;
+        std::fs::write(&rule_path, generate_cursor_rule_content())?;
         "agent rules written"
     };
 
@@ -352,21 +373,21 @@ fn setup_cursor(
     Ok(())
 }
 
-fn setup_codex(db_path: &Path, _allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".codex")?;
+fn setup_codex(db_path: &Path, _allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".codex"))?;
     let db_str = db_path.to_string_lossy();
-    let config_path = Path::new(".codex/config.toml");
+    let config_path = base.join(".codex/config.toml");
     let toml_section = format!(
         "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"{}\"]\n",
         db_str
     );
-    let merged = append_toml_if_missing(config_path, "mcp_servers.nestweaver", &toml_section)?;
+    let merged = append_toml_if_missing(&config_path, "mcp_servers.nestweaver", &toml_section)?;
 
-    let agents_path = Path::new("AGENTS.md");
+    let agents_path = base.join("AGENTS.md");
     let agents_status = if agents_path.exists() {
         "already exists (not overwritten)"
     } else {
-        std::fs::write(agents_path, generate_agents_md_content())?;
+        std::fs::write(&agents_path, generate_agents_md_content())?;
         "codebase guide written"
     };
 
@@ -416,14 +437,14 @@ fn setup_windsurf(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Erro
     Ok(())
 }
 
-fn setup_jetbrains(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".junie/mcp")?;
+fn setup_jetbrains(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".junie/mcp"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(Path::new(".junie/mcp/mcp.json"), "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(&base.join(".junie/mcp/mcp.json"), "nestweaver", &mcp_config)?;
 
     print_result(
         "JetBrains",
@@ -439,14 +460,14 @@ fn setup_jetbrains(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Err
     Ok(())
 }
 
-fn setup_vscode(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".vscode")?;
+fn setup_vscode(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".vscode"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(Path::new(".vscode/mcp.json"), "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(&base.join(".vscode/mcp.json"), "nestweaver", &mcp_config)?;
 
     print_result(
         "VS Code",
@@ -462,15 +483,15 @@ fn setup_vscode(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error>
     Ok(())
 }
 
-fn setup_gemini(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".gemini")?;
+fn setup_gemini(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".gemini"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
     let merged = merge_json_mcp(
-        Path::new(".gemini/settings.json"),
+        &base.join(".gemini/settings.json"),
         "nestweaver",
         &mcp_config,
     )?;
@@ -489,24 +510,24 @@ fn setup_gemini(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error>
     Ok(())
 }
 
-fn setup_copilot(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".github")?;
+fn setup_copilot(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".github"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
     let merged = merge_json_mcp(
-        Path::new(".github/copilot-mcp.json"),
+        &base.join(".github/copilot-mcp.json"),
         "nestweaver",
         &mcp_config,
     )?;
 
-    let instructions_path = Path::new(".github/copilot-instructions.md");
+    let instructions_path = base.join(".github/copilot-instructions.md");
     let instructions_status = if instructions_path.exists() {
         "already exists (not overwritten)"
     } else {
-        std::fs::write(instructions_path, generate_copilot_instructions())?;
+        std::fs::write(&instructions_path, generate_copilot_instructions())?;
         "instructions written"
     };
 
@@ -527,17 +548,17 @@ fn setup_copilot(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error
     Ok(())
 }
 
-fn setup_aider(db_path: &Path, _allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_aider(db_path: &Path, _allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
-    let config_path = Path::new(".aider.conf.yml");
-    let existing = std::fs::read_to_string(config_path).unwrap_or_default();
+    let config_path = base.join(".aider.conf.yml");
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let merged = if existing.contains("nestweaver") {
         false
     } else {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(config_path)?;
+            .open(&config_path)?;
         file.write_all(
             format!(
                 "\n# NestWeaver code intelligence\nrepo-map: nestweaver mcp --db {}\n",
@@ -562,14 +583,14 @@ fn setup_aider(db_path: &Path, _allow_writes: bool) -> Result<(), anyhow::Error>
     Ok(())
 }
 
-fn setup_kiro(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".kiro")?;
+fn setup_kiro(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".kiro"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(Path::new(".kiro/settings.json"), "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(&base.join(".kiro/settings.json"), "nestweaver", &mcp_config)?;
 
     print_result(
         "Kiro",
@@ -585,15 +606,15 @@ fn setup_kiro(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn setup_continue(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".continue")?;
+fn setup_continue(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".continue"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
     let merged = merge_json_mcp(
-        Path::new(".continue/config.json"),
+        &base.join(".continue/config.json"),
         "nestweaver",
         &mcp_config,
     )?;
@@ -612,14 +633,18 @@ fn setup_continue(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Erro
     Ok(())
 }
 
-fn setup_cline(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".cline")?;
+fn setup_cline(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".cline"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(Path::new(".cline/settings.json"), "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(
+        &base.join(".cline/settings.json"),
+        "nestweaver",
+        &mcp_config,
+    )?;
 
     print_result(
         "Cline",
@@ -635,15 +660,15 @@ fn setup_cline(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> 
     Ok(())
 }
 
-fn setup_opencode(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".opencode")?;
+fn setup_opencode(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".opencode"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
     let merged = merge_json_mcp(
-        Path::new(".opencode/config.json"),
+        &base.join(".opencode/config.json"),
         "nestweaver",
         &mcp_config,
     )?;
@@ -662,14 +687,14 @@ fn setup_opencode(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Erro
     Ok(())
 }
 
-fn setup_trae(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".trae")?;
+fn setup_trae(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".trae"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(Path::new(".trae/config.json"), "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(&base.join(".trae/config.json"), "nestweaver", &mcp_config)?;
 
     print_result(
         "Trae",
@@ -685,13 +710,13 @@ fn setup_trae(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn setup_devin(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
+fn setup_devin(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(Path::new("devin.json"), "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(&base.join("devin.json"), "nestweaver", &mcp_config)?;
 
     print_result(
         "Devin",
@@ -707,14 +732,14 @@ fn setup_devin(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> 
     Ok(())
 }
 
-fn setup_hermes(db_path: &Path, allow_writes: bool) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(".hermes")?;
+fn setup_hermes(db_path: &Path, allow_writes: bool, base: &Path) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(base.join(".hermes"))?;
     let db_str = db_path.to_string_lossy();
     let mcp_config = serde_json::json!({
         "command": "nestweaver",
         "args": mcp_args(&db_str, allow_writes)
     });
-    let merged = merge_json_mcp(Path::new(".hermes/config.json"), "nestweaver", &mcp_config)?;
+    let merged = merge_json_mcp(&base.join(".hermes/config.json"), "nestweaver", &mcp_config)?;
 
     print_result(
         "Hermes",
@@ -1018,82 +1043,207 @@ fn format_name(name: &str) -> &str {
     }
 }
 
-/// Check if a tool already has NestWeaver configuration in the current directory.
-/// Uses the primary config file that each tool's setup function writes.
-fn tool_already_configured(tool_name: &str) -> bool {
-    fn json_has_nestweaver(path: &str) -> bool {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v.get("mcpServers")
-                    .and_then(|s| s.get("nestweaver"))
-                    .map(|_| true)
-            })
-            .unwrap_or(false)
-    }
-    fn file_contains(path: &str, needle: &str) -> bool {
-        std::fs::read_to_string(path)
-            .map(|s| s.contains(needle))
-            .unwrap_or(false)
-    }
-    match tool_name {
-        "claude-code" => json_has_nestweaver(".mcp.json"),
-        "cursor" => json_has_nestweaver(".cursor/mcp.json"),
-        "codex" => file_contains(".codex/config.toml", "nestweaver"),
-        "windsurf" => dirs::home_dir()
-            .map(|h| {
-                json_has_nestweaver(
-                    h.join(".codeium/windsurf/mcp_config.json")
-                        .to_str()
-                        .unwrap_or(""),
-                )
-            })
-            .unwrap_or(false),
-        "jetbrains" => json_has_nestweaver(".junie/mcp/mcp.json"),
-        "vscode" => json_has_nestweaver(".vscode/mcp.json"),
-        "gemini" => json_has_nestweaver(".gemini/settings.json"),
-        "copilot" => json_has_nestweaver(".github/copilot-mcp.json"),
-        "aider" => file_contains(".aider.conf.yml", "nestweaver"),
-        "kiro" => json_has_nestweaver(".kiro/settings.json"),
-        "continue" => json_has_nestweaver(".continue/config.json"),
-        "cline" => json_has_nestweaver(".cline/settings.json"),
-        "opencode" => json_has_nestweaver(".opencode/config.json"),
-        "trae" => json_has_nestweaver(".trae/config.json"),
-        "devin" => json_has_nestweaver("devin.json"),
-        "hermes" => json_has_nestweaver(".hermes/config.json"),
-        _ => false,
-    }
+/// Run setup automatically after first index. Every detected tool is rerun
+/// idempotently while the completion marker is absent so a retry can repair
+/// secondary artifacts written after the primary config. Failures are returned
+/// so the caller can leave the marker absent and retry later.
+pub fn run_auto_setup(
+    db_path: &std::path::Path,
+    base: &Path,
+    quiet: bool,
+) -> Result<(), anyhow::Error> {
+    // Compute detected tools up front so we can print the banner at most once
+    // and skip it entirely when there's nothing to configure (nw-051).
+    let to_configure: Vec<&'static str> = detect_tools(base)
+        .into_iter()
+        .filter(|t| t.detected)
+        .map(|t| t.name)
+        .collect();
+    run_auto_setup_for_tools(db_path, base, quiet, &to_configure)
 }
 
-/// Run setup automatically after first index. Only configures tools that are
-/// detected and don't already have NestWeaver configs. Non-fatal — errors are
-/// logged but don't propagate.
-pub fn run_auto_setup(db_path: &std::path::Path) -> Result<(), anyhow::Error> {
-    let tools = detect_tools();
-    if tools.is_empty() {
+fn run_auto_setup_for_tools(
+    db_path: &Path,
+    base: &Path,
+    quiet: bool,
+    to_configure: &[&str],
+) -> Result<(), anyhow::Error> {
+    if to_configure.is_empty() {
         return Ok(());
     }
 
+    // Banner once per invocation, and suppressed under --quiet (nw-051).
+    if !quiet {
+        print_setup_banner(db_path);
+    }
+
     let mut configured = Vec::new();
-    for tool in &tools {
-        if !tool.detected {
-            continue;
-        }
-        if tool_already_configured(tool.name) {
-            continue;
-        }
-        match run_setup(Some(tool.name), db_path, false, false, false) {
-            Ok(()) => configured.push(tool.name),
-            Err(e) => tracing::debug!("auto-setup skipped {}: {e}", tool.name),
+    let mut failures = Vec::new();
+    for &name in to_configure {
+        match configure_tool(name, db_path, false, false, base) {
+            Ok(()) => configured.push(name),
+            Err(error) => failures.push(format!("{name}: {error:#}")),
         }
     }
 
-    if !configured.is_empty() {
+    if !configured.is_empty() && !quiet {
         eprintln!(
             "  Auto-configured NestWeaver for: {}. Run `nestweaver setup --help` to customize.",
             configured.join(", ")
         );
     }
+    if !failures.is_empty() {
+        anyhow::bail!("auto-setup failed for {}", failures.join("; "));
+    }
     Ok(())
+}
+
+/// nw-023: auto-setup may only fire for the persona it was built for —
+/// a human at a terminal, not suppressed by --quiet, indexing the repo
+/// they are standing in. Pure so it is unit-testable without a pty.
+/// `Path::starts_with` is component-wise, so /home/u/repo2 does not
+/// count as inside /home/u/repo.
+// Wired into the `Index` command handler in a later nw-023 task; the
+// `#[cfg(test)]` gate below exercises it in the meantime.
+pub fn should_auto_setup(
+    stderr_is_tty: bool,
+    quiet: bool,
+    cwd: &std::path::Path,
+    repo_root: &std::path::Path,
+) -> bool {
+    stderr_is_tty && !quiet && cwd.starts_with(repo_root)
+}
+
+#[cfg(test)]
+mod auto_setup_gate_tests {
+    use super::should_auto_setup;
+    use std::path::Path;
+
+    #[test]
+    fn allows_tty_interactive_cwd_inside_repo() {
+        assert!(should_auto_setup(
+            true,
+            false,
+            Path::new("/home/u/repo/subdir"),
+            Path::new("/home/u/repo")
+        ));
+    }
+    #[test]
+    fn allows_cwd_equal_to_repo_root() {
+        assert!(should_auto_setup(
+            true,
+            false,
+            Path::new("/r"),
+            Path::new("/r")
+        ));
+    }
+    #[test]
+    fn blocks_when_stderr_not_a_tty() {
+        assert!(!should_auto_setup(
+            false,
+            false,
+            Path::new("/r"),
+            Path::new("/r")
+        ));
+    }
+    #[test]
+    fn blocks_when_quiet() {
+        assert!(!should_auto_setup(
+            true,
+            true,
+            Path::new("/r"),
+            Path::new("/r")
+        ));
+    }
+    #[test]
+    fn blocks_when_cwd_outside_repo() {
+        assert!(!should_auto_setup(
+            true,
+            false,
+            Path::new("/somewhere/else"),
+            Path::new("/home/u/repo")
+        ));
+    }
+    #[test]
+    fn blocks_prefix_lookalike_dir() {
+        // /home/u/repo2 must NOT count as inside /home/u/repo
+        assert!(!should_auto_setup(
+            true,
+            false,
+            Path::new("/home/u/repo2"),
+            Path::new("/home/u/repo")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod setup_base_dir_tests {
+    use super::*;
+
+    /// The strong safety net: running setup with an explicit base must write
+    /// ONLY under that base, never into the process cwd.
+    #[test]
+    fn run_setup_writes_only_under_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(base.join(".cursor")).unwrap(); // deterministic detection, no `which` reliance
+        let db = tmp.path().join("t.lbug");
+        std::fs::write(&db, "").unwrap();
+
+        run_setup(Some("cursor"), &db, false, false, false, &base).unwrap();
+
+        assert!(
+            base.join(".cursor/mcp.json").exists(),
+            "config must land under base"
+        );
+        assert!(base.join(".cursor/rules/nestweaver.mdc").exists());
+    }
+
+    #[test]
+    fn detect_tools_probes_dot_dirs_under_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cursor")).unwrap();
+        let tools = detect_tools(tmp.path());
+        assert!(tools.iter().any(|t| t.name == "cursor" && t.detected));
+    }
+
+    #[test]
+    fn run_auto_setup_reports_partial_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(base.join(".cursor")).unwrap();
+        std::fs::write(base.join(".cursor/mcp.json"), "{ invalid json").unwrap();
+        let db = tmp.path().join("test.lbug");
+
+        let error = run_auto_setup_for_tools(&db, &base, true, &["cursor"]).unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("cursor"));
+        assert!(message.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn run_auto_setup_retries_missing_secondary_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(base.join(".cursor")).unwrap();
+        let rules_path = base.join(".cursor/rules");
+        std::fs::write(&rules_path, "blocks directory creation").unwrap();
+        let db = tmp.path().join("test.lbug");
+
+        setup_cursor(&db, false, false, &base).unwrap_err();
+        let mcp_path = base.join(".cursor/mcp.json");
+        let primary_before_retry = std::fs::read_to_string(&mcp_path).unwrap();
+        assert!(!rules_path.join("nestweaver.mdc").exists());
+
+        std::fs::remove_file(&rules_path).unwrap();
+        run_auto_setup_for_tools(&db, &base, true, &["cursor"]).unwrap();
+
+        assert!(rules_path.join("nestweaver.mdc").exists());
+        assert_eq!(
+            std::fs::read_to_string(mcp_path).unwrap(),
+            primary_before_retry
+        );
+    }
 }

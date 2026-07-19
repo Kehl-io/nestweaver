@@ -1,7 +1,7 @@
 # Build stage
-FROM rust:1.88-trixie AS builder
+FROM rust:1.96-trixie AS builder
 WORKDIR /build
-RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y libssl-dev pkg-config protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" cargo build --release --bin nestweaver
 

@@ -76,7 +76,7 @@ Confidence-weighted blast radius with `impact_score` decay through edges; co-cha
 <td width="50%" valign="top">
 
 **16 AI Tool Integrations**<br>
-One-command setup for Claude Code, Cursor, Codex, Gemini CLI, Copilot CLI, Aider, Kiro, and more.
+One-command setup for Claude Code, Cursor, Codex, Gemini CLI, Copilot CLI, Aider, Kiro, and more. Also offered automatically on the first interactive in-repo `index`.
 
 </td>
 </tr>
@@ -113,6 +113,11 @@ nestweaver watch
 nestweaver setup
 nestweaver setup --force   # regenerate skill/guide files even if customized
 ```
+
+> Running `nestweaver index` interactively from inside your repo also offers to
+> configure your AI tools on the first index (skipped in CI, scripts, and
+> non-TTY runs; force it with `nestweaver index --setup`). Config files are
+> always written to the repo root.
 
 Run `nestweaver --help` for the full command list. Most commands support `--json` for machine-readable output.
 
@@ -445,7 +450,7 @@ nestweaver project-context "payments" --token-budget 5000
 
 Manage multiple repositories as a single graph. NestWeaver discovers cross-repo dependencies, suggests links between related symbols, and lets you query across repository boundaries.
 
-See the [Instance Config Guide](docs/guide/instance-config.md) for full configuration options.
+See the [Instance Config Guide](docs/guide/instance-config.md) for full configuration options. If an older database mixes instance_id conventions, the [Instance ID Migration Runbook](docs/guide/instance-id-migration.md) consolidates it.
 
 ```sh
 # Discover cross-repo links

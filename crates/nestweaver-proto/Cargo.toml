@@ -9,6 +9,7 @@ description = "Generated protobuf types for NestWeaver daemon gRPC service"
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
+tokio-stream = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

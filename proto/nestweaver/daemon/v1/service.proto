@@ -30,6 +30,7 @@ message IndexRepoRequest {
   bool force = 3;
   bool with_trigrams = 4;
   bool with_git_activity = 5;
+  string instance_id = 6;  // nw-019: logical instance for the indexed data. Empty = daemon decides (config name, else runtime hash).
 }
 
 message IndexVaultRequest {
@@ -144,6 +145,10 @@ message MergeInstanceResponse {
   uint64 repos_reparented = 2;
   uint64 projects_reparented = 3;
   repeated string discarded_vaults = 4;
+  // Identifiers (display name or url) of repos whose source graph rows were
+  // removed during migration. Force re-index recreates those rows under the
+  // target instance. Non-empty means the caller should warn the user.
+  repeated string repos_needing_reindex = 5;
 }
 
 message PurgeInstanceRequest {

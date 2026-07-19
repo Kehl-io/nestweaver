@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::rank_events::with_rank_event;
 use crate::routes::workspaces::{self, P1Meta, P1Provenance, ResolvedWorkspace, WorkspaceKind};
 use crate::state::AppState;
 
@@ -71,6 +72,14 @@ pub async fn overview(
     State(state): State<Arc<AppState>>,
     Query(params): Query<OverviewParams>,
 ) -> Result<Response, ApiError> {
+    // The overview aggregates `symbols_by_pagerank`, which triggers the lazy
+    // PageRank compute on a cold cache. Run the store work off the async
+    // runtime and emit `pagerank:recomputed` if a (re)compute fired.
+    let state2 = state.clone();
+    with_rank_event(&state, move || overview_response(&state2, &params)).await
+}
+
+fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<Response, ApiError> {
     let limit = params.limit.unwrap_or(24).clamp(6, 100);
     let workspace = workspaces::resolve_workspace(
         &state.store,
@@ -78,7 +87,7 @@ pub async fn overview(
     )?;
 
     let (repos, services, top_symbols, _vaults, mut notes, counts, meta_state) =
-        overview_scope_data(&state, &workspace, limit)?;
+        overview_scope_data(state, &workspace, limit)?;
 
     notes.sort_by(|a, b| {
         b.pagerank_score
@@ -160,7 +169,7 @@ pub async fn overview(
     // top scene bridges, normalized by the scene max. Additive optional
     // field — landmarks that are not bridges serialize unchanged.
     let bridge_scores = crate::bridge::scene_bridge_scores(
-        &crate::bridge::global_bridge_scores(&state),
+        &crate::bridge::global_bridge_scores(state),
         landmarks.iter().map(|landmark| landmark.uid.clone()),
     );
     for landmark in &mut landmarks {

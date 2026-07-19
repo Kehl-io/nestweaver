@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod db;
+pub mod durable_sidecar;
 pub mod error;
 pub mod generation;
 pub mod ranking;
@@ -10,7 +11,7 @@ pub mod tantivy_index;
 pub mod traverse;
 pub mod write;
 
-pub use db::GraphStore;
+pub use db::{EmbeddingIndexReconciliation, GraphStore, IndexPublicationLease};
 pub use error::{CancelReason, StoreError};
 
 /// Re-export the LadybugDB connection type so callers can use transactional
@@ -34,15 +35,21 @@ pub use tantivy_index::{
     TantivyError, TantivyIndex,
 };
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
-pub use write::{DiscardedVault, MergeResult, PurgeInstanceResult};
+pub use write::{
+    DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
+    DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery, InstanceUidHandoff,
+    InstanceUidHandoffIdentity, InstanceUidMigrationPlan, InstanceUidRemap,
+    InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult, ProjectMutationDisposition,
+    PurgeInstanceResult,
+};
 
 #[cfg(test)]
 mod tests {
     use nestweaver_schema::{
-        EdgeType, File, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Visibility,
+        EdgeType, File, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Tag, Vault, Visibility,
     };
 
-    use super::GraphStore;
+    use super::{GraphStore, InstanceUidRemap, ProjectMutationDisposition};
 
     fn make_repo(uid: &str) -> Repo {
         Repo {
@@ -86,6 +93,193 @@ mod tests {
             framework_hint: None,
             canonical_id: None,
         }
+    }
+
+    #[test]
+    fn vault_cascade_outcome_distinguishes_noop_empty_and_tag_only_deletions() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let no_op = store
+            .delete_vault_cascade_with_outcome("vlt:missing")
+            .unwrap();
+        assert_eq!(no_op.notes_deleted, 0);
+        assert!(!no_op.changed);
+
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:empty".to_string(),
+                name: "empty".to_string(),
+                root_path: "/missing/empty".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let empty = store
+            .delete_vault_cascade_with_outcome("vlt:empty")
+            .unwrap();
+        assert_eq!(empty.notes_deleted, 0);
+        assert!(empty.changed);
+
+        store
+            .insert_tag(&Tag {
+                uid: "tag:vlt:tag-only:orphan".to_string(),
+                vault_uid: "vlt:tag-only".to_string(),
+                name: "orphan".to_string(),
+            })
+            .unwrap();
+        let tag_only = store
+            .delete_vault_cascade_with_outcome("vlt:tag-only")
+            .unwrap();
+        assert_eq!(tag_only.notes_deleted, 0);
+        assert!(tag_only.changed);
+        assert!(store.list_tags(Some("vlt:tag-only")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_cascade_is_atomic_and_removes_every_incident_project_edge() {
+        use nestweaver_schema::{Note, NoteKind, Project};
+
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [
+            ("proj:test:parent", "Parent"),
+            ("proj:test:target", "Target"),
+            ("proj:test:child", "Child"),
+        ] {
+            store
+                .insert_project(&Project {
+                    uid: uid.to_string(),
+                    name: name.to_string(),
+                    summary: None,
+                    instance_id: "test".to_string(),
+                })
+                .unwrap();
+        }
+        store
+            .insert_note(&Note {
+                uid: "note:project-delete".to_string(),
+                vault_uid: "vlt:project-delete".to_string(),
+                file_path: "project-delete.md".to_string(),
+                title: "Project delete".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 2,
+                content_hash: "note-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:project-delete",
+                "project_delete",
+                "repo:project-delete",
+                "src/lib.rs",
+            ))
+            .unwrap();
+
+        store
+            .batch_insert_project_note_edges(&[("proj:test:target", "note:project-delete")])
+            .unwrap();
+        store
+            .batch_insert_project_symbol_edges(
+                "proj:test:target",
+                &["sym:project-delete".to_string()],
+                1.0,
+            )
+            .unwrap();
+        store
+            .insert_project_component_edge("proj:test:parent", "proj:test:target", 1.0)
+            .unwrap();
+        store
+            .insert_project_component_edge("proj:test:target", "proj:test:child", 1.0)
+            .unwrap();
+        store
+            .insert_project_parent_edge("proj:test:target", "proj:test:parent", 1.0)
+            .unwrap();
+        store
+            .insert_project_parent_edge("proj:test:child", "proj:test:target", 1.0)
+            .unwrap();
+        let conn = store.conn().unwrap();
+        conn.query("CREATE REL TABLE FUTURE_PROJECT_TO_NOTE(FROM Project TO Note, marker STRING)")
+            .unwrap();
+        conn.query(
+            "MATCH (p:Project {uid: 'proj:test:target'}), \
+             (n:Note {uid: 'note:project-delete'}) \
+             CREATE (p)-[:FUTURE_PROJECT_TO_NOTE {marker: 'future'}]->(n)",
+        )
+        .unwrap();
+
+        let outcome = store
+            .delete_project_cascade_with_outcome("proj:test:target")
+            .unwrap();
+
+        assert_eq!(outcome.disposition, ProjectMutationDisposition::Changed);
+        assert_eq!(outcome.project_uid, "proj:test:target");
+        assert_eq!(outcome.project_name.as_deref(), Some("Target"));
+        assert_eq!(store.list_projects().unwrap().len(), 2);
+        for edge_type in [
+            "PROJECT_INCLUDES_NOTE",
+            "PROJECT_INCLUDES_SYMBOL",
+            "PROJECT_HAS_COMPONENT",
+            "PROJECT_HAS_PARENT",
+            "FUTURE_PROJECT_TO_NOTE",
+        ] {
+            let rows = conn
+                .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN count(r)"))
+                .unwrap();
+            let count = rows
+                .filter_map(|row| match row.first() {
+                    Some(lbug::Value::Int64(value)) => Some(*value),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_default();
+            assert_eq!(count, 0, "{edge_type} survived the project delete");
+        }
+        let surviving_project_uids: std::collections::HashSet<_> = store
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.uid)
+            .collect();
+        assert_eq!(
+            surviving_project_uids,
+            std::collections::HashSet::from([
+                "proj:test:parent".to_string(),
+                "proj:test:child".to_string(),
+            ])
+        );
+        for (label, uid) in [
+            ("Note", "note:project-delete"),
+            ("Symbol", "sym:project-delete"),
+        ] {
+            let mut rows = conn
+                .query(&format!(
+                    "MATCH (n:{label} {{uid: '{uid}'}}) RETURN count(n)"
+                ))
+                .unwrap();
+            assert_eq!(
+                rows.next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(count)) => Some(*count),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                1,
+                "unrelated {label} {uid} did not survive"
+            );
+        }
+
+        let missing = store
+            .delete_project_cascade_with_outcome("proj:test:missing")
+            .unwrap();
+        assert_eq!(
+            missing.disposition,
+            ProjectMutationDisposition::ConfirmedUnchanged
+        );
+        assert_eq!(missing.project_uid, "proj:test:missing");
+        assert_eq!(missing.project_name, None);
     }
 
     fn make_service(uid: &str, repo_uid: &str) -> Service {
@@ -1872,6 +2066,31 @@ mod tests {
     }
 
     #[test]
+    fn purge_instance_reports_orphan_only_code_deletions() {
+        let store = test_store();
+        let missing_repo = "repo:ghost:orphan";
+        store
+            .insert_file(&make_file("file:repo:ghost:orphan:main", missing_repo))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:repo:ghost:orphan:handler",
+                "orphan_handler",
+                missing_repo,
+                "src/main.rs",
+            ))
+            .unwrap();
+        store
+            .insert_service(&make_service("svc:repo:ghost:orphan:api", missing_repo))
+            .unwrap();
+
+        let result = store.purge_instance("ghost").unwrap();
+        assert_eq!(result.repos, 0, "precondition: no top-level repo existed");
+        assert_eq!(result.code_orphans_swept, 3);
+        assert_eq!(result.orphans_swept, 3);
+    }
+
+    #[test]
     fn reparent_vault_preserves_notes_and_children() {
         use nestweaver_schema::{Heading, Note, NoteKind, Section, Tag, Vault};
         let store = test_store();
@@ -2074,11 +2293,51 @@ mod tests {
             "expected no discarded vaults, got {:?}",
             result.discarded
         );
+        // No repos in this merge — nothing to re-index.
+        assert!(result.repos_moved.is_empty());
+        assert!(!result.repos_need_reindex());
 
         // All 3 notes should survive under the new vault UID.
         let new_vault_uid = vault_uid("tgt", "/tmp/vault");
         let surviving = store.list_notes(Some(&new_vault_uid)).unwrap();
         assert_eq!(surviving.len(), 3, "expected 3 notes to survive merge");
+    }
+
+    #[test]
+    fn merge_instance_ids_rejects_self_merge_without_mutation() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+        let store = test_store();
+        let vault = Vault {
+            uid: "vlt:self:one".to_string(),
+            name: "authored".to_string(),
+            root_path: "/authored".to_string(),
+            instance_id: "same".to_string(),
+        };
+        store.insert_vault(&vault).unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:self:one".to_string(),
+                vault_uid: vault.uid.clone(),
+                file_path: "authored.md".to_string(),
+                title: "Authored".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 42,
+                content_hash: "authored-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_vault_note_edge(&vault.uid, "note:self:one")
+            .unwrap();
+
+        let error = store.merge_instance_ids("same", "same").unwrap_err();
+        assert!(error.to_string().contains("same"));
+        assert_eq!(store.list_vaults(Some("same")).unwrap().len(), 1);
+        assert_eq!(store.list_notes(Some(&vault.uid)).unwrap().len(), 1);
     }
 
     #[test]
@@ -2170,5 +2429,564 @@ mod tests {
         assert_eq!(vaults.len(), 1);
         assert_eq!(vaults[0].uid, new_vault_uid);
         assert_eq!(vaults[0].instance_id, "tgt");
+    }
+
+    /// Merging an instance removes its derived code graph rows before re-minting
+    /// the Repo node under the target instance.
+    #[test]
+    fn merge_instance_ids_reports_repos_needing_reindex() {
+        use nestweaver_schema::uid::repo_uid;
+        let store = test_store();
+
+        // A repo under instance "old" with one symbol child.
+        let repo = Repo {
+            uid: repo_uid("old", "https://github.com/example/svc"),
+            url: "https://github.com/example/svc".to_string(),
+            indexed_sha: "abc123".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "old".to_string(),
+            name: Some("svc".to_string()),
+            root_path: Some("/home/kory/dev/svc".to_string()),
+        };
+        store.insert_repo(&repo).unwrap();
+        let symbol = make_symbol("sym:old:1", "handler", &repo.uid, "src/lib.rs");
+        store.insert_symbol(&symbol).unwrap();
+
+        let report = store.merge_instance_ids("old", "new").unwrap();
+
+        // The repo was re-minted → the caller must be told to re-index it.
+        assert_eq!(report.repos, 1);
+        assert_eq!(report.repos_moved.len(), 1);
+        assert_eq!(report.repos_moved[0], "svc"); // display name preferred
+        assert!(report.repos_need_reindex());
+
+        assert_eq!(report.repo_uids_removed, vec![repo.uid.clone()]);
+        assert!(store.lookup_symbol("sym:old:1").is_err());
+        assert!(store.lookup_repo(&repo.uid).unwrap().is_none());
+        let target_uid = repo_uid("new", "https://github.com/example/svc");
+        assert_eq!(
+            store.lookup_repo(&target_uid).unwrap().unwrap().instance_id,
+            "new"
+        );
+    }
+
+    #[test]
+    fn merge_instance_ids_repo_collision_preserves_target() {
+        use nestweaver_schema::uid::repo_uid;
+        let store = test_store();
+        let url = "https://github.com/example/collision";
+        let source = Repo {
+            uid: repo_uid("old", url),
+            url: url.to_string(),
+            indexed_sha: "source-sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "old".to_string(),
+            name: Some("source".to_string()),
+            root_path: None,
+        };
+        let target = Repo {
+            uid: repo_uid("new", url),
+            url: url.to_string(),
+            indexed_sha: "target-sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "new".to_string(),
+            name: Some("target".to_string()),
+            root_path: None,
+        };
+        store.insert_repo(&source).unwrap();
+        store.insert_repo(&target).unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:old:collision",
+                "handler",
+                &source.uid,
+                "src/lib.rs",
+            ))
+            .unwrap();
+
+        let report = store.merge_instance_ids("old", "new").unwrap();
+        assert_eq!(report.repos, 1);
+        assert_eq!(report.repo_uids_removed, vec![source.uid.clone()]);
+        assert!(store.lookup_symbol("sym:old:collision").is_err());
+        let surviving = store.lookup_repo(&target.uid).unwrap().unwrap();
+        assert_eq!(surviving.indexed_sha, "target-sha");
+        assert_eq!(store.list_repos(Some("new")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn instance_uid_remap_plan_covers_code_and_project_collisions() {
+        use nestweaver_schema::uid::{
+            file_uid, project_uid, repo_uid, service_uid, symbol_uid, vault_uid,
+        };
+        use nestweaver_schema::{File, Project, Service, Vault};
+
+        let store = test_store();
+        let url = "https://github.com/example/remap";
+        let source_repo_uid = repo_uid("old", url);
+        let target_repo_uid = repo_uid("new", url);
+        let source_repo = Repo {
+            uid: source_repo_uid.clone(),
+            url: url.to_string(),
+            indexed_sha: "source-sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "old".to_string(),
+            name: Some("source".to_string()),
+            root_path: None,
+        };
+        let target_repo = Repo {
+            uid: target_repo_uid.clone(),
+            instance_id: "new".to_string(),
+            indexed_sha: "target-sha".to_string(),
+            name: Some("target".to_string()),
+            ..source_repo.clone()
+        };
+        store.insert_repo(&source_repo).unwrap();
+        store.insert_repo(&target_repo).unwrap();
+
+        let source_file_uid = file_uid(&source_repo_uid, "src/lib.rs");
+        store
+            .insert_file(&File {
+                uid: source_file_uid.clone(),
+                path: "src/lib.rs".to_string(),
+                repo_uid: source_repo_uid.clone(),
+                content_hash: "file-hash".to_string(),
+            })
+            .unwrap();
+        let source_symbol_uid = symbol_uid(&source_repo_uid, "src/lib.rs", "handler", 10);
+        store
+            .insert_symbol(&make_symbol(
+                &source_symbol_uid,
+                "handler",
+                &source_repo_uid,
+                "src/lib.rs",
+            ))
+            .unwrap();
+        let source_service_uid = service_uid(&source_repo_uid, "api");
+        store
+            .insert_service(&Service {
+                uid: source_service_uid.clone(),
+                name: "api".to_string(),
+                repo_uid: source_repo_uid.clone(),
+                summary: None,
+                summary_hash: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let vault_root = "/tmp/remap-vault";
+        let source_vault_uid = vault_uid("old", vault_root);
+        let target_vault_uid = vault_uid("new", vault_root);
+        store
+            .insert_vault(&Vault {
+                uid: source_vault_uid.clone(),
+                name: "Remap vault".to_string(),
+                root_path: vault_root.to_string(),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+
+        let source_project_uid = project_uid("old", "Roadmap");
+        let target_project_uid = project_uid("new", "Roadmap");
+        store
+            .insert_project(&Project {
+                uid: source_project_uid.clone(),
+                name: "Roadmap".to_string(),
+                summary: Some("source".to_string()),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_project(&Project {
+                uid: target_project_uid.clone(),
+                name: "Roadmap".to_string(),
+                summary: Some("target".to_string()),
+                instance_id: "new".to_string(),
+            })
+            .unwrap();
+
+        let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::Prepared
+        );
+
+        assert_eq!(
+            plan,
+            vec![
+                InstanceUidRemap {
+                    source_uid: source_file_uid,
+                    destination_uid: file_uid(&target_repo_uid, "src/lib.rs"),
+                },
+                InstanceUidRemap {
+                    source_uid: source_project_uid,
+                    destination_uid: target_project_uid,
+                },
+                InstanceUidRemap {
+                    source_uid: source_repo_uid,
+                    destination_uid: target_repo_uid.clone(),
+                },
+                InstanceUidRemap {
+                    source_uid: source_service_uid,
+                    destination_uid: service_uid(&target_repo_uid, "api"),
+                },
+                InstanceUidRemap {
+                    source_uid: source_symbol_uid,
+                    destination_uid: symbol_uid(&target_repo_uid, "src/lib.rs", "handler", 10,),
+                },
+                InstanceUidRemap {
+                    source_uid: source_vault_uid,
+                    destination_uid: target_vault_uid,
+                },
+            ]
+        );
+        store.merge_instance_ids("old", "new").unwrap();
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::Applied
+        );
+
+        let mut tampered = plan;
+        tampered[0].destination_uid = "file:repo:new:ffffffffffff:ffffffffffff".to_string();
+        assert!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &tampered)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn instance_uid_remap_plan_recognizes_a_proven_partial_multi_repo_application() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let store = test_store();
+        let urls = [
+            "https://github.com/example/partial-a",
+            "https://github.com/example/partial-b",
+        ];
+        for url in urls {
+            store
+                .insert_repo(&Repo {
+                    uid: repo_uid("old", url),
+                    url: url.to_string(),
+                    indexed_sha: "source".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "old".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+
+        let applied_url = urls[0];
+        let source_uid = repo_uid("old", applied_url);
+        store
+            .bulk_delete_repo_files_and_symbols(&source_uid)
+            .unwrap();
+        store.clear_repo_derived_nodes(&source_uid).unwrap();
+        store.delete_repo_node(&source_uid).unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid("new", applied_url),
+                url: applied_url.to_string(),
+                indexed_sha: "source".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "new".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::PartiallyApplied
+        );
+    }
+
+    #[test]
+    fn instance_uid_remap_plan_recovers_repo_deleted_before_destination_insert() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let store = test_store();
+        let url = "https://github.com/example/repo-insert-crash";
+        let source_uid = repo_uid("old", url);
+        let destination_uid = repo_uid("new", url);
+        store
+            .insert_repo(&Repo {
+                uid: source_uid.clone(),
+                url: url.to_string(),
+                indexed_sha: "source-sha".to_string(),
+                staleness_commits_behind: 2,
+                instance_id: "old".to_string(),
+                name: Some("recover-me".to_string()),
+                root_path: Some("/tmp/recover-me".to_string()),
+            })
+            .unwrap();
+        let plan = store.plan_instance_uid_migration("old", "new").unwrap();
+
+        store
+            .bulk_delete_repo_files_and_symbols(&source_uid)
+            .unwrap();
+        store.clear_repo_derived_nodes(&source_uid).unwrap();
+        store.delete_repo_node(&source_uid).unwrap();
+
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::PartiallyApplied
+        );
+        assert_eq!(
+            store
+                .recover_missing_instance_repos("new", &plan.repo_recoveries)
+                .unwrap(),
+            1
+        );
+        let recovered = store.lookup_repo(&destination_uid).unwrap().unwrap();
+        assert_eq!(recovered.url, url);
+        assert_eq!(recovered.name.as_deref(), Some("recover-me"));
+        assert_eq!(recovered.root_path.as_deref(), Some("/tmp/recover-me"));
+        assert_eq!(recovered.indexed_sha, "");
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::Applied
+        );
+    }
+
+    #[test]
+    fn instance_uid_remap_plan_recovers_vault_and_project_deleted_before_destination_insert() {
+        use nestweaver_schema::uid::{project_uid, vault_uid};
+        use nestweaver_schema::{Project, Vault};
+
+        let store = test_store();
+        let vault_root = "/tmp/vault-insert-crash";
+        let source_vault_uid = vault_uid("old", vault_root);
+        let destination_vault_uid = vault_uid("new", vault_root);
+        store
+            .insert_vault(&Vault {
+                uid: source_vault_uid.clone(),
+                name: "Recover vault".to_string(),
+                root_path: vault_root.to_string(),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+
+        let source_project_uid = project_uid("old", "Recover project");
+        let destination_project_uid = project_uid("new", "Recover project");
+        store
+            .insert_project(&Project {
+                uid: source_project_uid.clone(),
+                name: "Recover project".to_string(),
+                summary: Some("source summary".to_string()),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+
+        let plan = store.plan_instance_uid_migration("old", "new").unwrap();
+        store.delete_vault_cascade(&source_vault_uid).unwrap();
+        store.delete_project_node(&source_project_uid).unwrap();
+
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::PartiallyApplied
+        );
+        assert_eq!(
+            store
+                .recover_missing_instance_roots(
+                    "new",
+                    &plan.repo_recoveries,
+                    &plan.vault_recoveries,
+                    &plan.project_recoveries,
+                )
+                .unwrap(),
+            2
+        );
+
+        let recovered_vault = store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .find(|vault| vault.uid == destination_vault_uid)
+            .expect("destination vault should be restored");
+        assert_eq!(recovered_vault.name, "Recover vault");
+        assert_eq!(recovered_vault.root_path, vault_root);
+        assert_eq!(recovered_vault.instance_id, "new");
+        let recovered_project = store
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.uid == destination_project_uid)
+            .expect("destination project should be restored");
+        assert_eq!(recovered_project.summary.as_deref(), Some("source summary"));
+        assert_eq!(recovered_project.instance_id, "new");
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::Applied
+        );
+    }
+
+    #[test]
+    fn project_collision_plan_and_merge_are_order_independent() {
+        use nestweaver_schema::Project;
+
+        type ProjectSnapshot = (String, String, Option<String>, String);
+        type RunResult = (Vec<InstanceUidRemap>, Vec<ProjectSnapshot>);
+
+        fn run(reverse: bool) -> RunResult {
+            let store = test_store();
+            let target_winner_uid = "proj:new:000000000001";
+            let target_loser_uid = "proj:new:ffffffffffff";
+            let mut projects = vec![
+                Project {
+                    uid: target_winner_uid.to_string(),
+                    name: "Roadmap".to_string(),
+                    summary: Some("stable target winner".to_string()),
+                    instance_id: "new".to_string(),
+                },
+                Project {
+                    uid: target_loser_uid.to_string(),
+                    name: "ROADMAP".to_string(),
+                    summary: Some("legacy target loser".to_string()),
+                    instance_id: "new".to_string(),
+                },
+                Project {
+                    uid: "proj:old:111111111111".to_string(),
+                    name: "roadmap".to_string(),
+                    summary: Some("source lower".to_string()),
+                    instance_id: "old".to_string(),
+                },
+                Project {
+                    uid: "proj:old:222222222222".to_string(),
+                    name: "RoadMap".to_string(),
+                    summary: Some("source mixed".to_string()),
+                    instance_id: "old".to_string(),
+                },
+            ];
+            if reverse {
+                projects.reverse();
+            }
+            for project in projects {
+                store.insert_project(&project).unwrap();
+            }
+
+            let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+            let result = store.merge_instance_ids("old", "new").unwrap();
+            assert_eq!(result.projects, 2);
+            let mut surviving: Vec<_> = store
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .map(|project| {
+                    (
+                        project.uid,
+                        project.name,
+                        project.summary,
+                        project.instance_id,
+                    )
+                })
+                .collect();
+            surviving.sort();
+            (plan, surviving)
+        }
+
+        let (forward_plan, forward_projects) = run(false);
+        let (reverse_plan, reverse_projects) = run(true);
+        let winner = "proj:new:000000000001";
+        let expected_plan = vec![
+            InstanceUidRemap {
+                source_uid: "proj:new:ffffffffffff".to_string(),
+                destination_uid: winner.to_string(),
+            },
+            InstanceUidRemap {
+                source_uid: "proj:old:111111111111".to_string(),
+                destination_uid: winner.to_string(),
+            },
+            InstanceUidRemap {
+                source_uid: "proj:old:222222222222".to_string(),
+                destination_uid: winner.to_string(),
+            },
+        ];
+        assert_eq!(forward_plan, expected_plan);
+        assert_eq!(reverse_plan, expected_plan);
+        assert_eq!(forward_projects, reverse_projects);
+        assert_eq!(forward_projects.len(), 1);
+        assert_eq!(forward_projects[0].0, winner);
+        assert_eq!(forward_projects[0].1, "Roadmap");
+        assert_eq!(
+            forward_projects[0].2.as_deref(),
+            Some("stable target winner")
+        );
+    }
+
+    #[test]
+    fn project_source_only_case_variants_choose_lexical_reminted_uid() {
+        use nestweaver_schema::Project;
+        use nestweaver_schema::uid::project_uid;
+
+        type ProjectSnapshot = (String, String, Option<String>);
+        type RunResult = (Vec<InstanceUidRemap>, Vec<ProjectSnapshot>);
+
+        fn run(reverse: bool) -> RunResult {
+            let store = test_store();
+            let mut projects = vec![
+                Project {
+                    uid: "proj:old:aaaaaaaaaaaa".to_string(),
+                    name: "Alpha".to_string(),
+                    summary: Some("upper".to_string()),
+                    instance_id: "old".to_string(),
+                },
+                Project {
+                    uid: "proj:old:bbbbbbbbbbbb".to_string(),
+                    name: "alpha".to_string(),
+                    summary: Some("lower".to_string()),
+                    instance_id: "old".to_string(),
+                },
+            ];
+            if reverse {
+                projects.reverse();
+            }
+            for project in projects {
+                store.insert_project(&project).unwrap();
+            }
+            let plan = store.plan_instance_uid_remaps("old", "new").unwrap();
+            store.merge_instance_ids("old", "new").unwrap();
+            let mut projects: Vec<_> = store
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .map(|project| (project.uid, project.name, project.summary))
+                .collect();
+            projects.sort();
+            (plan, projects)
+        }
+
+        let upper_uid = project_uid("new", "Alpha");
+        let lower_uid = project_uid("new", "alpha");
+        let expected_winner = upper_uid.min(lower_uid);
+        let (forward_plan, forward_projects) = run(false);
+        let (reverse_plan, reverse_projects) = run(true);
+
+        assert_eq!(forward_plan, reverse_plan);
+        assert_eq!(forward_projects, reverse_projects);
+        assert_eq!(forward_projects.len(), 1);
+        assert_eq!(forward_projects[0].0, expected_winner);
+        assert!(
+            forward_plan
+                .iter()
+                .all(|mapping| mapping.destination_uid == expected_winner)
+        );
+        assert_eq!(forward_plan.len(), 2);
     }
 }

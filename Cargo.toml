@@ -67,9 +67,8 @@ rayon = "1"
 dirs = "6"
 rmp-serde = "1"
 bumpalo = "3"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 async-stream = "0.3"
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }

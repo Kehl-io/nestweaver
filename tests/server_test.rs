@@ -88,8 +88,9 @@ fn write_repo_files(dir: &std::path::Path, files: &[(&str, &str)]) {
 
 /// Index `repo_dir` into `db_path` using the no-daemon path (so the on-disk DB
 /// exists before a `ServerGuard` serves it). Panics with the indexer's stderr
-/// on failure.
-fn index_repo(repo_dir: &std::path::Path, db_path: &std::path::Path) {
+/// on failure. Returns the child's combined stdout+stderr so tests can embed
+/// it in forensic failure messages (nw-043); most callers may ignore it.
+fn index_repo(repo_dir: &std::path::Path, db_path: &std::path::Path) -> String {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -109,6 +110,11 @@ fn index_repo(repo_dir: &std::path::Path, db_path: &std::path::Path) {
         "index failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    format!(
+        "--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 /// A bearer token that satisfies the daemon's 32-byte minimum for
@@ -2119,8 +2125,10 @@ async fn hybrid_flow_trace_auto_detects_cross_repo_boundary() {
 
     let db_server = dir.path().join("server").join("server.lbug");
     let db_local = dir.path().join("local").join("local.lbug");
-    index_repo(&callee, &db_server);
-    index_repo(&caller, &db_local);
+    // Indexer output is kept in memory solely for the nw-043 forensic dump on
+    // the (never-reproduced) isolation-anomaly path below; no cost otherwise.
+    let server_index_output = index_repo(&callee, &db_server);
+    let local_index_output = index_repo(&caller, &db_local);
 
     // All direct GraphStore access happens strictly BEFORE any daemon serves
     // these DBs (the daemon is the sole writer once running). The block scopes
@@ -2171,10 +2179,66 @@ async fn hybrid_flow_trace_auto_detects_cross_repo_boundary() {
             .into_iter()
             .map(|r| r.uid)
             .collect();
-        assert!(
-            !uids.contains(&remotefn.repo_uid),
-            "the stub's repo_uid must be foreign to the local index (uids: {uids:?})"
-        );
+        // The stub's repo_uid must be foreign to the local index. This tripped
+        // exactly once (nw-043, 1-in-54) and never reproduced; if it recurs,
+        // capture everything needed to classify the anomaly BEFORE panicking:
+        //   durable mis-write  -> row still present on fresh re-open
+        //   transient read     -> row absent on fresh re-open
+        //   test-env confusion -> dir listings / indexer logs show it
+        if uids.contains(&remotefn.repo_uid) {
+            // Forensic re-list on the ORIGINAL handle (with full row detail).
+            let full_rows = local_store.list_repos(None).expect("forensic re-list");
+            let relist: Vec<String> = full_rows
+                .iter()
+                .map(|r| {
+                    format!(
+                        "uid={} url={} root_path={:?} sha={}",
+                        r.uid, r.url, r.root_path, r.indexed_sha
+                    )
+                })
+                .collect();
+            // Drop the writer handle, then re-open fresh to discriminate
+            // durable vs transient.
+            drop(local_store);
+            let reopened =
+                nestweaver_store::GraphStore::open_read_only(&db_local).expect("forensic re-open");
+            let reopened_uids: Vec<String> = reopened
+                .list_repos(None)
+                .expect("forensic re-open list")
+                .into_iter()
+                .map(|r| r.uid)
+                .collect();
+            let ls = |p: &std::path::Path| -> String {
+                std::fs::read_dir(p.parent().unwrap())
+                    .map(|d| {
+                        d.filter_map(|e| e.ok())
+                            .map(|e| {
+                                format!(
+                                    "{:?} {}b",
+                                    e.file_name(),
+                                    e.metadata().map(|m| m.len()).unwrap_or(0)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|e| e.to_string())
+            };
+            panic!(
+                "nw-043 RECURRENCE — foreign repo row in local store.\n\
+                 expected-foreign uid: {}\n\
+                 in-handle rows: {relist:#?}\n\
+                 fresh re-open uids: {reopened_uids:?}  (row present here => DURABLE mis-write; absent => TRANSIENT read)\n\
+                 server db dir: [{}]\nlocal db dir: [{}]\n\
+                 indexer(callee->server) output:\n{}\n\
+                 indexer(caller->local) output:\n{}",
+                remotefn.repo_uid,
+                ls(&db_server),
+                ls(&db_local),
+                server_index_output,
+                local_index_output,
+            );
+        }
         uids
     };
 

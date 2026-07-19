@@ -142,6 +142,9 @@ export function useGraphBridge(): GraphBuffers {
   const theme = useStore((s) => s.theme);
 
   return useMemo(() => {
+    // Graphology is mutated in place. Consume the store's version token so
+    // buffer generation reruns even when the graph reference is unchanged.
+    void graphVersion;
     if (!graphInstance || graphInstance.order === 0) {
       return EMPTY_BUFFERS;
     }

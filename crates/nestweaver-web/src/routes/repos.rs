@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::ApiError;
+use crate::rank_events::with_rank_event;
 use crate::state::AppState;
 
 pub async fn list_repos(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
@@ -31,8 +32,15 @@ pub async fn repo_map(
     Query(params): Query<RepoMapParams>,
 ) -> Result<Response, ApiError> {
     let budget = params.budget.unwrap_or(2000);
-    let map = nestweaver_engine::generate_repo_map(&state.store, budget)?;
-    Ok(Json(json!({ "map": map })).into_response())
+    // `generate_repo_map` ranks symbols by PageRank and can trigger the lazy
+    // compute, so run it off the async runtime and emit `pagerank:recomputed`
+    // if a (re)compute fired.
+    let state2 = state.clone();
+    with_rank_event(&state, move || {
+        let map = nestweaver_engine::generate_repo_map(&state2.store, budget)?;
+        Ok(Json(json!({ "map": map })).into_response())
+    })
+    .await
 }
 
 pub async fn cross_repo_refs(
@@ -45,14 +53,79 @@ pub async fn cross_repo_refs(
 }
 
 pub async fn suggest_links(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    // Build manifest cache path: <db_path>.manifests.json
-    let manifest_path = nestweaver_engine::sidecar_path(&state.db_path, ".manifests.json");
-
-    let manifests = nestweaver_engine::load_manifest_cache(&manifest_path)?;
+    let manifests = nestweaver_engine::load_manifest_cache_for_db(&state.db_path)?;
     let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)?;
     let json = json!({
         "links": serde_json::to_value(&suggestions.links)?,
         "features": serde_json::to_value(&suggestions.features)?,
     });
     Ok(Json(json).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn suggest_links_migrates_and_reads_a_legacy_only_manifest_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        for (uid, url) in [
+            ("repo:test:legacy-app", "https://example.test/legacy-app"),
+            (
+                "repo:test:legacy-dependency",
+                "https://example.test/legacy-dependency",
+            ),
+        ] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.to_string(),
+                    url: url.to_string(),
+                    indexed_sha: "sha".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: "test".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        let manifests = std::collections::HashMap::from([
+            (
+                "repo:test:legacy-app".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("legacy-app-package".to_string()),
+                    dependencies: vec!["legacy-dependency-package".to_string()],
+                    entry_files: Vec::new(),
+                },
+            ),
+            (
+                "repo:test:legacy-dependency".to_string(),
+                nestweaver_engine::ManifestInfo {
+                    package_name: Some("legacy-dependency-package".to_string()),
+                    dependencies: Vec::new(),
+                    entry_files: Vec::new(),
+                },
+            ),
+        ]);
+        let legacy_path = db_path.with_extension("manifests.json");
+        let canonical_path = nestweaver_engine::manifest_cache_path(&db_path);
+        nestweaver_engine::save_manifest_cache(&manifests, &legacy_path).unwrap();
+        assert!(!canonical_path.exists());
+        let state = AppState::new(store, None, db_path);
+
+        let response = suggest_links(State(state))
+            .await
+            .unwrap_or_else(|_| panic!("suggest_links endpoint failed"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let suggestions: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(suggestions["links"].as_array().unwrap().iter().any(|link| {
+            link["description"] == "Depends on legacy-dependency-package (from manifest)"
+        }));
+        assert!(canonical_path.exists());
+        assert!(!legacy_path.exists());
+    }
 }

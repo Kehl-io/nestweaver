@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 ///
 /// Acquires an exclusive flock on the pidfile, checks whether a live daemon
 /// already exists, and spawns one if not. Uses exponential-backoff polling
-/// to wait for the socket to appear.
+/// to wait for the socket to accept connections.
 pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathBuf> {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let rt_dir = nestweaver_daemon::lifecycle::runtime_dir(&instance_id);
@@ -44,10 +44,8 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
             if let Some(pid) = read_pid_from_file(&mut file) {
                 debug!(pid, "daemon already running (lock held)");
             }
-            // Wait for the socket to appear if the daemon is still starting.
-            if !sock.exists() {
-                wait_for_socket(&sock)?;
-            }
+            // The socket inode can appear before the listener is ready.
+            wait_for_socket(&sock)?;
             return Ok(sock);
         }
         bail!("flock on pidfile failed: {}", err);
@@ -59,6 +57,7 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
         if is_process_alive(pid) {
             debug!(pid, "daemon already running");
             unsafe { libc::flock(fd, libc::LOCK_UN) };
+            wait_for_socket(&sock)?;
             return Ok(sock);
         }
         warn!(pid, "stale daemon pid — cleaning up");
@@ -106,7 +105,7 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
     }
 
     // Re-check: another client may have started the daemon while we waited for the spawn-lock.
-    if sock.exists() {
+    if socket_accepts_connections(&sock) {
         unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
         debug!("daemon started by a concurrent client while awaiting spawn lock");
         return Ok(sock);
@@ -115,8 +114,8 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
     // Spawn the daemon as a detached child.
     spawn_daemon(db_path, config_path)?;
 
-    // Poll for socket to appear, then release the spawn-lock so the next waiter's re-check
-    // observes the running daemon (its socket) instead of spawning another.
+    // Poll until the socket accepts connections, then release the spawn-lock so the next
+    // waiter's re-check observes a ready daemon instead of spawning another.
     let waited = wait_for_socket(&sock);
     unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
     waited?;
@@ -235,7 +234,11 @@ fn stop_legacy_daemon(instance_id: &str) {
     }
 }
 
-/// Poll for the socket file to appear with exponential backoff.
+fn socket_accepts_connections(sock: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(sock).is_ok()
+}
+
+/// Poll for the socket to accept connections with exponential backoff.
 ///
 /// Initial delay: 50ms, max delay: 500ms, total timeout: 5s.
 /// Larger databases need more time to open the DB, load sidecars,
@@ -247,7 +250,7 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
     let max_delay = Duration::from_millis(500);
 
     while start.elapsed() < timeout {
-        if sock.exists() {
+        if socket_accepts_connections(sock) {
             return Ok(());
         }
         std::thread::sleep(delay);
@@ -255,12 +258,12 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
     }
 
     // One final check after the loop.
-    if sock.exists() {
+    if socket_accepts_connections(sock) {
         return Ok(());
     }
 
     bail!(
-        "daemon did not create socket at {} within {:.1}s.\n\
+        "daemon socket at {} did not accept connections within {:.1}s.\n\
          Check the daemon log for errors: {}\n\
          If another process holds the database lock, stop it or use --no-daemon.",
         sock.display(),
@@ -274,4 +277,52 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
         )
         .display()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn wait_for_socket_does_not_return_until_socket_accepts_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+
+        // Leave behind the exact state that caused the auto-start race: the
+        // socket inode exists, but no process is listening yet.
+        drop(UnixListener::bind(&socket).unwrap());
+
+        let server_socket = socket.clone();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::remove_file(&server_socket).unwrap();
+            let listener = UnixListener::bind(&server_socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut accepted = 0;
+            while accepted < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => accepted += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+            accepted
+        });
+
+        let waited = wait_for_socket(&socket);
+        let connect_after_wait = UnixStream::connect(&socket);
+        let accepted = server.join().unwrap();
+
+        assert!(waited.is_ok());
+        assert!(
+            connect_after_wait.is_ok(),
+            "wait returned before the socket accepted connections"
+        );
+        assert_eq!(accepted, 2, "readiness probing should reach the listener");
+    }
 }

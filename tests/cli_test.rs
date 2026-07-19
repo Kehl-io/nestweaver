@@ -1,4 +1,6 @@
 use assert_cmd::Command;
+use assert_cmd::assert::OutputAssertExt;
+use nestweaver_engine::sidecar_path;
 use predicates::str::contains;
 use std::process::Command as StdCommand;
 
@@ -37,6 +39,60 @@ fn cli_help_lists_commands() {
         .stdout(contains("symbol"))
         .stdout(contains("search"))
         .stdout(contains("impact"));
+}
+
+#[test]
+fn standalone_suggest_links_reads_canonical_manifest_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("brain.lbug");
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    for (uid, url) in [
+        ("repo:test:app", "https://example.test/app"),
+        ("repo:test:dependency", "https://example.test/dependency"),
+    ] {
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.to_string(),
+                url: url.to_string(),
+                indexed_sha: "sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+    }
+    let manifests = std::collections::HashMap::from([
+        (
+            "repo:test:app".to_string(),
+            nestweaver_engine::ManifestInfo {
+                package_name: Some("app-package".to_string()),
+                dependencies: vec!["dependency-package".to_string()],
+                entry_files: Vec::new(),
+            },
+        ),
+        (
+            "repo:test:dependency".to_string(),
+            nestweaver_engine::ManifestInfo {
+                package_name: Some("dependency-package".to_string()),
+                dependencies: Vec::new(),
+                entry_files: Vec::new(),
+            },
+        ),
+    ]);
+    nestweaver_engine::save_manifest_cache_for_db(&manifests, &db_path).unwrap();
+    drop(store);
+
+    nestweaver_cmd()
+        .args([
+            "suggest-links",
+            "--json",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Depends on dependency-package (from manifest)"));
 }
 
 #[test]
@@ -242,6 +298,23 @@ fn cli_snapshot_build_and_verify() {
         .assert()
         .success()
         .stdout(contains("Snapshot verified OK"));
+
+    // nw-052b residual: a colon in the snapshot `--instance` flag must be
+    // rejected (it would otherwise land in the stamp label + output-dir name).
+    nestweaver_cmd()
+        .args([
+            "snapshot",
+            "build",
+            "--db",
+            &db_path.display().to_string(),
+            "--output",
+            &dir.path().join("snap-colon").display().to_string(),
+            "--instance",
+            "a:b",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("colon"));
 }
 
 #[test]
@@ -1231,4 +1304,600 @@ fn cli_contracts_diff_clean_on_identical_specs() {
         .assert()
         .success()
         .stdout(contains("No API changes"));
+}
+
+/// nw-019: `brain refresh --config` (no `--instance` flag) must tag the vault
+/// under the config's `instance_id`, not the literal "default". The vault UID
+/// is `vlt:{instance}:{hash}`, so the instance is directly readable from
+/// `brain list --json`. Mirrors `brain watch`/`brain add` precedence:
+/// `--instance` flag > config's instance_id > "default".
+#[test]
+fn brain_refresh_uses_config_instance_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("brain.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Hello\n\nsome content\n").unwrap();
+
+    // Instance config declaring a non-default instance_id. Only the fields
+    // without serde defaults are required: instance_id, snapshot_storage,
+    // workspace, inference, git.
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "vault-test"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            storage = dir.path().join("storage").display(),
+            workspace = dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("storage")).unwrap();
+    std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
+
+    // Seed the DB: `brain add --config` creates the vault under the config's
+    // instance ("vlt:vault-test:..."). `brain refresh` requires an existing DB.
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Refresh with --config but NO --instance flag. Pre-fix, refresh ignored
+    // the config and resolved "default", cascade-deleting nothing and creating
+    // a spurious second "vlt:default:..." vault. Post-fix it honors the config's
+    // instance_id and re-indexes the same "vlt:vault-test:..." vault in place.
+    nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault_dir)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Read the vault back and assert its UID carries the config's instance.
+    let output = nestweaver_cmd()
+        .args(["brain", "list", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let uids: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uid"].as_str().unwrap())
+        .collect();
+    assert!(
+        uids.iter().any(|u| u.starts_with("vlt:vault-test:")),
+        "vault should be tagged under config instance_id 'vault-test', got uids: {uids:?}"
+    );
+    assert!(
+        !uids.iter().any(|u| u.starts_with("vlt:default:")),
+        "vault must NOT be tagged under the literal 'default' instance, got uids: {uids:?}"
+    );
+}
+
+/// nw-047: the no-daemon `index` direct-write path must resolve the instance
+/// id as `--instance` > config `instance_id` > "default" (was
+/// `instance.unwrap_or("default")`, which ignored the config). Without a
+/// `--instance` flag, a `--config` naming `cfgname` must stamp repos under
+/// `repo:cfgname:…`, not `repo:default:…`.
+fn nw047_valid_config(dir: &std::path::Path, instance_id: &str) -> std::path::PathBuf {
+    let config_path = dir.join(format!("instance-{instance_id}.toml"));
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "{instance_id}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{storage}"
+
+[workspace]
+backend = "local"
+path = "{workspace}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+            storage = dir.join("storage").display(),
+            workspace = dir.join("workspace").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("storage")).unwrap();
+    std::fs::create_dir_all(dir.join("workspace")).unwrap();
+    config_path
+}
+
+fn nw047_repo_instances(db_path: &std::path::Path) -> Vec<String> {
+    let output = nestweaver_cmd()
+        .args(["list-repos", "--json", "--db"])
+        .arg(db_path)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["instance_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn no_daemon_index_uses_config_instance_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    let db = dir.path().join("test.lbug");
+    let config_path = nw047_valid_config(dir.path(), "cfgname");
+
+    // Index with --config but NO --instance flag.
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--config")
+        .arg(&config_path)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    let instances = nw047_repo_instances(&db);
+    assert!(
+        instances.iter().any(|i| i == "cfgname"),
+        "repo must be stamped under config instance 'cfgname', got: {instances:?}"
+    );
+    assert!(
+        !instances.iter().any(|i| i == "default"),
+        "repo must NOT fall back to 'default' when --config names an instance, got: {instances:?}"
+    );
+}
+
+#[test]
+fn no_daemon_index_empty_instance_flag_falls_back_to_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    let db = dir.path().join("test.lbug");
+    let config_path = nw047_valid_config(dir.path(), "cfgname");
+
+    // `--instance ""` must be treated as unset (not a literal empty instance)
+    // and fall through to the config's instance_id.
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--instance")
+        .arg("")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    let instances = nw047_repo_instances(&db);
+    assert!(
+        instances.iter().any(|i| i == "cfgname"),
+        "empty --instance must fall back to config 'cfgname', got: {instances:?}"
+    );
+    assert!(
+        !instances.iter().any(|i| i.is_empty()),
+        "empty --instance must not be stored as a literal empty instance, got: {instances:?}"
+    );
+}
+
+/// nw-052b: the `--instance` flag must be validated at the CLI choke point.
+/// nw-052 rejected a colon only in a `--config`'s `instance_id` (config-load),
+/// so `--instance "a:b"` still slipped through and stamped an ambiguous uid
+/// `repo:a:b:<hash>`. Validating the RESOLVED instance in `resolve_instance_id`
+/// closes the flag path: the command now exits non-zero with a colon error.
+#[test]
+fn no_daemon_index_rejects_colon_in_instance_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    let db = dir.path().join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--instance")
+        .arg("a:b")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .failure()
+        .stderr(contains("colon"));
+}
+
+fn toml_basic_string(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+fn write_disabled_watch_config(path: &std::path::Path) {
+    let root = path.parent().unwrap();
+    let storage = root.join("storage");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&storage).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        path,
+        format!(
+            r#"instance_id = "cfg-watch"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[watch]
+enabled = false
+"#,
+            toml_basic_string(&storage),
+            toml_basic_string(&workspace)
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn toml_path_escaping_preserves_windows_separators() {
+    let path = std::path::Path::new(r#"C:\Users\kory\workspace"#);
+    assert_eq!(toml_basic_string(path), r#"C:\\Users\\kory\\workspace"#);
+}
+
+#[test]
+fn no_daemon_brain_watch_rejects_invalid_instance_before_graph_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db = dir.path().join("brain.lbug");
+    let config = dir.path().join("instance.toml");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("note.md"), "# note").unwrap();
+    write_disabled_watch_config(&config);
+
+    nestweaver_cmd()
+        .args(["brain", "watch"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&db)
+        .arg("--config")
+        .arg(&config)
+        .arg("--instance")
+        .arg("a:b")
+        .assert()
+        .failure()
+        .stderr(contains("colon"));
+
+    assert!(!db.exists(), "invalid instance must not create the graph");
+    assert!(
+        !std::path::PathBuf::from(format!("{}.lock", db.display())).exists(),
+        "invalid instance must not publish a watcher lock"
+    );
+}
+
+#[test]
+fn no_daemon_brain_watch_accepts_empty_and_valid_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db = dir.path().join("brain.lbug");
+    let config = dir.path().join("instance.toml");
+    std::fs::create_dir_all(&vault).unwrap();
+    write_disabled_watch_config(&config);
+
+    for instance in ["", "valid-watch"] {
+        nestweaver_cmd()
+            .args(["brain", "watch"])
+            .arg(&vault)
+            .arg("--db")
+            .arg(&db)
+            .arg("--config")
+            .arg(&config)
+            .arg("--instance")
+            .arg(instance)
+            .assert()
+            .success()
+            .stderr(contains("Watching disabled"));
+    }
+}
+
+#[test]
+fn index_does_not_write_setup_files_into_unrelated_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("cwd");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    // Deterministic detection without relying on host PATH:
+    std::fs::create_dir_all(cwd.join(".cursor")).unwrap();
+    let db = dir.path().join("test.lbug");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .current_dir(&cwd)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    for f in [
+        ".mcp.json",
+        "AGENTS.md",
+        ".claude",
+        ".codex",
+        ".github",
+        ".cursor/mcp.json",
+        "devin.json",
+    ] {
+        assert!(
+            !cwd.join(f).exists(),
+            "index must not write {f} into an unrelated cwd"
+        );
+    }
+    // Piped output → stderr not a TTY → gate blocks even repo-root writes:
+    assert!(
+        !repo.join(".mcp.json").exists(),
+        "non-TTY index must not write into the repo either"
+    );
+    // Skipped ≠ done: marker must NOT be written, so a future interactive index still gets setup.
+    assert!(
+        !dir.path().join("test.lbug.setup_done").exists(),
+        "marker must only be written when setup actually ran"
+    );
+    // The hint must tell the user what they can do instead:
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nestweaver setup"),
+        "skip must print a hint, got: {stderr}"
+    );
+}
+
+#[test]
+fn index_setup_prints_banner_at_most_once_with_multiple_tools() {
+    // nw-051: auto-setup used to reprint the "NestWeaver Setup" banner once per
+    // detected tool. With two tools present it must still appear exactly once.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    // Two detectable tools anchored to the repo root.
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::create_dir_all(repo.join(".claude")).unwrap();
+    let db = dir.path().join("test.lbug");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--setup",
+        ])
+        .current_dir(&repo)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let banner_count = combined.matches("NestWeaver Setup").count();
+    assert_eq!(
+        banner_count, 1,
+        "banner must print exactly once regardless of tool count, got {banner_count}:\n{combined}"
+    );
+}
+
+#[test]
+fn index_setup_quiet_suppresses_setup_banner() {
+    // nw-051: --setup --quiet should still configure tools but stay quiet.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::create_dir_all(repo.join(".claude")).unwrap();
+    let db = dir.path().join("test.lbug");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--setup",
+            "--quiet",
+        ])
+        .current_dir(&repo)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("NestWeaver Setup"),
+        "--quiet must suppress the setup banner, got:\n{combined}"
+    );
+    // Setup still happened.
+    assert!(
+        repo.join(".cursor/mcp.json").exists(),
+        "--setup must still configure tools under --quiet"
+    );
+}
+
+#[test]
+fn index_setup_flag_forces_setup_anchored_to_repo_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("cwd");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    // Detection anchored to the repo (base), not the cwd:
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    let db = dir.path().join("test.lbug");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "index",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--setup",
+        ])
+        .current_dir(&cwd)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    assert!(
+        repo.join(".cursor/mcp.json").exists(),
+        "--setup must write configs at the indexed repo root even from a foreign, non-TTY cwd"
+    );
+    assert!(
+        !cwd.join(".cursor/mcp.json").exists(),
+        "cwd must stay clean"
+    );
+    assert!(
+        dir.path().join("test.lbug.setup_done").exists(),
+        "a forced run counts as done"
+    );
+}
+
+#[test]
+fn index_setup_failure_does_not_write_done_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    std::fs::write(repo.join(".cursor/mcp.json"), "{ invalid json").unwrap();
+    let db = dir.path().join("test.lbug");
+
+    std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--setup")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    assert!(!sidecar_path(&db, ".setup_done").exists());
+}
+
+#[test]
+fn index_setup_retries_secondary_before_writing_done_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::write(repo.join("main.js"), "function f() {}").unwrap();
+    let rules_path = repo.join(".cursor/rules");
+    std::fs::write(&rules_path, "blocks directory creation").unwrap();
+    let db = dir.path().join("test.lbug");
+    let marker = sidecar_path(&db, ".setup_done");
+
+    std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--setup")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    assert!(repo.join(".cursor/mcp.json").exists());
+    assert!(!rules_path.join("nestweaver.mdc").exists());
+    assert!(!marker.exists());
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .arg("--setup")
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .assert()
+        .success();
+
+    assert!(rules_path.join("nestweaver.mdc").exists());
+    assert!(marker.exists());
 }

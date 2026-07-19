@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -36,6 +37,16 @@ pub struct IndexResult {
     pub edges_count: usize,
     pub files_count: usize,
     pub files_unchanged: usize,
+    /// Count of old File rows removed by the indexing transaction, distinct
+    /// from `files_count` (files parsed) and `files_unchanged` (files skipped as
+    /// identical). Forced replacement counts every old row authoritatively
+    /// deleted by `bulk_reindex_write`, including same-path replacements. A
+    /// delete-only re-index has `files_count == 0` but `files_deleted > 0`; the
+    /// index-time PageRank guard consults this so surviving nodes' ranks are
+    /// recomputed after a deletion instead of left stale.
+    pub files_deleted: usize,
+    /// Symbols removed by replacement/deletion transactions during this run.
+    pub symbols_deleted: usize,
     pub skipped_files: Vec<SkippedFile>,
 }
 
@@ -60,20 +71,938 @@ pub struct CachedFileMeta {
 /// Map from repo-relative path to cached file metadata.
 pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 
-/// Load the file metadata sidecar. Returns an empty map on missing/corrupt file.
-pub fn load_filemeta_cache(path: &Path) -> FileMetaCache {
+/// Sidecar format version. v2 = per-repo keying (nw-022). v1 (implicit,
+/// unversioned flat map) fails deserialization and loads as empty — a
+/// deliberate fail-open that costs one full re-index and can never
+/// mis-classify a file.
+pub const FILEMETA_VERSION: u32 = 2;
+
+/// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
+/// repo uid, then repo-relative path. Two repos sharing one DB can never
+/// collide on a relative path (nw-022).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetaSidecar {
+    pub version: u32,
+    pub repos: HashMap<String, FileMetaCache>,
+}
+
+impl Default for FileMetaSidecar {
+    fn default() -> Self {
+        Self {
+            version: FILEMETA_VERSION,
+            repos: HashMap::new(),
+        }
+    }
+}
+
+/// Load the sidecar. Missing, corrupt, or old-format files yield an empty
+/// sidecar (every file classifies as New → full re-index, never a skip).
+pub fn load_filemeta_sidecar(path: &Path) -> FileMetaSidecar {
     match std::fs::read_to_string(path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => FileMetaCache::new(),
+        Ok(data) => match serde_json::from_str::<FileMetaSidecar>(&data) {
+            Ok(s) if s.version == FILEMETA_VERSION => s,
+            Ok(s) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    found_version = s.version,
+                    expected_version = FILEMETA_VERSION,
+                    "filemeta sidecar version mismatch; discarding (full re-index)"
+                );
+                FileMetaSidecar::default()
+            }
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "filemeta sidecar corrupt or legacy format; discarding (full re-index)"
+                );
+                FileMetaSidecar::default()
+            }
+        },
+        Err(e) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %e,
+                "filemeta sidecar missing or unreadable; starting empty"
+            );
+            FileMetaSidecar::default()
+        }
     }
 }
 
 /// Save the file metadata sidecar alongside the database.
-pub fn save_filemeta_cache(cache: &FileMetaCache, path: &Path) -> Result<(), anyhow::Error> {
-    let json = serde_json::to_string(cache).with_context(|| "serialize filemeta cache")?;
-    std::fs::write(path, json)
-        .with_context(|| format!("write filemeta cache to {}", path.display()))?;
+pub fn save_filemeta_sidecar(sidecar: &FileMetaSidecar, path: &Path) -> Result<(), anyhow::Error> {
+    debug_assert_eq!(
+        sidecar.version, FILEMETA_VERSION,
+        "FileMetaSidecar::default() pins the version; never construct one by hand"
+    );
+    let json = serde_json::to_string(sidecar).with_context(|| "serialize filemeta sidecar")?;
+    crate::manifest::atomic_replace_file(path, |file| file.write_all(json.as_bytes()))
+        .with_context(|| format!("write filemeta sidecar to {}", path.display()))?;
     Ok(())
+}
+
+/// A required durable stage in post-deletion reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionReconciliationStage {
+    IndexPublicationMarker,
+    IndexPublicationMarkerRetirement,
+    FileMetadata,
+    ResolutionDependencies,
+    ManifestCache,
+    EmbeddingIndex,
+    LegacyRetirement,
+    ClusterCache,
+    GenerationPersistence,
+    PersistedPageRank,
+    GraphLiveness,
+    ExtensionMetadata,
+    PageRankCompute,
+    PageRankPersistence,
+    SearchIndex,
+}
+
+impl std::fmt::Display for DeletionReconciliationStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::IndexPublicationMarker => "index-publication-marker",
+            Self::IndexPublicationMarkerRetirement => "index-publication-marker-retirement",
+            Self::FileMetadata => "filemeta",
+            Self::ResolutionDependencies => "resolution-deps",
+            Self::ManifestCache => "manifest-cache",
+            Self::EmbeddingIndex => "embedding-index",
+            Self::LegacyRetirement => "legacy-retirement",
+            Self::ClusterCache => "cluster-cache",
+            Self::GenerationPersistence => "generation-persistence",
+            Self::PersistedPageRank => "persisted-pagerank",
+            Self::GraphLiveness => "graph-liveness",
+            Self::ExtensionMetadata => "extension-metadata",
+            Self::PageRankCompute => "pagerank-compute",
+            Self::PageRankPersistence => "pagerank-persistence",
+            Self::SearchIndex => "search-index",
+        };
+        formatter.write_str(name)
+    }
+}
+
+/// One failed stage from a reconciliation run. Errors are strings because the
+/// finalizer crosses `anyhow`, store, filesystem, and Tantivy error domains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionReconciliationFailure {
+    pub stage: DeletionReconciliationStage,
+    pub repo_uid: Option<String>,
+    pub message: String,
+}
+
+/// Aggregate returned only after every safe reconciliation stage has run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionReconciliationError {
+    pub operation: String,
+    pub failures: Vec<DeletionReconciliationFailure>,
+}
+
+impl DeletionReconciliationError {
+    pub fn new(operation: impl Into<String>, failures: Vec<DeletionReconciliationFailure>) -> Self {
+        debug_assert!(!failures.is_empty());
+        Self {
+            operation: operation.into(),
+            failures,
+        }
+    }
+
+    pub fn single(
+        operation: impl Into<String>,
+        stage: DeletionReconciliationStage,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            operation,
+            vec![DeletionReconciliationFailure {
+                stage,
+                repo_uid: None,
+                message: message.into(),
+            }],
+        )
+    }
+}
+
+impl std::fmt::Display for DeletionReconciliationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} reconciliation failed in {} stage(s)",
+            self.operation,
+            self.failures.len()
+        )?;
+        for failure in &self.failures {
+            write!(formatter, "; {}", failure.stage)?;
+            if let Some(repo_uid) = &failure.repo_uid {
+                write!(formatter, "[{repo_uid}]")?;
+            }
+            write!(formatter, ": {}", failure.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DeletionReconciliationError {}
+
+trait DeletionReconciliationIo {
+    fn save_filemeta(&self, sidecar: &FileMetaSidecar, path: &Path) -> Result<(), anyhow::Error>;
+    fn save_resolution_deps(
+        &self,
+        deps: &crate::resolution_cache::ResolutionDeps,
+        path: &Path,
+    ) -> Result<(), anyhow::Error>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+}
+
+struct FileSystemDeletionReconciliationIo;
+
+impl DeletionReconciliationIo for FileSystemDeletionReconciliationIo {
+    fn save_filemeta(&self, sidecar: &FileMetaSidecar, path: &Path) -> Result<(), anyhow::Error> {
+        save_filemeta_sidecar(sidecar, path)
+    }
+
+    fn save_resolution_deps(
+        &self,
+        deps: &crate::resolution_cache::ResolutionDeps,
+        path: &Path,
+    ) -> Result<(), anyhow::Error> {
+        deps.save(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        nestweaver_store::durable_sidecar::remove_file_durable(path)
+    }
+}
+
+fn push_reconciliation_failure(
+    failures: &mut Vec<DeletionReconciliationFailure>,
+    stage: DeletionReconciliationStage,
+    repo_uid: Option<&str>,
+    message: impl Into<String>,
+) {
+    failures.push(DeletionReconciliationFailure {
+        stage,
+        repo_uid: repo_uid.map(str::to_owned),
+        message: message.into(),
+    });
+}
+
+/// Drop the removed repo's slices from the change-detection sidecars so a later
+/// re-index of the SAME path re-indexes its files instead of silently skipping
+/// every one as `Unchanged` (nw-048). `remove-repo` deletes the repo's graph
+/// nodes/symbols but, without this, leaves the `.filemeta` slice behind — the
+/// re-added repo (same path → same uid, unchanged files) then classifies every
+/// file `Unchanged`, so the deleted symbols are never restored and `search`
+/// finds nothing.
+///
+/// Contract:
+/// * **uid-scoped** — ONLY `repo_uid`'s slice is removed from each sidecar;
+///   other repos sharing the DB keep their slices untouched (dropping the wrong
+///   slice would be the same silent-data-loss class this fixes).
+/// * **fail-open input** — a missing, corrupt, or old-format sidecar is a no-op:
+///   `load_filemeta_sidecar` / `ResolutionDeps::load` already fail open to empty,
+///   and each sidecar is only rewritten when the slice was actually present.
+/// * **required output** — once a stale slice is found, failure to durably save
+///   its removal is returned. A caller must not report successful deletion while
+///   stale change-detection state can survive or be reused by the same repo UID.
+///
+/// The `.parsed_cache` sidecar is deliberately left alone: it is content-hash
+/// keyed and shared across repos (collision-safe), so an orphaned entry there is
+/// harmless dead space, not a correctness hazard.
+pub fn remove_repo_sidecar_slices(
+    db_path: &Path,
+    repo_uid: &str,
+) -> Result<(), DeletionReconciliationError> {
+    let mut failures = Vec::new();
+    remove_repo_sidecar_slices_with_io(
+        db_path,
+        repo_uid,
+        &FileSystemDeletionReconciliationIo,
+        &mut failures,
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(DeletionReconciliationError::new("repo sidecar", failures))
+    }
+}
+
+fn remove_repo_sidecar_slices_with_io(
+    db_path: &Path,
+    repo_uid: &str,
+    io: &dyn DeletionReconciliationIo,
+    failures: &mut Vec<DeletionReconciliationFailure>,
+) {
+    // filemeta — the primary nw-048 cause. A stale slice makes every file of the
+    // re-added repo classify `Unchanged`, so its symbols are never re-indexed.
+    crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
+    let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
+    let mut sidecar = load_filemeta_sidecar(&filemeta_path);
+    if sidecar.repos.remove(repo_uid).is_some()
+        && let Err(error) = io.save_filemeta(&sidecar, &filemeta_path)
+    {
+        push_reconciliation_failure(
+            failures,
+            DeletionReconciliationStage::FileMetadata,
+            Some(repo_uid),
+            format!("{}: {error:#}", filemeta_path.display()),
+        );
+    }
+
+    // resolution_deps — nw-045. Consumers fail open on unreadable input, but a
+    // durable slice for a deleted UID can influence a later same-UID incremental
+    // resolution, so a discovered slice is required output rather than hygiene.
+    let resolution_deps_path = crate::sidecar_path(db_path, ".resolution_deps.bin");
+    let mut deps = crate::resolution_cache::ResolutionDeps::load(&resolution_deps_path);
+    if deps.remove_repo(repo_uid)
+        && let Err(error) = io.save_resolution_deps(&deps, &resolution_deps_path)
+    {
+        push_reconciliation_failure(
+            failures,
+            DeletionReconciliationStage::ResolutionDependencies,
+            Some(repo_uid),
+            format!("{}: {error:#}", resolution_deps_path.display()),
+        );
+    }
+}
+
+/// Per-stage results from reconciling graph-derived sidecars after deletion.
+///
+/// The deletion finalizer consumes every result, continues through the other
+/// safe stages, then returns all required-stage failures in one aggregate.
+#[derive(Debug)]
+pub struct DeletedGraphStateReconciliation {
+    pub manifests_removed: Result<usize, String>,
+    pub embeddings: DeletedEmbeddingStateReconciliation,
+    pub clusters_invalidated: Result<bool, String>,
+}
+
+/// Typed embedding reconciliation results keep canonical persistence and
+/// legacy retirement distinguishable at the aggregate error boundary.
+#[derive(Debug)]
+pub enum DeletedEmbeddingStateReconciliation {
+    LiveSetFailed(String),
+    Reconciled {
+        removed: usize,
+        canonical_persistence: Result<(), String>,
+        legacy_retirement: Option<Result<bool, String>>,
+    },
+}
+
+/// Reconcile repo/node-keyed derived state against the authoritative live
+/// graph. This is safe after partial multi-statement deletion: live destination
+/// or surviving rows remain in the authoritative sets and therefore retain
+/// their manifest/vector data.
+pub fn reconcile_deleted_graph_state(
+    store: &GraphStore,
+    db_path: &Path,
+) -> DeletedGraphStateReconciliation {
+    reconcile_deleted_graph_state_with_io(store, db_path, &FileSystemDeletionReconciliationIo)
+}
+
+fn reconcile_deleted_graph_state_with_io(
+    store: &GraphStore,
+    db_path: &Path,
+    io: &dyn DeletionReconciliationIo,
+) -> DeletedGraphStateReconciliation {
+    let manifests_removed = (|| -> Result<usize, anyhow::Error> {
+        let manifests_path = crate::manifest::manifest_cache_path(db_path);
+        let mut manifests = crate::manifest::load_manifest_cache_for_db(db_path)?;
+        if !manifests_path.exists() {
+            return Ok(0);
+        }
+        let live_repo_uids: std::collections::HashSet<String> = store
+            .list_repos(None)
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .map(|repo| repo.uid)
+            .collect();
+        let before = manifests.len();
+        manifests.retain(|uid, _| live_repo_uids.contains(uid));
+        let removed = before - manifests.len();
+        if removed > 0 {
+            crate::manifest::save_manifest_cache_for_db(&manifests, db_path)?;
+        }
+        Ok(removed)
+    })()
+    .map_err(|error| format!("manifest reconciliation failed: {error:#}"));
+
+    let embeddings = match store.reconcile_embedding_index_stages() {
+        Ok(result) => DeletedEmbeddingStateReconciliation::Reconciled {
+            removed: result.removed,
+            canonical_persistence: result
+                .canonical_persistence
+                .map_err(|error| format!("embedding persistence failed: {error:#}")),
+            legacy_retirement: result.legacy_retirement.map(|retirement| {
+                retirement.map_err(|error| format!("legacy embedding retirement failed: {error:#}"))
+            }),
+        },
+        Err(error) => DeletedEmbeddingStateReconciliation::LiveSetFailed(format!(
+            "embedding live-set reconciliation failed: {error:#}"
+        )),
+    };
+    let clusters_path = crate::sidecar_path(db_path, ".clusters.json");
+    let clusters_invalidated = match io.remove_file(&clusters_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cluster invalidation failed for {}: {error}",
+            clusters_path.display()
+        )),
+    };
+
+    DeletedGraphStateReconciliation {
+        manifests_removed,
+        embeddings,
+        clusters_invalidated,
+    }
+}
+
+/// Publish all cache and sidecar effects that must follow committed code graph
+/// mutation, including a partially successful cascade. Both daemon RPC and
+/// web-admin removals call this epilogue so they cannot diverge after the same
+/// mutation. Required-stage failures are returned together only after every
+/// safe stage has been attempted.
+///
+/// The parsed cache is intentionally not touched: unlike filemeta and
+/// resolution dependencies, it is keyed by content hash and safely shared by
+/// every repo in the database.
+pub fn finalize_code_graph_deletion(
+    store: &GraphStore,
+    db_path: &Path,
+    repo_uids: &[String],
+    operation: &str,
+) -> Result<(), DeletionReconciliationError> {
+    finalize_code_graph_deletion_with_io(
+        store,
+        db_path,
+        repo_uids,
+        operation,
+        &FileSystemDeletionReconciliationIo,
+    )
+}
+
+fn finalize_code_graph_deletion_with_io(
+    store: &GraphStore,
+    db_path: &Path,
+    repo_uids: &[String],
+    operation: &str,
+    io: &dyn DeletionReconciliationIo,
+) -> Result<(), DeletionReconciliationError> {
+    let mut failures = Vec::new();
+    for uid in repo_uids {
+        remove_repo_sidecar_slices_with_io(db_path, uid, io, &mut failures);
+    }
+    let reconciliation = reconcile_deleted_graph_state_with_io(store, db_path, io);
+    match reconciliation.manifests_removed {
+        Ok(removed) => tracing::info!(removed, operation, "manifest cache reconciled"),
+        Err(error) => {
+            let stage = if error.contains("legacy manifest sidecar") {
+                DeletionReconciliationStage::LegacyRetirement
+            } else {
+                DeletionReconciliationStage::ManifestCache
+            };
+            push_reconciliation_failure(&mut failures, stage, None, error);
+        }
+    }
+    match reconciliation.embeddings {
+        DeletedEmbeddingStateReconciliation::LiveSetFailed(error) => push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::EmbeddingIndex,
+            None,
+            error,
+        ),
+        DeletedEmbeddingStateReconciliation::Reconciled {
+            removed,
+            canonical_persistence,
+            legacy_retirement,
+        } => {
+            match canonical_persistence {
+                Ok(()) => tracing::info!(removed, operation, "embedding index reconciled"),
+                Err(error) => push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::EmbeddingIndex,
+                    None,
+                    error,
+                ),
+            }
+            if let Some(Err(error)) = legacy_retirement {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::LegacyRetirement,
+                    None,
+                    error,
+                );
+            }
+        }
+    }
+    match reconciliation.clusters_invalidated {
+        Ok(invalidated) => tracing::info!(invalidated, operation, "cluster cache reconciled"),
+        Err(error) => push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::ClusterCache,
+            None,
+            error,
+        ),
+    }
+    match crate::extensions::reconcile_extension_liveness(store, db_path) {
+        Ok(removed) => tracing::info!(removed, operation, "extension metadata reconciled"),
+        Err(error) => push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::ExtensionMetadata,
+            None,
+            format!("extension metadata liveness reconciliation failed: {error:#}"),
+        ),
+    }
+
+    // Advance before its durable companion so live readers are safe even when
+    // sidecar persistence fails, but never wrap an exhausted counter.
+    let generation_advanced = match store.try_bump_graph_generation() {
+        Ok(_) => true,
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::GenerationPersistence,
+                None,
+                format!("advance graph generation: {error:#}"),
+            );
+            false
+        }
+    };
+    let generation_path = crate::sidecar_path(db_path, ".generation");
+    if generation_advanced && let Err(error) = store.save_graph_generation(&generation_path) {
+        push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::GenerationPersistence,
+            None,
+            format!("{}: {error:#}", generation_path.display()),
+        );
+    }
+    store.invalidate_pagerank();
+
+    let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
+    if let Err(error) = io.remove_file(&pagerank_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::PersistedPageRank,
+            None,
+            format!("{}: {error}", pagerank_path.display()),
+        );
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(DeletionReconciliationError::new(operation, failures))
+    }
+}
+
+/// Mandatory cache/generation publication after a committed indexing graph
+/// mutation. This runs before any later sidecar persistence or PageRank
+/// recomputation so a subsequent error cannot leave the previous ranks or
+/// graph generation authoritative.
+pub(crate) trait IndexEpilogueIo {
+    fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
+    fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+    fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn save_generation(
+        &self,
+        store: &GraphStore,
+        path: &Path,
+        generation: u64,
+    ) -> Result<(), anyhow::Error>;
+    fn compute_pagerank(
+        &self,
+        store: &GraphStore,
+        scope: &nestweaver_store::GraphScope,
+    ) -> Result<(), anyhow::Error>;
+    fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error>;
+}
+
+pub(crate) struct FileSystemIndexEpilogueIo;
+
+impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
+    fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("create index publication marker {}", path.display()))?;
+        let marker = format!(
+            "{}:{}\n",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        file.write_all(marker.as_bytes())
+            .with_context(|| format!("write index publication marker {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync index publication marker {}", path.display()))?;
+        sync_sidecar_parent(path)
+    }
+
+    fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+        match std::fs::remove_file(path) {
+            Ok(()) => sync_sidecar_parent(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("remove index publication marker {}", path.display())),
+        }
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        nestweaver_store::durable_sidecar::remove_file_durable(path)
+    }
+
+    fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)?;
+        sync_sidecar_parent_io(from)?;
+        if from.parent() != to.parent() {
+            sync_sidecar_parent_io(to)?;
+        }
+        Ok(())
+    }
+
+    fn save_generation(
+        &self,
+        store: &GraphStore,
+        path: &Path,
+        generation: u64,
+    ) -> Result<(), anyhow::Error> {
+        store.save_graph_generation_value(path, generation)?;
+        Ok(())
+    }
+
+    fn compute_pagerank(
+        &self,
+        store: &GraphStore,
+        scope: &nestweaver_store::GraphScope,
+    ) -> Result<(), anyhow::Error> {
+        store.compute_pagerank(0.85, 20, scope).map_err(Into::into)
+    }
+
+    fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+        store.save_pagerank_cache(path)?;
+        Ok(())
+    }
+}
+
+fn sync_sidecar_parent(path: &Path) -> Result<(), anyhow::Error> {
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(path)
+        .with_context(|| format!("publish sidecar namespace change for {}", path.display()))
+}
+
+fn sync_sidecar_parent_io(path: &Path) -> std::io::Result<()> {
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(path)
+}
+
+fn quarantine_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(".stale");
+    PathBuf::from(value)
+}
+
+fn invalidate_pagerank_sidecar_with_io(
+    pagerank_path: &Path,
+    io: &dyn IndexEpilogueIo,
+    failures: &mut Vec<DeletionReconciliationFailure>,
+) -> bool {
+    match io.remove_file(pagerank_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            let quarantine = quarantine_path(pagerank_path);
+            let quarantine_result = io.rename_file(pagerank_path, &quarantine);
+            let safe = quarantine_result.is_ok();
+            push_reconciliation_failure(
+                failures,
+                DeletionReconciliationStage::PersistedPageRank,
+                None,
+                match quarantine_result {
+                    Ok(()) => format!(
+                        "{}: removal failed ({error}); quarantined as {}",
+                        pagerank_path.display(),
+                        quarantine.display()
+                    ),
+                    Err(quarantine_error) => format!(
+                        "{}: removal failed ({error}); quarantine failed ({quarantine_error})",
+                        pagerank_path.display()
+                    ),
+                },
+            );
+            safe
+        }
+    }
+}
+
+pub(crate) fn establish_index_publication_marker_with_io<'a>(
+    store: &'a GraphStore,
+    db_path: Option<&Path>,
+    operation: &str,
+    io: &dyn IndexEpilogueIo,
+) -> Result<nestweaver_store::IndexPublicationLease<'a>, DeletionReconciliationError> {
+    let lease = store.acquire_index_publication_lease().map_err(|error| {
+        DeletionReconciliationError::new(
+            operation,
+            vec![DeletionReconciliationFailure {
+                stage: DeletionReconciliationStage::IndexPublicationMarker,
+                repo_uid: None,
+                message: format!("acquire exclusive index publication lease: {error:#}"),
+            }],
+        )
+    })?;
+    let Some(db_path) = db_path else {
+        lease.preflight_transient_generation().map_err(|error| {
+            DeletionReconciliationError::new(
+                operation,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::GenerationPersistence,
+                    repo_uid: None,
+                    message: format!("preflight transient index generation: {error:#}"),
+                }],
+            )
+        })?;
+        return Ok(lease);
+    };
+    lease.preflight_generation().map_err(|error| {
+        DeletionReconciliationError::new(
+            operation,
+            vec![DeletionReconciliationFailure {
+                stage: DeletionReconciliationStage::GenerationPersistence,
+                repo_uid: None,
+                message: format!("preflight index publication generation: {error:#}"),
+            }],
+        )
+    })?;
+    let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+    lease
+        .store()
+        .with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
+            io.establish_marker(&marker_path)?;
+            lease.reserve_generation()?;
+            Ok(())
+        })
+        .map_err(|error| {
+            DeletionReconciliationError::new(
+                operation,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::IndexPublicationMarker,
+                    repo_uid: None,
+                    message: format!("{}: {error:#}", marker_path.display()),
+                }],
+            )
+        })?;
+    Ok(lease)
+}
+
+fn finalize_committed_index_with_io(
+    lease: nestweaver_store::IndexPublicationLease<'_>,
+    db_path: Option<&Path>,
+    operation: &str,
+    io: &dyn IndexEpilogueIo,
+    refresh_pagerank: bool,
+) -> Result<(), DeletionReconciliationError> {
+    let scope = refresh_pagerank.then(nestweaver_store::GraphScope::code_only);
+    finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref())
+}
+
+pub(crate) fn finalize_committed_index_for_scope_with_io(
+    lease: nestweaver_store::IndexPublicationLease<'_>,
+    db_path: Option<&Path>,
+    operation: &str,
+    io: &dyn IndexEpilogueIo,
+    pagerank_scope: Option<&nestweaver_store::GraphScope>,
+) -> Result<(), DeletionReconciliationError> {
+    let mut failures = Vec::new();
+    let store = lease.store();
+
+    store.invalidate_pagerank();
+    let pagerank_safe = if let Some(db_path) = db_path {
+        invalidate_pagerank_sidecar_with_io(
+            &crate::sidecar_path(db_path, ".pagerank.json"),
+            io,
+            &mut failures,
+        )
+    } else {
+        true
+    };
+
+    let generation_advanced = if db_path.is_some() {
+        lease.clean_generation()
+    } else {
+        store.try_bump_graph_generation()
+    };
+    let generation_durable = match generation_advanced {
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::GenerationPersistence,
+                None,
+                format!("advance graph generation: {error:#}"),
+            );
+            false
+        }
+        Ok(generation) if db_path.is_some() => {
+            let generation_path = crate::sidecar_path(db_path.unwrap(), ".generation");
+            match io.save_generation(store, &generation_path, generation) {
+                Ok(()) => true,
+                Err(error) => {
+                    push_reconciliation_failure(
+                        &mut failures,
+                        DeletionReconciliationStage::GenerationPersistence,
+                        None,
+                        format!("{}: {error:#}", generation_path.display()),
+                    );
+                    false
+                }
+            }
+        }
+        Ok(_) => true,
+    };
+
+    let mut publication_clean = db_path.is_none();
+    if generation_durable
+        && pagerank_safe
+        && let Some(db_path) = db_path
+    {
+        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+        let retirement =
+            store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
+                lease.publish_clean_generation()?;
+                if let Err(error) = io.clear_marker(&marker_path) {
+                    lease.fail_clean_generation()?;
+                    return Err(error);
+                }
+                lease.complete_generation()?;
+                Ok(())
+            });
+        if let Err(error) = retirement {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::IndexPublicationMarkerRetirement,
+                None,
+                format!("{}: {error:#}", marker_path.display()),
+            );
+        } else {
+            publication_clean = true;
+        }
+    }
+
+    if let Some(scope) = pagerank_scope.filter(|_| publication_clean) {
+        match io.compute_pagerank(store, scope) {
+            Ok(()) => {
+                if let Some(db_path) = db_path {
+                    let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
+                    match io.save_pagerank(store, &pagerank_path) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            push_reconciliation_failure(
+                                &mut failures,
+                                DeletionReconciliationStage::PageRankPersistence,
+                                None,
+                                format!("{}: {error:#}", pagerank_path.display()),
+                            );
+                            invalidate_pagerank_sidecar_with_io(&pagerank_path, io, &mut failures);
+                        }
+                    }
+                }
+            }
+            Err(error) => push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::PageRankCompute,
+                None,
+                format!("{error:#}"),
+            ),
+        }
+    }
+
+    if publication_clean
+        && let Some(db_path) = db_path
+        && let Err(error) = crate::extensions::reconcile_extension_handoffs(store, db_path)
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::ExtensionMetadata,
+            None,
+            format!("reconcile deferred extension metadata after index publication: {error:#}"),
+        );
+    }
+
+    if failures.is_empty() {
+        lease.release().map_err(|error| {
+            DeletionReconciliationError::new(
+                operation,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::IndexPublicationMarkerRetirement,
+                    repo_uid: None,
+                    message: format!("release exclusive index publication lease: {error:#}"),
+                }],
+            )
+        })
+    } else {
+        Err(DeletionReconciliationError::new(operation, failures))
+    }
+}
+
+/// "Still alive" sets returned by [`merge_save_filemeta`], used to evict the
+/// parsed-cache / resolution-deps sidecars. A named struct so the same-typed
+/// sets can't be swapped at a call site.
+struct FilemetaEvictionUnions {
+    /// Cross-repo union of every repo's live content hashes. The parsed cache
+    /// is content-hash keyed (collision-safe across repos), so its eviction
+    /// must be union-scoped or indexing one repo would drop another's entries.
+    live_hashes: std::collections::HashSet<String>,
+    /// THIS repo's live repo-relative paths only. The resolution-deps tracker
+    /// is now per-repo keyed (nw-045), so its eviction is scoped to the repo
+    /// being indexed — never the cross-repo union (which could resurrect or
+    /// wrongly retain another repo's records on a shared rel path).
+    repo_live_files: std::collections::HashSet<String>,
+}
+
+/// Load-merge-save the filemeta sidecar for one repo's index run, and return
+/// the cross-repo eviction unions for the parsed-cache / resolution-deps
+/// sidecars. `drop_uids` removes slices for pruned or re-identified repos.
+/// NEVER a blind overwrite: other repos' slices are preserved (nw-022).
+fn merge_save_filemeta(
+    filemeta_path: &Path,
+    r_uid: &str,
+    new_filemeta: FileMetaCache,
+    drop_uids: &[String],
+) -> Result<FilemetaEvictionUnions, anyhow::Error> {
+    let mut sidecar = load_filemeta_sidecar(filemeta_path);
+    for uid in drop_uids {
+        sidecar.repos.remove(uid);
+    }
+    sidecar.repos.insert(r_uid.to_string(), new_filemeta);
+    // Content-hash union across ALL repos — feeding only the current repo's
+    // hashes (the old behavior) evicts every other repo's parse cache.
+    let live_hashes = sidecar
+        .repos
+        .values()
+        .flat_map(|files| files.values().map(|m| m.content_hash.clone()))
+        .collect();
+    // THIS repo's live rel-paths only (nw-045). The resolution-deps tracker is
+    // per-repo keyed, so its retention must be scoped to r_uid — the cross-repo
+    // union would preserve dead entries and defeats per-repo eviction.
+    let repo_live_files = sidecar
+        .repos
+        .get(r_uid)
+        .map(|files| files.keys().cloned().collect())
+        .unwrap_or_default();
+    save_filemeta_sidecar(&sidecar, filemeta_path)?;
+    Ok(FilemetaEvictionUnions {
+        live_hashes,
+        repo_live_files,
+    })
 }
 
 /// Outcome of the tiered change detection for a single file.
@@ -353,6 +1282,7 @@ fn index_directory_with_store_inner(
 ) -> Result<IndexResult, anyhow::Error> {
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
+    let r_uid = repo_uid(instance_id, repo_url);
     let mut new_filemeta = FileMetaCache::new();
 
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
@@ -366,6 +1296,10 @@ fn index_directory_with_store_inner(
     // Persisted as `root_path` on the Repo node so consumers never derive
     // a disk path from the identity `url`.
     let local_root = repo_path.display().to_string();
+    // nw-010: when the run re-identifies a legacy file:// repo under its
+    // origin remote, the old uid's filemeta slice must be dropped from the
+    // sidecar alongside the graph prune.
+    let mut reidentified_old_uid: Option<String> = None;
     let result = if force {
         index_into_store_with_write_gate(
             &reader,
@@ -377,47 +1311,51 @@ fn index_directory_with_store_inner(
             Some(&mut new_filemeta),
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
+            Some(&mut reidentified_old_uid),
             name,
             Some(&local_root),
-            false,
+            true,
+            &FileSystemIndexEpilogueIo,
             cancel,
             || Ok::<(), anyhow::Error>(()),
         )?
     } else {
-        let filemeta_cache = load_filemeta_cache(&filemeta_path);
+        // Only this repo's slice of the sidecar feeds change detection —
+        // another repo's entry for the same rel path must never match (nw-022).
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
         index_into_store_with_write_gate(
             &reader,
             store,
             instance_id,
             repo_url,
             indexed_sha,
-            Some(&filemeta_cache),
+            sidecar.repos.get(&r_uid),
             Some(&mut new_filemeta),
             Some(&mut parsed_cache),
             Some(&mut resolution_deps),
+            Some(&mut reidentified_old_uid),
             name,
             Some(&local_root),
-            false,
+            true,
+            &FileSystemIndexEpilogueIo,
             cancel,
             || Ok::<(), anyhow::Error>(()),
         )?
     };
 
-    // Evict stale cache entries for deleted/renamed files before saving.
-    {
-        let live_hashes: std::collections::HashSet<String> = new_filemeta
-            .values()
-            .map(|m| m.content_hash.clone())
-            .collect();
-        parsed_cache.retain_hashes(&live_hashes);
+    // Merge this repo's fresh entries into the shared sidecar and evict
+    // parse/resolution cache entries using cross-repo live unions.
+    //
+    // A sidecar write failure fails the whole run (`?`) on purpose: the graph
+    // was already mutated, so a stale sidecar would silently re-enable
+    // skip-classification against reality on the next run — files that
+    // changed since the stale snapshot would classify Unchanged and never be
+    // re-indexed. (The fallback path stays warn-only; see full_index_fallback.)
+    let drop_uids: Vec<String> = reidentified_old_uid.into_iter().collect();
+    let unions = merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &drop_uids)?;
+    parsed_cache.retain_hashes(&unions.live_hashes);
+    resolution_deps.retain_files_for_repo(&r_uid, &unions.repo_live_files);
 
-        let live_files: std::collections::HashSet<String> = new_filemeta.keys().cloned().collect();
-        resolution_deps.retain_files(&live_files);
-    }
-
-    if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
-        tracing::warn!("failed to save filemeta cache: {e}");
-    }
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
     }
@@ -426,17 +1364,18 @@ fn index_directory_with_store_inner(
     }
 
     let manifest = crate::manifest::parse_manifest(&reader);
-    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
-    let cache_path = crate::sidecar_path(db_path, ".manifests.json");
-    let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
-    let mut cache = crate::manifest::load_manifest_cache(&cache_path).unwrap_or_default();
+    let mut cache = crate::manifest::load_manifest_cache_for_db(db_path).unwrap_or_default();
     cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache(&cache, &cache_path) {
+    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&cache, db_path) {
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
-    store.bump_and_persist_generation();
-
+    // nw-029: warm PageRank at index time so first queries (UI overview, impact,
+    // repo-map, hubs) never pay the lazy compute. Mirrors the incremental path.
+    // Release-build cost is seconds even at ~50k symbols. A failure is returned:
+    // callers must not observe a successful index unless its fresh PageRank is
+    // durable. nw-055 (P1b): delete-only re-indexes also need fresh surviving
+    // ranks even though files_count is zero.
     Ok(result)
 }
 
@@ -506,6 +1445,49 @@ pub fn index_with_reader_and_write_gate<G, F>(
 where
     F: FnOnce() -> Result<G, anyhow::Error>,
 {
+    index_with_reader_and_write_gate_and_io(
+        ReaderIndexRequest {
+            reader,
+            store,
+            instance_id,
+            repo_url,
+            indexed_sha,
+            name,
+            cancel,
+            epilogue_io: &FileSystemIndexEpilogueIo,
+        },
+        acquire_write_guard,
+    )
+}
+
+struct ReaderIndexRequest<'a> {
+    reader: &'a dyn crate::content_reader::ContentReader,
+    store: &'a GraphStore,
+    instance_id: &'a str,
+    repo_url: &'a str,
+    indexed_sha: &'a str,
+    name: Option<&'a str>,
+    cancel: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    epilogue_io: &'a dyn IndexEpilogueIo,
+}
+
+fn index_with_reader_and_write_gate_and_io<G, F>(
+    request: ReaderIndexRequest<'_>,
+    acquire_write_guard: F,
+) -> Result<IndexResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    let ReaderIndexRequest {
+        reader,
+        store,
+        instance_id,
+        repo_url,
+        indexed_sha,
+        name,
+        cancel,
+        epilogue_io,
+    } = request;
     let result = index_into_store_with_write_gate(
         reader,
         store,
@@ -516,11 +1498,13 @@ where
         None,
         None,
         None,
+        None,
         name,
         // Server-mode: the reader is backed by a bare clone with no local
         // working tree, so the Repo node carries no root_path.
         None,
         true,
+        epilogue_io,
         cancel,
         acquire_write_guard,
     )?;
@@ -690,9 +1674,11 @@ fn index_into_store(
         new_filemeta,
         parsed_cache,
         resolution_deps,
+        None,
         name,
         root_path,
-        false,
+        true,
+        &FileSystemIndexEpilogueIo,
         None,
         || Ok::<_, anyhow::Error>(()),
     )
@@ -709,9 +1695,11 @@ fn index_into_store_with_write_gate<G, F>(
     mut new_filemeta: Option<&mut FileMetaCache>,
     mut parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
     mut resolution_deps: Option<&mut crate::resolution_cache::ResolutionDeps>,
+    reidentified_old_uid_out: Option<&mut Option<String>>,
     name: Option<&str>,
     root_path: Option<&str>,
     bump_generation_after_write: bool,
+    epilogue_io: &dyn IndexEpilogueIo,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     acquire_write_guard: F,
 ) -> Result<IndexResult, anyhow::Error>
@@ -737,6 +1725,11 @@ where
         Some(rp) => reidentified_legacy_uid(store, instance_id, rp, &r_uid)?,
         None => None,
     };
+    // Report the re-identified legacy uid so the caller can drop its filemeta
+    // slice when merge-saving the sidecar (nw-022).
+    if let Some(out) = reidentified_old_uid_out {
+        *out = reidentify_old_uid.clone();
+    }
     let filemeta_cache = if reidentify_old_uid.is_some() {
         None
     } else {
@@ -976,6 +1969,8 @@ where
     let mut handler_files: Vec<HandlerFileData> = Vec::new();
     let mut files_count = 0usize;
     let mut files_unchanged = 0usize;
+    let mut files_deleted = 0usize;
+    let mut symbols_deleted = 0usize;
     let mut symbols_count = 0usize;
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
     let mut actually_changed_files: std::collections::HashSet<String> =
@@ -1208,532 +2203,625 @@ where
     drop(_phase_collect_span);
 
     let _write_guard = acquire_write_guard()?;
-
-    // Re-identify prune: when a local repo previously indexed under a
-    // `file://<root_path>` identity is now indexed under a different
-    // identity (its git origin remote), the old file:// node is a stale
-    // duplicate of the same working tree. Prune it STRICTLY by uid — never
-    // by disk path — so unrelated repos can never be caught by this delete.
-    // Detected before the parse phase (see above) so the filemeta cache was
-    // already bypassed for this pass.
-    if let Some(old_uid) = &reidentify_old_uid {
-        tracing::info!(
-            old_uid,
-            new_uid = %r_uid,
-            root_path = root_path.unwrap_or(""),
-            url = repo_url,
-            "repo re-identified under its origin remote; pruning old file:// node by uid"
-        );
-        delete_repo_all_data(store, old_uid).context("delete_repo_all_data (re-identify prune)")?;
-    }
-
-    // Insert the Repo node if it doesn't exist yet. The target SHA is recorded
-    // only after every required graph write succeeds, so a later write failure
-    // cannot make retry preparation think this commit is already indexed.
-    let existing_repo = store.lookup_repo(&r_uid).context("lookup_repo")?;
-    if existing_repo.is_none() {
-        let repo = Repo {
-            uid: r_uid.clone(),
-            url: repo_url.trim_end_matches('/').to_string(),
-            indexed_sha: String::new(),
-            staleness_commits_behind: 0,
-            instance_id: instance_id.to_string(),
-            name: name.map(String::from),
-            root_path: root_path.map(String::from),
-        };
-        store.insert_repo(&repo).context("insert_repo")?;
-    } else if let (Some(rp), Some(existing)) = (root_path, existing_repo.as_ref())
-        && existing.root_path.as_deref() != Some(rp)
-    {
-        // Keep the on-disk location current for pre-existing rows (old DBs
-        // that predate root_path, or a working tree that moved).
-        store
-            .update_repo_root_path(&r_uid, rp)
-            .context("update_repo_root_path")?;
-    }
-
-    // 2b. When re-indexing over an existing store (tiered detection is active
-    //     and some files changed), clean up old File nodes and their symbols
-    //     for files we are about to re-insert.
-    //
-    //     For the incremental path, per-file deletes happen here (the window
-    //     is tiny per-file). For the force re-index path, the bulk delete is
-    //     deferred to step 3 and runs inside the same transaction as the
-    //     insert — see `bulk_reindex_write` — to prevent concurrent readers
-    //     from seeing zero symbols while the CPU-heavy service-grouping work
-    //     runs between delete and insert.
-    let force_reindex = existing_repo.is_some() && files_unchanged == 0;
-    if existing_repo.is_some() && !force_reindex {
-        // Incremental: only delete the specific files we're about to re-insert.
-        for file in &all_files {
-            // Remove old symbols belonging to this file.
-            let _ = store.delete_symbols_in_file(&r_uid, &file.path);
-            // Remove old File node.
-            let _ = store.delete_file_node(&file.uid);
+    let publication = establish_index_publication_marker_with_io(
+        store,
+        store.db_path(),
+        "index graph write",
+        epilogue_io,
+    )?;
+    let graph_mutation_attempted = std::cell::Cell::new(false);
+    let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
+        // Re-identify prune: when a local repo previously indexed under a
+        // `file://<root_path>` identity is now indexed under a different
+        // identity (its git origin remote), the old file:// node is a stale
+        // duplicate of the same working tree. Prune it STRICTLY by uid — never
+        // by disk path — so unrelated repos can never be caught by this delete.
+        // Detected before the parse phase (see above) so the filemeta cache was
+        // already bypassed for this pass.
+        if let Some(old_uid) = &reidentify_old_uid {
+            graph_mutation_attempted.set(true);
+            tracing::info!(
+                old_uid,
+                new_uid = %r_uid,
+                root_path = root_path.unwrap_or(""),
+                url = repo_url,
+                "repo re-identified under its origin remote; pruning old file:// node by uid"
+            );
+            let (deleted_files, deleted_symbols) = delete_repo_all_data(store, old_uid)
+                .context("delete_repo_all_data (re-identify prune)")?;
+            files_deleted += deleted_files;
+            symbols_deleted += deleted_symbols;
         }
-        // Prune File/Symbol nodes for files that vanished since the last
-        // index (e.g. a force-push that removed a file). The incremental
-        // branch above only deletes files being re-inserted, so without
-        // this pass removed files would linger. `present_files` covers
-        // Unchanged/CachedParsed/Parsed files — anything in the store but
-        // not present anymore is stale and gets dropped.
-        if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
-            for (f_uid, path) in &stored_files {
-                if !present_files.contains(path) {
-                    let _ = store.delete_symbols_in_file(&r_uid, path);
-                    let _ = store.delete_file_node(f_uid);
-                }
+
+        // Insert the Repo node if it doesn't exist yet. The target SHA is recorded
+        // only after every required graph write succeeds, so a later write failure
+        // cannot make retry preparation think this commit is already indexed.
+        let existing_repo = store.lookup_repo(&r_uid).context("lookup_repo")?;
+        // Every successful path below performs at least one graph write. Mark the
+        // attempt before the first one so even a partially committed store error
+        // is conservatively finalized.
+        graph_mutation_attempted.set(true);
+        if existing_repo.is_none() {
+            let repo = Repo {
+                uid: r_uid.clone(),
+                url: repo_url.trim_end_matches('/').to_string(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: instance_id.to_string(),
+                name: name.map(String::from),
+                root_path: root_path.map(String::from),
+            };
+            store.insert_repo(&repo).context("insert_repo")?;
+        } else if let (Some(rp), Some(existing)) = (root_path, existing_repo.as_ref())
+            && existing.root_path.as_deref() != Some(rp)
+        {
+            // Keep the on-disk location current for pre-existing rows (old DBs
+            // that predate root_path, or a working tree that moved).
+            store
+                .update_repo_root_path(&r_uid, rp)
+                .context("update_repo_root_path")?;
+        }
+
+        // 2b. When re-indexing over an existing store (tiered detection is active
+        //     and some files changed), clean up old File nodes and their symbols
+        //     for files we are about to re-insert.
+        //
+        //     For the incremental path, per-file deletes happen here (the window
+        //     is tiny per-file). For the force re-index path, the bulk delete is
+        //     deferred to step 3 and runs inside the same transaction as the
+        //     insert — see `bulk_reindex_write` — to prevent concurrent readers
+        //     from seeing zero symbols while the CPU-heavy service-grouping work
+        //     runs between delete and insert.
+        let force_reindex = existing_repo.is_some() && files_unchanged == 0;
+        if !force_reindex && existing_repo.is_some() {
+            // Incremental: only delete the specific files we're about to re-insert.
+            for file in &all_files {
+                // Remove old symbols belonging to this file.
+                let _ = store.delete_symbols_in_file(&r_uid, &file.path);
+                // Remove old File node.
+                let _ = store.delete_file_node(&file.uid);
             }
-        }
-        // Clear repo-scoped derived nodes (Service, Contract) before
-        // re-insert. `bulk_index_write` plain-CREATEs Service nodes whose UID
-        // is derived deterministically from repo_uid + directory, so an
-        // incremental re-index would otherwise collide on the primary key.
-        let _ = store.clear_repo_derived_nodes(&r_uid);
-    }
-
-    // 3-7. Build service groupings and perform all bulk inserts in a single transaction.
-    let _phase_write_span = tracing::info_span!("index_phase_write").entered();
-    let mut dir_symbols: HashMap<String, Vec<String>> = HashMap::new();
-    for sym in &all_symbols {
-        let dir = sym
-            .file_path
-            .rsplit_once('/')
-            .map(|(d, _)| d.to_string())
-            .unwrap_or_default();
-        if !dir.is_empty() {
-            dir_symbols.entry(dir).or_default().push(sym.uid.clone());
-        }
-    }
-
-    let mut all_services: Vec<Service> = Vec::new();
-    let mut service_symbol_pairs: Vec<(String, String)> = Vec::new();
-    for (dir, sym_uids) in &dir_symbols {
-        let svc_uid = service_uid(&r_uid, dir);
-        all_services.push(Service {
-            uid: svc_uid.clone(),
-            name: dir.clone(),
-            repo_uid: r_uid.clone(),
-            summary: None,
-            summary_hash: None,
-            embedding: None,
-        });
-        for sym_uid in sym_uids {
-            service_symbol_pairs.push((svc_uid.clone(), sym_uid.clone()));
-        }
-    }
-
-    let repo_file_refs: Vec<(&str, &str)> = repo_file_edge_pairs
-        .iter()
-        .map(|(r, f)| (r.as_str(), f.as_str()))
-        .collect();
-    let file_sym_refs: Vec<(&str, &str)> = file_symbol_edge_pairs
-        .iter()
-        .map(|(f, s)| (f.as_str(), s.as_str()))
-        .collect();
-    let svc_sym_refs: Vec<(&str, &str)> = service_symbol_pairs
-        .iter()
-        .map(|(s, sym)| (s.as_str(), sym.as_str()))
-        .collect();
-
-    if force_reindex {
-        // Atomic delete+insert: old data is only removed within the same
-        // transaction that inserts the replacement, so concurrent readers
-        // never see an empty repo.
-        store
-            .bulk_reindex_write(
-                &r_uid,
-                &all_files,
-                &all_symbols,
-                &repo_file_refs,
-                &file_sym_refs,
-                &all_services,
-                &svc_sym_refs,
-            )
-            .context("bulk_reindex_write")?;
-    } else {
-        store
-            .bulk_index_write(
-                &all_files,
-                &all_symbols,
-                &repo_file_refs,
-                &file_sym_refs,
-                &all_services,
-                &svc_sym_refs,
-            )
-            .context("bulk_index_write")?;
-    }
-    tracing::info!(
-        files_written = all_files.len(),
-        symbols_written = all_symbols.len(),
-        services_written = all_services.len(),
-        "phase write complete"
-    );
-    drop(_phase_write_span);
-
-    // ── Phase 3: Resolve cross-file references ────────────────────────────
-    let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
-    let resolve_pb = ProgressBar::new_spinner();
-    resolve_pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    resolve_pb.set_message("Resolving cross-file references...");
-    resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    // 8. Run full cross-file resolution via the resolver.
-    //    Use the most common language detected across files; fall back to JavaScript.
-    let language = {
-        let mut counts: HashMap<Language, usize> = HashMap::new();
-        for l in &detected_languages {
-            *counts.entry(*l).or_insert(0) += 1;
-        }
-        counts
-            .into_iter()
-            .max_by_key(|(_, c)| *c)
-            .map(|(l, _)| l)
-            .unwrap_or(Language::JavaScript)
-    };
-
-    // Load workspace context (monorepo packages + tsconfig aliases) for JS/TS resolution.
-    // Uses the ContentReader so this works with both filesystem and bare-repo readers.
-    let workspace_ctx = if matches!(
-        language,
-        Language::JavaScript
-            | Language::TypeScript
-            | Language::Vue
-            | Language::Svelte
-            | Language::Astro
-    ) {
-        discover_workspace_context_with(|rel_path| {
-            reader
-                .read_file(rel_path)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        })
-    } else {
-        Default::default()
-    };
-
-    // Build type environments per file for type-aware resolution.
-    // Each file's type env is independent, so we build them in parallel.
-    let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
-        parsed_files_for_resolver
-            .par_iter()
-            .filter_map(|(file_path, symbols, _references, source_opt)| {
-                let source_owned;
-                let source: &str = if let Some(s) = source_opt.as_deref() {
-                    s
-                } else {
-                    source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
-                    &source_owned
-                };
-
-                let empty_bindings = Vec::new();
-                let file_ast_bindings = ast_bindings_by_file
-                    .get(file_path.as_str())
-                    .unwrap_or(&empty_bindings);
-
-                let env = nestweaver_resolver::types::TypeEnvironment::build(
-                    source,
-                    language,
-                    symbols,
-                    file_ast_bindings,
-                );
-
-                if env.binding_count() > 0 {
-                    Some((file_path.clone(), env))
-                } else {
-                    None
-                }
-            })
-            .collect();
-    tracing::info!(
-        files_with_bindings = type_envs.len(),
-        total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
-        "type environments built"
-    );
-
-    // Cross-file return type propagation: seed bindings from known function return types
-    {
-        let all_symbols_with_returns: std::collections::HashMap<
-            &str,
-            &nestweaver_parser::RawSymbol,
-        > = parsed_files_for_resolver
-            .iter()
-            .flat_map(|(_, syms, _, _)| syms.iter())
-            .filter(|s| {
-                s.type_info
-                    .as_ref()
-                    .and_then(|ti| ti.return_type.as_ref())
-                    .is_some()
-            })
-            .map(|s| (s.name.as_str(), s))
-            .collect();
-
-        if !all_symbols_with_returns.is_empty() {
-            let mut seeded = 0usize;
-            for (file_path, _symbols, _refs, source_opt) in &parsed_files_for_resolver {
-                if let Some(env) = type_envs.get_mut(file_path) {
-                    let source_str = match source_opt {
-                        Some(s) => s.clone(),
-                        None => match reader.read_file(Path::new(file_path.as_str())) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        },
-                    };
-                    let before = env.binding_count();
-                    env.seed_return_types(&source_str, &all_symbols_with_returns);
-                    seeded += env.binding_count() - before;
-                }
-            }
-            if seeded > 0 {
-                tracing::info!(new_bindings = seeded, "cross-file return type propagation");
-            }
-        }
-    }
-
-    // Build a 3-tuple view for the resolver (it does not need source strings).
-    let resolver_view: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = parsed_files_for_resolver
-        .iter()
-        .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
-        .collect();
-
-    // Compute the incremental resolution filter: only re-resolve files that
-    // changed plus files that depend on changed files.
-    // When no files changed and we have prior resolution data, skip resolution
-    // entirely — edges from the previous run are still valid in the DB.
-    let skip_resolution = actually_changed_files.is_empty()
-        && resolution_deps.as_ref().is_some_and(|rd| !rd.is_empty());
-
-    let resolve_filter = if !skip_resolution
-        && !actually_changed_files.is_empty()
-        && files_unchanged > 0
-        && resolution_deps.as_ref().is_some_and(|rd| !rd.is_empty())
-    {
-        let affected = resolution_deps
-            .as_ref()
-            .unwrap()
-            .affected_files(&actually_changed_files);
-        tracing::info!(
-            changed = actually_changed_files.len(),
-            affected = affected.len(),
-            total = resolver_view.len(),
-            "incremental resolution"
-        );
-        Some(affected)
-    } else {
-        None
-    };
-
-    if skip_resolution {
-        tracing::info!("no files changed, skipping resolution");
-    }
-
-    let resolved_edges = if skip_resolution {
-        Vec::new()
-    } else {
-        resolve_references_with_context(
-            &resolver_view,
-            language,
-            &r_uid,
-            &workspace_ctx,
-            Some(&type_envs),
-            resolve_filter.as_ref(),
-        )
-    };
-
-    // Filter out unresolved edges whose target doesn't exist in the DB.
-    let insertable_edges: Vec<_> = resolved_edges
-        .into_iter()
-        .filter(|e| !e.target_uid.starts_with("unresolved:"))
-        .collect();
-
-    // When doing incremental resolution, delete old resolved edges for
-    // affected files before inserting the new ones.
-    if let Some(ref filter) = resolve_filter {
-        for file_path in filter {
-            let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
-        }
-    }
-
-    let mut edges_count = insertable_edges.len();
-    store
-        .batch_insert_edges(&insertable_edges)
-        .context("batch_insert_edges (resolved)")?;
-
-    let inferred_cross_repo_edges =
-        infer_cross_repo_call_edges(store, &r_uid, &parsed_files_for_resolver)?;
-    if !inferred_cross_repo_edges.is_empty() {
-        edges_count += inferred_cross_repo_edges.len();
-        store
-            .batch_insert_edges(&inferred_cross_repo_edges)
-            .context("batch_insert_edges (inferred cross-repo calls)")?;
-        tracing::debug!(
-            count = inferred_cross_repo_edges.len(),
-            "emitted inferred CROSS_REPO_LINK edges"
-        );
-    }
-
-    // Record file-level dependency information for future incremental runs.
-    if let Some(ref mut rd) = resolution_deps {
-        // Build symbol UID → file path map from ALL files (including cached)
-        // so incremental runs don't lose edges from CachedParsed files.
-        let symbol_file_index: HashMap<String, String> = parsed_files_for_resolver
-            .iter()
-            .flat_map(|(path, syms, _, _)| {
-                let r_uid_ref = &r_uid;
-                syms.iter().map(move |s| {
-                    let uid = symbol_uid(r_uid_ref, path, &s.name, s.start_line);
-                    (uid, path.clone())
-                })
-            })
-            .collect();
-        let mut file_deps: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-        for edge in &insertable_edges {
-            if let (Some(src_file), Some(tgt_file)) = (
-                symbol_file_index.get(&edge.source_uid),
-                symbol_file_index.get(&edge.target_uid),
-            ) && src_file != tgt_file
-            {
-                file_deps
-                    .entry(src_file.clone())
-                    .or_default()
-                    .insert(tgt_file.clone());
-            }
-        }
-        for (file, deps) in file_deps {
-            rd.set_deps(file, deps);
-        }
-    }
-
-    // ── Structural MEMBER_OF edges ────────────────────────────────────────
-    // Build a lookup: (file_path, type_name) → type_symbol_uid for all
-    // container symbols (Class / Interface / Enum / Trait).  Then for every
-    // raw symbol that carries a parent_name, emit a MEMBER_OF edge from the
-    // member to its parent container.
-    {
-        use nestweaver_schema::{EdgeType, ResolvedEdge};
-
-        let container_kinds = [
-            nestweaver_schema::SymbolKind::Class,
-            nestweaver_schema::SymbolKind::Interface,
-            nestweaver_schema::SymbolKind::Enum,
-            nestweaver_schema::SymbolKind::Trait,
-        ];
-
-        // (file_path, type_name) → uid — built from ALL files (including cached)
-        // so incremental runs don't lose MEMBER_OF edges for CachedParsed files.
-        let mut container_map: HashMap<(String, String), String> = HashMap::new();
-        for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
-            for raw_sym in raw_symbols {
-                if container_kinds.contains(&raw_sym.kind) {
-                    let uid = symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
-                    container_map.insert((rel_path.clone(), raw_sym.name.clone()), uid);
-                }
-            }
-        }
-
-        let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
-        for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
-            for raw_sym in raw_symbols {
-                if let Some(parent_name) = &raw_sym.parent_name {
-                    let key = (rel_path.clone(), parent_name.clone());
-                    if let Some(parent_uid) = container_map.get(&key) {
-                        let child_uid =
-                            symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
-                        member_of_edges.push(ResolvedEdge {
-                            source_uid: child_uid,
-                            target_uid: parent_uid.clone(),
-                            edge_type: EdgeType::MemberOf,
-                            confidence: 1.0,
-                            link_type: None,
-                            evidence: Vec::new(),
-                        });
+            // Prune File/Symbol nodes for files that vanished since the last
+            // index (e.g. a force-push that removed a file). The incremental
+            // branch above only deletes files being re-inserted, so without
+            // this pass removed files would linger. `present_files` covers
+            // Unchanged/CachedParsed/Parsed files — anything in the store but
+            // not present anymore is stale and gets dropped.
+            if let Ok(stored_files) = store.list_files_by_repo(&r_uid) {
+                for (f_uid, path) in &stored_files {
+                    if !present_files.contains(path) {
+                        let _ = store.delete_symbols_in_file(&r_uid, path);
+                        let _ = store.delete_file_node(f_uid);
+                        // nw-055 (P1b): a vanished file is a genuine deletion. Count
+                        // it so the index-time PageRank guard fires on a delete-only
+                        // re-index (files_count == 0) instead of leaving surviving
+                        // nodes' ranks stale.
+                        files_deleted += 1;
                     }
                 }
             }
+            // Clear repo-scoped derived nodes (Service, Contract) before
+            // re-insert. `bulk_index_write` plain-CREATEs Service nodes whose UID
+            // is derived deterministically from repo_uid + directory, so an
+            // incremental re-index would otherwise collide on the primary key.
+            let _ = store.clear_repo_derived_nodes(&r_uid);
         }
 
-        if !member_of_edges.is_empty() {
-            edges_count += member_of_edges.len();
+        // 3-7. Build service groupings and perform all bulk inserts in a single transaction.
+        let _phase_write_span = tracing::info_span!("index_phase_write").entered();
+        let mut dir_symbols: HashMap<String, Vec<String>> = HashMap::new();
+        for sym in &all_symbols {
+            let dir = sym
+                .file_path
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_string())
+                .unwrap_or_default();
+            if !dir.is_empty() {
+                dir_symbols.entry(dir).or_default().push(sym.uid.clone());
+            }
+        }
+
+        let mut all_services: Vec<Service> = Vec::new();
+        let mut service_symbol_pairs: Vec<(String, String)> = Vec::new();
+        for (dir, sym_uids) in &dir_symbols {
+            let svc_uid = service_uid(&r_uid, dir);
+            all_services.push(Service {
+                uid: svc_uid.clone(),
+                name: dir.clone(),
+                repo_uid: r_uid.clone(),
+                summary: None,
+                summary_hash: None,
+                embedding: None,
+            });
+            for sym_uid in sym_uids {
+                service_symbol_pairs.push((svc_uid.clone(), sym_uid.clone()));
+            }
+        }
+
+        let repo_file_refs: Vec<(&str, &str)> = repo_file_edge_pairs
+            .iter()
+            .map(|(r, f)| (r.as_str(), f.as_str()))
+            .collect();
+        let file_sym_refs: Vec<(&str, &str)> = file_symbol_edge_pairs
+            .iter()
+            .map(|(f, s)| (f.as_str(), s.as_str()))
+            .collect();
+        let svc_sym_refs: Vec<(&str, &str)> = service_symbol_pairs
+            .iter()
+            .map(|(s, sym)| (s.as_str(), sym.as_str()))
+            .collect();
+
+        if force_reindex {
+            // Atomic delete+insert: old data is only removed within the same
+            // transaction that inserts the replacement, so concurrent readers
+            // never see an empty repo.
+            let (deleted_files, deleted_symbols) = store
+                .bulk_reindex_write(
+                    &r_uid,
+                    &all_files,
+                    &all_symbols,
+                    &repo_file_refs,
+                    &file_sym_refs,
+                    &all_services,
+                    &svc_sym_refs,
+                )
+                .context("bulk_reindex_write")?;
+            files_deleted += deleted_files;
+            symbols_deleted += deleted_symbols;
+        } else {
             store
-                .batch_insert_edges(&member_of_edges)
-                .context("batch_insert_edges (member_of)")?;
-            tracing::debug!(count = member_of_edges.len(), "emitted MEMBER_OF edges");
+                .bulk_index_write(
+                    &all_files,
+                    &all_symbols,
+                    &repo_file_refs,
+                    &file_sym_refs,
+                    &all_services,
+                    &svc_sym_refs,
+                )
+                .context("bulk_index_write")?;
+        }
+        tracing::info!(
+            files_written = all_files.len(),
+            symbols_written = all_symbols.len(),
+            services_written = all_services.len(),
+            "phase write complete"
+        );
+        drop(_phase_write_span);
+
+        // ── Phase 3: Resolve cross-file references ────────────────────────────
+        let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
+        let resolve_pb = ProgressBar::new_spinner();
+        resolve_pb.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        resolve_pb.set_message("Resolving cross-file references...");
+        resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        // 8. Run full cross-file resolution via the resolver.
+        //    Use the most common language detected across files; fall back to JavaScript.
+        let language = {
+            let mut counts: HashMap<Language, usize> = HashMap::new();
+            for l in &detected_languages {
+                *counts.entry(*l).or_insert(0) += 1;
+            }
+            counts
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(l, _)| l)
+                .unwrap_or(Language::JavaScript)
+        };
+
+        // Load workspace context (monorepo packages + tsconfig aliases) for JS/TS resolution.
+        // Uses the ContentReader so this works with both filesystem and bare-repo readers.
+        let workspace_ctx = if matches!(
+            language,
+            Language::JavaScript
+                | Language::TypeScript
+                | Language::Vue
+                | Language::Svelte
+                | Language::Astro
+        ) {
+            discover_workspace_context_with(|rel_path| {
+                reader
+                    .read_file(rel_path)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+        } else {
+            Default::default()
+        };
+
+        // Build type environments per file for type-aware resolution.
+        // Each file's type env is independent, so we build them in parallel.
+        let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
+            parsed_files_for_resolver
+                .par_iter()
+                .filter_map(|(file_path, symbols, _references, source_opt)| {
+                    let source_owned;
+                    let source: &str = if let Some(s) = source_opt.as_deref() {
+                        s
+                    } else {
+                        source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
+                        &source_owned
+                    };
+
+                    let empty_bindings = Vec::new();
+                    let file_ast_bindings = ast_bindings_by_file
+                        .get(file_path.as_str())
+                        .unwrap_or(&empty_bindings);
+
+                    let env = nestweaver_resolver::types::TypeEnvironment::build(
+                        source,
+                        language,
+                        symbols,
+                        file_ast_bindings,
+                    );
+
+                    if env.binding_count() > 0 {
+                        Some((file_path.clone(), env))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        tracing::info!(
+            files_with_bindings = type_envs.len(),
+            total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
+            "type environments built"
+        );
+
+        // Cross-file return type propagation: seed bindings from known function return types
+        {
+            let all_symbols_with_returns: std::collections::HashMap<
+                &str,
+                &nestweaver_parser::RawSymbol,
+            > = parsed_files_for_resolver
+                .iter()
+                .flat_map(|(_, syms, _, _)| syms.iter())
+                .filter(|s| {
+                    s.type_info
+                        .as_ref()
+                        .and_then(|ti| ti.return_type.as_ref())
+                        .is_some()
+                })
+                .map(|s| (s.name.as_str(), s))
+                .collect();
+
+            if !all_symbols_with_returns.is_empty() {
+                let mut seeded = 0usize;
+                for (file_path, _symbols, _refs, source_opt) in &parsed_files_for_resolver {
+                    if let Some(env) = type_envs.get_mut(file_path) {
+                        let source_str = match source_opt {
+                            Some(s) => s.clone(),
+                            None => match reader.read_file(Path::new(file_path.as_str())) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            },
+                        };
+                        let before = env.binding_count();
+                        env.seed_return_types(&source_str, &all_symbols_with_returns);
+                        seeded += env.binding_count() - before;
+                    }
+                }
+                if seeded > 0 {
+                    tracing::info!(new_bindings = seeded, "cross-file return type propagation");
+                }
+            }
+        }
+
+        // Build a 3-tuple view for the resolver (it does not need source strings).
+        let resolver_view: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> =
+            parsed_files_for_resolver
+                .iter()
+                .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
+                .collect();
+
+        // Compute the incremental resolution filter: only re-resolve files that
+        // changed plus files that depend on changed files.
+        // When no files changed and we have prior resolution data, skip resolution
+        // entirely — edges from the previous run are still valid in the DB.
+        let skip_resolution = actually_changed_files.is_empty()
+            && resolution_deps
+                .as_ref()
+                .is_some_and(|rd| !rd.is_empty_for_repo(&r_uid));
+
+        let resolve_filter = if !skip_resolution
+            && !actually_changed_files.is_empty()
+            && files_unchanged > 0
+            && resolution_deps
+                .as_ref()
+                .is_some_and(|rd| !rd.is_empty_for_repo(&r_uid))
+        {
+            let affected = resolution_deps
+                .as_ref()
+                .unwrap()
+                .affected_files_for_repo(&r_uid, &actually_changed_files);
+            tracing::info!(
+                changed = actually_changed_files.len(),
+                affected = affected.len(),
+                total = resolver_view.len(),
+                "incremental resolution"
+            );
+            Some(affected)
+        } else {
+            None
+        };
+
+        if skip_resolution {
+            tracing::info!("no files changed, skipping resolution");
+        }
+
+        let resolved_edges = if skip_resolution {
+            Vec::new()
+        } else {
+            resolve_references_with_context(
+                &resolver_view,
+                language,
+                &r_uid,
+                &workspace_ctx,
+                Some(&type_envs),
+                resolve_filter.as_ref(),
+            )
+        };
+
+        // Filter out unresolved edges whose target doesn't exist in the DB.
+        let insertable_edges: Vec<_> = resolved_edges
+            .into_iter()
+            .filter(|e| !e.target_uid.starts_with("unresolved:"))
+            .collect();
+
+        // When doing incremental resolution, delete old resolved edges for
+        // affected files before inserting the new ones.
+        if let Some(ref filter) = resolve_filter {
+            for file_path in filter {
+                let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
+            }
+        }
+
+        let mut edges_count = insertable_edges.len();
+        store
+            .batch_insert_edges(&insertable_edges)
+            .context("batch_insert_edges (resolved)")?;
+
+        let inferred_cross_repo_edges =
+            infer_cross_repo_call_edges(store, &r_uid, &parsed_files_for_resolver)?;
+        if !inferred_cross_repo_edges.is_empty() {
+            edges_count += inferred_cross_repo_edges.len();
+            store
+                .batch_insert_edges(&inferred_cross_repo_edges)
+                .context("batch_insert_edges (inferred cross-repo calls)")?;
+            tracing::debug!(
+                count = inferred_cross_repo_edges.len(),
+                "emitted inferred CROSS_REPO_LINK edges"
+            );
+        }
+
+        // Record file-level dependency information for future incremental runs.
+        if let Some(ref mut rd) = resolution_deps {
+            // Build symbol UID → file path map from ALL files (including cached)
+            // so incremental runs don't lose edges from CachedParsed files.
+            let symbol_file_index: HashMap<String, String> = parsed_files_for_resolver
+                .iter()
+                .flat_map(|(path, syms, _, _)| {
+                    let r_uid_ref = &r_uid;
+                    syms.iter().map(move |s| {
+                        let uid = symbol_uid(r_uid_ref, path, &s.name, s.start_line);
+                        (uid, path.clone())
+                    })
+                })
+                .collect();
+            let mut file_deps: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+            for edge in &insertable_edges {
+                if let (Some(src_file), Some(tgt_file)) = (
+                    symbol_file_index.get(&edge.source_uid),
+                    symbol_file_index.get(&edge.target_uid),
+                ) && src_file != tgt_file
+                {
+                    file_deps
+                        .entry(src_file.clone())
+                        .or_default()
+                        .insert(tgt_file.clone());
+                }
+            }
+            for (file, deps) in file_deps {
+                rd.set_deps_for_repo(&r_uid, file, deps);
+            }
+        }
+
+        // ── Structural MEMBER_OF edges ────────────────────────────────────────
+        // Build a lookup: (file_path, type_name) → type_symbol_uid for all
+        // container symbols (Class / Interface / Enum / Trait).  Then for every
+        // raw symbol that carries a parent_name, emit a MEMBER_OF edge from the
+        // member to its parent container.
+        {
+            use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+            let container_kinds = [
+                nestweaver_schema::SymbolKind::Class,
+                nestweaver_schema::SymbolKind::Interface,
+                nestweaver_schema::SymbolKind::Enum,
+                nestweaver_schema::SymbolKind::Trait,
+            ];
+
+            // (file_path, type_name) → uid — built from ALL files (including cached)
+            // so incremental runs don't lose MEMBER_OF edges for CachedParsed files.
+            let mut container_map: HashMap<(String, String), String> = HashMap::new();
+            for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
+                for raw_sym in raw_symbols {
+                    if container_kinds.contains(&raw_sym.kind) {
+                        let uid = symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
+                        container_map.insert((rel_path.clone(), raw_sym.name.clone()), uid);
+                    }
+                }
+            }
+
+            let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
+            for (rel_path, raw_symbols, _, _) in &parsed_files_for_resolver {
+                for raw_sym in raw_symbols {
+                    if let Some(parent_name) = &raw_sym.parent_name {
+                        let key = (rel_path.clone(), parent_name.clone());
+                        if let Some(parent_uid) = container_map.get(&key) {
+                            let child_uid =
+                                symbol_uid(&r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
+                            member_of_edges.push(ResolvedEdge {
+                                source_uid: child_uid,
+                                target_uid: parent_uid.clone(),
+                                edge_type: EdgeType::MemberOf,
+                                confidence: 1.0,
+                                link_type: None,
+                                evidence: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if !member_of_edges.is_empty() {
+                edges_count += member_of_edges.len();
+                store
+                    .batch_insert_edges(&member_of_edges)
+                    .context("batch_insert_edges (member_of)")?;
+                tracing::debug!(count = member_of_edges.len(), "emitted MEMBER_OF edges");
+            }
+        }
+
+        resolve_pb.finish_and_clear();
+        tracing::info!(edges_resolved = edges_count, "phase resolve complete");
+        drop(_phase_resolve_span);
+
+        // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
+        let _phase_contracts_span = tracing::info_span!("index_phase_contracts").entered();
+        // Best-effort: a malformed spec or unexpected store error here must not
+        // fail the whole index. Contracts are hypotheses layered on top of the
+        // code graph.
+        if let Err(e) = derive_contracts(store, reader, &r_uid, &spec_files, &handler_files) {
+            tracing::warn!("contract derivation failed (non-fatal): {e}");
+        }
+        tracing::info!(
+            spec_files = spec_files.len(),
+            handler_files = handler_files.len(),
+            "phase contracts complete"
+        );
+        drop(_phase_contracts_span);
+
+        store
+            .update_repo_sha(&r_uid, indexed_sha)
+            .context("update_repo_sha")?;
+
+        // ── Summary ───────────────────────────────────────────────────────────
+        let elapsed = started.elapsed();
+        if files_unchanged > 0 {
+            tracing::info!(
+                files = files_count,
+                files_unchanged,
+                symbols = symbols_count,
+                edges = edges_count,
+                elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
+                "Done: {} files ({} unchanged, skipped), {} symbols, {} edges ({:.1}s)",
+                files_count,
+                files_unchanged,
+                symbols_count,
+                edges_count,
+                elapsed.as_secs_f64(),
+            );
+        } else {
+            tracing::info!(
+                files = files_count,
+                symbols = symbols_count,
+                edges = edges_count,
+                elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
+                "Done: {} files, {} symbols, {} edges ({:.1}s)",
+                files_count,
+                symbols_count,
+                edges_count,
+                elapsed.as_secs_f64(),
+            );
+        }
+
+        tracing::info!(
+            total_files = files_count,
+            files_unchanged = files_unchanged,
+            symbols = symbols_count,
+            "indexing complete"
+        );
+
+        let result = IndexResult {
+            symbols_count,
+            edges_count,
+            files_count,
+            files_unchanged,
+            files_deleted,
+            symbols_deleted,
+            skipped_files,
+        };
+
+        Ok(result)
+    })();
+
+    if !graph_mutation_attempted.get() {
+        if publication.is_recovered() {
+            return match graph_result {
+                // A recovered owner cannot prove that the preceding owner made
+                // no graph changes. A successful no-op therefore heals that
+                // unknown committed graph as one unified publication.
+                Ok(result) => finalize_committed_index_for_scope_with_io(
+                    publication,
+                    store.db_path(),
+                    "recovered index graph write",
+                    epilogue_io,
+                    Some(&nestweaver_store::GraphScope::unified()),
+                )
+                .map(|()| result)
+                .map_err(anyhow::Error::from),
+                // On an early error there is no safe finalization point. Drop
+                // only the live lease; keep the inherited marker/reservation
+                // so the next open continues to fail closed.
+                Err(primary) => Err(primary),
+            };
+        }
+        if let Some(db_path) = store.db_path() {
+            let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+            let cancellation = store.with_index_publication_rank_barrier(|| {
+                publication.cancel_generation()?;
+                epilogue_io.clear_marker(&marker_path)?;
+                Ok::<(), anyhow::Error>(())
+            });
+            if let Err(marker_error) = cancellation {
+                return match graph_result {
+                    Ok(_) => Err(marker_error),
+                    Err(primary) => {
+                        let primary_message = format!("{primary:#}");
+                        Err(primary.context(format!(
+                            "{primary_message}; additionally, failed to retire uncommitted index marker: {marker_error:#}"
+                        )))
+                    }
+                };
+            }
+        }
+        publication.release()?;
+        return graph_result;
+    }
+
+    // The write guard stays alive through this mandatory epilogue. Publish
+    // invalidation/generation/PageRank on success and every later graph error.
+    let finalization = finalize_committed_index_with_io(
+        publication,
+        store.db_path(),
+        "index graph write",
+        epilogue_io,
+        bump_generation_after_write,
+    );
+    match (graph_result, finalization) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(finalization)) => Err(finalization.into()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(finalization)) => {
+            let primary_message = format!("{primary:#}");
+            Err(primary.context(format!(
+                "{primary_message}; additionally, mandatory index finalization failed: {finalization}"
+            )))
         }
     }
-
-    resolve_pb.finish_and_clear();
-    tracing::info!(edges_resolved = edges_count, "phase resolve complete");
-    drop(_phase_resolve_span);
-
-    // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
-    let _phase_contracts_span = tracing::info_span!("index_phase_contracts").entered();
-    // Best-effort: a malformed spec or unexpected store error here must not
-    // fail the whole index. Contracts are hypotheses layered on top of the
-    // code graph.
-    if let Err(e) = derive_contracts(store, reader, &r_uid, &spec_files, &handler_files) {
-        tracing::warn!("contract derivation failed (non-fatal): {e}");
-    }
-    tracing::info!(
-        spec_files = spec_files.len(),
-        handler_files = handler_files.len(),
-        "phase contracts complete"
-    );
-    drop(_phase_contracts_span);
-
-    store
-        .update_repo_sha(&r_uid, indexed_sha)
-        .context("update_repo_sha")?;
-
-    // ── Summary ───────────────────────────────────────────────────────────
-    let elapsed = started.elapsed();
-    if files_unchanged > 0 {
-        tracing::info!(
-            files = files_count,
-            files_unchanged,
-            symbols = symbols_count,
-            edges = edges_count,
-            elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
-            "Done: {} files ({} unchanged, skipped), {} symbols, {} edges ({:.1}s)",
-            files_count,
-            files_unchanged,
-            symbols_count,
-            edges_count,
-            elapsed.as_secs_f64(),
-        );
-    } else {
-        tracing::info!(
-            files = files_count,
-            symbols = symbols_count,
-            edges = edges_count,
-            elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
-            "Done: {} files, {} symbols, {} edges ({:.1}s)",
-            files_count,
-            symbols_count,
-            edges_count,
-            elapsed.as_secs_f64(),
-        );
-    }
-
-    tracing::info!(
-        total_files = files_count,
-        files_unchanged = files_unchanged,
-        symbols = symbols_count,
-        "indexing complete"
-    );
-
-    if bump_generation_after_write {
-        store.bump_and_persist_generation();
-    }
-
-    Ok(IndexResult {
-        symbols_count,
-        edges_count,
-        files_count,
-        files_unchanged,
-        skipped_files,
-    })
 }
 
 /// Returns true if the given path has a supported language extension.
@@ -1906,6 +2994,24 @@ pub fn incremental_index_with_name(
     repo_url: &str,
     name: Option<&str>,
 ) -> Result<IncrementalResult, anyhow::Error> {
+    incremental_index_with_name_and_io(
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        name,
+        &FileSystemIndexEpilogueIo,
+    )
+}
+
+fn incremental_index_with_name_and_io(
+    repo_path: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    repo_url: &str,
+    name: Option<&str>,
+    epilogue_io: &dyn IndexEpilogueIo,
+) -> Result<IncrementalResult, anyhow::Error> {
     let store = nestweaver_store::GraphStore::open_or_create(db_path)
         .with_context(|| format!("open/create store at {}", db_path.display()))?;
 
@@ -1921,13 +3027,17 @@ pub fn incremental_index_with_name(
         Err(_) => {
             tracing::info!("not a git repo; falling back to full index");
             return full_index_fallback(
-                repo_path,
-                db_path,
                 &store,
-                instance_id,
-                repo_url,
-                "local",
-                name,
+                FullIndexFallback {
+                    repo_path,
+                    db_path,
+                    instance_id,
+                    repo_url,
+                    new_sha: "local",
+                    name,
+                    force: false,
+                    epilogue_io,
+                },
             );
         }
     };
@@ -1937,13 +3047,17 @@ pub fn incremental_index_with_name(
         None => {
             tracing::info!("no existing repo found; falling back to full index");
             return full_index_fallback(
-                repo_path,
-                db_path,
                 &store,
-                instance_id,
-                repo_url,
-                &new_sha,
-                name,
+                FullIndexFallback {
+                    repo_path,
+                    db_path,
+                    instance_id,
+                    repo_url,
+                    new_sha: &new_sha,
+                    name,
+                    force: false,
+                    epilogue_io,
+                },
             );
         }
         Some(r) => r.indexed_sha,
@@ -1956,17 +3070,20 @@ pub fn incremental_index_with_name(
             new_sha,
             "old SHA is not an ancestor of HEAD; falling back to full re-index"
         );
-        // Delete all existing repo data before full re-index.
-        delete_repo_all_data(&store, &r_uid)
-            .with_context(|| "delete_repo_all_data before full re-index")?;
         return full_index_fallback(
-            repo_path,
-            db_path,
             &store,
-            instance_id,
-            repo_url,
-            &new_sha,
-            name,
+            FullIndexFallback {
+                repo_path,
+                db_path,
+                instance_id,
+                repo_url,
+                new_sha: &new_sha,
+                name,
+                // Force the core path so bulk_reindex_write deletes the old
+                // graph and installs its replacement in one transaction.
+                force: true,
+                epilogue_io,
+            },
         );
     }
 
@@ -1994,6 +3111,13 @@ pub fn incremental_index_with_name(
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+
+    let publication = establish_index_publication_marker_with_io(
+        &store,
+        Some(db_path),
+        "incremental index",
+        epilogue_io,
+    )?;
 
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
@@ -2113,20 +3237,13 @@ pub fn incremental_index_with_name(
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
 
-    // 7. Recompute PageRank (outside the transaction — it's read-heavy and
-    // idempotent, so partial completion is fine).
-    store
-        .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
-        .with_context(|| "compute_pagerank after incremental index")?;
-
-    crate::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
-    let pr_path = crate::sidecar_path(db_path, ".pagerank.json");
-    if let Err(e) = store.save_pagerank_cache(&pr_path) {
-        tracing::warn!("failed to save pagerank cache: {e}");
-    }
-
-    // P0.2: incremental index mutated the graph; bump + persist the generation.
-    store.bump_and_persist_generation();
+    finalize_committed_index_with_io(
+        publication,
+        Some(db_path),
+        "incremental index",
+        epilogue_io,
+        true,
+    )?;
 
     Ok(result)
 }
@@ -2185,6 +3302,12 @@ where
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
 
     let _write_guard = acquire_write_guard()?;
+    let publication = establish_index_publication_marker_with_io(
+        store,
+        store.db_path(),
+        "server incremental index",
+        &FileSystemIndexEpilogueIo,
+    )?;
     let txn = store
         .begin_transaction()
         .with_context(|| "begin incremental transaction")?;
@@ -2292,19 +3415,13 @@ where
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
 
-    store
-        .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
-        .with_context(|| "compute_pagerank after incremental index")?;
-
-    if let Some(db_path) = store.db_path() {
-        crate::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
-        let pr_path = crate::sidecar_path(db_path, ".pagerank.json");
-        if let Err(e) = store.save_pagerank_cache(&pr_path) {
-            tracing::warn!("failed to save pagerank cache: {e}");
-        }
-    }
-
-    store.bump_and_persist_generation();
+    finalize_committed_index_with_io(
+        publication,
+        store.db_path(),
+        "server incremental index",
+        &FileSystemIndexEpilogueIo,
+        true,
+    )?;
 
     Ok(result)
 }
@@ -2771,7 +3888,7 @@ pub(crate) fn reidentified_legacy_uid(
 pub(crate) fn delete_repo_all_data(
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
-) -> Result<(), anyhow::Error> {
+) -> Result<(usize, usize), anyhow::Error> {
     let (file_count, sym_count) = store
         .bulk_delete_repo_files_and_symbols(r_uid)
         .with_context(|| "bulk_delete_repo_files_and_symbols")?;
@@ -2790,24 +3907,47 @@ pub(crate) fn delete_repo_all_data(
         .delete_repo_node(r_uid)
         .with_context(|| "delete_repo_node")?;
 
-    Ok(())
+    Ok((file_count, sym_count))
 }
 
 /// Full index fallback — uses the already-open store to avoid double-
 /// opening the LadybugDB file (which corrupts it).
+struct FullIndexFallback<'a> {
+    repo_path: &'a Path,
+    db_path: &'a Path,
+    instance_id: &'a str,
+    repo_url: &'a str,
+    new_sha: &'a str,
+    name: Option<&'a str>,
+    force: bool,
+    epilogue_io: &'a dyn IndexEpilogueIo,
+}
+
 fn full_index_fallback(
-    repo_path: &Path,
-    db_path: &Path,
     store: &GraphStore,
-    instance_id: &str,
-    repo_url: &str,
-    new_sha: &str,
-    name: Option<&str>,
+    request: FullIndexFallback<'_>,
 ) -> Result<IncrementalResult, anyhow::Error> {
+    let FullIndexFallback {
+        repo_path,
+        db_path,
+        instance_id,
+        repo_url,
+        new_sha,
+        name,
+        force,
+        epilogue_io,
+    } = request;
     // Load filemeta sidecar for tiered change detection even in fallback.
+    // Only this repo's slice feeds change detection — another repo's entry
+    // for the same rel path must never match (nw-022).
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
-    let filemeta_cache = load_filemeta_cache(&filemeta_path);
+    let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
+    let filemeta_cache = load_filemeta_sidecar(&filemeta_path)
+        .repos
+        .get(&r_uid)
+        .cloned()
+        .unwrap_or_default();
     let mut new_filemeta = FileMetaCache::new();
 
     let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
@@ -2818,35 +3958,44 @@ fn full_index_fallback(
 
     let reader = crate::content_reader::FilesystemReader::new(repo_path);
     let local_root = repo_path.display().to_string();
-    let result = index_into_store(
+    // nw-022: capture a re-identified legacy file:// uid so its filemeta
+    // slice is dropped below, mirroring index_directory_with_store_inner.
+    let mut reidentified_old_uid: Option<String> = None;
+    let result = index_into_store_with_write_gate(
         &reader,
         store,
         instance_id,
         repo_url,
         new_sha,
-        Some(&filemeta_cache),
+        (!force).then_some(&filemeta_cache),
         Some(&mut new_filemeta),
         Some(&mut parsed_cache),
         Some(&mut resolution_deps),
+        Some(&mut reidentified_old_uid),
         name,
         Some(&local_root),
+        true,
+        epilogue_io,
+        None,
+        || Ok::<(), anyhow::Error>(()),
     )?;
 
-    // Evict stale cache entries for deleted/renamed files before saving.
-    {
-        let live_hashes: std::collections::HashSet<String> = new_filemeta
-            .values()
-            .map(|m| m.content_hash.clone())
-            .collect();
-        parsed_cache.retain_hashes(&live_hashes);
-
-        let live_files: std::collections::HashSet<String> = new_filemeta.keys().cloned().collect();
-        resolution_deps.retain_files(&live_files);
-    }
-
-    // Persist the updated filemeta sidecar.
-    if let Err(e) = save_filemeta_cache(&new_filemeta, &filemeta_path) {
-        tracing::warn!("failed to save filemeta cache: {e}");
+    // Merge this repo's fresh entries into the shared sidecar (preserving
+    // other repos' slices) and evict parse/resolution cache entries using the
+    // cross-repo live unions.
+    //
+    // Deliberately warn-only, unlike the primary path's `?`: this preserves
+    // the legacy incremental-entry behavior where sidecar persistence is
+    // best-effort, and a stale slice here self-heals — the next full pass
+    // falls through Tier 1/2 to Tier 3's content-hash comparison and
+    // re-indexes anything the stale snapshot would have mis-skipped.
+    let drop_uids: Vec<String> = reidentified_old_uid.into_iter().collect();
+    match merge_save_filemeta(&filemeta_path, &r_uid, new_filemeta, &drop_uids) {
+        Ok(unions) => {
+            parsed_cache.retain_hashes(&unions.live_hashes);
+            resolution_deps.retain_files_for_repo(&r_uid, &unions.repo_live_files);
+        }
+        Err(e) => tracing::warn!("failed to save filemeta sidecar: {e}"),
     }
     if let Err(e) = parsed_cache.save(&parsed_cache_path) {
         tracing::warn!("failed to save parsed cache: {e}");
@@ -2857,21 +4006,25 @@ fn full_index_fallback(
 
     // Update the manifest cache sidecar (same as index_directory does).
     let manifest = crate::manifest::parse_manifest(&reader);
-    crate::migrate_sidecar(db_path, "manifests.json", ".manifests.json");
-    let cache_path = crate::sidecar_path(db_path, ".manifests.json");
-    let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
-    let mut cache = crate::manifest::load_manifest_cache(&cache_path).unwrap_or_default();
+    let mut cache = crate::manifest::load_manifest_cache_for_db(db_path).unwrap_or_default();
     cache.insert(r_uid, manifest);
-    if let Err(e) = crate::manifest::save_manifest_cache(&cache, &cache_path) {
+    if let Err(e) = crate::manifest::save_manifest_cache_for_db(&cache, db_path) {
         tracing::warn!("failed to save manifest cache: {e}");
     }
 
-    // P0.2: full re-index mutated the graph; bump + persist the generation.
-    store.bump_and_persist_generation();
-
+    // nw-029: warm PageRank at index time so first queries (UI overview, impact,
+    // repo-map, hubs) never pay the lazy compute. This is the first-index-of-a-
+    // new-repo path (`nestweaver index` with no prior index / non-git dir), the
+    // most common case — without this it stayed sidecar-less. Mirrors the full
+    // and incremental paths. Release-build cost is seconds even at ~50k symbols.
+    // A failure is returned so the fallback cannot report success without a
+    // durable fresh cache. nw-055 (P1b): delete-only re-indexes also refresh the
+    // surviving nodes' ranks even though files_count is zero.
     Ok(IncrementalResult {
         fell_back_to_full: true,
         symbols_added: result.symbols_count,
+        files_deleted: result.files_deleted,
+        symbols_removed: result.symbols_deleted,
         ..Default::default()
     })
 }
@@ -2886,6 +4039,402 @@ fn content_hash_hex(s: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn insert_publication_graph(store: &GraphStore, publisher: &str) {
+        let repo_uid = format!("repo:publisher-{publisher}");
+        let file_uid = format!("file:publisher-{publisher}");
+        let source_uid = format!("sym:publisher-{publisher}:source");
+        let target_uid = format!("sym:publisher-{publisher}:target");
+        let file_path = format!("src/{publisher}.rs");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: repo_uid.clone(),
+                url: format!("https://example.test/publisher-{publisher}"),
+                indexed_sha: publisher.into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid.clone(),
+                path: file_path.clone(),
+                repo_uid: repo_uid.clone(),
+                content_hash: format!("hash-{publisher}"),
+            })
+            .unwrap();
+        store.insert_repo_file_edge(&repo_uid, &file_uid).unwrap();
+        for (uid, name) in [
+            (&source_uid, format!("publisher_{publisher}_source")),
+            (&target_uid, format!("publisher_{publisher}_target")),
+        ] {
+            store
+                .insert_symbol(&nestweaver_schema::Symbol {
+                    uid: uid.clone(),
+                    name,
+                    kind: nestweaver_schema::SymbolKind::Function,
+                    repo_uid: repo_uid.clone(),
+                    file_path: file_path.clone(),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: format!("fn {publisher}()"),
+                    summary: None,
+                    content_hash: format!("hash-{uid}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: nestweaver_schema::Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+            store.insert_file_symbol_edge(&file_uid, uid).unwrap();
+        }
+        store
+            .insert_edge(&nestweaver_schema::ResolvedEdge {
+                source_uid,
+                target_uid,
+                edge_type: nestweaver_schema::EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn overlapping_publications_serialize_before_the_second_mutation() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+
+        let publication_a = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "publisher A",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+
+        let (established_tx, established_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let b_store = Arc::clone(&store);
+        let b_db_path = db_path.clone();
+        let publisher_b = std::thread::spawn(move || {
+            let publication_b = establish_index_publication_marker_with_io(
+                &b_store,
+                Some(&b_db_path),
+                "publisher B",
+                &FileSystemIndexEpilogueIo,
+            );
+            established_tx
+                .send(
+                    publication_b
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(ToString::to_string),
+                )
+                .unwrap();
+            continue_rx.recv().unwrap();
+            let publication_b = publication_b.unwrap();
+            insert_publication_graph(&b_store, "b");
+            let result = finalize_committed_index_with_io(
+                publication_b,
+                Some(&b_db_path),
+                "publisher B",
+                &FileSystemIndexEpilogueIo,
+                true,
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        assert!(
+            store.wait_for_index_publication_waiters(1, Duration::from_secs(2)),
+            "publisher B must register as waiting on A's publication lease"
+        );
+        assert!(
+            matches!(established_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "publisher B must not establish while A owns the lease"
+        );
+        assert!(
+            store.lookup_repo("repo:publisher-b").unwrap().is_none(),
+            "publisher B must not mutate before it exclusively establishes"
+        );
+        insert_publication_graph(&store, "a");
+        finalize_committed_index_with_io(
+            publication_a,
+            Some(&db_path),
+            "publisher A",
+            &FileSystemIndexEpilogueIo,
+            true,
+        )
+        .unwrap();
+        let generation_after_a = store.graph_generation();
+
+        let b_established = established_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("publisher B must establish after A finalizes");
+        b_established.unwrap();
+        continue_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("publisher B must finish")
+            .unwrap();
+        publisher_b.join().unwrap();
+
+        assert!(store.graph_generation() > generation_after_a);
+        assert_eq!(
+            fs::read_to_string(&generation_path)
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            store.graph_generation()
+        );
+        assert!(pagerank_path.exists());
+        let expected_scores = store.pagerank_scores();
+        assert_eq!(expected_scores.len(), 4);
+        for uid in [
+            "sym:publisher-a:source",
+            "sym:publisher-a:target",
+            "sym:publisher-b:source",
+            "sym:publisher-b:target",
+        ] {
+            assert!(
+                expected_scores.contains_key(uid),
+                "missing PageRank for {uid}"
+            );
+        }
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(reopened.lookup_repo("repo:publisher-a").unwrap().is_some());
+        assert!(reopened.lookup_repo("repo:publisher-b").unwrap().is_some());
+        assert_eq!(
+            reopened
+                .list_files_by_repo("repo:publisher-a")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .list_files_by_repo("repo:publisher-b")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .callees_of("sym:publisher-a:source")
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.uid)
+                .collect::<Vec<_>>(),
+            vec!["sym:publisher-a:target".to_string()]
+        );
+        assert_eq!(
+            reopened
+                .callees_of("sym:publisher-b:source")
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.uid)
+                .collect::<Vec<_>>(),
+            vec!["sym:publisher-b:target".to_string()]
+        );
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert_eq!(reopened.pagerank_scores(), expected_scores);
+        assert_eq!(reopened.graph_generation(), generation_after_a + 2);
+    }
+
+    #[test]
+    fn dropped_publication_owner_leaves_dirty_state_for_next_owner_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let canonical_generation = store.graph_generation();
+
+        let abandoned = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "abandoned publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let dirty_generation = store.graph_generation();
+        assert_eq!(dirty_generation, canonical_generation + 1);
+        drop(abandoned);
+
+        assert!(marker_path.exists());
+        assert_eq!(store.graph_generation(), dirty_generation);
+        let recovery = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "recovery publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        assert_eq!(
+            store.graph_generation(),
+            dirty_generation,
+            "recovery must retain the abandoned N+1 reservation"
+        );
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:recovery-owner".into(),
+                url: "https://example.test/recovery-owner".into(),
+                indexed_sha: "recovered".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        finalize_committed_index_with_io(
+            recovery,
+            Some(&db_path),
+            "recovery publisher",
+            &FileSystemIndexEpilogueIo,
+            true,
+        )
+        .unwrap();
+
+        assert!(!marker_path.exists());
+        assert_eq!(store.graph_generation(), canonical_generation + 2);
+        drop(store);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(reopened.graph_generation(), canonical_generation + 2);
+        assert!(
+            reopened
+                .lookup_repo("repo:recovery-owner")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn recovered_owner_early_noop_cannot_cancel_prior_unknown_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+
+        let abandoned = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "publisher with unknown committed work",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        insert_publication_graph(&store, "abandoned");
+        drop(abandoned);
+
+        let recovered = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "early no-op recovery",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        assert!(recovered.is_recovered());
+        assert!(
+            store
+                .lookup_repo("repo:early-lookup-miss")
+                .unwrap()
+                .is_none(),
+            "exercise an early lookup/no-op before this owner mutates"
+        );
+        assert!(
+            recovered.cancel_generation().is_err(),
+            "a recovered owner must not cancel the prior owner's unknown mutation"
+        );
+        drop(recovered);
+
+        assert!(marker_path.exists());
+        drop(store);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(reopened.is_index_publication_dirty());
+        assert!(
+            reopened
+                .lookup_repo("repo:publisher-abandoned")
+                .unwrap()
+                .is_some()
+        );
+        assert!(reopened.pagerank_scores().is_empty());
+    }
+
+    #[test]
+    fn recovered_owner_can_heal_prior_unknown_mutation_without_own_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let canonical_generation = store.graph_generation();
+
+        let abandoned = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "publisher with unknown committed work",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        insert_publication_graph(&store, "healed");
+        drop(abandoned);
+
+        let recovered = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "successful no-op recovery",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        assert!(recovered.is_recovered());
+        finalize_committed_index_for_scope_with_io(
+            recovered,
+            Some(&db_path),
+            "successful no-op recovery",
+            &FileSystemIndexEpilogueIo,
+            Some(&nestweaver_store::GraphScope::unified()),
+        )
+        .unwrap();
+
+        assert!(!marker_path.exists());
+        assert_eq!(store.graph_generation(), canonical_generation + 2);
+        let expected_scores = store.pagerank_scores();
+        assert_eq!(expected_scores.len(), 2);
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.is_index_publication_dirty());
+        assert!(
+            reopened
+                .lookup_symbol("sym:publisher-healed:source")
+                .is_ok()
+        );
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert_eq!(reopened.pagerank_scores(), expected_scores);
+    }
 
     #[test]
     fn index_js_directory_extracts_symbols() {
@@ -3593,6 +5142,1481 @@ function hello(name) { return "Hello " + name; }
     // ── Tiered change detection tests ─────────────────────────────────────
 
     #[test]
+    fn force_reindex_reports_transactional_deletion_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&src).unwrap();
+        let source_path = src.join("main.js");
+        fs::write(&source_path, "function before() { return 1; }").unwrap();
+
+        let first = index_directory_with_options(
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/repo",
+            "sha-1",
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.files_count, 1);
+
+        // The path is still present, so the old pre-count classified it as
+        // "not deleted" even though bulk_reindex_write transactionally deletes
+        // the old File row before inserting its replacement.
+        fs::write(&source_path, "function after() { return 2; }").unwrap();
+        let second = index_directory_with_options(
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/repo",
+            "sha-2",
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            second.files_deleted, 1,
+            "the result must use bulk_reindex_write's authoritative deletion count"
+        );
+    }
+
+    #[test]
+    fn deletion_finalizer_removes_phantom_manifest_suggestions_and_preserves_survivors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repos = [
+            (
+                "app",
+                "https://example.com/app",
+                r#"{"name":"@acme/app","dependencies":{"@acme/removed":"1","@acme/survivor":"1"}}"#,
+            ),
+            (
+                "removed",
+                "https://example.com/removed",
+                r#"{"name":"@acme/removed"}"#,
+            ),
+            (
+                "survivor",
+                "https://example.com/survivor",
+                r#"{"name":"@acme/survivor"}"#,
+            ),
+        ];
+        for (name, url, manifest) in repos {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join(format!("{name}.js")),
+                format!("function {name}() {{ return '{name}'; }}"),
+            )
+            .unwrap();
+            fs::write(root.join("package.json"), manifest).unwrap();
+            index_directory(&root, &db_path, "test", url, "sha").unwrap();
+        }
+
+        let removed_uid = nestweaver_schema::repo_uid("test", "https://example.com/removed");
+        let survivor_uid = nestweaver_schema::repo_uid("test", "https://example.com/survivor");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store
+            .bulk_delete_repo_files_and_symbols(&removed_uid)
+            .unwrap();
+        store.clear_repo_derived_nodes(&removed_uid).unwrap();
+        store.delete_repo_node(&removed_uid).unwrap();
+        let clusters_path = crate::sidecar_path(&db_path, ".clusters.json");
+        fs::write(&clusters_path, r#"{"communities":[]}"#).unwrap();
+
+        finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            std::slice::from_ref(&removed_uid),
+            "manifest regression",
+        )
+        .unwrap();
+
+        let manifests_path = crate::sidecar_path(&db_path, ".manifests.json");
+        let manifests = crate::load_manifest_cache(&manifests_path).unwrap();
+        let suggestions = crate::suggest_links(&store, &manifests).unwrap();
+        assert!(
+            suggestions.links.iter().all(|link| {
+                link.to != removed_uid && !link.description.contains("@acme/removed")
+            }),
+            "removed repo manifest produced a phantom suggestion: {:?}",
+            suggestions.links
+        );
+        assert!(!manifests.contains_key(&removed_uid));
+        assert!(manifests.contains_key(&survivor_uid));
+        assert!(suggestions.links.iter().any(|link| {
+            link.link_type == "package-dependency" && link.description.contains("@acme/survivor")
+        }));
+        assert!(
+            !clusters_path.exists(),
+            "node-UID-keyed cluster output must be invalidated after deletion"
+        );
+    }
+
+    #[test]
+    fn deletion_finalizer_prunes_stale_embeddings_before_vector_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        for (name, url) in [
+            ("removed", "https://example.com/removed-vector"),
+            ("survivor", "https://example.com/survivor-vector"),
+        ] {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join(format!("{name}.js")),
+                format!("function {name}() {{ return '{name}'; }}"),
+            )
+            .unwrap();
+            index_directory(&root, &db_path, "test", url, "sha").unwrap();
+        }
+
+        let removed_repo_uid =
+            nestweaver_schema::repo_uid("test", "https://example.com/removed-vector");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let removed_symbol_uid = store
+            .symbols_in_file("removed.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        let survivor_symbol_uid = store
+            .symbols_in_file("survivor.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        assert!(store.add_embedding(&removed_symbol_uid, vec![1.0, 0.0]));
+        assert!(store.add_embedding(&survivor_symbol_uid, vec![0.8, 0.6]));
+        store.flush_embedding_index().unwrap();
+        assert_eq!(
+            store.vector_search(&[1.0, 0.0], 1)[0].0,
+            removed_symbol_uid,
+            "precondition: stale vector must displace the live result"
+        );
+
+        store
+            .bulk_delete_repo_files_and_symbols(&removed_repo_uid)
+            .unwrap();
+        store.clear_repo_derived_nodes(&removed_repo_uid).unwrap();
+        store.delete_repo_node(&removed_repo_uid).unwrap();
+        finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            std::slice::from_ref(&removed_repo_uid),
+            "embedding regression",
+        )
+        .unwrap();
+
+        let live_results = store.vector_search(&[1.0, 0.0], 1);
+        assert_eq!(live_results[0].0, survivor_symbol_uid);
+        assert!(!store.has_embedding(&removed_symbol_uid));
+        assert!(store.has_embedding(&survivor_symbol_uid));
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let persisted_results = reopened.vector_search(&[1.0, 0.0], 1);
+        assert_eq!(persisted_results[0].0, survivor_symbol_uid);
+        assert!(!reopened.has_embedding(&removed_symbol_uid));
+        assert!(reopened.has_embedding(&survivor_symbol_uid));
+    }
+
+    struct InjectedDeletionIo {
+        fail_save: PathBuf,
+        fail_remove: PathBuf,
+    }
+
+    impl DeletionReconciliationIo for InjectedDeletionIo {
+        fn save_filemeta(
+            &self,
+            sidecar: &FileMetaSidecar,
+            path: &Path,
+        ) -> Result<(), anyhow::Error> {
+            if path == self.fail_save {
+                anyhow::bail!("injected filemeta save failure");
+            }
+            save_filemeta_sidecar(sidecar, path)
+        }
+
+        fn save_resolution_deps(
+            &self,
+            deps: &crate::resolution_cache::ResolutionDeps,
+            path: &Path,
+        ) -> Result<(), anyhow::Error> {
+            deps.save(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            if path == self.fail_remove {
+                return Err(std::io::Error::other("injected sidecar removal failure"));
+            }
+            std::fs::remove_file(path)
+        }
+    }
+
+    #[test]
+    fn deletion_finalizer_aggregates_failures_and_runs_every_later_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_uid = "repo:test:aggregate-reconciliation".to_string();
+
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        let mut filemeta = FileMetaSidecar::default();
+        filemeta.repos.entry(repo_uid.clone()).or_default();
+        save_filemeta_sidecar(&filemeta, &filemeta_path).unwrap();
+
+        let clusters_path = crate::sidecar_path(&db_path, ".clusters.json");
+        fs::write(&clusters_path, r#"{"communities":[]}"#).unwrap();
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        fs::create_dir(&generation_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"deleted":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_generation = store.pagerank_generation();
+
+        let io = InjectedDeletionIo {
+            fail_save: filemeta_path.clone(),
+            fail_remove: clusters_path.clone(),
+        };
+
+        let error = finalize_code_graph_deletion_with_io(
+            &store,
+            &db_path,
+            std::slice::from_ref(&repo_uid),
+            "aggregate regression",
+            &io,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .failures
+                .iter()
+                .map(|failure| failure.stage)
+                .collect::<Vec<_>>(),
+            vec![
+                DeletionReconciliationStage::FileMetadata,
+                DeletionReconciliationStage::ClusterCache,
+                DeletionReconciliationStage::GenerationPersistence,
+            ]
+        );
+        assert!(
+            load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&repo_uid),
+            "failed filemeta save must leave the durable stale slice visible"
+        );
+        assert!(
+            clusters_path.exists(),
+            "injected removal failure must be real"
+        );
+        assert!(
+            generation_path.is_dir(),
+            "injected generation persistence failure must remain observable"
+        );
+        assert!(
+            !pagerank_path.exists(),
+            "persisted PageRank invalidation must run after earlier failures"
+        );
+        assert!(
+            !store.pagerank_scores().contains_key("deleted"),
+            "live PageRank invalidation must discard the primed stale score"
+        );
+        assert!(store.pagerank_generation() > pagerank_generation);
+    }
+
+    #[test]
+    fn deletion_finalizer_classifies_legacy_retirement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_uid = "repo:test:legacy-retirement".to_string();
+        let manifests_path = crate::manifest::manifest_cache_path(&db_path);
+        let manifests =
+            HashMap::from([(repo_uid.clone(), crate::manifest::ManifestInfo::default())]);
+        crate::manifest::save_manifest_cache(&manifests, &manifests_path).unwrap();
+        let legacy_path = db_path.with_extension("manifests.json");
+        fs::create_dir(&legacy_path).unwrap();
+
+        let error = finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            &[repo_uid],
+            "legacy retirement regression",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.failures.len(), 1);
+        assert_eq!(
+            error.failures[0].stage,
+            DeletionReconciliationStage::LegacyRetirement
+        );
+        assert!(
+            error.failures[0]
+                .message
+                .contains("legacy manifest sidecar")
+        );
+        assert!(
+            crate::sidecar_path(&db_path, ".generation").exists(),
+            "later generation persistence must still run"
+        );
+    }
+
+    #[test]
+    fn deletion_finalizer_classifies_embedding_legacy_retirement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let mut legacy_path = db_path.as_os_str().to_owned();
+        legacy_path.push(".embeddings");
+        fs::create_dir(std::path::PathBuf::from(legacy_path)).unwrap();
+
+        let error = finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            &[],
+            "embedding legacy retirement regression",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.failures.len(), 1);
+        assert_eq!(
+            error.failures[0].stage,
+            DeletionReconciliationStage::LegacyRetirement
+        );
+        assert!(
+            error.failures[0]
+                .message
+                .contains("legacy embedding retirement")
+        );
+    }
+
+    #[test]
+    fn full_index_filemeta_failure_still_finalizes_committed_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("old.js"), "function oldVersion() { return 1; }").unwrap();
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            "https://example.com/filemeta-epilogue",
+            "sha-1",
+        )
+        .unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = store.graph_generation();
+
+        fs::remove_file(repo.join("old.js")).unwrap();
+        fs::write(repo.join("new.js"), "function newVersion() { return 2; }").unwrap();
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        fs::remove_file(&filemeta_path).unwrap();
+        fs::create_dir(&filemeta_path).unwrap();
+
+        let error = match index_directory_with_store(
+            &store,
+            &repo,
+            &db_path,
+            "test",
+            "https://example.com/filemeta-epilogue",
+            "sha-2",
+            true,
+            None,
+        ) {
+            Ok(_) => panic!("injected filemeta persistence failure must be returned"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("filemeta sidecar"));
+        assert!(
+            store
+                .symbols_in_file("new.js")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "newVersion"),
+            "precondition: the replacement graph transaction must commit before filemeta fails"
+        );
+        assert!(
+            !store.pagerank_scores().contains_key("stale"),
+            "the committed graph must invalidate the live stale PageRank cache"
+        );
+        let persisted: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            !persisted.contains_key("stale"),
+            "the committed graph may publish fresh PageRank but must not retain the stale score"
+        );
+        assert!(
+            !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "durable fresh publication should retire the fail-closed marker"
+        );
+        assert!(store.graph_generation() > generation_before);
+        assert_eq!(
+            fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            store.graph_generation(),
+            "the bumped graph generation must be durable before returning the filemeta error"
+        );
+    }
+
+    #[derive(Default)]
+    struct InjectedIndexEpilogueIo {
+        fail_establish: bool,
+        fail_remove: bool,
+        fail_rename: bool,
+        fail_generation: bool,
+        fail_compute: bool,
+        fail_save: bool,
+    }
+
+    impl IndexEpilogueIo for InjectedIndexEpilogueIo {
+        fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            if self.fail_establish {
+                anyhow::bail!("injected marker establishment failure");
+            }
+            FileSystemIndexEpilogueIo.establish_marker(path)
+        }
+
+        fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.clear_marker(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            if self.fail_remove {
+                return Err(std::io::Error::other("injected PageRank removal failure"));
+            }
+            std::fs::remove_file(path)
+        }
+
+        fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.fail_rename {
+                return Err(std::io::Error::other(
+                    "injected PageRank quarantine failure",
+                ));
+            }
+            std::fs::rename(from, to)
+        }
+
+        fn save_generation(
+            &self,
+            store: &GraphStore,
+            path: &Path,
+            generation: u64,
+        ) -> Result<(), anyhow::Error> {
+            if self.fail_generation {
+                anyhow::bail!("injected generation save failure");
+            }
+            store
+                .save_graph_generation_value(path, generation)
+                .map_err(Into::into)
+        }
+
+        fn compute_pagerank(
+            &self,
+            store: &GraphStore,
+            scope: &nestweaver_store::GraphScope,
+        ) -> Result<(), anyhow::Error> {
+            if self.fail_compute {
+                anyhow::bail!("injected PageRank compute failure");
+            }
+            FileSystemIndexEpilogueIo.compute_pagerank(store, scope)
+        }
+
+        fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+            if self.fail_save {
+                anyhow::bail!("injected PageRank save failure");
+            }
+            FileSystemIndexEpilogueIo.save_pagerank(store, path)
+        }
+    }
+
+    #[test]
+    fn pagerank_compute_failure_is_returned_after_mandatory_commit_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = store.graph_generation();
+
+        let publication = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "compute failure regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
+            publication,
+            Some(&db_path),
+            "compute failure regression",
+            &InjectedIndexEpilogueIo {
+                fail_compute: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .expect_err("a post-commit PageRank compute failure must be returned");
+
+        assert_eq!(
+            error.failures[0].stage,
+            DeletionReconciliationStage::PageRankCompute
+        );
+        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!pagerank_path.exists());
+        assert!(store.graph_generation() > generation_before);
+        assert_eq!(
+            fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            store.graph_generation()
+        );
+    }
+
+    #[test]
+    fn pagerank_save_failure_is_returned_without_restoring_stale_persisted_ranks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = store.graph_generation();
+
+        let publication = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "save failure regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
+            publication,
+            Some(&db_path),
+            "save failure regression",
+            &InjectedIndexEpilogueIo {
+                fail_save: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .expect_err("a post-commit PageRank save failure must be returned");
+
+        assert_eq!(
+            error.failures[0].stage,
+            DeletionReconciliationStage::PageRankPersistence
+        );
+        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!pagerank_path.exists());
+        assert!(store.graph_generation() > generation_before);
+    }
+
+    #[test]
+    fn pagerank_removal_failure_quarantines_stale_ranks_and_publishes_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = store.graph_generation();
+
+        let publication = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "removal failure regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
+            publication,
+            Some(&db_path),
+            "removal failure regression",
+            &InjectedIndexEpilogueIo {
+                fail_remove: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect_err("the injected durable removal failure must be returned");
+
+        assert_eq!(
+            error.failures[0].stage,
+            DeletionReconciliationStage::PersistedPageRank
+        );
+        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!pagerank_path.exists());
+        assert!(quarantine_path(&pagerank_path).exists());
+        assert!(store.graph_generation() > generation_before);
+        assert_eq!(
+            fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            store.graph_generation()
+        );
+    }
+
+    #[test]
+    fn unlink_and_quarantine_failure_keeps_dirty_marker_fail_closed_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+
+        let publication = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "unlink and quarantine regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
+            publication,
+            Some(&db_path),
+            "unlink and quarantine regression",
+            &InjectedIndexEpilogueIo {
+                fail_remove: true,
+                fail_rename: true,
+                fail_compute: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .expect_err("unsafe persisted PageRank must fail publication");
+
+        assert!(error.to_string().contains("persisted-pagerank"));
+        assert!(
+            !error.to_string().contains("pagerank-compute"),
+            "PageRank must not run while unsafe publication remains dirty"
+        );
+        assert!(marker_path.exists(), "unsafe publication must remain dirty");
+        assert!(
+            pagerank_path.exists(),
+            "both injected retirement paths failed"
+        );
+        let canonical_generation = fs::read_to_string(&generation_path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_ne!(reopened.graph_generation(), canonical_generation);
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key("stale"));
+    }
+
+    #[test]
+    fn generation_save_failure_keeps_dirty_marker_fail_closed_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let stale_generation = store.graph_generation();
+
+        let publication = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "generation regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
+            publication,
+            Some(&db_path),
+            "generation regression",
+            &InjectedIndexEpilogueIo {
+                fail_generation: true,
+                fail_compute: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .expect_err("unsafe generation persistence must fail publication");
+
+        let message = error.to_string();
+        assert!(message.contains("generation-persistence"));
+        assert!(
+            !message.contains("pagerank-compute"),
+            "PageRank must not run before generation publication is clean"
+        );
+        assert!(marker_path.exists(), "unsafe publication must remain dirty");
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_ne!(reopened.graph_generation(), stale_generation);
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key("stale"));
+    }
+
+    #[test]
+    fn unreadable_marker_recovery_publishes_monotonic_generation_and_rejects_stale_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let cache_key = nestweaver_store::cache::ResponseCache::key(
+            "brain_search",
+            &serde_json::json!({"query": "historical"}),
+        );
+        let scope_digest = 41;
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            for _ in 0..7 {
+                store.bump_graph_generation();
+            }
+            store.save_graph_generation(&generation_path).unwrap();
+            let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+            cache.insert(
+                cache_key,
+                "brain_search",
+                br#"{"stale":true}"#,
+                store.graph_generation(),
+                scope_digest,
+            );
+            cache.save();
+        }
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        fs::create_dir(&marker_path).unwrap();
+
+        let recovering = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            recovering.graph_generation(),
+            8,
+            "dirty recovery must reserve canonical generation 7's successor"
+        );
+        recovering.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!recovering.pagerank_scores().contains_key("stale"));
+        let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+        assert!(
+            cache
+                .get(cache_key, recovering.graph_generation(), scope_digest)
+                .is_none(),
+            "the reserved recovery generation must reject generation-7 cache entries"
+        );
+        cache.insert(
+            cache_key,
+            "brain_search",
+            br#"{"dirty":true}"#,
+            recovering.graph_generation(),
+            scope_digest,
+        );
+        cache.save();
+
+        fs::remove_dir(&marker_path).unwrap();
+        let publication = establish_index_publication_marker_with_io(
+            &recovering,
+            Some(&db_path),
+            "unreadable marker recovery",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        finalize_committed_index_with_io(
+            publication,
+            Some(&db_path),
+            "unreadable marker recovery",
+            &FileSystemIndexEpilogueIo,
+            false,
+        )
+        .unwrap();
+        assert!(!marker_path.exists());
+        assert_eq!(
+            recovering.graph_generation(),
+            9,
+            "clean publication must not reuse dirty reservation 8"
+        );
+        drop(recovering);
+
+        let clean = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(clean.graph_generation(), 9);
+        assert!(clean.graph_generation() > 8);
+        clean.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!clean.pagerank_scores().contains_key("stale"));
+        let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+        assert!(
+            cache
+                .get(cache_key, clean.graph_generation(), scope_digest)
+                .is_none(),
+            "clean reopen must reject the dirty-generation cache entry"
+        );
+    }
+
+    #[test]
+    fn successor_exhaustion_aborts_before_marker_establishment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+
+        let recovering = GraphStore::open_or_create(&db_path).unwrap();
+        fs::write(&generation_path, (u64::MAX - 1).to_string()).unwrap();
+        recovering.load_graph_generation(&generation_path);
+        assert_eq!(recovering.graph_generation(), u64::MAX - 1);
+
+        let error = establish_index_publication_marker_with_io(
+            &recovering,
+            Some(&db_path),
+            "exhausted generation",
+            &FileSystemIndexEpilogueIo,
+        )
+        .expect_err("generation exhaustion must abort before graph publication");
+
+        assert!(error.to_string().contains("generation"));
+        assert!(
+            !marker_path.exists(),
+            "successor exhaustion must fail before establishing the marker"
+        );
+        assert_eq!(recovering.graph_generation(), u64::MAX - 1);
+        assert_eq!(
+            fs::read_to_string(&generation_path).unwrap(),
+            (u64::MAX - 1).to_string()
+        );
+    }
+
+    struct EmptyReader {
+        root: PathBuf,
+    }
+
+    impl crate::content_reader::ContentReader for EmptyReader {
+        fn read_file(&self, _rel_path: &Path) -> Result<String, anyhow::Error> {
+            // Manifest discovery probes well-known paths even when list_files
+            // is empty; model those probes as absent/empty content.
+            Ok(String::new())
+        }
+
+        fn list_files(&self) -> Result<Vec<PathBuf>, anyhow::Error> {
+            Ok(Vec::new())
+        }
+
+        fn file_meta(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+            Ok(None)
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn version_id(&self) -> &str {
+            "empty"
+        }
+    }
+
+    #[test]
+    fn server_full_delete_only_replacement_refreshes_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed_repo = dir.path().join("removed-repo");
+        let surviving_repo = dir.path().join("surviving-repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&removed_repo).unwrap();
+        fs::create_dir_all(&surviving_repo).unwrap();
+        fs::write(
+            removed_repo.join("removed.js"),
+            "function removed() { return 1; }",
+        )
+        .unwrap();
+        fs::write(
+            surviving_repo.join("survivor.js"),
+            "function survivor() { return 2; }",
+        )
+        .unwrap();
+
+        let removed_url = "https://example.com/removed";
+        index_directory(&removed_repo, &db_path, "test", removed_url, "sha-1").unwrap();
+        index_directory(
+            &surviving_repo,
+            &db_path,
+            "test",
+            "https://example.com/surviving",
+            "sha-1",
+        )
+        .unwrap();
+
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let removed_uid = store
+            .symbols_in_file("removed.js")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .uid;
+        assert!(store.pagerank_scores().contains_key(&removed_uid));
+
+        let reader = EmptyReader {
+            root: dir.path().join("empty-reader"),
+        };
+        let result = index_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test",
+            removed_url,
+            "sha-2",
+            None,
+            None,
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.files_deleted, 1);
+        assert!(
+            !store.pagerank_scores().contains_key(&removed_uid),
+            "the live server store must not serve the deleted symbol's stale score"
+        );
+        let persisted: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            !persisted.contains_key(&removed_uid),
+            "a daemon restart must not reload the deleted symbol from the PageRank sidecar"
+        );
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(
+            !reopened.pagerank_scores().contains_key(&removed_uid),
+            "a reopened store must not reload the deleted symbol's stale score"
+        );
+    }
+
+    #[test]
+    fn server_full_compute_failure_finalizes_before_releasing_write_gate() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct PublicationGuard<'a> {
+            store: &'a GraphStore,
+            pagerank_path: PathBuf,
+            generation_path: PathBuf,
+            generation_before: u64,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Drop for PublicationGuard<'_> {
+            fn drop(&mut self) {
+                assert!(
+                    !self.pagerank_path.exists(),
+                    "the stale PageRank sidecar must be retired before the write gate is released"
+                );
+                assert!(self.store.graph_generation() > self.generation_before);
+                assert_eq!(
+                    fs::read_to_string(&self.generation_path)
+                        .unwrap()
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap(),
+                    self.store.graph_generation(),
+                    "the graph generation must be durable before the write gate is released"
+                );
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("old.js"), "function oldVersion() { return 1; }").unwrap();
+
+        let repo_url = "https://example.com/server-write-gate-epilogue";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let generation_before = store.graph_generation();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reader = EmptyReader {
+            root: dir.path().join("empty-reader"),
+        };
+
+        let error = match index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-2",
+                name: None,
+                cancel: None,
+                epilogue_io: &InjectedIndexEpilogueIo {
+                    fail_compute: true,
+                    ..Default::default()
+                },
+            },
+            || {
+                Ok::<_, anyhow::Error>(PublicationGuard {
+                    store: &store,
+                    pagerank_path: pagerank_path.clone(),
+                    generation_path: generation_path.clone(),
+                    generation_before,
+                    dropped: Arc::clone(&dropped),
+                })
+            },
+        ) {
+            Ok(_) => panic!("the injected server PageRank compute failure must be returned"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("pagerank-compute"));
+        assert!(
+            store.symbols_in_file("old.js").unwrap().is_empty(),
+            "the server replacement transaction must commit before PageRank fails"
+        );
+        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn full_generation_failure_skips_dirty_pagerank_compute() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("old.js"), "function oldVersion() { return 1; }").unwrap();
+        let repo_url = "https://example.com/full-dual-failure";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let reader = EmptyReader {
+            root: dir.path().join("empty-reader"),
+        };
+
+        let error = match index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-2",
+                name: None,
+                cancel: None,
+                epilogue_io: &InjectedIndexEpilogueIo {
+                    fail_generation: true,
+                    fail_compute: true,
+                    ..Default::default()
+                },
+            },
+            || Ok::<_, anyhow::Error>(()),
+        ) {
+            Ok(_) => panic!("dual post-commit failure must be returned"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("generation-persistence"));
+        assert!(
+            !message.contains("pagerank-compute"),
+            "PageRank must not run before generation publication is clean"
+        );
+        assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
+        assert!(store.symbols_in_file("old.js").unwrap().is_empty());
+    }
+
+    #[test]
+    fn marker_establishment_failure_aborts_before_full_graph_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("old.js"), "function oldVersion() { return 1; }").unwrap();
+        let repo_url = "https://example.com/marker-precondition";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let reader = EmptyReader {
+            root: dir.path().join("empty-reader"),
+        };
+
+        let error = match index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-2",
+                name: None,
+                cancel: None,
+                epilogue_io: &InjectedIndexEpilogueIo {
+                    fail_establish: true,
+                    ..Default::default()
+                },
+            },
+            || Ok::<_, anyhow::Error>(()),
+        ) {
+            Ok(_) => panic!("marker establishment failure must abort indexing"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("index-publication-marker"));
+        assert!(
+            store
+                .symbols_in_file("old.js")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "oldVersion"),
+            "no graph replacement may commit without the durable marker"
+        );
+    }
+
+    #[test]
+    fn deleting_last_parseable_file_refreshes_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed_repo = dir.path().join("removed-repo");
+        let surviving_repo = dir.path().join("surviving-repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&removed_repo).unwrap();
+        fs::create_dir_all(&surviving_repo).unwrap();
+        let removed_file = removed_repo.join("removed.js");
+        fs::write(&removed_file, "function removed() { return 1; }").unwrap();
+        fs::write(
+            surviving_repo.join("survivor.js"),
+            "function survivor() { return 2; }",
+        )
+        .unwrap();
+
+        index_directory(
+            &removed_repo,
+            &db_path,
+            "test",
+            "https://example.com/removed",
+            "abc123",
+        )
+        .unwrap();
+        index_directory(
+            &surviving_repo,
+            &db_path,
+            "test",
+            "https://example.com/surviving",
+            "abc123",
+        )
+        .unwrap();
+
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let pagerank_before: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        fs::remove_file(&removed_file).unwrap();
+
+        let result = index_directory(
+            &removed_repo,
+            &db_path,
+            "test",
+            "https://example.com/removed",
+            "abc123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files_deleted, 1,
+            "the force-reindex path must report deletion of the repo's last parseable file"
+        );
+        let pagerank_after: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            pagerank_after.len() < pagerank_before.len(),
+            "PageRank sidecar must drop the deleted repo's symbols"
+        );
+    }
+
+    #[test]
+    fn reidentify_delete_only_refreshes_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed_repo = dir.path().join("removed-repo");
+        let surviving_repo = dir.path().join("surviving-repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&removed_repo).unwrap();
+        fs::create_dir_all(&surviving_repo).unwrap();
+        let removed_file = removed_repo.join("removed.js");
+        fs::write(&removed_file, "function removed() { return 1; }").unwrap();
+        fs::write(
+            surviving_repo.join("survivor.js"),
+            "function survivor() { return 2; }",
+        )
+        .unwrap();
+
+        let local_url = format!("file://{}", removed_repo.display());
+        index_directory(&removed_repo, &db_path, "test", &local_url, "abc123").unwrap();
+        index_directory(
+            &surviving_repo,
+            &db_path,
+            "test",
+            "https://example.com/surviving",
+            "abc123",
+        )
+        .unwrap();
+
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let pagerank_before: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        fs::remove_file(&removed_file).unwrap();
+
+        let result = index_directory(
+            &removed_repo,
+            &db_path,
+            "test",
+            "https://example.com/reidentified",
+            "abc123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files_deleted, 1,
+            "re-identification must report files deleted with the old repo uid"
+        );
+        let pagerank_after: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            pagerank_after.len() < pagerank_before.len(),
+            "PageRank sidecar must drop symbols deleted during re-identification"
+        );
+    }
+
+    #[test]
+    fn non_ancestor_delete_only_fallback_refreshes_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed_repo = dir.path().join("removed-repo");
+        let surviving_repo = dir.path().join("surviving-repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&removed_repo).unwrap();
+        fs::create_dir_all(&surviving_repo).unwrap();
+        fs::write(
+            removed_repo.join("removed.js"),
+            "function removed() { return 1; }",
+        )
+        .unwrap();
+        fs::write(
+            surviving_repo.join("survivor.js"),
+            "function survivor() { return 2; }",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&removed_repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "removed.js"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+
+        let repo_url = "https://example.com/removed";
+        index_directory(&removed_repo, &db_path, "test", repo_url, &old_sha).unwrap();
+        index_directory(
+            &surviving_repo,
+            &db_path,
+            "test",
+            "https://example.com/surviving",
+            "abc123",
+        )
+        .unwrap();
+
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let pagerank_before: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        fs::remove_file(removed_repo.join("removed.js")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--amend", "--no-edit", "--allow-empty", "-q"]);
+
+        let result = incremental_index(&removed_repo, &db_path, "test", repo_url).unwrap();
+
+        assert!(result.fell_back_to_full);
+        assert_eq!(
+            result.files_deleted, 1,
+            "non-ancestor fallback must report files deleted before the full index"
+        );
+        let pagerank_after: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
+        assert!(
+            pagerank_after.len() < pagerank_before.len(),
+            "PageRank sidecar must drop symbols deleted before non-ancestor fallback"
+        );
+    }
+
+    #[test]
+    fn incremental_generation_failure_skips_dirty_pagerank_compute() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "function before() { return 1; }").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "main.js"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/incremental-epilogue";
+        index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+
+        fs::write(repo.join("main.js"), "function after() { return 2; }").unwrap();
+        git(&["add", "main.js"]);
+        git(&["commit", "-q", "-m", "update"]);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = store.graph_generation();
+        drop(store);
+
+        let error = incremental_index_with_name_and_io(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            None,
+            &InjectedIndexEpilogueIo {
+                fail_generation: true,
+                fail_compute: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("the injected incremental compute failure must be returned");
+
+        let message = error.to_string();
+        assert!(message.contains("generation-persistence"));
+        assert!(
+            !message.contains("pagerank-compute"),
+            "PageRank must not run before generation publication is clean"
+        );
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            store
+                .symbols_in_file("main.js")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "after"),
+            "the incremental transaction must be committed before PageRank fails"
+        );
+        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!pagerank_path.exists());
+        assert!(store.graph_generation() > generation_before);
+    }
+
+    #[test]
+    fn fallback_generation_failure_skips_dirty_pagerank_compute() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("old.js"), "function oldVersion() { return 1; }").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "old.js"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let old_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/fallback-epilogue";
+        index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+
+        fs::remove_file(repo.join("old.js")).unwrap();
+        fs::write(repo.join("new.js"), "function replacement() { return 2; }").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--amend", "--no-edit", "-q"]);
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = store.graph_generation();
+        drop(store);
+
+        let error = incremental_index_with_name_and_io(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            None,
+            &InjectedIndexEpilogueIo {
+                fail_generation: true,
+                fail_compute: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("the injected fallback compute failure must be returned");
+
+        let message = error.to_string();
+        assert!(message.contains("generation-persistence"));
+        assert!(
+            !message.contains("pagerank-compute"),
+            "PageRank must not run before generation publication is clean"
+        );
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(store.symbols_in_file("old.js").unwrap().is_empty());
+        assert!(
+            store
+                .symbols_in_file("new.js")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "replacement"),
+            "the forced fallback must atomically install the replacement graph"
+        );
+        assert!(!store.pagerank_scores().contains_key("stale"));
+        assert!(!pagerank_path.exists());
+        assert!(store.graph_generation() > generation_before);
+    }
+
+    #[test]
     fn tiered_check_new_file_returns_changed() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("hello.js");
@@ -3726,33 +6750,92 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn filemeta_sidecar_round_trip() {
+    fn filemeta_sidecar_v2_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let sidecar_path = dir.path().join("test.filemeta.json");
-
-        let mut cache = FileMetaCache::new();
-        cache.insert(
-            "src/main.js".to_string(),
-            CachedFileMeta {
-                mtime_secs: 1234567890,
-                size_bytes: 42,
-                content_hash: "abc123".to_string(),
-            },
-        );
-
-        save_filemeta_cache(&cache, &sidecar_path).unwrap();
-        let loaded = load_filemeta_cache(&sidecar_path);
-        assert_eq!(loaded.len(), 1);
-        let entry = loaded.get("src/main.js").unwrap();
-        assert_eq!(entry.mtime_secs, 1234567890);
-        assert_eq!(entry.size_bytes, 42);
-        assert_eq!(entry.content_hash, "abc123");
+        let path = dir.path().join("db.lbug.filemeta.json");
+        let mut sidecar = FileMetaSidecar::default();
+        sidecar
+            .repos
+            .entry("repo:test:aaaa".into())
+            .or_default()
+            .insert(
+                "main.js".into(),
+                CachedFileMeta {
+                    mtime_secs: 1,
+                    size_bytes: 2,
+                    content_hash: "h1".into(),
+                },
+            );
+        save_filemeta_sidecar(&sidecar, &path).unwrap();
+        let loaded = load_filemeta_sidecar(&path);
+        assert_eq!(loaded.version, FILEMETA_VERSION);
+        assert_eq!(loaded.repos["repo:test:aaaa"]["main.js"].content_hash, "h1");
     }
 
     #[test]
-    fn filemeta_cache_missing_file_returns_empty() {
-        let cache = load_filemeta_cache(Path::new("/nonexistent/filemeta.json"));
-        assert!(cache.is_empty());
+    fn filemeta_sidecar_legacy_flat_format_loads_empty() {
+        // Old flat format must fail-open to empty → one-time full re-index.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+        fs::write(
+            &path,
+            r#"{"main.js":{"mtime_secs":5,"size_bytes":10,"content_hash":"abc"}}"#,
+        )
+        .unwrap();
+        let loaded = load_filemeta_sidecar(&path);
+        assert!(
+            loaded.repos.is_empty(),
+            "legacy format must load as empty, got {loaded:?}"
+        );
+    }
+
+    #[test]
+    fn filemeta_sidecar_corrupt_and_missing_load_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+        assert!(load_filemeta_sidecar(&path).repos.is_empty()); // missing
+        fs::write(&path, "not json").unwrap();
+        assert!(load_filemeta_sidecar(&path).repos.is_empty()); // corrupt
+    }
+
+    #[test]
+    fn filemeta_sidecar_future_version_loads_empty() {
+        // A version we don't know (e.g. written by a newer binary) must
+        // fail-open to empty — full re-index, never a mis-classification.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+        fs::write(
+            &path,
+            r#"{"version":3,"repos":{"repo:test:aaaa":{"main.js":{"mtime_secs":1,"size_bytes":2,"content_hash":"h1"}}}}"#,
+        )
+        .unwrap();
+        let loaded = load_filemeta_sidecar(&path);
+        assert!(
+            loaded.repos.is_empty(),
+            "future version must load as empty, got {loaded:?}"
+        );
+    }
+
+    #[test]
+    fn filemeta_sidecar_empty_repos_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.lbug.filemeta.json");
+        let sidecar = FileMetaSidecar::default();
+        save_filemeta_sidecar(&sidecar, &path).unwrap();
+        // Assert on the serialized bytes, not just the round-tripped struct:
+        // without the `impl Default` version pin, save would write
+        // `"version":0`, load would see the mismatch and fail-open to
+        // default() — silently satisfying the version/empty asserts below.
+        // Pinning the check to the on-disk bytes catches that regression.
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""version":2"#),
+            "a default-constructed sidecar must serialize with the current version"
+        );
+        let loaded = load_filemeta_sidecar(&path);
+        assert_eq!(loaded.version, FILEMETA_VERSION);
+        assert!(loaded.repos.is_empty());
     }
 
     struct GateOrderReader {
@@ -3825,9 +6908,13 @@ function hello(name) { return "Hello " + name; }
 
         let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
         assert!(filemeta_path.exists(), "filemeta sidecar should be created");
-        let cache = load_filemeta_cache(&filemeta_path);
-        assert_eq!(cache.len(), 1, "one file should be in the cache");
-        assert!(cache.contains_key("main.js"));
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        let uid = repo_uid("test", "https://example.com/repo");
+        assert_eq!(sidecar.repos.len(), 1, "one repo slice should exist");
+        assert!(
+            sidecar.repos[&uid].contains_key("main.js"),
+            "repo slice should contain main.js, got {sidecar:?}"
+        );
     }
 
     #[test]
@@ -3853,6 +6940,361 @@ function hello(name) { return "Hello " + name; }
         );
         // files_count tracks only files that were actually processed (parsed).
         assert_eq!(result2.files_count, 0, "no files should be re-indexed");
+    }
+
+    #[test]
+    fn full_index_writes_pagerank_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.js"),
+            "function f() { g(); }\nfunction g() {}",
+        )
+        .unwrap();
+        index_directory(&repo, &db_path, "test", "https://example.com/a", "sha").unwrap();
+        let sidecar = dir.path().join("t.lbug.pagerank.json");
+        assert!(sidecar.exists(), "full index must compute+save pagerank");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert!(
+            json.as_object().map(|o| !o.is_empty()).unwrap_or(false),
+            "sidecar must contain scores"
+        );
+    }
+
+    #[test]
+    fn first_index_of_new_repo_via_fallback_writes_pagerank_sidecar() {
+        // nw-029: the first `nestweaver index` of a new repo routes through
+        // full_index_fallback, which (pre-fix) never computed/saved the pagerank
+        // sidecar — leaving the most common case cold.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.js"),
+            "function f() { g(); }\nfunction g() {}",
+        )
+        .unwrap();
+        // drive the plain/incremental entry that falls back to full_index_fallback
+        // for a repo with no prior index (non-git dir → full fallback).
+        incremental_index_with_name(&repo, &db_path, "test", "https://example.com/a", None)
+            .unwrap();
+        let sidecar = dir.path().join("t.lbug.pagerank.json");
+        assert!(
+            sidecar.exists(),
+            "first index via fallback must compute+save pagerank"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert!(
+            json.as_object().map(|o| !o.is_empty()).unwrap_or(false),
+            "sidecar must contain scores"
+        );
+    }
+
+    #[test]
+    fn second_repo_with_colliding_rel_path_and_mtime_is_indexed() {
+        // nw-022 repro: two repos share ONE db. Their files share a rel path
+        // ("main.js") and an mtime second. Tier 1 (tiered_change_check) matches
+        // repo A's sidecar entry when repo B is first indexed → repo B's file
+        // is classified Unchanged and its symbols are never written.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.lbug");
+        let repo_a = dir.path().join("repo_a");
+        let repo_b = dir.path().join("repo_b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("main.js"), "function alpha() {}").unwrap();
+        fs::write(repo_b.join("main.js"), "function beta() {}").unwrap();
+
+        // Pin identical mtimes (don't rely on same-second scheduling).
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        fs::File::options()
+            .write(true)
+            .open(repo_a.join("main.js"))
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(repo_b.join("main.js"))
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+
+        let r1 =
+            index_directory(&repo_a, &db_path, "test", "https://example.com/a", "sha").unwrap();
+        assert_eq!(r1.files_count, 1);
+
+        let r2 =
+            index_directory(&repo_b, &db_path, "test", "https://example.com/b", "sha").unwrap();
+        assert_eq!(
+            r2.files_unchanged, 0,
+            "repo B must not inherit repo A's filemeta entry"
+        );
+        assert_eq!(r2.files_count, 1);
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let uid_b = repo_uid("test", "https://example.com/b");
+        let symbols = store.symbol_names_by_repo(&uid_b).unwrap();
+        assert!(
+            symbols.iter().any(|n| n == "beta"),
+            "repo B's symbol must exist in the shared DB, got {symbols:?}"
+        );
+        assert!(
+            !store.list_files_by_repo(&uid_b).unwrap().is_empty(),
+            "repo B must have File nodes"
+        );
+    }
+
+    #[test]
+    fn indexing_second_repo_preserves_first_repos_filemeta() {
+        // nw-022 second defect: the save site overwrites the whole sidecar with
+        // only the current repo's entries, destroying repo A's warm cache.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.lbug");
+        let repo_a = dir.path().join("repo_a");
+        let repo_b = dir.path().join("repo_b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("alpha.js"), "function alpha() {}").unwrap();
+        fs::write(repo_b.join("beta.js"), "function beta() {}").unwrap();
+
+        index_directory(&repo_a, &db_path, "test", "https://example.com/a", "sha").unwrap();
+        index_directory(&repo_b, &db_path, "test", "https://example.com/b", "sha").unwrap();
+
+        // Re-index repo A: it must still see its own warm entries.
+        let r3 =
+            index_directory(&repo_a, &db_path, "test", "https://example.com/a", "sha").unwrap();
+        assert_eq!(
+            r3.files_unchanged, 1,
+            "repo A's warm cache must survive repo B's index (sidecar must not be overwritten)"
+        );
+        assert_eq!(r3.files_count, 0);
+    }
+
+    #[test]
+    fn full_index_fallback_uses_per_repo_slice_and_merge_saves() {
+        // nw-022 T4: same two-repo collision shape as
+        // `second_repo_with_colliding_rel_path_and_mtime_is_indexed`, but driven
+        // through the incremental entry point — a non-git dir routes to
+        // full_index_fallback, which must also key change detection per repo.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.lbug");
+        let repo_a = dir.path().join("repo_a");
+        let repo_b = dir.path().join("repo_b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("main.js"), "function alpha() {}").unwrap();
+        fs::write(repo_b.join("main.js"), "function beta() {}").unwrap();
+
+        // Pin identical mtimes (don't rely on same-second scheduling).
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        for p in [repo_a.join("main.js"), repo_b.join("main.js")] {
+            fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        }
+
+        let r1 =
+            incremental_index_with_name(&repo_a, &db_path, "test", "https://example.com/a", None)
+                .unwrap();
+        assert!(r1.fell_back_to_full, "non-git dir must fall back to full");
+        assert!(r1.symbols_added >= 1, "repo A must be indexed");
+
+        // IncrementalResult carries no files_unchanged; a cross-match would
+        // classify repo B's only file Unchanged and never write its symbols,
+        // so assert on symbols_added + the store contents instead.
+        let r2 =
+            incremental_index_with_name(&repo_b, &db_path, "test", "https://example.com/b", None)
+                .unwrap();
+        assert!(r2.fell_back_to_full);
+        assert!(
+            r2.symbols_added >= 1,
+            "fallback path must not cross-match repo A's filemeta entries"
+        );
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let uid_b = repo_uid("test", "https://example.com/b");
+        let symbols = store.symbol_names_by_repo(&uid_b).unwrap();
+        assert!(
+            symbols.iter().any(|n| n == "beta"),
+            "repo B's symbol must exist in the shared DB, got {symbols:?}"
+        );
+        assert!(
+            !store.list_files_by_repo(&uid_b).unwrap().is_empty(),
+            "repo B must have File nodes"
+        );
+
+        // Merge-save: repo A's slice must survive repo B's fallback run.
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        let uid_a = repo_uid("test", "https://example.com/a");
+        assert!(
+            sidecar.repos.contains_key(&uid_a) && sidecar.repos.contains_key(&uid_b),
+            "both repo slices must be present after the fallback merge-save, got {:?}",
+            sidecar.repos.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn full_index_fallback_eviction_uses_cross_repo_unions() {
+        // nw-022 T4, the eviction property (the graph-loss / nw-010 class):
+        // full_index_fallback feeds `parsed_cache.retain_hashes(...)` the
+        // cross-repo union of live hashes from merge_save_filemeta. If it were
+        // fed only THIS run's hashes (the pre-fix behavior), indexing repo B
+        // through the fallback path would evict repo A's parsed-cache entries.
+        // This test reverts to RED if the eviction block is fed current-run-only
+        // hashes/files instead of `unions.live_hashes` / `unions.live_files`.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.lbug");
+        let repo_a = dir.path().join("repo_a");
+        let repo_b = dir.path().join("repo_b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        // Distinct files + distinct content → distinct content hashes.
+        fs::write(repo_a.join("alpha.js"), "function alpha() { return 1; }").unwrap();
+        fs::write(repo_b.join("beta.js"), "function beta() { return 2; }").unwrap();
+
+        // Index repo A through the incremental entry point (non-git → fallback).
+        let ra =
+            incremental_index_with_name(&repo_a, &db_path, "test", "https://example.com/a", None)
+                .unwrap();
+        assert!(ra.fell_back_to_full, "non-git dir must fall back to full");
+
+        // Recover repo A's live content hash from its filemeta slice (the same
+        // hash the fallback path keys the parsed cache by) and confirm the
+        // parsed-cache entry exists after A's run.
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        let uid_a = repo_uid("test", "https://example.com/a");
+        let hash_a = load_filemeta_sidecar(&filemeta_path)
+            .repos
+            .get(&uid_a)
+            .and_then(|slice| slice.get("alpha.js"))
+            .map(|m| m.content_hash.clone())
+            .expect("repo A's filemeta slice must record alpha.js");
+
+        let parsed_cache_path = crate::sidecar_path(&db_path, ".parsed_cache.bin");
+        assert!(
+            crate::parsed_cache::ParsedCache::load(&parsed_cache_path)
+                .get(&hash_a)
+                .is_some(),
+            "repo A's parsed-cache entry must exist after its own fallback run"
+        );
+
+        // Index repo B into the SAME db through the fallback path.
+        let rb =
+            incremental_index_with_name(&repo_b, &db_path, "test", "https://example.com/b", None)
+                .unwrap();
+        assert!(rb.fell_back_to_full);
+
+        // The eviction must be union-scoped: repo A's entry survives.
+        assert!(
+            crate::parsed_cache::ParsedCache::load(&parsed_cache_path)
+                .get(&hash_a)
+                .is_some(),
+            "repo A's parsed-cache entry must survive repo B's fallback run"
+        );
+    }
+
+    #[test]
+    fn reidentify_drops_old_uid_filemeta_slice() {
+        // nw-022 T6, PRIMARY path (index_directory): re-indexing a working
+        // tree under its origin identity must drop the legacy file:// uid's
+        // filemeta slice from the sidecar alongside the graph prune.
+        //
+        // Naming note: this is the spec-named test, but the primary-path
+        // drop_uids threading it guards already shipped in the PARENT commit
+        // (b7a0661e). Reverting THIS commit's fallback threading does NOT turn
+        // this test red — the fallback deliverable is guarded by
+        // `reidentify_drops_old_uid_filemeta_slice_fallback` below.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.js"), "function a() { return 1; }\n").unwrap();
+
+        let local_root = src.display().to_string();
+        let file_url = format!("file://{local_root}");
+        index_directory(&src, &db_path, "test", &file_url, "sha-1").unwrap();
+
+        let old_uid = repo_uid("test", &file_url);
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        assert!(
+            load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&old_uid),
+            "first pass must record the file:// slice"
+        );
+
+        let origin_url = "https://example.com/acme/demo.git";
+        index_directory(&src, &db_path, "test", origin_url, "sha-1").unwrap();
+
+        let new_uid = repo_uid("test", origin_url);
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        assert!(
+            !sidecar.repos.contains_key(&old_uid),
+            "re-identify must drop the legacy uid's slice, got {:?}",
+            sidecar.repos.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            sidecar.repos.contains_key(&new_uid),
+            "the new origin uid must have a slice"
+        );
+    }
+
+    #[test]
+    fn reidentify_drops_old_uid_filemeta_slice_fallback() {
+        // nw-022 T6, FALLBACK path: the same re-identify hand-off driven
+        // through the incremental entry point (non-git dir →
+        // full_index_fallback) must also drop the legacy uid's slice.
+        //
+        // Naming note: this is the real T6 deliverable of THIS commit. It is
+        // the ONLY test that turns red if full_index_fallback's `drop_uids`
+        // threading (reidentified_old_uid → merge_save_filemeta) is reverted;
+        // the spec-named `reidentify_drops_old_uid_filemeta_slice` above only
+        // exercises the parent commit's already-fixed primary path.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.js"), "function a() { return 1; }\n").unwrap();
+
+        let local_root = src.display().to_string();
+        let file_url = format!("file://{local_root}");
+        let r1 = incremental_index_with_name(&src, &db_path, "test", &file_url, None).unwrap();
+        assert!(r1.fell_back_to_full, "non-git dir must fall back to full");
+
+        let old_uid = repo_uid("test", &file_url);
+        let filemeta_path = crate::sidecar_path(&db_path, ".filemeta.json");
+        assert!(
+            load_filemeta_sidecar(&filemeta_path)
+                .repos
+                .contains_key(&old_uid),
+            "first pass must record the file:// slice"
+        );
+
+        let origin_url = "https://example.com/acme/demo.git";
+        let r2 = incremental_index_with_name(&src, &db_path, "test", origin_url, None).unwrap();
+        assert!(r2.fell_back_to_full);
+
+        let new_uid = repo_uid("test", origin_url);
+        let sidecar = load_filemeta_sidecar(&filemeta_path);
+        assert!(
+            !sidecar.repos.contains_key(&old_uid),
+            "fallback re-identify must drop the legacy uid's slice, got {:?}",
+            sidecar.repos.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            sidecar.repos.contains_key(&new_uid),
+            "the new origin uid must have a slice"
+        );
     }
 
     #[test]

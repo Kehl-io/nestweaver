@@ -16,6 +16,8 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".cochange.json",
     ".interactions.json",
     ".extensions.json",
+    ".extensions.migration.json",
+    ".extensions.handoff.json",
     ".aliases.json",
     ".bundles.json",
     ".generation",
@@ -89,10 +91,8 @@ pub struct RestoreResult {
 
 /// Create a backup of the NestWeaver database and all sidecar files.
 ///
-/// The caller is responsible for ensuring exclusive access to the database
-/// (no concurrent writes) for the duration of this call.
-/// A backup staged (files copied, stats gathered) while the write lock was
-/// held, ready to package lock-free via [`package_staged`].
+/// A backup staged (files copied, stats gathered) while the publication lease
+/// was held, ready to package lock-free via [`package_staged`].
 pub struct StagedBackup {
     staging: tempfile::TempDir,
     repos: Vec<BackupRepoInfo>,
@@ -104,15 +104,51 @@ pub struct StagedBackup {
 /// Stage a backup from an ALREADY-OPEN store: flush embeddings, `CHECKPOINT` the
 /// WAL into the main file, copy the on-disk files to a temp staging dir, and
 /// gather manifest stats. Reuses the caller's live connection — it never opens a
-/// second one — so the daemon can call this while holding its own write lock
-/// (quiesce == lock-held), guaranteeing no writer touches the files mid-copy.
+/// second one. It also owns the store's publication lease through checkpoint,
+/// copy, and statistics collection, so UI watchers and other publishers cannot
+/// mutate the graph mid-copy. The configured path must resolve to this store;
+/// all database and sidecar reads derive from `store.db_path()`. An inherited
+/// dirty publication is rejected.
 /// The returned [`StagedBackup`] is packaged lock-free by [`package_staged`].
 pub fn stage_backup_from_store(
     store: &nestweaver_store::GraphStore,
     config: &BackupConfig,
 ) -> anyhow::Result<StagedBackup> {
+    let store_db_path = store
+        .db_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot back up an in-memory graph store"))?;
+    let configured_db = std::fs::canonicalize(&config.db_path).with_context(|| {
+        format!(
+            "failed to resolve configured backup database {}",
+            config.db_path.display()
+        )
+    })?;
+    let opened_db = std::fs::canonicalize(store_db_path).with_context(|| {
+        format!(
+            "failed to resolve opened backup database {}",
+            store_db_path.display()
+        )
+    })?;
+    if configured_db != opened_db {
+        anyhow::bail!(
+            "configured backup database {} does not match opened store {}",
+            config.db_path.display(),
+            store_db_path.display()
+        );
+    }
+    let staged_db_filename = config
+        .db_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("db_path has no filename"))?;
+
     let start = Instant::now();
     let pause_start = Instant::now();
+    let publication = store
+        .acquire_index_publication_lease()
+        .map_err(|error| anyhow::anyhow!("failed to quiesce graph publication: {error}"))?;
+    publication
+        .ensure_clean_for_snapshot()
+        .map_err(|error| anyhow::anyhow!("refusing backup of dirty index publication: {error}"))?;
     let staging = tempfile::tempdir()?;
 
     store
@@ -124,7 +160,8 @@ pub fn stage_backup_from_store(
 
     // Copy files while the caller holds the write lock (sidecars are non-atomic).
     copy_db_files(
-        &config.db_path,
+        store_db_path,
+        staged_db_filename,
         staging.path(),
         config.include_clones,
         config.workspace_path.as_deref(),
@@ -145,6 +182,9 @@ pub fn stage_backup_from_store(
         .collect();
 
     let write_pause = pause_start.elapsed();
+    publication
+        .release()
+        .map_err(|error| anyhow::anyhow!("failed to release backup publication lease: {error}"))?;
     Ok(StagedBackup {
         staging,
         repos,
@@ -431,16 +471,13 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
 /// Copy the database file and all existing sidecars into the staging directory.
 fn copy_db_files(
     db_path: &Path,
+    staged_db_filename: &std::ffi::OsStr,
     staging: &Path,
     include_clones: bool,
     workspace_path: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let db_filename = db_path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("db_path has no filename"))?;
-
     // Copy the main database file.
-    std::fs::copy(db_path, staging.join(db_filename))?;
+    std::fs::copy(db_path, staging.join(staged_db_filename))?;
 
     // Copy known sidecars (skip missing ones silently).
     for suffix in SIDECAR_SUFFIXES {
@@ -449,7 +486,7 @@ fn copy_db_files(
             continue;
         }
         let dest_name = {
-            let mut s = db_filename.to_owned();
+            let mut s = staged_db_filename.to_owned();
             s.push(suffix);
             s
         };
@@ -463,7 +500,7 @@ fn copy_db_files(
     // Copy WAL if it still exists (should be gone after CHECKPOINT, but be safe).
     let wal = crate::sidecar_path(db_path, ".wal");
     if wal.exists() {
-        let mut wal_dest = db_filename.to_owned();
+        let mut wal_dest = staged_db_filename.to_owned();
         wal_dest.push(".wal");
         std::fs::copy(&wal, staging.join(&wal_dest))?;
     }
@@ -761,6 +798,29 @@ fn is_leap(y: u64) -> bool {
 mod tests {
     use super::*;
 
+    fn backup_symbol(uid: &str, name: &str) -> nestweaver_schema::Symbol {
+        nestweaver_schema::Symbol {
+            uid: uid.into(),
+            name: name.into(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo:backup-publication".into(),
+            file_path: "src/backup.rs".into(),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash:{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
     #[test]
     fn test_backup_save_and_inspect() {
         let dir = tempfile::tempdir().unwrap();
@@ -812,6 +872,227 @@ mod tests {
         assert!(output.exists());
         assert_eq!(result.manifest.instance_id, "test");
         assert_eq!(backup_inspect(&output).unwrap().instance_id, "test");
+    }
+
+    #[test]
+    fn stage_rejects_store_and_config_database_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_a_path = dir.path().join("a.lbug");
+        let store_b_path = dir.path().join("b.lbug");
+        let store_a = nestweaver_store::GraphStore::create(&store_a_path).unwrap();
+        let store_b = nestweaver_store::GraphStore::create(&store_b_path).unwrap();
+        let dirty_b = crate::index::establish_index_publication_marker_with_io(
+            &store_b,
+            Some(&store_b_path),
+            "mismatched backup source",
+            &crate::index::FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        store_b
+            .insert_symbol(&backup_symbol("sym:backup:mismatched", "mismatched"))
+            .unwrap();
+
+        let config = BackupConfig {
+            db_path: store_b_path.clone(),
+            output_path: dir.path().join("must-not-exist.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+        let error = match stage_backup_from_store(&store_a, &config) {
+            Ok(_) => panic!("mismatched store and config unexpectedly produced a staged backup"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("does not match"));
+        assert!(
+            crate::sidecar_path(&store_b_path, ".index-dirty").exists(),
+            "rejecting the mismatch must not alter the actual config database"
+        );
+        assert!(store_b.is_index_publication_dirty());
+        drop(dirty_b);
+    }
+
+    #[test]
+    fn stage_accepts_relative_path_to_the_opened_store() {
+        let current_dir = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&current_dir).unwrap();
+        let store_path = dir.path().join("relative.lbug");
+        let relative_path = store_path.strip_prefix(&current_dir).unwrap().to_path_buf();
+        let store = nestweaver_store::GraphStore::create(&store_path).unwrap();
+        let config = BackupConfig {
+            db_path: relative_path,
+            output_path: dir.path().join("relative.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+
+        let staged = stage_backup_from_store(&store, &config).unwrap();
+        let result = package_staged(&config, staged).unwrap();
+        assert_eq!(result.manifest.repo_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_accepts_symlink_equivalent_path_and_copies_store_sidecars() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("real.lbug");
+        let alias_path = dir.path().join("alias.lbug");
+        let store = nestweaver_store::GraphStore::create(&store_path).unwrap();
+        let store_sidecar = crate::sidecar_path(&store_path, ".aliases.json");
+        std::fs::write(&store_sidecar, r#"{"sentinel":"from-store"}"#).unwrap();
+        symlink(&store_path, &alias_path).unwrap();
+
+        let output = dir.path().join("alias.nwsnap.zst");
+        let config = BackupConfig {
+            db_path: alias_path,
+            output_path: output,
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+        let staged = stage_backup_from_store(&store, &config).unwrap();
+        let result = package_staged(&config, staged).unwrap();
+
+        assert!(
+            result
+                .manifest
+                .checksums
+                .contains_key("alias.lbug.aliases.json"),
+            "an equivalent config alias must stage sidecars located beside the store path"
+        );
+    }
+
+    #[test]
+    fn backup_waits_for_active_publication_and_restores_complete_latest_generation() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let output = dir.path().join("snap.nwsnap.zst");
+        let restore_dir = dir.path().join("restored");
+        let config = BackupConfig {
+            db_path: db_path.clone(),
+            output_path: output.clone(),
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+        let store = Arc::new(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+        let publication = crate::index::establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "paused watcher publication",
+            &crate::index::FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:backup-publication".into(),
+                url: "https://example.test/backup-publication".into(),
+                indexed_sha: "latest".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&backup_symbol("sym:backup:first", "first"))
+            .unwrap();
+
+        let backup_store = Arc::clone(&store);
+        let backup_config = config.clone();
+        let backup_thread =
+            std::thread::spawn(move || stage_backup_from_store(&backup_store, &backup_config));
+        assert!(
+            store.wait_for_index_publication_waiters(1, Duration::from_secs(2)),
+            "backup must register as waiting before checkpoint/copy"
+        );
+
+        store
+            .insert_symbol(&backup_symbol("sym:backup:second", "second"))
+            .unwrap();
+        store
+            .insert_edge(&nestweaver_schema::ResolvedEdge {
+                source_uid: "sym:backup:first".into(),
+                target_uid: "sym:backup:second".into(),
+                edge_type: nestweaver_schema::EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        crate::index::finalize_committed_index_for_scope_with_io(
+            publication,
+            Some(&db_path),
+            "paused watcher publication",
+            &crate::index::FileSystemIndexEpilogueIo,
+            Some(&nestweaver_store::GraphScope::code_only()),
+        )
+        .unwrap();
+        let latest_generation = store.graph_generation();
+
+        let staged = backup_thread.join().unwrap().unwrap();
+        package_staged(&config, staged).unwrap();
+        backup_restore(&RestoreConfig {
+            snapshot_path: output,
+            data_dir: restore_dir.clone(),
+        })
+        .unwrap();
+
+        let restored =
+            nestweaver_store::GraphStore::open_or_create(&restore_dir.join("test.lbug")).unwrap();
+        assert_eq!(restored.graph_generation(), latest_generation);
+        assert!(restored.lookup_symbol("sym:backup:first").is_ok());
+        assert!(restored.lookup_symbol("sym:backup:second").is_ok());
+        assert_eq!(
+            restored
+                .callees_of("sym:backup:first")
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.uid)
+                .collect::<Vec<_>>(),
+            vec!["sym:backup:second".to_string()]
+        );
+    }
+
+    #[test]
+    fn backup_rejects_abandoned_dirty_publication_and_preserves_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let config = BackupConfig {
+            db_path: db_path.clone(),
+            output_path: dir.path().join("must-not-exist.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let abandoned = crate::index::establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "abandoned watcher publication",
+            &crate::index::FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        store
+            .insert_symbol(&backup_symbol("sym:backup:abandoned", "abandoned"))
+            .unwrap();
+        drop(abandoned);
+
+        let error = match stage_backup_from_store(&store, &config) {
+            Ok(_) => panic!("dirty publication backup unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("dirty index publication"));
+        assert!(marker_path.exists());
+        assert!(store.is_index_publication_dirty());
     }
 
     #[test]
@@ -1050,6 +1331,12 @@ mod tests {
         let result = backup_save(&config).unwrap();
         assert!(output.exists());
         assert_eq!(result.manifest.instance_id, "bare-test");
+    }
+
+    #[test]
+    fn backup_sidecars_include_incomplete_extension_migration_journal() {
+        assert!(SIDECAR_SUFFIXES.contains(&".extensions.migration.json"));
+        assert!(SIDECAR_SUFFIXES.contains(&".extensions.handoff.json"));
     }
 
     #[test]

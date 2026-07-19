@@ -1,10 +1,20 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::error::StoreError;
 use crate::ranking::QueryIntent;
+
+/// Typed results for the two durable embedding reconciliation sub-stages.
+/// Legacy retirement is not attempted until canonical persistence succeeds.
+#[derive(Debug)]
+pub struct EmbeddingIndexReconciliation {
+    pub removed: usize,
+    pub canonical_persistence: Result<(), StoreError>,
+    pub legacy_retirement: Option<Result<bool, StoreError>>,
+}
 
 /// Cached PPR adjacency graph keyed on `(graph_generation, scope_hash, intent)`.
 ///
@@ -31,6 +41,153 @@ pub(crate) struct PprGraphCached {
     pub out_weight: Vec<f64>,
 }
 
+#[derive(Default)]
+struct IndexPublicationLeaseState {
+    owner: Option<u64>,
+    next_token: u64,
+    waiters: usize,
+}
+
+#[derive(Default)]
+struct IndexPublicationLeaseCoordinator {
+    state: Mutex<IndexPublicationLeaseState>,
+    available: Condvar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexPublicationReservationState {
+    Unreserved,
+    Fresh,
+    Recovered,
+}
+
+#[derive(Debug)]
+struct IndexPublicationGenerationReservation {
+    generation: u64,
+    recovered: bool,
+}
+
+/// Exclusive, Send-safe ownership of one graph publication lifetime.
+///
+/// The lease holds no mutex guard. A publisher owns it from before marker
+/// establishment through every graph mutation and durable finalization. If it
+/// is dropped early, only live-process exclusivity is released: the dirty
+/// marker and reserved generation remain fail-closed for the next owner to
+/// recover.
+#[must_use = "hold the publication lease through graph mutation and durable finalization"]
+pub struct IndexPublicationLease<'a> {
+    store: &'a GraphStore,
+    token: u64,
+    reservation: Cell<IndexPublicationReservationState>,
+    released: bool,
+}
+
+impl std::fmt::Debug for IndexPublicationLease<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexPublicationLease")
+            .field("token", &self.token)
+            .field("reservation", &self.reservation.get())
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IndexPublicationLease<'_> {
+    /// The store whose publication lifetime this lease exclusively owns.
+    pub fn store(&self) -> &GraphStore {
+        self.store
+    }
+
+    /// Verify that dirty N+1 and clean N+2 remain available.
+    pub fn preflight_generation(&self) -> Result<(), StoreError> {
+        self.store
+            .preflight_index_publication_generation(self.token)
+    }
+
+    /// Verify that an in-memory publication has one successor available.
+    pub fn preflight_transient_generation(&self) -> Result<(), StoreError> {
+        self.store
+            .preflight_transient_index_publication_generation(self.token)
+    }
+
+    /// Reserve or recover the dirty N+1 generation for this owner.
+    pub fn reserve_generation(&self) -> Result<u64, StoreError> {
+        let prior = self.reservation.get();
+        let reserved = self
+            .store
+            .reserve_index_publication_generation(self.token)?;
+        if prior == IndexPublicationReservationState::Unreserved {
+            self.reservation.set(if reserved.recovered {
+                IndexPublicationReservationState::Recovered
+            } else {
+                IndexPublicationReservationState::Fresh
+            });
+        }
+        Ok(reserved.generation)
+    }
+
+    /// Whether this owner inherited an already-dirty publication.
+    pub fn is_recovered(&self) -> bool {
+        self.reservation.get() == IndexPublicationReservationState::Recovered
+    }
+
+    /// Refuse snapshot reads unless this owner acquired a fully clean store.
+    pub fn ensure_clean_for_snapshot(&self) -> Result<(), StoreError> {
+        self.store
+            .ensure_clean_index_publication_for_snapshot(self.token)
+    }
+
+    /// Return the clean N+2 generation prepared by this owner.
+    pub fn clean_generation(&self) -> Result<u64, StoreError> {
+        self.store.clean_index_publication_generation(self.token)
+    }
+
+    /// Make this owner's prepared clean generation live.
+    pub fn publish_clean_generation(&self) -> Result<u64, StoreError> {
+        self.store
+            .publish_clean_index_publication_generation(self.token)
+    }
+
+    /// Preserve fail-closed monotonicity after marker retirement failed.
+    pub fn fail_clean_generation(&self) -> Result<(), StoreError> {
+        self.store
+            .fail_clean_index_publication_generation(self.token)
+    }
+
+    /// Retire this owner's in-memory dirty generation reservation.
+    pub fn complete_generation(&self) -> Result<(), StoreError> {
+        self.store.complete_index_publication_generation(self.token)
+    }
+
+    /// Restore the prior canonical generation when no graph mutation occurred.
+    pub fn cancel_generation(&self) -> Result<(), StoreError> {
+        if self.reservation.get() != IndexPublicationReservationState::Fresh {
+            return Err(StoreError::Query(
+                "only a fresh index publication owner may cancel its generation".into(),
+            ));
+        }
+        self.store.cancel_index_publication_generation(self.token)
+    }
+
+    /// Release live-process ownership after explicit successful publication.
+    pub fn release(mut self) -> Result<(), StoreError> {
+        self.store.release_index_publication_lease(self.token)?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for IndexPublicationLease<'_> {
+    fn drop(&mut self) {
+        if !self.released
+            && let Err(error) = self.store.release_index_publication_lease(self.token)
+        {
+            tracing::error!(%error, "failed to release index publication lease");
+        }
+    }
+}
+
 /// GraphStore wraps a LadybugDB database for storing and querying the code knowledge graph.
 ///
 /// Each method creates a fresh Connection internally, which is the simplest safe pattern
@@ -42,10 +199,27 @@ pub struct GraphStore {
     /// clients (the watcher, the MCP server, downstream tools) detect when
     /// their cached scores are stale without comparing entire score maps.
     pub(crate) pagerank_generation: AtomicU64,
+    /// Serializes lazy PageRank computation and graph-publication cache state.
+    /// `ensure_pagerank_loaded` uses it so N concurrent first-touch callers
+    /// produce exactly one compute instead of N duplicate full computes
+    /// (nw-029). Dirty-marker transitions, invalidation, and generation-keyed
+    /// cache fills also take it so in-flight readers cannot republish stale
+    /// state after an index publication transition.
+    pub(crate) pagerank_compute_lock: Mutex<()>,
     /// Monotonic counter that bumps whenever the graph data changes (nodes
     /// or edges added/removed). Lets the web UI and other consumers detect
     /// when their view of the graph is stale without diffing the full graph.
     pub(crate) graph_generation: AtomicU64,
+    /// Last canonical generation while an index publication is dirty. A
+    /// present value means `graph_generation` is either its dirty N+1
+    /// reservation or the prepared clean N+2 publication. Keeping this
+    /// recovery state separate prevents an ephemeral fail-closed value from
+    /// becoming a wrapping persisted counter.
+    pub(crate) index_publication_generation_base: Mutex<Option<u64>>,
+    /// Serializes complete marker→mutation→finalization publication lifetimes.
+    /// The condition-variable state stores only an opaque owner token; lease
+    /// holders never retain a mutex guard while doing graph or sidecar I/O.
+    index_publication_lease: IndexPublicationLeaseCoordinator,
     /// Optional interaction memory scores keyed by node UID. When loaded,
     /// PPR's personalization vector blends a small fraction of these scores
     /// to boost nodes the user has frequently accessed.
@@ -152,7 +326,10 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -178,7 +355,10 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -203,7 +383,10 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -253,7 +436,10 @@ impl GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
             pagerank_generation: AtomicU64::new(0),
+            pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -281,6 +467,59 @@ impl GraphStore {
     /// consulted them.
     pub fn is_pagerank_stale(&self, observed: u64) -> bool {
         observed < self.pagerank_generation()
+    }
+
+    /// nw-055 (P1b): drop the in-memory PageRank score cache so the next rank
+    /// query recomputes fresh.
+    ///
+    /// The `pagerank_cache` score map is NOT generation-keyed, so bumping the
+    /// graph generation after a deletion (which invalidates the
+    /// generation-keyed `symbol_name_cache` / `ppr_graph_cache`) does NOT
+    /// refresh these scores — a rank query after a code-repo removal would
+    /// keep serving scores computed over the pre-deletion graph (surviving
+    /// nodes' scores still reflecting the removed nodes' edges). Delete RPCs
+    /// that remove CODE repos (`remove_repo`, `prune_stale`) call this so the
+    /// next `ensure_pagerank_loaded` recomputes via the nw-029 single-flight.
+    /// Lazy (recompute on next rank query) rather than eager, matching nw-029.
+    pub fn invalidate_pagerank(&self) {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.invalidate_ranking_caches_locked();
+    }
+
+    pub(crate) fn invalidate_ranking_caches_locked(&self) {
+        *self
+            .pagerank_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .ppr_graph_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.ppr_result_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .symbol_name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Run a publication marker transition while excluding PageRank readers,
+    /// computations, and generation-keyed cache publication, then discard
+    /// caches before releasing them. Establishment and retirement both use
+    /// this barrier so no dirty-window state can survive publication.
+    pub fn with_index_publication_rank_barrier<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = operation();
+        self.invalidate_ranking_caches_locked();
+        result
     }
 
     /// Load pre-computed interaction memory scores into the in-memory cache.
@@ -386,13 +625,339 @@ impl GraphStore {
     /// that modifies the graph. The web server can poll this to detect when to
     /// push an SSE event to connected clients.
     pub fn bump_graph_generation(&self) {
-        self.graph_generation.fetch_add(1, Ordering::AcqRel);
+        if let Err(error) = self.try_bump_graph_generation() {
+            tracing::error!(%error, "refusing to wrap exhausted graph generation");
+        }
+    }
+
+    /// Advance the live generation without ever wrapping to a reused value.
+    pub fn try_bump_graph_generation(&self) -> Result<u64, StoreError> {
+        let reservation = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if reservation.is_some() {
+            return Err(StoreError::Query(
+                "index publication generation is already reserved".to_string(),
+            ));
+        }
+        self.graph_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| StoreError::Query("graph generation exhausted".to_string()))
+    }
+
+    /// Wait for exclusive ownership of a complete index publication lifetime.
+    ///
+    /// Acquisition is blocking and intended for the engine's synchronous
+    /// indexing and watcher paths. The returned lease is `Send` and holds no
+    /// mutex guard, so moving the synchronous work to a blocking worker thread
+    /// remains safe.
+    pub fn acquire_index_publication_lease(&self) -> Result<IndexPublicationLease<'_>, StoreError> {
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut registered_waiter = false;
+        while state.owner.is_some() {
+            if !registered_waiter {
+                state.waiters = state.waiters.checked_add(1).ok_or_else(|| {
+                    StoreError::Query("index publication waiter count exhausted".into())
+                })?;
+                registered_waiter = true;
+                self.index_publication_lease.available.notify_all();
+            }
+            state = self
+                .index_publication_lease
+                .available
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        if registered_waiter {
+            state.waiters -= 1;
+        }
+        let token = state.next_token;
+        state.next_token = token.checked_add(1).ok_or_else(|| {
+            StoreError::Query("index publication ownership token exhausted".into())
+        })?;
+        state.owner = Some(token);
+        Ok(IndexPublicationLease {
+            store: self,
+            token,
+            reservation: Cell::new(IndexPublicationReservationState::Unreserved),
+            released: false,
+        })
+    }
+
+    /// Current number of publishers or snapshot readers waiting for ownership.
+    #[doc(hidden)]
+    pub fn index_publication_waiter_count(&self) -> usize {
+        self.index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .waiters
+    }
+
+    /// Wait until at least `minimum` publication owners are registered as blocked.
+    #[doc(hidden)]
+    pub fn wait_for_index_publication_waiters(
+        &self,
+        minimum: usize,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while state.waiters < minimum {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timed) = self
+                .index_publication_lease
+                .available
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+            if timed.timed_out() && state.waiters < minimum {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn validate_index_publication_owner(&self, token: u64) -> Result<(), StoreError> {
+        let state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner == Some(token) {
+            Ok(())
+        } else {
+            Err(StoreError::Query(
+                "index publication lease is not owned by this token".into(),
+            ))
+        }
+    }
+
+    fn release_index_publication_lease(&self, token: u64) -> Result<(), StoreError> {
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner != Some(token) {
+            return Err(StoreError::Query(
+                "index publication lease release attempted by a non-owner".into(),
+            ));
+        }
+        state.owner = None;
+        drop(state);
+        self.index_publication_lease.available.notify_all();
+        Ok(())
+    }
+
+    /// Verify that both the dirty reservation and its distinct clean
+    /// publication generation are available.
+    fn preflight_index_publication_generation(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let canonical = (*base).unwrap_or_else(|| self.graph_generation());
+        canonical.checked_add(2).map(|_| ()).ok_or_else(|| {
+            StoreError::Query("graph generation exhausted during index publication".into())
+        })
+    }
+
+    /// Verify that an in-memory publication can advance once after its graph
+    /// mutation. Unlike a persistent publication, no dirty N+1 is exposed and
+    /// no distinct clean N+2 is required.
+    fn preflight_transient_index_publication_generation(
+        &self,
+        token: u64,
+    ) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if base.is_some() {
+            return Err(StoreError::Query(
+                "index publication generation is already reserved".into(),
+            ));
+        }
+        self.graph_generation()
+            .checked_add(1)
+            .map(|_| ())
+            .ok_or_else(|| {
+                StoreError::Query("graph generation exhausted during index publication".into())
+            })
+    }
+
+    /// Reserve the dirty generation for an in-progress publication. Repeated
+    /// calls during the same dirty recovery return the same N+1 value. The
+    /// clean N+2 successor is preflighted before changing live state.
+    fn reserve_index_publication_generation(
+        &self,
+        token: u64,
+    ) -> Result<IndexPublicationGenerationReservation, StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let mut base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(canonical) = *base {
+            canonical.checked_add(2).ok_or_else(|| {
+                StoreError::Query("graph generation exhausted during index publication".into())
+            })?;
+            let generation = canonical.checked_add(1).ok_or_else(|| {
+                StoreError::Query("graph generation exhausted during index publication".into())
+            })?;
+            return Ok(IndexPublicationGenerationReservation {
+                generation,
+                recovered: true,
+            });
+        }
+
+        let canonical = self.graph_generation();
+        canonical.checked_add(2).ok_or_else(|| {
+            StoreError::Query("graph generation exhausted during index publication".into())
+        })?;
+        let reserved = canonical.checked_add(1).ok_or_else(|| {
+            StoreError::Query("graph generation exhausted during index publication".into())
+        })?;
+        *base = Some(canonical);
+        self.graph_generation.store(reserved, Ordering::Release);
+        Ok(IndexPublicationGenerationReservation {
+            generation: reserved,
+            recovered: false,
+        })
+    }
+
+    /// Confirm that a lease acquired for backup/snapshot work did not inherit
+    /// an abandoned or active publication. Holding the lease makes this check
+    /// stable until the reader releases it.
+    fn ensure_clean_index_publication_for_snapshot(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let reserved = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some();
+        if reserved || self.is_index_publication_dirty() {
+            return Err(StoreError::Query(
+                "dirty index publication prevents a consistent snapshot".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return the distinct N+2 generation to persist for an active dirty
+    /// publication without exposing it to live cache consumers yet.
+    fn clean_index_publication_generation(&self, token: u64) -> Result<u64, StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let canonical = base.ok_or_else(|| {
+            StoreError::Query("index publication generation is not reserved".into())
+        })?;
+        canonical.checked_add(2).ok_or_else(|| {
+            StoreError::Query("graph generation exhausted during index publication".into())
+        })
+    }
+
+    /// Make the prepared N+2 generation live immediately before retiring the
+    /// dirty marker. Callers must hold the publication rank barrier.
+    fn publish_clean_index_publication_generation(&self, token: u64) -> Result<u64, StoreError> {
+        let clean = self.clean_index_publication_generation(token)?;
+        self.graph_generation.store(clean, Ordering::Release);
+        Ok(clean)
+    }
+
+    /// A marker-retirement failure may have briefly exposed the persisted
+    /// clean value. Treat it as the next canonical base and reserve a newer
+    /// dirty value so that generation can never be reused on retry.
+    fn fail_clean_index_publication_generation(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let mut base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(canonical) = *base
+            && let Some(clean) = canonical.checked_add(2)
+        {
+            *base = Some(clean);
+            self.graph_generation
+                .store(clean.saturating_add(1), Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Mark a durably published reserved generation as canonical.
+    fn complete_index_publication_generation(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
+        *self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        Ok(())
+    }
+
+    /// Restore the canonical generation when a marker was established but no
+    /// graph mutation was attempted.
+    fn cancel_index_publication_generation(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let mut base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(canonical) = base.take() {
+            self.graph_generation.store(canonical, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_index_publication_generation_on_clean_load(&self) {
+        *self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     /// The on-disk database path this store was opened from, when known
     /// (`None` for in-memory stores). Lets callers locate sidecars.
     pub fn db_path(&self) -> Option<&Path> {
         self.db_path.as_deref()
+    }
+
+    /// Whether an indexing writer durably marked graph publication incomplete.
+    /// While this marker exists, or its state cannot be determined, canonical
+    /// generation and PageRank sidecars may predate the committed graph and
+    /// must not be treated as authoritative.
+    pub fn is_index_publication_dirty(&self) -> bool {
+        self.db_path.as_ref().is_some_and(|path| {
+            Self::index_publication_marker_for(path)
+                .try_exists()
+                .unwrap_or(true)
+        })
+    }
+
+    fn index_publication_marker_for(db_path: &Path) -> PathBuf {
+        let mut value = db_path.as_os_str().to_owned();
+        value.push(".index-dirty");
+        PathBuf::from(value)
     }
 
     /// Path to the `<db>.generation` sidecar. For in-memory stores (no
@@ -499,6 +1064,60 @@ impl GraphStore {
                 .map_err(|e| StoreError::Query(format!("save binary embedding sidecar: {e}")))?;
         }
         Ok(())
+    }
+
+    /// Remove embeddings for graph nodes that no longer exist, update the
+    /// live index, and persist the repaired binary sidecar.
+    ///
+    /// The live UID set is read after graph mutation, so partial multi-step
+    /// deletes preserve vectors for nodes that survived. Once the binary
+    /// sidecar is durable, the legacy JSON fallback is removed so a later
+    /// binary read failure cannot resurrect stale vectors.
+    pub fn reconcile_embedding_index(&self) -> Result<usize, StoreError> {
+        let stages = self.reconcile_embedding_index_stages()?;
+        stages.canonical_persistence?;
+        if let Some(retirement) = stages.legacy_retirement {
+            retirement?;
+        }
+        Ok(stages.removed)
+    }
+
+    /// Reconcile the live embedding index while retaining typed persistence
+    /// and legacy-retirement results for aggregate deletion finalizers.
+    pub fn reconcile_embedding_index_stages(
+        &self,
+    ) -> Result<EmbeddingIndexReconciliation, StoreError> {
+        let live_uids = self.live_embedding_node_uids()?;
+        let removed = {
+            let mut idx = self
+                .embedding_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            idx.retain_uids(&live_uids)
+        };
+
+        let canonical_persistence = self.flush_embedding_index();
+        let legacy_retirement = if canonical_persistence.is_ok() {
+            self.db_path.as_ref().map(|db_path| {
+                let legacy_path = Self::embedding_sidecar_json_for(db_path);
+                crate::durable_sidecar::remove_file_durable_if_exists(&legacy_path).map_err(
+                    |error| {
+                        StoreError::Query(format!(
+                            "remove legacy embedding sidecar {}: {error}",
+                            legacy_path.display()
+                        ))
+                    },
+                )
+            })
+        } else {
+            None
+        };
+
+        Ok(EmbeddingIndexReconciliation {
+            removed,
+            canonical_persistence,
+            legacy_retirement,
+        })
     }
 
     /// Perform a vector similarity search over the embedding index.
@@ -1032,6 +1651,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn index_publication_lease_is_send_without_a_held_mutex_guard() {
+        fn assert_send<T: Send>() {}
+        assert_send::<IndexPublicationLease<'static>>();
+    }
+
+    #[test]
+    fn non_owner_token_cannot_change_publication_generation_state() {
+        let store = GraphStore::in_memory().unwrap();
+        let owner = store.acquire_index_publication_lease().unwrap();
+        let impostor = owner.token.wrapping_add(1);
+
+        assert!(
+            store
+                .reserve_index_publication_generation(impostor)
+                .unwrap_err()
+                .to_string()
+                .contains("not owned")
+        );
+        assert_eq!(owner.reserve_generation().unwrap(), 1);
+        assert!(
+            store
+                .complete_index_publication_generation(impostor)
+                .unwrap_err()
+                .to_string()
+                .contains("not owned")
+        );
+        assert_eq!(store.graph_generation(), 1);
+    }
+
+    #[test]
+    fn in_memory_publication_preflight_rejects_exhaustion_before_graph_mutation() {
+        let store = GraphStore::in_memory().unwrap();
+        store.graph_generation.store(u64::MAX, Ordering::Release);
+        let publication = store.acquire_index_publication_lease().unwrap();
+
+        let result = (|| -> Result<(), StoreError> {
+            publication.preflight_transient_generation()?;
+            store.insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:must-not-exist".into(),
+                url: "https://example.test/must-not-exist".into(),
+                indexed_sha: "never".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+        })();
+
+        assert!(result.unwrap_err().to_string().contains("exhausted"));
+        assert!(store.lookup_repo("repo:must-not-exist").unwrap().is_none());
+        assert_eq!(store.graph_generation(), u64::MAX);
+    }
+
+    #[test]
+    fn in_memory_publication_preflight_allows_exactly_one_remaining_successor() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .graph_generation
+            .store(u64::MAX - 1, Ordering::Release);
+        let publication = store.acquire_index_publication_lease().unwrap();
+
+        publication.preflight_transient_generation().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:last-generation".into(),
+                url: "https://example.test/last-generation".into(),
+                indexed_sha: "last".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.try_bump_graph_generation().unwrap(), u64::MAX);
+        assert!(store.lookup_repo("repo:last-generation").unwrap().is_some());
+    }
+
+    #[test]
     fn stale_checkpoint_error_recognized() {
         let real = "Runtime exception: Database ID for temporary file \
                     '/x/db.lbug.wal.checkpoint' does not match the current database. \
@@ -1102,6 +1800,121 @@ mod tests {
             reopened.graph_generation(),
             2,
             "generation must survive reopen and NOT reset to 0"
+        );
+    }
+
+    #[test]
+    fn dirty_index_publication_ignores_stale_generation_and_pagerank_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = PathBuf::from(format!("{}.generation", db_path.display()));
+        let pagerank_path = PathBuf::from(format!("{}.pagerank.json", db_path.display()));
+        let dirty_path = PathBuf::from(format!("{}.index-dirty", db_path.display()));
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            for _ in 0..7 {
+                store.bump_graph_generation();
+            }
+            store.save_graph_generation(&generation_path).unwrap();
+        }
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        std::fs::write(&dirty_path, b"dirty").unwrap();
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_ne!(
+            reopened.graph_generation(),
+            7,
+            "a dirty publication must not restore the stale canonical generation"
+        );
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(
+            !reopened.pagerank_scores().contains_key("stale"),
+            "a dirty publication must not load canonical PageRank from before the graph commit"
+        );
+    }
+
+    #[test]
+    fn unreadable_index_publication_marker_fails_closed_for_generation_and_pagerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = PathBuf::from(format!("{}.generation", db_path.display()));
+        let pagerank_path = PathBuf::from(format!("{}.pagerank.json", db_path.display()));
+        let dirty_path = PathBuf::from(format!("{}.index-dirty", db_path.display()));
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            for _ in 0..7 {
+                store.bump_graph_generation();
+            }
+            store.save_graph_generation(&generation_path).unwrap();
+        }
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        std::fs::create_dir(&dirty_path).unwrap();
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            reopened.graph_generation(),
+            8,
+            "an unreadable marker must reserve the monotonic canonical successor"
+        );
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(
+            !reopened.pagerank_scores().contains_key("stale"),
+            "an unreadable marker must make canonical PageRank non-authoritative"
+        );
+    }
+
+    #[test]
+    fn graph_generation_never_wraps_at_counter_exhaustion() {
+        let store = GraphStore::in_memory().unwrap();
+        store.graph_generation.store(u64::MAX, Ordering::Release);
+
+        store.bump_graph_generation();
+
+        assert_eq!(
+            store.graph_generation(),
+            u64::MAX,
+            "generation exhaustion must never wrap to a reused value"
+        );
+    }
+
+    #[test]
+    fn embedding_reconciliation_preserves_typed_legacy_retirement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let mut legacy_path = db_path.as_os_str().to_owned();
+        legacy_path.push(".embeddings");
+        let legacy_path = std::path::PathBuf::from(legacy_path);
+        std::fs::create_dir(&legacy_path).unwrap();
+
+        let result = store.reconcile_embedding_index_stages().unwrap();
+
+        assert!(result.canonical_persistence.is_ok());
+        assert!(result.legacy_retirement.unwrap().is_err());
+    }
+
+    #[test]
+    fn embedding_reconciliation_surfaces_durable_legacy_retirement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let legacy_path = GraphStore::embedding_sidecar_json_for(&db_path);
+        std::fs::write(&legacy_path, b"legacy").unwrap();
+
+        let result = crate::durable_sidecar::with_test_fault(
+            crate::durable_sidecar::TestFault::Remove,
+            || store.reconcile_embedding_index_stages(),
+        )
+        .unwrap();
+
+        assert!(result.canonical_persistence.is_ok());
+        let retirement = result.legacy_retirement.unwrap().unwrap_err();
+        assert!(retirement.to_string().contains("legacy embedding sidecar"));
+        assert!(
+            legacy_path.exists(),
+            "failed retirement must preserve fallback"
         );
     }
 }

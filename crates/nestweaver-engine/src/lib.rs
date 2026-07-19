@@ -152,6 +152,7 @@ pub use config::{
     RankingConfig, RepoConfig, RepoType, ResponseConfig, SchemaExtensions, SeedResolutionConfig,
     StorageConfig, UpstreamEntry, WikiSourceConfig, WorkspaceConfig, append_repo_to_config_file,
     default_kind_priority, default_test_path_patterns, remove_repo_from_config_file,
+    validate_instance_id,
 };
 pub use contract_change::breaking_changes_from_git;
 pub use cross_domain::{
@@ -174,8 +175,14 @@ pub use eval::{
 pub use export::{export_cypher, export_graphml, export_mermaid};
 pub use export_graph::export_in_memory_graph;
 pub use extensions::{
-    ExtensionStore, get_all_properties, get_last_indexed_at, get_property, load_extensions,
-    query_by_property, record_last_indexed_at, save_extensions, set_property,
+    ExtensionStore, InstanceExtensionMigration, InstanceMigrationFinalizerPlan,
+    finalize_instance_extension_migration, get_all_properties, get_last_indexed_at, get_property,
+    load_extensions, load_live_extensions, mark_instance_extension_migration_graph_applied,
+    mark_instance_extension_migration_reconciled, pending_instance_extension_migration,
+    prepare_instance_extension_migration, prepare_instance_extension_migration_with_finalizers,
+    prepare_instance_uid_migration_with_finalizers, query_by_property,
+    reconcile_deleted_extension_uids, reconcile_extension_handoffs, reconcile_extension_liveness,
+    record_last_indexed_at, remove_extension_uid_durable, save_extensions, set_property,
 };
 pub use guide_rules::{
     HARD_RULES, OwnedRule, RULES_VERSION, Rule, parse_rules_override, render_owned_rules_markdown,
@@ -183,11 +190,14 @@ pub use guide_rules::{
 };
 pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
-    CachedFileMeta, FileMetaCache, IncrementalResult, IndexResult, incremental_index,
-    incremental_index_with_name, index_directory, index_directory_in_memory,
-    index_directory_with_options, index_directory_with_store,
+    CachedFileMeta, DeletedEmbeddingStateReconciliation, DeletedGraphStateReconciliation,
+    DeletionReconciliationError, DeletionReconciliationFailure, DeletionReconciliationStage,
+    FILEMETA_VERSION, FileMetaCache, FileMetaSidecar, IncrementalResult, IndexResult,
+    finalize_code_graph_deletion, incremental_index, incremental_index_with_name, index_directory,
+    index_directory_in_memory, index_directory_with_options, index_directory_with_store,
     index_directory_with_store_cancellable, index_with_reader, index_with_reader_and_write_gate,
-    load_filemeta_cache, save_filemeta_cache,
+    load_filemeta_sidecar, reconcile_deleted_graph_state, remove_repo_sidecar_slices,
+    save_filemeta_sidecar,
 };
 pub use index_md::{
     MarkdownIndexResult, MarkdownSinceResult, index_markdown_directory,
@@ -207,7 +217,10 @@ pub use investigate::{
     NeighborRef, bundle_sidecar_path, investigate, investigate_expand, investigate_hydrate,
     load_bundle, load_bundle_store, save_bundle_store,
 };
-pub use manifest::{ManifestInfo, load_manifest_cache, parse_manifest, save_manifest_cache};
+pub use manifest::{
+    ManifestInfo, load_manifest_cache, load_manifest_cache_for_db, manifest_cache_path,
+    parse_manifest, save_manifest_cache, save_manifest_cache_for_db,
+};
 pub use process::{
     AffectedProcess, AffectedSymbol, ChangeImpact, ProcessMember, ProcessResult, RiskLevel,
     detect_changes_impact, trace_processes,

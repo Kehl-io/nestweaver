@@ -37,6 +37,36 @@ pub struct CodeWatcher {
 }
 
 impl CodeWatcher {
+    fn establish_graph_publication_with_io<'a>(
+        &self,
+        store: &'a GraphStore,
+        io: &dyn crate::index::IndexEpilogueIo,
+    ) -> Result<
+        nestweaver_store::IndexPublicationLease<'a>,
+        crate::index::DeletionReconciliationError,
+    > {
+        crate::index::establish_index_publication_marker_with_io(
+            store,
+            Some(&self.db_path),
+            "code watcher batch",
+            io,
+        )
+    }
+
+    fn finalize_graph_publication_with_io(
+        &self,
+        publication: nestweaver_store::IndexPublicationLease<'_>,
+        io: &dyn crate::index::IndexEpilogueIo,
+    ) -> Result<(), crate::index::DeletionReconciliationError> {
+        crate::index::finalize_committed_index_for_scope_with_io(
+            publication,
+            Some(&self.db_path),
+            "code watcher batch",
+            io,
+            Some(&GraphScope::code_only()),
+        )
+    }
+
     pub fn new(
         db_path: impl Into<PathBuf>,
         repo_root: impl Into<PathBuf>,
@@ -99,7 +129,11 @@ impl CodeWatcher {
         // File and Symbol nodes. If there's no prior index we create a
         // minimal Repo node; the watcher will populate it file-by-file.
         if store.lookup_repo(&r_uid)?.is_none() {
-            store
+            let publication = self.establish_graph_publication_with_io(
+                &store,
+                &crate::index::FileSystemIndexEpilogueIo,
+            )?;
+            let insert_result = store
                 .insert_repo(&nestweaver_schema::Repo {
                     uid: r_uid.clone(),
                     url: repo_url.clone(),
@@ -109,7 +143,21 @@ impl CodeWatcher {
                     name: None,
                     root_path: Some(root_path.clone()),
                 })
-                .context("insert initial Repo node")?;
+                .context("insert initial Repo node");
+            let finalization = self.finalize_graph_publication_with_io(
+                publication,
+                &crate::index::FileSystemIndexEpilogueIo,
+            );
+            match (insert_result, finalization) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) => return Err(error),
+                (Ok(()), Err(error)) => return Err(error.into()),
+                (Err(error), Err(finalization)) => {
+                    return Err(error.context(format!(
+                        "initial Repo insert also failed mandatory publication: {finalization}"
+                    )));
+                }
+            }
         }
 
         // Channel from the debouncer into our loop.
@@ -192,8 +240,17 @@ impl CodeWatcher {
                 continue;
             }
 
+            // Publish a dirty marker and reserve N+1 before the first graph
+            // mutation. Any later error leaves reopen fail-closed until the
+            // mandatory N+2 finalization completes.
+            let publication = self.establish_graph_publication_with_io(
+                &store,
+                &crate::index::FileSystemIndexEpilogueIo,
+            )?;
+
             let start = Instant::now();
             let mut files_processed = 0usize;
+            let mut batch_failures = Vec::new();
 
             for path in &relevant {
                 let rel_path = match path.strip_prefix(&self.repo_root) {
@@ -210,7 +267,14 @@ impl CodeWatcher {
 
                 if path.exists() {
                     // File was created or modified: delete old data, re-parse, re-insert.
-                    let removed = store.delete_symbols_in_file(&r_uid, &rel_str).unwrap_or(0);
+                    let removed = match store.delete_symbols_in_file(&r_uid, &rel_str) {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            batch_failures
+                                .push(format!("delete stale symbols for {}: {error}", rel_str));
+                            0
+                        }
+                    };
                     if removed > 0 {
                         tracing::debug!(
                             path = %rel_str,
@@ -229,6 +293,7 @@ impl CodeWatcher {
                             files_processed += 1;
                         }
                         Err(e) => {
+                            batch_failures.push(format!("re-index {}: {e:#}", rel_str));
                             tracing::warn!(
                                 path = %rel_str,
                                 error = %e,
@@ -238,9 +303,21 @@ impl CodeWatcher {
                     }
                 } else {
                     // File was deleted: remove its symbols and File node.
-                    let removed = store.delete_symbols_in_file(&r_uid, &rel_str).unwrap_or(0);
+                    let removed = match store.delete_symbols_in_file(&r_uid, &rel_str) {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            batch_failures.push(format!(
+                                "delete symbols for removed file {}: {error}",
+                                rel_str
+                            ));
+                            0
+                        }
+                    };
                     let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
-                    let _ = store.delete_file_node(&f_uid);
+                    if let Err(error) = store.delete_file_node(&f_uid) {
+                        batch_failures
+                            .push(format!("delete removed File node {}: {error}", rel_str));
+                    }
                     if removed > 0 {
                         tracing::debug!(
                             path = %rel_str,
@@ -252,15 +329,11 @@ impl CodeWatcher {
                 }
             }
 
-            if files_processed > 0 {
-                // Recompute PageRank so queries reflect the updated graph.
-                if let Err(e) = store.compute_pagerank(0.85, 20, &GraphScope::code_only()) {
-                    tracing::warn!("post-batch PageRank recompute failed: {e}");
-                } else {
-                    let pr_path = crate::sidecar_path(&self.db_path, ".pagerank.json");
-                    let _ = store.save_pagerank_cache(&pr_path);
-                }
-
+            let finalization = self.finalize_graph_publication_with_io(
+                publication,
+                &crate::index::FileSystemIndexEpilogueIo,
+            );
+            if finalization.is_ok() {
                 let duration = start.elapsed();
                 tracing::info!(
                     files_processed,
@@ -270,15 +343,18 @@ impl CodeWatcher {
                     duration.as_secs_f64()
                 );
 
-                // Bump the graph generation counter so consumers (e.g. the
-                // web server SSE handler) can detect that the graph changed.
-                // P0.2: also persist it to `<db>.generation` so short-lived
-                // processes (and the F16 cache) see the bump after restart.
-                let gen_sidecar = crate::sidecar_path(&self.db_path, ".generation");
-                store.bump_and_persist_graph_generation(&gen_sidecar);
                 if let Some(ref cb) = on_change {
                     cb();
                 }
+            }
+            if let Err(error) = finalization {
+                batch_failures.push(format!("mandatory graph publication: {error}"));
+            }
+            if !batch_failures.is_empty() {
+                anyhow::bail!(
+                    "code watcher batch failed after committed graph work: {}",
+                    batch_failures.join("; ")
+                );
             }
         }
     }
@@ -506,6 +582,93 @@ fn reindex_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailingGenerationPublicationIo;
+
+    impl crate::index::IndexEpilogueIo for FailingGenerationPublicationIo {
+        fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.establish_marker(path)
+        }
+
+        fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.clear_marker(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.remove_file(path)
+        }
+
+        fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.rename_file(from, to)
+        }
+
+        fn save_generation(
+            &self,
+            _store: &GraphStore,
+            _path: &Path,
+            _generation: u64,
+        ) -> Result<(), anyhow::Error> {
+            anyhow::bail!("injected watcher generation save failure")
+        }
+
+        fn compute_pagerank(
+            &self,
+            store: &GraphStore,
+            scope: &GraphScope,
+        ) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.compute_pagerank(store, scope)
+        }
+
+        fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.save_pagerank(store, path)
+        }
+    }
+
+    #[test]
+    fn watcher_generation_failure_keeps_reopen_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir(&repo_root).unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let stale_generation = store.graph_generation();
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let watcher = CodeWatcher::new(&db_path, &repo_root, "test");
+
+        let publication = watcher
+            .establish_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo)
+            .unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:watcher-failure".into(),
+                url: "file:///watcher-failure".into(),
+                indexed_sha: "watch".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        let error = watcher
+            .finalize_graph_publication_with_io(publication, &FailingGenerationPublicationIo)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("generation-persistence"));
+        assert!(marker_path.exists());
+        assert!(!pagerank_path.exists());
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_ne!(reopened.graph_generation(), stale_generation);
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key("stale"));
+    }
 
     #[test]
     fn skip_dir_detection() {

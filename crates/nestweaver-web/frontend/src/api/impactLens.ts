@@ -76,8 +76,29 @@ export interface ImpactLensOptions {
   limit?: number;
 }
 
-async function request<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+const IMPACT_TIMEOUT_MS = 30_000;
+
+/** Thrown when an impact request exceeds IMPACT_TIMEOUT_MS. */
+export class ImpactTimeoutError extends Error {
+  constructor() {
+    super("Impact request timed out");
+    this.name = "ImpactTimeoutError";
+  }
+}
+
+async function request<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const timeout = AbortSignal.timeout(IMPACT_TIMEOUT_MS);
+  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  let response: Response;
+  try {
+    response = await fetch(url, { signal: combined });
+  } catch (err) {
+    // Distinguish our own timeout from a caller-initiated abort: the timeout
+    // signal firing means the backend was still computing (e.g. cold-DB
+    // PageRank) when the budget elapsed.
+    if (timeout.aborted) throw new ImpactTimeoutError();
+    throw err;
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
     throw new Error(body.error || response.statusText);
@@ -97,6 +118,7 @@ export function impactLensUrl(uid: string, options: ImpactLensOptions = {}): str
 export function loadImpactLens(
   uid: string,
   options: ImpactLensOptions = {},
+  signal?: AbortSignal,
 ): Promise<ImpactLensResponse> {
-  return request<ImpactLensResponse>(impactLensUrl(uid, options));
+  return request<ImpactLensResponse>(impactLensUrl(uid, options), signal);
 }

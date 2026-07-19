@@ -49,7 +49,7 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev pkg-config protobuf-compiler
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
@@ -68,19 +68,74 @@ jobs:
           linker = "aarch64-linux-gnu-gcc"
           rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
           EOF
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
       - name: Build frontend
         run: npm ci && npm run build
         working-directory: crates/nestweaver-web/frontend
+      - name: Build target OpenSSL
+        shell: bash
+        run: |
+          cargo build --locked --release --target "${{ matrix.target }}" -p openssl-sys
+          OPENSSL_INSTALL="$(find "target/${{ matrix.target }}/release/build" -type d -path '*/openssl-sys-*/out/openssl-build/install' -print -quit)"
+          test -n "$OPENSSL_INSTALL"
+          OPENSSL_INSTALL="$(cd "$OPENSSL_INSTALL" && pwd)"
+          test -f "$OPENSSL_INSTALL/lib/libssl.a"
+          test -f "$OPENSSL_INSTALL/lib/libcrypto.a"
+          test -f "$OPENSSL_INSTALL/include/openssl/ssl.h"
+          echo "OPENSSL_DIR=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
+          echo "OPENSSL_ROOT_DIR=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
+          echo "OPENSSL_LIB_DIR=$OPENSSL_INSTALL/lib" >> "$GITHUB_ENV"
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_INSTALL/include" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
           LBUG_BUILD_FROM_SOURCE: "1"
+      - name: Verify release binary
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/nestweaver"
+          FILE_INFO="$(file "$BIN")"
+          echo "$FILE_INFO"
+
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu) echo "$FILE_INFO" | grep -q 'x86-64' ;;
+            aarch64-unknown-linux-gnu) echo "$FILE_INFO" | grep -Eq 'ARM aarch64|ARM64' ;;
+            x86_64-apple-darwin) echo "$FILE_INFO" | grep -q 'x86_64' ;;
+            aarch64-apple-darwin) echo "$FILE_INFO" | grep -Eq 'arm64|ARM64' ;;
+          esac
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            otool -L "$BIN" | tee linked-libraries.txt
+            if grep -Eq '/opt/homebrew|/usr/local|libssl|libcrypto' linked-libraries.txt; then
+              echo "release binary has a non-system OpenSSL dependency" >&2
+              exit 1
+            fi
+          else
+            readelf -d "$BIN" | tee linked-libraries.txt
+            if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' linked-libraries.txt; then
+              echo "release binary has a dynamic OpenSSL dependency" >&2
+              exit 1
+            fi
+          fi
+
+          HOST="$(uname -s)-$(uname -m)"
+          case "$HOST:${{ matrix.target }}" in
+            Linux-x86_64:x86_64-unknown-linux-gnu|Darwin-x86_64:x86_64-apple-darwin|Darwin-arm64:aarch64-apple-darwin)
+              "$BIN" --version
+              ;;
+          esac
       - name: Package binary
         run: |
           BIN="target/${{ matrix.target }}/release/nestweaver"
@@ -90,7 +145,7 @@ jobs:
       - name: Generate SHA-256 checksum
         run: shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ env.ARCHIVE }}
       - name: Upload release artifact
@@ -108,9 +163,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
       # The wrapper's postinstall downloads the matching release binary, so it
       # must publish only after the `build` job has uploaded the assets for

@@ -106,6 +106,48 @@ pub struct BrainWatcher {
 }
 
 impl BrainWatcher {
+    fn event_targets_graph(&self, event: &DebouncedEvent) -> bool {
+        let path = &event.path;
+        if !is_markdown(path) || path_in_skip_dir(path) {
+            return false;
+        }
+        let rel_path = path
+            .strip_prefix(&self.vault_root)
+            .unwrap_or(path)
+            .to_string_lossy();
+        !crate::brainignore::is_ignored(&rel_path, &self.ignore_set)
+    }
+
+    fn establish_graph_publication_with_io<'a>(
+        &self,
+        store: &'a GraphStore,
+        io: &dyn crate::index::IndexEpilogueIo,
+    ) -> Result<
+        nestweaver_store::IndexPublicationLease<'a>,
+        crate::index::DeletionReconciliationError,
+    > {
+        crate::index::establish_index_publication_marker_with_io(
+            store,
+            Some(&self.db_path),
+            "brain watcher batch",
+            io,
+        )
+    }
+
+    fn finalize_graph_publication_with_io(
+        &self,
+        publication: nestweaver_store::IndexPublicationLease<'_>,
+        io: &dyn crate::index::IndexEpilogueIo,
+    ) -> Result<(), crate::index::DeletionReconciliationError> {
+        crate::index::finalize_committed_index_for_scope_with_io(
+            publication,
+            Some(&self.db_path),
+            "brain watcher batch",
+            io,
+            Some(&GraphScope::unified()),
+        )
+    }
+
     pub fn new(
         db_path: impl Into<PathBuf>,
         vault_root: impl Into<PathBuf>,
@@ -246,13 +288,35 @@ impl BrainWatcher {
         // Make sure the Vault node exists — first-time runs (no prior
         // `brain add`) still get a working graph.
         let v_uid = vault_uid(&self.instance_id, &self.vault_root.to_string_lossy());
-        ensure_vault(
+        let initial_publication = self.establish_graph_publication_with_io(
+            &store,
+            &crate::index::FileSystemIndexEpilogueIo,
+        )?;
+        let ensure_result = ensure_vault(
             &store,
             &v_uid,
             &self.vault_root,
             &self.instance_id,
             &self.vault_name,
-        )?;
+        );
+        let initial_finalization = self.finalize_graph_publication_with_io(
+            initial_publication,
+            &crate::index::FileSystemIndexEpilogueIo,
+        );
+        match (ensure_result, initial_finalization) {
+            (Ok(()), Ok(())) => {
+                if let Some(ref cb) = on_change {
+                    cb();
+                }
+            }
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error.into()),
+            (Err(error), Err(finalization)) => {
+                return Err(error.context(format!(
+                    "Vault upsert also failed mandatory publication: {finalization}"
+                )));
+            }
+        }
 
         // Channel from the debouncer into our loop.
         let (tx, rx) = std::sync::mpsc::channel::<DebounceResult>();
@@ -325,6 +389,18 @@ impl BrainWatcher {
                 }
             };
 
+            let graph_batch = batch.iter().any(|event| self.event_targets_graph(event));
+            let publication = if graph_batch {
+                // Establish the fail-closed marker before handle_event can
+                // cascade-delete a note and then fail during read or parse.
+                Some(self.establish_graph_publication_with_io(
+                    &store,
+                    &crate::index::FileSystemIndexEpilogueIo,
+                )?)
+            } else {
+                None
+            };
+
             // Pre-build the symbol index once per batch so cross-domain
             // refresh doesn't re-query the DB for every file.
             let symbol_index = crate::cross_domain::build_symbol_index(&store).ok();
@@ -344,7 +420,7 @@ impl BrainWatcher {
                 title_reverse.insert(n.uid.clone(), key);
             }
 
-            let mut any_change = false;
+            let mut batch_failures = Vec::new();
             for event in batch {
                 match self.handle_event(
                     &store,
@@ -355,16 +431,11 @@ impl BrainWatcher {
                     &mut title_forward,
                     &mut title_reverse,
                 ) {
-                    Ok(outcome) => {
-                        if matches!(
-                            outcome,
-                            UpdateOutcome::Updated { .. } | UpdateOutcome::Deleted { .. }
-                        ) {
-                            any_change = true;
-                        }
-                        log_outcome(&outcome);
+                    Ok(outcome) => log_outcome(&outcome),
+                    Err(e) => {
+                        batch_failures.push(format!("event handling failed: {e:#}"));
+                        tracing::warn!("event handling failed: {e:#}");
                     }
-                    Err(e) => tracing::warn!("event handling failed: {e:#}"),
                 }
             }
 
@@ -373,32 +444,36 @@ impl BrainWatcher {
             // Per the architecture doc §6.3: full recompute is fine for
             // <50K-node graphs (~milliseconds); true incremental
             // forward-push residuals are a later optimisation.
-            if any_change {
-                match store.compute_pagerank(0.85, 20, &GraphScope::unified()) {
-                    Ok(()) => {
-                        tracing::debug!(
-                            generation = store.pagerank_generation(),
-                            "PPR recomputed after watcher batch"
-                        );
+            if graph_batch {
+                let finalization = self.finalize_graph_publication_with_io(
+                    publication.expect("graph batch established publication lease"),
+                    &crate::index::FileSystemIndexEpilogueIo,
+                );
+                if finalization.is_ok() {
+                    tracing::debug!(
+                        generation = store.pagerank_generation(),
+                        "PPR durably published after watcher batch"
+                    );
+                    // Record the watcher commit timestamp so `brain status`
+                    // shows the actual last-indexed time, not max(modified_at).
+                    if let Err(e) = crate::extensions::record_last_indexed_at(&self.db_path, &v_uid)
+                    {
+                        batch_failures.push(format!("record last_indexed_at: {e:#}"));
                     }
-                    Err(e) => tracing::warn!("post-batch PPR recompute failed: {e}"),
-                }
 
-                // Record the watcher commit timestamp so `brain status`
-                // shows the actual last-indexed time, not max(modified_at).
-                if let Err(e) = crate::extensions::record_last_indexed_at(&self.db_path, &v_uid) {
-                    tracing::warn!("failed to record last_indexed_at: {e}");
+                    if let Some(ref cb) = on_change {
+                        cb();
+                    }
                 }
-
-                // Bump the graph generation counter so consumers (e.g. the
-                // web server SSE handler) can detect that the graph changed.
-                // P0.2: also persist it to `<db>.generation` so short-lived
-                // processes (and the F16 cache) see the bump after restart.
-                let gen_sidecar = crate::sidecar_path(&self.db_path, ".generation");
-                store.bump_and_persist_graph_generation(&gen_sidecar);
-                if let Some(ref cb) = on_change {
-                    cb();
+                if let Err(error) = finalization {
+                    batch_failures.push(format!("mandatory graph publication: {error}"));
                 }
+            }
+            if !batch_failures.is_empty() {
+                anyhow::bail!(
+                    "brain watcher batch failed after committed graph work: {}",
+                    batch_failures.join("; ")
+                );
             }
         }
     }
@@ -434,11 +509,22 @@ impl BrainWatcher {
                 );
                 // Load the existing cache, update this repo's entry, and save.
                 let repo_key = repo_path.to_string_lossy().into_owned();
-                match crate::manifest::load_manifest_cache(manifests_path) {
+                let canonical_manifests_path = crate::manifest::manifest_cache_path(&self.db_path);
+                let uses_canonical_path = manifests_path == &canonical_manifests_path;
+                let loaded = if uses_canonical_path {
+                    crate::manifest::load_manifest_cache_for_db(&self.db_path)
+                } else {
+                    crate::manifest::load_manifest_cache(manifests_path)
+                };
+                match loaded {
                     Ok(mut cache) => {
                         cache.insert(repo_key.clone(), manifest);
-                        if let Err(e) = crate::manifest::save_manifest_cache(&cache, manifests_path)
-                        {
+                        let saved = if uses_canonical_path {
+                            crate::manifest::save_manifest_cache_for_db(&cache, &self.db_path)
+                        } else {
+                            crate::manifest::save_manifest_cache(&cache, manifests_path)
+                        };
+                        if let Err(e) = saved {
                             tracing::warn!(
                                 "watcher: failed to save manifest cache after {}: {e}",
                                 path.display()
@@ -1010,6 +1096,124 @@ mod tests {
             fs::write(&p, content).unwrap();
         }
         (dir, root)
+    }
+
+    struct FailingPageRankRetirementIo;
+
+    impl crate::index::IndexEpilogueIo for FailingPageRankRetirementIo {
+        fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.establish_marker(path)
+        }
+
+        fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.clear_marker(path)
+        }
+
+        fn remove_file(&self, _path: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected watcher PageRank remove failure",
+            ))
+        }
+
+        fn rename_file(&self, _from: &Path, _to: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected watcher PageRank quarantine failure",
+            ))
+        }
+
+        fn save_generation(
+            &self,
+            store: &GraphStore,
+            path: &Path,
+            generation: u64,
+        ) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.save_generation(store, path, generation)
+        }
+
+        fn compute_pagerank(
+            &self,
+            store: &GraphStore,
+            scope: &GraphScope,
+        ) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.compute_pagerank(store, scope)
+        }
+
+        fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+            crate::index::FileSystemIndexEpilogueIo.save_pagerank(store, path)
+        }
+    }
+
+    #[test]
+    fn watcher_pagerank_retirement_failure_keeps_reopen_fail_closed() {
+        let (dir, root) = make_vault(&[]);
+        let db_path = dir.path().join("brain.lbug");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let stale_generation = store.graph_generation();
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "test", "test");
+
+        let publication = watcher
+            .establish_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo)
+            .unwrap();
+        ensure_vault(&store, "vault:watcher-failure", &root, "test", "test").unwrap();
+        let error = watcher
+            .finalize_graph_publication_with_io(publication, &FailingPageRankRetirementIo)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("persisted-pagerank"));
+        assert!(marker_path.exists());
+        assert!(pagerank_path.exists());
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_ne!(reopened.graph_generation(), stale_generation);
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key("stale"));
+    }
+
+    #[test]
+    fn canonical_manifest_watch_update_retires_legacy_sidecar() {
+        let (_dir, root) = make_vault(&[(
+            "package.json",
+            r#"{"name":"watched-package","dependencies":{"watched-dep":"1"}}"#,
+        )]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let legacy_path = db_path.with_extension("manifests.json");
+        crate::save_manifest_cache(&HashMap::new(), &legacy_path).unwrap();
+        let canonical_path = crate::manifest_cache_path(&db_path);
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test")
+            .with_manifests_path(&canonical_path);
+
+        watcher
+            .handle_event(
+                &store,
+                None,
+                "vlt:test",
+                DebouncedEvent::new(root.join("package.json"), DebouncedEventKind::Any),
+                None,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+            )
+            .unwrap();
+
+        assert!(canonical_path.exists());
+        assert!(!legacy_path.exists());
+        let manifests = crate::load_manifest_cache_for_db(&db_path).unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            manifests.values().next().unwrap().package_name.as_deref(),
+            Some("watched-package")
+        );
     }
 
     #[test]

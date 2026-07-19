@@ -603,7 +603,7 @@ export function NodeListView() {
     if (
       activeLens.lens === "unsupported" ||
       lowerLabel.includes("contract drift") ||
-      unsupported.length > 0
+      trustResult === "unsupported"
     ) {
       return unsupportedRows(
         activeLens.label,

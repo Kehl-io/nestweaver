@@ -112,6 +112,11 @@ export interface ContentSlice {
   setSseConnected: (connected: boolean) => void;
   setLastEventTimestamp: (timestamp: number | null) => void;
 
+  // Bumped (debounced) when the backend finishes a lazy PageRank recompute so
+  // lenses that consume rank data can retry a stale/timed-out result once.
+  ranksGeneration: number;
+  bumpRanksGeneration: () => void;
+
   theme: "system" | "light" | "dark";
   setTheme: (theme: "system" | "light" | "dark") => void;
 }
@@ -278,6 +283,12 @@ export const createContentSlice: StateCreator<
   setLastEventTimestamp: (timestamp) =>
     set((s) => {
       s.lastEventTimestamp = timestamp;
+    }),
+
+  ranksGeneration: 0,
+  bumpRanksGeneration: () =>
+    set((s) => {
+      s.ranksGeneration += 1;
     }),
 
   // Dark-first default per the locked design decisions — the graph's bloom

@@ -3,12 +3,113 @@ use std::path::Path;
 use nestweaver_schema::{
     Contract, EdgeType, File, Heading, Note, Project, Repo, ResolvedEdge, Section, Service, Symbol,
     Tag, Vault,
-    uid::{project_uid, repo_uid, vault_uid},
+    uid::{file_uid, project_uid, repo_uid, service_uid, symbol_uid, vault_uid},
 };
 use serde_json;
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
+
+/// Confirmed graph mutation performed by a vault cascade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteVaultCascadeOutcome {
+    pub notes_deleted: usize,
+    pub changed: bool,
+}
+
+/// What the store can prove about a Project cascade after the transaction
+/// attempt completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectMutationDisposition {
+    /// No graph mutation was attempted (including a missing Project).
+    ConfirmedUnchanged,
+    /// A mutation was attempted and a subsequent rollback succeeded.
+    ConfirmedRolledBack,
+    /// The transaction committed successfully.
+    Changed,
+    /// The database may have committed or a required rollback could not be
+    /// confirmed. Callers must reconcile against graph liveness.
+    Ambiguous,
+}
+
+/// Confirmed result of an atomic Project cascade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteProjectCascadeOutcome {
+    pub project_uid: String,
+    pub project_name: Option<String>,
+    pub disposition: ProjectMutationDisposition,
+}
+
+/// A failed Project cascade together with the strongest mutation guarantee
+/// the store can make.
+#[derive(Debug)]
+pub struct DeleteProjectCascadeError {
+    pub project_uid: String,
+    pub project_name: Option<String>,
+    pub disposition: ProjectMutationDisposition,
+    pub primary: StoreError,
+    pub rollback: Option<StoreError>,
+}
+
+impl std::fmt::Display for DeleteProjectCascadeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Project cascade deletion for {} ({:?}) failed: {}",
+            self.project_uid, self.disposition, self.primary
+        )?;
+        if let Some(project_name) = &self.project_name {
+            write!(formatter, "; project_name={project_name}")?;
+        }
+        if let Some(rollback) = &self.rollback {
+            write!(formatter, "; rollback failed: {rollback}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DeleteProjectCascadeError {}
+
+#[derive(Clone, Copy)]
+struct ProjectCascadeQueries {
+    begin: &'static str,
+    repeat_begin: bool,
+    lookup: &'static str,
+    delete: &'static str,
+    omit_delete_params: bool,
+    commit: &'static str,
+    repeat_commit: bool,
+    rollback: &'static str,
+}
+
+impl Default for ProjectCascadeQueries {
+    fn default() -> Self {
+        Self {
+            begin: "BEGIN TRANSACTION",
+            repeat_begin: false,
+            lookup: "MATCH (p:Project {uid: $uid}) RETURN p.uid, p.name",
+            delete: "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
+            omit_delete_params: false,
+            commit: "COMMIT",
+            repeat_commit: false,
+            rollback: "ROLLBACK",
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ProjectCascadeFaults {
+    begin: bool,
+    lookup: bool,
+    lookup_uid_mismatch: bool,
+    lookup_uid_malformed: bool,
+    lookup_name_malformed: bool,
+    before_mutation: bool,
+    detach: bool,
+    commit: bool,
+    rollback: bool,
+}
 
 /// A vault whose notes were discarded during a collision in instance merge.
 /// When two instances have vaults at the same root_path, the vault with
@@ -20,12 +121,129 @@ pub struct DiscardedVault {
 }
 
 /// Result of [`GraphStore::merge_instance_ids`].
+///
+/// `repos_moved` lists the identifier (display name if set, else url) of
+/// every Repo node that was re-minted under the target instance. Source code
+/// graph rows are removed before each Repo is re-minted, so the caller must
+/// force re-index every repo in this list — see
+/// [`MergeResult::repos_need_reindex`].
 #[derive(Debug)]
 pub struct MergeResult {
     pub vaults: usize,
     pub repos: usize,
     pub projects: usize,
     pub discarded: Vec<DiscardedVault>,
+    /// Identifiers of repos re-minted under the target instance. Their graph
+    /// rows were removed and must be rebuilt by a forced re-index.
+    pub repos_moved: Vec<String>,
+    /// Source repo UIDs whose derived graph rows were deleted during migration.
+    /// The daemon uses these keys to remove per-repo sidecar slices.
+    pub repo_uids_removed: Vec<String>,
+}
+
+/// A deterministic source-to-destination UID mapping produced by an instance
+/// merge. File and Symbol rows are removed by the merge and rebuilt by the
+/// required re-index, but their target UIDs are still deterministic from the
+/// graph rows present at merge preflight.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceUidRemap {
+    pub source_uid: String,
+    pub destination_uid: String,
+}
+
+/// Stable identity used to attach authored metadata after a merge-required
+/// force re-index recreates a node under an actual (possibly line-shifted) UID.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InstanceUidHandoffIdentity {
+    File {
+        destination_repo_uid: String,
+        path: String,
+    },
+    Service {
+        destination_repo_uid: String,
+        name: String,
+    },
+    Symbol {
+        destination_repo_uid: String,
+        canonical_id: Option<String>,
+        file_path: String,
+        name: String,
+        kind: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceUidHandoff {
+    pub source_uid: String,
+    pub predicted_destination_uid: String,
+    pub identity: InstanceUidHandoffIdentity,
+}
+
+/// Durable Repo payload needed to resume the delete-before-insert crash window
+/// in a non-transactional instance merge.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceRepoRecovery {
+    pub source_uid: String,
+    pub destination_uid: String,
+    pub url: String,
+    pub staleness_commits_behind: u32,
+    pub name: Option<String>,
+    pub root_path: Option<String>,
+}
+
+/// Durable Vault payload needed to resume the delete-before-insert crash
+/// window in a non-transactional instance merge. Children are intentionally
+/// not captured: a recovered empty Vault is reindexed after the merge.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceVaultRecovery {
+    pub source_uid: String,
+    pub destination_uid: String,
+    pub name: String,
+    pub root_path: String,
+}
+
+/// Durable Project payload needed to resume the delete-before-insert crash
+/// window in a non-transactional instance merge.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceProjectRecovery {
+    pub source_uid: String,
+    pub destination_uid: String,
+    pub name: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstanceUidMigrationPlan {
+    pub remaps: Vec<InstanceUidRemap>,
+    pub handoffs: Vec<InstanceUidHandoff>,
+    pub repo_recoveries: Vec<InstanceRepoRecovery>,
+    pub vault_recoveries: Vec<InstanceVaultRecovery>,
+    pub project_recoveries: Vec<InstanceProjectRecovery>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstanceUidRemapPlanState {
+    Prepared,
+    PartiallyApplied,
+    Applied,
+}
+
+#[derive(Clone, Debug)]
+struct InstanceProjectMergePlan {
+    winner: Project,
+    winner_preexists: bool,
+    recovery_source_uid: Option<String>,
+    source_count: usize,
+    remaps: Vec<InstanceUidRemap>,
+}
+
+impl MergeResult {
+    /// True when the merge re-minted one or more Repo nodes. The caller should
+    /// instruct the user to force re-index each repo listed in
+    /// [`MergeResult::repos_moved`].
+    pub fn repos_need_reindex(&self) -> bool {
+        !self.repos_moved.is_empty()
+    }
 }
 
 /// Result of [`GraphStore::reparent_vault`].
@@ -52,6 +270,11 @@ pub struct PurgeInstanceResult {
     pub notes: usize,
     pub projects: usize,
     pub orphans_swept: usize,
+    /// Orphaned code rows removed without a top-level Repo registry entry.
+    pub code_orphans_swept: usize,
+    /// Repo UIDs referenced by code rows removed during the purge, including
+    /// orphan-only code whose top-level Repo registry row was already absent.
+    pub code_repo_uids: Vec<String>,
 }
 
 /// Encode a Symbol's `framework_hint` as the `"framework:role"` string the
@@ -199,6 +422,73 @@ fn exec_params(
 }
 
 impl GraphStore {
+    fn plan_instance_project_merges(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<InstanceProjectMergePlan>, StoreError> {
+        let mut groups: std::collections::BTreeMap<String, (Vec<Project>, Vec<Project>)> =
+            std::collections::BTreeMap::new();
+        for project in self.list_projects()? {
+            let entry = groups.entry(project.name.to_lowercase()).or_default();
+            if project.instance_id == from {
+                entry.0.push(project);
+            } else if project.instance_id == to {
+                entry.1.push(project);
+            }
+        }
+
+        let mut plans = Vec::new();
+        for (_casefolded_name, (mut sources, mut targets)) in groups {
+            if sources.is_empty() {
+                continue;
+            }
+            sources.sort_by(|left, right| {
+                project_uid(to, &left.name)
+                    .cmp(&project_uid(to, &right.name))
+                    .then_with(|| left.uid.cmp(&right.uid))
+            });
+            targets.sort_by(|left, right| left.uid.cmp(&right.uid));
+
+            let source_count = sources.len();
+            let (winner, winner_preexists, recovery_source_uid) =
+                if let Some(target) = targets.first() {
+                    (target.clone(), true, None)
+                } else {
+                    let source = &sources[0];
+                    (
+                        Project {
+                            uid: project_uid(to, &source.name),
+                            name: source.name.clone(),
+                            summary: source.summary.clone(),
+                            instance_id: to.to_string(),
+                        },
+                        false,
+                        Some(source.uid.clone()),
+                    )
+                };
+
+            let mut remaps: Vec<InstanceUidRemap> = targets
+                .into_iter()
+                .skip(1)
+                .chain(sources)
+                .map(|project| InstanceUidRemap {
+                    source_uid: project.uid,
+                    destination_uid: winner.uid.clone(),
+                })
+                .collect();
+            remaps.sort();
+            plans.push(InstanceProjectMergePlan {
+                winner,
+                winner_preexists,
+                recovery_source_uid,
+                source_count,
+                remaps,
+            });
+        }
+        Ok(plans)
+    }
+
     pub fn insert_repo(&self, repo: &Repo) -> Result<(), StoreError> {
         let conn = self.conn()?;
         exec_params(
@@ -1948,10 +2238,22 @@ impl GraphStore {
     ///
     /// `delete_note_cascade` is kept as-is for incremental single-note deletions.
     pub fn delete_vault_cascade(&self, vault_uid: &str) -> Result<usize, StoreError> {
+        Ok(self
+            .delete_vault_cascade_with_outcome(vault_uid)?
+            .notes_deleted)
+    }
+
+    /// Cascade-delete a vault and report whether any row targeted by the
+    /// cascade existed. This distinguishes a confirmed no-op from deletion of
+    /// an empty Vault or orphan Tag rows, both of which still mutate the graph.
+    pub fn delete_vault_cascade_with_outcome(
+        &self,
+        vault_uid: &str,
+    ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
         let conn = self.begin_transaction()?;
-        let count = Self::delete_vault_cascade_on(&conn, vault_uid)?;
+        let outcome = Self::delete_vault_cascade_with_outcome_on(&conn, vault_uid)?;
         self.commit_transaction(&conn)?;
-        Ok(count)
+        Ok(outcome)
     }
 
     /// Cascade-delete a vault's data using an externally-provided transaction
@@ -1965,26 +2267,46 @@ impl GraphStore {
         conn: &lbug::Connection<'_>,
         vault_uid: &str,
     ) -> Result<usize, StoreError> {
-        // Count notes before deletion so we can return the count.
-        let count = {
+        Ok(Self::delete_vault_cascade_with_outcome_on(conn, vault_uid)?.notes_deleted)
+    }
+
+    fn delete_vault_cascade_with_outcome_on(
+        conn: &lbug::Connection<'_>,
+        vault_uid: &str,
+    ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
+        let count_matches = |query: &str, context: &str| -> Result<usize, StoreError> {
             let mut stmt = conn
-                .prepare("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)")
-                .map_err(|e| StoreError::Query(format!("prepare count: {e}")))?;
+                .prepare(query)
+                .map_err(|e| StoreError::Query(format!("prepare {context}: {e}")))?;
             let rows = conn
                 .execute(
                     &mut stmt,
                     vec![("vid", lbug::Value::String(vault_uid.to_string()))],
                 )
-                .map_err(|e| StoreError::Query(format!("count notes: {e}")))?;
-            rows.filter_map(|row| {
-                row.first().and_then(|v| match v {
-                    lbug::Value::Int64(n) => Some(*n as usize),
-                    _ => None,
+                .map_err(|e| StoreError::Query(format!("execute {context}: {e}")))?;
+            Ok(rows
+                .filter_map(|row| {
+                    row.first().and_then(|v| match v {
+                        lbug::Value::Int64(n) => Some(*n as usize),
+                        _ => None,
+                    })
                 })
-            })
-            .next()
-            .unwrap_or(0)
+                .next()
+                .unwrap_or(0))
         };
+        let count = count_matches(
+            "MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)",
+            "note count",
+        )?;
+        let vault_count = count_matches(
+            "MATCH (v:Vault) WHERE v.uid = $vid RETURN count(v)",
+            "vault count",
+        )?;
+        let tag_count = count_matches(
+            "MATCH (t:Tag) WHERE t.vault_uid = $vid RETURN count(t)",
+            "tag count",
+        )?;
+        let changed = count > 0 || vault_count > 0 || tag_count > 0;
 
         // 1. Delete all Sections under notes in this vault.
         exec_params(
@@ -2046,7 +2368,10 @@ impl GraphStore {
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
-        Ok(count)
+        Ok(DeleteVaultCascadeOutcome {
+            notes_deleted: count,
+            changed,
+        })
     }
 
     /// Batch insert REFERENCES_CODE edges from Note → Symbol. Each tuple
@@ -2677,7 +3002,10 @@ impl GraphStore {
     /// DB. Useful for recovering from a misconfigured `instance merge`
     /// that left an orphan instance ID behind.
     pub fn purge_instance(&self, id: &str) -> Result<PurgeInstanceResult, StoreError> {
-        let mut result = PurgeInstanceResult::default();
+        let mut result = PurgeInstanceResult {
+            code_repo_uids: self.list_purge_code_repo_uids(id)?,
+            ..PurgeInstanceResult::default()
+        };
 
         // Repos owned by this instance — cascade delete every File,
         // Symbol, Service, and Contract that hangs off each one before
@@ -2720,23 +3048,33 @@ impl GraphStore {
         // in their UID prefix, so we can find and drop them even after
         // the parent is gone. Order matters only for telemetry — every
         // statement is `DETACH DELETE` so incident edges are cleaned.
-        for (label, prefix) in [
-            ("Symbol", format!("sym:repo:{id}:")),
-            ("File", format!("file:repo:{id}:")),
-            ("Service", format!("svc:repo:{id}:")),
-            ("Note", format!("note:vlt:{id}:")),
-            ("Heading", format!("head:note:vlt:{id}:")),
-            ("Section", format!("sec:note:vlt:{id}:")),
-            ("Tag", format!("tag:vlt:{id}:")),
+        for (label, prefix, is_code) in [
+            ("Symbol", format!("sym:repo:{id}:"), true),
+            ("File", format!("file:repo:{id}:"), true),
+            ("Service", format!("svc:repo:{id}:"), true),
+            ("Note", format!("note:vlt:{id}:"), false),
+            ("Heading", format!("head:note:vlt:{id}:"), false),
+            ("Section", format!("sec:note:vlt:{id}:"), false),
+            ("Tag", format!("tag:vlt:{id}:"), false),
             // Defensive: also catch Repo/Vault/Project rows that the
             // registry-walk above missed (e.g. stale rows whose
             // instance_id column was scrambled but whose UID is intact).
-            ("Repo", format!("repo:{id}:")),
-            ("Vault", format!("vlt:{id}:")),
-            ("Project", format!("proj:{id}:")),
+            ("Repo", format!("repo:{id}:"), true),
+            ("Vault", format!("vlt:{id}:"), false),
+            ("Project", format!("proj:{id}:"), false),
         ] {
-            result.orphans_swept += self.sweep_orphan_nodes(label, &prefix)?;
+            let swept = self.sweep_orphan_nodes(label, &prefix)?;
+            result.orphans_swept += swept;
+            if is_code {
+                result.code_orphans_swept += swept;
+            }
         }
+
+        // Contract UIDs describe API identity and do not embed the repo UID,
+        // so sweep code-orphan contracts by their repo_uid property instead.
+        let contracts = self.sweep_orphan_contracts(&format!("repo:{id}:"))?;
+        result.orphans_swept += contracts;
+        result.code_orphans_swept += contracts;
 
         Ok(result)
     }
@@ -2769,6 +3107,75 @@ impl GraphStore {
             .next()
             .unwrap_or(0);
         Ok(count)
+    }
+
+    fn sweep_orphan_contracts(&self, repo_prefix: &str) -> Result<usize, StoreError> {
+        let conn = self.conn()?;
+        let Ok(mut stmt) = conn.prepare(
+            "MATCH (n:Contract) WHERE n.repo_uid STARTS WITH $p DETACH DELETE n RETURN count(n)",
+        ) else {
+            // Contract tables were introduced after the initial schema.
+            return Ok(0);
+        };
+        let rows = conn
+            .execute(
+                &mut stmt,
+                vec![("p", lbug::Value::String(repo_prefix.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("sweep Contract orphans: {e}")))?;
+        Ok(rows
+            .filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    lbug::Value::Int64(n) => Some(*n as usize),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or(0))
+    }
+
+    /// Return every repo UID whose registry row or code children would be
+    /// affected by [`purge_instance`](Self::purge_instance). Daemon callers
+    /// use this before the non-transactional purge so sidecars can still be
+    /// reconciled if a later deletion returns an error.
+    pub fn list_purge_code_repo_uids(&self, id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        let prefix = format!("repo:{id}:");
+        let mut uids = std::collections::HashSet::new();
+
+        for label in ["Symbol", "File", "Service", "Contract"] {
+            let query = format!(
+                "MATCH (n:{label}) WHERE n.repo_uid STARTS WITH $p RETURN DISTINCT n.repo_uid"
+            );
+            let Ok(mut stmt) = conn.prepare(&query) else {
+                // Optional/legacy tables (notably Contract) may not exist.
+                continue;
+            };
+            let rows = conn
+                .execute(&mut stmt, vec![("p", lbug::Value::String(prefix.clone()))])
+                .map_err(|e| StoreError::Query(format!("list {label} purge repos: {e}")))?;
+            for row in rows {
+                if let Some(lbug::Value::String(uid)) = row.first() {
+                    uids.insert(uid.clone());
+                }
+            }
+        }
+
+        let mut stmt = conn
+            .prepare("MATCH (r:Repo) WHERE r.uid STARTS WITH $p RETURN r.uid")
+            .map_err(|e| StoreError::Query(format!("prepare purge repo UIDs: {e}")))?;
+        let rows = conn
+            .execute(&mut stmt, vec![("p", lbug::Value::String(prefix))])
+            .map_err(|e| StoreError::Query(format!("list purge repo UIDs: {e}")))?;
+        for row in rows {
+            if let Some(lbug::Value::String(uid)) = row.first() {
+                uids.insert(uid.clone());
+            }
+        }
+
+        let mut uids = uids.into_iter().collect::<Vec<_>>();
+        uids.sort();
+        Ok(uids)
     }
 
     /// Insert a single CROSS_REPO_LINK edge between two Symbol nodes.
@@ -2882,35 +3289,368 @@ impl GraphStore {
         )
     }
 
-    /// Delete all outgoing project edges for the given project UID.
-    /// Idempotent — silently ignores errors (table may not exist on first run).
-    pub fn delete_project_edges(&self, project_uid: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        for edge_type in &[
-            "PROJECT_INCLUDES_NOTE",
-            "PROJECT_INCLUDES_SYMBOL",
-            "PROJECT_HAS_COMPONENT",
-            "PROJECT_HAS_PARENT",
-        ] {
-            let q = format!("MATCH (p:Project {{uid: $uid}})-[r:{edge_type}]->() DELETE r");
-            if let Ok(mut stmt) = conn.prepare(&q) {
-                let _ = conn.execute(
-                    &mut stmt,
+    /// Delete all outgoing project edges for the given Project UID atomically.
+    ///
+    /// This is the rematerialization reset path, so it deliberately preserves
+    /// the Project node and incoming parent/component links. Every prepare and
+    /// execution error is surfaced and the transaction is explicitly rolled
+    /// back. Returns the number of relationships that were present and deleted.
+    pub fn delete_project_edges(&self, project_uid: &str) -> Result<usize, StoreError> {
+        self.delete_project_edges_with_types(
+            project_uid,
+            &[
+                "PROJECT_INCLUDES_NOTE",
+                "PROJECT_INCLUDES_SYMBOL",
+                "PROJECT_HAS_COMPONENT",
+                "PROJECT_HAS_PARENT",
+            ],
+        )
+    }
+
+    fn delete_project_edges_with_types(
+        &self,
+        project_uid: &str,
+        edge_types: &[&str],
+    ) -> Result<usize, StoreError> {
+        let conn = self.begin_transaction().map_err(|error| {
+            StoreError::Query(format!(
+                "begin Project edge deletion for {project_uid}: {error}"
+            ))
+        })?;
+        let mutation = (|| {
+            let mut deleted = 0usize;
+            for edge_type in edge_types {
+                let count_query =
+                    format!("MATCH (p:Project {{uid: $uid}})-[r:{edge_type}]->() RETURN count(r)");
+                let mut count_stmt = conn.prepare(&count_query).map_err(|error| {
+                    StoreError::Query(format!(
+                        "prepare count for Project edge {edge_type}: {error}"
+                    ))
+                })?;
+                let mut rows = conn
+                    .execute(
+                        &mut count_stmt,
+                        vec![("uid", lbug::Value::String(project_uid.to_string()))],
+                    )
+                    .map_err(|error| {
+                        StoreError::Query(format!(
+                            "execute count for Project edge {edge_type}: {error}"
+                        ))
+                    })?;
+                deleted += rows
+                    .next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(count)) => usize::try_from(*count).ok(),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                drop(rows);
+
+                let delete_query =
+                    format!("MATCH (p:Project {{uid: $uid}})-[r:{edge_type}]->() DELETE r");
+                let mut delete_stmt = conn.prepare(&delete_query).map_err(|error| {
+                    StoreError::Query(format!(
+                        "prepare delete for Project edge {edge_type}: {error}"
+                    ))
+                })?;
+                conn.execute(
+                    &mut delete_stmt,
                     vec![("uid", lbug::Value::String(project_uid.to_string()))],
-                );
+                )
+                .map_err(|error| {
+                    StoreError::Query(format!(
+                        "execute delete for Project edge {edge_type}: {error}"
+                    ))
+                })?;
             }
+            Ok(deleted)
+        })();
+
+        self.finish_project_transaction(&conn, mutation, "Project edge deletion")
+    }
+
+    /// Atomically delete a Project node and every incident relationship.
+    /// `DETACH DELETE` covers incoming and outgoing edges, including any
+    /// future relationship table that can be incident on Project.
+    pub fn delete_project_cascade_with_outcome(
+        &self,
+        project_uid: &str,
+    ) -> Result<DeleteProjectCascadeOutcome, DeleteProjectCascadeError> {
+        self.delete_project_cascade_with_queries(project_uid, ProjectCascadeQueries::default())
+    }
+
+    fn delete_project_cascade_with_queries(
+        &self,
+        project_uid: &str,
+        queries: ProjectCascadeQueries,
+    ) -> Result<DeleteProjectCascadeOutcome, DeleteProjectCascadeError> {
+        let conn = self.conn().map_err(|error| DeleteProjectCascadeError {
+            project_uid: project_uid.to_string(),
+            project_name: None,
+            disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+            primary: StoreError::Query(format!("open connection before Project cascade: {error}")),
+            rollback: None,
+        })?;
+        if let Err(error) = conn.query(queries.begin) {
+            return Err(DeleteProjectCascadeError {
+                project_uid: project_uid.to_string(),
+                project_name: None,
+                disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+                primary: StoreError::Query(format!("begin Project cascade: {error}")),
+                rollback: None,
+            });
         }
-        Ok(())
+        if queries.repeat_begin
+            && let Err(error) = conn.query(queries.begin)
+        {
+            return Err(Self::project_cascade_pre_mutation_error(
+                &conn,
+                queries.rollback,
+                project_uid,
+                None,
+                StoreError::Query(format!("begin Project cascade: {error}")),
+            ));
+        }
+
+        let mut lookup = match conn.prepare(queries.lookup) {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                return Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    None,
+                    StoreError::Query(format!("prepare Project lookup: {error}")),
+                ));
+            }
+        };
+        let mut rows = match conn.execute(
+            &mut lookup,
+            vec![("uid", lbug::Value::String(project_uid.to_string()))],
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    None,
+                    StoreError::Query(format!("execute Project lookup: {error}")),
+                ));
+            }
+        };
+        let lookup_row = rows.next();
+        drop(rows);
+
+        let Some(lookup_row) = lookup_row else {
+            let commit = conn.query(queries.commit).and_then(|_| {
+                if queries.repeat_commit {
+                    conn.query(queries.commit).map(|_| ())
+                } else {
+                    Ok(())
+                }
+            });
+            return match commit {
+                Ok(_) => Ok(DeleteProjectCascadeOutcome {
+                    project_uid: project_uid.to_string(),
+                    project_name: None,
+                    disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+                }),
+                Err(error) => Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    None,
+                    StoreError::Query(format!("commit read-only Project lookup: {error}")),
+                )),
+            };
+        };
+        let returned_uid = match lookup_row.first() {
+            Some(lbug::Value::String(returned_uid)) => returned_uid,
+            value => {
+                return Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    None,
+                    StoreError::Query(format!(
+                        "malformed Project lookup UID for {project_uid}: {value:?}"
+                    )),
+                ));
+            }
+        };
+        if returned_uid != project_uid {
+            return Err(Self::project_cascade_pre_mutation_error(
+                &conn,
+                queries.rollback,
+                project_uid,
+                None,
+                StoreError::Query(format!(
+                    "Project lookup UID mismatch: requested {project_uid}, returned {returned_uid}"
+                )),
+            ));
+        }
+        let project_name = match lookup_row.get(1) {
+            Some(lbug::Value::String(project_name)) => Some(project_name.clone()),
+            _ => None,
+        };
+
+        let mut delete = match conn.prepare(queries.delete) {
+            Ok(delete) => delete,
+            Err(error) => {
+                return Err(Self::project_cascade_pre_mutation_error(
+                    &conn,
+                    queries.rollback,
+                    project_uid,
+                    project_name,
+                    StoreError::Query(format!("prepare Project DETACH DELETE: {error}")),
+                ));
+            }
+        };
+        let delete_params = if queries.omit_delete_params {
+            Vec::new()
+        } else {
+            vec![("uid", lbug::Value::String(project_uid.to_string()))]
+        };
+        if let Err(error) = conn.execute(&mut delete, delete_params) {
+            let rollback = Self::project_cascade_rollback(&conn, queries.rollback);
+            return Err(DeleteProjectCascadeError {
+                project_uid: project_uid.to_string(),
+                project_name,
+                disposition: if rollback.is_none() {
+                    ProjectMutationDisposition::ConfirmedRolledBack
+                } else {
+                    ProjectMutationDisposition::Ambiguous
+                },
+                primary: StoreError::Query(format!("execute Project DETACH DELETE: {error}")),
+                rollback,
+            });
+        }
+
+        let commit = conn.query(queries.commit).and_then(|_| {
+            if queries.repeat_commit {
+                conn.query(queries.commit).map(|_| ())
+            } else {
+                Ok(())
+            }
+        });
+        match commit {
+            Ok(_) => Ok(DeleteProjectCascadeOutcome {
+                project_uid: project_uid.to_string(),
+                project_name,
+                disposition: ProjectMutationDisposition::Changed,
+            }),
+            Err(error) => Err(DeleteProjectCascadeError {
+                project_uid: project_uid.to_string(),
+                project_name,
+                // A COMMIT error after a mutation is ambiguous even when a
+                // best-effort rollback subsequently reports success.
+                disposition: ProjectMutationDisposition::Ambiguous,
+                primary: StoreError::Query(format!("commit Project cascade: {error}")),
+                rollback: Self::project_cascade_rollback(&conn, queries.rollback),
+            }),
+        }
+    }
+
+    fn project_cascade_pre_mutation_error(
+        conn: &lbug::Connection<'_>,
+        rollback_query: &str,
+        project_uid: &str,
+        project_name: Option<String>,
+        primary: StoreError,
+    ) -> DeleteProjectCascadeError {
+        DeleteProjectCascadeError {
+            project_uid: project_uid.to_string(),
+            project_name,
+            disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+            primary,
+            rollback: Self::project_cascade_rollback(conn, rollback_query),
+        }
+    }
+
+    fn project_cascade_rollback(
+        conn: &lbug::Connection<'_>,
+        rollback_query: &str,
+    ) -> Option<StoreError> {
+        conn.query(rollback_query)
+            .err()
+            .map(|error| StoreError::Query(format!("rollback Project cascade: {error}")))
+    }
+
+    #[cfg(test)]
+    fn delete_project_cascade_with_faults(
+        &self,
+        project_uid: &str,
+        faults: ProjectCascadeFaults,
+    ) -> Result<DeleteProjectCascadeOutcome, DeleteProjectCascadeError> {
+        let mut queries = ProjectCascadeQueries::default();
+        if faults.begin {
+            queries.repeat_begin = true;
+        }
+        if faults.lookup {
+            queries.lookup = "INJECTED LOOKUP FAILURE";
+        }
+        if faults.lookup_uid_mismatch {
+            queries.lookup = "MATCH (p:Project {uid: $uid}) RETURN 'proj:txn:unexpected', p.name";
+        }
+        if faults.lookup_uid_malformed {
+            queries.lookup = "MATCH (p:Project {uid: $uid}) RETURN 42, p.name";
+        }
+        if faults.lookup_name_malformed {
+            queries.lookup = "MATCH (p:Project {uid: $uid}) RETURN p.uid, 42";
+        }
+        if faults.before_mutation {
+            queries.delete = "INJECTED BEFORE MUTATION FAILURE";
+        }
+        queries.omit_delete_params = faults.detach;
+        if faults.commit {
+            queries.repeat_commit = true;
+        }
+        if faults.rollback {
+            queries.rollback = "INJECTED ROLLBACK FAILURE";
+        }
+        self.delete_project_cascade_with_queries(project_uid, queries)
+    }
+
+    fn finish_project_transaction<T>(
+        &self,
+        conn: &lbug::Connection<'_>,
+        mutation: Result<T, StoreError>,
+        operation: &str,
+    ) -> Result<T, StoreError> {
+        match mutation {
+            Ok(value) => match self.commit_transaction(conn) {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    let commit_error = StoreError::Query(format!("{operation} commit: {error}"));
+                    Err(Self::rollback_project_transaction(
+                        conn,
+                        commit_error,
+                        operation,
+                    ))
+                }
+            },
+            Err(error) => Err(Self::rollback_project_transaction(conn, error, operation)),
+        }
+    }
+
+    fn rollback_project_transaction(
+        conn: &lbug::Connection<'_>,
+        error: StoreError,
+        operation: &str,
+    ) -> StoreError {
+        match conn.query("ROLLBACK") {
+            Ok(_) => error,
+            Err(rollback_error) => StoreError::Query(format!(
+                "{error}; {operation} rollback failed: {rollback_error}"
+            )),
+        }
     }
 
     /// Delete the Project node itself (and any remaining edges).
     pub fn delete_project_node(&self, project_uid: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        exec_params(
-            &conn,
-            "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
-            vec![("uid", lbug::Value::String(project_uid.to_string()))],
-        )?;
+        self.delete_project_cascade_with_outcome(project_uid)
+            .map_err(|error| StoreError::Query(error.to_string()))?;
         Ok(())
     }
 
@@ -3019,18 +3759,9 @@ impl GraphStore {
             tags_migrated: tags.len(),
         };
 
-        // 3. Delete old vault and all its children.
-        self.delete_vault_cascade(old_vault_uid)?;
-
-        // 4. Create new vault with updated UID and instance_id.
-        self.insert_vault(&Vault {
-            uid: new_vault_uid.to_string(),
-            name: old_vault.name,
-            root_path: old_vault.root_path,
-            instance_id: new_instance_id.to_string(),
-        })?;
-
-        // 5. Re-insert notes with updated vault_uid.
+        // Prepare all replacement rows before opening the transaction. The
+        // delete and every insert below share one commit so a crash or write
+        // error cannot leave both the old and new vault roots absent.
         let reparented_notes: Vec<Note> = notes
             .into_iter()
             .map(|n| Note {
@@ -3038,36 +3769,18 @@ impl GraphStore {
                 ..n
             })
             .collect();
-        self.batch_insert_notes(&reparented_notes)?;
-
-        // Re-create VAULT_HAS_NOTE edges.
         let vault_note_edges: Vec<(&str, &str)> = reparented_notes
             .iter()
             .map(|n| (new_vault_uid, n.uid.as_str()))
             .collect();
-        self.batch_insert_vault_note_edges(&vault_note_edges)?;
-
-        // 6. Re-insert headings (note_uid stays the same).
-        self.batch_insert_headings(&headings)?;
-
-        // Re-create NOTE_HAS_HEADING edges.
         let note_heading_edges: Vec<(&str, &str)> = headings
             .iter()
             .map(|h| (h.note_uid.as_str(), h.uid.as_str()))
             .collect();
-        self.batch_insert_note_heading_edges(&note_heading_edges)?;
-
-        // 7. Re-insert sections (note_uid stays the same).
-        self.batch_insert_sections(&sections)?;
-
-        // Re-create NOTE_HAS_SECTION edges.
         let note_section_edges: Vec<(&str, &str)> = sections
             .iter()
             .map(|s| (s.note_uid.as_str(), s.uid.as_str()))
             .collect();
-        self.batch_insert_note_section_edges(&note_section_edges)?;
-
-        // Re-create HEADING_HAS_SECTION edges where applicable.
         let heading_section_edges: Vec<(&str, &str)> = sections
             .iter()
             .filter_map(|s| {
@@ -3076,11 +3789,6 @@ impl GraphStore {
                     .map(|huid| (huid.as_str(), s.uid.as_str()))
             })
             .collect();
-        if !heading_section_edges.is_empty() {
-            self.batch_insert_heading_section_edges(&heading_section_edges)?;
-        }
-
-        // 8. Re-insert tags with updated vault_uid.
         let reparented_tags: Vec<Tag> = tags
             .into_iter()
             .map(|t| Tag {
@@ -3088,27 +3796,452 @@ impl GraphStore {
                 ..t
             })
             .collect();
-        self.batch_insert_tags(&reparented_tags)?;
-
-        // Re-create NOTE_TAGGED_WITH edges.
         let nt_edges: Vec<(&str, &str)> = note_tag_edges
             .iter()
             .map(|(nuid, tuid)| (nuid.as_str(), tuid.as_str()))
             .collect();
-        if !nt_edges.is_empty() {
-            self.batch_insert_note_tag_edges(&nt_edges)?;
-        }
-
-        // Re-create SECTION_TAGGED_WITH edges.
         let st_edges: Vec<(&str, &str)> = section_tag_edges
             .iter()
             .map(|(suid, tuid)| (suid.as_str(), tuid.as_str()))
             .collect();
-        if !st_edges.is_empty() {
-            self.batch_insert_section_tag_edges(&st_edges)?;
+
+        let txn = self.begin_transaction()?;
+        let conn = &txn;
+        // 3. Delete old vault and all its children.
+        Self::delete_vault_cascade_on(conn, old_vault_uid)?;
+
+        // 4. Create new vault with updated UID and instance_id.
+        exec_params(
+            conn,
+            "CREATE (:Vault {uid: $uid, name: $name, root_path: $rp, instance_id: $iid})",
+            vec![
+                ("uid", lbug::Value::String(new_vault_uid.to_string())),
+                ("name", lbug::Value::String(old_vault.name)),
+                ("rp", lbug::Value::String(old_vault.root_path)),
+                ("iid", lbug::Value::String(new_instance_id.to_string())),
+            ],
+        )?;
+
+        // 5. Re-insert notes with updated vault_uid and restore their edges.
+        Self::batch_insert_notes_on(conn, &reparented_notes)?;
+        Self::batch_insert_vault_note_edges_on(conn, &vault_note_edges)?;
+
+        // 6. Re-insert headings and their edges (note_uid stays the same).
+        Self::batch_insert_headings_on(conn, &headings)?;
+        Self::batch_insert_note_heading_edges_on(conn, &note_heading_edges)?;
+
+        // 7. Re-insert sections and their edges (note_uid stays the same).
+        Self::batch_insert_sections_on(conn, &sections)?;
+        Self::batch_insert_note_section_edges_on(conn, &note_section_edges)?;
+        if !heading_section_edges.is_empty() {
+            Self::batch_insert_heading_section_edges_on(conn, &heading_section_edges)?;
         }
 
+        // 8. Re-insert tags with updated vault_uid and restore tag edges.
+        Self::batch_insert_tags_on(conn, &reparented_tags)?;
+        if !nt_edges.is_empty() {
+            Self::batch_insert_note_tag_edges_on(conn, &nt_edges)?;
+        }
+        if !st_edges.is_empty() {
+            Self::batch_insert_section_tag_edges_on(conn, &st_edges)?;
+        }
+        self.commit_transaction(&txn)?;
+
         Ok(result)
+    }
+
+    /// Enumerate every authored extension UID that changes when `from` is
+    /// merged into `to`.
+    ///
+    /// Every instance-derived UID that the merge invalidates is represented:
+    /// Repo, File, Service, Symbol, Vault, and Project. File, Service, and
+    /// Symbol rows are deleted during the merge and require re-indexing, so
+    /// their predicted target UIDs are computed before deletion. Sorting makes
+    /// collision and dedup handling deterministic when multiple source rows
+    /// map to one destination.
+    pub fn plan_instance_uid_remaps(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<InstanceUidRemap>, StoreError> {
+        Ok(self.plan_instance_uid_migration(from, to)?.remaps)
+    }
+
+    /// Plan UID remaps together with semantic handoffs for rows that indexing
+    /// recreates. Handoffs are source-UID sorted and bind the predicted UID to
+    /// an instance-independent identity used after publication.
+    pub fn plan_instance_uid_migration(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<InstanceUidMigrationPlan, StoreError> {
+        if from == to {
+            return Err(StoreError::Query(format!(
+                "source and target instance IDs must differ (both were {from:?})"
+            )));
+        }
+
+        let mut remaps = Vec::new();
+        let mut handoffs = Vec::new();
+        let mut repo_recoveries = Vec::new();
+        let mut vault_recoveries = Vec::new();
+        let mut project_recoveries = Vec::new();
+        // The LadybugDB Cypher subset does not support a MATCH subquery in an
+        // `IN` predicate, so enumerate once and scope by each source Repo UID.
+        let services = self.list_services(None)?;
+        for repo in self.list_repos(Some(from))? {
+            let destination_repo_uid = repo_uid(to, &repo.url);
+            remaps.push(InstanceUidRemap {
+                source_uid: repo.uid.clone(),
+                destination_uid: destination_repo_uid.clone(),
+            });
+            repo_recoveries.push(InstanceRepoRecovery {
+                source_uid: repo.uid.clone(),
+                destination_uid: destination_repo_uid.clone(),
+                url: repo.url.clone(),
+                staleness_commits_behind: repo.staleness_commits_behind,
+                name: repo.name.clone(),
+                root_path: repo.root_path.clone(),
+            });
+            for (source_uid, path) in self.list_files_by_repo(&repo.uid)? {
+                let destination_uid = file_uid(&destination_repo_uid, &path);
+                remaps.push(InstanceUidRemap {
+                    source_uid: source_uid.clone(),
+                    destination_uid: destination_uid.clone(),
+                });
+                handoffs.push(InstanceUidHandoff {
+                    source_uid,
+                    predicted_destination_uid: destination_uid,
+                    identity: InstanceUidHandoffIdentity::File {
+                        destination_repo_uid: destination_repo_uid.clone(),
+                        path,
+                    },
+                });
+            }
+            for symbol in self.lookup_symbols_by_repo(&repo.uid)? {
+                let destination_uid = symbol_uid(
+                    &destination_repo_uid,
+                    &symbol.file_path,
+                    &symbol.name,
+                    symbol.start_line,
+                );
+                remaps.push(InstanceUidRemap {
+                    source_uid: symbol.uid.clone(),
+                    destination_uid: destination_uid.clone(),
+                });
+                handoffs.push(InstanceUidHandoff {
+                    source_uid: symbol.uid,
+                    predicted_destination_uid: destination_uid,
+                    identity: InstanceUidHandoffIdentity::Symbol {
+                        destination_repo_uid: destination_repo_uid.clone(),
+                        canonical_id: symbol.canonical_id,
+                        file_path: symbol.file_path,
+                        name: symbol.name,
+                        kind: symbol.kind.to_string(),
+                    },
+                });
+            }
+            for service in services
+                .iter()
+                .filter(|service| service.repo_uid == repo.uid)
+            {
+                let destination_uid = service_uid(&destination_repo_uid, &service.name);
+                remaps.push(InstanceUidRemap {
+                    source_uid: service.uid.clone(),
+                    destination_uid: destination_uid.clone(),
+                });
+                handoffs.push(InstanceUidHandoff {
+                    source_uid: service.uid.clone(),
+                    predicted_destination_uid: destination_uid,
+                    identity: InstanceUidHandoffIdentity::Service {
+                        destination_repo_uid: destination_repo_uid.clone(),
+                        name: service.name.clone(),
+                    },
+                });
+            }
+        }
+        for vault in self.list_vaults(Some(from))? {
+            let destination_uid = vault_uid(to, &vault.root_path);
+            remaps.push(InstanceUidRemap {
+                source_uid: vault.uid.clone(),
+                destination_uid: destination_uid.clone(),
+            });
+            vault_recoveries.push(InstanceVaultRecovery {
+                source_uid: vault.uid,
+                destination_uid,
+                name: vault.name,
+                root_path: vault.root_path,
+            });
+        }
+        for project_merge in self.plan_instance_project_merges(from, to)? {
+            if let Some(source_uid) = project_merge.recovery_source_uid.clone() {
+                project_recoveries.push(InstanceProjectRecovery {
+                    source_uid,
+                    destination_uid: project_merge.winner.uid.clone(),
+                    name: project_merge.winner.name.clone(),
+                    summary: project_merge.winner.summary.clone(),
+                });
+            }
+            remaps.extend(project_merge.remaps);
+        }
+        remaps.sort();
+        remaps.dedup();
+        handoffs.sort();
+        handoffs.dedup();
+        repo_recoveries.sort();
+        repo_recoveries.dedup();
+        vault_recoveries.sort();
+        vault_recoveries.dedup();
+        project_recoveries.sort();
+        project_recoveries.dedup();
+        Ok(InstanceUidMigrationPlan {
+            remaps,
+            handoffs,
+            repo_recoveries,
+            vault_recoveries,
+            project_recoveries,
+        })
+    }
+
+    /// Restore target Repo roots whose source row was committed deleted before
+    /// the corresponding target insert. The empty indexed SHA makes the
+    /// recovered root explicitly require a full re-index.
+    pub fn recover_missing_instance_repos(
+        &self,
+        to: &str,
+        recoveries: &[InstanceRepoRecovery],
+    ) -> Result<usize, StoreError> {
+        let mut restored = 0;
+        for recovery in recoveries {
+            if repo_uid(to, &recovery.url) != recovery.destination_uid {
+                return Err(StoreError::Query(format!(
+                    "repo recovery destination is not deterministic: {}",
+                    recovery.destination_uid
+                )));
+            }
+            if self.lookup_repo(&recovery.source_uid)?.is_some()
+                || self.lookup_repo(&recovery.destination_uid)?.is_some()
+            {
+                continue;
+            }
+            self.insert_repo(&Repo {
+                uid: recovery.destination_uid.clone(),
+                url: recovery.url.clone(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: recovery.staleness_commits_behind,
+                instance_id: to.to_string(),
+                name: recovery.name.clone(),
+                root_path: recovery.root_path.clone(),
+            })?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
+    /// Restore target Repo, Vault, and Project roots whose source row was
+    /// committed deleted before the corresponding target insert. Recovered
+    /// code and Vault roots are intentionally empty and require re-indexing.
+    pub fn recover_missing_instance_roots(
+        &self,
+        to: &str,
+        repo_recoveries: &[InstanceRepoRecovery],
+        vault_recoveries: &[InstanceVaultRecovery],
+        project_recoveries: &[InstanceProjectRecovery],
+    ) -> Result<usize, StoreError> {
+        let mut restored = self.recover_missing_instance_repos(to, repo_recoveries)?;
+        for recovery in vault_recoveries {
+            if vault_uid(to, &recovery.root_path) != recovery.destination_uid {
+                return Err(StoreError::Query(format!(
+                    "vault recovery destination is not deterministic: {}",
+                    recovery.destination_uid
+                )));
+            }
+            if !self.list_vaults(None)?.iter().any(|vault| {
+                vault.uid == recovery.source_uid || vault.uid == recovery.destination_uid
+            }) {
+                self.insert_vault(&Vault {
+                    uid: recovery.destination_uid.clone(),
+                    name: recovery.name.clone(),
+                    root_path: recovery.root_path.clone(),
+                    instance_id: to.to_string(),
+                })?;
+                restored += 1;
+            }
+        }
+        for recovery in project_recoveries {
+            if project_uid(to, &recovery.name) != recovery.destination_uid {
+                return Err(StoreError::Query(format!(
+                    "project recovery destination is not deterministic: {}",
+                    recovery.destination_uid
+                )));
+            }
+            if !self.list_projects()?.iter().any(|project| {
+                project.uid == recovery.source_uid || project.uid == recovery.destination_uid
+            }) {
+                self.insert_project(&Project {
+                    uid: recovery.destination_uid.clone(),
+                    name: recovery.name.clone(),
+                    summary: recovery.summary.clone(),
+                    instance_id: to.to_string(),
+                })?;
+                restored += 1;
+            }
+        }
+        Ok(restored)
+    }
+
+    fn instance_merge_node_exists(&self, label: &str, uid: &str) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        let query = format!("MATCH (n:{label} {{uid: $uid}}) RETURN n.uid");
+        let mut statement = conn
+            .prepare(&query)
+            .map_err(|error| StoreError::Query(format!("prepare {label} liveness: {error}")))?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![("uid", lbug::Value::String(uid.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("execute {label} liveness: {error}")))?;
+        Ok(rows.next().is_some())
+    }
+
+    /// Prove whether an exact, previously journaled UID remap plan is still
+    /// prepared, has a provably-applied prefix/subset, or is fully applied.
+    /// Current mappings must be an exact subset of the journal, and every
+    /// missing mapping must independently prove source absence plus a live
+    /// destination (or destination root). Extras and contradictions fail closed.
+    pub fn verify_instance_uid_remap_plan_state(
+        &self,
+        from: &str,
+        to: &str,
+        expected: &[InstanceUidRemap],
+    ) -> Result<InstanceUidRemapPlanState, StoreError> {
+        if expected.is_empty() {
+            return Err(StoreError::Query(
+                "cannot verify an empty instance UID remap plan".to_string(),
+            ));
+        }
+        let current = self.plan_instance_uid_remaps(from, to)?;
+        if current == expected {
+            return Ok(InstanceUidRemapPlanState::Prepared);
+        }
+        let expected_set: std::collections::BTreeSet<_> = expected.iter().cloned().collect();
+        if expected_set.len() != expected.len() {
+            return Err(StoreError::Query(
+                "journaled instance UID remap plan contains duplicates".to_string(),
+            ));
+        }
+        for mapping in &current {
+            if !expected_set.contains(mapping) {
+                return Err(StoreError::Query(format!(
+                    "current graph remap is extra or contradicts the journaled plan: {} -> {}",
+                    mapping.source_uid, mapping.destination_uid
+                )));
+            }
+        }
+
+        let current_set: std::collections::BTreeSet<_> = current.iter().cloned().collect();
+        let mut missing_root_destinations = std::collections::BTreeSet::new();
+        for mapping in expected
+            .iter()
+            .filter(|mapping| !current_set.contains(*mapping))
+        {
+            let root_label = if mapping.source_uid.starts_with("repo:")
+                && mapping.destination_uid.starts_with("repo:")
+            {
+                Some("Repo")
+            } else if mapping.source_uid.starts_with("vlt:")
+                && mapping.destination_uid.starts_with("vlt:")
+            {
+                Some("Vault")
+            } else if mapping.source_uid.starts_with("proj:")
+                && mapping.destination_uid.starts_with("proj:")
+            {
+                Some("Project")
+            } else {
+                None
+            };
+            if let Some(root_label) = root_label {
+                let source_live =
+                    self.instance_merge_node_exists(root_label, &mapping.source_uid)?;
+                let destination_live =
+                    self.instance_merge_node_exists(root_label, &mapping.destination_uid)?;
+                if !source_live && !destination_live {
+                    missing_root_destinations.insert(mapping.destination_uid.clone());
+                }
+            }
+        }
+        for mapping in expected
+            .iter()
+            .filter(|mapping| !current_set.contains(*mapping))
+        {
+            let (source_label, destination_label, destination_root) =
+                if mapping.source_uid.starts_with("repo:")
+                    && mapping.destination_uid.starts_with("repo:")
+                {
+                    ("Repo", "Repo", mapping.destination_uid.clone())
+                } else if mapping.source_uid.starts_with("proj:")
+                    && mapping.destination_uid.starts_with("proj:")
+                {
+                    ("Project", "Project", mapping.destination_uid.clone())
+                } else if mapping.source_uid.starts_with("vlt:")
+                    && mapping.destination_uid.starts_with("vlt:")
+                {
+                    ("Vault", "Vault", mapping.destination_uid.clone())
+                } else if mapping.source_uid.starts_with("svc:repo:")
+                    && mapping.destination_uid.starts_with("svc:repo:")
+                {
+                    let parts: Vec<&str> = mapping.destination_uid.split(':').collect();
+                    if parts.len() != 5 {
+                        return Err(StoreError::Query(
+                            "journaled Service remap has invalid destination UID".to_string(),
+                        ));
+                    }
+                    ("Service", "Repo", format!("repo:{}:{}", parts[2], parts[3]))
+                } else if mapping.source_uid.starts_with("file:repo:")
+                    && mapping.destination_uid.starts_with("file:repo:")
+                {
+                    let parts: Vec<&str> = mapping.destination_uid.split(':').collect();
+                    if parts.len() != 5 {
+                        return Err(StoreError::Query(
+                            "journaled File remap has invalid destination UID".to_string(),
+                        ));
+                    }
+                    ("File", "Repo", format!("repo:{}:{}", parts[2], parts[3]))
+                } else if mapping.source_uid.starts_with("sym:repo:")
+                    && mapping.destination_uid.starts_with("sym:repo:")
+                {
+                    let parts: Vec<&str> = mapping.destination_uid.split(':').collect();
+                    if parts.len() != 7 {
+                        return Err(StoreError::Query(
+                            "journaled Symbol remap has invalid destination UID".to_string(),
+                        ));
+                    }
+                    ("Symbol", "Repo", format!("repo:{}:{}", parts[2], parts[3]))
+                } else {
+                    return Err(StoreError::Query(
+                        "journaled remap changes node kind or uses an unsupported UID".to_string(),
+                    ));
+                };
+            if self.instance_merge_node_exists(source_label, &mapping.source_uid)? {
+                return Err(StoreError::Query(format!(
+                    "journaled source node still exists after non-matching plan: {}",
+                    mapping.source_uid
+                )));
+            }
+            if !self.instance_merge_node_exists(destination_label, &destination_root)?
+                && !missing_root_destinations.contains(&destination_root)
+            {
+                return Err(StoreError::Query(format!(
+                    "journaled destination root does not exist: {destination_root}"
+                )));
+            }
+        }
+        if current.is_empty() && missing_root_destinations.is_empty() {
+            Ok(InstanceUidRemapPlanState::Applied)
+        } else {
+            Ok(InstanceUidRemapPlanState::PartiallyApplied)
+        }
     }
 
     /// Rewrite `instance_id` on all Vault, Repo, and Project nodes that
@@ -3119,10 +4252,19 @@ impl GraphStore {
     ///
     /// Uses [`reparent_vault`] to preserve notes in the winning vault.
     pub fn merge_instance_ids(&self, from: &str, to: &str) -> Result<MergeResult, StoreError> {
+        if from == to {
+            return Err(StoreError::Query(format!(
+                "source and target instance IDs must differ (both were {from:?})"
+            )));
+        }
+
+        let project_merges = self.plan_instance_project_merges(from, to)?;
         let mut vault_count = 0usize;
         let mut repo_count = 0usize;
         let mut project_count = 0usize;
         let mut discarded: Vec<DiscardedVault> = Vec::new();
+        let mut repos_moved: Vec<String> = Vec::new();
+        let mut repo_uids_removed: Vec<String> = Vec::new();
 
         // Build a map of target-instance vaults keyed by root_path so we
         // can detect collisions and compare child counts.
@@ -3174,35 +4316,49 @@ impl GraphStore {
         }
         for r in self.list_repos(None)? {
             if r.instance_id == from {
-                let conn = self.conn()?;
-                exec_params(
-                    &conn,
-                    "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
-                    vec![("uid", lbug::Value::String(r.uid.clone()))],
-                )?;
-                self.insert_repo(&Repo {
-                    uid: repo_uid(to, &r.url),
-                    instance_id: to.to_string(),
-                    ..r
-                })?;
+                // Identify the repo for the re-index guidance before we move
+                // `r` into the reinsert. Prefer the display name, else the url.
+                let repo_ident = r.name.clone().unwrap_or_else(|| r.url.clone());
+                let source_uid = r.uid.clone();
+                let target_uid = repo_uid(to, &r.url);
+
+                self.bulk_delete_repo_files_and_symbols(&source_uid)?;
+                self.clear_repo_derived_nodes(&source_uid)?;
+                self.delete_repo_node(&source_uid)?;
+
+                if self.lookup_repo(&target_uid)?.is_none() {
+                    self.insert_repo(&Repo {
+                        uid: target_uid,
+                        instance_id: to.to_string(),
+                        ..r
+                    })?;
+                }
+
                 repo_count += 1;
+                repos_moved.push(repo_ident);
+                repo_uids_removed.push(source_uid);
             }
         }
-        for p in self.list_projects()? {
-            if p.instance_id == from {
-                self.upsert_project(&Project {
-                    uid: project_uid(to, &p.name),
-                    instance_id: to.to_string(),
-                    ..p
-                })?;
-                project_count += 1;
+        for project_merge in project_merges {
+            // Publish a newly minted winner before deleting its source. If a
+            // process stops between these statements, the durable migration
+            // journal can safely retry the source deletion; deleting first
+            // would leave both roots absent and require reconstruction.
+            if !project_merge.winner_preexists {
+                self.insert_project(&project_merge.winner)?;
             }
+            for mapping in &project_merge.remaps {
+                self.delete_project_node(&mapping.source_uid)?;
+            }
+            project_count += project_merge.source_count;
         }
         Ok(MergeResult {
             vaults: vault_count,
             repos: repo_count,
             projects: project_count,
             discarded,
+            repos_moved,
+            repo_uids_removed,
         })
     }
 
@@ -3452,6 +4608,340 @@ mod copy_from_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed_project_component(store: &GraphStore) {
+        for (uid, name) in [("proj:txn:parent", "Parent"), ("proj:txn:child", "Child")] {
+            store
+                .insert_project(&Project {
+                    uid: uid.to_string(),
+                    name: name.to_string(),
+                    summary: None,
+                    instance_id: "txn".to_string(),
+                })
+                .unwrap();
+        }
+        store
+            .insert_project_component_edge("proj:txn:parent", "proj:txn:child", 1.0)
+            .unwrap();
+    }
+
+    #[test]
+    fn project_edge_delete_query_failure_before_mutation_preserves_edges() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let error = store
+            .delete_project_edges_with_types(
+                "proj:txn:parent",
+                &["NOT_A_PROJECT_EDGE", "PROJECT_HAS_COMPONENT"],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("NOT_A_PROJECT_EDGE"));
+        assert_eq!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap(),
+            vec!["proj:txn:child"]
+        );
+    }
+
+    #[test]
+    fn project_edge_delete_reports_confirmed_mutation_count() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let deleted = store.delete_project_edges("proj:txn:parent").unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn project_edge_delete_mid_operation_failure_rolls_back() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let error = store
+            .delete_project_edges_with_types(
+                "proj:txn:parent",
+                &["PROJECT_HAS_COMPONENT", "NOT_A_PROJECT_EDGE"],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("NOT_A_PROJECT_EDGE"));
+        assert_eq!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap(),
+            vec!["proj:txn:child"],
+            "the earlier edge delete must roll back with the failed transaction"
+        );
+    }
+
+    #[test]
+    fn project_cascade_fault_matrix_reports_transaction_disposition() {
+        for (faults, expected, name_known) in [
+            (
+                ProjectCascadeFaults {
+                    begin: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::ConfirmedUnchanged,
+                false,
+            ),
+            (
+                ProjectCascadeFaults {
+                    lookup: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::ConfirmedUnchanged,
+                false,
+            ),
+            (
+                ProjectCascadeFaults {
+                    before_mutation: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::ConfirmedUnchanged,
+                true,
+            ),
+            (
+                ProjectCascadeFaults {
+                    detach: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::ConfirmedRolledBack,
+                true,
+            ),
+            (
+                ProjectCascadeFaults {
+                    commit: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::Ambiguous,
+                true,
+            ),
+            (
+                ProjectCascadeFaults {
+                    detach: true,
+                    rollback: true,
+                    ..Default::default()
+                },
+                ProjectMutationDisposition::Ambiguous,
+                true,
+            ),
+        ] {
+            let store = GraphStore::in_memory().unwrap();
+            seed_project_component(&store);
+
+            let error = store
+                .delete_project_cascade_with_faults("proj:txn:parent", faults)
+                .unwrap_err();
+
+            assert_eq!(error.project_uid, "proj:txn:parent");
+            assert_eq!(error.disposition, expected, "{faults:?}");
+            assert_eq!(error.project_name.is_some(), name_known, "{faults:?}");
+            assert!(!error.primary.to_string().is_empty());
+            if faults.rollback {
+                assert!(
+                    error.rollback.as_ref().is_some_and(|rollback| rollback
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("injected")),
+                    "rollback context missing: {error}"
+                );
+            }
+
+            if matches!(
+                expected,
+                ProjectMutationDisposition::ConfirmedUnchanged
+                    | ProjectMutationDisposition::ConfirmedRolledBack
+            ) {
+                assert!(
+                    store
+                        .list_projects()
+                        .unwrap()
+                        .iter()
+                        .any(|project| project.uid == "proj:txn:parent"),
+                    "confirmed failure removed the Project: {faults:?}"
+                );
+                assert_eq!(
+                    store
+                        .list_project_component_uids("proj:txn:parent")
+                        .unwrap(),
+                    vec!["proj:txn:child"],
+                    "confirmed failure removed the edge: {faults:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn project_cascade_lookup_identity_failures_are_not_reported_as_missing() {
+        for (faults, expected_message) in [
+            (
+                ProjectCascadeFaults {
+                    lookup_uid_mismatch: true,
+                    ..Default::default()
+                },
+                "mismatch",
+            ),
+            (
+                ProjectCascadeFaults {
+                    lookup_uid_malformed: true,
+                    ..Default::default()
+                },
+                "malformed",
+            ),
+        ] {
+            let store = GraphStore::in_memory().unwrap();
+            seed_project_component(&store);
+
+            let error = store
+                .delete_project_cascade_with_faults("proj:txn:parent", faults)
+                .expect_err("an untrusted lookup identity must fail closed");
+
+            assert_eq!(
+                error.disposition,
+                ProjectMutationDisposition::ConfirmedUnchanged
+            );
+            assert!(
+                error
+                    .primary
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains(expected_message),
+                "unexpected error: {error}"
+            );
+            assert!(store.project_exists("proj:txn:parent").unwrap());
+            assert_eq!(
+                store
+                    .list_project_component_uids("proj:txn:parent")
+                    .unwrap(),
+                vec!["proj:txn:child"]
+            );
+        }
+    }
+
+    #[test]
+    fn project_cascade_non_string_name_is_optional_metadata() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let outcome = store
+            .delete_project_cascade_with_faults(
+                "proj:txn:parent",
+                ProjectCascadeFaults {
+                    lookup_name_malformed: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, ProjectMutationDisposition::Changed);
+        assert_eq!(outcome.project_uid, "proj:txn:parent");
+        assert_eq!(outcome.project_name, None);
+        assert!(!store.project_exists("proj:txn:parent").unwrap());
+        assert!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn project_cascade_deletes_null_name_project_and_incident_edges() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:null-project-delete".to_string(),
+                vault_uid: "vlt:null-project-delete".to_string(),
+                file_path: "null-project-delete.md".to_string(),
+                title: "Null project delete".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 3,
+                content_hash: "null-project-delete-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        let conn = store.conn().unwrap();
+        conn.query(
+            "CREATE (:Project {uid: 'proj:txn:null-name', name: NULL, summary: NULL, instance_id: 'txn'})",
+        )
+        .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:txn:null-name", "note:null-project-delete")])
+            .unwrap();
+        conn.query(
+            "CREATE REL TABLE FUTURE_NULL_PROJECT_EDGE(FROM Project TO Note, marker STRING)",
+        )
+        .unwrap();
+        conn.query(
+            "MATCH (p:Project {uid: 'proj:txn:null-name'}), \
+             (n:Note {uid: 'note:null-project-delete'}) \
+             CREATE (p)-[:FUTURE_NULL_PROJECT_EDGE {marker: 'future'}]->(n)",
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| project.uid == "proj:txn:null-name")
+                .unwrap()
+                .name,
+            ""
+        );
+
+        let outcome = store
+            .delete_project_cascade_with_outcome("proj:txn:null-name")
+            .unwrap();
+
+        assert_eq!(outcome.disposition, ProjectMutationDisposition::Changed);
+        assert_eq!(outcome.project_uid, "proj:txn:null-name");
+        assert_eq!(outcome.project_name, None);
+        assert!(!store.project_exists("proj:txn:null-name").unwrap());
+        for edge_type in ["PROJECT_INCLUDES_NOTE", "FUTURE_NULL_PROJECT_EDGE"] {
+            let count = conn
+                .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN r"))
+                .unwrap()
+                .count();
+            assert_eq!(count, 0, "{edge_type} survived the Project delete");
+        }
+    }
+
+    #[test]
+    fn missing_project_commit_failure_is_confirmed_unchanged() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let error = store
+            .delete_project_cascade_with_faults(
+                "proj:txn:missing",
+                ProjectCascadeFaults {
+                    commit: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.disposition,
+            ProjectMutationDisposition::ConfirmedUnchanged
+        );
+        assert_eq!(error.project_uid, "proj:txn:missing");
+        assert_eq!(error.project_name, None);
+    }
 
     #[test]
     fn embedding_metadata_round_trips_including_special_chars() {
