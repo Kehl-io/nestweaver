@@ -6,8 +6,35 @@
 
 use std::path::{Path, PathBuf};
 
+fn resolved_lbug_version(manifest_dir: &Path) -> Option<String> {
+    let lock_path = manifest_dir
+        .ancestors()
+        .map(|ancestor| ancestor.join("Cargo.lock"))
+        .find(|candidate| candidate.is_file())?;
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+
+    let lock = std::fs::read_to_string(lock_path).ok()?;
+    lock.split("[[package]]").find_map(|package| {
+        let is_lbug = package.lines().any(|line| line.trim() == "name = \"lbug\"");
+        if !is_lbug {
+            return None;
+        }
+        package.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("version = \"")
+                .and_then(|version| version.strip_suffix('"'))
+                .map(str::to_owned)
+        })
+    })
+}
+
 fn lbug_src_dir() -> Option<PathBuf> {
     // Locate the lbug crate in the cargo registry and return its lbug-src/ dir.
+    // Match the exact Cargo.lock version: selecting an arbitrary installed
+    // lbug source tree can compile ABI-incompatible parser support libraries.
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?);
+    let resolved_dir =
+        resolved_lbug_version(&manifest_dir).map(|version| format!("lbug-{version}"));
     let cargo_home = std::env::var("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -22,7 +49,7 @@ fn lbug_src_dir() -> Option<PathBuf> {
             if let Ok(entries) = std::fs::read_dir(index.path()) {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
-                    if name.to_string_lossy().starts_with("lbug-") {
+                    if resolved_dir.as_deref() == Some(name.to_string_lossy().as_ref()) {
                         let candidate = entry.path().join("lbug-src");
                         if candidate.is_dir() {
                             return Some(candidate);
