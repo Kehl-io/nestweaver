@@ -57,6 +57,10 @@ impl GraphStore {
 
     /// Persist the current in-memory `graph_generation` value to the
     /// `<db>.generation` sidecar at `path` (a plain decimal integer).
+    ///
+    /// If this returns an error from the final parent-directory sync, the
+    /// complete new generation may already be canonical even though crash
+    /// durability of the rename could not be confirmed.
     pub fn save_graph_generation(&self, path: &Path) -> Result<(), StoreError> {
         let value = self.graph_generation.load(Ordering::Acquire);
         self.save_graph_generation_value(path, value)
@@ -65,6 +69,8 @@ impl GraphStore {
     /// Persist an explicitly prepared generation without making it visible to
     /// live cache consumers. Index publication uses this for clean N+2 while
     /// the dirty marker and live N+1 reservation remain authoritative.
+    /// A final directory-sync error can occur after the canonical file was
+    /// replaced; callers must retain their fail-closed publication marker.
     pub fn save_graph_generation_value(&self, path: &Path, value: u64) -> Result<(), StoreError> {
         let contents = value.to_string();
         crate::durable_sidecar::atomic_replace_file(path, |file| {

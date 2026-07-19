@@ -1065,6 +1065,9 @@ impl GraphStore {
     /// Persist the in-memory PageRank cache to a JSON sidecar file at `path`.
     ///
     /// If the cache is empty (PageRank has not been computed yet), this is a no-op.
+    /// If the final parent-directory sync fails, the complete new cache may
+    /// already be canonical even though crash durability of the rename could
+    /// not be confirmed.
     pub fn save_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
         let _flight = self
             .pagerank_compute_lock
