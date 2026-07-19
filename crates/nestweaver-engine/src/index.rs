@@ -598,7 +598,12 @@ trait IndexEpilogueIo {
     fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
     fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()>;
-    fn save_generation(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error>;
+    fn save_generation(
+        &self,
+        store: &GraphStore,
+        path: &Path,
+        generation: u64,
+    ) -> Result<(), anyhow::Error>;
     fn compute_pagerank(&self, store: &GraphStore) -> Result<(), anyhow::Error>;
     fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error>;
 }
@@ -651,8 +656,13 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
         Ok(())
     }
 
-    fn save_generation(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
-        store.save_graph_generation(path)?;
+    fn save_generation(
+        &self,
+        store: &GraphStore,
+        path: &Path,
+        generation: u64,
+    ) -> Result<(), anyhow::Error> {
+        store.save_graph_generation_value(path, generation)?;
         sync_sidecar_file_and_parent(path)
     }
 
@@ -742,24 +752,29 @@ fn establish_index_publication_marker_with_io(
     io: &dyn IndexEpilogueIo,
 ) -> Result<(), DeletionReconciliationError> {
     let marker_path = crate::sidecar_path(db_path, ".index-dirty");
-    io.establish_marker(&marker_path).map_err(|error| {
-        DeletionReconciliationError::new(
-            operation,
-            vec![DeletionReconciliationFailure {
-                stage: DeletionReconciliationStage::IndexPublicationMarker,
-                repo_uid: None,
-                message: format!("{}: {error:#}", marker_path.display()),
-            }],
-        )
-    })?;
     store
-        .reserve_index_publication_generation()
-        .map(|_| ())
+        .preflight_index_publication_generation()
         .map_err(|error| {
             DeletionReconciliationError::new(
                 operation,
                 vec![DeletionReconciliationFailure {
                     stage: DeletionReconciliationStage::GenerationPersistence,
+                    repo_uid: None,
+                    message: format!("{}: {error:#}", marker_path.display()),
+                }],
+            )
+        })?;
+    store
+        .with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
+            io.establish_marker(&marker_path)?;
+            store.reserve_index_publication_generation()?;
+            Ok(())
+        })
+        .map_err(|error| {
+            DeletionReconciliationError::new(
+                operation,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::IndexPublicationMarker,
                     repo_uid: None,
                     message: format!("{}: {error:#}", marker_path.display()),
                 }],
@@ -777,7 +792,7 @@ fn finalize_committed_index_with_io(
     let mut failures = Vec::new();
 
     store.invalidate_pagerank();
-    let mut pagerank_safe = if let Some(db_path) = db_path {
+    let pagerank_safe = if let Some(db_path) = db_path {
         invalidate_pagerank_sidecar_with_io(
             &crate::sidecar_path(db_path, ".pagerank.json"),
             io,
@@ -788,43 +803,73 @@ fn finalize_committed_index_with_io(
     };
 
     let generation_advanced = if db_path.is_some() {
-        store.reserve_index_publication_generation()
+        store.clean_index_publication_generation()
     } else {
         store.try_bump_graph_generation()
     };
-    let generation_durable = if let Err(error) = generation_advanced {
-        push_reconciliation_failure(
-            &mut failures,
-            DeletionReconciliationStage::GenerationPersistence,
-            None,
-            format!("advance graph generation: {error:#}"),
-        );
-        false
-    } else if let Some(db_path) = db_path {
-        let generation_path = crate::sidecar_path(db_path, ".generation");
-        match io.save_generation(store, &generation_path) {
-            Ok(()) => true,
-            Err(error) => {
-                push_reconciliation_failure(
-                    &mut failures,
-                    DeletionReconciliationStage::GenerationPersistence,
-                    None,
-                    format!("{}: {error:#}", generation_path.display()),
-                );
-                false
+    let generation_durable = match generation_advanced {
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::GenerationPersistence,
+                None,
+                format!("advance graph generation: {error:#}"),
+            );
+            false
+        }
+        Ok(generation) if db_path.is_some() => {
+            let generation_path = crate::sidecar_path(db_path.unwrap(), ".generation");
+            match io.save_generation(store, &generation_path, generation) {
+                Ok(()) => true,
+                Err(error) => {
+                    push_reconciliation_failure(
+                        &mut failures,
+                        DeletionReconciliationStage::GenerationPersistence,
+                        None,
+                        format!("{}: {error:#}", generation_path.display()),
+                    );
+                    false
+                }
             }
         }
-    } else {
-        true
+        Ok(_) => true,
     };
 
-    if refresh_pagerank {
+    let mut publication_clean = db_path.is_none();
+    if generation_durable
+        && pagerank_safe
+        && let Some(db_path) = db_path
+    {
+        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+        let retirement =
+            store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
+                store.publish_clean_index_publication_generation()?;
+                if let Err(error) = io.clear_marker(&marker_path) {
+                    store.fail_clean_index_publication_generation();
+                    return Err(error);
+                }
+                store.complete_index_publication_generation();
+                Ok(())
+            });
+        if let Err(error) = retirement {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::IndexPublicationMarkerRetirement,
+                None,
+                format!("{}: {error:#}", marker_path.display()),
+            );
+        } else {
+            publication_clean = true;
+        }
+    }
+
+    if refresh_pagerank && publication_clean {
         match io.compute_pagerank(store) {
             Ok(()) => {
                 if let Some(db_path) = db_path {
                     let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
                     match io.save_pagerank(store, &pagerank_path) {
-                        Ok(()) => pagerank_safe = true,
+                        Ok(()) => {}
                         Err(error) => {
                             push_reconciliation_failure(
                                 &mut failures,
@@ -832,11 +877,7 @@ fn finalize_committed_index_with_io(
                                 None,
                                 format!("{}: {error:#}", pagerank_path.display()),
                             );
-                            pagerank_safe = invalidate_pagerank_sidecar_with_io(
-                                &pagerank_path,
-                                io,
-                                &mut failures,
-                            );
+                            invalidate_pagerank_sidecar_with_io(&pagerank_path, io, &mut failures);
                         }
                     }
                 }
@@ -847,23 +888,6 @@ fn finalize_committed_index_with_io(
                 None,
                 format!("{error:#}"),
             ),
-        }
-    }
-
-    if generation_durable
-        && pagerank_safe
-        && let Some(db_path) = db_path
-    {
-        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
-        if let Err(error) = io.clear_marker(&marker_path) {
-            push_reconciliation_failure(
-                &mut failures,
-                DeletionReconciliationStage::IndexPublicationMarkerRetirement,
-                None,
-                format!("{}: {error:#}", marker_path.display()),
-            );
-        } else {
-            store.complete_index_publication_generation();
         }
     }
 
@@ -5110,11 +5134,18 @@ function hello(name) { return "Hello " + name; }
             std::fs::rename(from, to)
         }
 
-        fn save_generation(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+        fn save_generation(
+            &self,
+            store: &GraphStore,
+            path: &Path,
+            generation: u64,
+        ) -> Result<(), anyhow::Error> {
             if self.fail_generation {
                 anyhow::bail!("injected generation save failure");
             }
-            store.save_graph_generation(path).map_err(Into::into)
+            store
+                .save_graph_generation_value(path, generation)
+                .map_err(Into::into)
         }
 
         fn compute_pagerank(&self, store: &GraphStore) -> Result<(), anyhow::Error> {
@@ -5298,7 +5329,10 @@ function hello(name) { return "Hello " + name; }
         .expect_err("unsafe persisted PageRank must fail publication");
 
         assert!(error.to_string().contains("persisted-pagerank"));
-        assert!(error.to_string().contains("pagerank-compute"));
+        assert!(
+            !error.to_string().contains("pagerank-compute"),
+            "PageRank must not run while unsafe publication remains dirty"
+        );
         assert!(marker_path.exists(), "unsafe publication must remain dirty");
         assert!(
             pagerank_path.exists(),
@@ -5352,9 +5386,11 @@ function hello(name) { return "Hello " + name; }
         .expect_err("unsafe generation persistence must fail publication");
 
         let message = error.to_string();
-        let generation_failure = message.find("generation-persistence").unwrap();
-        let compute_failure = message.find("pagerank-compute").unwrap();
-        assert!(generation_failure < compute_failure);
+        assert!(message.contains("generation-persistence"));
+        assert!(
+            !message.contains("pagerank-compute"),
+            "PageRank must not run before generation publication is clean"
+        );
         assert!(marker_path.exists(), "unsafe publication must remain dirty");
         drop(store);
 
@@ -5411,6 +5447,14 @@ function hello(name) { return "Hello " + name; }
                 .is_none(),
             "the reserved recovery generation must reject generation-7 cache entries"
         );
+        cache.insert(
+            cache_key,
+            "brain_search",
+            br#"{"dirty":true}"#,
+            recovering.graph_generation(),
+            scope_digest,
+        );
+        cache.save();
 
         fs::remove_dir(&marker_path).unwrap();
         establish_index_publication_marker_with_io(
@@ -5429,12 +5473,16 @@ function hello(name) { return "Hello " + name; }
         )
         .unwrap();
         assert!(!marker_path.exists());
-        assert_eq!(recovering.graph_generation(), 8);
+        assert_eq!(
+            recovering.graph_generation(),
+            9,
+            "clean publication must not reuse dirty reservation 8"
+        );
         drop(recovering);
 
         let clean = GraphStore::open_or_create(&db_path).unwrap();
-        assert_eq!(clean.graph_generation(), 8);
-        assert!(clean.graph_generation() > 7);
+        assert_eq!(clean.graph_generation(), 9);
+        assert!(clean.graph_generation() > 8);
         clean.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(!clean.pagerank_scores().contains_key("stale"));
         let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
@@ -5442,27 +5490,22 @@ function hello(name) { return "Hello " + name; }
             cache
                 .get(cache_key, clean.graph_generation(), scope_digest)
                 .is_none(),
-            "clean reopen must not reuse the historical generation cache key"
+            "clean reopen must reject the dirty-generation cache entry"
         );
     }
 
     #[test]
-    fn exhausted_generation_keeps_publication_dirty_without_wraparound() {
+    fn successor_exhaustion_aborts_before_marker_establishment() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let generation_path = crate::sidecar_path(&db_path, ".generation");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
 
-        {
-            let store = GraphStore::open_or_create(&db_path).unwrap();
-            fs::write(&generation_path, u64::MAX.to_string()).unwrap();
-            store.load_graph_generation(&generation_path);
-        }
-        fs::create_dir(&marker_path).unwrap();
         let recovering = GraphStore::open_or_create(&db_path).unwrap();
-        assert_eq!(recovering.graph_generation(), u64::MAX);
+        fs::write(&generation_path, (u64::MAX - 1).to_string()).unwrap();
+        recovering.load_graph_generation(&generation_path);
+        assert_eq!(recovering.graph_generation(), u64::MAX - 1);
 
-        fs::remove_dir(&marker_path).unwrap();
         let error = establish_index_publication_marker_with_io(
             &recovering,
             &db_path,
@@ -5472,11 +5515,14 @@ function hello(name) { return "Hello " + name; }
         .expect_err("generation exhaustion must abort before graph publication");
 
         assert!(error.to_string().contains("generation"));
-        assert!(marker_path.exists(), "exhaustion must remain fail-closed");
-        assert_eq!(recovering.graph_generation(), u64::MAX);
+        assert!(
+            !marker_path.exists(),
+            "successor exhaustion must fail before establishing the marker"
+        );
+        assert_eq!(recovering.graph_generation(), u64::MAX - 1);
         assert_eq!(
             fs::read_to_string(&generation_path).unwrap(),
-            u64::MAX.to_string()
+            (u64::MAX - 1).to_string()
         );
     }
 
@@ -5676,7 +5722,7 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn full_publication_and_compute_failures_are_aggregated() {
+    fn full_generation_failure_skips_dirty_pagerank_compute() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
@@ -5711,9 +5757,11 @@ function hello(name) { return "Hello " + name; }
         };
 
         let message = error.to_string();
-        let generation_failure = message.find("generation-persistence").unwrap();
-        let compute_failure = message.find("pagerank-compute").unwrap();
-        assert!(generation_failure < compute_failure);
+        assert!(message.contains("generation-persistence"));
+        assert!(
+            !message.contains("pagerank-compute"),
+            "PageRank must not run before generation publication is clean"
+        );
         assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
         assert!(store.symbols_in_file("old.js").unwrap().is_empty());
     }
@@ -5948,7 +5996,7 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn incremental_publication_and_compute_failures_are_aggregated() {
+    fn incremental_generation_failure_skips_dirty_pagerank_compute() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
@@ -5997,9 +6045,11 @@ function hello(name) { return "Hello " + name; }
         .expect_err("the injected incremental compute failure must be returned");
 
         let message = error.to_string();
-        let generation_failure = message.find("generation-persistence").unwrap();
-        let compute_failure = message.find("pagerank-compute").unwrap();
-        assert!(generation_failure < compute_failure);
+        assert!(message.contains("generation-persistence"));
+        assert!(
+            !message.contains("pagerank-compute"),
+            "PageRank must not run before generation publication is clean"
+        );
         let store = GraphStore::open_or_create(&db_path).unwrap();
         assert!(
             store
@@ -6015,7 +6065,7 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn fallback_publication_and_compute_failures_are_aggregated() {
+    fn fallback_generation_failure_skips_dirty_pagerank_compute() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
@@ -6065,9 +6115,11 @@ function hello(name) { return "Hello " + name; }
         .expect_err("the injected fallback compute failure must be returned");
 
         let message = error.to_string();
-        let generation_failure = message.find("generation-persistence").unwrap();
-        let compute_failure = message.find("pagerank-compute").unwrap();
-        assert!(generation_failure < compute_failure);
+        assert!(message.contains("generation-persistence"));
+        assert!(
+            !message.contains("pagerank-compute"),
+            "PageRank must not run before generation publication is clean"
+        );
         let store = GraphStore::open_or_create(&db_path).unwrap();
         assert!(store.symbols_in_file("old.js").unwrap().is_empty());
         assert!(

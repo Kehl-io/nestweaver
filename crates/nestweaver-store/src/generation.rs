@@ -34,9 +34,9 @@ impl GraphStore {
     /// Load the persisted `graph_generation` value from the `<db>.generation`
     /// sidecar at `path` into the in-memory counter. When publication is clean,
     /// an absent or unparseable sidecar leaves the current value unchanged. A
-    /// dirty publication instead reserves the canonical successor; if the
-    /// canonical value is unavailable or exhausted, recovery remains at the
-    /// non-advancing fail-closed value and publication cannot complete.
+    /// dirty publication instead reserves the canonical N+1 dirty successor;
+    /// completion separately publishes N+2. If either successor is unavailable,
+    /// recovery remains fail-closed and publication cannot complete.
     ///
     /// Called automatically on [`GraphStore::open`] / [`GraphStore::create`] /
     /// [`GraphStore::open_read_only`] via the stored `db_path`.
@@ -58,6 +58,13 @@ impl GraphStore {
     /// `<db>.generation` sidecar at `path` (a plain decimal integer).
     pub fn save_graph_generation(&self, path: &Path) -> Result<(), StoreError> {
         let value = self.graph_generation.load(Ordering::Acquire);
+        self.save_graph_generation_value(path, value)
+    }
+
+    /// Persist an explicitly prepared generation without making it visible to
+    /// live cache consumers. Index publication uses this for clean N+2 while
+    /// the dirty marker and live N+1 reservation remain authoritative.
+    pub fn save_graph_generation_value(&self, path: &Path, value: u64) -> Result<(), StoreError> {
         std::fs::write(path, value.to_string())
             .map_err(|e| StoreError::Query(format!("write generation sidecar: {e}")))
     }

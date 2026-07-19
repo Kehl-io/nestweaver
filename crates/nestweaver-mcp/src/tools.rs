@@ -513,6 +513,9 @@ fn maybe_cached(
     let Ok(db_path) = current_db_path(store) else {
         return dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible);
     };
+    if store.is_index_publication_dirty() {
+        return dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible);
+    }
 
     let max_mb = CACHE_MAX_SIZE_MB.with(|c| c.get());
     // Fold the caller's repo-visibility into the cache key so a redacted
@@ -538,7 +541,10 @@ fn maybe_cached(
         cache.get(key, generation, scope_digest)
     });
 
-    if let Some(bytes) = hit_bytes {
+    if let Some(bytes) = hit_bytes
+        && !store.is_index_publication_dirty()
+        && store.graph_generation() == generation
+    {
         CACHE_HITS.with(|c| c.set(c.get() + 1));
         // No save() on hit — LRU timestamp update is not worth a disk round-trip.
         let value: Value =
@@ -548,6 +554,9 @@ fn maybe_cached(
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
     let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)?;
+    if store.is_index_publication_dirty() || store.graph_generation() != generation {
+        return Ok(result);
+    }
     match serde_json::to_vec(&result) {
         Ok(bytes) => {
             // Insert into the in-process cache, then decide whether to flush.
@@ -7228,6 +7237,82 @@ mod cache_dispatch_tests {
         // The old entry's generation no longer matches → MISS (recomputed).
         assert_eq!(CACHE_MISSES.with(|c| c.get()), 1, "stale entry must miss");
         assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn dirty_generation_cache_entry_misses_after_clean_publication() {
+        reset_session();
+        let (dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let marker_path = nestweaver_engine::sidecar_path(&db_path, ".index-dirty");
+        fs::write(&marker_path, b"dirty").unwrap();
+
+        let dirty_store = GraphStore::open(&db_path).unwrap();
+        let dirty_generation = dirty_store.graph_generation();
+        let args = json!({ "limit": 5 });
+        let key = nestweaver_store::cache::ResponseCache::key("hub_nodes", &args);
+        let scope_digest = whole_db_scope_digest(&db_path);
+        let dirty_response = br#"{"dirty":true}"#;
+        let mut cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        cache.insert(
+            key,
+            "hub_nodes",
+            dirty_response,
+            dirty_generation,
+            scope_digest,
+        );
+        cache.save();
+        drop(dirty_store);
+
+        let src = dir.path().join("repo");
+        let repo_url = format!("file://{}", src.display());
+        nestweaver_engine::index_directory_with_options(
+            &src, &db_path, "test", &repo_url, "local", true, None,
+        )
+        .unwrap();
+
+        let clean_store = GraphStore::open(&db_path).unwrap();
+        assert!(
+            clean_store.graph_generation() > dirty_generation,
+            "clean publication must advance beyond the dirty reservation"
+        );
+        reset_session();
+        let result = dispatch(&clean_store, None, "hub_nodes", args, None).unwrap();
+        assert_ne!(
+            result,
+            serde_json::from_slice::<Value>(dirty_response).unwrap()
+        );
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 1);
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn dirty_publication_bypasses_response_cache() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        fs::write(
+            nestweaver_engine::sidecar_path(&db_path, ".index-dirty"),
+            b"dirty",
+        )
+        .unwrap();
+        let store = GraphStore::open(&db_path).unwrap();
+        let args = json!({ "limit": 5 });
+
+        let _ = dispatch(&store, None, "hub_nodes", args.clone(), None).unwrap();
+        let _ = dispatch(&store, None, "hub_nodes", args, None).unwrap();
+        flush_response_cache();
+
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+        assert_eq!(CACHE_MISSES.with(|c| c.get()), 0);
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(cache.is_empty(), "dirty responses must not be retained");
     }
 
     #[test]

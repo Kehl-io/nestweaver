@@ -1983,6 +1983,14 @@ impl GraphStore {
         project_uid: &str,
         limit: usize,
     ) -> Result<Vec<String>, StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Ok(vec![]);
+        }
         if limit == 0 {
             return Ok(vec![]);
         }

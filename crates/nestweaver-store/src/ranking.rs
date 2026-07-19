@@ -560,6 +560,26 @@ impl GraphStore {
         scope: &GraphScope,
         warm_start: Option<&HashMap<String, f64>>,
     ) -> Result<(), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.compute_pagerank_warm_locked(damping, iterations, scope, warm_start)
+    }
+
+    fn compute_pagerank_warm_locked(
+        &self,
+        damping: f64,
+        iterations: u32,
+        scope: &GraphScope,
+        warm_start: Option<&HashMap<String, f64>>,
+    ) -> Result<(), StoreError> {
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Err(StoreError::Query(
+                "PageRank unavailable during dirty index publication".into(),
+            ));
+        }
         let (uids, _uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, None)?;
         let n = uids.len();
         if n == 0 {
@@ -635,6 +655,13 @@ impl GraphStore {
             if delta < 1e-6 {
                 break;
             }
+        }
+
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Err(StoreError::Query(
+                "PageRank unavailable during dirty index publication".into(),
+            ));
         }
 
         // 5. Store scores in the in-memory cache (no DB write-back needed).
@@ -830,6 +857,16 @@ impl GraphStore {
         scope: &GraphScope,
         intent: Option<QueryIntent>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Err(StoreError::Query(
+                "PageRank unavailable during dirty index publication".into(),
+            ));
+        }
         let effective_damping = intent.map_or(damping, |i| i.damping());
 
         // --- PPR graph cache check -------------------------------------------
@@ -959,13 +996,22 @@ impl GraphStore {
     /// If the cache is empty it is computed lazily on first access.
     /// If `limit` is `None`, all symbols are returned.
     pub fn symbols_by_pagerank(&self, limit: Option<usize>) -> Result<Vec<Symbol>, StoreError> {
-        self.ensure_pagerank_loaded();
-        let cache = self
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Ok(Vec::new());
+        }
+        self.ensure_pagerank_loaded_locked();
+        let scores = self
             .pagerank_cache
             .lock()
-            .map_err(|e| StoreError::Query(format!("lock: {e}")))?;
-        let scores = match cache.as_ref() {
-            Some(s) => s,
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))?
+            .clone();
+        let scores = match scores {
+            Some(scores) => scores,
             None => return Ok(Vec::new()),
         };
 
@@ -1019,6 +1065,14 @@ impl GraphStore {
     ///
     /// If the cache is empty (PageRank has not been computed yet), this is a no-op.
     pub fn save_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Ok(());
+        }
         let cache = self
             .pagerank_cache
             .lock()
@@ -1035,8 +1089,12 @@ impl GraphStore {
     ///
     /// If the file does not exist, this is a no-op.
     pub fn load_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if self.is_index_publication_dirty() {
-            self.invalidate_pagerank();
+            self.invalidate_ranking_caches_locked();
             return Ok(());
         }
         if path.exists() {
@@ -1058,7 +1116,15 @@ impl GraphStore {
     /// cache is not loaded. Used by downstream crates (engine) that need
     /// per-UID score lookups without loading full Symbol objects.
     pub fn pagerank_scores(&self) -> HashMap<String, f64> {
-        self.ensure_pagerank_loaded();
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return HashMap::new();
+        }
+        self.ensure_pagerank_loaded_locked();
         self.pagerank_cache
             .lock()
             .ok()
@@ -1072,26 +1138,27 @@ impl GraphStore {
     /// computation), this is a no-op.  Otherwise it computes PageRank on
     /// demand so callers never see an empty cache after a fresh index.
     pub fn ensure_pagerank_loaded(&self) {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.ensure_pagerank_loaded_locked();
+    }
+
+    fn ensure_pagerank_loaded_locked(&self) {
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return;
+        }
         let loaded = |cache: &std::sync::Mutex<Option<HashMap<String, f64>>>| {
             cache.lock().map(|c| c.is_some()).unwrap_or(false)
         };
         if loaded(&self.pagerank_cache) {
             return;
         }
-        // Single-flight (nw-029): late arrivals block here while the first
-        // caller computes, then hit the double-check below and return without
-        // recomputing. Invalidation takes the same lock before clearing the
-        // cache so an in-flight lazy compute cannot restore stale scores.
-        // Explicit recomputes are unaffected.
-        let _flight = match self.pagerank_compute_lock.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if loaded(&self.pagerank_cache) {
-            return;
-        }
         tracing::info!("PageRank cache empty — computing lazily (single-flight)");
-        if let Err(e) = self.compute_pagerank(0.85, 20, &GraphScope::code_only()) {
+        if let Err(e) = self.compute_pagerank_warm_locked(0.85, 20, &GraphScope::code_only(), None)
+        {
             tracing::warn!("lazy PageRank computation failed: {e}");
         }
     }
@@ -1104,6 +1171,16 @@ impl GraphStore {
     /// and will be reused by subsequent `personalized_pagerank*` calls
     /// until the graph generation changes.
     pub fn warm_ppr_cache(&self) -> Result<(), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_ranking_caches_locked();
+            return Err(StoreError::Query(
+                "PageRank unavailable during dirty index publication".into(),
+            ));
+        }
         let scope = GraphScope::unified();
         self.load_ppr_graph(&scope, None)?;
         Ok(())
@@ -1118,6 +1195,7 @@ mod tests {
 
     use super::GraphScope;
     use crate::db::GraphStore;
+    use crate::error::StoreError;
 
     fn make_symbol(uid: &str, name: &str) -> Symbol {
         Symbol {
@@ -1205,6 +1283,80 @@ mod tests {
             store.pagerank_generation(),
             initial + 1,
             "8 concurrent callers must trigger exactly one compute"
+        );
+    }
+
+    #[test]
+    fn dirty_publication_blocks_pagerank_load_compute_save_and_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let pagerank_path =
+            std::path::PathBuf::from(format!("{}.pagerank.json", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        assert!(store.pagerank_scores().contains_key("A"));
+        let clean_pagerank_generation = store.pagerank_generation();
+
+        let dirty_generation = store
+            .with_index_publication_rank_barrier(|| -> Result<u64, StoreError> {
+                std::fs::write(&marker_path, b"dirty")
+                    .map_err(|error| StoreError::Query(error.to_string()))?;
+                store.reserve_index_publication_generation()
+            })
+            .unwrap();
+
+        assert!(
+            store.pagerank_scores().is_empty(),
+            "dirty publication must not serve ranks computed while clean"
+        );
+        assert_eq!(
+            store.pagerank_generation(),
+            clean_pagerank_generation,
+            "dirty lazy access must not compute PageRank"
+        );
+        assert!(
+            store
+                .compute_pagerank(0.85, 20, &GraphScope::code_only())
+                .is_err(),
+            "explicit PageRank computation must fail closed while dirty"
+        );
+        store.save_pagerank_cache(&pagerank_path).unwrap();
+        assert!(
+            !pagerank_path.exists(),
+            "dirty PageRank state must never be persisted"
+        );
+        assert!(store.pagerank_scores().is_empty());
+        assert_eq!(store.pagerank_generation(), clean_pagerank_generation);
+
+        let clean_generation = store.clean_index_publication_generation().unwrap();
+        assert!(clean_generation > dirty_generation);
+        store
+            .with_index_publication_rank_barrier(|| -> Result<(), StoreError> {
+                store.publish_clean_index_publication_generation()?;
+                std::fs::remove_file(&marker_path)
+                    .map_err(|error| StoreError::Query(error.to_string()))?;
+                store.complete_index_publication_generation();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .pagerank_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none(),
+            "dirty-window ranks must not survive clean publication"
+        );
+        assert_eq!(store.pagerank_generation(), clean_pagerank_generation);
+        assert!(store.pagerank_scores().contains_key("A"));
+        assert_eq!(
+            store.pagerank_generation(),
+            clean_pagerank_generation + 1,
+            "the first clean access must perform the only retained recompute"
         );
     }
 

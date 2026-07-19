@@ -61,10 +61,10 @@ pub struct GraphStore {
     /// when their view of the graph is stale without diffing the full graph.
     pub(crate) graph_generation: AtomicU64,
     /// Last canonical generation while an index publication is dirty. A
-    /// present value means `graph_generation` is its reserved successor (or
-    /// `u64::MAX` when no successor can be represented). Keeping this recovery
-    /// state separate prevents an ephemeral fail-closed value from becoming a
-    /// wrapping persisted counter.
+    /// present value means `graph_generation` is either its dirty N+1
+    /// reservation or the prepared clean N+2 publication. Keeping this
+    /// recovery state separate prevents an ephemeral fail-closed value from
+    /// becoming a wrapping persisted counter.
     pub(crate) index_publication_generation_base: Mutex<Option<u64>>,
     /// Optional interaction memory scores keyed by node UID. When loaded,
     /// PPR's personalization vector blends a small fraction of these scores
@@ -328,10 +328,40 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        self.invalidate_ranking_caches_locked();
+    }
+
+    pub(crate) fn invalidate_ranking_caches_locked(&self) {
         *self
             .pagerank_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .ppr_graph_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.ppr_result_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .symbol_name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Run a publication marker transition while excluding PageRank readers
+    /// and computations, then discard rank and generation-keyed caches before
+    /// releasing them. Establishment and retirement both use this barrier so
+    /// no dirty-window state can survive publication.
+    pub fn with_index_publication_rank_barrier<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = operation();
+        self.invalidate_ranking_caches_locked();
+        result
     }
 
     /// Load pre-computed interaction memory scores into the in-memory cache.
@@ -461,26 +491,86 @@ impl GraphStore {
             .map_err(|_| StoreError::Query("graph generation exhausted".to_string()))
     }
 
-    /// Reserve the next canonical generation for an in-progress publication.
-    /// Repeated calls during the same dirty recovery return the same value.
+    /// Verify that both the dirty reservation and its distinct clean
+    /// publication generation are available.
+    pub fn preflight_index_publication_generation(&self) -> Result<(), StoreError> {
+        let base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let canonical = (*base).unwrap_or_else(|| self.graph_generation());
+        canonical.checked_add(2).map(|_| ()).ok_or_else(|| {
+            StoreError::Query("graph generation exhausted during index publication".into())
+        })
+    }
+
+    /// Reserve the dirty generation for an in-progress publication. Repeated
+    /// calls during the same dirty recovery return the same N+1 value. The
+    /// clean N+2 successor is preflighted before changing live state.
     pub fn reserve_index_publication_generation(&self) -> Result<u64, StoreError> {
         let mut base = self
             .index_publication_generation_base
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(canonical) = *base {
+            canonical.checked_add(2).ok_or_else(|| {
+                StoreError::Query("graph generation exhausted during index publication".into())
+            })?;
             return canonical.checked_add(1).ok_or_else(|| {
                 StoreError::Query("graph generation exhausted during index publication".into())
             });
         }
 
         let canonical = self.graph_generation();
-        *base = Some(canonical);
+        canonical.checked_add(2).ok_or_else(|| {
+            StoreError::Query("graph generation exhausted during index publication".into())
+        })?;
         let reserved = canonical.checked_add(1).ok_or_else(|| {
             StoreError::Query("graph generation exhausted during index publication".into())
         })?;
+        *base = Some(canonical);
         self.graph_generation.store(reserved, Ordering::Release);
         Ok(reserved)
+    }
+
+    /// Return the distinct N+2 generation to persist for an active dirty
+    /// publication without exposing it to live cache consumers yet.
+    pub fn clean_index_publication_generation(&self) -> Result<u64, StoreError> {
+        let base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let canonical = base.ok_or_else(|| {
+            StoreError::Query("index publication generation is not reserved".into())
+        })?;
+        canonical.checked_add(2).ok_or_else(|| {
+            StoreError::Query("graph generation exhausted during index publication".into())
+        })
+    }
+
+    /// Make the prepared N+2 generation live immediately before retiring the
+    /// dirty marker. Callers must hold the publication rank barrier.
+    pub fn publish_clean_index_publication_generation(&self) -> Result<u64, StoreError> {
+        let clean = self.clean_index_publication_generation()?;
+        self.graph_generation.store(clean, Ordering::Release);
+        Ok(clean)
+    }
+
+    /// A marker-retirement failure may have briefly exposed the persisted
+    /// clean value. Treat it as the next canonical base and reserve a newer
+    /// dirty value so that generation can never be reused on retry.
+    pub fn fail_clean_index_publication_generation(&self) {
+        let mut base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(canonical) = *base
+            && let Some(clean) = canonical.checked_add(2)
+        {
+            *base = Some(clean);
+            self.graph_generation
+                .store(clean.saturating_add(1), Ordering::Release);
+        }
     }
 
     /// Mark a durably published reserved generation as canonical.
