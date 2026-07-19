@@ -145,6 +145,8 @@ pub fn save_filemeta_sidecar(sidecar: &FileMetaSidecar, path: &Path) -> Result<(
 /// A required durable stage in post-deletion reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeletionReconciliationStage {
+    IndexPublicationMarker,
+    IndexPublicationMarkerRetirement,
     FileMetadata,
     ResolutionDependencies,
     ManifestCache,
@@ -161,6 +163,8 @@ pub enum DeletionReconciliationStage {
 impl std::fmt::Display for DeletionReconciliationStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
+            Self::IndexPublicationMarker => "index-publication-marker",
+            Self::IndexPublicationMarkerRetirement => "index-publication-marker-retirement",
             Self::FileMetadata => "filemeta",
             Self::ResolutionDependencies => "resolution-deps",
             Self::ManifestCache => "manifest-cache",
@@ -580,6 +584,8 @@ fn finalize_code_graph_deletion_with_io(
 /// recomputation so a subsequent error cannot leave the previous ranks or
 /// graph generation authoritative.
 trait IndexEpilogueIo {
+    fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
+    fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
     fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()>;
     fn save_generation(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error>;
@@ -590,16 +596,54 @@ trait IndexEpilogueIo {
 struct FileSystemIndexEpilogueIo;
 
 impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
+    fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("create index publication marker {}", path.display()))?;
+        let marker = format!(
+            "{}:{}\n",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        file.write_all(marker.as_bytes())
+            .with_context(|| format!("write index publication marker {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync index publication marker {}", path.display()))?;
+        sync_sidecar_parent(path)
+    }
+
+    fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+        match std::fs::remove_file(path) {
+            Ok(()) => sync_sidecar_parent(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("remove index publication marker {}", path.display())),
+        }
+    }
+
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::remove_file(path)
+        std::fs::remove_file(path)?;
+        sync_sidecar_parent_io(path)
     }
 
     fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        std::fs::rename(from, to)
+        std::fs::rename(from, to)?;
+        sync_sidecar_parent_io(from)?;
+        if from.parent() != to.parent() {
+            sync_sidecar_parent_io(to)?;
+        }
+        Ok(())
     }
 
     fn save_generation(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
-        store.save_graph_generation(path).map_err(Into::into)
+        store.save_graph_generation(path)?;
+        sync_sidecar_file_and_parent(path)
     }
 
     fn compute_pagerank(&self, store: &GraphStore) -> Result<(), anyhow::Error> {
@@ -609,8 +653,37 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
     }
 
     fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
-        store.save_pagerank_cache(path).map_err(Into::into)
+        store.save_pagerank_cache(path)?;
+        sync_sidecar_file_and_parent(path)
     }
+}
+
+fn sync_sidecar_parent(path: &Path) -> Result<(), anyhow::Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("sidecar path has no parent: {}", path.display()))?;
+    std::fs::File::open(parent)
+        .with_context(|| format!("open sidecar directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync sidecar directory {}", parent.display()))
+}
+
+fn sync_sidecar_parent_io(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("sidecar path has no parent: {}", path.display()),
+        )
+    })?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+fn sync_sidecar_file_and_parent(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::File::open(path)
+        .with_context(|| format!("open sidecar {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync sidecar {}", path.display()))?;
+    sync_sidecar_parent(path)
 }
 
 fn quarantine_path(path: &Path) -> PathBuf {
@@ -623,62 +696,135 @@ fn invalidate_pagerank_sidecar_with_io(
     pagerank_path: &Path,
     io: &dyn IndexEpilogueIo,
     failures: &mut Vec<DeletionReconciliationFailure>,
-) {
-    if let Err(error) = io.remove_file(pagerank_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        let quarantine = quarantine_path(pagerank_path);
-        let quarantine_result = io.rename_file(pagerank_path, &quarantine);
-        push_reconciliation_failure(
-            failures,
-            DeletionReconciliationStage::PersistedPageRank,
-            None,
-            match quarantine_result {
-                Ok(()) => format!(
-                    "{}: removal failed ({error}); quarantined as {}",
-                    pagerank_path.display(),
-                    quarantine.display()
-                ),
-                Err(quarantine_error) => format!(
-                    "{}: removal failed ({error}); quarantine failed ({quarantine_error})",
-                    pagerank_path.display()
-                ),
-            },
-        );
+) -> bool {
+    match io.remove_file(pagerank_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            let quarantine = quarantine_path(pagerank_path);
+            let quarantine_result = io.rename_file(pagerank_path, &quarantine);
+            let safe = quarantine_result.is_ok();
+            push_reconciliation_failure(
+                failures,
+                DeletionReconciliationStage::PersistedPageRank,
+                None,
+                match quarantine_result {
+                    Ok(()) => format!(
+                        "{}: removal failed ({error}); quarantined as {}",
+                        pagerank_path.display(),
+                        quarantine.display()
+                    ),
+                    Err(quarantine_error) => format!(
+                        "{}: removal failed ({error}); quarantine failed ({quarantine_error})",
+                        pagerank_path.display()
+                    ),
+                },
+            );
+            safe
+        }
     }
 }
 
-fn finalize_index_commit(
-    store: &GraphStore,
-    db_path: Option<&Path>,
+fn establish_index_publication_marker_with_io(
+    db_path: &Path,
     operation: &str,
+    io: &dyn IndexEpilogueIo,
 ) -> Result<(), DeletionReconciliationError> {
-    finalize_index_commit_with_io(store, db_path, operation, &FileSystemIndexEpilogueIo)
+    let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+    io.establish_marker(&marker_path).map_err(|error| {
+        DeletionReconciliationError::new(
+            operation,
+            vec![DeletionReconciliationFailure {
+                stage: DeletionReconciliationStage::IndexPublicationMarker,
+                repo_uid: None,
+                message: format!("{}: {error:#}", marker_path.display()),
+            }],
+        )
+    })
 }
 
-fn finalize_index_commit_with_io(
+fn finalize_committed_index_with_io(
     store: &GraphStore,
     db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
+    refresh_pagerank: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let mut failures = Vec::new();
 
     store.invalidate_pagerank();
-    if let Some(db_path) = db_path {
-        let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
-        invalidate_pagerank_sidecar_with_io(&pagerank_path, io, &mut failures);
-    }
+    let mut pagerank_safe = if let Some(db_path) = db_path {
+        invalidate_pagerank_sidecar_with_io(
+            &crate::sidecar_path(db_path, ".pagerank.json"),
+            io,
+            &mut failures,
+        )
+    } else {
+        true
+    };
 
     store.bump_graph_generation();
-    if let Some(db_path) = db_path {
+    let generation_durable = if let Some(db_path) = db_path {
         let generation_path = crate::sidecar_path(db_path, ".generation");
-        if let Err(error) = io.save_generation(store, &generation_path) {
+        match io.save_generation(store, &generation_path) {
+            Ok(()) => true,
+            Err(error) => {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::GenerationPersistence,
+                    None,
+                    format!("{}: {error:#}", generation_path.display()),
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+
+    if refresh_pagerank {
+        match io.compute_pagerank(store) {
+            Ok(()) => {
+                if let Some(db_path) = db_path {
+                    let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
+                    match io.save_pagerank(store, &pagerank_path) {
+                        Ok(()) => pagerank_safe = true,
+                        Err(error) => {
+                            push_reconciliation_failure(
+                                &mut failures,
+                                DeletionReconciliationStage::PageRankPersistence,
+                                None,
+                                format!("{}: {error:#}", pagerank_path.display()),
+                            );
+                            pagerank_safe = invalidate_pagerank_sidecar_with_io(
+                                &pagerank_path,
+                                io,
+                                &mut failures,
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::PageRankCompute,
+                None,
+                format!("{error:#}"),
+            ),
+        }
+    }
+
+    if generation_durable
+        && pagerank_safe
+        && let Some(db_path) = db_path
+    {
+        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+        if let Err(error) = io.clear_marker(&marker_path) {
             push_reconciliation_failure(
                 &mut failures,
-                DeletionReconciliationStage::GenerationPersistence,
+                DeletionReconciliationStage::IndexPublicationMarkerRetirement,
                 None,
-                format!("{}: {error:#}", generation_path.display()),
+                format!("{}: {error:#}", marker_path.display()),
             );
         }
     }
@@ -687,56 +833,6 @@ fn finalize_index_commit_with_io(
         Ok(())
     } else {
         Err(DeletionReconciliationError::new(operation, failures))
-    }
-}
-
-fn refresh_index_pagerank_with_io(
-    store: &GraphStore,
-    db_path: Option<&Path>,
-    operation: &str,
-    io: &dyn IndexEpilogueIo,
-) -> Result<(), DeletionReconciliationError> {
-    let mut failures = Vec::new();
-    if let Err(error) = io.compute_pagerank(store) {
-        push_reconciliation_failure(
-            &mut failures,
-            DeletionReconciliationStage::PageRankCompute,
-            None,
-            format!("{error:#}"),
-        );
-    } else if let Some(db_path) = db_path {
-        let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
-        if let Err(error) = io.save_pagerank(store, &pagerank_path) {
-            push_reconciliation_failure(
-                &mut failures,
-                DeletionReconciliationStage::PageRankPersistence,
-                None,
-                format!("{}: {error:#}", pagerank_path.display()),
-            );
-            invalidate_pagerank_sidecar_with_io(&pagerank_path, io, &mut failures);
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(DeletionReconciliationError::new(operation, failures))
-    }
-}
-
-fn merge_reconciliation_results(
-    operation: &str,
-    first: Result<(), DeletionReconciliationError>,
-    second: Result<(), DeletionReconciliationError>,
-) -> Result<(), DeletionReconciliationError> {
-    match (first, second) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(mut first), Err(second)) => {
-            first.failures.extend(second.failures);
-            first.operation = operation.to_string();
-            Err(first)
-        }
     }
 }
 
@@ -1101,7 +1197,7 @@ fn index_directory_with_store_inner(
             Some(&mut reidentified_old_uid),
             name,
             Some(&local_root),
-            false,
+            true,
             &FileSystemIndexEpilogueIo,
             cancel,
             || Ok::<(), anyhow::Error>(()),
@@ -1123,7 +1219,7 @@ fn index_directory_with_store_inner(
             Some(&mut reidentified_old_uid),
             name,
             Some(&local_root),
-            false,
+            true,
             &FileSystemIndexEpilogueIo,
             cancel,
             || Ok::<(), anyhow::Error>(()),
@@ -1163,13 +1259,6 @@ fn index_directory_with_store_inner(
     // callers must not observe a successful index unless its fresh PageRank is
     // durable. nw-055 (P1b): delete-only re-indexes also need fresh surviving
     // ranks even though files_count is zero.
-    refresh_index_pagerank_with_io(
-        store,
-        Some(db_path),
-        "full index",
-        &FileSystemIndexEpilogueIo,
-    )?;
-
     Ok(result)
 }
 
@@ -1240,6 +1329,39 @@ where
     F: FnOnce() -> Result<G, anyhow::Error>,
 {
     index_with_reader_and_write_gate_and_io(
+        ReaderIndexRequest {
+            reader,
+            store,
+            instance_id,
+            repo_url,
+            indexed_sha,
+            name,
+            cancel,
+            epilogue_io: &FileSystemIndexEpilogueIo,
+        },
+        acquire_write_guard,
+    )
+}
+
+struct ReaderIndexRequest<'a> {
+    reader: &'a dyn crate::content_reader::ContentReader,
+    store: &'a GraphStore,
+    instance_id: &'a str,
+    repo_url: &'a str,
+    indexed_sha: &'a str,
+    name: Option<&'a str>,
+    cancel: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    epilogue_io: &'a dyn IndexEpilogueIo,
+}
+
+fn index_with_reader_and_write_gate_and_io<G, F>(
+    request: ReaderIndexRequest<'_>,
+    acquire_write_guard: F,
+) -> Result<IndexResult, anyhow::Error>
+where
+    F: FnOnce() -> Result<G, anyhow::Error>,
+{
+    let ReaderIndexRequest {
         reader,
         store,
         instance_id,
@@ -1247,26 +1369,8 @@ where
         indexed_sha,
         name,
         cancel,
-        &FileSystemIndexEpilogueIo,
-        acquire_write_guard,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn index_with_reader_and_write_gate_and_io<G, F>(
-    reader: &dyn crate::content_reader::ContentReader,
-    store: &GraphStore,
-    instance_id: &str,
-    repo_url: &str,
-    indexed_sha: &str,
-    name: Option<&str>,
-    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    epilogue_io: &dyn IndexEpilogueIo,
-    acquire_write_guard: F,
-) -> Result<IndexResult, anyhow::Error>
-where
-    F: FnOnce() -> Result<G, anyhow::Error>,
-{
+        epilogue_io,
+    } = request;
     let result = index_into_store_with_write_gate(
         reader,
         store,
@@ -1456,7 +1560,7 @@ fn index_into_store(
         None,
         name,
         root_path,
-        false,
+        true,
         &FileSystemIndexEpilogueIo,
         None,
         || Ok::<_, anyhow::Error>(()),
@@ -1982,6 +2086,9 @@ where
     drop(_phase_collect_span);
 
     let _write_guard = acquire_write_guard()?;
+    if let Some(db_path) = store.db_path() {
+        establish_index_publication_marker_with_io(db_path, "index graph write", epilogue_io)?;
+    }
     let graph_mutation_attempted = std::cell::Cell::new(false);
     let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
         // Re-identify prune: when a local repo previously indexed under a
@@ -2532,29 +2639,32 @@ where
     })();
 
     if !graph_mutation_attempted.get() {
+        if let Some(db_path) = store.db_path() {
+            let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+            if let Err(marker_error) = epilogue_io.clear_marker(&marker_path) {
+                return match graph_result {
+                    Ok(_) => Err(marker_error),
+                    Err(primary) => {
+                        let primary_message = format!("{primary:#}");
+                        Err(primary.context(format!(
+                            "{primary_message}; additionally, failed to retire uncommitted index marker: {marker_error:#}"
+                        )))
+                    }
+                };
+            }
+        }
         return graph_result;
     }
 
     // The write guard stays alive through this mandatory epilogue. Publish
-    // invalidation/generation on both success and every later graph error.
-    let publication =
-        finalize_index_commit_with_io(store, store.db_path(), "index graph write", epilogue_io);
-    let refresh = match graph_result.as_ref() {
-        Ok(result) if bump_generation_after_write => {
-            if result.files_count == 0 && result.files_deleted == 0 {
-                Ok(())
-            } else {
-                refresh_index_pagerank_with_io(
-                    store,
-                    store.db_path(),
-                    "server full index",
-                    epilogue_io,
-                )
-            }
-        }
-        _ => Ok(()),
-    };
-    let finalization = merge_reconciliation_results("index graph write", publication, refresh);
+    // invalidation/generation/PageRank on success and every later graph error.
+    let finalization = finalize_committed_index_with_io(
+        store,
+        store.db_path(),
+        "index graph write",
+        epilogue_io,
+        bump_generation_after_write,
+    );
     match (graph_result, finalization) {
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(finalization)) => Err(finalization.into()),
@@ -2856,6 +2966,8 @@ fn incremental_index_with_name_and_io(
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
 
+    establish_index_publication_marker_with_io(db_path, "incremental index", epilogue_io)?;
+
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
     // SHA is updated inside the transaction — if we crash before commit, the
@@ -2974,9 +3086,13 @@ fn incremental_index_with_name_and_io(
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
 
-    finalize_index_commit_with_io(&store, Some(db_path), "incremental index", epilogue_io)?;
-
-    refresh_index_pagerank_with_io(&store, Some(db_path), "incremental index", epilogue_io)?;
+    finalize_committed_index_with_io(
+        &store,
+        Some(db_path),
+        "incremental index",
+        epilogue_io,
+        true,
+    )?;
 
     Ok(result)
 }
@@ -3035,6 +3151,13 @@ where
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
 
     let _write_guard = acquire_write_guard()?;
+    if let Some(db_path) = store.db_path() {
+        establish_index_publication_marker_with_io(
+            db_path,
+            "server incremental index",
+            &FileSystemIndexEpilogueIo,
+        )?;
+    }
     let txn = store
         .begin_transaction()
         .with_context(|| "begin incremental transaction")?;
@@ -3142,13 +3265,12 @@ where
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
 
-    finalize_index_commit(store, store.db_path(), "server incremental index")?;
-
-    refresh_index_pagerank_with_io(
+    finalize_committed_index_with_io(
         store,
         store.db_path(),
         "server incremental index",
         &FileSystemIndexEpilogueIo,
+        true,
     )?;
 
     Ok(result)
@@ -3702,7 +3824,7 @@ fn full_index_fallback(
         Some(&mut reidentified_old_uid),
         name,
         Some(&local_root),
-        false,
+        true,
         epilogue_io,
         None,
         || Ok::<(), anyhow::Error>(()),
@@ -3748,8 +3870,6 @@ fn full_index_fallback(
     // A failure is returned so the fallback cannot report success without a
     // durable fresh cache. nw-055 (P1b): delete-only re-indexes also refresh the
     // surviving nodes' ranks even though files_count is zero.
-    refresh_index_pagerank_with_io(store, Some(db_path), "full index fallback", epilogue_io)?;
-
     Ok(IncrementalResult {
         fell_back_to_full: true,
         symbols_added: result.symbols_count,
@@ -4885,9 +5005,15 @@ function hello(name) { return "Hello " + name; }
             !store.pagerank_scores().contains_key("stale"),
             "the committed graph must invalidate the live stale PageRank cache"
         );
+        let persisted: HashMap<String, f64> =
+            serde_json::from_slice(&fs::read(&pagerank_path).unwrap()).unwrap();
         assert!(
-            !pagerank_path.exists(),
-            "the committed graph must remove or quarantine persisted stale PageRank"
+            !persisted.contains_key("stale"),
+            "the committed graph may publish fresh PageRank but must not retain the stale score"
+        );
+        assert!(
+            !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "durable fresh publication should retire the fail-closed marker"
         );
         assert!(store.graph_generation() > generation_before);
         assert_eq!(
@@ -4901,13 +5027,28 @@ function hello(name) { return "Hello " + name; }
         );
     }
 
+    #[derive(Default)]
     struct InjectedIndexEpilogueIo {
+        fail_establish: bool,
         fail_remove: bool,
+        fail_rename: bool,
+        fail_generation: bool,
         fail_compute: bool,
         fail_save: bool,
     }
 
     impl IndexEpilogueIo for InjectedIndexEpilogueIo {
+        fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            if self.fail_establish {
+                anyhow::bail!("injected marker establishment failure");
+            }
+            FileSystemIndexEpilogueIo.establish_marker(path)
+        }
+
+        fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.clear_marker(path)
+        }
+
         fn remove_file(&self, path: &Path) -> std::io::Result<()> {
             if self.fail_remove {
                 return Err(std::io::Error::other("injected PageRank removal failure"));
@@ -4916,10 +5057,18 @@ function hello(name) { return "Hello " + name; }
         }
 
         fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.fail_rename {
+                return Err(std::io::Error::other(
+                    "injected PageRank quarantine failure",
+                ));
+            }
             std::fs::rename(from, to)
         }
 
         fn save_generation(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+            if self.fail_generation {
+                anyhow::bail!("injected generation save failure");
+            }
             store.save_graph_generation(path).map_err(Into::into)
         }
 
@@ -4948,16 +5097,21 @@ function hello(name) { return "Hello " + name; }
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
-        finalize_index_commit(&store, Some(&db_path), "compute failure regression").unwrap();
-        let error = refresh_index_pagerank_with_io(
+        establish_index_publication_marker_with_io(
+            &db_path,
+            "compute failure regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
             &store,
             Some(&db_path),
             "compute failure regression",
             &InjectedIndexEpilogueIo {
-                fail_remove: false,
                 fail_compute: true,
-                fail_save: false,
+                ..Default::default()
             },
+            true,
         )
         .expect_err("a post-commit PageRank compute failure must be returned");
 
@@ -4988,16 +5142,21 @@ function hello(name) { return "Hello " + name; }
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
-        finalize_index_commit(&store, Some(&db_path), "save failure regression").unwrap();
-        let error = refresh_index_pagerank_with_io(
+        establish_index_publication_marker_with_io(
+            &db_path,
+            "save failure regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
             &store,
             Some(&db_path),
             "save failure regression",
             &InjectedIndexEpilogueIo {
-                fail_remove: false,
-                fail_compute: false,
                 fail_save: true,
+                ..Default::default()
             },
+            true,
         )
         .expect_err("a post-commit PageRank save failure must be returned");
 
@@ -5020,15 +5179,21 @@ function hello(name) { return "Hello " + name; }
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
-        let error = finalize_index_commit_with_io(
+        establish_index_publication_marker_with_io(
+            &db_path,
+            "removal failure regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
             &store,
             Some(&db_path),
             "removal failure regression",
             &InjectedIndexEpilogueIo {
                 fail_remove: true,
-                fail_compute: false,
-                fail_save: false,
+                ..Default::default()
             },
+            false,
         )
         .expect_err("the injected durable removal failure must be returned");
 
@@ -5048,6 +5213,105 @@ function hello(name) { return "Hello " + name; }
                 .unwrap(),
             store.graph_generation()
         );
+    }
+
+    #[test]
+    fn unlink_and_quarantine_failure_keeps_dirty_marker_fail_closed_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+
+        establish_index_publication_marker_with_io(
+            &db_path,
+            "unlink and quarantine regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
+            &store,
+            Some(&db_path),
+            "unlink and quarantine regression",
+            &InjectedIndexEpilogueIo {
+                fail_remove: true,
+                fail_rename: true,
+                fail_compute: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .expect_err("unsafe persisted PageRank must fail publication");
+
+        assert!(error.to_string().contains("persisted-pagerank"));
+        assert!(error.to_string().contains("pagerank-compute"));
+        assert!(marker_path.exists(), "unsafe publication must remain dirty");
+        assert!(
+            pagerank_path.exists(),
+            "both injected retirement paths failed"
+        );
+        let canonical_generation = fs::read_to_string(&generation_path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_ne!(reopened.graph_generation(), canonical_generation);
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key("stale"));
+    }
+
+    #[test]
+    fn generation_save_failure_keeps_dirty_marker_fail_closed_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        store.load_pagerank_cache(&pagerank_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let stale_generation = store.graph_generation();
+
+        establish_index_publication_marker_with_io(
+            &db_path,
+            "generation regression",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let error = finalize_committed_index_with_io(
+            &store,
+            Some(&db_path),
+            "generation regression",
+            &InjectedIndexEpilogueIo {
+                fail_generation: true,
+                fail_compute: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .expect_err("unsafe generation persistence must fail publication");
+
+        let message = error.to_string();
+        let generation_failure = message.find("generation-persistence").unwrap();
+        let compute_failure = message.find("pagerank-compute").unwrap();
+        assert!(generation_failure < compute_failure);
+        assert!(marker_path.exists(), "unsafe publication must remain dirty");
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_ne!(reopened.graph_generation(), stale_generation);
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key("stale"));
     }
 
     struct EmptyReader {
@@ -5209,17 +5473,18 @@ function hello(name) { return "Hello " + name; }
         };
 
         let error = match index_with_reader_and_write_gate_and_io(
-            &reader,
-            &store,
-            "test",
-            repo_url,
-            "sha-2",
-            None,
-            None,
-            &InjectedIndexEpilogueIo {
-                fail_remove: false,
-                fail_compute: true,
-                fail_save: false,
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-2",
+                name: None,
+                cancel: None,
+                epilogue_io: &InjectedIndexEpilogueIo {
+                    fail_compute: true,
+                    ..Default::default()
+                },
             },
             || {
                 Ok::<_, anyhow::Error>(PublicationGuard {
@@ -5242,6 +5507,94 @@ function hello(name) { return "Hello " + name; }
         );
         assert!(!store.pagerank_scores().contains_key("stale"));
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn full_publication_and_compute_failures_are_aggregated() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("old.js"), "function oldVersion() { return 1; }").unwrap();
+        let repo_url = "https://example.com/full-dual-failure";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let reader = EmptyReader {
+            root: dir.path().join("empty-reader"),
+        };
+
+        let error = match index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-2",
+                name: None,
+                cancel: None,
+                epilogue_io: &InjectedIndexEpilogueIo {
+                    fail_generation: true,
+                    fail_compute: true,
+                    ..Default::default()
+                },
+            },
+            || Ok::<_, anyhow::Error>(()),
+        ) {
+            Ok(_) => panic!("dual post-commit failure must be returned"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        let generation_failure = message.find("generation-persistence").unwrap();
+        let compute_failure = message.find("pagerank-compute").unwrap();
+        assert!(generation_failure < compute_failure);
+        assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
+        assert!(store.symbols_in_file("old.js").unwrap().is_empty());
+    }
+
+    #[test]
+    fn marker_establishment_failure_aborts_before_full_graph_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("old.js"), "function oldVersion() { return 1; }").unwrap();
+        let repo_url = "https://example.com/marker-precondition";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let reader = EmptyReader {
+            root: dir.path().join("empty-reader"),
+        };
+
+        let error = match index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-2",
+                name: None,
+                cancel: None,
+                epilogue_io: &InjectedIndexEpilogueIo {
+                    fail_establish: true,
+                    ..Default::default()
+                },
+            },
+            || Ok::<_, anyhow::Error>(()),
+        ) {
+            Ok(_) => panic!("marker establishment failure must abort indexing"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("index-publication-marker"));
+        assert!(
+            store
+                .symbols_in_file("old.js")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "oldVersion"),
+            "no graph replacement may commit without the durable marker"
+        );
     }
 
     #[test]
@@ -5429,7 +5782,7 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn incremental_compute_failure_finalizes_the_committed_update() {
+    fn incremental_publication_and_compute_failures_are_aggregated() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
@@ -5470,14 +5823,17 @@ function hello(name) { return "Hello " + name; }
             repo_url,
             None,
             &InjectedIndexEpilogueIo {
-                fail_remove: false,
+                fail_generation: true,
                 fail_compute: true,
-                fail_save: false,
+                ..Default::default()
             },
         )
         .expect_err("the injected incremental compute failure must be returned");
 
-        assert!(error.to_string().contains("pagerank-compute"));
+        let message = error.to_string();
+        let generation_failure = message.find("generation-persistence").unwrap();
+        let compute_failure = message.find("pagerank-compute").unwrap();
+        assert!(generation_failure < compute_failure);
         let store = GraphStore::open_or_create(&db_path).unwrap();
         assert!(
             store
@@ -5493,7 +5849,7 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn non_ancestor_fallback_compute_failure_finalizes_atomic_replacement() {
+    fn fallback_publication_and_compute_failures_are_aggregated() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
@@ -5535,14 +5891,17 @@ function hello(name) { return "Hello " + name; }
             repo_url,
             None,
             &InjectedIndexEpilogueIo {
-                fail_remove: false,
+                fail_generation: true,
                 fail_compute: true,
-                fail_save: false,
+                ..Default::default()
             },
         )
         .expect_err("the injected fallback compute failure must be returned");
 
-        assert!(error.to_string().contains("pagerank-compute"));
+        let message = error.to_string();
+        let generation_failure = message.find("generation-persistence").unwrap();
+        let compute_failure = message.find("pagerank-compute").unwrap();
+        assert!(generation_failure < compute_failure);
         let store = GraphStore::open_or_create(&db_path).unwrap();
         assert!(store.symbols_in_file("old.js").unwrap().is_empty());
         assert!(

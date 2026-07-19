@@ -1035,6 +1035,10 @@ impl GraphStore {
     ///
     /// If the file does not exist, this is a no-op.
     pub fn load_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
+        if self.is_index_publication_dirty() {
+            self.invalidate_pagerank();
+            return Ok(());
+        }
         if path.exists() {
             let json = std::fs::read_to_string(path)
                 .map_err(|e| StoreError::Query(format!("read: {e}")))?;

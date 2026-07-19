@@ -14,6 +14,7 @@
 //! generation, so a freshly-opened process sees the new value and treats every
 //! older cache entry as a MISS — no background daemon required.
 
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -21,6 +22,17 @@ use crate::db::GraphStore;
 use crate::error::StoreError;
 
 impl GraphStore {
+    fn dirty_index_publication_generation(&self) -> Option<u64> {
+        let db_path = self.db_path.as_ref()?;
+        let mut marker_path = db_path.as_os_str().to_owned();
+        marker_path.push(".index-dirty");
+        let marker_path = std::path::PathBuf::from(marker_path);
+        let marker = std::fs::read(marker_path).ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        marker.hash(&mut hasher);
+        Some(hasher.finish() | (1_u64 << 63))
+    }
+
     /// Load the persisted `graph_generation` value from the `<db>.generation`
     /// sidecar at `path` into the in-memory counter. No-op (counter stays at
     /// its current value) when the file is absent or unparseable — a missing
@@ -32,7 +44,19 @@ impl GraphStore {
         if let Ok(contents) = std::fs::read_to_string(path)
             && let Ok(value) = contents.trim().parse::<u64>()
         {
-            self.graph_generation.store(value, Ordering::Release);
+            // A durable index-publication marker means the graph may have
+            // committed after this sidecar was written. Never restore the
+            // stale value as current; use a distinct ephemeral successor so
+            // generation-keyed caches fail closed until publication repairs.
+            let loaded = self.dirty_index_publication_generation().unwrap_or(value);
+            self.graph_generation.store(loaded, Ordering::Release);
+        } else if self.is_index_publication_dirty() {
+            // Missing/unparseable generation while dirty is also newer than
+            // the conventional never-indexed generation zero.
+            let loaded = self
+                .dirty_index_publication_generation()
+                .unwrap_or(u64::MAX);
+            self.graph_generation.store(loaded, Ordering::Release);
         }
     }
 

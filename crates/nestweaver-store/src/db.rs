@@ -436,6 +436,21 @@ impl GraphStore {
         self.db_path.as_deref()
     }
 
+    /// Whether an indexing writer durably marked graph publication incomplete.
+    /// While this marker exists, canonical generation and PageRank sidecars may
+    /// predate the committed graph and must not be treated as authoritative.
+    pub fn is_index_publication_dirty(&self) -> bool {
+        self.db_path
+            .as_ref()
+            .is_some_and(|path| Self::index_publication_marker_for(path).exists())
+    }
+
+    fn index_publication_marker_for(db_path: &Path) -> PathBuf {
+        let mut value = db_path.as_os_str().to_owned();
+        value.push(".index-dirty");
+        PathBuf::from(value)
+    }
+
     /// Path to the `<db>.generation` sidecar. For in-memory stores (no
     /// `db_path`) this returns a relative `.generation` path that is never
     /// actually read or written — `load_graph_generation` no-ops on absence
@@ -1199,6 +1214,37 @@ mod tests {
             reopened.graph_generation(),
             2,
             "generation must survive reopen and NOT reset to 0"
+        );
+    }
+
+    #[test]
+    fn dirty_index_publication_ignores_stale_generation_and_pagerank_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = PathBuf::from(format!("{}.generation", db_path.display()));
+        let pagerank_path = PathBuf::from(format!("{}.pagerank.json", db_path.display()));
+        let dirty_path = PathBuf::from(format!("{}.index-dirty", db_path.display()));
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            for _ in 0..7 {
+                store.bump_graph_generation();
+            }
+            store.save_graph_generation(&generation_path).unwrap();
+        }
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        std::fs::write(&dirty_path, b"dirty").unwrap();
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_ne!(
+            reopened.graph_generation(),
+            7,
+            "a dirty publication must not restore the stale canonical generation"
+        );
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(
+            !reopened.pagerank_scores().contains_key("stale"),
+            "a dirty publication must not load canonical PageRank from before the graph commit"
         );
     }
 
