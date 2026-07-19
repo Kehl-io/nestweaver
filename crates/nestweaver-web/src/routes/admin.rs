@@ -405,7 +405,6 @@ pub async fn add_repo(
 fn run_admin_remove_repo_with<C, D>(
     store: &nestweaver_store::GraphStore,
     db_path: &std::path::Path,
-    tantivy: Option<&nestweaver_store::TantivyIndex>,
     repo_uid: &str,
     clear_derived: C,
     delete_repo: D,
@@ -427,7 +426,6 @@ where
         store,
         db_path,
         &[repo_uid.to_string()],
-        tantivy,
         "admin repo removal",
     );
     match (cascade_result, reconciliation) {
@@ -533,13 +531,11 @@ pub async fn remove_repo(
     // whether the repo node still exists and skips if deleted.
     let write_mutex = state.write_mutex.clone();
     let db_path = state.db_path.clone();
-    let tantivy = state.tantivy.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = write_mutex.as_ref().map(|m| m.blocking_lock());
         run_admin_remove_repo_with(
             &store,
             &db_path,
-            tantivy.as_deref(),
             &uid,
             |store, uid| {
                 store.clear_repo_derived_nodes(uid).map_err(|e| {
@@ -1975,7 +1971,7 @@ url = "https://github.com/example/existing"
     }
 
     #[tokio::test]
-    async fn remove_repo_finalizes_live_caches_sidecars_and_search() {
+    async fn remove_repo_finalizes_code_state_without_rebuilding_vault_search() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
@@ -2035,9 +2031,8 @@ url = "https://github.com/example/existing"
         let tantivy = Arc::new(
             nestweaver_store::TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap(),
         );
-        // Seed a search-only stale document. Shared finalization rebuilds the
-        // corpus from the graph, so this disappears iff the admin path really
-        // reconciles the live Tantivy writer after mutation.
+        // Seed an unrelated vault document. Repo deletion changes no indexed
+        // vault document kind, so the admin path must leave Tantivy untouched.
         tantivy
             .update_note(
                 "note:stale-admin-delete",
@@ -2124,11 +2119,11 @@ url = "https://github.com/example/existing"
             "admin deletion must invalidate the live PageRank cache"
         );
         assert!(
-            tantivy
+            !tantivy
                 .search("admin_delete_target", 10)
                 .unwrap()
                 .is_empty(),
-            "admin deletion must reconcile the text-search index"
+            "code-only admin deletion must not rebuild unrelated vault search"
         );
         assert!(
             !nestweaver_engine::load_manifest_cache(&manifests_path)
@@ -2205,7 +2200,6 @@ url = "https://github.com/example/existing"
         let error = run_admin_remove_repo_with(
             &store,
             &db_path,
-            Some(&tantivy),
             repo_uid,
             |store, uid| {
                 store.clear_repo_derived_nodes(uid).map_err(|e| {
@@ -2246,42 +2240,69 @@ url = "https://github.com/example/existing"
         assert!(!pagerank_path.exists());
         assert!(!store.pagerank_scores().contains_key(&file_uid));
         assert!(
-            tantivy
+            !tantivy
                 .search("web_late_remove_search_sentinel", 10)
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "code-only deletion must not rebuild unrelated vault search documents"
         );
     }
 
     #[test]
-    fn admin_remove_repo_preserves_mutation_and_tantivy_rebuild_failures() {
+    fn admin_remove_repo_preserves_real_mutation_and_reconciliation_failures() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
-        let tantivy_path = dir.path().join("tantivy");
-        drop(nestweaver_store::TantivyIndex::open_or_create(&tantivy_path).unwrap());
-        let reader = nestweaver_store::TantivyIndex::open_reader_only(&tantivy_path).unwrap();
+        let repo_uid = "repo:test:web-real-combined-error";
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: repo_uid.to_string(),
+                url: "https://example.test/web-real-combined-error".to_string(),
+                indexed_sha: "sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(repo_uid, "src/lib.rs"),
+                path: "src/lib.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        let generation_path = nestweaver_engine::sidecar_path(&db_path, ".generation");
+        std::fs::create_dir(&generation_path).unwrap();
         let generation_before = store.graph_generation();
 
         let error = run_admin_remove_repo_with(
             &store,
             &db_path,
-            Some(&reader),
-            "repo:test:web-search-failure",
-            |_store, _uid| Ok(()),
+            repo_uid,
+            |store, uid| {
+                store.clear_repo_derived_nodes(uid).map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("clear derived: {error}"),
+                    )
+                })
+            },
             |_store, _uid| {
                 Err((
                     StatusCode::CONFLICT,
-                    "injected admin mutation failure".to_string(),
+                    "real committed admin mutation failure".to_string(),
                 ))
             },
         )
         .unwrap_err();
 
         assert_eq!(error.0, StatusCode::CONFLICT);
-        assert!(error.1.contains("injected admin mutation failure"));
-        assert!(error.1.contains("search-index"));
-        assert!(error.1.contains("writer unavailable"));
+        assert!(error.1.contains("real committed admin mutation failure"));
+        assert!(error.1.contains("generation-persistence"));
+        assert!(store.list_files_by_repo(repo_uid).unwrap().is_empty());
+        assert!(store.lookup_repo(repo_uid).unwrap().is_some());
         assert!(store.graph_generation() > generation_before);
     }
 

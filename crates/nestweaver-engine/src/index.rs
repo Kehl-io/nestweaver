@@ -362,8 +362,20 @@ fn remove_repo_sidecar_slices_with_io(
 #[derive(Debug)]
 pub struct DeletedGraphStateReconciliation {
     pub manifests_removed: Result<usize, String>,
-    pub embeddings_removed: Result<usize, String>,
+    pub embeddings: DeletedEmbeddingStateReconciliation,
     pub clusters_invalidated: Result<bool, String>,
+}
+
+/// Typed embedding reconciliation results keep canonical persistence and
+/// legacy retirement distinguishable at the aggregate error boundary.
+#[derive(Debug)]
+pub enum DeletedEmbeddingStateReconciliation {
+    LiveSetFailed(String),
+    Reconciled {
+        removed: usize,
+        canonical_persistence: Result<(), String>,
+        legacy_retirement: Option<Result<bool, String>>,
+    },
 }
 
 /// Reconcile repo/node-keyed derived state against the authoritative live
@@ -404,9 +416,20 @@ fn reconcile_deleted_graph_state_with_io(
     })()
     .map_err(|error| format!("manifest reconciliation failed: {error:#}"));
 
-    let embeddings_removed = store
-        .reconcile_embedding_index()
-        .map_err(|error| format!("embedding reconciliation failed: {error:#}"));
+    let embeddings = match store.reconcile_embedding_index_stages() {
+        Ok(result) => DeletedEmbeddingStateReconciliation::Reconciled {
+            removed: result.removed,
+            canonical_persistence: result
+                .canonical_persistence
+                .map_err(|error| format!("embedding persistence failed: {error:#}")),
+            legacy_retirement: result.legacy_retirement.map(|retirement| {
+                retirement.map_err(|error| format!("legacy embedding retirement failed: {error:#}"))
+            }),
+        },
+        Err(error) => DeletedEmbeddingStateReconciliation::LiveSetFailed(format!(
+            "embedding live-set reconciliation failed: {error:#}"
+        )),
+    };
     let clusters_path = crate::sidecar_path(db_path, ".clusters.json");
     let clusters_invalidated = match io.remove_file(&clusters_path) {
         Ok(()) => Ok(true),
@@ -419,7 +442,7 @@ fn reconcile_deleted_graph_state_with_io(
 
     DeletedGraphStateReconciliation {
         manifests_removed,
-        embeddings_removed,
+        embeddings,
         clusters_invalidated,
     }
 }
@@ -437,14 +460,12 @@ pub fn finalize_code_graph_deletion(
     store: &GraphStore,
     db_path: &Path,
     repo_uids: &[String],
-    tantivy: Option<&nestweaver_store::TantivyIndex>,
     operation: &str,
 ) -> Result<(), DeletionReconciliationError> {
     finalize_code_graph_deletion_with_io(
         store,
         db_path,
         repo_uids,
-        tantivy,
         operation,
         &FileSystemDeletionReconciliationIo,
     )
@@ -454,7 +475,6 @@ fn finalize_code_graph_deletion_with_io(
     store: &GraphStore,
     db_path: &Path,
     repo_uids: &[String],
-    tantivy: Option<&nestweaver_store::TantivyIndex>,
     operation: &str,
     io: &dyn DeletionReconciliationIo,
 ) -> Result<(), DeletionReconciliationError> {
@@ -474,15 +494,35 @@ fn finalize_code_graph_deletion_with_io(
             push_reconciliation_failure(&mut failures, stage, None, error);
         }
     }
-    match reconciliation.embeddings_removed {
-        Ok(removed) => tracing::info!(removed, operation, "embedding index reconciled"),
-        Err(error) => {
-            let stage = if error.contains("legacy embedding sidecar") {
-                DeletionReconciliationStage::LegacyRetirement
-            } else {
-                DeletionReconciliationStage::EmbeddingIndex
-            };
-            push_reconciliation_failure(&mut failures, stage, None, error);
+    match reconciliation.embeddings {
+        DeletedEmbeddingStateReconciliation::LiveSetFailed(error) => push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::EmbeddingIndex,
+            None,
+            error,
+        ),
+        DeletedEmbeddingStateReconciliation::Reconciled {
+            removed,
+            canonical_persistence,
+            legacy_retirement,
+        } => {
+            match canonical_persistence {
+                Ok(()) => tracing::info!(removed, operation, "embedding index reconciled"),
+                Err(error) => push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::EmbeddingIndex,
+                    None,
+                    error,
+                ),
+            }
+            if let Some(Err(error)) = legacy_retirement {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::LegacyRetirement,
+                    None,
+                    error,
+                );
+            }
         }
     }
     match reconciliation.clusters_invalidated {
@@ -520,18 +560,6 @@ fn finalize_code_graph_deletion_with_io(
             None,
             format!("{}: {error}", pagerank_path.display()),
         );
-    }
-
-    if let Some(tantivy) = tantivy {
-        match tantivy.reindex_from_store(store) {
-            Ok(docs) => tracing::info!(docs, operation, "Tantivy reindexed after mutation"),
-            Err(error) => push_reconciliation_failure(
-                &mut failures,
-                DeletionReconciliationStage::SearchIndex,
-                None,
-                error.to_string(),
-            ),
-        }
     }
 
     if failures.is_empty() {
@@ -4329,7 +4357,6 @@ function hello(name) { return "Hello " + name; }
             &store,
             &db_path,
             std::slice::from_ref(&removed_uid),
-            None,
             "manifest regression",
         )
         .unwrap();
@@ -4408,7 +4435,6 @@ function hello(name) { return "Hello " + name; }
             &store,
             &db_path,
             std::slice::from_ref(&removed_repo_uid),
-            None,
             "embedding regression",
         )
         .unwrap();
@@ -4479,9 +4505,6 @@ function hello(name) { return "Hello " + name; }
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let pagerank_generation = store.pagerank_generation();
 
-        let tantivy_path = dir.path().join("tantivy");
-        drop(nestweaver_store::TantivyIndex::open_or_create(&tantivy_path).unwrap());
-        let reader = nestweaver_store::TantivyIndex::open_reader_only(&tantivy_path).unwrap();
         let io = InjectedDeletionIo {
             fail_save: filemeta_path.clone(),
             fail_remove: clusters_path.clone(),
@@ -4491,7 +4514,6 @@ function hello(name) { return "Hello " + name; }
             &store,
             &db_path,
             std::slice::from_ref(&repo_uid),
-            Some(&reader),
             "aggregate regression",
             &io,
         )
@@ -4507,7 +4529,6 @@ function hello(name) { return "Hello " + name; }
                 DeletionReconciliationStage::FileMetadata,
                 DeletionReconciliationStage::ClusterCache,
                 DeletionReconciliationStage::GenerationPersistence,
-                DeletionReconciliationStage::SearchIndex,
             ]
         );
         assert!(
@@ -4552,7 +4573,6 @@ function hello(name) { return "Hello " + name; }
             &store,
             &db_path,
             &[repo_uid],
-            None,
             "legacy retirement regression",
         )
         .unwrap_err();
@@ -4570,6 +4590,35 @@ function hello(name) { return "Hello " + name; }
         assert!(
             crate::sidecar_path(&db_path, ".generation").exists(),
             "later generation persistence must still run"
+        );
+    }
+
+    #[test]
+    fn deletion_finalizer_classifies_embedding_legacy_retirement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let mut legacy_path = db_path.as_os_str().to_owned();
+        legacy_path.push(".embeddings");
+        fs::create_dir(std::path::PathBuf::from(legacy_path)).unwrap();
+
+        let error = finalize_code_graph_deletion(
+            &store,
+            &db_path,
+            &[],
+            "embedding legacy retirement regression",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.failures.len(), 1);
+        assert_eq!(
+            error.failures[0].stage,
+            DeletionReconciliationStage::LegacyRetirement
+        );
+        assert!(
+            error.failures[0]
+                .message
+                .contains("legacy embedding retirement")
         );
     }
 

@@ -184,11 +184,11 @@ pub use guide_rules::{
 };
 pub use hubs::{HubNode, attach_cluster_ids, find_hub_nodes};
 pub use index::{
-    CachedFileMeta, DeletedGraphStateReconciliation, DeletionReconciliationError,
-    DeletionReconciliationFailure, DeletionReconciliationStage, FILEMETA_VERSION, FileMetaCache,
-    FileMetaSidecar, IncrementalResult, IndexResult, finalize_code_graph_deletion,
-    incremental_index, incremental_index_with_name, index_directory, index_directory_in_memory,
-    index_directory_with_options, index_directory_with_store,
+    CachedFileMeta, DeletedEmbeddingStateReconciliation, DeletedGraphStateReconciliation,
+    DeletionReconciliationError, DeletionReconciliationFailure, DeletionReconciliationStage,
+    FILEMETA_VERSION, FileMetaCache, FileMetaSidecar, IncrementalResult, IndexResult,
+    finalize_code_graph_deletion, incremental_index, incremental_index_with_name, index_directory,
+    index_directory_in_memory, index_directory_with_options, index_directory_with_store,
     index_directory_with_store_cancellable, index_with_reader, index_with_reader_and_write_gate,
     load_filemeta_sidecar, reconcile_deleted_graph_state, remove_repo_sidecar_slices,
     save_filemeta_sidecar,

@@ -104,9 +104,17 @@ impl Drop for ConnectionGuard {
 }
 
 /// Shared state held by the daemon process.
+#[derive(Clone)]
+enum SearchIndexReconciliation {
+    Disabled,
+    Available(Arc<TantivyIndex>),
+    Unavailable(String),
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
+    search_reconciliation: SearchIndexReconciliation,
     pub db_path: PathBuf,
     /// Runtime identity: the SHA-256-derived id of the canonical `--db` path
     /// (see [`lifecycle::instance_id_from_db_path`]). Used ONLY for runtime
@@ -875,7 +883,6 @@ fn finalize_code_graph_deletion(
         &state.store,
         &state.db_path,
         repo_uids,
-        None,
         "code graph deletion",
     ) {
         Ok(()) => Vec::new(),
@@ -900,15 +907,33 @@ fn finalize_node_graph_deletion(
     operation: &str,
 ) -> Vec<nestweaver_engine::DeletionReconciliationFailure> {
     let mut failures = Vec::new();
-    match state.store.reconcile_embedding_index() {
-        Ok(removed) => {
-            tracing::info!(removed, operation, "reconciled deleted node embeddings")
-        }
+    match state.store.reconcile_embedding_index_stages() {
         Err(error) => push_reconciliation_failure(
             &mut failures,
             nestweaver_engine::DeletionReconciliationStage::EmbeddingIndex,
-            format!("embedding reconciliation failed: {error:#}"),
+            format!("embedding live-set reconciliation failed: {error:#}"),
         ),
+        Ok(result) => {
+            match result.canonical_persistence {
+                Ok(()) => tracing::info!(
+                    removed = result.removed,
+                    operation,
+                    "reconciled deleted node embeddings"
+                ),
+                Err(error) => push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::EmbeddingIndex,
+                    format!("embedding persistence failed: {error:#}"),
+                ),
+            }
+            if let Some(Err(error)) = result.legacy_retirement {
+                push_reconciliation_failure(
+                    &mut failures,
+                    nestweaver_engine::DeletionReconciliationStage::LegacyRetirement,
+                    format!("legacy embedding retirement failed: {error:#}"),
+                );
+            }
+        }
     }
     state.store.bump_graph_generation();
     let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
@@ -919,7 +944,245 @@ fn finalize_node_graph_deletion(
             format!("{}: {error:#}", generation_path.display()),
         );
     }
+    state.store.invalidate_pagerank();
+    let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+    if let Err(error) = std::fs::remove_file(&pagerank_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        push_reconciliation_failure(
+            &mut failures,
+            nestweaver_engine::DeletionReconciliationStage::PersistedPageRank,
+            format!("{}: {error}", pagerank_path.display()),
+        );
+    }
     failures
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct IndexedSearchDocument {
+    uid: String,
+    kind: &'static str,
+    title: String,
+    body: String,
+    vault_uid: String,
+    note_uid: String,
+}
+
+fn indexed_section_lines(lines: &[&str], start: u32, end: u32) -> String {
+    if start == 0 || start as usize > lines.len() {
+        return String::new();
+    }
+    let end = (end as usize).min(lines.len());
+    let start = (start - 1) as usize;
+    if start >= end {
+        return String::new();
+    }
+    lines[start..end].join("\n")
+}
+
+fn indexed_search_rows(
+    store: &GraphStore,
+) -> Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error> {
+    use std::collections::{HashMap, HashSet};
+
+    let notes = store.list_notes(None)?;
+    let headings = store.list_all_headings()?;
+    let sections = store.list_all_sections()?;
+    let mut headings_by_note: HashMap<&str, Vec<_>> = HashMap::new();
+    for heading in &headings {
+        headings_by_note
+            .entry(heading.note_uid.as_str())
+            .or_default()
+            .push(heading);
+    }
+    let mut sections_by_note: HashMap<&str, Vec<_>> = HashMap::new();
+    for section in &sections {
+        sections_by_note
+            .entry(section.note_uid.as_str())
+            .or_default()
+            .push(section);
+    }
+
+    let mut documents = HashSet::new();
+    for note in &notes {
+        let note_headings = headings_by_note
+            .get(note.uid.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let note_sections = sections_by_note
+            .get(note.uid.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let body_from_disk = store.lookup_vault(&note.vault_uid).ok().and_then(|vault| {
+            let path = std::path::Path::new(&vault.root_path).join(&note.file_path);
+            std::fs::read_to_string(path).ok()
+        });
+        documents.insert(IndexedSearchDocument {
+            uid: note.uid.clone(),
+            kind: "note",
+            title: note.title.clone(),
+            body: body_from_disk.clone().unwrap_or_else(|| note.title.clone()),
+            vault_uid: note.vault_uid.clone(),
+            note_uid: note.uid.clone(),
+        });
+        for heading in note_headings {
+            documents.insert(IndexedSearchDocument {
+                uid: heading.uid.clone(),
+                kind: "heading",
+                title: heading.text.clone(),
+                body: heading.text.clone(),
+                vault_uid: note.vault_uid.clone(),
+                note_uid: note.uid.clone(),
+            });
+        }
+        let body_lines: Vec<&str> = body_from_disk
+            .as_deref()
+            .map(|body| body.lines().collect())
+            .unwrap_or_default();
+        for section in note_sections {
+            let title = section
+                .heading_uid
+                .as_deref()
+                .and_then(|heading_uid| {
+                    note_headings
+                        .iter()
+                        .find(|heading| heading.uid == heading_uid)
+                })
+                .map(|heading| heading.text.clone())
+                .unwrap_or_default();
+            let body = if section.text_content.is_empty() {
+                indexed_section_lines(&body_lines, section.start_line, section.end_line)
+            } else {
+                section.text_content.clone()
+            };
+            documents.insert(IndexedSearchDocument {
+                uid: section.uid.clone(),
+                kind: "section",
+                title,
+                body,
+                vault_uid: note.vault_uid.clone(),
+                note_uid: note.uid.clone(),
+            });
+        }
+    }
+    for tag in store.list_tags(None)? {
+        documents.insert(IndexedSearchDocument {
+            uid: tag.uid,
+            kind: "tag",
+            title: tag.name.clone(),
+            body: tag.name,
+            vault_uid: tag.vault_uid,
+            note_uid: String::new(),
+        });
+    }
+    Ok(documents)
+}
+
+fn indexed_search_rows_changed(
+    before: Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>,
+    store: &GraphStore,
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+) -> bool {
+    match (before, indexed_search_rows(store)) {
+        (Ok(before), Ok(after)) => before != after,
+        (Err(error), _) | (_, Err(error)) => {
+            push_reconciliation_failure(
+                failures,
+                nestweaver_engine::DeletionReconciliationStage::SearchIndex,
+                format!("failed to determine indexed document mutation: {error:#}"),
+            );
+            false
+        }
+    }
+}
+
+fn reconcile_search_index(
+    state: &SearchIndexReconciliation,
+    store: &GraphStore,
+    indexed_rows_changed: bool,
+    operation: &str,
+) -> Result<(), anyhow::Error> {
+    if !indexed_rows_changed {
+        return Ok(());
+    }
+    match state {
+        SearchIndexReconciliation::Disabled => Ok(()),
+        SearchIndexReconciliation::Available(tantivy) => {
+            let docs = tantivy.reindex_from_store(store)?;
+            tracing::info!(docs, operation, "Tantivy reindexed after mutation");
+            Ok(())
+        }
+        SearchIndexReconciliation::Unavailable(reason) => {
+            anyhow::bail!("configured Tantivy index unavailable: {reason}")
+        }
+    }
+}
+
+fn open_search_index(
+    tantivy_path: &Path,
+    read_only: bool,
+) -> (Option<Arc<TantivyIndex>>, SearchIndexReconciliation) {
+    if read_only {
+        return match TantivyIndex::open_reader_only(tantivy_path) {
+            Ok(index) => {
+                tracing::info!(
+                    docs = index.doc_count(),
+                    path = %tantivy_path.display(),
+                    "Tantivy index open (replica, reader-only)"
+                );
+                (Some(Arc::new(index)), SearchIndexReconciliation::Disabled)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not open Tantivy index reader — search will use substring fallback"
+                );
+                (None, SearchIndexReconciliation::Disabled)
+            }
+        };
+    }
+
+    match TantivyIndex::open_or_create(tantivy_path) {
+        Ok(index) => {
+            tracing::info!(
+                docs = index.doc_count(),
+                path = %tantivy_path.display(),
+                "Tantivy index open (read-write)"
+            );
+            let index = Arc::new(index);
+            (
+                Some(Arc::clone(&index)),
+                SearchIndexReconciliation::Available(index),
+            )
+        }
+        Err(writer_error) => match TantivyIndex::open_reader_only(tantivy_path) {
+            Ok(index) => {
+                tracing::info!(
+                    docs = index.doc_count(),
+                    path = %tantivy_path.display(),
+                    "Tantivy index open (reader-only fallback)"
+                );
+                (
+                    Some(Arc::new(index)),
+                    SearchIndexReconciliation::Unavailable(format!(
+                        "writer open failed: {writer_error}"
+                    )),
+                )
+            }
+            Err(reader_error) => {
+                tracing::warn!(
+                    error = %reader_error,
+                    "could not open Tantivy index — search will use substring fallback"
+                );
+                (
+                    None,
+                    SearchIndexReconciliation::Unavailable(format!(
+                        "writer open failed: {writer_error}; reader open failed: {reader_error}"
+                    )),
+                )
+            }
+        },
+    }
 }
 
 fn finish_reconciled_mutation<T>(
@@ -977,7 +1240,6 @@ where
         &state.store,
         &state.db_path,
         &[repo_uid.to_string()],
-        state.tantivy.as_deref(),
         "repo removal",
     )
     .err()
@@ -998,13 +1260,7 @@ fn rebuild_tantivy_after_mutation(
     state: &DaemonState,
     operation: &str,
 ) -> Result<(), anyhow::Error> {
-    if let Some(ref tantivy) = state.tantivy {
-        let docs = tantivy
-            .reindex_from_store(&state.store)
-            .map_err(anyhow::Error::from)?;
-        tracing::info!(docs, operation, "Tantivy reindexed after mutation");
-    }
-    Ok(())
+    reconcile_search_index(&state.search_reconciliation, &state.store, true, operation)
 }
 
 fn run_prune_stale_with<DR, DV, R>(
@@ -1018,6 +1274,7 @@ where
     DV: FnMut(&GraphStore, &nestweaver_schema::Vault) -> Result<(), anyhow::Error>,
     R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
 {
+    let search_rows_before = indexed_search_rows(&state.store);
     let (removed_repos, mut error) = prune_stale_repos_with(&state.store, delete_repo);
     let mut removed_vaults = Vec::new();
     let mut vault_mutation_attempted = false;
@@ -1052,7 +1309,9 @@ where
     } else {
         Vec::new()
     };
-    if changed {
+    let indexed_rows_changed =
+        indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
+    if indexed_rows_changed {
         append_search_reconciliation(&mut failures, reconcile_search(state, "prune_stale"));
     }
 
@@ -1076,6 +1335,7 @@ where
     F: FnOnce(&GraphStore, &str) -> Result<nestweaver_store::PurgeInstanceResult, anyhow::Error>,
     R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
 {
+    let search_rows_before = indexed_search_rows(&state.store);
     let mut repo_uids = list_instance_code_repo_uids(&state.store, instance_id)
         .map_err(|e| Status::internal(format!("PurgeInstance failed to list code repos: {e:#}")))?;
 
@@ -1100,7 +1360,9 @@ where
             } else {
                 Vec::new()
             };
-            if changed {
+            let indexed_rows_changed =
+                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
+            if indexed_rows_changed {
                 append_search_reconciliation(
                     &mut failures,
                     reconcile_search(state, "purge_instance"),
@@ -1118,10 +1380,14 @@ where
             } else {
                 finalize_code_graph_deletion(state, &repo_uids)
             };
-            append_search_reconciliation(
-                &mut failures,
-                reconcile_search(state, "purge_instance_error"),
-            );
+            let indexed_rows_changed =
+                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
+            if indexed_rows_changed {
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(state, "purge_instance_error"),
+                );
+            }
             finish_reconciled_mutation(
                 Err(Status::internal(format!("PurgeInstance failed: {error:#}"))),
                 "purge_instance_error",
@@ -1158,6 +1424,7 @@ where
     F: FnOnce(&GraphStore, &str, &str) -> Result<nestweaver_store::MergeResult, anyhow::Error>,
     R: FnMut(&DaemonState, &str) -> Result<(), anyhow::Error>,
 {
+    let search_rows_before = indexed_search_rows(&state.store);
     let repo_uids = list_instance_code_repo_uids(&state.store, from_id)
         .map_err(|e| Status::internal(format!("merge failed to list code repos: {e:#}")))?;
 
@@ -1174,7 +1441,9 @@ where
             } else {
                 Vec::new()
             };
-            if changed {
+            let indexed_rows_changed =
+                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
+            if indexed_rows_changed {
                 append_search_reconciliation(
                     &mut failures,
                     reconcile_search(state, "merge_instance"),
@@ -1192,10 +1461,14 @@ where
             } else {
                 finalize_code_graph_deletion(state, &repo_uids)
             };
-            append_search_reconciliation(
-                &mut failures,
-                reconcile_search(state, "merge_instance_error"),
-            );
+            let indexed_rows_changed =
+                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
+            if indexed_rows_changed {
+                append_search_reconciliation(
+                    &mut failures,
+                    reconcile_search(state, "merge_instance_error"),
+                );
+            }
             finish_reconciled_mutation(
                 Err(Status::internal(format!(
                     "merge_instance_ids failed: {error:#}"
@@ -2301,6 +2574,7 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
+            let search_rows_before = indexed_search_rows(&state.store);
             let mutation = state
                 .store
                 .delete_vault_cascade(&req.vault_uid)
@@ -2312,10 +2586,14 @@ impl NestWeaverDaemon for DaemonService {
             // satisfying subsequent lookups out of the stale cache and returns the
             // just-deleted notes.
             let mut failures = finalize_node_graph_deletion(&state, "remove_vault");
-            append_search_reconciliation(
-                &mut failures,
-                rebuild_tantivy_after_mutation(&state, "remove_vault"),
-            );
+            let indexed_rows_changed =
+                indexed_search_rows_changed(search_rows_before, &state.store, &mut failures);
+            if indexed_rows_changed {
+                append_search_reconciliation(
+                    &mut failures,
+                    rebuild_tantivy_after_mutation(&state, "remove_vault"),
+                );
+            }
 
             finish_reconciled_mutation(
                 mutation.map(|notes_deleted| RemoveVaultResponse {
@@ -4932,53 +5210,7 @@ pub async fn run_server(
     // another process (e.g. a running brain watcher), and finally to None when
     // the index doesn't exist at all.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
-    let tantivy = if read_only {
-        match TantivyIndex::open_reader_only(&tantivy_path) {
-            Ok(idx) => {
-                tracing::info!(
-                    docs = idx.doc_count(),
-                    path = %tantivy_path.display(),
-                    "Tantivy index open (replica, reader-only)"
-                );
-                Some(Arc::new(idx))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "could not open Tantivy index reader — search will use substring fallback"
-                );
-                None
-            }
-        }
-    } else {
-        match TantivyIndex::open_or_create(&tantivy_path) {
-            Ok(idx) => {
-                tracing::info!(
-                    docs = idx.doc_count(),
-                    path = %tantivy_path.display(),
-                    "Tantivy index open (read-write)"
-                );
-                Some(Arc::new(idx))
-            }
-            Err(_) => match TantivyIndex::open_reader_only(&tantivy_path) {
-                Ok(idx) => {
-                    tracing::info!(
-                        docs = idx.doc_count(),
-                        path = %tantivy_path.display(),
-                        "Tantivy index open (reader-only fallback)"
-                    );
-                    Some(Arc::new(idx))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "could not open Tantivy index — search will use substring fallback"
-                    );
-                    None
-                }
-            },
-        }
-    };
+    let (tantivy, search_reconciliation) = open_search_index(&tantivy_path, read_only);
 
     let idle_notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -5115,6 +5347,7 @@ pub async fn run_server(
         store: Arc::new(store),
 
         tantivy,
+        search_reconciliation,
         db_path: db_path.clone(),
         read_only,
         instance_id: instance_id.clone(),
@@ -7148,24 +7381,52 @@ mod startup_helper_tests {
     }
 
     #[test]
-    fn purge_preserves_mutation_error_and_appends_reconciliation_failure() {
+    fn purge_preserves_real_mutation_error_and_appends_real_reconciliation_failure() {
         let state = test_state_with_writer();
+        let repo_uid = "repo:partial:real-purge-error";
+        let file_uid = nestweaver_schema::file_uid(repo_uid, "src/lib.rs");
+        let mut repo = test_repo(repo_uid, "https://example.test/real-purge-error", None);
+        repo.instance_id = "partial".to_string();
+        state.store.insert_repo(&repo).unwrap();
+        state
+            .store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid,
+                path: "src/lib.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        std::fs::create_dir(&generation_path).unwrap();
+        let mut search_reconciliations = 0;
 
         let error = run_purge_instance_with(
             &state,
             "partial",
-            |_store, _id| Err(anyhow::anyhow!("injected committed mutation failure")),
-            |_state, _operation| Err(anyhow::anyhow!("injected search failure")),
+            |store, _id| {
+                let repo = store.lookup_repo(repo_uid)?.unwrap();
+                delete_repo_cascade(store, &repo)?;
+                Err(anyhow::anyhow!("real committed purge mutation failure"))
+            },
+            |_state, _operation| {
+                search_reconciliations += 1;
+                Ok(())
+            },
         )
         .unwrap_err();
 
         assert!(
             error
                 .message()
-                .contains("injected committed mutation failure")
+                .contains("real committed purge mutation failure")
         );
-        assert!(error.message().contains("search-index"));
-        assert!(error.message().contains("injected search failure"));
+        assert!(error.message().contains("generation-persistence"));
+        assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
+        assert_eq!(
+            search_reconciliations, 0,
+            "code-only purge changed no indexed documents"
+        );
     }
 
     #[test]
@@ -7525,7 +7786,10 @@ mod startup_helper_tests {
 
         assert_eq!(error.code(), tonic::Code::Internal);
         assert_eq!(calls, 2);
-        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        assert_eq!(
+            reconciliations, 0,
+            "code-only prune must not rebuild vault document search"
+        );
         assert!(state.store.graph_generation() > generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
         assert_eq!(state.store.list_repos(None).unwrap().len(), 1);
@@ -7582,7 +7846,10 @@ mod startup_helper_tests {
         assert!(state.store.lookup_vault("vlt:test:gone").is_ok());
         assert!(state.store.graph_generation() > generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
-        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        assert_eq!(
+            reconciliations, 0,
+            "repo deletion plus an empty-vault failure changes no indexed document rows"
+        );
     }
 
     #[test]
@@ -7638,7 +7905,10 @@ mod startup_helper_tests {
         );
         assert!(state.store.graph_generation() > generation);
         assert!(!pagerank_path.exists(), "stale PageRank sidecar survived");
-        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        assert_eq!(
+            reconciliations, 0,
+            "code-only purge must not rebuild Tantivy"
+        );
         let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
             &state.db_path,
             ".manifests.json",
@@ -7722,7 +7992,10 @@ mod startup_helper_tests {
             !scores_after.contains_key("repo:old:first"),
             "post-error rank query returned the deleted repo"
         );
-        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        assert_eq!(
+            reconciliations, 0,
+            "code-only merge must not rebuild Tantivy"
+        );
         let manifests = nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
             &state.db_path,
             ".manifests.json",
@@ -7735,7 +8008,7 @@ mod startup_helper_tests {
     }
 
     #[test]
-    fn vault_only_purge_failure_preserves_pagerank() {
+    fn vault_only_purge_failure_invalidates_live_and_persisted_pagerank() {
         let state = test_state_with_writer();
         state
             .store
@@ -7750,7 +8023,6 @@ mod startup_helper_tests {
         let persisted_rank = r#"{"rank-sentinel":0.75}"#;
         std::fs::write(&pagerank_path, persisted_rank).unwrap();
         state.store.load_pagerank_cache(&pagerank_path).unwrap();
-        let scores_before = state.store.pagerank_scores();
         let graph_generation = state.store.graph_generation();
         let pagerank_generation = state.store.pagerank_generation();
         let mut reconciliations = 0;
@@ -7771,13 +8043,109 @@ mod startup_helper_tests {
 
         assert_eq!(error.code(), tonic::Code::Internal);
         assert!(state.store.graph_generation() > graph_generation);
-        assert_eq!(state.store.pagerank_generation(), pagerank_generation);
-        assert_eq!(state.store.pagerank_scores(), scores_before);
+        assert!(!pagerank_path.exists());
+        assert!(!state.store.pagerank_scores().contains_key("rank-sentinel"));
+        assert!(state.store.pagerank_generation() > pagerank_generation);
         assert_eq!(
-            std::fs::read_to_string(&pagerank_path).unwrap(),
-            persisted_rank
+            reconciliations, 0,
+            "an empty vault changes PageRank state but no indexed document rows"
         );
-        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+    }
+
+    #[test]
+    fn configured_unavailable_search_errors_only_after_indexed_rows_change() {
+        let state = SearchIndexReconciliation::Unavailable(
+            "configured Tantivy index is corrupt".to_string(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("test.lbug")).unwrap();
+
+        assert!(reconcile_search_index(&state, &store, false, "code-only").is_ok());
+        let error = reconcile_search_index(&state, &store, true, "vault-delete").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("configured Tantivy index is corrupt")
+        );
+        assert!(
+            reconcile_search_index(
+                &SearchIndexReconciliation::Disabled,
+                &store,
+                true,
+                "disabled"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn indexed_search_fingerprint_ignores_non_tantivy_note_metadata() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+
+        let state = test_state_with_writer();
+        let vault_uid = "vlt:fingerprint:metadata";
+        let note_uid = "note:fingerprint:metadata";
+        state
+            .store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "fingerprint metadata".to_string(),
+                root_path: "/missing/fingerprint-metadata".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let mut note = Note {
+            uid: note_uid.to_string(),
+            vault_uid: vault_uid.to_string(),
+            file_path: "note.md".to_string(),
+            title: "Indexed title".to_string(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "old-hash".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        state.store.insert_note(&note).unwrap();
+        state
+            .store
+            .insert_vault_note_edge(vault_uid, note_uid)
+            .unwrap();
+        let before = indexed_search_rows(&state.store).unwrap();
+
+        state.store.delete_note_cascade(note_uid).unwrap();
+        note.note_kind = NoteKind::Design;
+        note.word_count = 99;
+        note.content_hash = "new-hash".to_string();
+        note.frontmatter = Some("private: metadata".to_string());
+        note.modified_at = Some("2026-07-18".to_string());
+        note.pagerank_score = Some(0.75);
+        state.store.insert_note(&note).unwrap();
+        state
+            .store
+            .insert_vault_note_edge(vault_uid, note_uid)
+            .unwrap();
+
+        assert_eq!(before, indexed_search_rows(&state.store).unwrap());
+    }
+
+    #[test]
+    fn production_startup_preserves_configured_but_writer_unavailable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_path = dir.path().join("tantivy");
+        let _writer = TantivyIndex::open_or_create(&tantivy_path).unwrap();
+
+        let (reader, state) = open_search_index(&tantivy_path, false);
+
+        assert!(reader.is_some(), "reader fallback should remain queryable");
+        match state {
+            SearchIndexReconciliation::Unavailable(reason) => {
+                assert!(reason.contains("writer open failed"));
+            }
+            _ => panic!("writer lock must remain explicit unavailable mutation state"),
+        }
     }
 
     #[test]
@@ -7827,7 +8195,10 @@ mod startup_helper_tests {
         let scores_after = state.store.pagerank_scores();
         assert!(state.store.pagerank_generation() > pagerank_generation);
         assert!(!scores_after.contains_key(repo_uid));
-        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        assert_eq!(
+            reconciliations, 0,
+            "code-only merge must not rebuild Tantivy"
+        );
     }
 
     #[test]
@@ -7872,7 +8243,10 @@ mod startup_helper_tests {
         let scores_after = state.store.pagerank_scores();
         assert!(state.store.pagerank_generation() > pagerank_generation);
         assert!(!scores_after.contains_key(repo_uid));
-        assert_eq!(reconciliations, 1, "Tantivy was not reconciled");
+        assert_eq!(
+            reconciliations, 0,
+            "code-only purge must not rebuild Tantivy"
+        );
     }
 
     #[test]
@@ -8032,10 +8406,11 @@ mod startup_helper_tests {
         assert!(!pagerank_path.exists());
         assert!(!state.store.pagerank_scores().contains_key(&file_uid));
         assert!(
-            tantivy
+            !tantivy
                 .search("late_remove_search_sentinel", 10)
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "code-only remove must not rebuild unrelated vault search documents"
         );
         assert!(
             nestweaver_engine::load_manifest_cache(&nestweaver_engine::sidecar_path(
@@ -8746,7 +9121,8 @@ mod startup_helper_tests {
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         Arc::new(DaemonState {
             store,
-            tantivy: Some(tantivy),
+            tantivy: Some(Arc::clone(&tantivy)),
+            search_reconciliation: SearchIndexReconciliation::Available(tantivy),
             db_path,
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
@@ -8784,6 +9160,7 @@ mod startup_helper_tests {
         Arc::new(DaemonState {
             store,
             tantivy: None,
+            search_reconciliation: SearchIndexReconciliation::Disabled,
             db_path: std::path::PathBuf::from(":memory:"),
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),

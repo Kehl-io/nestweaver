@@ -6,6 +6,15 @@ use std::sync::{Arc, Mutex};
 use crate::error::StoreError;
 use crate::ranking::QueryIntent;
 
+/// Typed results for the two durable embedding reconciliation sub-stages.
+/// Legacy retirement is not attempted until canonical persistence succeeds.
+#[derive(Debug)]
+pub struct EmbeddingIndexReconciliation {
+    pub removed: usize,
+    pub canonical_persistence: Result<(), StoreError>,
+    pub legacy_retirement: Option<Result<bool, StoreError>>,
+}
+
 /// Cached PPR adjacency graph keyed on `(graph_generation, scope_hash, intent)`.
 ///
 /// Stores the output of `load_ppr_graph` so repeated PPR calls within the same
@@ -541,6 +550,19 @@ impl GraphStore {
     /// sidecar is durable, the legacy JSON fallback is removed so a later
     /// binary read failure cannot resurrect stale vectors.
     pub fn reconcile_embedding_index(&self) -> Result<usize, StoreError> {
+        let stages = self.reconcile_embedding_index_stages()?;
+        stages.canonical_persistence?;
+        if let Some(retirement) = stages.legacy_retirement {
+            retirement?;
+        }
+        Ok(stages.removed)
+    }
+
+    /// Reconcile the live embedding index while retaining typed persistence
+    /// and legacy-retirement results for aggregate deletion finalizers.
+    pub fn reconcile_embedding_index_stages(
+        &self,
+    ) -> Result<EmbeddingIndexReconciliation, StoreError> {
         let live_uids = self.live_embedding_node_uids()?;
         let removed = {
             let mut idx = self
@@ -550,20 +572,30 @@ impl GraphStore {
             idx.retain_uids(&live_uids)
         };
 
-        self.flush_embedding_index()?;
-        if let Some(db_path) = &self.db_path {
-            let legacy_path = Self::embedding_sidecar_json_for(db_path);
-            if let Err(error) = std::fs::remove_file(&legacy_path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(StoreError::Query(format!(
-                    "remove legacy embedding sidecar {}: {error}",
-                    legacy_path.display()
-                )));
-            }
-        }
+        let canonical_persistence = self.flush_embedding_index();
+        let legacy_retirement = if canonical_persistence.is_ok() {
+            self.db_path.as_ref().map(|db_path| {
+                let legacy_path = Self::embedding_sidecar_json_for(db_path);
+                let existed = legacy_path.exists();
+                if let Err(error) = std::fs::remove_file(&legacy_path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(StoreError::Query(format!(
+                        "remove legacy embedding sidecar {}: {error}",
+                        legacy_path.display()
+                    )));
+                }
+                Ok(existed)
+            })
+        } else {
+            None
+        };
 
-        Ok(removed)
+        Ok(EmbeddingIndexReconciliation {
+            removed,
+            canonical_persistence,
+            legacy_retirement,
+        })
     }
 
     /// Perform a vector similarity search over the embedding index.
@@ -1168,5 +1200,21 @@ mod tests {
             2,
             "generation must survive reopen and NOT reset to 0"
         );
+    }
+
+    #[test]
+    fn embedding_reconciliation_preserves_typed_legacy_retirement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let mut legacy_path = db_path.as_os_str().to_owned();
+        legacy_path.push(".embeddings");
+        let legacy_path = std::path::PathBuf::from(legacy_path);
+        std::fs::create_dir(&legacy_path).unwrap();
+
+        let result = store.reconcile_embedding_index_stages().unwrap();
+
+        assert!(result.canonical_persistence.is_ok());
+        assert!(result.legacy_retirement.unwrap().is_err());
     }
 }
