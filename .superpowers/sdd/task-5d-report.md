@@ -19,7 +19,8 @@ primary error and include the aggregate reconciliation details.
 - Search reconciliation compares before/after fingerprints of the exact
   Note/Heading/Section/Tag documents Tantivy indexes. Proven-unchanged
   code/project-only mutations do not rebuild or false-fail search; an unknown
-  projection conservatively repairs when a writer is available.
+  projection after a confirmed mutation conservatively repairs when a writer
+  is available. Confirmed no-ops skip all mutation reconciliation.
 - Filemeta and resolution-dependency rewrites now use the existing flushed,
   sibling-temp-file atomic replacement helper.
 
@@ -37,7 +38,7 @@ primary error and include the aggregate reconciliation details.
 | Generation sidecar persistence | Required | Other processes must observe the mutation generation. |
 | Live PageRank invalidation | Required, infallible for every graph deletion | Prevents live stale graph-node scores; graph generation does not invalidate the independent PageRank cache. |
 | Persisted PageRank removal | Required for every graph deletion | No reliable scope discriminator proves persisted ranks exclude vault/project nodes. Absence is success. |
-| Tantivy rebuild | Required when indexed Note/Heading/Section/Tag documents changed or projection comparison is unknown | Available writers rebuild; configured-but-unavailable/corrupt startup state surfaces `search-index`; disabled/read-only state skips projection and repair intentionally. Proven-unchanged code/project-only deletion is not applicable. |
+| Tantivy rebuild | Required when indexed Note/Heading/Section/Tag documents changed or projection comparison after a confirmed mutation is unknown | Available writers rebuild; configured-but-unavailable/corrupt startup state surfaces `search-index`; disabled/read-only state and confirmed no-ops skip projection/repair intentionally. Proven-unchanged code/project-only deletion is not applicable. |
 | Parsed cache | Intentionally retained | It is content-hash keyed and repo independent. |
 | Missing/corrupt fail-open input or absent removable sidecar | Best-effort / not applicable | It cannot preserve a known stale slice; consumers fall back to safe recomputation and deletion absence is the desired state. |
 
@@ -83,6 +84,22 @@ applicable.
   to reflect reader fallback, universal deletion invalidation, and code-only
   admin deletion behavior.
 
+## Review 3 corrections
+
+- Vault cascades now return a transactional mutation outcome based on the
+  pre-delete Vault, Note, and Tag rows. This distinguishes a truly nonexistent
+  target from an existing empty vault and from tag-only graph data.
+- Direct `remove_vault` skips embedding, generation, PageRank, and search
+  reconciliation only for a confirmed no-op. Cascade errors remain
+  conservative, and any confirmed graph mutation still uses the full node
+  finalizer.
+- Audited every other direct vault-cascade caller: stale prune, instance purge,
+  reparent, and merge all obtain targets from an authoritative vault listing or
+  lookup, so they do not share the arbitrary-UID no-op ambiguity.
+- Added deterministic available/unavailable-search coverage with a forced
+  unknown projection, proving a nonexistent vault neither rebuilds search nor
+  surfaces configured unavailability.
+
 ## TDD evidence
 
 RED:
@@ -121,6 +138,12 @@ Review 2 RED/GREEN evidence:
 - RED: `cargo test -q -p nestweaver-daemon available_search_repairs_after_unknown_preflight_projection --no-run` — exit 101 because the tri-state mutation type and disabled preflight seam did not exist and projection errors still required an aggregate failure sink.
 - GREEN: unknown available repair 1/1; disabled projection skip 1/1; configured-unavailable tri-state 1/1; focused daemon search 7/7, prune 6/6, purge 5/5, merge 5/5; focused web admin removal 2/2.
 - GREEN: relevant daemon/web Clippy with warnings denied, `cargo fmt --all --check`, and `git diff --check` passed.
+
+Review 3 RED/GREEN evidence:
+
+- RED: `cargo test -q -p nestweaver-daemon nonexistent_vault_skips_all_reconciliation_after_unknown_preflight --no-run` — exit 101 because the confirmed-outcome removal seam did not exist.
+- GREEN: confirmed no-op with available/unavailable search 1/1; vault-cascade outcomes 1/1; focused daemon remove-vault 2/2 and search 7/7; focused store vault-cascade 2/2.
+- GREEN: relevant store/daemon Clippy with warnings denied, `cargo fmt --all --check`, and `git diff --check` passed.
 
 Final validation:
 

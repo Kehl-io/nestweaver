@@ -34,12 +34,12 @@ pub use tantivy_index::{
     TantivyError, TantivyIndex,
 };
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
-pub use write::{DiscardedVault, MergeResult, PurgeInstanceResult};
+pub use write::{DeleteVaultCascadeOutcome, DiscardedVault, MergeResult, PurgeInstanceResult};
 
 #[cfg(test)]
 mod tests {
     use nestweaver_schema::{
-        EdgeType, File, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Visibility,
+        EdgeType, File, Repo, ResolvedEdge, Service, Symbol, SymbolKind, Tag, Vault, Visibility,
     };
 
     use super::GraphStore;
@@ -86,6 +86,45 @@ mod tests {
             framework_hint: None,
             canonical_id: None,
         }
+    }
+
+    #[test]
+    fn vault_cascade_outcome_distinguishes_noop_empty_and_tag_only_deletions() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let no_op = store
+            .delete_vault_cascade_with_outcome("vlt:missing")
+            .unwrap();
+        assert_eq!(no_op.notes_deleted, 0);
+        assert!(!no_op.changed);
+
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:empty".to_string(),
+                name: "empty".to_string(),
+                root_path: "/missing/empty".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let empty = store
+            .delete_vault_cascade_with_outcome("vlt:empty")
+            .unwrap();
+        assert_eq!(empty.notes_deleted, 0);
+        assert!(empty.changed);
+
+        store
+            .insert_tag(&Tag {
+                uid: "tag:vlt:tag-only:orphan".to_string(),
+                vault_uid: "vlt:tag-only".to_string(),
+                name: "orphan".to_string(),
+            })
+            .unwrap();
+        let tag_only = store
+            .delete_vault_cascade_with_outcome("vlt:tag-only")
+            .unwrap();
+        assert_eq!(tag_only.notes_deleted, 0);
+        assert!(tag_only.changed);
+        assert!(store.list_tags(Some("vlt:tag-only")).unwrap().is_empty());
     }
 
     fn make_service(uid: &str, repo_uid: &str) -> Service {

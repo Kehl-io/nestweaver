@@ -1535,6 +1535,39 @@ where
     }
 }
 
+fn run_remove_vault_with_projection(
+    state: &DaemonState,
+    vault_uid: &str,
+    search_rows_before: Option<
+        Result<std::collections::HashSet<IndexedSearchDocument>, anyhow::Error>,
+    >,
+) -> Result<RemoveVaultResponse, Status> {
+    let mutation = state
+        .store
+        .delete_vault_cascade_with_outcome(vault_uid)
+        .map_err(|error| Status::internal(format!("delete_vault_cascade failed: {error:#}")));
+    let confirmed_noop = matches!(&mutation, Ok(outcome) if !outcome.changed);
+    let mut failures = Vec::new();
+    if !confirmed_noop {
+        failures = finalize_node_graph_deletion(state, "remove_vault");
+        let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
+        if search_mutation != IndexedSearchMutation::Unchanged {
+            append_search_reconciliation(
+                &mut failures,
+                rebuild_tantivy_after_mutation(state, search_mutation, "remove_vault"),
+            );
+        }
+    }
+
+    finish_reconciled_mutation(
+        mutation.map(|outcome| RemoveVaultResponse {
+            notes_deleted: outcome.notes_deleted as u64,
+        }),
+        "remove_vault",
+        failures,
+    )
+}
+
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -2630,32 +2663,7 @@ impl NestWeaverDaemon for DaemonService {
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
             let search_rows_before = indexed_search_rows_before(&state);
-            let mutation = state
-                .store
-                .delete_vault_cascade(&req.vault_uid)
-                .map_err(|e| Status::internal(format!("delete_vault_cascade failed: {e:#}")));
-
-            // nw-054: bump the graph generation so generation-keyed in-memory
-            // caches on the live daemon store invalidate (mirrors `remove_repo`
-            // and `index`). Without this a query primed before the removal keeps
-            // satisfying subsequent lookups out of the stale cache and returns the
-            // just-deleted notes.
-            let mut failures = finalize_node_graph_deletion(&state, "remove_vault");
-            let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
-            if search_mutation != IndexedSearchMutation::Unchanged {
-                append_search_reconciliation(
-                    &mut failures,
-                    rebuild_tantivy_after_mutation(&state, search_mutation, "remove_vault"),
-                );
-            }
-
-            finish_reconciled_mutation(
-                mutation.map(|notes_deleted| RemoveVaultResponse {
-                    notes_deleted: notes_deleted as u64,
-                }),
-                "remove_vault",
-                failures,
-            )
+            run_remove_vault_with_projection(&state, &req.vault_uid, search_rows_before)
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -7326,6 +7334,71 @@ mod startup_helper_tests {
         service.remove_vault(request).await.unwrap();
 
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn nonexistent_vault_skips_all_reconciliation_after_unknown_preflight() {
+        let state = test_state_with_writer();
+        let tantivy = state.tantivy.as_ref().unwrap();
+        tantivy
+            .update_note(
+                "note:nonexistent-vault-noop",
+                "nonexistent_vault_noop_sentinel",
+                "vlt:nonexistent-vault-noop",
+                &["nonexistent_vault_noop_sentinel".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            state
+                .store
+                .add_embedding("note:nonexistent-vault-noop", vec![1.0, 0.0])
+        );
+        state.store.flush_embedding_index().unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"nonexistent-vault-noop":0.5}"#).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let response = run_remove_vault_with_projection(
+            &state,
+            "vlt:does-not-exist",
+            Some(Err(anyhow::anyhow!(
+                "deterministic preflight projection failure"
+            ))),
+        )
+        .unwrap();
+
+        assert_eq!(response.notes_deleted, 0);
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert!(pagerank_path.exists());
+        assert!(state.store.has_embedding("note:nonexistent-vault-noop"));
+        assert!(
+            !tantivy
+                .search("nonexistent_vault_noop_sentinel", 10)
+                .unwrap()
+                .is_empty(),
+            "confirmed no-op must not rebuild available search"
+        );
+
+        let mut unavailable = test_state_with_writer();
+        Arc::get_mut(&mut unavailable)
+            .unwrap()
+            .search_reconciliation =
+            SearchIndexReconciliation::Unavailable("configured search unavailable".to_string());
+        let generation_before = unavailable.store.graph_generation();
+        let response = run_remove_vault_with_projection(
+            &unavailable,
+            "vlt:still-does-not-exist",
+            Some(Err(anyhow::anyhow!(
+                "deterministic preflight projection failure"
+            ))),
+        )
+        .unwrap();
+        assert_eq!(response.notes_deleted, 0);
+        assert_eq!(unavailable.store.graph_generation(), generation_before);
     }
 
     #[tokio::test]

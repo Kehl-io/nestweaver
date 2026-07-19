@@ -10,6 +10,13 @@ use serde_json;
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+/// Confirmed graph mutation performed by a vault cascade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteVaultCascadeOutcome {
+    pub notes_deleted: usize,
+    pub changed: bool,
+}
+
 /// A vault whose notes were discarded during a collision in instance merge.
 /// When two instances have vaults at the same root_path, the vault with
 /// fewer notes loses and its notes are cascade-deleted.
@@ -1974,10 +1981,22 @@ impl GraphStore {
     ///
     /// `delete_note_cascade` is kept as-is for incremental single-note deletions.
     pub fn delete_vault_cascade(&self, vault_uid: &str) -> Result<usize, StoreError> {
+        Ok(self
+            .delete_vault_cascade_with_outcome(vault_uid)?
+            .notes_deleted)
+    }
+
+    /// Cascade-delete a vault and report whether any row targeted by the
+    /// cascade existed. This distinguishes a confirmed no-op from deletion of
+    /// an empty Vault or orphan Tag rows, both of which still mutate the graph.
+    pub fn delete_vault_cascade_with_outcome(
+        &self,
+        vault_uid: &str,
+    ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
         let conn = self.begin_transaction()?;
-        let count = Self::delete_vault_cascade_on(&conn, vault_uid)?;
+        let outcome = Self::delete_vault_cascade_with_outcome_on(&conn, vault_uid)?;
         self.commit_transaction(&conn)?;
-        Ok(count)
+        Ok(outcome)
     }
 
     /// Cascade-delete a vault's data using an externally-provided transaction
@@ -1991,26 +2010,46 @@ impl GraphStore {
         conn: &lbug::Connection<'_>,
         vault_uid: &str,
     ) -> Result<usize, StoreError> {
-        // Count notes before deletion so we can return the count.
-        let count = {
+        Ok(Self::delete_vault_cascade_with_outcome_on(conn, vault_uid)?.notes_deleted)
+    }
+
+    fn delete_vault_cascade_with_outcome_on(
+        conn: &lbug::Connection<'_>,
+        vault_uid: &str,
+    ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
+        let count_matches = |query: &str, context: &str| -> Result<usize, StoreError> {
             let mut stmt = conn
-                .prepare("MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)")
-                .map_err(|e| StoreError::Query(format!("prepare count: {e}")))?;
+                .prepare(query)
+                .map_err(|e| StoreError::Query(format!("prepare {context}: {e}")))?;
             let rows = conn
                 .execute(
                     &mut stmt,
                     vec![("vid", lbug::Value::String(vault_uid.to_string()))],
                 )
-                .map_err(|e| StoreError::Query(format!("count notes: {e}")))?;
-            rows.filter_map(|row| {
-                row.first().and_then(|v| match v {
-                    lbug::Value::Int64(n) => Some(*n as usize),
-                    _ => None,
+                .map_err(|e| StoreError::Query(format!("execute {context}: {e}")))?;
+            Ok(rows
+                .filter_map(|row| {
+                    row.first().and_then(|v| match v {
+                        lbug::Value::Int64(n) => Some(*n as usize),
+                        _ => None,
+                    })
                 })
-            })
-            .next()
-            .unwrap_or(0)
+                .next()
+                .unwrap_or(0))
         };
+        let count = count_matches(
+            "MATCH (n:Note) WHERE n.vault_uid = $vid RETURN count(n)",
+            "note count",
+        )?;
+        let vault_count = count_matches(
+            "MATCH (v:Vault) WHERE v.uid = $vid RETURN count(v)",
+            "vault count",
+        )?;
+        let tag_count = count_matches(
+            "MATCH (t:Tag) WHERE t.vault_uid = $vid RETURN count(t)",
+            "tag count",
+        )?;
+        let changed = count > 0 || vault_count > 0 || tag_count > 0;
 
         // 1. Delete all Sections under notes in this vault.
         exec_params(
@@ -2072,7 +2111,10 @@ impl GraphStore {
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
-        Ok(count)
+        Ok(DeleteVaultCascadeOutcome {
+            notes_deleted: count,
+            changed,
+        })
     }
 
     /// Batch insert REFERENCES_CODE edges from Note → Symbol. Each tuple
