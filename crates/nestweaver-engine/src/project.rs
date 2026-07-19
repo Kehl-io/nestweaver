@@ -69,7 +69,7 @@ pub fn materialize_projects(
     // Clean existing project edges before re-materializing (idempotent).
     for project_config in &config.projects {
         let uid = project_uid(instance_id, &project_config.name);
-        let _ = store.delete_project_edges(&uid);
+        store.delete_project_edges(&uid)?;
     }
 
     let mut projects_created = 0usize;

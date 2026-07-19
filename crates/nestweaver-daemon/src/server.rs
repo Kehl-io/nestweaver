@@ -1305,6 +1305,44 @@ where
     )
 }
 
+fn run_remove_project_with<D, F>(
+    state: &DaemonState,
+    project_uid: &str,
+    delete_project: D,
+    finalize: F,
+) -> Result<RemoveProjectResponse, Status>
+where
+    D: FnOnce(
+        &GraphStore,
+        &str,
+    ) -> Result<
+        nestweaver_store::DeleteProjectCascadeOutcome,
+        nestweaver_store::StoreError,
+    >,
+    F: FnOnce(&DaemonState, &str) -> Vec<nestweaver_engine::DeletionReconciliationFailure>,
+{
+    let mutation = delete_project(&state.store, project_uid)
+        .map_err(|error| Status::internal(format!("delete Project cascade failed: {error:#}")));
+    let confirmed_noop = matches!(&mutation, Ok(outcome) if !outcome.changed);
+    let failures = if confirmed_noop {
+        Vec::new()
+    } else {
+        // A transaction commit error is ambiguous: the graph may already be
+        // durable even when the client did not receive confirmation. Finalize
+        // every changed or errored attempt so no stale generation, embedding,
+        // or PageRank state can survive a possibly-committed delete.
+        finalize(state, "project removal")
+    };
+
+    finish_reconciled_mutation(
+        mutation.map(|outcome| RemoveProjectResponse {
+            project_name: outcome.project_name.unwrap_or_default(),
+        }),
+        "project removal",
+        failures,
+    )
+}
+
 fn rebuild_tantivy_after_mutation(
     state: &DaemonState,
     mutation: IndexedSearchMutation,
@@ -2736,34 +2774,12 @@ impl NestWeaverDaemon for DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            // Look up project name before deleting.
-            let projects = state
-                .store
-                .list_projects()
-                .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
-            let project_name = projects
-                .iter()
-                .find(|p| p.uid == req.project_uid)
-                .map(|p| p.name.clone())
-                .unwrap_or_default();
-
-            state
-                .store
-                .delete_project_edges(&req.project_uid)
-                .map_err(|e| Status::internal(format!("delete_project_edges failed: {e:#}")))?;
-
-            state
-                .store
-                .delete_project_node(&req.project_uid)
-                .map_err(|e| Status::internal(format!("delete_project_node failed: {e:#}")))?;
-
-            // nw-054: bump the graph generation so generation-keyed in-memory
-            // caches on the live daemon store invalidate (mirrors `remove_repo`
-            // and `index`). Without this a query primed before the removal keeps
-            // serving the just-deleted project's nodes out of the stale cache.
-            state.store.bump_and_persist_generation();
-
-            Ok::<_, Status>(RemoveProjectResponse { project_name })
+            run_remove_project_with(
+                &state,
+                &req.project_uid,
+                |store, uid| store.delete_project_cascade_with_outcome(uid),
+                finalize_node_graph_deletion,
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
@@ -7255,6 +7271,18 @@ mod startup_helper_tests {
         symbol_uid
     }
 
+    fn seed_project(state: &DaemonState, uid: &str, name: &str) {
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: uid.to_string(),
+                name: name.to_string(),
+                summary: None,
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+    }
+
     fn seed_vault_note_heading_embeddings(
         state: &DaemonState,
         vault_uid: &str,
@@ -8571,6 +8599,175 @@ mod startup_helper_tests {
     }
 
     #[test]
+    fn remove_project_persists_generation_invalidates_pagerank_and_survives_reopen() {
+        let state = test_state_with_writer();
+        let project_uid = "proj:test:durable-remove";
+        seed_project(&state, project_uid, "Durable remove");
+        assert!(state.store.add_embedding(project_uid, vec![1.0, 0.0]));
+        state.store.flush_embedding_index().unwrap();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, format!(r#"{{"{project_uid}":1.0}}"#)).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let generation_before = state.store.graph_generation();
+
+        let response = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            finalize_node_graph_deletion,
+        )
+        .unwrap();
+
+        assert_eq!(response.project_name, "Durable remove");
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(!pagerank_path.exists());
+        assert!(!state.store.pagerank_scores().contains_key(project_uid));
+        assert!(!state.store.has_embedding(project_uid));
+
+        let db_path = state.db_path.clone();
+        let expected_generation = state.store.graph_generation();
+        state.store.checkpoint().unwrap();
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            reopened
+                .list_projects()
+                .unwrap()
+                .iter()
+                .all(|project| project.uid != project_uid)
+        );
+        assert_eq!(reopened.graph_generation(), expected_generation);
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!reopened.pagerank_scores().contains_key(project_uid));
+    }
+
+    #[test]
+    fn missing_project_is_a_true_noop_without_finalization() {
+        let state = test_state_with_writer();
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"still-valid":1.0}"#).unwrap();
+        let generation_before = state.store.graph_generation();
+        let finalized = std::cell::Cell::new(false);
+
+        let response = run_remove_project_with(
+            &state,
+            "proj:test:missing",
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            |_state, _operation| {
+                finalized.set(true);
+                Vec::new()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.project_name, "");
+        assert!(!finalized.get());
+        assert_eq!(state.store.graph_generation(), generation_before);
+        assert!(pagerank_path.exists());
+    }
+
+    #[test]
+    fn remove_project_surfaces_generation_exhaustion_after_committed_delete() {
+        let state = test_state_with_writer_generation(Some(u64::MAX));
+        let project_uid = "proj:test:exhausted-remove";
+        seed_project(&state, project_uid, "Exhausted remove");
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+
+        let error = run_remove_project_with(
+            &state,
+            project_uid,
+            |store, uid| store.delete_project_cascade_with_outcome(uid),
+            finalize_node_graph_deletion,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("generation-persistence"));
+        assert!(error.message().contains("exhaust"));
+        assert!(
+            state
+                .store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .all(|project| project.uid != project_uid)
+        );
+        assert!(!pagerank_path.exists());
+    }
+
+    #[test]
+    fn remove_project_surfaces_generation_save_and_pagerank_unlink_failures() {
+        for failure in ["generation", "pagerank"] {
+            let state = test_state_with_writer();
+            let project_uid = format!("proj:test:{failure}-failure");
+            seed_project(&state, &project_uid, failure);
+            let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+            let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+            if failure == "generation" {
+                if generation_path.exists() {
+                    std::fs::remove_file(&generation_path).unwrap();
+                }
+                std::fs::create_dir(&generation_path).unwrap();
+            } else {
+                std::fs::create_dir(&pagerank_path).unwrap();
+            }
+
+            let error = run_remove_project_with(
+                &state,
+                &project_uid,
+                |store, uid| store.delete_project_cascade_with_outcome(uid),
+                finalize_node_graph_deletion,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(
+                error.message().contains(if failure == "generation" {
+                    "generation-persistence"
+                } else {
+                    "persisted-pagerank"
+                }),
+                "unexpected {failure} error: {error}"
+            );
+            assert!(
+                state
+                    .store
+                    .list_projects()
+                    .unwrap()
+                    .iter()
+                    .all(|project| project.uid != project_uid)
+            );
+        }
+    }
+
+    #[test]
+    fn remove_project_aggregates_graph_and_finalizer_errors() {
+        let state = test_state_with_writer();
+        let error = run_remove_project_with(
+            &state,
+            "proj:test:aggregate-errors",
+            |_store, _uid| {
+                Err(nestweaver_store::StoreError::Query(
+                    "injected graph mutation failure".to_string(),
+                ))
+            },
+            |_state, _operation| {
+                vec![nestweaver_engine::DeletionReconciliationFailure {
+                    stage: nestweaver_engine::DeletionReconciliationStage::PersistedPageRank,
+                    repo_uid: None,
+                    message: "injected durable unlink failure".to_string(),
+                }]
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message().contains("injected graph mutation failure"));
+        assert!(error.message().contains("persisted-pagerank"));
+        assert!(error.message().contains("injected durable unlink failure"));
+    }
+
+    #[test]
     fn remove_repo_late_failure_finalizes_committed_children() {
         let state = test_state_with_writer();
         let repo_uid = "repo:test:late-remove";
@@ -9531,6 +9728,29 @@ mod startup_helper_tests {
              (drain-visible + backup-safe); it returned without waiting"
         );
 
+        drop(gate);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_project_holds_write_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let gate = state.write_mutex.clone().lock_owned().await;
+        let mut request = Request::new(RemoveProjectRequest {
+            project_uid: "proj:test:write-gate".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            service.remove_project(request),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "remove_project must serialize with the daemon write gate"
+        );
         drop(gate);
     }
 

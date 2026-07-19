@@ -35,7 +35,10 @@ pub use tantivy_index::{
     TantivyError, TantivyIndex,
 };
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
-pub use write::{DeleteVaultCascadeOutcome, DiscardedVault, MergeResult, PurgeInstanceResult};
+pub use write::{
+    DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome, DiscardedVault, MergeResult,
+    PurgeInstanceResult,
+};
 
 #[cfg(test)]
 mod tests {
@@ -126,6 +129,107 @@ mod tests {
         assert_eq!(tag_only.notes_deleted, 0);
         assert!(tag_only.changed);
         assert!(store.list_tags(Some("vlt:tag-only")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_cascade_is_atomic_and_removes_every_incident_project_edge() {
+        use nestweaver_schema::{Note, NoteKind, Project};
+
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [
+            ("proj:test:parent", "Parent"),
+            ("proj:test:target", "Target"),
+            ("proj:test:child", "Child"),
+        ] {
+            store
+                .insert_project(&Project {
+                    uid: uid.to_string(),
+                    name: name.to_string(),
+                    summary: None,
+                    instance_id: "test".to_string(),
+                })
+                .unwrap();
+        }
+        store
+            .insert_note(&Note {
+                uid: "note:project-delete".to_string(),
+                vault_uid: "vlt:project-delete".to_string(),
+                file_path: "project-delete.md".to_string(),
+                title: "Project delete".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 2,
+                content_hash: "note-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:project-delete",
+                "project_delete",
+                "repo:project-delete",
+                "src/lib.rs",
+            ))
+            .unwrap();
+
+        store
+            .batch_insert_project_note_edges(&[("proj:test:target", "note:project-delete")])
+            .unwrap();
+        store
+            .batch_insert_project_symbol_edges(
+                "proj:test:target",
+                &["sym:project-delete".to_string()],
+                1.0,
+            )
+            .unwrap();
+        store
+            .insert_project_component_edge("proj:test:parent", "proj:test:target", 1.0)
+            .unwrap();
+        store
+            .insert_project_component_edge("proj:test:target", "proj:test:child", 1.0)
+            .unwrap();
+        store
+            .insert_project_parent_edge("proj:test:target", "proj:test:parent", 1.0)
+            .unwrap();
+        store
+            .insert_project_parent_edge("proj:test:child", "proj:test:target", 1.0)
+            .unwrap();
+
+        let outcome = store
+            .delete_project_cascade_with_outcome("proj:test:target")
+            .unwrap();
+
+        assert!(outcome.changed);
+        assert_eq!(outcome.project_name.as_deref(), Some("Target"));
+        assert_eq!(store.list_projects().unwrap().len(), 2);
+        let conn = store.conn().unwrap();
+        for edge_type in [
+            "PROJECT_INCLUDES_NOTE",
+            "PROJECT_INCLUDES_SYMBOL",
+            "PROJECT_HAS_COMPONENT",
+            "PROJECT_HAS_PARENT",
+        ] {
+            let rows = conn
+                .query(&format!("MATCH ()-[r:{edge_type}]->() RETURN count(r)"))
+                .unwrap();
+            let count = rows
+                .filter_map(|row| match row.first() {
+                    Some(lbug::Value::Int64(value)) => Some(*value),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_default();
+            assert_eq!(count, 0, "{edge_type} survived the project delete");
+        }
+
+        let missing = store
+            .delete_project_cascade_with_outcome("proj:test:missing")
+            .unwrap();
+        assert!(!missing.changed);
+        assert_eq!(missing.project_name, None);
     }
 
     fn make_service(uid: &str, repo_uid: &str) -> Service {

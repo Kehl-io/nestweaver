@@ -17,6 +17,13 @@ pub struct DeleteVaultCascadeOutcome {
     pub changed: bool,
 }
 
+/// Confirmed graph mutation performed by an atomic Project cascade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteProjectCascadeOutcome {
+    pub project_name: Option<String>,
+    pub changed: bool,
+}
+
 /// A vault whose notes were discarded during a collision in instance merge.
 /// When two instances have vaults at the same root_path, the vault with
 /// fewer notes loses and its notes are cascade-deleted.
@@ -3032,35 +3039,190 @@ impl GraphStore {
         )
     }
 
-    /// Delete all outgoing project edges for the given project UID.
-    /// Idempotent — silently ignores errors (table may not exist on first run).
-    pub fn delete_project_edges(&self, project_uid: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        for edge_type in &[
-            "PROJECT_INCLUDES_NOTE",
-            "PROJECT_INCLUDES_SYMBOL",
-            "PROJECT_HAS_COMPONENT",
-            "PROJECT_HAS_PARENT",
-        ] {
-            let q = format!("MATCH (p:Project {{uid: $uid}})-[r:{edge_type}]->() DELETE r");
-            if let Ok(mut stmt) = conn.prepare(&q) {
-                let _ = conn.execute(
-                    &mut stmt,
+    /// Delete all outgoing project edges for the given Project UID atomically.
+    ///
+    /// This is the rematerialization reset path, so it deliberately preserves
+    /// the Project node and incoming parent/component links. Every prepare and
+    /// execution error is surfaced and the transaction is explicitly rolled
+    /// back. Returns the number of relationships that were present and deleted.
+    pub fn delete_project_edges(&self, project_uid: &str) -> Result<usize, StoreError> {
+        self.delete_project_edges_with_types(
+            project_uid,
+            &[
+                "PROJECT_INCLUDES_NOTE",
+                "PROJECT_INCLUDES_SYMBOL",
+                "PROJECT_HAS_COMPONENT",
+                "PROJECT_HAS_PARENT",
+            ],
+        )
+    }
+
+    fn delete_project_edges_with_types(
+        &self,
+        project_uid: &str,
+        edge_types: &[&str],
+    ) -> Result<usize, StoreError> {
+        let conn = self.begin_transaction().map_err(|error| {
+            StoreError::Query(format!(
+                "begin Project edge deletion for {project_uid}: {error}"
+            ))
+        })?;
+        let mutation = (|| {
+            let mut deleted = 0usize;
+            for edge_type in edge_types {
+                let count_query =
+                    format!("MATCH (p:Project {{uid: $uid}})-[r:{edge_type}]->() RETURN count(r)");
+                let mut count_stmt = conn.prepare(&count_query).map_err(|error| {
+                    StoreError::Query(format!(
+                        "prepare count for Project edge {edge_type}: {error}"
+                    ))
+                })?;
+                let mut rows = conn
+                    .execute(
+                        &mut count_stmt,
+                        vec![("uid", lbug::Value::String(project_uid.to_string()))],
+                    )
+                    .map_err(|error| {
+                        StoreError::Query(format!(
+                            "execute count for Project edge {edge_type}: {error}"
+                        ))
+                    })?;
+                deleted += rows
+                    .next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(count)) => usize::try_from(*count).ok(),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                drop(rows);
+
+                let delete_query =
+                    format!("MATCH (p:Project {{uid: $uid}})-[r:{edge_type}]->() DELETE r");
+                let mut delete_stmt = conn.prepare(&delete_query).map_err(|error| {
+                    StoreError::Query(format!(
+                        "prepare delete for Project edge {edge_type}: {error}"
+                    ))
+                })?;
+                conn.execute(
+                    &mut delete_stmt,
                     vec![("uid", lbug::Value::String(project_uid.to_string()))],
-                );
+                )
+                .map_err(|error| {
+                    StoreError::Query(format!(
+                        "execute delete for Project edge {edge_type}: {error}"
+                    ))
+                })?;
             }
+            Ok(deleted)
+        })();
+
+        self.finish_project_transaction(&conn, mutation, "Project edge deletion")
+    }
+
+    /// Atomically delete a Project node and every incident relationship.
+    /// `DETACH DELETE` covers incoming and outgoing edges, including any
+    /// future relationship table that can be incident on Project.
+    pub fn delete_project_cascade_with_outcome(
+        &self,
+        project_uid: &str,
+    ) -> Result<DeleteProjectCascadeOutcome, StoreError> {
+        self.delete_project_cascade_with_hook(project_uid, || Ok(()))
+    }
+
+    fn delete_project_cascade_with_hook<F>(
+        &self,
+        project_uid: &str,
+        before_commit: F,
+    ) -> Result<DeleteProjectCascadeOutcome, StoreError>
+    where
+        F: FnOnce() -> Result<(), StoreError>,
+    {
+        let conn = self.begin_transaction().map_err(|error| {
+            StoreError::Query(format!(
+                "begin Project cascade deletion for {project_uid}: {error}"
+            ))
+        })?;
+        let mutation = (|| {
+            let mut lookup = conn
+                .prepare("MATCH (p:Project {uid: $uid}) RETURN p.name")
+                .map_err(|error| {
+                    StoreError::Query(format!("prepare Project lookup before delete: {error}"))
+                })?;
+            let mut rows = conn
+                .execute(
+                    &mut lookup,
+                    vec![("uid", lbug::Value::String(project_uid.to_string()))],
+                )
+                .map_err(|error| {
+                    StoreError::Query(format!("execute Project lookup before delete: {error}"))
+                })?;
+            let project_name = rows.next().and_then(|row| match row.first() {
+                Some(lbug::Value::String(name)) => Some(name.clone()),
+                _ => None,
+            });
+            drop(rows);
+
+            let Some(project_name) = project_name else {
+                return Ok(DeleteProjectCascadeOutcome {
+                    project_name: None,
+                    changed: false,
+                });
+            };
+
+            exec_params(
+                &conn,
+                "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
+                vec![("uid", lbug::Value::String(project_uid.to_string()))],
+            )
+            .map_err(|error| StoreError::Query(format!("delete Project node: {error}")))?;
+            before_commit()?;
+            Ok(DeleteProjectCascadeOutcome {
+                project_name: Some(project_name),
+                changed: true,
+            })
+        })();
+
+        self.finish_project_transaction(&conn, mutation, "Project cascade deletion")
+    }
+
+    fn finish_project_transaction<T>(
+        &self,
+        conn: &lbug::Connection<'_>,
+        mutation: Result<T, StoreError>,
+        operation: &str,
+    ) -> Result<T, StoreError> {
+        match mutation {
+            Ok(value) => match self.commit_transaction(conn) {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    let commit_error = StoreError::Query(format!("{operation} commit: {error}"));
+                    Err(Self::rollback_project_transaction(
+                        conn,
+                        commit_error,
+                        operation,
+                    ))
+                }
+            },
+            Err(error) => Err(Self::rollback_project_transaction(conn, error, operation)),
         }
-        Ok(())
+    }
+
+    fn rollback_project_transaction(
+        conn: &lbug::Connection<'_>,
+        error: StoreError,
+        operation: &str,
+    ) -> StoreError {
+        match conn.query("ROLLBACK") {
+            Ok(_) => error,
+            Err(rollback_error) => StoreError::Query(format!(
+                "{error}; {operation} rollback failed: {rollback_error}"
+            )),
+        }
     }
 
     /// Delete the Project node itself (and any remaining edges).
     pub fn delete_project_node(&self, project_uid: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        exec_params(
-            &conn,
-            "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
-            vec![("uid", lbug::Value::String(project_uid.to_string()))],
-        )?;
+        self.delete_project_cascade_with_outcome(project_uid)?;
         Ok(())
     }
 
@@ -3621,6 +3783,108 @@ mod copy_from_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed_project_component(store: &GraphStore) {
+        for (uid, name) in [("proj:txn:parent", "Parent"), ("proj:txn:child", "Child")] {
+            store
+                .insert_project(&Project {
+                    uid: uid.to_string(),
+                    name: name.to_string(),
+                    summary: None,
+                    instance_id: "txn".to_string(),
+                })
+                .unwrap();
+        }
+        store
+            .insert_project_component_edge("proj:txn:parent", "proj:txn:child", 1.0)
+            .unwrap();
+    }
+
+    #[test]
+    fn project_edge_delete_query_failure_before_mutation_preserves_edges() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let error = store
+            .delete_project_edges_with_types(
+                "proj:txn:parent",
+                &["NOT_A_PROJECT_EDGE", "PROJECT_HAS_COMPONENT"],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("NOT_A_PROJECT_EDGE"));
+        assert_eq!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap(),
+            vec!["proj:txn:child"]
+        );
+    }
+
+    #[test]
+    fn project_edge_delete_reports_confirmed_mutation_count() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let deleted = store.delete_project_edges("proj:txn:parent").unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn project_edge_delete_mid_operation_failure_rolls_back() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let error = store
+            .delete_project_edges_with_types(
+                "proj:txn:parent",
+                &["PROJECT_HAS_COMPONENT", "NOT_A_PROJECT_EDGE"],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("NOT_A_PROJECT_EDGE"));
+        assert_eq!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap(),
+            vec!["proj:txn:child"],
+            "the earlier edge delete must roll back with the failed transaction"
+        );
+    }
+
+    #[test]
+    fn project_cascade_mid_operation_failure_rolls_back_node_and_edges() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_project_component(&store);
+
+        let error = store
+            .delete_project_cascade_with_hook("proj:txn:parent", || {
+                Err(StoreError::Query("injected before commit".to_string()))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected before commit"));
+        assert!(
+            store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .any(|project| project.uid == "proj:txn:parent")
+        );
+        assert_eq!(
+            store
+                .list_project_component_uids("proj:txn:parent")
+                .unwrap(),
+            vec!["proj:txn:child"]
+        );
+    }
 
     #[test]
     fn embedding_metadata_round_trips_including_special_chars() {
