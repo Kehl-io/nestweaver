@@ -22,6 +22,29 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Check out release PR
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+      - name: Install Rust toolchain
+        if: steps.release.outputs.prs_created == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Synchronize release lockfile
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          RELEASE_PR_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+        run: |
+          cargo update --workspace
+          if git diff --quiet -- Cargo.lock; then
+            exit 0
+          fi
+
+          git add Cargo.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: synchronize Cargo.lock for release"
+          git push origin "HEAD:$RELEASE_PR_BRANCH"
 
   build:
     name: Build ${{ matrix.target }}
