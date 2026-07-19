@@ -38,6 +38,9 @@ export function useImpactMode() {
   );
 
   const loadImpactData = useCallback(async () => {
+    // `ranksGeneration` is an invalidation token: the graph query itself does
+    // not send it, but a new generation must rerun this callback.
+    void ranksGeneration;
     // Any prior in-flight request is now superseded — abort its fetch so we
     // don't leave a hung PageRank request running against a cold DB.
     abortRef.current?.abort();

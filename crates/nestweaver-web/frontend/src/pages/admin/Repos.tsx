@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useAdminApi } from "../../hooks/useAdminApi";
 
 interface Repo {
@@ -31,16 +31,16 @@ export function Repos() {
   const [newUrl, setNewUrl] = useState("");
   const [newBranch, setNewBranch] = useState("");
 
-  function load() {
+  const load = useCallback(() => {
     api
       .get<Repo[]>("/repos")
       .then(setRepos)
       .catch((e) => setError(e.message));
-  }
+  }, [api]);
 
   useEffect(() => {
     load();
-  }, [api]);
+  }, [load]);
 
   async function handleAdd(e: FormEvent) {
     e.preventDefault();

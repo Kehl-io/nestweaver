@@ -11,10 +11,15 @@ test.describe("Search Flow", () => {
 
   test("search via UI shows results", async ({ page }) => {
     await page.goto("/");
-    const searchInput = page.locator('[data-testid="search-input"]');
-    await searchInput.waitFor({ timeout: 10_000 });
+    await expect(page.getByTestId("control-dock")).toBeVisible({
+      timeout: 15_000,
+    });
+
+    const searchInput = page.getByTestId("search-input");
     await searchInput.fill("greet");
-    await expect(page.locator("text=greet").first()).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.getByRole("listbox").getByRole("option").filter({ hasText: "greet" }).first(),
+    ).toBeVisible({ timeout: 10_000 });
   });
 
   test("search with no results shows empty state", async ({ request }) => {

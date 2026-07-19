@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAdminApi } from "../../hooks/useAdminApi";
 
 interface DeadLetterEntry {
@@ -15,16 +15,16 @@ export function DeadLetter() {
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  function load() {
+  const load = useCallback(() => {
     api
       .get<DeadLetterEntry[]>("/dead-letter")
       .then(setEntries)
       .catch((e) => setError(e.message));
-  }
+  }, [api]);
 
   useEffect(() => {
     load();
-  }, [api]);
+  }, [load]);
 
   async function handleRetry(id: string) {
     try {
