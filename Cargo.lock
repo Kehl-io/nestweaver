@@ -4250,6 +4250,7 @@ name = "nestweaver-proto"
 version = "2.4.0"
 dependencies = [
  "prost",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tonic-prost",

@@ -6563,13 +6563,41 @@ pub fn dispatch_via_daemon(
 /// 1. `.git/` present → code repo (IndexRepo)
 /// 2. `.obsidian/` present OR contains `.md` files → vault/markdown (IndexVault)
 #[cfg(feature = "daemon")]
+#[derive(Clone, Copy)]
+enum DaemonIndexSource {
+    Repo,
+    Vault,
+}
+
+#[cfg(feature = "daemon")]
+impl DaemonIndexSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Repo => "repository",
+            Self::Vault => "vault",
+        }
+    }
+}
+
+#[cfg(feature = "daemon")]
+async fn consume_daemon_index_progress<S>(
+    source: DaemonIndexSource,
+    mut stream: S,
+) -> Result<String, anyhow::Error>
+where
+    S: tokio_stream::Stream<Item = Result<nestweaver_proto::IndexProgress, tonic::Status>> + Unpin,
+{
+    nestweaver_proto::consume_index_progress(&mut stream, |_| {})
+        .await
+        .map_err(|error| anyhow::anyhow!("{} index failed: {error}", source.label()))
+}
+
+#[cfg(feature = "daemon")]
 fn dispatch_add_source_via_daemon(
     client: &mut DaemonGrpcClient,
     rt: &tokio::runtime::Runtime,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    use tokio_stream::StreamExt;
-
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -6606,18 +6634,12 @@ fn dispatch_add_source_via_daemon(
                 extra_ignore_patterns: vec![],
                 instance_id: instance_id.clone(),
             });
-            let mut stream = client
+            let stream = client
                 .index_vault(req)
                 .await
                 .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
                 .into_inner();
-
-            let mut last_msg = String::new();
-            while let Some(progress) = stream.next().await {
-                let progress =
-                    progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
-                last_msg = progress.message;
-            }
+            let last_msg = consume_daemon_index_progress(DaemonIndexSource::Vault, stream).await?;
             Ok(serde_json::json!({
                 "status": "indexed",
                 "path": path,
@@ -6635,18 +6657,12 @@ fn dispatch_add_source_via_daemon(
                 // (config's logical name, else runtime hash).
                 instance_id: String::new(),
             });
-            let mut stream = client
+            let stream = client
                 .index_repo(req)
                 .await
                 .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?
                 .into_inner();
-
-            let mut last_msg = String::new();
-            while let Some(progress) = stream.next().await {
-                let progress =
-                    progress.map_err(|s| anyhow::anyhow!("stream error: {}", s.message()))?;
-                last_msg = progress.message;
-            }
+            let last_msg = consume_daemon_index_progress(DaemonIndexSource::Repo, stream).await?;
             Ok(serde_json::json!({
                 "status": "indexed",
                 "path": path,
@@ -6658,6 +6674,144 @@ fn dispatch_add_source_via_daemon(
 }
 
 // ── F10: investigate bundle primitive ─────────────────────────────────────
+
+#[cfg(all(test, feature = "daemon"))]
+mod daemon_index_progress_tests {
+    use super::*;
+    use nestweaver_proto::{IndexProgress, Phase};
+
+    fn progress(phase: Phase, message: &str) -> Result<IndexProgress, tonic::Status> {
+        Ok(IndexProgress {
+            phase: phase as i32,
+            message: message.to_string(),
+            ..Default::default()
+        })
+    }
+
+    async fn outcome_for(
+        source: DaemonIndexSource,
+        events: Vec<Result<IndexProgress, tonic::Status>>,
+    ) -> Result<String, anyhow::Error> {
+        consume_daemon_index_progress(source, tokio_stream::iter(events)).await
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_accept_only_a_done_terminated_stream() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let message = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Discovering, "scanning"),
+                    progress(Phase::Writing, "writing"),
+                    progress(Phase::Done, "indexed successfully"),
+                ],
+            )
+            .await
+            .expect("Done must be accepted");
+
+            assert_eq!(message, "indexed successfully");
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_reject_an_explicit_error_with_its_message() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let error = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Discovering, "scanning"),
+                    progress(Phase::Error, "parser exploded"),
+                ],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(source.label()));
+            assert!(error.contains("parser exploded"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_reject_empty_and_truncated_streams() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let empty = outcome_for(source, vec![]).await.unwrap_err().to_string();
+            assert!(empty.contains(source.label()));
+            assert!(empty.contains("empty"), "unexpected error: {empty}");
+
+            let truncated =
+                outcome_for(source, vec![progress(Phase::Discovering, "still scanning")])
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            assert!(truncated.contains(source.label()));
+            assert!(
+                truncated.contains("before completion"),
+                "unexpected error: {truncated}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_preserve_transport_errors() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let error = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Discovering, "scanning"),
+                    Err(tonic::Status::unavailable("connection reset")),
+                ],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(source.label()));
+            assert!(error.contains("connection reset"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_reject_events_after_done() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let error = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Done, "done"),
+                    progress(Phase::Writing, "late write"),
+                ],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(source.label()));
+            assert!(error.contains("after terminal Done"));
+            assert!(error.contains("late write"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_and_vault_reject_events_after_error() {
+        for source in [DaemonIndexSource::Repo, DaemonIndexSource::Vault] {
+            let error = outcome_for(
+                source,
+                vec![
+                    progress(Phase::Error, "first failure"),
+                    progress(Phase::Done, "late done"),
+                ],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(source.label()));
+            assert!(error.contains("after terminal Error"));
+            assert!(error.contains("first failure"));
+            assert!(error.contains("late done"));
+        }
+    }
+}
 
 /// Resolve the source root for body reads: explicit `root` arg, else cwd.
 fn arg_root(args: &Value) -> std::path::PathBuf {

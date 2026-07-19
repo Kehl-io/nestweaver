@@ -35,20 +35,18 @@ const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
 
 // ── Daemon index-stream phases ────────────────────────────────────────────────
-// Mirror the daemon's `Phase` enum (crates/nestweaver-daemon proto): the client
-// only sees these as raw i32s on the `IndexProgress` stream. nw-052 (P2b): the
-// client must distinguish a clean terminal `Done` from an in-band `Error` (a
-// logical failure the daemon reports as `Ok(IndexProgress{phase: Error})`).
-const DAEMON_INDEX_PHASE_DONE: i32 = 5;
-const DAEMON_INDEX_PHASE_ERROR: i32 = 6;
-
-/// P2b: decide whether the daemon-mode index succeeded cleanly enough to run
-/// client-side auto-setup and return a success exit code. Only a terminal
-/// `Done` phase qualifies; an in-band `Error` phase or a truncated stream
-/// (any non-`Done` terminal phase, including the `-1` "no messages" sentinel)
-/// is a failure. Pure + total so it can be unit-tested without a live daemon.
-fn daemon_index_succeeded(terminal_phase: i32) -> bool {
-    terminal_phase == DAEMON_INDEX_PHASE_DONE
+/// Drain one daemon index stream with the shared fail-closed terminal-state
+/// classifier while letting each CLI command preserve its progress rendering.
+async fn consume_cli_index_progress<S, F>(stream: S, on_progress: F) -> anyhow::Result<String>
+where
+    S: tonic::codegen::tokio_stream::Stream<
+            Item = Result<nestweaver_proto::IndexProgress, tonic::Status>,
+        > + Unpin,
+    F: FnMut(&nestweaver_proto::IndexProgress),
+{
+    nestweaver_proto::consume_index_progress(stream, on_progress)
+        .await
+        .map_err(Into::into)
 }
 
 // ── Rich diagnostics ─────────────────────────────────────────────────────────
@@ -8032,16 +8030,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     instance_id: instance.clone().unwrap_or_default(),
                 };
 
-                // nw-052 (P2b): track the terminal phase reported IN-BAND on the
-                // stream. The `?` on `stream.message()` only catches TRANSPORT
-                // errors; a LOGICAL index failure arrives as `Ok(IndexProgress{
-                // phase: Error})` and would otherwise fall through to a success
-                // exit + auto-setup (false green for CI/scripts, and it would
-                // stamp `.setup_done` + integration files on a failed first run).
-                let terminal_phase = rt.block_on(async {
-                    let mut stream = client.inner_mut().index_repo(req).await?.into_inner();
-                    let mut last_phase: i32 = -1;
-                    while let Some(progress) = stream.message().await? {
+                let index_result = rt.block_on(async {
+                    let stream = client.inner_mut().index_repo(req).await?.into_inner();
+                    consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
                             0 => "Discovering",
                             1 => "Parsing",
@@ -8053,22 +8044,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             _ => "Unknown",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
-                        last_phase = progress.phase;
-                    }
-                    Ok::<_, anyhow::Error>(last_phase)
-                })?;
+                    })
+                    .await
+                });
 
-                // Only a clean `Done` (phase 5) is a success. An in-band `Error`
-                // (phase 6) OR a stream that ended without ever reaching `Done`
-                // (truncated) is a failure: skip auto-setup and exit non-zero so
-                // callers/CI see the failure instead of a false green.
-                if !daemon_index_succeeded(terminal_phase) {
-                    let reason = if terminal_phase == DAEMON_INDEX_PHASE_ERROR {
-                        "daemon reported an index error"
-                    } else {
-                        "daemon index stream ended before completion"
-                    };
-                    out.status(&format!("Index failed: {reason}."));
+                // Logical failures arrive in-band. Empty, truncated, malformed,
+                // and transport-failed streams must also skip auto-setup.
+                if let Err(error) = index_result {
+                    out.status(&format!("Index failed: {error}"));
                     return Ok((EXIT_ERROR, None));
                 }
 
@@ -9772,8 +9755,8 @@ fn run_brain(
                     instance_id: instance_id.to_string(),
                 };
                 rt.block_on(async {
-                    let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
-                    while let Some(progress) = stream.message().await? {
+                    let stream = client.inner_mut().index_vault(req).await?.into_inner();
+                    consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
                             0 => "Discovering",
                             1 => "Parsing",
@@ -9785,8 +9768,8 @@ fn run_brain(
                             _ => "Unknown",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
-                    }
-                    Ok::<_, anyhow::Error>(())
+                    })
+                    .await
                 })?;
                 return Ok((EXIT_SUCCESS, None));
             }
@@ -10817,16 +10800,16 @@ fn run_brain(
                     instance_id: instance_id.to_string(),
                 };
                 rt.block_on(async {
-                    let mut stream = client.inner_mut().index_vault(req).await?.into_inner();
-                    while let Some(progress) = stream.message().await? {
+                    let stream = client.inner_mut().index_vault(req).await?.into_inner();
+                    consume_cli_index_progress(stream, |progress| {
                         let phase_name = match progress.phase {
                             5 => "Done",
                             6 => "Error",
                             _ => "Progress",
                         };
                         eprintln!("[{phase_name}] {}", progress.message);
-                    }
-                    Ok::<_, anyhow::Error>(())
+                    })
+                    .await
                 })?;
                 return Ok((EXIT_SUCCESS, None));
             }
@@ -15649,31 +15632,79 @@ credential_method = "ssh"
 mod daemon_index_phase_tests {
     use super::*;
 
-    /// nw-052 (P2b): a clean terminal `Done` (phase 5) is the ONLY success. It
-    /// gates client-side auto-setup + the success exit code.
-    #[test]
-    fn done_phase_succeeds() {
-        assert!(daemon_index_succeeded(DAEMON_INDEX_PHASE_DONE));
+    fn progress(
+        phase: nestweaver_proto::Phase,
+        message: &str,
+    ) -> Result<nestweaver_proto::IndexProgress, tonic::Status> {
+        Ok(nestweaver_proto::IndexProgress {
+            phase: phase as i32,
+            message: message.to_string(),
+            ..Default::default()
+        })
     }
 
-    /// An in-band `Error` (phase 6) is a LOGICAL index failure the daemon
-    /// reports as `Ok(IndexProgress{phase: Error})`. It must NOT run auto-setup
-    /// or return success — otherwise a failed index is a false green that also
-    /// stamps `.setup_done` + integration files on a first interactive run.
-    #[test]
-    fn error_phase_fails() {
-        assert!(!daemon_index_succeeded(DAEMON_INDEX_PHASE_ERROR));
+    #[tokio::test]
+    async fn cli_consumer_forwards_progress_and_requires_done() {
+        let mut forwarded = Vec::new();
+        let message = consume_cli_index_progress(
+            tonic::codegen::tokio_stream::iter(vec![
+                progress(nestweaver_proto::Phase::Discovering, "scanning"),
+                progress(nestweaver_proto::Phase::Done, "complete"),
+            ]),
+            |event| forwarded.push(event.message.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(message, "complete");
+        assert_eq!(forwarded, ["scanning", "complete"]);
     }
 
-    /// A stream that ends without ever reaching `Done` (truncated, or the `-1`
-    /// "no messages seen" sentinel, or a mid-pipeline phase) is treated as a
-    /// failure — safer than assuming completion.
-    #[test]
-    fn truncated_or_intermediate_phases_fail() {
-        for phase in [-1, 0, 1, 2, 3, 4] {
+    #[tokio::test]
+    async fn cli_consumer_rejects_logical_and_transport_failures() {
+        let logical = consume_cli_index_progress(
+            tonic::codegen::tokio_stream::iter(vec![progress(
+                nestweaver_proto::Phase::Error,
+                "parser exploded",
+            )]),
+            |_| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(logical.contains("parser exploded"));
+
+        let transport = consume_cli_index_progress(
+            tonic::codegen::tokio_stream::iter(vec![Err(tonic::Status::unavailable(
+                "connection reset",
+            ))]),
+            |_| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(transport.contains("connection reset"));
+
+        let mut forwarded = Vec::new();
+        let malformed = consume_cli_index_progress(
+            tonic::codegen::tokio_stream::iter(vec![
+                progress(nestweaver_proto::Phase::Done, "done"),
+                progress(nestweaver_proto::Phase::Writing, "late"),
+            ]),
+            |event| forwarded.push(event.message.clone()),
+        )
+        .await;
+        assert!(malformed.is_err());
+        assert_eq!(forwarded, ["done"], "late events must not be forwarded");
+
+        for events in [
+            vec![],
+            vec![progress(nestweaver_proto::Phase::Writing, "truncated")],
+        ] {
             assert!(
-                !daemon_index_succeeded(phase),
-                "phase {phase} is not a clean Done and must not count as success"
+                consume_cli_index_progress(tonic::codegen::tokio_stream::iter(events), |_| {})
+                    .await
+                    .is_err()
             );
         }
     }
