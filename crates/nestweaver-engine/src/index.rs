@@ -593,7 +593,7 @@ fn finalize_code_graph_deletion_with_io(
 /// mutation. This runs before any later sidecar persistence or PageRank
 /// recomputation so a subsequent error cannot leave the previous ranks or
 /// graph generation authoritative.
-trait IndexEpilogueIo {
+pub(crate) trait IndexEpilogueIo {
     fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
     fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error>;
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
@@ -604,11 +604,15 @@ trait IndexEpilogueIo {
         path: &Path,
         generation: u64,
     ) -> Result<(), anyhow::Error>;
-    fn compute_pagerank(&self, store: &GraphStore) -> Result<(), anyhow::Error>;
+    fn compute_pagerank(
+        &self,
+        store: &GraphStore,
+        scope: &nestweaver_store::GraphScope,
+    ) -> Result<(), anyhow::Error>;
     fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error>;
 }
 
-struct FileSystemIndexEpilogueIo;
+pub(crate) struct FileSystemIndexEpilogueIo;
 
 impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
     fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
@@ -665,10 +669,12 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
         Ok(())
     }
 
-    fn compute_pagerank(&self, store: &GraphStore) -> Result<(), anyhow::Error> {
-        store
-            .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::code_only())
-            .map_err(Into::into)
+    fn compute_pagerank(
+        &self,
+        store: &GraphStore,
+        scope: &nestweaver_store::GraphScope,
+    ) -> Result<(), anyhow::Error> {
+        store.compute_pagerank(0.85, 20, scope).map_err(Into::into)
     }
 
     fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
@@ -678,23 +684,12 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
 }
 
 fn sync_sidecar_parent(path: &Path) -> Result<(), anyhow::Error> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("sidecar path has no parent: {}", path.display()))?;
-    std::fs::File::open(parent)
-        .with_context(|| format!("open sidecar directory {}", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("sync sidecar directory {}", parent.display()))
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(path)
+        .with_context(|| format!("publish sidecar namespace change for {}", path.display()))
 }
 
 fn sync_sidecar_parent_io(path: &Path) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("sidecar path has no parent: {}", path.display()),
-        )
-    })?;
-    std::fs::File::open(parent)?.sync_all()
+    nestweaver_store::durable_sidecar::sync_parent_directory_durable(path)
 }
 
 fn quarantine_path(path: &Path) -> PathBuf {
@@ -736,7 +731,7 @@ fn invalidate_pagerank_sidecar_with_io(
     }
 }
 
-fn establish_index_publication_marker_with_io(
+pub(crate) fn establish_index_publication_marker_with_io(
     store: &GraphStore,
     db_path: &Path,
     operation: &str,
@@ -779,6 +774,17 @@ fn finalize_committed_index_with_io(
     operation: &str,
     io: &dyn IndexEpilogueIo,
     refresh_pagerank: bool,
+) -> Result<(), DeletionReconciliationError> {
+    let scope = refresh_pagerank.then(nestweaver_store::GraphScope::code_only);
+    finalize_committed_index_for_scope_with_io(store, db_path, operation, io, scope.as_ref())
+}
+
+pub(crate) fn finalize_committed_index_for_scope_with_io(
+    store: &GraphStore,
+    db_path: Option<&Path>,
+    operation: &str,
+    io: &dyn IndexEpilogueIo,
+    pagerank_scope: Option<&nestweaver_store::GraphScope>,
 ) -> Result<(), DeletionReconciliationError> {
     let mut failures = Vec::new();
 
@@ -854,8 +860,8 @@ fn finalize_committed_index_with_io(
         }
     }
 
-    if refresh_pagerank && publication_clean {
-        match io.compute_pagerank(store) {
+    if let Some(scope) = pagerank_scope.filter(|_| publication_clean) {
+        match io.compute_pagerank(store, scope) {
             Ok(()) => {
                 if let Some(db_path) = db_path {
                     let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
@@ -5139,11 +5145,15 @@ function hello(name) { return "Hello " + name; }
                 .map_err(Into::into)
         }
 
-        fn compute_pagerank(&self, store: &GraphStore) -> Result<(), anyhow::Error> {
+        fn compute_pagerank(
+            &self,
+            store: &GraphStore,
+            scope: &nestweaver_store::GraphScope,
+        ) -> Result<(), anyhow::Error> {
             if self.fail_compute {
                 anyhow::bail!("injected PageRank compute failure");
             }
-            FileSystemIndexEpilogueIo.compute_pagerank(store)
+            FileSystemIndexEpilogueIo.compute_pagerank(store, scope)
         }
 
         fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
