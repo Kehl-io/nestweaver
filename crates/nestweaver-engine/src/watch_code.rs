@@ -37,14 +37,17 @@ pub struct CodeWatcher {
 }
 
 impl CodeWatcher {
-    fn establish_graph_publication_with_io(
+    fn establish_graph_publication_with_io<'a>(
         &self,
-        store: &GraphStore,
+        store: &'a GraphStore,
         io: &dyn crate::index::IndexEpilogueIo,
-    ) -> Result<(), crate::index::DeletionReconciliationError> {
+    ) -> Result<
+        nestweaver_store::IndexPublicationLease<'a>,
+        crate::index::DeletionReconciliationError,
+    > {
         crate::index::establish_index_publication_marker_with_io(
             store,
-            &self.db_path,
+            Some(&self.db_path),
             "code watcher batch",
             io,
         )
@@ -52,11 +55,11 @@ impl CodeWatcher {
 
     fn finalize_graph_publication_with_io(
         &self,
-        store: &GraphStore,
+        publication: nestweaver_store::IndexPublicationLease<'_>,
         io: &dyn crate::index::IndexEpilogueIo,
     ) -> Result<(), crate::index::DeletionReconciliationError> {
         crate::index::finalize_committed_index_for_scope_with_io(
-            store,
+            publication,
             Some(&self.db_path),
             "code watcher batch",
             io,
@@ -126,7 +129,7 @@ impl CodeWatcher {
         // File and Symbol nodes. If there's no prior index we create a
         // minimal Repo node; the watcher will populate it file-by-file.
         if store.lookup_repo(&r_uid)?.is_none() {
-            self.establish_graph_publication_with_io(
+            let publication = self.establish_graph_publication_with_io(
                 &store,
                 &crate::index::FileSystemIndexEpilogueIo,
             )?;
@@ -142,7 +145,7 @@ impl CodeWatcher {
                 })
                 .context("insert initial Repo node");
             let finalization = self.finalize_graph_publication_with_io(
-                &store,
+                publication,
                 &crate::index::FileSystemIndexEpilogueIo,
             );
             match (insert_result, finalization) {
@@ -240,7 +243,7 @@ impl CodeWatcher {
             // Publish a dirty marker and reserve N+1 before the first graph
             // mutation. Any later error leaves reopen fail-closed until the
             // mandatory N+2 finalization completes.
-            self.establish_graph_publication_with_io(
+            let publication = self.establish_graph_publication_with_io(
                 &store,
                 &crate::index::FileSystemIndexEpilogueIo,
             )?;
@@ -327,7 +330,7 @@ impl CodeWatcher {
             }
 
             let finalization = self.finalize_graph_publication_with_io(
-                &store,
+                publication,
                 &crate::index::FileSystemIndexEpilogueIo,
             );
             if finalization.is_ok() {
@@ -638,7 +641,7 @@ mod tests {
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let watcher = CodeWatcher::new(&db_path, &repo_root, "test");
 
-        watcher
+        let publication = watcher
             .establish_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo)
             .unwrap();
         store
@@ -653,7 +656,7 @@ mod tests {
             })
             .unwrap();
         let error = watcher
-            .finalize_graph_publication_with_io(&store, &FailingGenerationPublicationIo)
+            .finalize_graph_publication_with_io(publication, &FailingGenerationPublicationIo)
             .unwrap_err();
 
         assert!(error.to_string().contains("generation-persistence"));

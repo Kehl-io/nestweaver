@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::error::StoreError;
 use crate::ranking::QueryIntent;
@@ -40,6 +40,104 @@ pub(crate) struct PprGraphCached {
     pub out_weight: Vec<f64>,
 }
 
+#[derive(Default)]
+struct IndexPublicationLeaseState {
+    owner: Option<u64>,
+    next_token: u64,
+}
+
+#[derive(Default)]
+struct IndexPublicationLeaseCoordinator {
+    state: Mutex<IndexPublicationLeaseState>,
+    available: Condvar,
+}
+
+/// Exclusive, Send-safe ownership of one graph publication lifetime.
+///
+/// The lease holds no mutex guard. A publisher owns it from before marker
+/// establishment through every graph mutation and durable finalization. If it
+/// is dropped early, only live-process exclusivity is released: the dirty
+/// marker and reserved generation remain fail-closed for the next owner to
+/// recover.
+#[must_use = "hold the publication lease through graph mutation and durable finalization"]
+pub struct IndexPublicationLease<'a> {
+    store: &'a GraphStore,
+    token: u64,
+    released: bool,
+}
+
+impl std::fmt::Debug for IndexPublicationLease<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexPublicationLease")
+            .field("token", &self.token)
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IndexPublicationLease<'_> {
+    /// The store whose publication lifetime this lease exclusively owns.
+    pub fn store(&self) -> &GraphStore {
+        self.store
+    }
+
+    /// Verify that dirty N+1 and clean N+2 remain available.
+    pub fn preflight_generation(&self) -> Result<(), StoreError> {
+        self.store
+            .preflight_index_publication_generation(self.token)
+    }
+
+    /// Reserve or recover the dirty N+1 generation for this owner.
+    pub fn reserve_generation(&self) -> Result<u64, StoreError> {
+        self.store.reserve_index_publication_generation(self.token)
+    }
+
+    /// Return the clean N+2 generation prepared by this owner.
+    pub fn clean_generation(&self) -> Result<u64, StoreError> {
+        self.store.clean_index_publication_generation(self.token)
+    }
+
+    /// Make this owner's prepared clean generation live.
+    pub fn publish_clean_generation(&self) -> Result<u64, StoreError> {
+        self.store
+            .publish_clean_index_publication_generation(self.token)
+    }
+
+    /// Preserve fail-closed monotonicity after marker retirement failed.
+    pub fn fail_clean_generation(&self) -> Result<(), StoreError> {
+        self.store
+            .fail_clean_index_publication_generation(self.token)
+    }
+
+    /// Retire this owner's in-memory dirty generation reservation.
+    pub fn complete_generation(&self) -> Result<(), StoreError> {
+        self.store.complete_index_publication_generation(self.token)
+    }
+
+    /// Restore the prior canonical generation when no graph mutation occurred.
+    pub fn cancel_generation(&self) -> Result<(), StoreError> {
+        self.store.cancel_index_publication_generation(self.token)
+    }
+
+    /// Release live-process ownership after explicit successful publication.
+    pub fn release(mut self) -> Result<(), StoreError> {
+        self.store.release_index_publication_lease(self.token)?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for IndexPublicationLease<'_> {
+    fn drop(&mut self) {
+        if !self.released
+            && let Err(error) = self.store.release_index_publication_lease(self.token)
+        {
+            tracing::error!(%error, "failed to release index publication lease");
+        }
+    }
+}
+
 /// GraphStore wraps a LadybugDB database for storing and querying the code knowledge graph.
 ///
 /// Each method creates a fresh Connection internally, which is the simplest safe pattern
@@ -68,6 +166,10 @@ pub struct GraphStore {
     /// recovery state separate prevents an ephemeral fail-closed value from
     /// becoming a wrapping persisted counter.
     pub(crate) index_publication_generation_base: Mutex<Option<u64>>,
+    /// Serializes complete marker→mutation→finalization publication lifetimes.
+    /// The condition-variable state stores only an opaque owner token; lease
+    /// holders never retain a mutex guard while doing graph or sidecar I/O.
+    index_publication_lease: IndexPublicationLeaseCoordinator,
     /// Optional interaction memory scores keyed by node UID. When loaded,
     /// PPR's personalization vector blends a small fraction of these scores
     /// to boost nodes the user has frequently accessed.
@@ -177,6 +279,7 @@ impl GraphStore {
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
             index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -205,6 +308,7 @@ impl GraphStore {
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
             index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -232,6 +336,7 @@ impl GraphStore {
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
             index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -284,6 +389,7 @@ impl GraphStore {
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
             index_publication_generation_base: Mutex::new(None),
+            index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -493,9 +599,73 @@ impl GraphStore {
             .map_err(|_| StoreError::Query("graph generation exhausted".to_string()))
     }
 
+    /// Wait for exclusive ownership of a complete index publication lifetime.
+    ///
+    /// Acquisition is blocking and intended for the engine's synchronous
+    /// indexing and watcher paths. The returned lease is `Send` and holds no
+    /// mutex guard, so moving the synchronous work to a blocking worker thread
+    /// remains safe.
+    pub fn acquire_index_publication_lease(&self) -> Result<IndexPublicationLease<'_>, StoreError> {
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while state.owner.is_some() {
+            state = self
+                .index_publication_lease
+                .available
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        let token = state.next_token;
+        state.next_token = token.checked_add(1).ok_or_else(|| {
+            StoreError::Query("index publication ownership token exhausted".into())
+        })?;
+        state.owner = Some(token);
+        Ok(IndexPublicationLease {
+            store: self,
+            token,
+            released: false,
+        })
+    }
+
+    fn validate_index_publication_owner(&self, token: u64) -> Result<(), StoreError> {
+        let state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner == Some(token) {
+            Ok(())
+        } else {
+            Err(StoreError::Query(
+                "index publication lease is not owned by this token".into(),
+            ))
+        }
+    }
+
+    fn release_index_publication_lease(&self, token: u64) -> Result<(), StoreError> {
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner != Some(token) {
+            return Err(StoreError::Query(
+                "index publication lease release attempted by a non-owner".into(),
+            ));
+        }
+        state.owner = None;
+        drop(state);
+        self.index_publication_lease.available.notify_one();
+        Ok(())
+    }
+
     /// Verify that both the dirty reservation and its distinct clean
     /// publication generation are available.
-    pub fn preflight_index_publication_generation(&self) -> Result<(), StoreError> {
+    fn preflight_index_publication_generation(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
         let base = self
             .index_publication_generation_base
             .lock()
@@ -509,7 +679,8 @@ impl GraphStore {
     /// Reserve the dirty generation for an in-progress publication. Repeated
     /// calls during the same dirty recovery return the same N+1 value. The
     /// clean N+2 successor is preflighted before changing live state.
-    pub fn reserve_index_publication_generation(&self) -> Result<u64, StoreError> {
+    fn reserve_index_publication_generation(&self, token: u64) -> Result<u64, StoreError> {
+        self.validate_index_publication_owner(token)?;
         let mut base = self
             .index_publication_generation_base
             .lock()
@@ -537,7 +708,8 @@ impl GraphStore {
 
     /// Return the distinct N+2 generation to persist for an active dirty
     /// publication without exposing it to live cache consumers yet.
-    pub fn clean_index_publication_generation(&self) -> Result<u64, StoreError> {
+    fn clean_index_publication_generation(&self, token: u64) -> Result<u64, StoreError> {
+        self.validate_index_publication_owner(token)?;
         let base = self
             .index_publication_generation_base
             .lock()
@@ -552,8 +724,8 @@ impl GraphStore {
 
     /// Make the prepared N+2 generation live immediately before retiring the
     /// dirty marker. Callers must hold the publication rank barrier.
-    pub fn publish_clean_index_publication_generation(&self) -> Result<u64, StoreError> {
-        let clean = self.clean_index_publication_generation()?;
+    fn publish_clean_index_publication_generation(&self, token: u64) -> Result<u64, StoreError> {
+        let clean = self.clean_index_publication_generation(token)?;
         self.graph_generation.store(clean, Ordering::Release);
         Ok(clean)
     }
@@ -561,7 +733,8 @@ impl GraphStore {
     /// A marker-retirement failure may have briefly exposed the persisted
     /// clean value. Treat it as the next canonical base and reserve a newer
     /// dirty value so that generation can never be reused on retry.
-    pub fn fail_clean_index_publication_generation(&self) {
+    fn fail_clean_index_publication_generation(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
         let mut base = self
             .index_publication_generation_base
             .lock()
@@ -573,19 +746,23 @@ impl GraphStore {
             self.graph_generation
                 .store(clean.saturating_add(1), Ordering::Release);
         }
+        Ok(())
     }
 
     /// Mark a durably published reserved generation as canonical.
-    pub fn complete_index_publication_generation(&self) {
+    fn complete_index_publication_generation(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
         *self
             .index_publication_generation_base
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
+        Ok(())
     }
 
     /// Restore the canonical generation when a marker was established but no
     /// graph mutation was attempted.
-    pub fn cancel_index_publication_generation(&self) {
+    fn cancel_index_publication_generation(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
         let mut base = self
             .index_publication_generation_base
             .lock()
@@ -593,6 +770,14 @@ impl GraphStore {
         if let Some(canonical) = base.take() {
             self.graph_generation.store(canonical, Ordering::Release);
         }
+        Ok(())
+    }
+
+    pub(crate) fn clear_index_publication_generation_on_clean_load(&self) {
+        *self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     /// The on-disk database path this store was opened from, when known
@@ -1310,6 +1495,36 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_publication_lease_is_send_without_a_held_mutex_guard() {
+        fn assert_send<T: Send>() {}
+        assert_send::<IndexPublicationLease<'static>>();
+    }
+
+    #[test]
+    fn non_owner_token_cannot_change_publication_generation_state() {
+        let store = GraphStore::in_memory().unwrap();
+        let owner = store.acquire_index_publication_lease().unwrap();
+        let impostor = owner.token.wrapping_add(1);
+
+        assert!(
+            store
+                .reserve_index_publication_generation(impostor)
+                .unwrap_err()
+                .to_string()
+                .contains("not owned")
+        );
+        assert_eq!(owner.reserve_generation().unwrap(), 1);
+        assert!(
+            store
+                .complete_index_publication_generation(impostor)
+                .unwrap_err()
+                .to_string()
+                .contains("not owned")
+        );
+        assert_eq!(store.graph_generation(), 1);
+    }
 
     #[test]
     fn stale_checkpoint_error_recognized() {

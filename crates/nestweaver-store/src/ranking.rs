@@ -1308,11 +1308,12 @@ mod tests {
         assert!(store.pagerank_scores().contains_key("A"));
         let clean_pagerank_generation = store.pagerank_generation();
 
+        let publication = store.acquire_index_publication_lease().unwrap();
         let dirty_generation = store
             .with_index_publication_rank_barrier(|| -> Result<u64, StoreError> {
                 std::fs::write(&marker_path, b"dirty")
                     .map_err(|error| StoreError::Query(error.to_string()))?;
-                store.reserve_index_publication_generation()
+                publication.reserve_generation()
             })
             .unwrap();
 
@@ -1339,17 +1340,18 @@ mod tests {
         assert!(store.pagerank_scores().is_empty());
         assert_eq!(store.pagerank_generation(), clean_pagerank_generation);
 
-        let clean_generation = store.clean_index_publication_generation().unwrap();
+        let clean_generation = publication.clean_generation().unwrap();
         assert!(clean_generation > dirty_generation);
         store
             .with_index_publication_rank_barrier(|| -> Result<(), StoreError> {
-                store.publish_clean_index_publication_generation()?;
+                publication.publish_clean_generation()?;
                 std::fs::remove_file(&marker_path)
                     .map_err(|error| StoreError::Query(error.to_string()))?;
-                store.complete_index_publication_generation();
+                publication.complete_generation()?;
                 Ok(())
             })
             .unwrap();
+        publication.release().unwrap();
         assert!(
             store
                 .pagerank_cache

@@ -49,7 +49,7 @@ impl GraphStore {
             self.load_fail_closed_index_publication_generation(canonical);
             return;
         }
-        self.complete_index_publication_generation();
+        self.clear_index_publication_generation_on_clean_load();
         if let Some(value) = canonical {
             self.graph_generation.store(value, Ordering::Release);
         }

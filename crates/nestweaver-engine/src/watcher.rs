@@ -118,14 +118,17 @@ impl BrainWatcher {
         !crate::brainignore::is_ignored(&rel_path, &self.ignore_set)
     }
 
-    fn establish_graph_publication_with_io(
+    fn establish_graph_publication_with_io<'a>(
         &self,
-        store: &GraphStore,
+        store: &'a GraphStore,
         io: &dyn crate::index::IndexEpilogueIo,
-    ) -> Result<(), crate::index::DeletionReconciliationError> {
+    ) -> Result<
+        nestweaver_store::IndexPublicationLease<'a>,
+        crate::index::DeletionReconciliationError,
+    > {
         crate::index::establish_index_publication_marker_with_io(
             store,
-            &self.db_path,
+            Some(&self.db_path),
             "brain watcher batch",
             io,
         )
@@ -133,11 +136,11 @@ impl BrainWatcher {
 
     fn finalize_graph_publication_with_io(
         &self,
-        store: &GraphStore,
+        publication: nestweaver_store::IndexPublicationLease<'_>,
         io: &dyn crate::index::IndexEpilogueIo,
     ) -> Result<(), crate::index::DeletionReconciliationError> {
         crate::index::finalize_committed_index_for_scope_with_io(
-            store,
+            publication,
             Some(&self.db_path),
             "brain watcher batch",
             io,
@@ -285,7 +288,10 @@ impl BrainWatcher {
         // Make sure the Vault node exists — first-time runs (no prior
         // `brain add`) still get a working graph.
         let v_uid = vault_uid(&self.instance_id, &self.vault_root.to_string_lossy());
-        self.establish_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo)?;
+        let initial_publication = self.establish_graph_publication_with_io(
+            &store,
+            &crate::index::FileSystemIndexEpilogueIo,
+        )?;
         let ensure_result = ensure_vault(
             &store,
             &v_uid,
@@ -293,8 +299,10 @@ impl BrainWatcher {
             &self.instance_id,
             &self.vault_name,
         );
-        let initial_finalization = self
-            .finalize_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo);
+        let initial_finalization = self.finalize_graph_publication_with_io(
+            initial_publication,
+            &crate::index::FileSystemIndexEpilogueIo,
+        );
         match (ensure_result, initial_finalization) {
             (Ok(()), Ok(())) => {
                 if let Some(ref cb) = on_change {
@@ -382,14 +390,16 @@ impl BrainWatcher {
             };
 
             let graph_batch = batch.iter().any(|event| self.event_targets_graph(event));
-            if graph_batch {
+            let publication = if graph_batch {
                 // Establish the fail-closed marker before handle_event can
                 // cascade-delete a note and then fail during read or parse.
-                self.establish_graph_publication_with_io(
+                Some(self.establish_graph_publication_with_io(
                     &store,
                     &crate::index::FileSystemIndexEpilogueIo,
-                )?;
-            }
+                )?)
+            } else {
+                None
+            };
 
             // Pre-build the symbol index once per batch so cross-domain
             // refresh doesn't re-query the DB for every file.
@@ -436,7 +446,7 @@ impl BrainWatcher {
             // forward-push residuals are a later optimisation.
             if graph_batch {
                 let finalization = self.finalize_graph_publication_with_io(
-                    &store,
+                    publication.expect("graph batch established publication lease"),
                     &crate::index::FileSystemIndexEpilogueIo,
                 );
                 if finalization.is_ok() {
@@ -1150,12 +1160,12 @@ mod tests {
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let watcher = BrainWatcher::new(&db_path, &root, "test", "test");
 
-        watcher
+        let publication = watcher
             .establish_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo)
             .unwrap();
         ensure_vault(&store, "vault:watcher-failure", &root, "test", "test").unwrap();
         let error = watcher
-            .finalize_graph_publication_with_io(&store, &FailingPageRankRetirementIo)
+            .finalize_graph_publication_with_io(publication, &FailingPageRankRetirementIo)
             .unwrap_err();
 
         assert!(error.to_string().contains("persisted-pagerank"));

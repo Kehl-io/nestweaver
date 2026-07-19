@@ -731,29 +731,41 @@ fn invalidate_pagerank_sidecar_with_io(
     }
 }
 
-pub(crate) fn establish_index_publication_marker_with_io(
-    store: &GraphStore,
-    db_path: &Path,
+pub(crate) fn establish_index_publication_marker_with_io<'a>(
+    store: &'a GraphStore,
+    db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
-) -> Result<(), DeletionReconciliationError> {
+) -> Result<nestweaver_store::IndexPublicationLease<'a>, DeletionReconciliationError> {
+    let lease = store.acquire_index_publication_lease().map_err(|error| {
+        DeletionReconciliationError::new(
+            operation,
+            vec![DeletionReconciliationFailure {
+                stage: DeletionReconciliationStage::IndexPublicationMarker,
+                repo_uid: None,
+                message: format!("acquire exclusive index publication lease: {error:#}"),
+            }],
+        )
+    })?;
+    let Some(db_path) = db_path else {
+        return Ok(lease);
+    };
+    lease.preflight_generation().map_err(|error| {
+        DeletionReconciliationError::new(
+            operation,
+            vec![DeletionReconciliationFailure {
+                stage: DeletionReconciliationStage::GenerationPersistence,
+                repo_uid: None,
+                message: format!("preflight index publication generation: {error:#}"),
+            }],
+        )
+    })?;
     let marker_path = crate::sidecar_path(db_path, ".index-dirty");
-    store
-        .preflight_index_publication_generation()
-        .map_err(|error| {
-            DeletionReconciliationError::new(
-                operation,
-                vec![DeletionReconciliationFailure {
-                    stage: DeletionReconciliationStage::GenerationPersistence,
-                    repo_uid: None,
-                    message: format!("{}: {error:#}", marker_path.display()),
-                }],
-            )
-        })?;
-    store
+    lease
+        .store()
         .with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
             io.establish_marker(&marker_path)?;
-            store.reserve_index_publication_generation()?;
+            lease.reserve_generation()?;
             Ok(())
         })
         .map_err(|error| {
@@ -765,28 +777,30 @@ pub(crate) fn establish_index_publication_marker_with_io(
                     message: format!("{}: {error:#}", marker_path.display()),
                 }],
             )
-        })
+        })?;
+    Ok(lease)
 }
 
 fn finalize_committed_index_with_io(
-    store: &GraphStore,
+    lease: nestweaver_store::IndexPublicationLease<'_>,
     db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
     refresh_pagerank: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let scope = refresh_pagerank.then(nestweaver_store::GraphScope::code_only);
-    finalize_committed_index_for_scope_with_io(store, db_path, operation, io, scope.as_ref())
+    finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref())
 }
 
 pub(crate) fn finalize_committed_index_for_scope_with_io(
-    store: &GraphStore,
+    lease: nestweaver_store::IndexPublicationLease<'_>,
     db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
     pagerank_scope: Option<&nestweaver_store::GraphScope>,
 ) -> Result<(), DeletionReconciliationError> {
     let mut failures = Vec::new();
+    let store = lease.store();
 
     store.invalidate_pagerank();
     let pagerank_safe = if let Some(db_path) = db_path {
@@ -800,7 +814,7 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
     };
 
     let generation_advanced = if db_path.is_some() {
-        store.clean_index_publication_generation()
+        lease.clean_generation()
     } else {
         store.try_bump_graph_generation()
     };
@@ -840,12 +854,12 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         let marker_path = crate::sidecar_path(db_path, ".index-dirty");
         let retirement =
             store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
-                store.publish_clean_index_publication_generation()?;
+                lease.publish_clean_generation()?;
                 if let Err(error) = io.clear_marker(&marker_path) {
-                    store.fail_clean_index_publication_generation();
+                    lease.fail_clean_generation()?;
                     return Err(error);
                 }
-                store.complete_index_publication_generation();
+                lease.complete_generation()?;
                 Ok(())
             });
         if let Err(error) = retirement {
@@ -889,7 +903,16 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
     }
 
     if failures.is_empty() {
-        Ok(())
+        lease.release().map_err(|error| {
+            DeletionReconciliationError::new(
+                operation,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::IndexPublicationMarkerRetirement,
+                    repo_uid: None,
+                    message: format!("release exclusive index publication lease: {error:#}"),
+                }],
+            )
+        })
     } else {
         Err(DeletionReconciliationError::new(operation, failures))
     }
@@ -2145,14 +2168,12 @@ where
     drop(_phase_collect_span);
 
     let _write_guard = acquire_write_guard()?;
-    if let Some(db_path) = store.db_path() {
-        establish_index_publication_marker_with_io(
-            store,
-            db_path,
-            "index graph write",
-            epilogue_io,
-        )?;
-    }
+    let publication = establish_index_publication_marker_with_io(
+        store,
+        store.db_path(),
+        "index graph write",
+        epilogue_io,
+    )?;
     let graph_mutation_attempted = std::cell::Cell::new(false);
     let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
         // Re-identify prune: when a local repo previously indexed under a
@@ -2705,7 +2726,12 @@ where
     if !graph_mutation_attempted.get() {
         if let Some(db_path) = store.db_path() {
             let marker_path = crate::sidecar_path(db_path, ".index-dirty");
-            if let Err(marker_error) = epilogue_io.clear_marker(&marker_path) {
+            let cancellation = store.with_index_publication_rank_barrier(|| {
+                epilogue_io.clear_marker(&marker_path)?;
+                publication.cancel_generation()?;
+                Ok::<(), anyhow::Error>(())
+            });
+            if let Err(marker_error) = cancellation {
                 return match graph_result {
                     Ok(_) => Err(marker_error),
                     Err(primary) => {
@@ -2716,15 +2742,15 @@ where
                     }
                 };
             }
-            store.cancel_index_publication_generation();
         }
+        publication.release()?;
         return graph_result;
     }
 
     // The write guard stays alive through this mandatory epilogue. Publish
     // invalidation/generation/PageRank on success and every later graph error.
     let finalization = finalize_committed_index_with_io(
-        store,
+        publication,
         store.db_path(),
         "index graph write",
         epilogue_io,
@@ -3031,7 +3057,12 @@ fn incremental_index_with_name_and_io(
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
 
-    establish_index_publication_marker_with_io(&store, db_path, "incremental index", epilogue_io)?;
+    let publication = establish_index_publication_marker_with_io(
+        &store,
+        Some(db_path),
+        "incremental index",
+        epilogue_io,
+    )?;
 
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
@@ -3152,7 +3183,7 @@ fn incremental_index_with_name_and_io(
     drop(txn);
 
     finalize_committed_index_with_io(
-        &store,
+        publication,
         Some(db_path),
         "incremental index",
         epilogue_io,
@@ -3216,14 +3247,12 @@ where
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
 
     let _write_guard = acquire_write_guard()?;
-    if let Some(db_path) = store.db_path() {
-        establish_index_publication_marker_with_io(
-            store,
-            db_path,
-            "server incremental index",
-            &FileSystemIndexEpilogueIo,
-        )?;
-    }
+    let publication = establish_index_publication_marker_with_io(
+        store,
+        store.db_path(),
+        "server incremental index",
+        &FileSystemIndexEpilogueIo,
+    )?;
     let txn = store
         .begin_transaction()
         .with_context(|| "begin incremental transaction")?;
@@ -3332,7 +3361,7 @@ where
     drop(txn);
 
     finalize_committed_index_with_io(
-        store,
+        publication,
         store.db_path(),
         "server incremental index",
         &FileSystemIndexEpilogueIo,
@@ -3955,6 +3984,202 @@ fn content_hash_hex(s: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn overlapping_publications_serialize_before_the_second_mutation() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+
+        let publication_a = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "publisher A",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+
+        let (established_tx, established_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let b_store = Arc::clone(&store);
+        let b_db_path = db_path.clone();
+        let publisher_b = std::thread::spawn(move || {
+            let publication_b = establish_index_publication_marker_with_io(
+                &b_store,
+                Some(&b_db_path),
+                "publisher B",
+                &FileSystemIndexEpilogueIo,
+            );
+            established_tx
+                .send(
+                    publication_b
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(ToString::to_string),
+                )
+                .unwrap();
+            continue_rx.recv().unwrap();
+            let publication_b = publication_b.unwrap();
+            b_store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: "repo:publisher-b".into(),
+                    url: "https://example.test/publisher-b".into(),
+                    indexed_sha: "b".into(),
+                    staleness_commits_behind: 0,
+                    instance_id: "test".into(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+            let result = finalize_committed_index_with_io(
+                publication_b,
+                Some(&b_db_path),
+                "publisher B",
+                &FileSystemIndexEpilogueIo,
+                true,
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        let established_while_a_owned = established_rx.recv_timeout(Duration::from_millis(150));
+        let b_was_blocked = matches!(
+            established_while_a_owned,
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert!(
+            store.lookup_repo("repo:publisher-b").unwrap().is_none(),
+            "publisher B must not mutate before it exclusively establishes"
+        );
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:publisher-a".into(),
+                url: "https://example.test/publisher-a".into(),
+                indexed_sha: "a".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        finalize_committed_index_with_io(
+            publication_a,
+            Some(&db_path),
+            "publisher A",
+            &FileSystemIndexEpilogueIo,
+            true,
+        )
+        .unwrap();
+        let generation_after_a = store.graph_generation();
+
+        let b_established = match established_while_a_owned {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => established_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("publisher B must establish after A finalizes"),
+            Err(error) => panic!("publisher B establishment channel failed: {error}"),
+        };
+        b_established.unwrap();
+        continue_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("publisher B must finish")
+            .unwrap();
+        publisher_b.join().unwrap();
+
+        assert!(b_was_blocked, "publisher B reused A's active reservation");
+        assert!(store.graph_generation() > generation_after_a);
+        assert_eq!(
+            fs::read_to_string(&generation_path)
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            store.graph_generation()
+        );
+        assert!(pagerank_path.exists());
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(reopened.lookup_repo("repo:publisher-a").unwrap().is_some());
+        assert!(reopened.lookup_repo("repo:publisher-b").unwrap().is_some());
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert_eq!(reopened.graph_generation(), generation_after_a + 2);
+    }
+
+    #[test]
+    fn dropped_publication_owner_leaves_dirty_state_for_next_owner_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let canonical_generation = store.graph_generation();
+
+        let abandoned = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "abandoned publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        let dirty_generation = store.graph_generation();
+        assert_eq!(dirty_generation, canonical_generation + 1);
+        drop(abandoned);
+
+        assert!(marker_path.exists());
+        assert_eq!(store.graph_generation(), dirty_generation);
+        let recovery = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "recovery publisher",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        assert_eq!(
+            store.graph_generation(),
+            dirty_generation,
+            "recovery must retain the abandoned N+1 reservation"
+        );
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:recovery-owner".into(),
+                url: "https://example.test/recovery-owner".into(),
+                indexed_sha: "recovered".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        finalize_committed_index_with_io(
+            recovery,
+            Some(&db_path),
+            "recovery publisher",
+            &FileSystemIndexEpilogueIo,
+            true,
+        )
+        .unwrap();
+
+        assert!(!marker_path.exists());
+        assert_eq!(store.graph_generation(), canonical_generation + 2);
+        drop(store);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(reopened.graph_generation(), canonical_generation + 2);
+        assert!(
+            reopened
+                .lookup_repo("repo:recovery-owner")
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn index_js_directory_extracts_symbols() {
@@ -5174,15 +5399,15 @@ function hello(name) { return "Hello " + name; }
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
-        establish_index_publication_marker_with_io(
+        let publication = establish_index_publication_marker_with_io(
             &store,
-            &db_path,
+            Some(&db_path),
             "compute failure regression",
             &FileSystemIndexEpilogueIo,
         )
         .unwrap();
         let error = finalize_committed_index_with_io(
-            &store,
+            publication,
             Some(&db_path),
             "compute failure regression",
             &InjectedIndexEpilogueIo {
@@ -5220,15 +5445,15 @@ function hello(name) { return "Hello " + name; }
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
-        establish_index_publication_marker_with_io(
+        let publication = establish_index_publication_marker_with_io(
             &store,
-            &db_path,
+            Some(&db_path),
             "save failure regression",
             &FileSystemIndexEpilogueIo,
         )
         .unwrap();
         let error = finalize_committed_index_with_io(
-            &store,
+            publication,
             Some(&db_path),
             "save failure regression",
             &InjectedIndexEpilogueIo {
@@ -5258,15 +5483,15 @@ function hello(name) { return "Hello " + name; }
         store.load_pagerank_cache(&pagerank_path).unwrap();
         let generation_before = store.graph_generation();
 
-        establish_index_publication_marker_with_io(
+        let publication = establish_index_publication_marker_with_io(
             &store,
-            &db_path,
+            Some(&db_path),
             "removal failure regression",
             &FileSystemIndexEpilogueIo,
         )
         .unwrap();
         let error = finalize_committed_index_with_io(
-            &store,
+            publication,
             Some(&db_path),
             "removal failure regression",
             &InjectedIndexEpilogueIo {
@@ -5308,15 +5533,15 @@ function hello(name) { return "Hello " + name; }
         store.bump_graph_generation();
         store.save_graph_generation(&generation_path).unwrap();
 
-        establish_index_publication_marker_with_io(
+        let publication = establish_index_publication_marker_with_io(
             &store,
-            &db_path,
+            Some(&db_path),
             "unlink and quarantine regression",
             &FileSystemIndexEpilogueIo,
         )
         .unwrap();
         let error = finalize_committed_index_with_io(
-            &store,
+            publication,
             Some(&db_path),
             "unlink and quarantine regression",
             &InjectedIndexEpilogueIo {
@@ -5366,15 +5591,15 @@ function hello(name) { return "Hello " + name; }
         store.save_graph_generation(&generation_path).unwrap();
         let stale_generation = store.graph_generation();
 
-        establish_index_publication_marker_with_io(
+        let publication = establish_index_publication_marker_with_io(
             &store,
-            &db_path,
+            Some(&db_path),
             "generation regression",
             &FileSystemIndexEpilogueIo,
         )
         .unwrap();
         let error = finalize_committed_index_with_io(
-            &store,
+            publication,
             Some(&db_path),
             "generation regression",
             &InjectedIndexEpilogueIo {
@@ -5458,15 +5683,15 @@ function hello(name) { return "Hello " + name; }
         cache.save();
 
         fs::remove_dir(&marker_path).unwrap();
-        establish_index_publication_marker_with_io(
+        let publication = establish_index_publication_marker_with_io(
             &recovering,
-            &db_path,
+            Some(&db_path),
             "unreadable marker recovery",
             &FileSystemIndexEpilogueIo,
         )
         .unwrap();
         finalize_committed_index_with_io(
-            &recovering,
+            publication,
             Some(&db_path),
             "unreadable marker recovery",
             &FileSystemIndexEpilogueIo,
@@ -5509,7 +5734,7 @@ function hello(name) { return "Hello " + name; }
 
         let error = establish_index_publication_marker_with_io(
             &recovering,
-            &db_path,
+            Some(&db_path),
             "exhausted generation",
             &FileSystemIndexEpilogueIo,
         )

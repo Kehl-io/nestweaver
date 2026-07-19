@@ -968,9 +968,10 @@ mod tests {
             .insert_symbol(&make_symbol("fresh", "NeedleFresh"))
             .unwrap();
 
+        let publication = store.acquire_index_publication_lease().unwrap();
         store.with_index_publication_rank_barrier(|| {
             std::fs::write(&marker_path, b"dirty").unwrap();
-            store.reserve_index_publication_generation().unwrap();
+            publication.reserve_generation().unwrap();
         });
 
         let poisoned = Arc::new(super::SymbolNameCached {
@@ -1067,9 +1068,10 @@ mod tests {
         };
 
         scan_finished.wait();
+        let publication = store.acquire_index_publication_lease().unwrap();
         store.with_index_publication_rank_barrier(|| {
             std::fs::write(&marker_path, b"dirty").unwrap();
-            store.reserve_index_publication_generation().unwrap();
+            publication.reserve_generation().unwrap();
         });
         assert_ne!(
             store.graph_generation(),
@@ -1119,17 +1121,19 @@ mod tests {
         let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
         let store = GraphStore::open_or_create(&db_path).unwrap();
         store.insert_symbol(&make_symbol("new", "New")).unwrap();
+        let publication = store.acquire_index_publication_lease().unwrap();
         store.with_index_publication_rank_barrier(|| {
             std::fs::write(&marker_path, b"dirty").unwrap();
-            store.reserve_index_publication_generation().unwrap();
+            publication.reserve_generation().unwrap();
         });
         let dirty_generation = store.graph_generation();
 
         store.with_index_publication_rank_barrier(|| {
-            store.publish_clean_index_publication_generation().unwrap();
+            publication.publish_clean_generation().unwrap();
             std::fs::remove_file(&marker_path).unwrap();
-            store.complete_index_publication_generation();
+            publication.complete_generation().unwrap();
         });
+        publication.release().unwrap();
 
         store.finalize_symbol_name_cache_query(
             dirty_generation,
