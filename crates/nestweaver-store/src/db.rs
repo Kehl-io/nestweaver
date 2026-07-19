@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,12 +45,26 @@ pub(crate) struct PprGraphCached {
 struct IndexPublicationLeaseState {
     owner: Option<u64>,
     next_token: u64,
+    waiters: usize,
 }
 
 #[derive(Default)]
 struct IndexPublicationLeaseCoordinator {
     state: Mutex<IndexPublicationLeaseState>,
     available: Condvar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexPublicationReservationState {
+    Unreserved,
+    Fresh,
+    Recovered,
+}
+
+#[derive(Debug)]
+struct IndexPublicationGenerationReservation {
+    generation: u64,
+    recovered: bool,
 }
 
 /// Exclusive, Send-safe ownership of one graph publication lifetime.
@@ -63,6 +78,7 @@ struct IndexPublicationLeaseCoordinator {
 pub struct IndexPublicationLease<'a> {
     store: &'a GraphStore,
     token: u64,
+    reservation: Cell<IndexPublicationReservationState>,
     released: bool,
 }
 
@@ -71,6 +87,7 @@ impl std::fmt::Debug for IndexPublicationLease<'_> {
         formatter
             .debug_struct("IndexPublicationLease")
             .field("token", &self.token)
+            .field("reservation", &self.reservation.get())
             .field("released", &self.released)
             .finish_non_exhaustive()
     }
@@ -88,9 +105,37 @@ impl IndexPublicationLease<'_> {
             .preflight_index_publication_generation(self.token)
     }
 
+    /// Verify that an in-memory publication has one successor available.
+    pub fn preflight_transient_generation(&self) -> Result<(), StoreError> {
+        self.store
+            .preflight_transient_index_publication_generation(self.token)
+    }
+
     /// Reserve or recover the dirty N+1 generation for this owner.
     pub fn reserve_generation(&self) -> Result<u64, StoreError> {
-        self.store.reserve_index_publication_generation(self.token)
+        let prior = self.reservation.get();
+        let reserved = self
+            .store
+            .reserve_index_publication_generation(self.token)?;
+        if prior == IndexPublicationReservationState::Unreserved {
+            self.reservation.set(if reserved.recovered {
+                IndexPublicationReservationState::Recovered
+            } else {
+                IndexPublicationReservationState::Fresh
+            });
+        }
+        Ok(reserved.generation)
+    }
+
+    /// Whether this owner inherited an already-dirty publication.
+    pub fn is_recovered(&self) -> bool {
+        self.reservation.get() == IndexPublicationReservationState::Recovered
+    }
+
+    /// Refuse snapshot reads unless this owner acquired a fully clean store.
+    pub fn ensure_clean_for_snapshot(&self) -> Result<(), StoreError> {
+        self.store
+            .ensure_clean_index_publication_for_snapshot(self.token)
     }
 
     /// Return the clean N+2 generation prepared by this owner.
@@ -117,6 +162,11 @@ impl IndexPublicationLease<'_> {
 
     /// Restore the prior canonical generation when no graph mutation occurred.
     pub fn cancel_generation(&self) -> Result<(), StoreError> {
+        if self.reservation.get() != IndexPublicationReservationState::Fresh {
+            return Err(StoreError::Query(
+                "only a fresh index publication owner may cancel its generation".into(),
+            ));
+        }
         self.store.cancel_index_publication_generation(self.token)
     }
 
@@ -611,12 +661,23 @@ impl GraphStore {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let mut registered_waiter = false;
         while state.owner.is_some() {
+            if !registered_waiter {
+                state.waiters = state.waiters.checked_add(1).ok_or_else(|| {
+                    StoreError::Query("index publication waiter count exhausted".into())
+                })?;
+                registered_waiter = true;
+                self.index_publication_lease.available.notify_all();
+            }
             state = self
                 .index_publication_lease
                 .available
                 .wait(state)
                 .unwrap_or_else(|error| error.into_inner());
+        }
+        if registered_waiter {
+            state.waiters -= 1;
         }
         let token = state.next_token;
         state.next_token = token.checked_add(1).ok_or_else(|| {
@@ -626,8 +687,50 @@ impl GraphStore {
         Ok(IndexPublicationLease {
             store: self,
             token,
+            reservation: Cell::new(IndexPublicationReservationState::Unreserved),
             released: false,
         })
+    }
+
+    /// Current number of publishers or snapshot readers waiting for ownership.
+    #[doc(hidden)]
+    pub fn index_publication_waiter_count(&self) -> usize {
+        self.index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .waiters
+    }
+
+    /// Wait until at least `minimum` publication owners are registered as blocked.
+    #[doc(hidden)]
+    pub fn wait_for_index_publication_waiters(
+        &self,
+        minimum: usize,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while state.waiters < minimum {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timed) = self
+                .index_publication_lease
+                .available
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+            if timed.timed_out() && state.waiters < minimum {
+                return false;
+            }
+        }
+        true
     }
 
     fn validate_index_publication_owner(&self, token: u64) -> Result<(), StoreError> {
@@ -658,7 +761,7 @@ impl GraphStore {
         }
         state.owner = None;
         drop(state);
-        self.index_publication_lease.available.notify_one();
+        self.index_publication_lease.available.notify_all();
         Ok(())
     }
 
@@ -676,10 +779,38 @@ impl GraphStore {
         })
     }
 
+    /// Verify that an in-memory publication can advance once after its graph
+    /// mutation. Unlike a persistent publication, no dirty N+1 is exposed and
+    /// no distinct clean N+2 is required.
+    fn preflight_transient_index_publication_generation(
+        &self,
+        token: u64,
+    ) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if base.is_some() {
+            return Err(StoreError::Query(
+                "index publication generation is already reserved".into(),
+            ));
+        }
+        self.graph_generation()
+            .checked_add(1)
+            .map(|_| ())
+            .ok_or_else(|| {
+                StoreError::Query("graph generation exhausted during index publication".into())
+            })
+    }
+
     /// Reserve the dirty generation for an in-progress publication. Repeated
     /// calls during the same dirty recovery return the same N+1 value. The
     /// clean N+2 successor is preflighted before changing live state.
-    fn reserve_index_publication_generation(&self, token: u64) -> Result<u64, StoreError> {
+    fn reserve_index_publication_generation(
+        &self,
+        token: u64,
+    ) -> Result<IndexPublicationGenerationReservation, StoreError> {
         self.validate_index_publication_owner(token)?;
         let mut base = self
             .index_publication_generation_base
@@ -689,8 +820,12 @@ impl GraphStore {
             canonical.checked_add(2).ok_or_else(|| {
                 StoreError::Query("graph generation exhausted during index publication".into())
             })?;
-            return canonical.checked_add(1).ok_or_else(|| {
+            let generation = canonical.checked_add(1).ok_or_else(|| {
                 StoreError::Query("graph generation exhausted during index publication".into())
+            })?;
+            return Ok(IndexPublicationGenerationReservation {
+                generation,
+                recovered: true,
             });
         }
 
@@ -703,7 +838,28 @@ impl GraphStore {
         })?;
         *base = Some(canonical);
         self.graph_generation.store(reserved, Ordering::Release);
-        Ok(reserved)
+        Ok(IndexPublicationGenerationReservation {
+            generation: reserved,
+            recovered: false,
+        })
+    }
+
+    /// Confirm that a lease acquired for backup/snapshot work did not inherit
+    /// an abandoned or active publication. Holding the lease makes this check
+    /// stable until the reader releases it.
+    fn ensure_clean_index_publication_for_snapshot(&self, token: u64) -> Result<(), StoreError> {
+        self.validate_index_publication_owner(token)?;
+        let reserved = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some();
+        if reserved || self.is_index_publication_dirty() {
+            return Err(StoreError::Query(
+                "dirty index publication prevents a consistent snapshot".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Return the distinct N+2 generation to persist for an active dirty
@@ -1524,6 +1680,55 @@ mod tests {
                 .contains("not owned")
         );
         assert_eq!(store.graph_generation(), 1);
+    }
+
+    #[test]
+    fn in_memory_publication_preflight_rejects_exhaustion_before_graph_mutation() {
+        let store = GraphStore::in_memory().unwrap();
+        store.graph_generation.store(u64::MAX, Ordering::Release);
+        let publication = store.acquire_index_publication_lease().unwrap();
+
+        let result = (|| -> Result<(), StoreError> {
+            publication.preflight_transient_generation()?;
+            store.insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:must-not-exist".into(),
+                url: "https://example.test/must-not-exist".into(),
+                indexed_sha: "never".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+        })();
+
+        assert!(result.unwrap_err().to_string().contains("exhausted"));
+        assert!(store.lookup_repo("repo:must-not-exist").unwrap().is_none());
+        assert_eq!(store.graph_generation(), u64::MAX);
+    }
+
+    #[test]
+    fn in_memory_publication_preflight_allows_exactly_one_remaining_successor() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .graph_generation
+            .store(u64::MAX - 1, Ordering::Release);
+        let publication = store.acquire_index_publication_lease().unwrap();
+
+        publication.preflight_transient_generation().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:last-generation".into(),
+                url: "https://example.test/last-generation".into(),
+                indexed_sha: "last".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.try_bump_graph_generation().unwrap(), u64::MAX);
+        assert!(store.lookup_repo("repo:last-generation").unwrap().is_some());
     }
 
     #[test]

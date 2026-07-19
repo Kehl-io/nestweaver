@@ -748,6 +748,16 @@ pub(crate) fn establish_index_publication_marker_with_io<'a>(
         )
     })?;
     let Some(db_path) = db_path else {
+        lease.preflight_transient_generation().map_err(|error| {
+            DeletionReconciliationError::new(
+                operation,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::GenerationPersistence,
+                    repo_uid: None,
+                    message: format!("preflight transient index generation: {error:#}"),
+                }],
+            )
+        })?;
         return Ok(lease);
     };
     lease.preflight_generation().map_err(|error| {
@@ -2724,11 +2734,31 @@ where
     })();
 
     if !graph_mutation_attempted.get() {
+        if publication.is_recovered() {
+            return match graph_result {
+                // A recovered owner cannot prove that the preceding owner made
+                // no graph changes. A successful no-op therefore heals that
+                // unknown committed graph as one unified publication.
+                Ok(result) => finalize_committed_index_for_scope_with_io(
+                    publication,
+                    store.db_path(),
+                    "recovered index graph write",
+                    epilogue_io,
+                    Some(&nestweaver_store::GraphScope::unified()),
+                )
+                .map(|()| result)
+                .map_err(anyhow::Error::from),
+                // On an early error there is no safe finalization point. Drop
+                // only the live lease; keep the inherited marker/reservation
+                // so the next open continues to fail closed.
+                Err(primary) => Err(primary),
+            };
+        }
         if let Some(db_path) = store.db_path() {
             let marker_path = crate::sidecar_path(db_path, ".index-dirty");
             let cancellation = store.with_index_publication_rank_barrier(|| {
-                epilogue_io.clear_marker(&marker_path)?;
                 publication.cancel_generation()?;
+                epilogue_io.clear_marker(&marker_path)?;
                 Ok::<(), anyhow::Error>(())
             });
             if let Err(marker_error) = cancellation {
@@ -3985,6 +4015,72 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn insert_publication_graph(store: &GraphStore, publisher: &str) {
+        let repo_uid = format!("repo:publisher-{publisher}");
+        let file_uid = format!("file:publisher-{publisher}");
+        let source_uid = format!("sym:publisher-{publisher}:source");
+        let target_uid = format!("sym:publisher-{publisher}:target");
+        let file_path = format!("src/{publisher}.rs");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: repo_uid.clone(),
+                url: format!("https://example.test/publisher-{publisher}"),
+                indexed_sha: publisher.into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid.clone(),
+                path: file_path.clone(),
+                repo_uid: repo_uid.clone(),
+                content_hash: format!("hash-{publisher}"),
+            })
+            .unwrap();
+        store.insert_repo_file_edge(&repo_uid, &file_uid).unwrap();
+        for (uid, name) in [
+            (&source_uid, format!("publisher_{publisher}_source")),
+            (&target_uid, format!("publisher_{publisher}_target")),
+        ] {
+            store
+                .insert_symbol(&nestweaver_schema::Symbol {
+                    uid: uid.clone(),
+                    name,
+                    kind: nestweaver_schema::SymbolKind::Function,
+                    repo_uid: repo_uid.clone(),
+                    file_path: file_path.clone(),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: format!("fn {publisher}()"),
+                    summary: None,
+                    content_hash: format!("hash-{uid}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: nestweaver_schema::Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+            store.insert_file_symbol_edge(&file_uid, uid).unwrap();
+        }
+        store
+            .insert_edge(&nestweaver_schema::ResolvedEdge {
+                source_uid,
+                target_uid,
+                edge_type: nestweaver_schema::EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
     #[test]
     fn overlapping_publications_serialize_before_the_second_mutation() {
         use std::sync::{Arc, mpsc};
@@ -4026,17 +4122,7 @@ mod tests {
                 .unwrap();
             continue_rx.recv().unwrap();
             let publication_b = publication_b.unwrap();
-            b_store
-                .insert_repo(&nestweaver_schema::Repo {
-                    uid: "repo:publisher-b".into(),
-                    url: "https://example.test/publisher-b".into(),
-                    indexed_sha: "b".into(),
-                    staleness_commits_behind: 0,
-                    instance_id: "test".into(),
-                    name: None,
-                    root_path: None,
-                })
-                .unwrap();
+            insert_publication_graph(&b_store, "b");
             let result = finalize_committed_index_with_io(
                 publication_b,
                 Some(&b_db_path),
@@ -4047,26 +4133,19 @@ mod tests {
             done_tx.send(result).unwrap();
         });
 
-        let established_while_a_owned = established_rx.recv_timeout(Duration::from_millis(150));
-        let b_was_blocked = matches!(
-            established_while_a_owned,
-            Err(mpsc::RecvTimeoutError::Timeout)
+        assert!(
+            store.wait_for_index_publication_waiters(1, Duration::from_secs(2)),
+            "publisher B must register as waiting on A's publication lease"
+        );
+        assert!(
+            matches!(established_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "publisher B must not establish while A owns the lease"
         );
         assert!(
             store.lookup_repo("repo:publisher-b").unwrap().is_none(),
             "publisher B must not mutate before it exclusively establishes"
         );
-        store
-            .insert_repo(&nestweaver_schema::Repo {
-                uid: "repo:publisher-a".into(),
-                url: "https://example.test/publisher-a".into(),
-                indexed_sha: "a".into(),
-                staleness_commits_behind: 0,
-                instance_id: "test".into(),
-                name: None,
-                root_path: None,
-            })
-            .unwrap();
+        insert_publication_graph(&store, "a");
         finalize_committed_index_with_io(
             publication_a,
             Some(&db_path),
@@ -4077,13 +4156,9 @@ mod tests {
         .unwrap();
         let generation_after_a = store.graph_generation();
 
-        let b_established = match established_while_a_owned {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => established_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("publisher B must establish after A finalizes"),
-            Err(error) => panic!("publisher B establishment channel failed: {error}"),
-        };
+        let b_established = established_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("publisher B must establish after A finalizes");
         b_established.unwrap();
         continue_tx.send(()).unwrap();
         done_rx
@@ -4092,7 +4167,6 @@ mod tests {
             .unwrap();
         publisher_b.join().unwrap();
 
-        assert!(b_was_blocked, "publisher B reused A's active reservation");
         assert!(store.graph_generation() > generation_after_a);
         assert_eq!(
             fs::read_to_string(&generation_path)
@@ -4103,12 +4177,58 @@ mod tests {
             store.graph_generation()
         );
         assert!(pagerank_path.exists());
+        let expected_scores = store.pagerank_scores();
+        assert_eq!(expected_scores.len(), 4);
+        for uid in [
+            "sym:publisher-a:source",
+            "sym:publisher-a:target",
+            "sym:publisher-b:source",
+            "sym:publisher-b:target",
+        ] {
+            assert!(
+                expected_scores.contains_key(uid),
+                "missing PageRank for {uid}"
+            );
+        }
         drop(store);
 
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         assert!(reopened.lookup_repo("repo:publisher-a").unwrap().is_some());
         assert!(reopened.lookup_repo("repo:publisher-b").unwrap().is_some());
+        assert_eq!(
+            reopened
+                .list_files_by_repo("repo:publisher-a")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .list_files_by_repo("repo:publisher-b")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .callees_of("sym:publisher-a:source")
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.uid)
+                .collect::<Vec<_>>(),
+            vec!["sym:publisher-a:target".to_string()]
+        );
+        assert_eq!(
+            reopened
+                .callees_of("sym:publisher-b:source")
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.uid)
+                .collect::<Vec<_>>(),
+            vec!["sym:publisher-b:target".to_string()]
+        );
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert_eq!(reopened.pagerank_scores(), expected_scores);
         assert_eq!(reopened.graph_generation(), generation_after_a + 2);
     }
 
@@ -4179,6 +4299,116 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn recovered_owner_early_noop_cannot_cancel_prior_unknown_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+
+        let abandoned = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "publisher with unknown committed work",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        insert_publication_graph(&store, "abandoned");
+        drop(abandoned);
+
+        let recovered = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "early no-op recovery",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        assert!(recovered.is_recovered());
+        assert!(
+            store
+                .lookup_repo("repo:early-lookup-miss")
+                .unwrap()
+                .is_none(),
+            "exercise an early lookup/no-op before this owner mutates"
+        );
+        assert!(
+            recovered.cancel_generation().is_err(),
+            "a recovered owner must not cancel the prior owner's unknown mutation"
+        );
+        drop(recovered);
+
+        assert!(marker_path.exists());
+        drop(store);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(reopened.is_index_publication_dirty());
+        assert!(
+            reopened
+                .lookup_repo("repo:publisher-abandoned")
+                .unwrap()
+                .is_some()
+        );
+        assert!(reopened.pagerank_scores().is_empty());
+    }
+
+    #[test]
+    fn recovered_owner_can_heal_prior_unknown_mutation_without_own_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.bump_graph_generation();
+        store.save_graph_generation(&generation_path).unwrap();
+        let canonical_generation = store.graph_generation();
+
+        let abandoned = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "publisher with unknown committed work",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        insert_publication_graph(&store, "healed");
+        drop(abandoned);
+
+        let recovered = establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "successful no-op recovery",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        assert!(recovered.is_recovered());
+        finalize_committed_index_for_scope_with_io(
+            recovered,
+            Some(&db_path),
+            "successful no-op recovery",
+            &FileSystemIndexEpilogueIo,
+            Some(&nestweaver_store::GraphScope::unified()),
+        )
+        .unwrap();
+
+        assert!(!marker_path.exists());
+        assert_eq!(store.graph_generation(), canonical_generation + 2);
+        let expected_scores = store.pagerank_scores();
+        assert_eq!(expected_scores.len(), 2);
+        drop(store);
+
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.is_index_publication_dirty());
+        assert!(
+            reopened
+                .lookup_symbol("sym:publisher-healed:source")
+                .is_ok()
+        );
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert_eq!(reopened.pagerank_scores(), expected_scores);
     }
 
     #[test]

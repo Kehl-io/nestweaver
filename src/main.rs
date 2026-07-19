@@ -14071,7 +14071,7 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
 
-    match std::fs::read_to_string(&pidfile) {
+    let daemon_check: anyhow::Result<()> = match std::fs::read_to_string(&pidfile) {
         // No pidfile → nothing claims this DB → quiesced.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         // Present but unreadable → cannot confirm the daemon is stopped → fail closed.
@@ -14098,6 +14098,35 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
                 db_path.display(),
             ),
             // Dead/stale pid → daemon is gone → quiesced.
+            Ok(_) => Ok(()),
+        },
+    };
+    daemon_check?;
+
+    // Standalone `code watch` and `brain watch` processes do not own a daemon
+    // pidfile. They publish their PID in `<db>.lock`; apply the same fail-closed
+    // quiescence check so snapshot build cannot race those writers either.
+    let watcher_lock = nestweaver_engine::sidecar_path(db_path, ".lock");
+    match std::fs::read_to_string(&watcher_lock) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => anyhow::bail!(
+            "a watcher lock exists at {} but could not be read ({error}) — refusing to build a \
+             possibly-torn snapshot. Stop the standalone watcher or remove its stale lock, then \
+             retry.",
+            watcher_lock.display(),
+        ),
+        Ok(contents) => match contents.trim().parse::<i32>() {
+            Err(_) => anyhow::bail!(
+                "a watcher lock exists at {} but could not be parsed — refusing to build a \
+                 possibly-torn snapshot. Stop the standalone watcher or remove its stale lock, \
+                 then retry.",
+                watcher_lock.display(),
+            ),
+            Ok(pid) if nestweaver_client::autostart::is_process_alive(pid) => anyhow::bail!(
+                "a standalone watcher (pid {pid}) is writing this database {} — stop it before \
+                 building a snapshot.",
+                db_path.display(),
+            ),
             Ok(_) => Ok(()),
         },
     }
@@ -14989,6 +15018,31 @@ mod snapshot_build_guard_tests {
         let err = ensure_no_live_daemon_for_snapshot_build(&db)
             .expect_err("build must refuse when the pidfile cannot be parsed");
         assert!(err.to_string().contains("pidfile"), "err was: {err}");
+    }
+
+    #[test]
+    fn snapshot_build_refuses_live_or_unparseable_standalone_watcher_lock() {
+        let rt = tempfile::tempdir().unwrap();
+        let _env = RuntimeDirGuard::set(rt.path());
+        let (_data_dir, db, _pidfile) = fixture();
+        let watcher_lock = nestweaver_engine::sidecar_path(&db, ".lock");
+
+        std::fs::write(&watcher_lock, std::process::id().to_string()).unwrap();
+        let error = ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect_err("build must refuse while a standalone watcher is live");
+        assert!(error.to_string().contains("watcher"), "err was: {error}");
+
+        std::fs::write(&watcher_lock, "not-a-pid").unwrap();
+        let error = ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect_err("build must fail closed on an unparseable watcher lock");
+        assert!(
+            error.to_string().contains("watcher lock"),
+            "err was: {error}"
+        );
+
+        std::fs::write(&watcher_lock, i32::MAX.to_string()).unwrap();
+        ensure_no_live_daemon_for_snapshot_build(&db)
+            .expect("a stale watcher lock must not block snapshot build");
     }
 }
 

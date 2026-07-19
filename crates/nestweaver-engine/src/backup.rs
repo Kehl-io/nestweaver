@@ -89,10 +89,8 @@ pub struct RestoreResult {
 
 /// Create a backup of the NestWeaver database and all sidecar files.
 ///
-/// The caller is responsible for ensuring exclusive access to the database
-/// (no concurrent writes) for the duration of this call.
-/// A backup staged (files copied, stats gathered) while the write lock was
-/// held, ready to package lock-free via [`package_staged`].
+/// A backup staged (files copied, stats gathered) while the publication lease
+/// was held, ready to package lock-free via [`package_staged`].
 pub struct StagedBackup {
     staging: tempfile::TempDir,
     repos: Vec<BackupRepoInfo>,
@@ -104,8 +102,9 @@ pub struct StagedBackup {
 /// Stage a backup from an ALREADY-OPEN store: flush embeddings, `CHECKPOINT` the
 /// WAL into the main file, copy the on-disk files to a temp staging dir, and
 /// gather manifest stats. Reuses the caller's live connection — it never opens a
-/// second one — so the daemon can call this while holding its own write lock
-/// (quiesce == lock-held), guaranteeing no writer touches the files mid-copy.
+/// second one. It also owns the store's publication lease through checkpoint,
+/// copy, and statistics collection, so UI watchers and other publishers cannot
+/// mutate the graph mid-copy. An inherited dirty publication is rejected.
 /// The returned [`StagedBackup`] is packaged lock-free by [`package_staged`].
 pub fn stage_backup_from_store(
     store: &nestweaver_store::GraphStore,
@@ -113,6 +112,12 @@ pub fn stage_backup_from_store(
 ) -> anyhow::Result<StagedBackup> {
     let start = Instant::now();
     let pause_start = Instant::now();
+    let publication = store
+        .acquire_index_publication_lease()
+        .map_err(|error| anyhow::anyhow!("failed to quiesce graph publication: {error}"))?;
+    publication
+        .ensure_clean_for_snapshot()
+        .map_err(|error| anyhow::anyhow!("refusing backup of dirty index publication: {error}"))?;
     let staging = tempfile::tempdir()?;
 
     store
@@ -145,6 +150,9 @@ pub fn stage_backup_from_store(
         .collect();
 
     let write_pause = pause_start.elapsed();
+    publication
+        .release()
+        .map_err(|error| anyhow::anyhow!("failed to release backup publication lease: {error}"))?;
     Ok(StagedBackup {
         staging,
         repos,
@@ -761,6 +769,29 @@ fn is_leap(y: u64) -> bool {
 mod tests {
     use super::*;
 
+    fn backup_symbol(uid: &str, name: &str) -> nestweaver_schema::Symbol {
+        nestweaver_schema::Symbol {
+            uid: uid.into(),
+            name: name.into(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo:backup-publication".into(),
+            file_path: "src/backup.rs".into(),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash:{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
     #[test]
     fn test_backup_save_and_inspect() {
         let dir = tempfile::tempdir().unwrap();
@@ -812,6 +843,135 @@ mod tests {
         assert!(output.exists());
         assert_eq!(result.manifest.instance_id, "test");
         assert_eq!(backup_inspect(&output).unwrap().instance_id, "test");
+    }
+
+    #[test]
+    fn backup_waits_for_active_publication_and_restores_complete_latest_generation() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let output = dir.path().join("snap.nwsnap.zst");
+        let restore_dir = dir.path().join("restored");
+        let config = BackupConfig {
+            db_path: db_path.clone(),
+            output_path: output.clone(),
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+        let store = Arc::new(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
+
+        let publication = crate::index::establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "paused watcher publication",
+            &crate::index::FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:backup-publication".into(),
+                url: "https://example.test/backup-publication".into(),
+                indexed_sha: "latest".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&backup_symbol("sym:backup:first", "first"))
+            .unwrap();
+
+        let backup_store = Arc::clone(&store);
+        let backup_config = config.clone();
+        let backup_thread =
+            std::thread::spawn(move || stage_backup_from_store(&backup_store, &backup_config));
+        assert!(
+            store.wait_for_index_publication_waiters(1, Duration::from_secs(2)),
+            "backup must register as waiting before checkpoint/copy"
+        );
+
+        store
+            .insert_symbol(&backup_symbol("sym:backup:second", "second"))
+            .unwrap();
+        store
+            .insert_edge(&nestweaver_schema::ResolvedEdge {
+                source_uid: "sym:backup:first".into(),
+                target_uid: "sym:backup:second".into(),
+                edge_type: nestweaver_schema::EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        crate::index::finalize_committed_index_for_scope_with_io(
+            publication,
+            Some(&db_path),
+            "paused watcher publication",
+            &crate::index::FileSystemIndexEpilogueIo,
+            Some(&nestweaver_store::GraphScope::code_only()),
+        )
+        .unwrap();
+        let latest_generation = store.graph_generation();
+
+        let staged = backup_thread.join().unwrap().unwrap();
+        package_staged(&config, staged).unwrap();
+        backup_restore(&RestoreConfig {
+            snapshot_path: output,
+            data_dir: restore_dir.clone(),
+        })
+        .unwrap();
+
+        let restored =
+            nestweaver_store::GraphStore::open_or_create(&restore_dir.join("test.lbug")).unwrap();
+        assert_eq!(restored.graph_generation(), latest_generation);
+        assert!(restored.lookup_symbol("sym:backup:first").is_ok());
+        assert!(restored.lookup_symbol("sym:backup:second").is_ok());
+        assert_eq!(
+            restored
+                .callees_of("sym:backup:first")
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.uid)
+                .collect::<Vec<_>>(),
+            vec!["sym:backup:second".to_string()]
+        );
+    }
+
+    #[test]
+    fn backup_rejects_abandoned_dirty_publication_and_preserves_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let config = BackupConfig {
+            db_path: db_path.clone(),
+            output_path: dir.path().join("must-not-exist.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+        };
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let abandoned = crate::index::establish_index_publication_marker_with_io(
+            &store,
+            Some(&db_path),
+            "abandoned watcher publication",
+            &crate::index::FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        store
+            .insert_symbol(&backup_symbol("sym:backup:abandoned", "abandoned"))
+            .unwrap();
+        drop(abandoned);
+
+        let error = match stage_backup_from_store(&store, &config) {
+            Ok(_) => panic!("dirty publication backup unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("dirty index publication"));
+        assert!(marker_path.exists());
+        assert!(store.is_index_publication_dirty());
     }
 
     #[test]

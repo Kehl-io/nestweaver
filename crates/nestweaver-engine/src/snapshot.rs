@@ -200,6 +200,45 @@ pub fn build_snapshot(
     manifest: &Manifest,
     db_path: &Path,
 ) -> Result<(), anyhow::Error> {
+    let store = nestweaver_store::GraphStore::open(db_path)
+        .map_err(|error| anyhow::anyhow!("failed to open snapshot database: {error}"))?;
+    build_snapshot_from_store(output_dir, stamp, manifest, &store)
+}
+
+/// Build a snapshot from an already-open store while excluding graph
+/// publishers for the complete checkpoint-and-copy lifetime.
+pub fn build_snapshot_from_store(
+    output_dir: &Path,
+    stamp: &Stamp,
+    manifest: &Manifest,
+    store: &nestweaver_store::GraphStore,
+) -> Result<(), anyhow::Error> {
+    let db_path = store
+        .db_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot snapshot an in-memory graph store"))?;
+    let publication = store
+        .acquire_index_publication_lease()
+        .map_err(|error| anyhow::anyhow!("failed to quiesce graph publication: {error}"))?;
+    publication.ensure_clean_for_snapshot().map_err(|error| {
+        anyhow::anyhow!("refusing snapshot of dirty index publication: {error}")
+    })?;
+    store
+        .checkpoint()
+        .map_err(|error| anyhow::anyhow!("snapshot CHECKPOINT failed: {error}"))?;
+
+    let result = build_snapshot_files(output_dir, stamp, manifest, db_path);
+    publication.release().map_err(|error| {
+        anyhow::anyhow!("failed to release snapshot publication lease: {error}")
+    })?;
+    result
+}
+
+fn build_snapshot_files(
+    output_dir: &Path,
+    stamp: &Stamp,
+    manifest: &Manifest,
+    db_path: &Path,
+) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(output_dir).map_err(|e| {
         anyhow::anyhow!("failed to create output_dir {}: {e}", output_dir.display())
     })?;
@@ -474,9 +513,9 @@ mod tests {
         }
     }
 
-    fn make_fake_db(dir: &Path) -> PathBuf {
+    fn make_test_db(dir: &Path) -> PathBuf {
         let db = dir.join("test.lbug");
-        std::fs::write(&db, b"fake-graph-data").unwrap();
+        drop(nestweaver_store::GraphStore::create(&db).unwrap());
         db
     }
 
@@ -484,7 +523,7 @@ mod tests {
     fn build_creates_all_files() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
-        let db = make_fake_db(dir.path());
+        let db = make_test_db(dir.path());
 
         let stamp = make_stamp(
             "0.1.0",
@@ -509,10 +548,44 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_abandoned_dirty_publication_without_copying_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        let marker = crate::sidecar_path(&db, ".index-dirty");
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let abandoned = crate::index::establish_index_publication_marker_with_io(
+            &store,
+            Some(&db),
+            "abandoned snapshot publication",
+            &crate::index::FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        drop(abandoned);
+
+        let error = build_snapshot_from_store(
+            &snap_dir,
+            &make_stamp("0.1.0", "0.1.0", "schema-hash", "model"),
+            &make_manifest(),
+            &store,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("dirty index publication"));
+        assert!(
+            marker.exists(),
+            "rejected snapshot must retain dirty marker"
+        );
+        assert!(
+            !snap_dir.join("index-dirty").exists(),
+            "dirty marker must never be included in snapshot output"
+        );
+    }
+
+    #[test]
     fn verify_passes_valid_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
-        let db = make_fake_db(dir.path());
+        let db = make_test_db(dir.path());
 
         let stamp = make_stamp(
             "0.1.0",
@@ -532,7 +605,7 @@ mod tests {
     fn materialize_relocates_sidecars_and_gates_compat() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
-        let db = make_fake_db(dir.path());
+        let db = make_test_db(dir.path());
         // Give the source DB sidecars so build_snapshot captures them.
         std::fs::write(crate::sidecar_path(&db, ".pagerank.json"), b"{}").unwrap();
         std::fs::write(crate::sidecar_path(&db, ".manifests.json"), b"{}").unwrap();
@@ -588,7 +661,7 @@ mod tests {
     fn verify_fails_tampered_stamp() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
-        let db = make_fake_db(dir.path());
+        let db = make_test_db(dir.path());
 
         let stamp = make_stamp(
             "0.1.0",
@@ -622,7 +695,7 @@ mod tests {
     fn load_rejects_incompatible_engine() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
-        let db = make_fake_db(dir.path());
+        let db = make_test_db(dir.path());
 
         // Snapshot requires engine >= 2.0.0
         let stamp = make_stamp(
@@ -653,7 +726,7 @@ mod tests {
     fn load_rejects_mismatched_schema() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
-        let db = make_fake_db(dir.path());
+        let db = make_test_db(dir.path());
 
         let stamp = make_stamp(
             "0.1.0",
@@ -682,7 +755,7 @@ mod tests {
     fn load_rejects_mismatched_embedding_model() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
-        let db = make_fake_db(dir.path());
+        let db = make_test_db(dir.path());
 
         let stamp = make_stamp(
             "0.1.0",
@@ -711,7 +784,7 @@ mod tests {
     fn verify_legacy_single_hash_checksum() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
-        let db = make_fake_db(dir.path());
+        let db = make_test_db(dir.path());
 
         let stamp = make_stamp(
             "0.1.0",
