@@ -568,10 +568,20 @@ impl GraphStore {
     /// same clean generation that the query began against. Rechecking dirty
     /// state and generation while holding the publication barrier makes the
     /// check-and-fill atomic with marker establishment/retirement.
+    #[cfg(test)]
     fn finalize_symbol_name_cache_query(
         &self,
         query_generation: u64,
         symbols: Vec<(String, nestweaver_schema::Symbol)>,
+    ) -> std::sync::Arc<SymbolNameCached> {
+        self.finalize_symbol_name_cache_query_with_hook(query_generation, symbols, || {})
+    }
+
+    fn finalize_symbol_name_cache_query_with_hook(
+        &self,
+        query_generation: u64,
+        symbols: Vec<(String, nestweaver_schema::Symbol)>,
+        inside_publication_barrier: impl FnOnce(),
     ) -> std::sync::Arc<SymbolNameCached> {
         let candidate = std::sync::Arc::new(SymbolNameCached {
             generation: query_generation,
@@ -581,6 +591,7 @@ impl GraphStore {
             .pagerank_compute_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        inside_publication_barrier();
         let current_generation = self.graph_generation();
         if self.is_index_publication_dirty() || current_generation != query_generation {
             return candidate;
@@ -623,6 +634,37 @@ impl GraphStore {
         limit: usize,
         seed_resolution: &SeedResolutionConfig,
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
+        self.search_symbols_by_name_impl(query, limit, seed_resolution, || {}, || {})
+    }
+
+    /// Test-only entry to the exact public-search implementation with
+    /// deterministic synchronization points around cache publication.
+    #[cfg(test)]
+    fn search_symbols_by_name_with_hooks(
+        &self,
+        query: &str,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+        after_db_scan: impl FnOnce(),
+        inside_publication_barrier: impl FnOnce(),
+    ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
+        self.search_symbols_by_name_impl(
+            query,
+            limit,
+            seed_resolution,
+            after_db_scan,
+            inside_publication_barrier,
+        )
+    }
+
+    fn search_symbols_by_name_impl(
+        &self,
+        query: &str,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+        after_db_scan: impl FnOnce(),
+        inside_publication_barrier: impl FnOnce(),
+    ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
         let needle = query.to_lowercase();
         // --- Step 1: coherently snapshot publication state + cache ----------
         // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
@@ -651,7 +693,12 @@ impl GraphStore {
                 }
             }
 
-            self.finalize_symbol_name_cache_query(query_generation, all)
+            after_db_scan();
+            self.finalize_symbol_name_cache_query_with_hook(
+                query_generation,
+                all,
+                inside_publication_barrier,
+            )
         };
 
         // --- Step 3: filter and rank the in-memory list ----------------------
@@ -699,7 +746,7 @@ impl GraphStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{Arc, Barrier};
 
     use nestweaver_schema::{Symbol, SymbolKind, Visibility};
 
@@ -988,26 +1035,63 @@ mod tests {
     }
 
     #[test]
-    fn symbol_name_cache_does_not_fill_when_publication_turns_dirty_during_fetch() {
+    fn symbol_name_cache_real_query_does_not_fill_when_publication_turns_dirty_after_scan() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
-        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        store
+            .insert_symbol(&make_symbol("fresh", "RaceFresh"))
+            .unwrap();
         let query_generation = store.graph_generation();
+        assert!(store.symbol_name_cache.lock().unwrap().is_none());
+        let scan_finished = Arc::new(Barrier::new(2));
+        let release_reader = Arc::new(Barrier::new(2));
 
+        let reader = {
+            let store = Arc::clone(&store);
+            let scan_finished = Arc::clone(&scan_finished);
+            let release_reader = Arc::clone(&release_reader);
+            std::thread::spawn(move || {
+                store.search_symbols_by_name_with_hooks(
+                    "race",
+                    10,
+                    &no_rules(),
+                    || {
+                        scan_finished.wait();
+                        release_reader.wait();
+                    },
+                    || {},
+                )
+            })
+        };
+
+        scan_finished.wait();
         store.with_index_publication_rank_barrier(|| {
             std::fs::write(&marker_path, b"dirty").unwrap();
             store.reserve_index_publication_generation().unwrap();
         });
-
-        store.finalize_symbol_name_cache_query(
+        assert_ne!(
+            store.graph_generation(),
             query_generation,
-            vec![("old".into(), make_symbol("old", "Old"))],
+            "the paused query must have captured the preceding clean generation"
         );
+        assert!(store.symbol_name_cache.lock().unwrap().is_none());
 
+        release_reader.wait();
+        let results = reader.join().unwrap().unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|symbol| symbol.uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh"],
+            "the dirty-window reader still returns its uncached DB result"
+        );
         assert!(
             store.symbol_name_cache.lock().unwrap().is_none(),
-            "a query that began clean must not fill after publication becomes dirty"
+            "the reader must not publish after the writer's completed invalidation"
         );
     }
 
@@ -1072,76 +1156,40 @@ mod tests {
     }
 
     #[test]
-    fn symbol_name_cache_reader_writer_race_never_publishes_pre_commit_symbols() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.lbug");
-        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
-        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+    fn symbol_name_cache_final_check_and_fill_hold_publication_barrier() {
+        let store = GraphStore::in_memory().unwrap();
         store
-            .insert_symbol(&make_symbol("old", "TargetOld"))
+            .insert_symbol(&make_symbol("fresh", "BarrierFresh"))
             .unwrap();
-        let query_generation = store.graph_generation();
-        let writer_holds_barrier = Arc::new(Barrier::new(2));
-        let release_writer = Arc::new(Barrier::new(2));
-
-        let writer = {
-            let store = Arc::clone(&store);
-            let marker_path = marker_path.clone();
-            let writer_holds_barrier = Arc::clone(&writer_holds_barrier);
-            let release_writer = Arc::clone(&release_writer);
-            std::thread::spawn(move || {
-                store.with_index_publication_rank_barrier(|| {
-                    std::fs::write(&marker_path, b"dirty").unwrap();
-                    store.reserve_index_publication_generation().unwrap();
-                    writer_holds_barrier.wait();
-                    release_writer.wait();
-                    store
-                        .insert_symbol(&make_symbol("new", "TargetNew"))
-                        .unwrap();
-                    store.publish_clean_index_publication_generation().unwrap();
-                    std::fs::remove_file(&marker_path).unwrap();
-                    store.complete_index_publication_generation();
-                });
-            })
-        };
-        writer_holds_barrier.wait();
-
-        let (reader_started_tx, reader_started_rx) = mpsc::channel();
-        let (reader_done_tx, reader_done_rx) = mpsc::channel();
-        let reader = {
-            let store = Arc::clone(&store);
-            std::thread::spawn(move || {
-                reader_started_tx.send(()).unwrap();
-                store.finalize_symbol_name_cache_query(
-                    query_generation,
-                    vec![("targetold".into(), make_symbol("old", "TargetOld"))],
-                );
-                reader_done_tx.send(()).unwrap();
-            })
-        };
-        reader_started_rx.recv().unwrap();
-        assert!(
-            matches!(reader_done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
-            "cache publication must wait behind an active publication transition"
-        );
-        release_writer.wait();
-        writer.join().unwrap();
-        reader.join().unwrap();
-        reader_done_rx.recv().unwrap();
-
-        assert!(
-            store.symbol_name_cache.lock().unwrap().is_none(),
-            "a blocked pre-commit reader must reject its result after the writer publishes"
-        );
         let results = store
-            .search_symbols_by_name("target", 10, &no_rules())
+            .search_symbols_by_name_with_hooks(
+                "barrier",
+                10,
+                &no_rules(),
+                || {},
+                || {
+                    assert!(
+                        matches!(
+                            store.pagerank_compute_lock.try_lock(),
+                            Err(std::sync::TryLockError::WouldBlock)
+                        ),
+                        "final generation/dirty validation and fill must own the publication barrier"
+                    );
+                },
+            )
             .unwrap();
-        let mut uids = results
-            .iter()
-            .map(|symbol| symbol.uid.as_str())
-            .collect::<Vec<_>>();
-        uids.sort_unstable();
-        assert_eq!(uids, vec!["new", "old"]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].uid, "fresh");
+        assert_eq!(
+            store
+                .symbol_name_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
+            store.graph_generation()
+        );
     }
 
     // ── Finding #7 — seed_resolution scoring + kind tiebreak ────────────
