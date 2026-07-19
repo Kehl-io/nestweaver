@@ -60,6 +60,12 @@ pub struct GraphStore {
     /// or edges added/removed). Lets the web UI and other consumers detect
     /// when their view of the graph is stale without diffing the full graph.
     pub(crate) graph_generation: AtomicU64,
+    /// Last canonical generation while an index publication is dirty. A
+    /// present value means `graph_generation` is its reserved successor (or
+    /// `u64::MAX` when no successor can be represented). Keeping this recovery
+    /// state separate prevents an ephemeral fail-closed value from becoming a
+    /// wrapping persisted counter.
+    pub(crate) index_publication_generation_base: Mutex<Option<u64>>,
     /// Optional interaction memory scores keyed by node UID. When loaded,
     /// PPR's personalization vector blends a small fraction of these scores
     /// to boost nodes the user has frequently accessed.
@@ -168,6 +174,7 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -195,6 +202,7 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -221,6 +229,7 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -272,6 +281,7 @@ impl GraphStore {
             pagerank_generation: AtomicU64::new(0),
             pagerank_compute_lock: Mutex::new(()),
             graph_generation: AtomicU64::new(0),
+            index_publication_generation_base: Mutex::new(None),
             interaction_cache: Mutex::new(None),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
@@ -427,7 +437,70 @@ impl GraphStore {
     /// that modifies the graph. The web server can poll this to detect when to
     /// push an SSE event to connected clients.
     pub fn bump_graph_generation(&self) {
-        self.graph_generation.fetch_add(1, Ordering::AcqRel);
+        if let Err(error) = self.try_bump_graph_generation() {
+            tracing::error!(%error, "refusing to wrap exhausted graph generation");
+        }
+    }
+
+    /// Advance the live generation without ever wrapping to a reused value.
+    pub fn try_bump_graph_generation(&self) -> Result<u64, StoreError> {
+        let reservation = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if reservation.is_some() {
+            return Err(StoreError::Query(
+                "index publication generation is already reserved".to_string(),
+            ));
+        }
+        self.graph_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| StoreError::Query("graph generation exhausted".to_string()))
+    }
+
+    /// Reserve the next canonical generation for an in-progress publication.
+    /// Repeated calls during the same dirty recovery return the same value.
+    pub fn reserve_index_publication_generation(&self) -> Result<u64, StoreError> {
+        let mut base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(canonical) = *base {
+            return canonical.checked_add(1).ok_or_else(|| {
+                StoreError::Query("graph generation exhausted during index publication".into())
+            });
+        }
+
+        let canonical = self.graph_generation();
+        *base = Some(canonical);
+        let reserved = canonical.checked_add(1).ok_or_else(|| {
+            StoreError::Query("graph generation exhausted during index publication".into())
+        })?;
+        self.graph_generation.store(reserved, Ordering::Release);
+        Ok(reserved)
+    }
+
+    /// Mark a durably published reserved generation as canonical.
+    pub fn complete_index_publication_generation(&self) {
+        *self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    /// Restore the canonical generation when a marker was established but no
+    /// graph mutation was attempted.
+    pub fn cancel_index_publication_generation(&self) {
+        let mut base = self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(canonical) = base.take() {
+            self.graph_generation.store(canonical, Ordering::Release);
+        }
     }
 
     /// The on-disk database path this store was opened from, when known
@@ -1272,13 +1345,27 @@ mod tests {
         let reopened = GraphStore::open_or_create(&db_path).unwrap();
         assert_eq!(
             reopened.graph_generation(),
-            u64::MAX,
-            "an unreadable marker must select the reserved fail-closed generation"
+            8,
+            "an unreadable marker must reserve the monotonic canonical successor"
         );
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(
             !reopened.pagerank_scores().contains_key("stale"),
             "an unreadable marker must make canonical PageRank non-authoritative"
+        );
+    }
+
+    #[test]
+    fn graph_generation_never_wraps_at_counter_exhaustion() {
+        let store = GraphStore::in_memory().unwrap();
+        store.graph_generation.store(u64::MAX, Ordering::Release);
+
+        store.bump_graph_generation();
+
+        assert_eq!(
+            store.graph_generation(),
+            u64::MAX,
+            "generation exhaustion must never wrap to a reused value"
         );
     }
 

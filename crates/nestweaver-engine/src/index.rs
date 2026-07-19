@@ -545,12 +545,22 @@ fn finalize_code_graph_deletion_with_io(
         ),
     }
 
-    // The in-memory generation and PageRank invalidations are required but
-    // infallible. Run them before their durable companions so live readers are
-    // safe even when sidecar persistence fails.
-    store.bump_graph_generation();
+    // Advance before its durable companion so live readers are safe even when
+    // sidecar persistence fails, but never wrap an exhausted counter.
+    let generation_advanced = match store.try_bump_graph_generation() {
+        Ok(_) => true,
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::GenerationPersistence,
+                None,
+                format!("advance graph generation: {error:#}"),
+            );
+            false
+        }
+    };
     let generation_path = crate::sidecar_path(db_path, ".generation");
-    if let Err(error) = store.save_graph_generation(&generation_path) {
+    if generation_advanced && let Err(error) = store.save_graph_generation(&generation_path) {
         push_reconciliation_failure(
             &mut failures,
             DeletionReconciliationStage::GenerationPersistence,
@@ -726,6 +736,7 @@ fn invalidate_pagerank_sidecar_with_io(
 }
 
 fn establish_index_publication_marker_with_io(
+    store: &GraphStore,
     db_path: &Path,
     operation: &str,
     io: &dyn IndexEpilogueIo,
@@ -740,7 +751,20 @@ fn establish_index_publication_marker_with_io(
                 message: format!("{}: {error:#}", marker_path.display()),
             }],
         )
-    })
+    })?;
+    store
+        .reserve_index_publication_generation()
+        .map(|_| ())
+        .map_err(|error| {
+            DeletionReconciliationError::new(
+                operation,
+                vec![DeletionReconciliationFailure {
+                    stage: DeletionReconciliationStage::GenerationPersistence,
+                    repo_uid: None,
+                    message: format!("{}: {error:#}", marker_path.display()),
+                }],
+            )
+        })
 }
 
 fn finalize_committed_index_with_io(
@@ -763,8 +787,20 @@ fn finalize_committed_index_with_io(
         true
     };
 
-    store.bump_graph_generation();
-    let generation_durable = if let Some(db_path) = db_path {
+    let generation_advanced = if db_path.is_some() {
+        store.reserve_index_publication_generation()
+    } else {
+        store.try_bump_graph_generation()
+    };
+    let generation_durable = if let Err(error) = generation_advanced {
+        push_reconciliation_failure(
+            &mut failures,
+            DeletionReconciliationStage::GenerationPersistence,
+            None,
+            format!("advance graph generation: {error:#}"),
+        );
+        false
+    } else if let Some(db_path) = db_path {
         let generation_path = crate::sidecar_path(db_path, ".generation");
         match io.save_generation(store, &generation_path) {
             Ok(()) => true,
@@ -826,6 +862,8 @@ fn finalize_committed_index_with_io(
                 None,
                 format!("{}: {error:#}", marker_path.display()),
             );
+        } else {
+            store.complete_index_publication_generation();
         }
     }
 
@@ -2087,7 +2125,12 @@ where
 
     let _write_guard = acquire_write_guard()?;
     if let Some(db_path) = store.db_path() {
-        establish_index_publication_marker_with_io(db_path, "index graph write", epilogue_io)?;
+        establish_index_publication_marker_with_io(
+            store,
+            db_path,
+            "index graph write",
+            epilogue_io,
+        )?;
     }
     let graph_mutation_attempted = std::cell::Cell::new(false);
     let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
@@ -2652,6 +2695,7 @@ where
                     }
                 };
             }
+            store.cancel_index_publication_generation();
         }
         return graph_result;
     }
@@ -2966,7 +3010,7 @@ fn incremental_index_with_name_and_io(
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
 
-    establish_index_publication_marker_with_io(db_path, "incremental index", epilogue_io)?;
+    establish_index_publication_marker_with_io(&store, db_path, "incremental index", epilogue_io)?;
 
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
@@ -3153,6 +3197,7 @@ where
     let _write_guard = acquire_write_guard()?;
     if let Some(db_path) = store.db_path() {
         establish_index_publication_marker_with_io(
+            store,
             db_path,
             "server incremental index",
             &FileSystemIndexEpilogueIo,
@@ -5098,6 +5143,7 @@ function hello(name) { return "Hello " + name; }
         let generation_before = store.graph_generation();
 
         establish_index_publication_marker_with_io(
+            &store,
             &db_path,
             "compute failure regression",
             &FileSystemIndexEpilogueIo,
@@ -5143,6 +5189,7 @@ function hello(name) { return "Hello " + name; }
         let generation_before = store.graph_generation();
 
         establish_index_publication_marker_with_io(
+            &store,
             &db_path,
             "save failure regression",
             &FileSystemIndexEpilogueIo,
@@ -5180,6 +5227,7 @@ function hello(name) { return "Hello " + name; }
         let generation_before = store.graph_generation();
 
         establish_index_publication_marker_with_io(
+            &store,
             &db_path,
             "removal failure regression",
             &FileSystemIndexEpilogueIo,
@@ -5229,6 +5277,7 @@ function hello(name) { return "Hello " + name; }
         store.save_graph_generation(&generation_path).unwrap();
 
         establish_index_publication_marker_with_io(
+            &store,
             &db_path,
             "unlink and quarantine regression",
             &FileSystemIndexEpilogueIo,
@@ -5283,6 +5332,7 @@ function hello(name) { return "Hello " + name; }
         let stale_generation = store.graph_generation();
 
         establish_index_publication_marker_with_io(
+            &store,
             &db_path,
             "generation regression",
             &FileSystemIndexEpilogueIo,
@@ -5312,6 +5362,122 @@ function hello(name) { return "Hello " + name; }
         assert_ne!(reopened.graph_generation(), stale_generation);
         reopened.load_pagerank_cache(&pagerank_path).unwrap();
         assert!(!reopened.pagerank_scores().contains_key("stale"));
+    }
+
+    #[test]
+    fn unreadable_marker_recovery_publishes_monotonic_generation_and_rejects_stale_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let pagerank_path = crate::sidecar_path(&db_path, ".pagerank.json");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let cache_key = nestweaver_store::cache::ResponseCache::key(
+            "brain_search",
+            &serde_json::json!({"query": "historical"}),
+        );
+        let scope_digest = 41;
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            for _ in 0..7 {
+                store.bump_graph_generation();
+            }
+            store.save_graph_generation(&generation_path).unwrap();
+            let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+            cache.insert(
+                cache_key,
+                "brain_search",
+                br#"{"stale":true}"#,
+                store.graph_generation(),
+                scope_digest,
+            );
+            cache.save();
+        }
+        fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        fs::create_dir(&marker_path).unwrap();
+
+        let recovering = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            recovering.graph_generation(),
+            8,
+            "dirty recovery must reserve canonical generation 7's successor"
+        );
+        recovering.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!recovering.pagerank_scores().contains_key("stale"));
+        let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+        assert!(
+            cache
+                .get(cache_key, recovering.graph_generation(), scope_digest)
+                .is_none(),
+            "the reserved recovery generation must reject generation-7 cache entries"
+        );
+
+        fs::remove_dir(&marker_path).unwrap();
+        establish_index_publication_marker_with_io(
+            &recovering,
+            &db_path,
+            "unreadable marker recovery",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        finalize_committed_index_with_io(
+            &recovering,
+            Some(&db_path),
+            "unreadable marker recovery",
+            &FileSystemIndexEpilogueIo,
+            false,
+        )
+        .unwrap();
+        assert!(!marker_path.exists());
+        assert_eq!(recovering.graph_generation(), 8);
+        drop(recovering);
+
+        let clean = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(clean.graph_generation(), 8);
+        assert!(clean.graph_generation() > 7);
+        clean.load_pagerank_cache(&pagerank_path).unwrap();
+        assert!(!clean.pagerank_scores().contains_key("stale"));
+        let mut cache = nestweaver_store::cache::ResponseCache::open(&db_path, 1);
+        assert!(
+            cache
+                .get(cache_key, clean.graph_generation(), scope_digest)
+                .is_none(),
+            "clean reopen must not reuse the historical generation cache key"
+        );
+    }
+
+    #[test]
+    fn exhausted_generation_keeps_publication_dirty_without_wraparound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            fs::write(&generation_path, u64::MAX.to_string()).unwrap();
+            store.load_graph_generation(&generation_path);
+        }
+        fs::create_dir(&marker_path).unwrap();
+        let recovering = GraphStore::open_or_create(&db_path).unwrap();
+        assert_eq!(recovering.graph_generation(), u64::MAX);
+
+        fs::remove_dir(&marker_path).unwrap();
+        let error = establish_index_publication_marker_with_io(
+            &recovering,
+            &db_path,
+            "exhausted generation",
+            &FileSystemIndexEpilogueIo,
+        )
+        .expect_err("generation exhaustion must abort before graph publication");
+
+        assert!(error.to_string().contains("generation"));
+        assert!(marker_path.exists(), "exhaustion must remain fail-closed");
+        assert_eq!(recovering.graph_generation(), u64::MAX);
+        assert_eq!(
+            fs::read_to_string(&generation_path).unwrap(),
+            u64::MAX.to_string()
+        );
     }
 
     struct EmptyReader {

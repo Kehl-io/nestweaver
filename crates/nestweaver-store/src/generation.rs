@@ -14,7 +14,6 @@
 //! generation, so a freshly-opened process sees the new value and treats every
 //! older cache entry as a MISS — no background daemon required.
 
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -22,41 +21,35 @@ use crate::db::GraphStore;
 use crate::error::StoreError;
 
 impl GraphStore {
-    fn fail_closed_index_publication_generation(&self) -> Option<u64> {
-        let db_path = self.db_path.as_ref()?;
-        let mut marker_path = db_path.as_os_str().to_owned();
-        marker_path.push(".index-dirty");
-        let marker_path = std::path::PathBuf::from(marker_path);
-        if let Ok(false) = marker_path.try_exists() {
-            return None;
-        }
-        let marker = match std::fs::read(marker_path) {
-            Ok(marker) => marker,
-            // Marker unreadability is publication uncertainty. Use the
-            // reserved generation instead of falling back to the canonical
-            // sidecar, which may predate the committed graph.
-            Err(_) => return Some(u64::MAX),
-        };
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        marker.hash(&mut hasher);
-        Some(hasher.finish() | (1_u64 << 63))
+    fn load_fail_closed_index_publication_generation(&self, canonical: Option<u64>) {
+        let canonical = canonical.unwrap_or(u64::MAX);
+        let reserved = canonical.saturating_add(1);
+        *self
+            .index_publication_generation_base
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(canonical);
+        self.graph_generation.store(reserved, Ordering::Release);
     }
 
     /// Load the persisted `graph_generation` value from the `<db>.generation`
-    /// sidecar at `path` into the in-memory counter. No-op (counter stays at
-    /// its current value) when the file is absent or unparseable — a missing
-    /// sidecar means "never indexed", i.e. generation 0.
+    /// sidecar at `path` into the in-memory counter. When publication is clean,
+    /// an absent or unparseable sidecar leaves the current value unchanged. A
+    /// dirty publication instead reserves the canonical successor; if the
+    /// canonical value is unavailable or exhausted, recovery remains at the
+    /// non-advancing fail-closed value and publication cannot complete.
     ///
     /// Called automatically on [`GraphStore::open`] / [`GraphStore::create`] /
     /// [`GraphStore::open_read_only`] via the stored `db_path`.
     pub fn load_graph_generation(&self, path: &Path) {
-        if let Some(fail_closed) = self.fail_closed_index_publication_generation() {
-            self.graph_generation.store(fail_closed, Ordering::Release);
+        let canonical = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u64>().ok());
+        if self.is_index_publication_dirty() {
+            self.load_fail_closed_index_publication_generation(canonical);
             return;
         }
-        if let Ok(contents) = std::fs::read_to_string(path)
-            && let Ok(value) = contents.trim().parse::<u64>()
-        {
+        self.complete_index_publication_generation();
+        if let Some(value) = canonical {
             self.graph_generation.store(value, Ordering::Release);
         }
     }
@@ -75,10 +68,13 @@ impl GraphStore {
     /// batch). Persisting on every bump is what lets a later short-lived
     /// process observe the bump without any running daemon.
     ///
-    /// The persist is best-effort: a write failure is logged but does not abort
-    /// the surrounding operation (the in-memory bump still happened).
+    /// The operation is best-effort: advancement exhaustion and write failures
+    /// are logged but do not abort the surrounding operation.
     pub fn bump_and_persist_graph_generation(&self, path: &Path) {
-        self.bump_graph_generation();
+        if let Err(e) = self.try_bump_graph_generation() {
+            tracing::warn!("failed to advance graph generation: {e}");
+            return;
+        }
         if let Err(e) = self.save_graph_generation(path) {
             tracing::warn!("failed to persist graph generation: {e}");
         }
