@@ -1553,6 +1553,12 @@ fn no_daemon_index_rejects_colon_in_instance_flag() {
         .stderr(contains("colon"));
 }
 
+fn toml_basic_string(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
 fn write_disabled_watch_config(path: &std::path::Path) {
     let root = path.parent().unwrap();
     let storage = root.join("storage");
@@ -1584,11 +1590,17 @@ credential_method = "gh"
 [watch]
 enabled = false
 "#,
-            storage.display(),
-            workspace.display()
+            toml_basic_string(&storage),
+            toml_basic_string(&workspace)
         ),
     )
     .unwrap();
+}
+
+#[test]
+fn toml_path_escaping_preserves_windows_separators() {
+    let path = std::path::Path::new(r#"C:\Users\kory\workspace"#);
+    assert_eq!(toml_basic_string(path), r#"C:\\Users\\kory\\workspace"#);
 }
 
 #[test]
