@@ -3659,8 +3659,8 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
     };
     let sock = rt_dir.join("daemon.sock");
 
-    // If the socket already exists, the daemon is running — return immediately.
-    if sock.exists() {
+    // The socket inode can appear before the daemon starts accepting connections.
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         return Ok(sock);
     }
 
@@ -3678,22 +3678,22 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {e}"))?;
 
-    // Poll for the socket to appear (up to 5s, same as autostart.rs).
+    // Poll for the socket to accept connections (up to 5s, same as autostart.rs).
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(5);
     let mut delay = std::time::Duration::from_millis(50);
     while start.elapsed() < timeout {
-        if sock.exists() {
+        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
             return Ok(sock);
         }
         std::thread::sleep(delay);
         delay = (delay * 2).min(std::time::Duration::from_millis(500));
     }
-    if sock.exists() {
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         return Ok(sock);
     }
     Err(anyhow::anyhow!(
-        "daemon socket did not appear within 5s at {}",
+        "daemon socket did not accept connections within 5s at {}",
         sock.display()
     ))
 }
