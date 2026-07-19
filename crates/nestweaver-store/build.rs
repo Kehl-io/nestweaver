@@ -66,6 +66,40 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+fn emit_openssl_link_search() {
+    for variable in ["OPENSSL_LIB_DIR", "OPENSSL_DIR", "OPENSSL_ROOT_DIR"] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+
+    let explicit_lib_dir = std::env::var_os("OPENSSL_LIB_DIR").map(PathBuf::from);
+    let explicit_root = std::env::var_os("OPENSSL_DIR")
+        .or_else(|| std::env::var_os("OPENSSL_ROOT_DIR"))
+        .map(PathBuf::from)
+        .map(|path| path.join("lib"));
+    let candidates = [
+        explicit_lib_dir,
+        explicit_root,
+        Some(PathBuf::from("/opt/homebrew/opt/openssl@3/lib")),
+        Some(PathBuf::from("/usr/local/opt/openssl@3/lib")),
+    ];
+
+    if let Some(lib_dir) = candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.join("libssl.dylib").is_file())
+    {
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    } else {
+        println!(
+            "cargo:warning=OpenSSL 3 library directory not found; set OPENSSL_LIB_DIR before linking lbug"
+        );
+    }
+}
+
 /// Glob all .c / .cpp / .cc files in `dir` (non-recursive unless `recursive`).
 fn collect_sources(dir: &Path, recursive: bool) -> Vec<PathBuf> {
     let mut out = vec![];
@@ -93,6 +127,11 @@ fn main() {
     if std::env::var("LBUG_SHARED").is_ok() {
         return;
     }
+
+    // lbug 0.18 links OpenSSL dynamically. Its pkg-config probe does not work
+    // on a stock macOS developer machine where pkg-config is absent, so expose
+    // the standard OpenSSL 3 locations to the final linker ourselves.
+    emit_openssl_link_search();
     // When lbug is built FROM SOURCE (LBUG_BUILD_FROM_SOURCE), its own build
     // compiles AND links every one of these third_party libraries. Compiling them
     // here too duplicates each static global — e.g. antlr4's `COMPLETE_CHAR_SET`,

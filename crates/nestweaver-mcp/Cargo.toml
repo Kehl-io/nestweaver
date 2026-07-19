@@ -38,4 +38,4 @@ embed = ["nestweaver-engine/embed"]
 tempfile = "3"
 tower = "0.5"
 tokio = { version = "1", features = ["macros"] }
-toml = "0.8"
+toml = "1.1"
