@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 
 use lbug::Value;
 use nestweaver_algorithms::graph::AdjacencyData;
@@ -1080,7 +1081,10 @@ impl GraphStore {
         if let Some(scores) = cache.as_ref() {
             let json = serde_json::to_string(scores)
                 .map_err(|e| StoreError::Query(format!("serialize: {e}")))?;
-            std::fs::write(path, json).map_err(|e| StoreError::Query(format!("write: {e}")))?;
+            crate::durable_sidecar::atomic_replace_file(path, |file| {
+                file.write_all(json.as_bytes())
+            })
+            .map_err(|e| StoreError::Query(format!("write: {e}")))?;
         }
         Ok(())
     }

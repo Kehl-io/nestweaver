@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod db;
+pub mod durable_sidecar;
 pub mod error;
 pub mod generation;
 pub mod ranking;

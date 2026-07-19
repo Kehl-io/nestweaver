@@ -14,6 +14,7 @@
 //! generation, so a freshly-opened process sees the new value and treats every
 //! older cache entry as a MISS — no background daemon required.
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -65,8 +66,11 @@ impl GraphStore {
     /// live cache consumers. Index publication uses this for clean N+2 while
     /// the dirty marker and live N+1 reservation remain authoritative.
     pub fn save_graph_generation_value(&self, path: &Path, value: u64) -> Result<(), StoreError> {
-        std::fs::write(path, value.to_string())
-            .map_err(|e| StoreError::Query(format!("write generation sidecar: {e}")))
+        let contents = value.to_string();
+        crate::durable_sidecar::atomic_replace_file(path, |file| {
+            file.write_all(contents.as_bytes())
+        })
+        .map_err(|e| StoreError::Query(format!("write generation sidecar: {e}")))
     }
 
     /// Bump the `graph_generation` counter and immediately persist it to the

@@ -946,8 +946,8 @@ fn finalize_node_graph_deletion(
     }
     state.store.invalidate_pagerank();
     let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
-    if let Err(error) = std::fs::remove_file(&pagerank_path)
-        && error.kind() != std::io::ErrorKind::NotFound
+    if let Err(error) =
+        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&pagerank_path)
     {
         push_reconciliation_failure(
             &mut failures,

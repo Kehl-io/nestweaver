@@ -269,7 +269,7 @@ impl DeletionReconciliationIo for FileSystemDeletionReconciliationIo {
     }
 
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::remove_file(path)
+        nestweaver_store::durable_sidecar::remove_file_durable(path)
     }
 }
 
@@ -643,8 +643,7 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
     }
 
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::remove_file(path)?;
-        sync_sidecar_parent_io(path)
+        nestweaver_store::durable_sidecar::remove_file_durable(path)
     }
 
     fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
@@ -663,7 +662,7 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
         generation: u64,
     ) -> Result<(), anyhow::Error> {
         store.save_graph_generation_value(path, generation)?;
-        sync_sidecar_file_and_parent(path)
+        Ok(())
     }
 
     fn compute_pagerank(&self, store: &GraphStore) -> Result<(), anyhow::Error> {
@@ -674,7 +673,7 @@ impl IndexEpilogueIo for FileSystemIndexEpilogueIo {
 
     fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
         store.save_pagerank_cache(path)?;
-        sync_sidecar_file_and_parent(path)
+        Ok(())
     }
 }
 
@@ -696,14 +695,6 @@ fn sync_sidecar_parent_io(path: &Path) -> std::io::Result<()> {
         )
     })?;
     std::fs::File::open(parent)?.sync_all()
-}
-
-fn sync_sidecar_file_and_parent(path: &Path) -> Result<(), anyhow::Error> {
-    std::fs::File::open(path)
-        .with_context(|| format!("open sidecar {} for sync", path.display()))?
-        .sync_all()
-        .with_context(|| format!("sync sidecar {}", path.display()))?;
-    sync_sidecar_parent(path)
 }
 
 fn quarantine_path(path: &Path) -> PathBuf {
