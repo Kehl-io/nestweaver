@@ -935,9 +935,19 @@ fn finalize_node_graph_deletion(
             }
         }
     }
-    state.store.bump_graph_generation();
+    let generation_advanced = match state.store.try_bump_graph_generation() {
+        Ok(_) => true,
+        Err(error) => {
+            push_reconciliation_failure(
+                &mut failures,
+                nestweaver_engine::DeletionReconciliationStage::GenerationPersistence,
+                format!("advance graph generation: {error:#}"),
+            );
+            false
+        }
+    };
     let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
-    if let Err(error) = state.store.save_graph_generation(&generation_path) {
+    if generation_advanced && let Err(error) = state.store.save_graph_generation(&generation_path) {
         push_reconciliation_failure(
             &mut failures,
             nestweaver_engine::DeletionReconciliationStage::GenerationPersistence,
@@ -8534,6 +8544,33 @@ mod startup_helper_tests {
     }
 
     #[test]
+    fn node_deletion_generation_exhaustion_is_reported_while_pagerank_is_invalidated() {
+        let state = test_state_with_writer_generation(Some(u64::MAX));
+        let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
+        let pagerank_path = nestweaver_engine::sidecar_path(&state.db_path, ".pagerank.json");
+        std::fs::write(&pagerank_path, r#"{"stale":1.0}"#).unwrap();
+        state.store.load_pagerank_cache(&pagerank_path).unwrap();
+        let pagerank_generation = state.store.pagerank_generation();
+
+        let failures = finalize_node_graph_deletion(&state, "generation exhaustion regression");
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].stage,
+            nestweaver_engine::DeletionReconciliationStage::GenerationPersistence
+        );
+        assert!(failures[0].message.contains("exhaust"));
+        assert_eq!(state.store.graph_generation(), u64::MAX);
+        assert_eq!(
+            std::fs::read_to_string(generation_path).unwrap(),
+            u64::MAX.to_string()
+        );
+        assert!(!pagerank_path.exists());
+        assert!(state.store.pagerank_scores().is_empty());
+        assert!(state.store.pagerank_generation() > pagerank_generation);
+    }
+
+    #[test]
     fn remove_repo_late_failure_finalizes_committed_children() {
         let state = test_state_with_writer();
         let repo_uid = "repo:test:late-remove";
@@ -9324,8 +9361,16 @@ mod startup_helper_tests {
     /// Build a minimal `DaemonState` with a writer-mode Tantivy index for
     /// exercising admin mutation RPCs in isolation.
     fn test_state_with_writer() -> Arc<DaemonState> {
+        test_state_with_writer_generation(None)
+    }
+
+    fn test_state_with_writer_generation(generation: Option<u64>) -> Arc<DaemonState> {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("brain.lbug");
+        if let Some(generation) = generation {
+            let generation_path = nestweaver_engine::sidecar_path(&db_path, ".generation");
+            std::fs::write(generation_path, generation.to_string()).unwrap();
+        }
         let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
         let tantivy = Arc::new(TantivyIndex::open_or_create(&dir.path().join("tantivy")).unwrap());
         // Keep the temp dir alive for the duration of the test process.
