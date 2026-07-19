@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 /// In-memory extension store: node UID → property map.
 pub type ExtensionStore = HashMap<String, HashMap<String, serde_json::Value>>;
 
-const INSTANCE_MIGRATION_VERSION: u32 = 3;
+const INSTANCE_MIGRATION_VERSION: u32 = 4;
 const EXTENSION_HANDOFF_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,6 +73,17 @@ struct JournalHandoff {
     identity: JournalHandoffIdentity,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournalRepoRecovery {
+    source_uid: String,
+    destination_uid: String,
+    url: String,
+    staleness_commits_behind: u32,
+    name: Option<String>,
+    root_path: Option<String>,
+}
+
 /// Exact post-graph reconciliation inputs captured before an instance merge.
 ///
 /// Repo UIDs are the source graph/sidecar scopes that must be purged from
@@ -97,6 +108,7 @@ struct InstanceExtensionMigrationJournal {
     to_id: String,
     mappings: Vec<JournalUidRemap>,
     handoffs: Vec<JournalHandoff>,
+    repo_recoveries: Vec<JournalRepoRecovery>,
     finalizers: InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
 }
@@ -182,6 +194,26 @@ impl InstanceExtensionMigration {
                     .map(|mapping| nestweaver_store::InstanceUidRemap {
                         source_uid: mapping.source_uid.clone(),
                         destination_uid: mapping.destination_uid.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn repo_recoveries(&self) -> Vec<nestweaver_store::InstanceRepoRecovery> {
+        self.journal
+            .as_ref()
+            .map(|journal| {
+                journal
+                    .repo_recoveries
+                    .iter()
+                    .map(|recovery| nestweaver_store::InstanceRepoRecovery {
+                        source_uid: recovery.source_uid.clone(),
+                        destination_uid: recovery.destination_uid.clone(),
+                        url: recovery.url.clone(),
+                        staleness_commits_behind: recovery.staleness_commits_behind,
+                        name: recovery.name.clone(),
+                        root_path: recovery.root_path.clone(),
                     })
                     .collect()
             })
@@ -778,6 +810,7 @@ fn plan_fingerprint(
     to_id: &str,
     mappings: &[JournalUidRemap],
     handoffs: &[JournalHandoff],
+    repo_recoveries: &[JournalRepoRecovery],
     finalizers: &InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
 ) -> Result<String, anyhow::Error> {
@@ -787,6 +820,7 @@ fn plan_fingerprint(
         to_id,
         mappings,
         handoffs,
+        repo_recoveries,
         finalizers,
         extension_metadata_required,
     ))?;
@@ -846,6 +880,26 @@ fn validate_instance_extension_migration_journal(
             anyhow::bail!("instance extension handoff kind does not match its source UID");
         }
     }
+    let mut previous_recovery: Option<&JournalRepoRecovery> = None;
+    for recovery in &journal.repo_recoveries {
+        if previous_recovery.is_some_and(|previous| previous >= recovery) {
+            anyhow::bail!("instance Repo recoveries must be strictly sorted");
+        }
+        previous_recovery = Some(recovery);
+        if !mapping_pairs.contains(&(
+            recovery.source_uid.as_str(),
+            recovery.destination_uid.as_str(),
+        )) {
+            anyhow::bail!("instance Repo recovery is not bound to an exact UID remap");
+        }
+        if parse_instance_migration_uid(&recovery.source_uid)?.kind() != "Repo"
+            || parse_instance_migration_uid(&recovery.destination_uid)?.kind() != "Repo"
+            || nestweaver_schema::repo_uid(&journal.to_id, &recovery.url)
+                != recovery.destination_uid
+        {
+            anyhow::bail!("instance Repo recovery identity is not deterministic");
+        }
+    }
     validate_finalizer_plan(&journal.from_id, &journal.mappings, &journal.finalizers)?;
     if journal.mappings.is_empty()
         && journal.finalizers.repo_uids.is_empty()
@@ -861,6 +915,7 @@ fn validate_instance_extension_migration_journal(
         &journal.to_id,
         &journal.mappings,
         &journal.handoffs,
+        &journal.repo_recoveries,
         &journal.finalizers,
         journal.extension_metadata_required,
     )?;
@@ -934,6 +989,25 @@ fn canonical_journal_handoffs(
     handoffs
 }
 
+fn canonical_repo_recoveries(
+    recoveries: &[nestweaver_store::InstanceRepoRecovery],
+) -> Vec<JournalRepoRecovery> {
+    let mut recoveries: Vec<_> = recoveries
+        .iter()
+        .map(|recovery| JournalRepoRecovery {
+            source_uid: recovery.source_uid.clone(),
+            destination_uid: recovery.destination_uid.clone(),
+            url: recovery.url.clone(),
+            staleness_commits_behind: recovery.staleness_commits_behind,
+            name: recovery.name.clone(),
+            root_path: recovery.root_path.clone(),
+        })
+        .collect();
+    recoveries.sort();
+    recoveries.dedup();
+    recoveries
+}
+
 fn merge_extension_properties(
     store: &mut ExtensionStore,
     to_id: &str,
@@ -981,6 +1055,7 @@ fn journal_for_plan(
     to_id: &str,
     mappings: Vec<JournalUidRemap>,
     handoffs: Vec<JournalHandoff>,
+    repo_recoveries: Vec<JournalRepoRecovery>,
     finalizers: InstanceMigrationFinalizerPlan,
     extension_metadata_required: bool,
     phase: InstanceMigrationPhase,
@@ -990,6 +1065,7 @@ fn journal_for_plan(
         to_id,
         &mappings,
         &handoffs,
+        &repo_recoveries,
         &finalizers,
         extension_metadata_required,
     )?;
@@ -1002,6 +1078,7 @@ fn journal_for_plan(
         to_id: to_id.to_string(),
         mappings,
         handoffs,
+        repo_recoveries,
         finalizers,
         extension_metadata_required,
     })
@@ -1073,6 +1150,7 @@ pub fn prepare_instance_extension_migration_with_finalizers(
         to_id,
         mappings,
         &[],
+        &[],
         finalizers,
         write_instance_extension_migration_journal,
     )
@@ -1094,6 +1172,7 @@ pub fn prepare_instance_uid_migration_with_finalizers(
         to_id,
         &plan.remaps,
         &plan.handoffs,
+        &plan.repo_recoveries,
         finalizers,
         write_instance_extension_migration_journal,
     )
@@ -1123,6 +1202,7 @@ where
         to_id,
         mappings,
         &[],
+        &[],
         &InstanceMigrationFinalizerPlan {
             repo_uids,
             search_reconciliation_required: false,
@@ -1137,6 +1217,7 @@ fn prepare_instance_extension_migration_with_finalizers_and_write<F>(
     to_id: &str,
     mappings: &[nestweaver_store::InstanceUidRemap],
     handoffs: &[nestweaver_store::InstanceUidHandoff],
+    repo_recoveries: &[nestweaver_store::InstanceRepoRecovery],
     finalizers: &InstanceMigrationFinalizerPlan,
     write_journal: F,
 ) -> Result<InstanceExtensionMigration, anyhow::Error>
@@ -1152,6 +1233,7 @@ where
             anyhow::anyhow!("exact current graph plan does not match journal: {error}")
         })?;
     let current_handoffs = canonical_journal_handoffs(handoffs);
+    let current_repo_recoveries = canonical_repo_recoveries(repo_recoveries);
     let current_finalizers = canonical_finalizer_plan(from_id, &current_mappings, finalizers)
         .map_err(|error| {
             anyhow::anyhow!("exact current finalizer plan does not match journal: {error}")
@@ -1175,6 +1257,7 @@ where
         if journal.phase != InstanceMigrationPhase::Prepared
             || journal.mappings != current_mappings
             || journal.handoffs != current_handoffs
+            || journal.repo_recoveries != current_repo_recoveries
             || journal.finalizers != current_finalizers
             || journal.extension_metadata_required != extension_metadata_required
             || journal.plan_fingerprint
@@ -1183,6 +1266,7 @@ where
                     to_id,
                     &current_mappings,
                     &current_handoffs,
+                    &current_repo_recoveries,
                     &current_finalizers,
                     extension_metadata_required,
                 )?
@@ -1215,6 +1299,7 @@ where
         to_id,
         current_mappings,
         current_handoffs,
+        current_repo_recoveries,
         current_finalizers,
         extension_metadata_required,
         InstanceMigrationPhase::Prepared,
@@ -2343,7 +2428,7 @@ mod tests {
         let journal_path = instance_extension_migration_journal_path(&db_path);
         let journal: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
-        assert_eq!(journal["version"], 3);
+        assert_eq!(journal["version"], INSTANCE_MIGRATION_VERSION);
         assert_eq!(journal["phase"], "prepared");
         assert_eq!(
             journal["finalizers"]["repo_uids"],

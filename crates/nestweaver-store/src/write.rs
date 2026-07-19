@@ -179,10 +179,23 @@ pub struct InstanceUidHandoff {
     pub identity: InstanceUidHandoffIdentity,
 }
 
+/// Durable Repo payload needed to resume the delete-before-insert crash window
+/// in a non-transactional instance merge.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstanceRepoRecovery {
+    pub source_uid: String,
+    pub destination_uid: String,
+    pub url: String,
+    pub staleness_commits_behind: u32,
+    pub name: Option<String>,
+    pub root_path: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InstanceUidMigrationPlan {
     pub remaps: Vec<InstanceUidRemap>,
     pub handoffs: Vec<InstanceUidHandoff>,
+    pub repo_recoveries: Vec<InstanceRepoRecovery>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3844,6 +3857,7 @@ impl GraphStore {
 
         let mut remaps = Vec::new();
         let mut handoffs = Vec::new();
+        let mut repo_recoveries = Vec::new();
         // The LadybugDB Cypher subset does not support a MATCH subquery in an
         // `IN` predicate, so enumerate once and scope by each source Repo UID.
         let services = self.list_services(None)?;
@@ -3852,6 +3866,14 @@ impl GraphStore {
             remaps.push(InstanceUidRemap {
                 source_uid: repo.uid.clone(),
                 destination_uid: destination_repo_uid.clone(),
+            });
+            repo_recoveries.push(InstanceRepoRecovery {
+                source_uid: repo.uid.clone(),
+                destination_uid: destination_repo_uid.clone(),
+                url: repo.url.clone(),
+                staleness_commits_behind: repo.staleness_commits_behind,
+                name: repo.name.clone(),
+                root_path: repo.root_path.clone(),
             });
             for (source_uid, path) in self.list_files_by_repo(&repo.uid)? {
                 let destination_uid = file_uid(&destination_repo_uid, &path);
@@ -3923,7 +3945,48 @@ impl GraphStore {
         remaps.dedup();
         handoffs.sort();
         handoffs.dedup();
-        Ok(InstanceUidMigrationPlan { remaps, handoffs })
+        repo_recoveries.sort();
+        repo_recoveries.dedup();
+        Ok(InstanceUidMigrationPlan {
+            remaps,
+            handoffs,
+            repo_recoveries,
+        })
+    }
+
+    /// Restore target Repo roots whose source row was committed deleted before
+    /// the corresponding target insert. The empty indexed SHA makes the
+    /// recovered root explicitly require a full re-index.
+    pub fn recover_missing_instance_repos(
+        &self,
+        to: &str,
+        recoveries: &[InstanceRepoRecovery],
+    ) -> Result<usize, StoreError> {
+        let mut restored = 0;
+        for recovery in recoveries {
+            if repo_uid(to, &recovery.url) != recovery.destination_uid {
+                return Err(StoreError::Query(format!(
+                    "repo recovery destination is not deterministic: {}",
+                    recovery.destination_uid
+                )));
+            }
+            if self.lookup_repo(&recovery.source_uid)?.is_some()
+                || self.lookup_repo(&recovery.destination_uid)?.is_some()
+            {
+                continue;
+            }
+            self.insert_repo(&Repo {
+                uid: recovery.destination_uid.clone(),
+                url: recovery.url.clone(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: recovery.staleness_commits_behind,
+                instance_id: to.to_string(),
+                name: recovery.name.clone(),
+                root_path: recovery.root_path.clone(),
+            })?;
+            restored += 1;
+        }
+        Ok(restored)
     }
 
     fn instance_merge_node_exists(&self, label: &str, uid: &str) -> Result<bool, StoreError> {
@@ -3977,6 +4040,22 @@ impl GraphStore {
         }
 
         let current_set: std::collections::BTreeSet<_> = current.iter().cloned().collect();
+        let mut missing_repo_destinations = std::collections::BTreeSet::new();
+        for mapping in expected
+            .iter()
+            .filter(|mapping| !current_set.contains(*mapping))
+            .filter(|mapping| {
+                mapping.source_uid.starts_with("repo:")
+                    && mapping.destination_uid.starts_with("repo:")
+            })
+        {
+            let source_live = self.instance_merge_node_exists("Repo", &mapping.source_uid)?;
+            let destination_live =
+                self.instance_merge_node_exists("Repo", &mapping.destination_uid)?;
+            if !source_live && !destination_live {
+                missing_repo_destinations.insert(mapping.destination_uid.clone());
+            }
+        }
         for mapping in expected
             .iter()
             .filter(|mapping| !current_set.contains(*mapping))
@@ -4035,13 +4114,15 @@ impl GraphStore {
                     mapping.source_uid
                 )));
             }
-            if !self.instance_merge_node_exists(destination_label, &destination_root)? {
+            if !self.instance_merge_node_exists(destination_label, &destination_root)?
+                && !missing_repo_destinations.contains(&destination_root)
+            {
                 return Err(StoreError::Query(format!(
                     "journaled destination root does not exist: {destination_root}"
                 )));
             }
         }
-        if current.is_empty() {
+        if current.is_empty() && missing_repo_destinations.is_empty() {
             Ok(InstanceUidRemapPlanState::Applied)
         } else {
             Ok(InstanceUidRemapPlanState::PartiallyApplied)

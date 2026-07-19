@@ -37,9 +37,9 @@ pub use tantivy_index::{
 pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{
     DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
-    DiscardedVault, InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan,
-    InstanceUidRemap, InstanceUidRemapPlanState, MergeResult, ProjectMutationDisposition,
-    PurgeInstanceResult,
+    DiscardedVault, InstanceRepoRecovery, InstanceUidHandoff, InstanceUidHandoffIdentity,
+    InstanceUidMigrationPlan, InstanceUidRemap, InstanceUidRemapPlanState, MergeResult,
+    ProjectMutationDisposition, PurgeInstanceResult,
 };
 
 #[cfg(test)]
@@ -2705,6 +2705,58 @@ mod tests {
                 .verify_instance_uid_remap_plan_state("old", "new", &plan)
                 .unwrap(),
             super::InstanceUidRemapPlanState::PartiallyApplied
+        );
+    }
+
+    #[test]
+    fn instance_uid_remap_plan_recovers_repo_deleted_before_destination_insert() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let store = test_store();
+        let url = "https://github.com/example/repo-insert-crash";
+        let source_uid = repo_uid("old", url);
+        let destination_uid = repo_uid("new", url);
+        store
+            .insert_repo(&Repo {
+                uid: source_uid.clone(),
+                url: url.to_string(),
+                indexed_sha: "source-sha".to_string(),
+                staleness_commits_behind: 2,
+                instance_id: "old".to_string(),
+                name: Some("recover-me".to_string()),
+                root_path: Some("/tmp/recover-me".to_string()),
+            })
+            .unwrap();
+        let plan = store.plan_instance_uid_migration("old", "new").unwrap();
+
+        store
+            .bulk_delete_repo_files_and_symbols(&source_uid)
+            .unwrap();
+        store.clear_repo_derived_nodes(&source_uid).unwrap();
+        store.delete_repo_node(&source_uid).unwrap();
+
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::PartiallyApplied
+        );
+        assert_eq!(
+            store
+                .recover_missing_instance_repos("new", &plan.repo_recoveries)
+                .unwrap(),
+            1
+        );
+        let recovered = store.lookup_repo(&destination_uid).unwrap().unwrap();
+        assert_eq!(recovered.url, url);
+        assert_eq!(recovered.name.as_deref(), Some("recover-me"));
+        assert_eq!(recovered.root_path.as_deref(), Some("/tmp/recover-me"));
+        assert_eq!(recovered.indexed_sha, "");
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("old", "new", &plan.remaps)
+                .unwrap(),
+            super::InstanceUidRemapPlanState::Applied
         );
     }
 

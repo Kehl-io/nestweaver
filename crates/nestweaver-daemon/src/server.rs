@@ -1284,15 +1284,40 @@ where
     C: FnOnce(&GraphStore, &str) -> Result<(), Status>,
     D: FnOnce(&GraphStore, &str) -> Result<(), Status>,
 {
-    let (file_count, sym_count) = state
-        .store
-        .bulk_delete_repo_files_and_symbols(repo_uid)
-        .map_err(|e| {
-            Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}"))
-        })?;
+    run_remove_repo_with_bulk(
+        state,
+        repo_uid,
+        |store, uid| {
+            store.bulk_delete_repo_files_and_symbols(uid).map_err(|e| {
+                Status::internal(format!("bulk_delete_repo_files_and_symbols failed: {e:#}"))
+            })
+        },
+        clear_derived,
+        delete_repo,
+    )
+}
 
-    let cascade_result =
-        clear_derived(&state.store, repo_uid).and_then(|()| delete_repo(&state.store, repo_uid));
+fn run_remove_repo_with_bulk<B, C, D>(
+    state: &DaemonState,
+    repo_uid: &str,
+    bulk_delete: B,
+    clear_derived: C,
+    delete_repo: D,
+) -> Result<RemoveRepoResponse, Status>
+where
+    B: FnOnce(&GraphStore, &str) -> Result<(usize, usize), Status>,
+    C: FnOnce(&GraphStore, &str) -> Result<(), Status>,
+    D: FnOnce(&GraphStore, &str) -> Result<(), Status>,
+{
+    let mutation = match bulk_delete(&state.store, repo_uid) {
+        Ok((file_count, sym_count)) => clear_derived(&state.store, repo_uid)
+            .and_then(|()| delete_repo(&state.store, repo_uid))
+            .map(|()| RemoveRepoResponse {
+                files_deleted: file_count as u64,
+                symbols_deleted: sym_count as u64,
+            }),
+        Err(error) => Err(error),
+    };
 
     let reconciliation = nestweaver_engine::finalize_code_graph_deletion(
         &state.store,
@@ -1304,14 +1329,7 @@ where
     .map(|error| error.failures)
     .unwrap_or_default();
 
-    finish_reconciled_mutation(
-        cascade_result.map(|()| RemoveRepoResponse {
-            files_deleted: file_count as u64,
-            symbols_deleted: sym_count as u64,
-        }),
-        "repo removal",
-        reconciliation,
-    )
+    finish_reconciled_mutation(mutation, "repo removal", reconciliation)
 }
 
 fn run_remove_project_with<D, L, C, F>(
@@ -1516,6 +1534,21 @@ where
     let search_rows_before = indexed_search_rows_before(state);
     let mut repo_uids = list_instance_code_repo_uids(&state.store, instance_id)
         .map_err(|e| Status::internal(format!("PurgeInstance failed to list code repos: {e:#}")))?;
+    let project_prefix = format!("proj:{instance_id}:");
+    let mut project_uids: Vec<_> = state
+        .store
+        .list_projects()
+        .map_err(|error| {
+            Status::internal(format!("PurgeInstance failed to list Projects: {error:#}"))
+        })?
+        .into_iter()
+        .filter(|project| {
+            project.instance_id == instance_id || project.uid.starts_with(&project_prefix)
+        })
+        .map(|project| project.uid)
+        .collect();
+    project_uids.sort();
+    project_uids.dedup();
 
     match purge(&state.store, instance_id) {
         Ok(result) => {
@@ -1538,6 +1571,7 @@ where
             } else {
                 Vec::new()
             };
+            reconcile_deleted_project_extensions(state, &project_uids, &mut failures);
             let search_mutation = if changed {
                 indexed_search_mutation(search_rows_before, &state.store)
             } else {
@@ -1561,6 +1595,7 @@ where
             } else {
                 finalize_code_graph_deletion(state, &repo_uids)
             };
+            reconcile_deleted_project_extensions(state, &project_uids, &mut failures);
             let search_mutation = indexed_search_mutation(search_rows_before, &state.store);
             if search_mutation != IndexedSearchMutation::Unchanged {
                 append_search_reconciliation(
@@ -1573,6 +1608,34 @@ where
                 "purge_instance_error",
                 failures,
             )
+        }
+    }
+}
+
+fn reconcile_deleted_project_extensions(
+    state: &DaemonState,
+    project_uids: &[String],
+    failures: &mut Vec<nestweaver_engine::DeletionReconciliationFailure>,
+) {
+    for project_uid in project_uids {
+        match state.store.project_exists(project_uid) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(error) =
+                    nestweaver_engine::remove_extension_uid_durable(&state.db_path, project_uid)
+                {
+                    push_reconciliation_failure(
+                        failures,
+                        nestweaver_engine::DeletionReconciliationStage::ExtensionMetadata,
+                        format!("Project {project_uid}: {error:#}"),
+                    );
+                }
+            }
+            Err(error) => push_reconciliation_failure(
+                failures,
+                nestweaver_engine::DeletionReconciliationStage::GraphLiveness,
+                format!("Project {project_uid} liveness query failed: {error:#}"),
+            ),
         }
     }
 }
@@ -1648,6 +1711,14 @@ where
                 pending.to_id()
             )));
         }
+        state
+            .store
+            .recover_missing_instance_repos(to_id, &pending.repo_recoveries())
+            .map_err(|error| {
+                Status::internal(format!(
+                    "recover pending instance Repo insertion failed: {error:#}"
+                ))
+            })?;
         let remaps = pending.uid_remaps();
         let graph_state = if remaps.is_empty() {
             if state
@@ -8312,6 +8383,94 @@ mod startup_helper_tests {
     }
 
     #[test]
+    fn startup_recovery_restores_repo_deleted_before_destination_insert() {
+        use nestweaver_schema::uid::repo_uid;
+
+        let state = test_state_with_writer();
+        let db_path = state.db_path.clone();
+        let url = "https://example.test/repo-delete-before-insert";
+        let source_uid = repo_uid("old", url);
+        let destination_uid = repo_uid("new", url);
+        let mut repo = test_repo(&source_uid, url, Some("/work/repo-delete-before-insert"));
+        repo.instance_id = "old".to_string();
+        repo.name = Some("crash-window".to_string());
+        repo.staleness_commits_behind = 7;
+        state.store.insert_repo(&repo).unwrap();
+        seed_extension(
+            &state,
+            &source_uid,
+            "owner",
+            serde_json::json!("preserve-on-recovery"),
+        );
+
+        let plan = state
+            .store
+            .plan_instance_uid_migration("old", "new")
+            .unwrap();
+        nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
+            &state.db_path,
+            "old",
+            "new",
+            &plan,
+            &nestweaver_engine::InstanceMigrationFinalizerPlan {
+                repo_uids: vec![source_uid.clone()],
+                search_reconciliation_required: false,
+            },
+        )
+        .unwrap();
+
+        state
+            .store
+            .bulk_delete_repo_files_and_symbols(&source_uid)
+            .unwrap();
+        state.store.clear_repo_derived_nodes(&source_uid).unwrap();
+        state.store.delete_repo_node(&source_uid).unwrap();
+        assert!(state.store.lookup_repo(&source_uid).unwrap().is_none());
+        assert!(state.store.lookup_repo(&destination_uid).unwrap().is_none());
+
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        let recovered = state
+            .store
+            .lookup_repo(&destination_uid)
+            .unwrap()
+            .expect("startup recovery must restore the missing destination Repo");
+        assert_eq!(recovered.instance_id, "new");
+        assert_eq!(recovered.url, url);
+        assert_eq!(recovered.indexed_sha, "");
+        assert_eq!(recovered.staleness_commits_behind, 7);
+        assert_eq!(recovered.name.as_deref(), Some("crash-window"));
+        assert_eq!(
+            recovered.root_path.as_deref(),
+            Some("/work/repo-delete-before-insert")
+        );
+        assert!(state.store.lookup_repo(&source_uid).unwrap().is_none());
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(!extensions.contains_key(&source_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, &destination_uid, "owner"),
+            Some(&serde_json::json!("preserve-on-recovery"))
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
+        );
+
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let recovered = reopened.lookup_repo(&destination_uid).unwrap().unwrap();
+        assert_eq!(recovered.indexed_sha, "");
+        assert_eq!(recovered.name.as_deref(), Some("crash-window"));
+        assert_eq!(
+            nestweaver_engine::get_property(
+                &nestweaver_engine::load_extensions(&db_path),
+                &destination_uid,
+                "owner",
+            ),
+            Some(&serde_json::json!("preserve-on-recovery"))
+        );
+    }
+
+    #[test]
     fn startup_recovery_uses_graph_applied_journal_for_code_sidecars() {
         use nestweaver_schema::uid::repo_uid;
 
@@ -8734,6 +8893,54 @@ mod startup_helper_tests {
 
         assert_eq!(result.vaults, 1);
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    #[test]
+    fn purge_instance_durably_removes_deleted_project_extensions_only() {
+        let state = test_state_with_writer();
+        let removed_uid = "proj:purge-projects:removed";
+        let retained_uid = "proj:other:retained";
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: removed_uid.to_string(),
+                name: "Removed".to_string(),
+                summary: None,
+                instance_id: "purge-projects".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: retained_uid.to_string(),
+                name: "Retained".to_string(),
+                summary: None,
+                instance_id: "other".to_string(),
+            })
+            .unwrap();
+        seed_extension(&state, removed_uid, "owner", serde_json::json!("remove"));
+        seed_extension(&state, retained_uid, "owner", serde_json::json!("keep"));
+
+        let result = run_purge_instance_with(
+            &state,
+            "purge-projects",
+            |store, id| store.purge_instance(id).map_err(anyhow::Error::from),
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.projects, 1);
+        let db_path = state.db_path.clone();
+        drop(state);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        let extensions = nestweaver_engine::load_extensions(&db_path);
+        assert!(!extensions.contains_key(removed_uid));
+        assert_eq!(
+            nestweaver_engine::get_property(&extensions, retained_uid, "owner"),
+            Some(&serde_json::json!("keep"))
+        );
+        assert!(!reopened.project_exists(removed_uid).unwrap());
+        assert!(reopened.project_exists(retained_uid).unwrap());
     }
 
     #[test]
@@ -10501,6 +10708,59 @@ mod startup_helper_tests {
             !state.store.has_embedding(&removed_symbol),
             "the committed Symbol deletion must remove its embedding"
         );
+    }
+
+    #[test]
+    fn remove_repo_bulk_error_finalizes_ambiguous_partial_deletion_extensions() {
+        let state = test_state_with_writer();
+        let repo_uid = "repo:test:bulk-error";
+        let file_uid = nestweaver_schema::file_uid(repo_uid, "src/lib.rs");
+        state
+            .store
+            .insert_repo(&test_repo(
+                repo_uid,
+                "https://example.test/bulk-error",
+                None,
+            ))
+            .unwrap();
+        state
+            .store
+            .insert_file(&nestweaver_schema::File {
+                uid: file_uid.clone(),
+                path: "src/lib.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        seed_extension(&state, repo_uid, "owner", serde_json::json!("keep-live"));
+        seed_extension(&state, &file_uid, "owner", serde_json::json!("remove-dead"));
+        let generation_before = state.store.graph_generation();
+
+        let error = run_remove_repo_with_bulk(
+            &state,
+            repo_uid,
+            |store, uid| {
+                store.bulk_delete_repo_files_and_symbols(uid).unwrap();
+                Err(Status::internal(
+                    "injected ambiguous error after bulk commit",
+                ))
+            },
+            |_store, _uid| panic!("later stages must not run after bulk error"),
+            |_store, _uid| panic!("later stages must not run after bulk error"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .message()
+                .contains("ambiguous error after bulk commit")
+        );
+        assert!(state.store.graph_generation() > generation_before);
+        assert!(state.store.lookup_repo(repo_uid).unwrap().is_some());
+        assert!(state.store.list_files_by_repo(repo_uid).unwrap().is_empty());
+        let extensions = nestweaver_engine::load_extensions(&state.db_path);
+        assert!(extensions.contains_key(repo_uid));
+        assert!(!extensions.contains_key(&file_uid));
     }
 
     /// The gRPC mutating-tool gate MUST reference the single shared
