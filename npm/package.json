@@ -1,6 +1,6 @@
 {
   "name": "@kehl-io/nestweaver",
-  "version": "2.5.8",
+  "version": "2.5.9",
   "description": "Code knowledge graph for AI agents — 40 MCP tools, 15 languages, graph visualization",
   "bin": {
     "nestweaver": "bin/nestweaver"
