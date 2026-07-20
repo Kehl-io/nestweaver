@@ -15,11 +15,9 @@ Across **every** Claude Code session under `~/.claude/projects/` on this machine
 | Signal | Count |
 |--------|-------|
 | NestWeaver MCP tool invocations | **0** |
-| GitNexus MCP tool invocations | **0** |
 | `Bash` tool calls | **39,668** |
 | Other MCP actually used | Claude-in-Chrome (183), Supabase (~38), Gmail/Drive (~11) |
 | Files *mentioning* "nestweaver" (as text/paths) | 665 |
-| Files *mentioning* "gitnexus" | 69 |
 
 In day-to-day captured usage, the agents orient via **Bash (grep/rg/git/find)**, not via NestWeaver. NestWeaver appears as *the thing being built*, not *a tool being used*.
 
@@ -41,7 +39,7 @@ of falling back to Bash* — F3/F4 (first-party regex/count so skills stop shell
 Prioritize them on that evidence, not taste.
 
 ### A.2 — Your own benchmark defines value as 7 code-graph journeys
-`_docs/benchmark/journeys.sh` measures these, by **latency + result count** (not retrieval quality), vs GitNexus/Graphify:
+`_docs/benchmark/journeys.sh` measures these, by **latency + result count** (not retrieval quality), vs Graphify:
 
 | # | Journey | CLI exercised | Features that serve it |
 |---|---------|---------------|------------------------|

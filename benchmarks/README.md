@@ -1,6 +1,6 @@
 # NestWeaver Benchmark Suite
 
-Competitive benchmark comparing NestWeaver against Graphify and GitNexus on indexing speed, query latency, and token savings.
+Competitive benchmark comparing NestWeaver against Graphify on indexing speed, query latency, and token savings.
 
 ## Quick Start
 
@@ -18,7 +18,7 @@ The suite is fully self-contained — nothing touches your global NestWeaver ins
 
 - **NestWeaver** is built from source into `/private/tmp/nestweaver-bench/local/` with Metal + embed features
 - **A dedicated daemon** starts per-repo with its own DB socket (your production daemon is untouched)
-- **GitNexus** is installed via npm into a local prefix under the bench root
+- **Graphify** is installed into a Python virtual environment under the bench root
 - **Python deps** (matplotlib, tiktoken) go into a venv at `venvs/bench/`
 - **All indexes, results, and reports** live under `/private/tmp/nestweaver-bench/`
 
@@ -50,7 +50,7 @@ Results land in `/private/tmp/nestweaver-bench/`:
 results/
   metadata.json               # Hardware, versions, repo SHAs
   <repo>-nestweaver.json      # Per-repo NestWeaver results
-  <repo>-gitnexus.json        # Per-repo competitor results
+  <repo>-graphify.json        # Per-repo competitor results
   token-savings.json           # Token comparison data
 report/
   benchmark-report.md          # Markdown report with tables

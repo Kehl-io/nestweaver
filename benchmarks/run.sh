@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run.sh -- NestWeaver benchmark orchestrator
-# Fully isolated: builds NestWeaver to a local prefix, installs competitors
+# Fully isolated: builds NestWeaver to a local prefix, installs the competitor
 # locally, uses a dedicated daemon instance. Nothing touches your global
 # NestWeaver installation.
 set -euo pipefail
@@ -18,12 +18,11 @@ INDEX_DIR="$BENCH_ROOT/indexes"
 RESULTS_DIR="$BENCH_ROOT/results"
 REPORT_DIR="$BENCH_ROOT/report"
 VENVS_DIR="$BENCH_ROOT/venvs"
-NODE_DIR="$BENCH_ROOT/node"
 BIN_DIR="$BENCH_ROOT/bin"
 LOCAL_PREFIX="$BENCH_ROOT/local"
 
 mkdir -p "$REPOS_DIR" "$INDEX_DIR" "$RESULTS_DIR" "$REPORT_DIR" \
-         "$VENVS_DIR" "$NODE_DIR" "$BIN_DIR" "$LOCAL_PREFIX"
+         "$VENVS_DIR" "$BIN_DIR" "$LOCAL_PREFIX"
 
 NUM_RUNS="${NUM_RUNS:-3}"
 export NUM_RUNS REPOS_DIR INDEX_DIR RESULTS_DIR REPORT_DIR BIN_DIR BENCH_ROOT QUERIES REPO_ROOT
@@ -95,9 +94,9 @@ info "  nestweaver $NW_VERSION at $BENCH_NESTWEAVER"
 export BENCH_NESTWEAVER
 
 # ---------------------------------------------------------------------------
-# 4. Install competitors (all isolated under BENCH_ROOT)
+# 4. Install competitor (isolated under BENCH_ROOT)
 # ---------------------------------------------------------------------------
-info "Installing competitors..."
+info "Installing competitor..."
 
 # Python venv for benchmark scripts (charts, token_savings)
 BENCH_VENV="$VENVS_DIR/bench"
@@ -120,16 +119,7 @@ if [[ ! -f "$GRAPHIFY_VENV/bin/graphify" ]]; then
 fi
 GRAPHIFY_BIN="$GRAPHIFY_VENV/bin/graphify"
 
-# GitNexus -- local npm install
-GITNEXUS_DIR="$NODE_DIR/gitnexus"
-if [[ ! -f "$GITNEXUS_DIR/node_modules/.bin/gitnexus" ]]; then
-    mkdir -p "$GITNEXUS_DIR"
-    npm install --prefix "$GITNEXUS_DIR" gitnexus 2>/dev/null \
-        || warn "  gitnexus npm install failed"
-fi
-GITNEXUS_BIN="$GITNEXUS_DIR/node_modules/.bin/gitnexus"
-
-export GRAPHIFY_BIN GITNEXUS_BIN
+export GRAPHIFY_BIN
 
 # ---------------------------------------------------------------------------
 # 5. Record metadata
@@ -208,12 +198,6 @@ for name in $REPO_NAMES; do
         benchmark_graphify "$name" "$repo_path"
     else
         warn "  Skipping graphify (not installed)"
-    fi
-
-    if [[ -x "$GITNEXUS_BIN" ]]; then
-        benchmark_gitnexus "$name" "$repo_path"
-    else
-        warn "  Skipping gitnexus (not installed)"
     fi
 
     # codebase-memory-mcp removed -- unreliable install, dead upstream URL
