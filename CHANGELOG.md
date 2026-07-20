@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.5.2](https://github.com/Kehl-io/nestweaver/compare/v2.5.1...v2.5.2) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** guard missing release PR output ([93646d5](https://github.com/Kehl-io/nestweaver/commit/93646d5361b3cd49f868a38c052999fca75a9d30))
+* **release:** guard missing release PR output ([acfba65](https://github.com/Kehl-io/nestweaver/commit/acfba65201da0fb4fe19cb9e0a6107726a769b9c))
+
 ## [2.5.1](https://github.com/Kehl-io/nestweaver/compare/v2.5.0...v2.5.1) (2026-07-19)
 
 
