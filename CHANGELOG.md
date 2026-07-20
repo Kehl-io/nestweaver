@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.5.10](https://github.com/Kehl-io/nestweaver/compare/v2.5.9...v2.5.10) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** require macOS 13.3 ([325ccf1](https://github.com/Kehl-io/nestweaver/commit/325ccf11e378bf0115ddf3b1ccaf17f9e4672652))
+* **release:** require macOS 13.3 ([790857a](https://github.com/Kehl-io/nestweaver/commit/790857a2213ea797b731487fd5e8fd41972056c4))
+
 ## [2.5.9](https://github.com/Kehl-io/nestweaver/compare/v2.5.8...v2.5.9) (2026-07-20)
 
 
