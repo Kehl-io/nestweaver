@@ -155,7 +155,7 @@ jobs:
         run: |
           CLANG_RT="$(clang --print-resource-dir)/lib/darwin/libclang_rt.osx.a"
           test -f "$CLANG_RT"
-          lipo -verify_arch x86_64 "$CLANG_RT"
+          lipo "$CLANG_RT" -verify_arch x86_64
           nm -arch x86_64 "$CLANG_RT" | grep '___cpu_model'
           echo "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=$CLANG_RT" >> "$GITHUB_ENV"
       - name: Build binary
