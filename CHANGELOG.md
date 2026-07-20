@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.5.9](https://github.com/Kehl-io/nestweaver/compare/v2.5.8...v2.5.9) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** use portable lipo syntax ([2256a9b](https://github.com/Kehl-io/nestweaver/commit/2256a9b9af41799a603e83012945a5c34095a83f))
+* **release:** use portable lipo syntax ([33c4620](https://github.com/Kehl-io/nestweaver/commit/33c462095c594eb230970bba89c8daf261c657a2))
+
 ## [2.5.8](https://github.com/Kehl-io/nestweaver/compare/v2.5.7...v2.5.8) (2026-07-20)
 
 
