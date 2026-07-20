@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.7](https://github.com/Kehl-io/nestweaver/compare/v2.5.6...v2.5.7) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** build Intel macOS natively ([#157](https://github.com/Kehl-io/nestweaver/issues/157)) ([a7569d5](https://github.com/Kehl-io/nestweaver/commit/a7569d508ecc22ef04e31bfb2cd748aed4252f7a))
+
 ## [2.5.6](https://github.com/Kehl-io/nestweaver/compare/v2.5.5...v2.5.6) (2026-07-20)
 
 
