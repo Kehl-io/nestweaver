@@ -4,6 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="$REPO_ROOT/target/release/NestWeaver.app"
+# LadybugDB uses floating-point std::format, available since macOS 13.3.
+export MACOSX_DEPLOYMENT_TARGET=13.3
+APP_ARCH="$(uname -m)"
+case "$APP_ARCH" in
+    arm64|x86_64) SWIFT_TARGET="$APP_ARCH-apple-macosx$MACOSX_DEPLOYMENT_TARGET" ;;
+    *)
+        echo "Unsupported macOS architecture: $APP_ARCH" >&2
+        exit 1
+        ;;
+esac
 
 echo "=== Building NestWeaver.app ==="
 
@@ -45,6 +55,7 @@ fi
 echo "[4/6] Compiling Swift launcher..."
 swiftc "$SCRIPT_DIR/Sources/main.swift" \
     -o "$REPO_ROOT/target/release/NestWeaverLauncher" \
+    -target "$SWIFT_TARGET" \
     -framework AppKit \
     -O
 
