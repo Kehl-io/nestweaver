@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.6](https://github.com/Kehl-io/nestweaver/compare/v2.5.5...v2.5.6) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** build Linux ARM64 natively ([#155](https://github.com/Kehl-io/nestweaver/issues/155)) ([22df618](https://github.com/Kehl-io/nestweaver/commit/22df618e30d7aa9aaa5d66aa7d7cc21f15530bf6))
+
 ## [2.5.5](https://github.com/Kehl-io/nestweaver/compare/v2.5.4...v2.5.5) (2026-07-20)
 
 
