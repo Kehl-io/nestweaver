@@ -119,16 +119,40 @@ jobs:
           echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            echo "PKG_CONFIG_PATH=$OPENSSL_INSTALL/lib/pkgconfig" >> "$GITHUB_ENV"
-            echo "PKG_CONFIG_LIBDIR=$OPENSSL_INSTALL/lib/pkgconfig" >> "$GITHUB_ENV"
-            echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+            TOOLCHAIN="$RUNNER_TEMP/nestweaver-aarch64-linux.cmake"
+            {
+              printf '%s\n' 'set(CMAKE_SYSTEM_NAME Linux)'
+              printf '%s\n' 'set(CMAKE_SYSTEM_PROCESSOR aarch64)'
+              printf '%s\n' 'set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)'
+              printf '%s\n' 'set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)'
+              printf 'set(OPENSSL_ROOT_DIR "%s" CACHE PATH "" FORCE)\n' "$OPENSSL_INSTALL"
+              printf 'set(OPENSSL_INCLUDE_DIR "%s/include" CACHE PATH "" FORCE)\n' "$OPENSSL_INSTALL"
+              printf 'set(OPENSSL_SSL_LIBRARY "%s/lib/libssl.a" CACHE FILEPATH "" FORCE)\n' "$OPENSSL_INSTALL"
+              printf 'set(OPENSSL_CRYPTO_LIBRARY "%s/lib/libcrypto.a" CACHE FILEPATH "" FORCE)\n' "$OPENSSL_INSTALL"
+              printf '%s\n' 'set(OPENSSL_USE_STATIC_LIBS TRUE CACHE BOOL "" FORCE)'
+            } > "$TOOLCHAIN"
+            echo "CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_gnu=$TOOLCHAIN" >> "$GITHUB_ENV"
+
+            PROBE_DIR="$RUNNER_TEMP/nestweaver-openssl-probe"
+            mkdir -p "$PROBE_DIR"
+            {
+              printf '%s\n' 'cmake_minimum_required(VERSION 3.20)'
+              printf '%s\n' 'project(nestweaver_openssl_probe C)'
+              printf '%s\n' 'find_package(OpenSSL 3 REQUIRED)'
+              printf '%s\n' 'if(NOT OPENSSL_INCLUDE_DIR STREQUAL "${EXPECTED_OPENSSL_ROOT}/include")'
+              printf '%s\n' '  message(FATAL_ERROR "Wrong OpenSSL include: ${OPENSSL_INCLUDE_DIR}")'
+              printf '%s\n' 'endif()'
+              printf '%s\n' 'if(NOT OPENSSL_CRYPTO_LIBRARY STREQUAL "${EXPECTED_OPENSSL_ROOT}/lib/libcrypto.a")'
+              printf '%s\n' '  message(FATAL_ERROR "Wrong OpenSSL crypto library: ${OPENSSL_CRYPTO_LIBRARY}")'
+              printf '%s\n' 'endif()'
+            } > "$PROBE_DIR/CMakeLists.txt"
+            cmake -S "$PROBE_DIR" -B "$PROBE_DIR/build" \
+              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+              -DEXPECTED_OPENSSL_ROOT="$OPENSSL_INSTALL"
           fi
         env:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-      - name: Clear cached LadybugDB cross-build state
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo clean --locked --release --package lbug --target ${{ matrix.target }}
       - name: Build binary
         run: cargo build --locked --release --target ${{ matrix.target }}
         env:
