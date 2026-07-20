@@ -72,16 +72,14 @@ apply_dark_theme()
 TOOL_COLORS = {
     "nestweaver": "#4F9CF7",
     "graphify": "#10B981",
-    "gitnexus": "#F59E0B",
 }
 
 TOOL_LABELS = {
     "nestweaver": "NestWeaver",
     "graphify": "Graphify",
-    "gitnexus": "GitNexus",
 }
 
-TOOL_ORDER = ["nestweaver", "graphify", "gitnexus"]
+TOOL_ORDER = ["nestweaver", "graphify"]
 
 REPO_ORDER = ["tailwindcss", "deno", "next.js", "elasticsearch"]
 
@@ -169,9 +167,6 @@ def compute_quality_stats(data: dict) -> dict:
                 total_nodes = sum(q.get("results", 0) for q in queries)
                 total_noise = sum(q.get("noise_nodes", 0) for q in queries)
                 t["noise_pct"] = (total_noise / total_nodes * 100) if total_nodes > 0 else 0.0
-
-            elif tool == "gitnexus":
-                t["avg_results"] = sum(q.get("results", 0) for q in queries) / len(queries)
 
             if t:
                 repo_stats[tool] = t
@@ -618,7 +613,7 @@ def generate_report(
         lines.append("## Incremental Indexing")
         lines.append("")
         lines.append("After a single file change, NestWeaver can re-index without "
-                      "rebuilding the entire graph. Competitors require a full re-index.")
+                     "rebuilding the entire graph. Graphify requires a full re-index.")
         lines.append("")
         if incremental_chart:
             lines.append("![Incremental Indexing](incremental-indexing.svg)")
@@ -666,7 +661,7 @@ def generate_report(
     if has_graph_stats:
         lines.append("## Graph Depth")
         lines.append("")
-        lines.append("NestWeaver extracts more symbols and cross-references than competitors,")
+        lines.append("NestWeaver extracts more symbols and cross-references than Graphify,")
         lines.append("building a richer knowledge graph that powers deeper query results.")
         lines.append("")
         if graph_depth_chart:
@@ -717,28 +712,25 @@ def generate_report(
         lines.append("Per-repo averages for structural / context queries:")
         lines.append("")
         lines.append("| Repository | NW Seeds | NW Connected | NW Unique Files "
-                     "| Graphify Nodes | Graphify Noise | GitNexus Results |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+                     "| Graphify Nodes | Graphify Noise |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
         for repo in repos:
             rs = quality_stats.get(repo, {})
             nw = rs.get("nestweaver", {})
             gf = rs.get("graphify", {})
-            gn = rs.get("gitnexus", {})
             seeds = f"{nw['avg_seeds']:.1f}" if "avg_seeds" in nw else "-"
             connected = f"{nw['avg_connected']:.1f}" if "avg_connected" in nw else "-"
             unique = f"{nw['avg_unique_files']:.1f}" if "avg_unique_files" in nw else "-"
             gf_nodes = f"{gf['avg_nodes']:.1f}" if "avg_nodes" in gf else "-"
             gf_noise = f"{gf['avg_noise']:.1f}" if "avg_noise" in gf else "-"
-            gn_results = f"{gn['avg_results']:.1f}" if "avg_results" in gn else "-"
             lines.append(f"| {REPO_LABELS.get(repo, repo)} | {seeds} | {connected} "
-                         f"| {unique} | {gf_nodes} | {gf_noise} | {gn_results} |")
+                         f"| {unique} | {gf_nodes} | {gf_noise} |")
         lines.append("")
 
     # Search Results table
     has_search = any(
         quality_stats.get(r, {}).get("nestweaver", {}).get("avg_search_results") is not None
         or quality_stats.get(r, {}).get("graphify", {}).get("avg_nodes") is not None
-        or quality_stats.get(r, {}).get("gitnexus", {}).get("avg_results") is not None
         for r in repos
     )
     if has_search:
@@ -762,8 +754,6 @@ def generate_report(
                     val = ts.get("avg_search_results")
                 elif tool == "graphify":
                     val = ts.get("avg_nodes")
-                elif tool == "gitnexus":
-                    val = ts.get("avg_results")
                 else:
                     val = None
                 row += f" {val:.1f} |" if val is not None else " - |"
@@ -779,12 +769,10 @@ def generate_report(
     nw_unique_files_vals = []
     gf_nodes_vals = []
     gf_noise_pcts = []
-    gn_results_vals = []
     for repo in repos:
         rs = quality_stats.get(repo, {})
         nw = rs.get("nestweaver", {})
         gf = rs.get("graphify", {})
-        gn = rs.get("gitnexus", {})
         if "avg_connected" in nw:
             nw_connected_vals.append(nw["avg_connected"])
         if "avg_unique_files" in nw:
@@ -793,8 +781,6 @@ def generate_report(
             gf_nodes_vals.append(gf["avg_nodes"])
         if "noise_pct" in gf:
             gf_noise_pcts.append(gf["noise_pct"])
-        if "avg_results" in gn:
-            gn_results_vals.append(gn["avg_results"])
 
     if nw_connected_vals and gf_nodes_vals:
         avg_nw_conn = sum(nw_connected_vals) / len(nw_connected_vals)
@@ -809,11 +795,6 @@ def generate_report(
         lines.append(f"- **Graphify noise**: {avg_noise:.0f}% of Graphify's returned nodes are "
                      f"framework stubs or vendored code without actionable source")
 
-    if gn_results_vals:
-        lines.append(f"- **GitNexus completeness**: GitNexus finds symbols but returns "
-                     f"0 callers and 0 callees — it locates definitions without showing "
-                     f"how they connect to the rest of the codebase")
-
     if nw_connected_vals and nw_unique_files_vals:
         avg_conn = sum(nw_connected_vals) / len(nw_connected_vals)
         avg_files = sum(nw_unique_files_vals) / len(nw_unique_files_vals)
@@ -824,8 +805,7 @@ def generate_report(
                 gf_noise_str = f" Graphify returns {sum(gf_nodes_vals) / len(gf_nodes_vals):.0f} nodes but {sum(gf_noise_pcts) / len(gf_noise_pcts):.0f}% are framework stubs without source code."
             lines.append("")
             lines.append(f"> NestWeaver returns **{avg_conn:.0f} connected symbols** per query with "
-                         f"**{file_pct:.0f}%** being from unique source files.{gf_noise_str} "
-                         f"GitNexus finds symbols but returns 0 callers and 0 callees.")
+                         f"**{file_pct:.0f}%** being from unique source files.{gf_noise_str}")
 
     lines.append("")
 

@@ -623,31 +623,31 @@ Elasticsearch — 511K symbols, 43K files
 </table>
 
 <details>
-<summary>Benchmark results (NestWeaver vs Graphify vs GitNexus)</summary>
+<summary>Benchmark results (NestWeaver vs Graphify)</summary>
 
 **Query Speed (p50)**
 
-| Repository | Files | NestWeaver | Graphify | GitNexus |
-|---|---:|---:|---:|---:|
-| Tailwind CSS | 542 | **157ms** | 185ms | 700ms |
-| Deno | 14,136 | **82ms** | 1,355ms | 908ms |
-| Next.js | 29,402 | **71ms** | 2,440ms | 1,116ms |
-| Elasticsearch | 43,806 | **617ms** | crashed | 1,573ms |
+| Repository | Files | NestWeaver | Graphify |
+|---|---:|---:|---:|
+| Tailwind CSS | 542 | **157ms** | 185ms |
+| Deno | 14,136 | **82ms** | 1,355ms |
+| Next.js | 29,402 | **71ms** | 2,440ms |
+| Elasticsearch | 43,806 | **617ms** | crashed |
 
 **Indexing Speed**
 
-| Repository | NestWeaver | Graphify | GitNexus |
-|---|---:|---:|---:|
-| Tailwind CSS | 3.6s | 2.5s | 9.2s |
-| Deno | 51s | 33s | 84s |
-| Next.js | **33s** | 111s | 176s |
-| Elasticsearch | **3,462s** | crashed | 5,434s |
+| Repository | NestWeaver | Graphify |
+|---|---:|---:|
+| Tailwind CSS | 3.6s | 2.5s |
+| Deno | 51s | 33s |
+| Next.js | **33s** | 111s |
+| Elasticsearch | **3,462s** | crashed |
 
-**Incremental re-indexing** (NestWeaver only — competitors require full re-index): 632ms (Tailwind), 4.0s (Next.js), 73s (Elasticsearch).
+**Incremental re-indexing** (NestWeaver only — Graphify requires full re-index): 632ms (Tailwind), 4.0s (Next.js), 73s (Elasticsearch).
 
 **Graph depth**: NestWeaver extracts 142K symbols / 280K edges on Deno (vs Graphify's 76K / 177K). On Elasticsearch: 511K symbols, 14.8M edges.
 
-**Result quality**: NestWeaver returns ~30 connected symbols per query ranked by PageRank with full signatures. Graphify returns file-level nodes with 9-15% garbage stubs. GitNexus finds definitions but returns 0 callers and 0 callees.
+**Result quality**: NestWeaver returns ~30 connected symbols per query ranked by PageRank with full signatures. Graphify returns file-level nodes with 9-15% garbage stubs.
 
 *Benchmarked in daemon mode on M3 Pro (36 GB). See [benchmarks/](benchmarks/) to reproduce.*
 

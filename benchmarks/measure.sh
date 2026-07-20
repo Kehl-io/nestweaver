@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # measure.sh -- benchmark measurement functions, sourced by run.sh
 # Requires: BENCH_NESTWEAVER, REPOS_DIR, INDEX_DIR, RESULTS_DIR, QUERIES,
-#           NUM_RUNS, GRAPHIFY_BIN, GITNEXUS_BIN, CBMCP_BIN
+#           NUM_RUNS, GRAPHIFY_BIN
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -399,7 +399,7 @@ benchmark_graphify() {
             if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
                 # Graphify outputs text -- NODE lines are actual results
                 results=$(echo "$CAPTURED_OUTPUT" | grep -c '^NODE ' || echo 0)
-                noise=$(echo "$CAPTURED_OUTPUT" | grep '^NODE' | grep 'src= ' | wc -l | tr -d ' ')
+                noise=$(echo "$CAPTURED_OUTPUT" | grep -c '^NODE.*src= ')
             fi
         done
 
@@ -446,113 +446,3 @@ with open('$result_file', 'w') as f:
     info "  [graphify] done -- index=${index_median}ms p50=${p50}ms p95=${p95}ms"
     set -e
 }
-
-# ---------------------------------------------------------------------------
-# benchmark_gitnexus REPO_NAME REPO_PATH
-# GitNexus stores its index inside the repo (.gitnexus/), so we operate
-# from within the repo directory.
-# ---------------------------------------------------------------------------
-benchmark_gitnexus() {
-    set +e
-    local name="$1" repo_path="$2"
-    local result_file="$RESULTS_DIR/${name}-gitnexus.json"
-
-    info "  [gitnexus] benchmarking $name..."
-
-    local index_times=()
-    for ((i = 1; i <= NUM_RUNS; i++)); do
-        rm -rf "$repo_path/.gitnexus"
-        local ms
-        ms=$(time_ms "$GITNEXUS_BIN" analyze "$repo_path")
-        index_times+=("$ms")
-        info "    index run $i: ${ms}ms"
-    done
-    local index_median
-    index_median=$(median "${index_times[@]}")
-
-    # --- Graph depth stats (re-run analyze to capture output) ---
-    local gn_stats
-    gn_stats=$("$GITNEXUS_BIN" analyze "$repo_path" --force 2>&1 || true)
-    local symbol_count edge_count
-    symbol_count=$(echo "$gn_stats" | grep -oE '[0-9,]+ nodes' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
-    edge_count=$(echo "$gn_stats" | grep -oE '[0-9,]+ edges' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
-    info "    graph: ${symbol_count} nodes, ${edge_count} edges"
-
-    # --- Index size on disk ---
-    local index_size_bytes
-    index_size_bytes=$(find "$repo_path/.gitnexus" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1}END{print s+0}' || echo 0)
-
-    # Warm-up queries
-    for ((w = 0; w < 3; w++)); do
-        "$GITNEXUS_BIN" query "warmup" -r "$repo_path" >/dev/null 2>&1 || true
-    done
-
-    local all_latencies=()
-    local query_results=()
-
-    while IFS= read -r query; do
-        local latencies=()
-        local results=0
-
-        for ((i = 1; i <= NUM_RUNS; i++)); do
-            local ms
-            ms=$(time_ms_capture "$GITNEXUS_BIN" query "$query" -r "$repo_path")
-            latencies+=("$ms")
-
-            read_captured
-            if [[ $i -eq 1 ]] && [[ -n "$CAPTURED_OUTPUT" ]]; then
-                results=$(echo "$CAPTURED_OUTPUT" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    procs = d.get('processes', [])
-    print(len(procs))
-except: print(0)
-" 2>/dev/null || echo 0)
-            fi
-        done
-
-        local lat_median
-        lat_median=$(median "${latencies[@]}")
-        all_latencies+=("${latencies[@]}")
-
-        local q_json runs_json
-        q_json=$(json_quote "$query")
-        runs_json=$(printf '%s,' "${latencies[@]}")
-        runs_json="[${runs_json%,}]"
-
-        query_results+=("{\"query\": $q_json, \"latency_median_ms\": $lat_median, \"results\": $results, \"runs\": $runs_json}")
-        info "    query '$query': ${lat_median}ms (results=$results)"
-    done < <(load_queries "$name" "search"; load_queries "$name" "context")
-
-    local p50 p95
-    p50=$(percentile 50 "${all_latencies[@]}")
-    p95=$(percentile 95 "${all_latencies[@]}")
-
-    local queries_json index_runs_json
-    queries_json=$(printf '%s,' "${query_results[@]}")
-    queries_json="[${queries_json%,}]"
-    index_runs_json=$(printf '%s,' "${index_times[@]}")
-    index_runs_json="[${index_runs_json%,}]"
-
-    python3 -c "
-import json
-result = {
-    'tool': 'gitnexus',
-    'repo': '$name',
-    'index_median_ms': $index_median,
-    'index_runs': $index_runs_json,
-    'index_size_bytes': $index_size_bytes,
-    'symbol_count': $symbol_count,
-    'edge_count': $edge_count,
-    'p50_ms': $p50,
-    'p95_ms': $p95,
-    'queries': $queries_json
-}
-with open('$result_file', 'w') as f:
-    json.dump(result, f, indent=2)
-"
-    info "  [gitnexus] done -- index=${index_median}ms p50=${p50}ms p95=${p95}ms"
-    set -e
-}
-
