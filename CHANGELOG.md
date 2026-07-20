@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.5.8](https://github.com/Kehl-io/nestweaver/compare/v2.5.7...v2.5.8) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** link Intel macOS compiler runtime ([ba06971](https://github.com/Kehl-io/nestweaver/commit/ba069717dde867a7b79688d115a56db9920832dd))
+* **release:** link Intel macOS compiler runtime ([d6e2bb2](https://github.com/Kehl-io/nestweaver/commit/d6e2bb24b6fe17798aee4176a6673730b9607917))
+
 ## [2.5.7](https://github.com/Kehl-io/nestweaver/compare/v2.5.6...v2.5.7) (2026-07-20)
 
 
