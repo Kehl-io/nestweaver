@@ -101,9 +101,9 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          # LadybugDB uses floating-point std::format, available since macOS 13.3.
           case "${{ matrix.target }}" in
-            x86_64-apple-darwin) DEPLOYMENT_TARGET=10.12 ;;
-            aarch64-apple-darwin) DEPLOYMENT_TARGET=11.0 ;;
+            x86_64-apple-darwin|aarch64-apple-darwin) DEPLOYMENT_TARGET=13.3 ;;
             *)
               echo "Unsupported macOS target: ${{ matrix.target }}" >&2
               exit 1
