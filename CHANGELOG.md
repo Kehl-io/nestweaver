@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.5](https://github.com/Kehl-io/nestweaver/compare/v2.5.4...v2.5.5) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** avoid stale native build cache ([#153](https://github.com/Kehl-io/nestweaver/issues/153)) ([7bea500](https://github.com/Kehl-io/nestweaver/commit/7bea500a5817b86e3d27d4b3775332137e119799))
+
 ## [2.5.4](https://github.com/Kehl-io/nestweaver/compare/v2.5.3...v2.5.4) (2026-07-20)
 
 
