@@ -110,15 +110,25 @@ jobs:
           test -f "$OPENSSL_INSTALL/lib/libssl.a"
           test -f "$OPENSSL_INSTALL/lib/libcrypto.a"
           test -f "$OPENSSL_INSTALL/include/openssl/ssl.h"
+          test -f "$OPENSSL_INSTALL/include/openssl/opensslconf.h"
+          test -f "$OPENSSL_INSTALL/lib/pkgconfig/openssl.pc"
           echo "OPENSSL_DIR=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
           echo "OPENSSL_ROOT_DIR=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
           echo "OPENSSL_LIB_DIR=$OPENSSL_INSTALL/lib" >> "$GITHUB_ENV"
           echo "OPENSSL_INCLUDE_DIR=$OPENSSL_INSTALL/include" >> "$GITHUB_ENV"
           echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            echo "PKG_CONFIG_PATH=$OPENSSL_INSTALL/lib/pkgconfig" >> "$GITHUB_ENV"
+            echo "PKG_CONFIG_LIBDIR=$OPENSSL_INSTALL/lib/pkgconfig" >> "$GITHUB_ENV"
+            echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+          fi
         env:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+      - name: Clear cached LadybugDB cross-build state
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo clean --locked --release --package lbug --target ${{ matrix.target }}
       - name: Build binary
         run: cargo build --locked --release --target ${{ matrix.target }}
         env:
