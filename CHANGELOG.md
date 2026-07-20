@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.3](https://github.com/Kehl-io/nestweaver/compare/v2.5.2...v2.5.3) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** isolate ARM64 OpenSSL discovery ([#149](https://github.com/Kehl-io/nestweaver/issues/149)) ([d0f4535](https://github.com/Kehl-io/nestweaver/commit/d0f4535bd23ce646e85a889066dd8c739751dcee))
+
 ## [2.5.2](https://github.com/Kehl-io/nestweaver/compare/v2.5.1...v2.5.2) (2026-07-20)
 
 
