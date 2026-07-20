@@ -58,12 +58,18 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -74,13 +80,10 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libzstd-dev pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
       - name: Configure linker (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -90,7 +93,6 @@ jobs:
           rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
 
           [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
           rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
           EOF
       - uses: actions/setup-node@v7
@@ -113,53 +115,17 @@ jobs:
           test -f "$OPENSSL_INSTALL/include/openssl/ssl.h"
           test -f "$OPENSSL_INSTALL/include/openssl/opensslconf.h"
           test -f "$OPENSSL_INSTALL/lib/pkgconfig/openssl.pc"
-          echo "OPENSSL_DIR=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
-          echo "OPENSSL_ROOT_DIR=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
-          echo "OPENSSL_LIB_DIR=$OPENSSL_INSTALL/lib" >> "$GITHUB_ENV"
-          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_INSTALL/include" >> "$GITHUB_ENV"
-          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
-          echo "CMAKE_PREFIX_PATH=$OPENSSL_INSTALL" >> "$GITHUB_ENV"
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            TOOLCHAIN="$RUNNER_TEMP/nestweaver-aarch64-linux.cmake"
-            {
-              printf '%s\n' 'set(CMAKE_SYSTEM_NAME Linux)'
-              printf '%s\n' 'set(CMAKE_SYSTEM_PROCESSOR aarch64)'
-              printf '%s\n' 'set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)'
-              printf '%s\n' 'set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)'
-              printf 'set(OPENSSL_ROOT_DIR "%s" CACHE PATH "" FORCE)\n' "$OPENSSL_INSTALL"
-              printf 'set(OPENSSL_INCLUDE_DIR "%s/include" CACHE PATH "" FORCE)\n' "$OPENSSL_INSTALL"
-              printf 'set(OPENSSL_SSL_LIBRARY "%s/lib/libssl.a" CACHE FILEPATH "" FORCE)\n' "$OPENSSL_INSTALL"
-              printf 'set(OPENSSL_CRYPTO_LIBRARY "%s/lib/libcrypto.a" CACHE FILEPATH "" FORCE)\n' "$OPENSSL_INSTALL"
-              printf '%s\n' 'set(OPENSSL_USE_STATIC_LIBS TRUE CACHE BOOL "" FORCE)'
-            } > "$TOOLCHAIN"
-            echo "CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_gnu=$TOOLCHAIN" >> "$GITHUB_ENV"
-
-            PROBE_DIR="$RUNNER_TEMP/nestweaver-openssl-probe"
-            mkdir -p "$PROBE_DIR"
-            {
-              printf '%s\n' 'cmake_minimum_required(VERSION 3.20)'
-              printf '%s\n' 'project(nestweaver_openssl_probe C)'
-              printf '%s\n' 'find_package(OpenSSL 3 REQUIRED)'
-              printf '%s\n' 'if(NOT OPENSSL_INCLUDE_DIR STREQUAL "${EXPECTED_OPENSSL_ROOT}/include")'
-              printf '%s\n' '  message(FATAL_ERROR "Wrong OpenSSL include: ${OPENSSL_INCLUDE_DIR}")'
-              printf '%s\n' 'endif()'
-              printf '%s\n' 'if(NOT OPENSSL_CRYPTO_LIBRARY STREQUAL "${EXPECTED_OPENSSL_ROOT}/lib/libcrypto.a")'
-              printf '%s\n' '  message(FATAL_ERROR "Wrong OpenSSL crypto library: ${OPENSSL_CRYPTO_LIBRARY}")'
-              printf '%s\n' 'endif()'
-            } > "$PROBE_DIR/CMakeLists.txt"
-            cmake -S "$PROBE_DIR" -B "$PROBE_DIR/build" \
-              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-              -DEXPECTED_OPENSSL_ROOT="$OPENSSL_INSTALL"
-          fi
-        env:
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          {
+            echo "OPENSSL_DIR=$OPENSSL_INSTALL"
+            echo "OPENSSL_ROOT_DIR=$OPENSSL_INSTALL"
+            echo "OPENSSL_LIB_DIR=$OPENSSL_INSTALL/lib"
+            echo "OPENSSL_INCLUDE_DIR=$OPENSSL_INSTALL/include"
+            echo "OPENSSL_STATIC=1"
+            echo "CMAKE_PREFIX_PATH=$OPENSSL_INSTALL"
+          } >> "$GITHUB_ENV"
       - name: Build binary
         run: cargo build --locked --release --target ${{ matrix.target }}
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
           LBUG_BUILD_FROM_SOURCE: "1"
       - name: Verify release binary
         shell: bash
@@ -191,16 +157,15 @@ jobs:
 
           HOST="$(uname -s)-$(uname -m)"
           case "$HOST:${{ matrix.target }}" in
-            Linux-x86_64:x86_64-unknown-linux-gnu|Darwin-x86_64:x86_64-apple-darwin|Darwin-arm64:aarch64-apple-darwin)
+            Linux-x86_64:x86_64-unknown-linux-gnu|Linux-aarch64:aarch64-unknown-linux-gnu|Darwin-x86_64:x86_64-apple-darwin|Darwin-arm64:aarch64-apple-darwin)
               "$BIN" --version
               ;;
           esac
       - name: Package binary
         run: |
-          BIN="target/${{ matrix.target }}/release/nestweaver"
           ARCHIVE="nestweaver-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}.tar.gz"
           tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" nestweaver
-          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       - name: Generate SHA-256 checksum
         run: shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
       - name: Attest build provenance
