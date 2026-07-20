@@ -97,6 +97,19 @@ jobs:
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
+      - name: Configure macOS deployment target
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-apple-darwin) DEPLOYMENT_TARGET=10.12 ;;
+            aarch64-apple-darwin) DEPLOYMENT_TARGET=11.0 ;;
+            *)
+              echo "Unsupported macOS target: ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+          echo "MACOSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET" >> "$GITHUB_ENV"
       - name: Configure linker (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -136,6 +149,15 @@ jobs:
             echo "OPENSSL_STATIC=1"
             echo "CMAKE_PREFIX_PATH=$OPENSSL_INSTALL"
           } >> "$GITHUB_ENV"
+      - name: Configure Intel macOS compiler runtime
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          CLANG_RT="$(clang --print-resource-dir)/lib/darwin/libclang_rt.osx.a"
+          test -f "$CLANG_RT"
+          lipo -verify_arch x86_64 "$CLANG_RT"
+          nm -arch x86_64 "$CLANG_RT" | grep '___cpu_model'
+          echo "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=$CLANG_RT" >> "$GITHUB_ENV"
       - name: Build binary
         run: cargo build --locked --release --target ${{ matrix.target }}
         env:
