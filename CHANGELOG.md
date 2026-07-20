@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.4](https://github.com/Kehl-io/nestweaver/compare/v2.5.3...v2.5.4) (2026-07-20)
+
+
+### Bug Fixes
+
+* **release:** pin ARM64 OpenSSL in CMake toolchain ([#151](https://github.com/Kehl-io/nestweaver/issues/151)) ([52e35c9](https://github.com/Kehl-io/nestweaver/commit/52e35c9af4c826485e7a2090cb019a79eaf4b239))
+
 ## [2.5.3](https://github.com/Kehl-io/nestweaver/compare/v2.5.2...v2.5.3) (2026-07-20)
 
 
