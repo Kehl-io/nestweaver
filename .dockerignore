@@ -28,7 +28,6 @@ graphify-out/
 .claude/
 .agents/
 .codex/
-.gitnexus/
 .playwright-cli/
 .superpowers/
 .devcontainer/
