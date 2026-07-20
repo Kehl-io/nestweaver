@@ -33,8 +33,9 @@ jobs:
       - name: Synchronize release lockfile
         if: steps.release.outputs.prs_created == 'true'
         env:
-          RELEASE_PR_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
         run: |
+          RELEASE_PR_BRANCH="$(jq -er '.headBranchName' <<< "$RELEASE_PR")"
           cargo update --workspace
           if git diff --quiet -- Cargo.lock; then
             exit 0
