@@ -197,8 +197,27 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
 }
 
+/// Whether a captured declaration node sits inside an `export_statement`.
+///
+/// Tree-sitter's JS/TS grammars wrap exported declarations (`export function`,
+/// `export const`, `export default ...`) in a PARENT `export_statement` node,
+/// so the `export` keyword is not part of the declaration node's own text. A
+/// short ancestor walk (declaration → lexical_declaration → export_statement
+/// is the deepest common shape) recovers it. Cheap: at most 3 parent hops.
+fn has_export_ancestor(node: &tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    for _ in 0..3 {
+        match current {
+            Some(n) if n.kind() == "export_statement" => return true,
+            Some(n) => current = n.parent(),
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Infer symbol visibility from name and surrounding source text based on language conventions.
-fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
+fn infer_visibility(name: &str, node_text: &str, lang: Language, exported: bool) -> Visibility {
     match lang {
         // Go: capitalized = public, lowercase = private
         Language::Go => {
@@ -240,7 +259,7 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
         | Language::Svelte
         | Language::Astro => {
             let sig = first_line(node_text);
-            if sig.contains("export ") {
+            if exported || sig.contains("export ") {
                 Visibility::Public
             } else {
                 Visibility::Private
@@ -861,7 +880,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     )
                 };
 
-                let visibility = infer_visibility(&name, node_text, lang);
+                let visibility =
+                    infer_visibility(&name, node_text, lang, has_export_ancestor(&node));
                 let type_info = extract_type_info(&signature, lang);
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
                     find_parent_name(&node, source_bytes)
@@ -1235,6 +1255,50 @@ mod tests {
         let path = root.join(rel);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read fixture {rel}: {e}"))
+    }
+
+    // ── visibility tests (nw-063) ───────────────────────────────────────────
+
+    /// `export`ed TS/JS declarations are the module's public API. Tree-sitter
+    /// wraps them in a parent `export_statement`, so the export keyword is NOT
+    /// in the declaration node's own text — visibility must consult ancestors.
+    #[test]
+    fn ts_exported_symbols_are_public() {
+        let src = "export function charge(id: string, amount: number): boolean {\n  return true;\n}\nfunction helper(): void {}\nexport const rate = (x: number): number => x * 2;\nexport default function main(): void {}\n";
+        let parsed = parse_source(Path::new("api.ts"), src).unwrap();
+        let vis = |name: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} not extracted: {:?}",
+                        parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    )
+                })
+                .visibility
+        };
+        assert_eq!(
+            vis("charge"),
+            Visibility::Public,
+            "export function must be Public"
+        );
+        assert_eq!(
+            vis("helper"),
+            Visibility::Private,
+            "non-exported stays Private"
+        );
+        assert_eq!(
+            vis("rate"),
+            Visibility::Public,
+            "export const arrow must be Public"
+        );
+        assert_eq!(
+            vis("main"),
+            Visibility::Public,
+            "export default must be Public"
+        );
     }
 
     // ── query cache tests ───────────────────────────────────────────────────
