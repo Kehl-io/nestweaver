@@ -676,6 +676,11 @@ pub fn analyze_blast_radius(
             .then_with(|| a.uid.cmp(&b.uid))
     });
 
+    // The verdict inputs are snapshotted BEFORE any display cap: a `limit` is
+    // presentation, and a risk/gate verdict computed from a truncated set is
+    // non-safe by definition (Rothermel-Harrold; audit nw-058).
+    let total_affected = affected_symbols.len();
+
     // R7: cap the returned set to the caller's `limit`, keeping the most-
     // impactful symbols (already sorted). A display cap is a user request, not
     // a failure, so it never escalates status — but the note carries the true
@@ -725,8 +730,7 @@ pub fn analyze_blast_radius(
         }
     }
 
-    // Step 4: Score risk.
-    let total_affected = affected_symbols.len();
+    // Step 4: Score risk (from the pre-truncation `total_affected`).
     let clusters_touched = affected_clusters.len();
 
     // Factor in PageRank centrality: if high-centrality symbols are changed,
@@ -751,7 +755,7 @@ pub fn analyze_blast_radius(
     let summary = render_blast_summary(
         changed_symbols.len(),
         changed_files.len(),
-        affected_symbols.len(),
+        total_affected,
         clusters_touched,
         risk_level,
         status,
@@ -2278,6 +2282,91 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn limit_does_not_deflate_risk_or_gate() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let store = GraphStore::in_memory().expect("store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.into(),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".into(),
+            file_path: file.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_symbol(&mk("target", "fn_target", "src/target.rs"))
+            .unwrap();
+        for i in 0..60 {
+            let uid = format!("c{i}");
+            store
+                .insert_symbol(&mk(&uid, &format!("fn_c{i}"), &format!("src/c{i}.rs")))
+                .unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid,
+                    target_uid: "target".into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        let files = [PathBuf::from("src/target.rs")];
+        let no_limit = analyze_blast_radius(
+            &store,
+            &files,
+            &BlastRadiusOptions {
+                limit: None,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let with_limit = analyze_blast_radius(
+            &store,
+            &files,
+            &BlastRadiusOptions {
+                limit: Some(5),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(no_limit.risk_level, RiskLevel::High);
+        assert_eq!(no_limit.gate_state, GateState::RiskFlagged);
+        // A display cap must never change the verdict (safe-RTS: verdicts from
+        // truncated sets are non-safe by definition).
+        assert_eq!(with_limit.risk_level, no_limit.risk_level);
+        assert_eq!(with_limit.gate_state, no_limit.gate_state);
+        assert_eq!(
+            with_limit.affected_symbols.len(),
+            5,
+            "display cap still applies"
+        );
+        // The human summary must report the TRUE total, not the capped count.
+        assert!(
+            with_limit.summary.contains("60 transitively affected"),
+            "summary must carry the pre-cap total, got: {}",
+            with_limit.summary
         );
     }
 
