@@ -370,13 +370,24 @@ impl GraphStore {
             return Ok(std::collections::HashMap::new());
         }
         let conn = self.conn()?;
+        // Drive PRIMARY-KEY point lookups via UNWIND rather than a
+        // `WHERE s.uid IN [...]` scan-with-filter. Two reasons:
+        //   1. Correctness: the storage engine's partial sequential string
+        //      scans can return garbled non-PK string values after
+        //      delete+checkpoint cycles (re-indexing), while primary-key point
+        //      lookups return correct values for the same rows. Driving the
+        //      lookup through the PK index is what keeps names/paths intact.
+        //   2. Speed: N index probes instead of a filtered scan, and one
+        //      parameterized statement instead of a fresh query string (which
+        //      would force a re-plan) per distinct key set.
         let in_list: String = uids
             .iter()
             .map(|u| format!("'{}'", u.replace('\'', "''")))
             .collect::<Vec<_>>()
             .join(", ");
         let q = format!(
-            "MATCH (s:Symbol) WHERE s.uid IN [{}] RETURN {}",
+            "UNWIND [{}] AS want_uid \
+             MATCH (s:Symbol {{uid: want_uid}}) RETURN {}",
             in_list, SYMBOL_COLUMNS
         );
         let result = conn

@@ -301,6 +301,15 @@ impl GraphStore {
         let mut truncated_by_threshold = false;
         let mut truncated_by_depth = false;
 
+        // nw-065: one connection and one prepared statement per edge type for
+        // the WHOLE traversal. Previously each visited node created a
+        // connection and re-prepared every statement, which dominated
+        // traversal cost. Prepare the union of structural+data edges; the
+        // per-depth edge slice still selects which are actually followed.
+        let prepare_set: &[EdgeType] = if data_active { &combined } else { structural };
+        let conn = self.conn()?;
+        let mut stmts = Self::prepare_caller_stmts(&conn, prepare_set);
+
         while let Some((current_uid, depth)) = queue.pop_front() {
             if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                 // The shared cancel flag is a bare bool and can't carry a
@@ -324,7 +333,13 @@ impl GraphStore {
             } else {
                 structural
             };
-            let callers = self.direct_callers_of(&current_uid, min_confidence, edges)?;
+            let callers = Self::direct_callers_prepared(
+                &conn,
+                &mut stmts,
+                &current_uid,
+                min_confidence,
+                edges,
+            );
 
             for row in callers {
                 // Skip the seed node itself.
@@ -366,6 +381,37 @@ impl GraphStore {
         }
 
         let mut results: Vec<ImpactNode> = result_map.into_values().collect();
+
+        // Repair display fields from PRIMARY-KEY point lookups.
+        //
+        // The traversal reads caller rows through a pattern scan, and the
+        // storage engine can return garbled non-PK string values from partial
+        // string scans after delete+checkpoint cycles (which re-indexing
+        // performs routinely) — while PK point lookups return the correct
+        // values for the very same rows. `uid` is the primary key and is
+        // therefore trustworthy; `name`/`file_path` are not. Re-resolve them
+        // through the PK-driven batch lookup so no consumer of impact results
+        // (blast radius, affected tests, flow trace) can surface corrupted
+        // symbol names. One batched query per traversal.
+        if !results.is_empty() {
+            let uids: Vec<&str> = results.iter().map(|n| n.uid.as_str()).collect();
+            match self.batch_lookup_symbols(&uids) {
+                Ok(map) => {
+                    for node in results.iter_mut() {
+                        if let Some(sym) = map.get(&node.uid) {
+                            node.name = sym.name.clone();
+                            node.file_path = sym.file_path.clone();
+                            node.start_line = sym.start_line;
+                        }
+                    }
+                }
+                // Non-fatal: the traversal result is still valid, display
+                // fields just keep their scan-provided values.
+                Err(e) => {
+                    tracing::warn!("impact: display-field repair lookup failed: {e}");
+                }
+            }
+        }
         // Sort by impact_score descending; break ties by uid for determinism.
         results.sort_by(|a, b| {
             b.impact_score
@@ -392,35 +438,31 @@ impl GraphStore {
 
     /// Internal: fetch all direct callers of `uid` across
     /// CALLS/IMPORTS/EXTENDS_SYM/IMPLEMENTS_SYM/INCLUDES_SYM/CROSS_REPO_LINK.
-    fn direct_callers_of(
-        &self,
+    /// Like [`direct_callers_of`], but reuses a caller-supplied connection and
+    /// prepared statements instead of creating a connection and re-preparing
+    /// one statement per edge type on EVERY call.
+    ///
+    /// `impact_bfs` calls this once per visited node, so this setup is paid
+    /// once per traversal instead of once per node (nw-065).
+    fn direct_callers_prepared(
+        conn: &lbug::Connection<'_>,
+        stmts: &mut [(String, lbug::PreparedStatement)],
         uid: &str,
         min_confidence: f32,
         edges: &[EdgeType],
-    ) -> Result<Vec<CallerRow>, StoreError> {
-        let conn = self.conn()?;
+    ) -> Vec<CallerRow> {
         let min_conf = min_confidence as f64;
         let mut rows: Vec<CallerRow> = Vec::new();
-
-        for edge_type in edges.iter().map(|edge_type| edge_type.rel_table_name()) {
-            let q = format!(
-                "MATCH (s:Symbol)-[r:{et}]->(t:Symbol {{uid: $uid}}) \
-                 WHERE r.confidence >= $min_conf \
-                 RETURN s.uid, s.name, s.file_path, s.start_line, r.confidence",
-                et = edge_type,
-            );
-
-            let mut stmt = match conn.prepare(&q) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::trace!(
-                        "impact: edge type {edge_type} skipped (table may not exist): {e}"
-                    );
-                    continue;
-                }
-            };
+        for (edge_label, stmt) in stmts.iter_mut() {
+            // Only follow the edge types active at this depth.
+            if !edges
+                .iter()
+                .any(|e| e.rel_table_name() == edge_label.as_str())
+            {
+                continue;
+            }
             let result = match conn.execute(
-                &mut stmt,
+                stmt,
                 vec![
                     ("uid", lbug::Value::String(uid.to_string())),
                     ("min_conf", lbug::Value::Double(min_conf)),
@@ -428,11 +470,10 @@ impl GraphStore {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::trace!("impact: edge type {edge_type} query failed: {e}");
+                    tracing::trace!("impact: edge type {edge_label} query failed: {e}");
                     continue;
                 }
             };
-
             for row in result {
                 use lbug::Value;
                 let caller_uid = match &row[0] {
@@ -457,23 +498,46 @@ impl GraphStore {
                     Value::Double(f) => *f as f32,
                     _ => 0.0,
                 };
-
                 rows.push(CallerRow {
                     uid: caller_uid,
                     name,
                     file_path,
                     start_line,
-                    edge_type: edge_type.to_string(),
+                    edge_type: edge_label.clone(),
                     confidence,
                 });
             }
         }
-
-        Ok(rows)
+        rows
     }
 
-    /// Return outgoing edges that use the same relationship types as impact
-    /// traversal.
+    /// Prepare one caller-lookup statement per edge type, for reuse across a
+    /// whole traversal. Edge types whose relationship table does not exist are
+    /// skipped (same tolerance as the per-call path).
+    fn prepare_caller_stmts(
+        conn: &lbug::Connection<'_>,
+        edges: &[EdgeType],
+    ) -> Vec<(String, lbug::PreparedStatement)> {
+        let mut out = Vec::new();
+        for edge_type in edges.iter().map(|e| e.rel_table_name()) {
+            let q = format!(
+                "MATCH (s:Symbol)-[r:{et}]->(t:Symbol {{uid: $uid}}) \
+                 WHERE r.confidence >= $min_conf \
+                 RETURN s.uid, s.name, s.file_path, s.start_line, r.confidence",
+                et = edge_type,
+            );
+            match conn.prepare(&q) {
+                Ok(stmt) => out.push((edge_type.to_string(), stmt)),
+                Err(e) => {
+                    tracing::trace!(
+                        "impact: edge type {edge_type} skipped (table may not exist): {e}"
+                    );
+                }
+            }
+        }
+        out
+    }
+
     pub fn outgoing_impact_edges(
         &self,
         source_uid: &str,
