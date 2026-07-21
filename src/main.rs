@@ -1905,6 +1905,14 @@ enum RtsEvalCommands {
         /// Total test files the full run executed (feeds the time-saved proxy).
         #[arg(long)]
         total_test_files: Option<usize>,
+        /// Failures identified as FLAKY (e.g. passed on rerun). Excluded from
+        /// recall entirely and never pinned into future selections.
+        #[arg(long = "flaky", num_args = 0..)]
+        flaky_test_files: Vec<String>,
+        /// How many times failures were re-run before reporting. Without this,
+        /// failures are UNCONFIRMED and the report marks recall an upper bound.
+        #[arg(long)]
+        reruns: Option<u32>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
@@ -9774,6 +9782,8 @@ fn run_rts_eval(command: RtsEvalCommands) -> anyhow::Result<(i32, Option<String>
             failed_test_files,
             none_failed,
             total_test_files,
+            flaky_test_files,
+            reruns,
             db,
         } => {
             if failed_test_files.is_empty() && !none_failed {
@@ -9788,6 +9798,8 @@ fn run_rts_eval(command: RtsEvalCommands) -> anyhow::Result<(i32, Option<String>
                 &sha,
                 &failed_test_files,
                 total_test_files,
+                &flaky_test_files,
+                reruns,
             )?;
             println!(
                 "Recorded full-suite outcome for {} ({} failed test file(s)).",
@@ -9830,6 +9842,21 @@ fn run_rts_eval(command: RtsEvalCommands) -> anyhow::Result<(i32, Option<String>
                     "  unresolved selections: {}  unmatched truths: {}",
                     report.n_unresolved_selections, report.n_unmatched_truths
                 );
+                if report.excluded_flaky_failures > 0 {
+                    println!(
+                        "  excluded {} failure(s) reported as flaky",
+                        report.excluded_flaky_failures
+                    );
+                }
+                if report.recall_is_upper_bound {
+                    println!();
+                    println!(
+                        "  NOTE: {} run(s) reported failures that were never re-run, so these",
+                        report.unconfirmed_failure_runs
+                    );
+                    println!("  recall figures are an UPPER BOUND. Pass --reruns (and --flaky) to");
+                    println!("  rts-eval record-truth to report confirmed failures.");
+                }
             }
             Ok((EXIT_SUCCESS, None))
         }

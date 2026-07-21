@@ -122,7 +122,10 @@ pub struct ChangedSymbolRef {
 
 const DISCLAIMER: &str = "Static call-graph regression test selection: a prioritized signal, NOT a \
 provably-safe subset. Misses reflection, DI, codegen, and data-driven/integration tests. \
-\"No tests found\" does not mean safe-to-skip — keep a periodic full test run.";
+\"No tests found\" does not mean safe-to-skip — keep a periodic full test run. \
+Published prior: static symbol-level selection violated safety on ~10.6% of revisions \
+versus dynamic coverage-based selection (FSE 2016), reflection being the dominant cause — \
+measure your own recall with `nestweaver rts-eval report` rather than assuming.";
 
 /// Fail-safe widening (Microsoft TIA precedent): an incomplete selection is
 /// only safe to act on by running the FULL suite; never narrow on degradation.

@@ -81,6 +81,33 @@ pub struct TruthRecord {
     /// time-saved proxy; None when not provided).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_test_files: Option<usize>,
+    /// Failures the reporter identified as FLAKY (e.g. they passed on rerun).
+    /// Excluded from recall entirely: a flaky failure is not evidence the
+    /// selection missed anything, and counting it inflates recall.
+    #[serde(default)]
+    pub flaky_test_files: Vec<String>,
+    /// How many times failures were re-run before being reported. `None` or 0
+    /// means the failures are UNCONFIRMED — recall computed over them is an
+    /// upper bound (Meta measured a ~20-point recall illusion from not
+    /// de-flaking; ICSE-SEIP 2019).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reruns: Option<u32>,
+}
+
+impl TruthRecord {
+    /// Failures that count as evidence: reported failures minus those the
+    /// reporter flagged flaky.
+    pub fn confirmed_failures(&self) -> Vec<&String> {
+        self.failed_test_files
+            .iter()
+            .filter(|f| !self.flaky_test_files.contains(f))
+            .collect()
+    }
+
+    /// Whether this record's failures were rerun-confirmed.
+    pub fn is_confirmed(&self) -> bool {
+        self.failed_test_files.is_empty() || self.reruns.unwrap_or(0) > 0
+    }
 }
 
 /// The joined metrics. All ratio fields are `None` until
@@ -116,6 +143,15 @@ pub struct RtsEvalReport {
     pub n_failing_pairs: usize,
     /// Window the report was computed over (last N joined pairs; 0 = all).
     pub window: usize,
+    /// Joined pairs whose failures were NOT rerun-confirmed. While this is
+    /// non-zero the recall figures are an UPPER BOUND — flaky failures that
+    /// the selection "missed" are counted as real misses only if confirmed,
+    /// and unconfirmed ones can inflate the number either way.
+    pub unconfirmed_failure_runs: usize,
+    /// Failures excluded as flaky across the window.
+    pub excluded_flaky_failures: usize,
+    /// Set when `unconfirmed_failure_runs > 0`: recall is an upper bound.
+    pub recall_is_upper_bound: bool,
 }
 
 /// In-band measured-recall disclosure attached to affected_tests results
@@ -216,12 +252,15 @@ pub fn record_selection(
 }
 
 /// Record a full-suite outcome (ground truth) for `sha`.
+#[allow(clippy::too_many_arguments)]
 pub fn record_truth(
     db_path: &Path,
     repo_uid: &str,
     sha: &str,
     failed_test_files: &[String],
     total_test_files: Option<usize>,
+    flaky_test_files: &[String],
+    reruns: Option<u32>,
 ) -> Result<()> {
     let rec = TruthRecord {
         ts: now_rfc3339(),
@@ -229,6 +268,8 @@ pub fn record_truth(
         sha: sha.to_string(),
         failed_test_files: failed_test_files.to_vec(),
         total_test_files,
+        flaky_test_files: flaky_test_files.to_vec(),
+        reruns,
     };
     let line = serde_json::to_string(&rec).context("serialize truth record")?;
     append_jsonl(&crate::sidecar_path(db_path, TRUTH_SUFFIX), &line)
@@ -284,18 +325,26 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     let mut failing_pairs_caught = 0usize;
     let mut breadth_sum = 0.0f64;
     let mut breadth_n = 0usize;
+    let mut unconfirmed_failure_runs = 0usize;
+    let mut excluded_flaky_failures = 0usize;
     for (sel, truth) in &joined {
         let selected: HashSet<&str> = sel.selected_test_files.iter().map(|s| s.as_str()).collect();
-        if !truth.failed_test_files.is_empty() {
+        // nw-066: only rerun-CONFIRMED, non-flaky failures are evidence. A
+        // flaky failure the selection didn't pick is not a miss, and counting
+        // it distorts recall (Meta measured a ~20-point illusion from
+        // computing recall over non-de-flaked outcomes).
+        let confirmed = truth.confirmed_failures();
+        excluded_flaky_failures += truth.failed_test_files.len() - confirmed.len();
+        if !truth.failed_test_files.is_empty() && !truth.is_confirmed() {
+            unconfirmed_failure_runs += 1;
+        }
+        if !confirmed.is_empty() {
             failing_pairs += 1;
-            let caught_any = truth
-                .failed_test_files
-                .iter()
-                .any(|f| selected.contains(f.as_str()));
+            let caught_any = confirmed.iter().any(|f| selected.contains(f.as_str()));
             if caught_any {
                 failing_pairs_caught += 1;
             }
-            for f in &truth.failed_test_files {
+            for f in &confirmed {
                 failed_total += 1;
                 if selected.contains(f.as_str()) {
                     failed_caught += 1;
@@ -334,6 +383,9 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
         time_saved_proxy: breadth.map(|b| 1.0 - b),
         n_failing_pairs: failing_pairs,
         window,
+        unconfirmed_failure_runs,
+        excluded_flaky_failures,
+        recall_is_upper_bound: unconfirmed_failure_runs > 0,
     };
 
     // Cache for the in-band `measured` disclosure; best-effort.
@@ -391,7 +443,9 @@ pub fn run_recorded(
         let mut included: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for t in recent {
-            for f in &t.failed_test_files {
+            // nw-066: never pin a FLAKY failure into every future selection —
+            // that silently widens selections forever off a non-signal.
+            for f in t.confirmed_failures() {
                 if !selected.contains(f) && seen.insert(f.clone()) {
                     included.push(f.clone());
                 }
@@ -562,7 +616,7 @@ mod tests {
                 7 => vec!["tests/b.test.ts".to_string()],
                 _ => Vec::new(),
             };
-            record_truth(&db, "repo:1", &sha, &failed, Some(10)).expect("truth");
+            record_truth(&db, "repo:1", &sha, &failed, Some(10), &[], Some(3)).expect("truth");
         }
         let report = compute_report(&db, 0).expect("report");
         assert_eq!(report.n_joined, 12);
@@ -581,6 +635,92 @@ mod tests {
         assert_eq!(measured.file_recall, 0.5);
     }
 
+    /// nw-066: a FLAKY failure must not count as a miss (it would deflate
+    /// recall), must not pin itself into future selections, and an
+    /// UNCONFIRMED failure run must mark recall as an upper bound.
+    #[test]
+    fn flaky_failures_excluded_and_unconfirmed_flagged() {
+        let (_dir, db) = scratch_db();
+        // 12 pairs: selection always picks a.test.ts. Run 3 fails b.test.ts
+        // but reports it FLAKY -> excluded entirely (recall stays perfect).
+        for i in 0..12 {
+            let sha = format!("sha{i}");
+            record_selection(&db, &result_selecting(&["tests/a.test.ts"]), "repo:1", &sha)
+                .expect("sel");
+            let (failed, flaky): (Vec<String>, Vec<String>) = if i == 3 {
+                (
+                    vec!["tests/b.test.ts".to_string()],
+                    vec!["tests/b.test.ts".to_string()],
+                )
+            } else if i == 5 {
+                (vec!["tests/a.test.ts".to_string()], vec![])
+            } else {
+                (vec![], vec![])
+            };
+            record_truth(&db, "repo:1", &sha, &failed, Some(10), &flaky, Some(3)).expect("truth");
+        }
+        let r = compute_report(&db, 0).expect("report");
+        assert_eq!(r.excluded_flaky_failures, 1, "flaky failure excluded");
+        // Only the confirmed a.test.ts failure counts, and it WAS selected.
+        assert_eq!(r.n_failing_pairs, 1);
+        assert_eq!(
+            r.file_recall,
+            Some(1.0),
+            "flaky miss must not deflate recall"
+        );
+        assert!(!r.recall_is_upper_bound, "all runs were rerun-confirmed");
+        assert_eq!(r.unconfirmed_failure_runs, 0);
+    }
+
+    #[test]
+    fn unconfirmed_failures_mark_recall_as_upper_bound() {
+        let (_dir, db) = scratch_db();
+        for i in 0..12 {
+            let sha = format!("sha{i}");
+            record_selection(&db, &result_selecting(&["tests/a.test.ts"]), "repo:1", &sha)
+                .expect("sel");
+            let failed = if i == 4 {
+                vec!["tests/a.test.ts".to_string()]
+            } else {
+                vec![]
+            };
+            // reruns: None => failures were never re-run => unconfirmed.
+            record_truth(&db, "repo:1", &sha, &failed, Some(10), &[], None).expect("truth");
+        }
+        let r = compute_report(&db, 0).expect("report");
+        assert_eq!(r.unconfirmed_failure_runs, 1);
+        assert!(
+            r.recall_is_upper_bound,
+            "unconfirmed failures must flag recall as an upper bound"
+        );
+    }
+
+    /// A flaky failure must NOT be pinned into every later selection by the
+    /// nw-064 always-include-previously-failing rule.
+    #[test]
+    fn flaky_failures_are_not_always_included() {
+        use nestweaver_store::GraphStore;
+        let store = GraphStore::in_memory().expect("store");
+        let (_dir, db) = scratch_db();
+        record_truth(
+            &db,
+            "",
+            "sha-prev",
+            &["tests/flaky.test.ts".to_string()],
+            Some(10),
+            &["tests/flaky.test.ts".to_string()],
+            Some(3),
+        )
+        .expect("truth");
+        let result =
+            run_recorded(&store, &["src/a.rs".to_string()], Some(&db)).expect("run_recorded");
+        let t1: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
+        assert!(
+            !t1.contains(&"tests/flaky.test.ts"),
+            "flaky failure must not be pinned into selections: {t1:?}"
+        );
+    }
+
     #[test]
     fn report_below_n10_refuses_percentages() {
         let (_dir, db) = scratch_db();
@@ -594,6 +734,8 @@ mod tests {
                 &sha,
                 &["tests/a.test.ts".to_string()],
                 Some(10),
+                &[],
+                Some(3),
             )
             .expect("truth");
         }
@@ -673,6 +815,8 @@ mod tests {
             "sha-prev",
             &["tests/flaky.test.ts".to_string()],
             Some(10),
+            &[],
+            Some(3),
         )
         .expect("truth");
         let result =

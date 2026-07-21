@@ -358,6 +358,40 @@ report refuses to print percentages at all, and `affected_tests` results only
 carry the in-band `measured` field once that bar clears — an unmeasured
 selection never reads as a measured guarantee.
 
+## How accurate is this, honestly?
+
+Published research measures static regression test selection against *dynamic*
+(coverage-traced) selection as the oracle. The result you should know before
+trusting `affected_tests`:
+
+| Approach | Safety violations vs dynamic oracle | Source |
+| --- | --- | --- |
+| Dynamic, file-level (Ekstazi) | analytically safe (proof, not a statistic) | ISSTA 2015 |
+| Static, **class**-level | 0.2% of revisions (avg magnitude 6.8%) | FSE 2016, 985 revisions / 22 projects |
+| Static, **method/symbol**-level | **10.6% of revisions (avg 15.6%)** | FSE 2016 |
+| Reflection-unaware static | 5.8% average safety violation | OOPSLA 2019, 1173 versions / 24 projects |
+
+NestWeaver's selection is static and symbol-granular — the row with the worst
+published safety record — and **reflection is the dominant named cause** of
+static RTS false negatives, which is exactly why `dynamic-dispatch` and
+`reflection` are declared blind spots on every result.
+
+What we do about it, rather than hiding it:
+
+- **We never claim safety.** The tiers are a prioritized signal; `status`,
+  `gate_state`, and `recommendation` tell CI when not to trust them.
+- **Degraded runs widen, never narrow** — `recommendation: run-full-suite`.
+- **Changed and recently-failed tests are always included** regardless of what
+  the graph says, so the common miss cases are covered by rule rather than by
+  traversal.
+- **We measure our own miss rate** (see above) instead of asserting one. No
+  coverage-based vendor publishes an accuracy number at all; the only published
+  figures in this space come from ML-based tools.
+
+The honest summary: run `affected_tests` for fast feedback, keep a periodic
+full-suite run as the safety net, and use `rts-eval report` to learn what your
+*actual* recall is on your codebase rather than trusting anyone's marketing.
+
 ## Networking
 
 ### GitHub-hosted runners
