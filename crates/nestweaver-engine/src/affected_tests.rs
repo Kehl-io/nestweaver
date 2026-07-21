@@ -156,9 +156,16 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     // layer (the 2.5.10 affected_tests daemon-crash/segfault report).
     let mut changed_symbols: Vec<ChangedSymbolRef> = Vec::new();
     let mut changed_uids: HashSet<String> = HashSet::new();
+    // Changed files that resolved to zero indexed symbols (new file or stale
+    // index) — non-test source files are disclosed as unassessed; test files
+    // are ALWAYS included in tier 1 below (TIA/Develocity always-include rule).
+    let mut files_without_symbols: Vec<&String> = Vec::new();
     for file_path in changed_files {
         match store.symbols_in_file(file_path) {
             Ok(syms) => {
+                if syms.is_empty() {
+                    files_without_symbols.push(file_path);
+                }
                 for s in syms {
                     if changed_uids.insert(s.uid.clone()) {
                         changed_symbols.push(ChangedSymbolRef {
@@ -251,9 +258,64 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
         }
     }
 
-    let tier_1 = group_by_file(tier_1_syms);
+    let mut tier_1 = group_by_file(tier_1_syms);
     let tier_2 = group_by_file(tier_2_syms);
     let tier_3 = group_by_file(tier_3_syms);
+
+    // nw-064: always-include + disclosure for changed files the index doesn't
+    // know (new file or stale index). A changed TEST file goes straight into
+    // tier 1 — TIA includes newly added tests, Develocity always selects
+    // "recently new/changed" tests; missing them during the stale-index window
+    // was a silent under-selection. A changed non-test SOURCE file is
+    // disclosed as unassessed (mirrors blast_radius's changed-file-no-symbols
+    // honesty) without gating — new files are common.
+    let selected_files: HashSet<&str> = tier_1
+        .iter()
+        .chain(&tier_2)
+        .chain(&tier_3)
+        .map(|f| f.test_file.as_str())
+        .collect();
+    let mut always_included: Vec<String> = Vec::new();
+    let mut unassessed: Vec<&str> = Vec::new();
+    for file_path in files_without_symbols {
+        if selected_files.contains(file_path.as_str()) {
+            continue;
+        }
+        if is_test_file(file_path) {
+            always_included.push(file_path.clone());
+        } else if nestweaver_parser::detect_language(std::path::Path::new(file_path)).is_some() {
+            unassessed.push(file_path);
+        }
+    }
+    for file_path in always_included.iter() {
+        tier_1.push(AffectedTestFile {
+            test_file: file_path.clone(),
+            tests: Vec::new(),
+            symbol_uid: String::new(),
+            confidence: 1.0,
+        });
+    }
+    if !always_included.is_empty() {
+        notifications.push(Notification {
+            level: NotificationLevel::Note,
+            message: format!(
+                "always-included {} changed test file(s) not yet in the index                  (new test or stale index): {}",
+                always_included.len(),
+                always_included.join(", ")
+            ),
+            descriptor: "always-include-changed-test".to_string(),
+        });
+    }
+    if !unassessed.is_empty() {
+        notifications.push(Notification {
+            level: NotificationLevel::Note,
+            message: format!(
+                "changed source file(s) with no indexed symbols (new file or stale                  index) — their impact was not assessed: {}",
+                unassessed.join(", ")
+            ),
+            descriptor: "changed-file-no-symbols".to_string(),
+        });
+    }
 
     let summary = format!(
         "{} tier-1, {} tier-2, {} tier-3 tests affected",
@@ -549,6 +611,66 @@ mod tests {
         assert_eq!(result.tier_1.len(), 1);
         assert_eq!(result.tier_1[0].test_file, "src/auth.test.ts");
         assert!(result.tier_1[0].tests.contains(&"checks_login".to_string()));
+    }
+
+    /// nw-064: TIA/Develocity always-include rule — a changed TEST file from
+    /// the diff itself is selected even when the index doesn't know it yet
+    /// (new test + stale index was a silent miss).
+    #[test]
+    fn unindexed_changed_test_file_is_always_included() {
+        let store = GraphStore::in_memory().expect("store");
+        let result = affected_tests(
+            &store,
+            &["src/new.test.ts".to_string(), "src/also_new.rs".to_string()],
+        )
+        .expect("ok");
+        let t1: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
+        assert!(
+            t1.contains(&"src/new.test.ts"),
+            "changed test file must be tier-1 even when unindexed: {t1:?}"
+        );
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "always-include-changed-test"),
+            "inclusion must be disclosed: {:?}",
+            result.notifications
+        );
+        // The non-test source file is disclosed as unassessed, not silent.
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols"
+                    && n.message.contains("src/also_new.rs")),
+            "unindexed changed source must be disclosed: {:?}",
+            result.notifications
+        );
+    }
+
+    /// The always-include rule must not duplicate a test file the graph
+    /// already selected via the edited-test tier-1 rule.
+    #[test]
+    fn always_include_does_not_duplicate_indexed_selection() {
+        let store = GraphStore::in_memory().expect("store");
+        let t = sym("sym:t", "checks_login", "src/auth.test.ts");
+        store.insert_symbol(&t).expect("insert");
+        let result = affected_tests(&store, &["src/auth.test.ts".to_string()]).expect("ok");
+        let count = result
+            .tier_1
+            .iter()
+            .filter(|f| f.test_file == "src/auth.test.ts")
+            .count();
+        assert_eq!(
+            count, 1,
+            "one entry, not graph + always-include: {:?}",
+            result.tier_1
+        );
+        assert!(
+            result.tier_1[0].tests.contains(&"checks_login".to_string()),
+            "the indexed entry (with test names) must win"
+        );
     }
 
     #[test]

@@ -257,7 +257,11 @@ jobs:
           category: nestweaver-blast-radius
 ```
 
-The SARIF carries the full trust contract, so reviewers see it inline:
+The SARIF carries the full trust contract. Two rendering tiers apply on
+GitHub: **results and tool-execution notifications render in the PR / Security
+tab**, while the namespaced `nestweaver/*` property bags are preserved but NOT
+displayed by GitHub's UI — they are for machine consumers (gating scripts,
+SARIF viewers, downstream tooling) reading the file directly:
 
 - **`invocations[].executionSuccessful` + `toolExecutionNotifications`** — a
   degraded/incomplete run is visible, never silently reported as "clean".

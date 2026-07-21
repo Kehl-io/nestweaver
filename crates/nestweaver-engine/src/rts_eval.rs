@@ -44,6 +44,10 @@ pub const MAX_RECORDS: usize = 10_000;
 /// measured guarantee while carrying none of its weight.
 pub const MIN_JOINED_FOR_METRICS: usize = 10;
 
+/// How many most-recent truth records feed the always-include-previously-
+/// failing rule (TIA: previous run's failures; Develocity: "recently failed").
+pub const RECENT_TRUTH_WINDOW: usize = 5;
+
 /// Env var that disables selection recording entirely.
 pub const NO_RECORD_ENV: &str = "NESTWEAVER_RTS_NO_RECORD";
 
@@ -364,6 +368,59 @@ pub fn run_recorded(
         .unwrap_or_default();
     let sha = resolve_selection_sha(store, &repo_uid);
 
+    // nw-064 always-include: test files that failed in the most recent
+    // full-suite runs are selected regardless of the static graph (TIA
+    // includes the previous run's failures; Develocity always selects
+    // recently-failed tests). Runs BEFORE record_selection so the recorded
+    // selection — and therefore the measured recall — reflects the widened
+    // set the CI job is actually told to run.
+    {
+        let (truths, _) = load_jsonl::<TruthRecord>(&crate::sidecar_path(db, TRUTH_SUFFIX));
+        let recent = truths
+            .iter()
+            .rev()
+            .filter(|t| t.repo_uid.is_empty() || repo_uid.is_empty() || t.repo_uid == repo_uid)
+            .take(RECENT_TRUTH_WINDOW);
+        let selected: HashSet<String> = result
+            .tier_1
+            .iter()
+            .chain(&result.tier_2)
+            .chain(&result.tier_3)
+            .map(|f| f.test_file.clone())
+            .collect();
+        let mut included: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in recent {
+            for f in &t.failed_test_files {
+                if !selected.contains(f) && seen.insert(f.clone()) {
+                    included.push(f.clone());
+                }
+            }
+        }
+        if !included.is_empty() {
+            for f in &included {
+                result.tier_1.push(crate::affected_tests::AffectedTestFile {
+                    test_file: f.clone(),
+                    tests: Vec::new(),
+                    symbol_uid: String::new(),
+                    confidence: 1.0,
+                });
+            }
+            result
+                .notifications
+                .push(crate::blast_radius::Notification {
+                    level: crate::blast_radius::NotificationLevel::Note,
+                    message: format!(
+                        "always-included {} recently-failed test file(s) from the last                          {} full-suite run(s): {}",
+                        included.len(),
+                        RECENT_TRUTH_WINDOW,
+                        included.join(", ")
+                    ),
+                    descriptor: "always-include-previously-failing".to_string(),
+                });
+        }
+    }
+
     if let Err(e) = record_selection(db, &result, &repo_uid, &sha) {
         result
             .notifications
@@ -598,6 +655,49 @@ mod tests {
             loaded.first().map(|r| r.sha.as_str()),
             Some("s0"),
             "oldest record dropped"
+        );
+    }
+
+    /// nw-064: TIA includes tests that failed in the previous run; Develocity
+    /// always selects "recently failed" tests. Recently-failed test files from
+    /// the truth sidecar must be tier-1 even when the static graph misses them
+    /// — and the recorded selection must count them as selected.
+    #[test]
+    fn recently_failed_tests_are_always_included() {
+        use nestweaver_store::GraphStore;
+        let store = GraphStore::in_memory().expect("store");
+        let (_dir, db) = scratch_db();
+        record_truth(
+            &db,
+            "",
+            "sha-prev",
+            &["tests/flaky.test.ts".to_string()],
+            Some(10),
+        )
+        .expect("truth");
+        let result =
+            run_recorded(&store, &["src/a.rs".to_string()], Some(&db)).expect("run_recorded");
+        let t1: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
+        assert!(
+            t1.contains(&"tests/flaky.test.ts"),
+            "recently-failed test must be always-included: {t1:?}"
+        );
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "always-include-previously-failing"),
+            "inclusion must be disclosed: {:?}",
+            result.notifications
+        );
+        // The recorded selection must reflect the widened set.
+        let (recs, _) = load_jsonl::<SelectionRecord>(&crate::sidecar_path(&db, SELECTIONS_SUFFIX));
+        assert!(
+            recs[0]
+                .selected_test_files
+                .contains(&"tests/flaky.test.ts".to_string()),
+            "recorded selection must include the always-included file: {:?}",
+            recs[0].selected_test_files
         );
     }
 
