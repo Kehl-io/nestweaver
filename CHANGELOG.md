@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.11](https://github.com/Kehl-io/nestweaver/compare/v2.5.10...v2.5.11) (2026-07-21)
+
+
+### Bug Fixes
+
+* user-reported 2.5.10 bugs — affected_tests crash/hang, top-level stale-check, trust-contract casing docs ([#165](https://github.com/Kehl-io/nestweaver/issues/165)) ([eb9d3e4](https://github.com/Kehl-io/nestweaver/commit/eb9d3e4f0782b7b6a6291a100346bf876ed80fb8))
+
 ## [2.5.10](https://github.com/Kehl-io/nestweaver/compare/v2.5.9...v2.5.10) (2026-07-20)
 
 
