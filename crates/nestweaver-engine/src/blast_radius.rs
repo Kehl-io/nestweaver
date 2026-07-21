@@ -452,6 +452,25 @@ pub fn analyze_blast_radius(
         }
     }
 
+    // nw-059: symbol rows never carry PageRank (it lives in the ranking
+    // cache/sidecar), so hydrate changed-symbol scores from the cache — else
+    // the centrality risk boost can never fire on a production DB. `ranks_len`
+    // (the graph size the scores normalize over) feeds the relative
+    // high-centrality threshold in Step 4; 0 means no cache was available.
+    let mut ranks_len: usize = 0;
+    if !changed_symbols.is_empty() {
+        store.ensure_pagerank_loaded();
+        let ranks = store.pagerank_scores();
+        if !ranks.is_empty() {
+            ranks_len = ranks.len();
+            for cs in &mut changed_symbols {
+                if let Some(r) = ranks.get(&cs.uid) {
+                    cs.pagerank_score = Some(*r);
+                }
+            }
+        }
+    }
+
     // Hard failure: we had files to analyze and *every* lookup errored. The
     // store is broken, not merely partial — a consumer must not read this as
     // "nothing affected".
@@ -734,8 +753,7 @@ pub fn analyze_blast_radius(
     let clusters_touched = affected_clusters.len();
 
     // Factor in PageRank centrality: if high-centrality symbols are changed,
-    // bump the risk. Average PageRank of changed symbols; a score > 0.01
-    // is considered "high centrality" in a typical graph.
+    // bump the risk. Average PageRank of changed symbols.
     let avg_pagerank = if changed_symbols.is_empty() {
         0.0
     } else {
@@ -750,7 +768,22 @@ pub fn analyze_blast_radius(
         if count > 0 { sum / count as f64 } else { 0.0 }
     };
 
-    let risk_level = compute_risk_level(total_affected, clusters_touched, avg_pagerank);
+    // High centrality: the average changed-symbol PageRank clears 10x the
+    // graph mean (normalized scores sum to ~1 over ranks_len symbols, so the
+    // mean is 1/N and any absolute threshold is meaningless across graph
+    // sizes). Falls back to the legacy absolute 0.01 when no ranking cache
+    // exists. The boost is deliberately modest — the centrality-as-risk
+    // literature is positive but contested (Zimmermann 2008 vs TSE 2021).
+    // Capped at 0.5: on tiny graphs 10/N exceeds any possible score (they sum
+    // to ~1), but an avg holding >50% of the total rank mass is unambiguously
+    // central at any size.
+    let high_centrality = if ranks_len > 0 {
+        avg_pagerank > (10.0 / ranks_len as f64).min(0.5)
+    } else {
+        avg_pagerank > 0.01
+    };
+
+    let risk_level = compute_risk_level(total_affected, clusters_touched, high_centrality);
 
     let summary = render_blast_summary(
         changed_symbols.len(),
@@ -896,10 +929,12 @@ fn classify_org_severity(impact_score: f64) -> &'static str {
 }
 
 /// Compute risk level based on affected count, clusters, and centrality.
+/// `high_centrality` is decided at the call site (relative to the graph-mean
+/// PageRank when a ranking cache exists) so this stays a pure bucketing fn.
 fn compute_risk_level(
     affected_count: usize,
     clusters_touched: usize,
-    avg_pagerank: f64,
+    high_centrality: bool,
 ) -> RiskLevel {
     // Base risk from affected symbol count:
     //   <10 = Low (0), 10-50 = Medium (1), 50-200 = High (2), >200 = High (3)
@@ -910,8 +945,8 @@ fn compute_risk_level(
         _ => 3,
     };
 
-    // Boost for high-centrality symbols (avg PageRank > 0.01).
-    let centrality_boost = if avg_pagerank > 0.01 { 1 } else { 0 };
+    // Boost for changes touching high-centrality symbols.
+    let centrality_boost = if high_centrality { 1 } else { 0 };
 
     // Boost for touching many clusters (>3 clusters).
     let cluster_boost = if clusters_touched > 3 { 1 } else { 0 };
@@ -1006,34 +1041,34 @@ mod tests {
 
     #[test]
     fn compute_risk_level_low() {
-        assert_eq!(compute_risk_level(5, 1, 0.001), RiskLevel::Low);
+        assert_eq!(compute_risk_level(5, 1, false), RiskLevel::Low);
     }
 
     #[test]
     fn compute_risk_level_medium_by_count() {
-        assert_eq!(compute_risk_level(25, 1, 0.001), RiskLevel::Medium);
+        assert_eq!(compute_risk_level(25, 1, false), RiskLevel::Medium);
     }
 
     #[test]
     fn compute_risk_level_high_by_count() {
-        assert_eq!(compute_risk_level(100, 1, 0.001), RiskLevel::High);
+        assert_eq!(compute_risk_level(100, 1, false), RiskLevel::High);
     }
 
     #[test]
     fn compute_risk_level_critical_by_count() {
-        assert_eq!(compute_risk_level(300, 1, 0.001), RiskLevel::High);
+        assert_eq!(compute_risk_level(300, 1, false), RiskLevel::High);
     }
 
     #[test]
     fn compute_risk_level_boosted_by_centrality() {
         // 25 affected would be Medium, but high centrality bumps it to High
-        assert_eq!(compute_risk_level(25, 1, 0.05), RiskLevel::High);
+        assert_eq!(compute_risk_level(25, 1, true), RiskLevel::High);
     }
 
     #[test]
     fn compute_risk_level_boosted_by_clusters() {
         // 25 affected would be Medium, but >3 clusters bumps it to High
-        assert_eq!(compute_risk_level(25, 5, 0.001), RiskLevel::High);
+        assert_eq!(compute_risk_level(25, 5, false), RiskLevel::High);
     }
 
     #[test]
@@ -1201,9 +1236,11 @@ mod tests {
         assert_eq!(result.changed_symbols[0].name, "fn_a");
         assert_eq!(result.affected_symbols.len(), 1);
         assert_eq!(result.affected_symbols[0].name, "fn_b");
-        // fn_a has pagerank_score=0.5 (high centrality), which boosts
-        // the risk from Low to Medium even with only 1 affected symbol.
-        assert_eq!(result.risk_level, RiskLevel::Medium);
+        // With a live ranking cache, centrality is judged RELATIVE to the
+        // graph mean (nw-059). This 2-node in-memory graph computes uniform
+        // ranks, so the changed symbol is exactly average — no boost, and the
+        // hand-set row score (0.5) is superseded by the cache hydration.
+        assert_eq!(result.risk_level, RiskLevel::Low);
 
         // Verify impact_score is populated: sym_b calls sym_a with confidence 0.9,
         // so impact_score should be 1.0 * 0.9 = 0.9.
@@ -2367,6 +2404,76 @@ mod tests {
             with_limit.summary.contains("60 transitively affected"),
             "summary must carry the pre-cap total, got: {}",
             with_limit.summary
+        );
+    }
+
+    #[test]
+    fn changed_symbol_pagerank_hydrates_from_cache() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let store = GraphStore::in_memory().expect("store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.into(),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".into(),
+            file_path: file.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            // Rows carry no score — the production shape (scores live only in
+            // the ranking cache/sidecar).
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_symbol(&mk("hub", "hub_fn", "src/hub.rs"))
+            .unwrap();
+        for i in 0..5 {
+            let uid = format!("caller{i}");
+            store
+                .insert_symbol(&mk(
+                    &uid,
+                    &format!("caller_fn{i}"),
+                    &format!("src/caller{i}.rs"),
+                ))
+                .unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid,
+                    target_uid: "hub".into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store.ensure_pagerank_loaded();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/hub.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let hub = result
+            .changed_symbols
+            .iter()
+            .find(|s| s.uid == "hub")
+            .expect("hub in changed set");
+        assert!(
+            hub.pagerank_score.unwrap_or(0.0) > 0.0,
+            "changed-symbol pagerank must hydrate from the cache (row value is None): {:?}",
+            hub.pagerank_score
         );
     }
 
