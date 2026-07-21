@@ -2,7 +2,7 @@
 //!
 //! The trust contract (status/gate/coverage/blind spots) is qualitative; the
 //! leaders in test selection publish *measured* unsafety (Facebook PTS ships
-//! >99.9% faulty-change recall as a production requirement; Launchable derives
+//! over 99.9% faulty-change recall as a production requirement; Launchable derives
 //! confidence curves from the customer's own history). This module closes that
 //! gap with a local, dashboard-free loop:
 //!
@@ -360,19 +360,7 @@ pub fn run_recorded(
     let repo_uid = result
         .changed_symbols
         .first()
-        .map(|cs| {
-            // ChangedSymbolRef has no repo field; derive from the uid prefix
-            // (sym:<repo_uid>:...) — uids are "sym:" + repo_uid + 2 segments.
-            cs.uid
-                .strip_prefix("sym:")
-                .and_then(|rest| {
-                    // repo uid itself contains ':'; take everything up to the
-                    // last two ':'-separated segments (file-hash:line).
-                    let parts: Vec<&str> = rest.rsplitn(3, ':').collect();
-                    parts.get(2).map(|s| s.to_string())
-                })
-                .unwrap_or_default()
-        })
+        .map(|cs| cs.repo_uid.clone())
         .unwrap_or_default();
     let sha = resolve_selection_sha(store, &repo_uid);
 

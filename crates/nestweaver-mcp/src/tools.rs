@@ -14,10 +14,10 @@ use anyhow::{Context, anyhow};
 use nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
 use nestweaver_engine::{
     BlastRadiusOptions, BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig,
-    SummaryLevel, ToolDocEntry, affected_tests, analyze_blast_radius, attach_cluster_ids,
-    attach_communities, broken_links, build_brain_context_hybrid_with_aliases, compute_clusters,
-    detect_changes_impact, detect_dead_code_cancellable, doc_stats, expand_query_with_aliases,
-    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    SummaryLevel, ToolDocEntry, analyze_blast_radius, attach_cluster_ids, attach_communities,
+    broken_links, build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
+    detect_dead_code_cancellable, doc_stats, expand_query_with_aliases, filter_by_target,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,

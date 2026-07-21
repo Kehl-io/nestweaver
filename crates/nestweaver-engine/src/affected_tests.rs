@@ -114,6 +114,10 @@ pub struct ChangedSymbolRef {
     pub uid: String,
     pub name: String,
     pub file_path: String,
+    /// Owning repo of the changed symbol (feeds selection recording and
+    /// multi-repo consumers). Empty on records serialized before this field.
+    #[serde(default)]
+    pub repo_uid: String,
 }
 
 const DISCLAIMER: &str = "Static call-graph regression test selection: a prioritized signal, NOT a \
@@ -161,6 +165,7 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
                             uid: s.uid,
                             name: s.name,
                             file_path: s.file_path,
+                            repo_uid: s.repo_uid,
                         });
                     }
                 }
