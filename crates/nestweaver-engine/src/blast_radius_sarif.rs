@@ -302,6 +302,7 @@ mod tests {
             notifications: vec![],
             gate_state: GateState::Ok,
             coverage: Coverage::default(),
+            cochanged_files: Vec::new(),
             blind_spots: vec![BlindSpot::DynamicDispatch],
             analysis_direction: "over-approximate".to_string(),
         }

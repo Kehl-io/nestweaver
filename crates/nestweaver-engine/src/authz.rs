@@ -580,6 +580,7 @@ mod tests {
                 }],
                 traversal_truncated: false,
             },
+            cochanged_files: Vec::new(),
             blind_spots: vec![],
             analysis_direction: String::new(),
         }

@@ -221,11 +221,34 @@ pub struct BlastRadiusResult {
     /// Categories of impact this static analysis cannot see.
     #[serde(default)]
     pub blind_spots: Vec<BlindSpot>,
+    /// Historically co-changing files for the changed set (advisory tier —
+    /// not part of risk scoring; empty when the cochange sidecar is absent,
+    /// disclosed via a `cochange-unavailable` note).
+    #[serde(default)]
+    pub cochanged_files: Vec<CoChangedFile>,
     /// How to read the result: static impact analysis over-approximates edges
     /// (it may report reachable-but-not-actually-affected symbols) while
     /// under-approximating the blind spots above.
     #[serde(default)]
     pub analysis_direction: String,
+}
+
+/// A file historically coupled to a changed file via git co-change mining
+/// (Jaccard confidence), with no requirement of a static edge. Advisory:
+/// closes the logical-coupling blind spot (serializer/config/cross-language
+/// pairs) that the static graph cannot see.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoChangedFile {
+    /// The coupled file (the one NOT in the changed set).
+    pub file: String,
+    /// The changed file it historically ships with.
+    pub coupled_to: String,
+    /// Commits in which both changed together.
+    pub cochange_count: u32,
+    /// Jaccard coefficient of the pairing.
+    pub confidence: f32,
+    /// Human-readable framing.
+    pub note: String,
 }
 
 /// Derive the gate verdict from the run status and computed risk.
@@ -899,6 +922,64 @@ pub fn analyze_blast_radius(
 
     let analysis_direction = "over-approximate".to_string();
 
+    // Advisory co-change tier (nw-034): surface historically-coupled files
+    // the static graph can't see. Absence of the sidecar is disclosed but
+    // never degrades the run — this tier is a recall supplement, not a gate
+    // input (risk integration waits on the nw-037 measurement loop).
+    let mut cochanged_files: Vec<CoChangedFile> = Vec::new();
+    if let Some(db) = db_path {
+        let path = crate::sidecar_path(db, ".cochange.json");
+        match crate::cochange::load_cochange_sidecar(&path) {
+            Some(edges) => {
+                let changed_set: HashSet<&str> =
+                    changed_files.iter().filter_map(|p| p.to_str()).collect();
+                let mut seen: HashSet<(String, String)> = HashSet::new();
+                for e in &edges {
+                    let (coupled, changed) = if changed_set.contains(e.file_a.as_str())
+                        && !changed_set.contains(e.file_b.as_str())
+                    {
+                        (e.file_b.clone(), e.file_a.clone())
+                    } else if changed_set.contains(e.file_b.as_str())
+                        && !changed_set.contains(e.file_a.as_str())
+                    {
+                        (e.file_a.clone(), e.file_b.clone())
+                    } else {
+                        continue;
+                    };
+                    if seen.insert((coupled.clone(), changed.clone())) {
+                        cochanged_files.push(CoChangedFile {
+                            note: format!(
+                                "historically co-changes with {changed} ({} shared commits, \
+                                 Jaccard {:.2}) — no static edge required; verify it ships \
+                                 with this change",
+                                e.cochange_count, e.confidence
+                            ),
+                            file: coupled,
+                            coupled_to: changed,
+                            cochange_count: e.cochange_count,
+                            confidence: e.confidence,
+                        });
+                    }
+                }
+                cochanged_files.sort_by(|a, b| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.file.cmp(&b.file))
+                });
+            }
+            None => {
+                notifications.push(Notification {
+                    level: NotificationLevel::Note,
+                    message: "co-change history unavailable (no .cochange.json sidecar) — \
+                              historically-coupled files are not represented"
+                        .to_string(),
+                    descriptor: "cochange-unavailable".to_string(),
+                });
+            }
+        }
+    }
+
     Ok(BlastRadiusResult {
         changed_symbols,
         affected_symbols,
@@ -911,6 +992,7 @@ pub fn analyze_blast_radius(
         gate_state,
         coverage,
         blind_spots,
+        cochanged_files,
         analysis_direction,
     })
 }
@@ -2320,6 +2402,97 @@ mod tests {
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn insert_minimal_symbol(store: &GraphStore, uid: &str, name: &str, file: &str) {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+        store
+            .insert_symbol(&Symbol {
+                uid: uid.into(),
+                name: name.into(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:1".into(),
+                file_path: file.into(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn {name}()"),
+                summary: None,
+                content_hash: format!("h_{uid}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .expect("insert symbol");
+    }
+
+    #[test]
+    fn cochange_sidecar_surfaces_coupled_files() {
+        use crate::cochange::{CoChangeEdge, save_cochange_sidecar};
+        let store = GraphStore::in_memory().expect("store");
+        insert_minimal_symbol(&store, "sym:bill", "compute_total", "src/billing.rs");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("scratch.lbug");
+        std::fs::write(&db, b"").expect("touch db");
+        let edges = vec![CoChangeEdge {
+            file_a: "src/billing.rs".into(),
+            file_b: "src/invoice_templates.sql".into(),
+            cochange_count: 9,
+            total_commits_a: 12,
+            total_commits_b: 10,
+            confidence: 0.69,
+        }];
+        save_cochange_sidecar(&edges, &crate::sidecar_path(&db, ".cochange.json"))
+            .expect("save sidecar");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/billing.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            Some(&db),
+        )
+        .expect("analyze");
+
+        assert_eq!(result.cochanged_files.len(), 1);
+        let c = &result.cochanged_files[0];
+        assert_eq!(c.file, "src/invoice_templates.sql");
+        assert_eq!(c.coupled_to, "src/billing.rs");
+        assert_eq!(c.cochange_count, 9);
+        assert!((c.confidence - 0.69).abs() < 1e-6);
+        assert!(c.note.contains("no static edge"));
+    }
+
+    #[test]
+    fn missing_cochange_sidecar_emits_honesty_note_not_error() {
+        let store = GraphStore::in_memory().expect("store");
+        insert_minimal_symbol(&store, "sym:bill", "compute_total", "src/billing.rs");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("scratch.lbug");
+        std::fs::write(&db, b"").expect("touch db");
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/billing.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            Some(&db),
+        )
+        .expect("analyze");
+        assert!(result.cochanged_files.is_empty());
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "cochange-unavailable"),
+            "absent sidecar must be disclosed, not silent: {:?}",
+            result.notifications
+        );
+        // Advisory tier: absence never degrades the run.
+        assert_eq!(result.status, AnalysisStatus::Complete);
     }
 
     #[test]
