@@ -95,6 +95,12 @@ pub struct AffectedTestsResult {
     /// Machine-readable reasons the selection was incomplete or degraded.
     #[serde(default)]
     pub notifications: Vec<Notification>,
+    /// Machine-readable CI directive derived from `status` (TIA-style
+    /// fail-safe widening): any non-Complete run says "run-full-suite" so a
+    /// pipeline can act on degradation without parsing notifications.
+    /// Values: "selection-usable" | "run-full-suite".
+    #[serde(default)]
+    pub recommendation: String,
 }
 
 /// A changed source symbol reference.
@@ -108,6 +114,15 @@ pub struct ChangedSymbolRef {
 const DISCLAIMER: &str = "Static call-graph regression test selection: a prioritized signal, NOT a \
 provably-safe subset. Misses reflection, DI, codegen, and data-driven/integration tests. \
 \"No tests found\" does not mean safe-to-skip — keep a periodic full test run.";
+
+/// Fail-safe widening (Microsoft TIA precedent): an incomplete selection is
+/// only safe to act on by running the FULL suite; never narrow on degradation.
+pub(crate) fn derive_recommendation(status: AnalysisStatus) -> &'static str {
+    match status {
+        AnalysisStatus::Complete => "selection-usable",
+        _ => "run-full-suite",
+    }
+}
 
 /// Compute the affected tests for a set of changed files.
 ///
@@ -245,6 +260,7 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
         tier_3,
         summary,
         disclaimer: DISCLAIMER.to_string(),
+        recommendation: derive_recommendation(status).to_string(),
         status,
         notifications,
     })
@@ -522,5 +538,32 @@ mod tests {
         assert_eq!(result.tier_1.len(), 1);
         assert_eq!(result.tier_1[0].test_file, "src/auth.test.ts");
         assert!(result.tier_1[0].tests.contains(&"checks_login".to_string()));
+    }
+
+    #[test]
+    fn degraded_run_recommends_full_suite() {
+        // Complete run: selection usable end-to-end.
+        let store = GraphStore::in_memory().expect("store");
+        let ok = affected_tests(&store, &["src/a.rs".to_string()]).expect("ok");
+        assert_eq!(ok.status, AnalysisStatus::Complete);
+        assert_eq!(ok.recommendation, "selection-usable");
+        // Fail-safe widening (TIA precedent): ANY non-complete status must
+        // recommend the full suite.
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Complete),
+            "selection-usable"
+        );
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Partial),
+            "run-full-suite"
+        );
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Degraded),
+            "run-full-suite"
+        );
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Failed),
+            "run-full-suite"
+        );
     }
 }

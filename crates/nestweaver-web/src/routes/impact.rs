@@ -300,6 +300,8 @@ fn empty_affected_tests(
         // not "no tests are affected". Reporting Complete would read as "safe to
         // skip all tests" — exactly the false-safe the trust core (D3) forbids.
         status: nestweaver_engine::AnalysisStatus::Degraded,
+        // Degraded hints => fail-safe widening (nw-060): CI must not narrow.
+        recommendation: "run-full-suite".to_string(),
         notifications: vec![nestweaver_engine::Notification {
             level: nestweaver_engine::NotificationLevel::Warning,
             message: "Affected-test hints are unavailable for this scoped impact response; \
