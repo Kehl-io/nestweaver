@@ -318,6 +318,42 @@ strict_block_on_high_risk = false # default — the risk score stays advisory
 adds an advisory pre-push check (see the CLI guide), and `--sarif` can be opened
 in the VS Code *SARIF Viewer* extension for inline review before you push.
 
+## Measuring your own miss rate
+
+`affected_tests` selections are recorded locally (`<db>.rts_selections.jsonl`;
+opt out with `NESTWEAVER_RTS_NO_RECORD=1`). Feed it ground truth from the
+periodic full-suite run the selection wedge already requires, and NestWeaver
+reports its own measured recall — the number competitors like Facebook PTS
+(>99.9% faulty-change recall) and Launchable (empirical confidence curves)
+publish, computed on *your* history:
+
+```yaml
+# after the periodic FULL test run (same sha the selection ran against):
+- name: Report full-suite outcome to NestWeaver
+  if: always()
+  run: |
+    if [ -s failed-test-files.txt ]; then
+      nestweaver rts-eval record-truth --sha "$GITHUB_SHA" \
+        --failed-test-files $(cat failed-test-files.txt) \
+        --total-test-files "$(wc -l < all-test-files.txt)"
+    else
+      nestweaver rts-eval record-truth --sha "$GITHUB_SHA" --none-failed \
+        --total-test-files "$(wc -l < all-test-files.txt)"
+    fi
+- name: Selection quality report
+  run: nestweaver rts-eval report --json
+```
+
+`rts-eval report` joins selections with truth by commit sha and emits rolling
+**file recall** (of the test files that failed in full runs, how many the
+selection had included — the safety-relevant number), **change recall**
+(failing runs where ≥1 failed file was selected), **selection breadth**
+(honestly *not* labelled precision — unexecuted selected tests have unknown
+outcomes), and a file-count **time-saved proxy**. Below 10 joined pairs the
+report refuses to print percentages at all, and `affected_tests` results only
+carry the in-band `measured` field once that bar clears — an unmeasured
+selection never reads as a measured guarantee.
+
 ## Networking
 
 ### GitHub-hosted runners

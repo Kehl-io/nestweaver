@@ -328,6 +328,12 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Measure affected-tests selection quality against full-suite outcomes
+    /// (nw-037): record ground truth from CI, report rolling recall.
+    RtsEval {
+        #[command(subcommand)]
+        command: RtsEvalCommands,
+    },
     /// List all services/modules in the graph
     ListServices {
         #[arg(long, help = "Filter by instance ID")]
@@ -1876,6 +1882,49 @@ enum RankingCommands {
             help = "Path to instance config (TOML) carrying [ranking] git_activity_weight"
         )]
         config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RtsEvalCommands {
+    /// Record a full-suite run's outcome (ground truth) for a commit sha.
+    /// Call from CI after the periodic full test run.
+    RecordTruth {
+        /// Commit sha the full suite ran against (same sha the selection used).
+        #[arg(long)]
+        sha: String,
+        /// Repo uid the outcome belongs to (optional in single-repo DBs).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Test files that failed (repo-relative). Omit with --none-failed for a green run.
+        #[arg(long = "failed-test-files", num_args = 0..)]
+        failed_test_files: Vec<String>,
+        /// Explicitly record a green run (no failures).
+        #[arg(long, conflicts_with = "failed_test_files")]
+        none_failed: bool,
+        /// Total test files the full run executed (feeds the time-saved proxy).
+        #[arg(long)]
+        total_test_files: Option<usize>,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Join recorded selections with ground truth and report rolling
+    /// file-recall / change-recall / selection-breadth. Refuses to print
+    /// percentages below 10 joined pairs.
+    Report {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        /// Compute over the last N joined pairs (0 = lifetime).
+        #[arg(long, default_value_t = 50)]
+        window: usize,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 }
 
@@ -5178,6 +5227,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
+        Commands::RtsEval { command } => run_rts_eval(command),
         Commands::StaleCheck { json, db } => run_brain(
             BrainCommands::StaleCheck { json, db },
             out,
@@ -9714,6 +9764,76 @@ fn hybrid_search_candidates_from_value(
     value: serde_json::Value,
 ) -> Vec<nestweaver_engine::SymbolCandidate> {
     serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default()
+}
+
+fn run_rts_eval(command: RtsEvalCommands) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        RtsEvalCommands::RecordTruth {
+            sha,
+            repo,
+            failed_test_files,
+            none_failed,
+            total_test_files,
+            db,
+        } => {
+            if failed_test_files.is_empty() && !none_failed {
+                anyhow::bail!(
+                    "provide --failed-test-files <paths...> or --none-failed for a green run"
+                );
+            }
+            let db_path = db.unwrap_or_else(default_db_path);
+            nestweaver_engine::rts_eval::record_truth(
+                &db_path,
+                repo.as_deref().unwrap_or(""),
+                &sha,
+                &failed_test_files,
+                total_test_files,
+            )?;
+            println!(
+                "Recorded full-suite outcome for {} ({} failed test file(s)).",
+                &sha[..8.min(sha.len())],
+                failed_test_files.len()
+            );
+            Ok((EXIT_SUCCESS, None))
+        }
+        RtsEvalCommands::Report { json, window, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let report = nestweaver_engine::rts_eval::compute_report(&db_path, window)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.insufficient_data {
+                println!(
+                    "Insufficient data: {} joined selection/truth pair(s) (need {}).",
+                    report.n_joined,
+                    nestweaver_engine::rts_eval::MIN_JOINED_FOR_METRICS
+                );
+                println!(
+                    "  unresolved selections: {}  unmatched truths: {}",
+                    report.n_unresolved_selections, report.n_unmatched_truths
+                );
+                println!("No recall percentages are reported below that bar — keep feeding");
+                println!("full-suite outcomes via `nestweaver rts-eval record-truth`.");
+            } else {
+                let pct = |v: Option<f64>| {
+                    v.map(|x| format!("{:.1}%", x * 100.0))
+                        .unwrap_or_else(|| "n/a".to_string())
+                };
+                println!(
+                    "RTS eval over last {} joined pair(s) ({} failing):",
+                    report.n_joined, report.n_failing_pairs
+                );
+                println!("  file recall:        {}", pct(report.file_recall));
+                println!("  change recall:      {}", pct(report.change_recall));
+                println!("  selection breadth:  {}", pct(report.selection_breadth));
+                println!("  time saved (proxy): {}", pct(report.time_saved_proxy));
+                println!(
+                    "  unresolved selections: {}  unmatched truths: {}",
+                    report.n_unresolved_selections, report.n_unmatched_truths
+                );
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+    }
 }
 
 fn run_brain(
@@ -15790,6 +15910,40 @@ mod daemon_index_phase_tests {
 #[cfg(test)]
 mod stale_check_cli_tests {
     use super::*;
+
+    #[test]
+    fn rts_eval_subcommands_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "rts-eval",
+                    "record-truth",
+                    "--sha",
+                    "abc123",
+                    "--failed-test-files",
+                    "tests/a.test.ts",
+                    "--total-test-files",
+                    "10",
+                ])
+                .expect("record-truth must parse");
+                assert!(matches!(cli.command, Commands::RtsEval { .. }));
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "rts-eval",
+                    "report",
+                    "--json",
+                    "--window",
+                    "25",
+                ])
+                .expect("report must parse");
+                assert!(matches!(cli.command, Commands::RtsEval { .. }));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
 
     #[test]
     fn top_level_stale_check_parses() {
