@@ -93,6 +93,7 @@ pub mod recency;
 pub mod registry;
 pub mod rerank;
 pub mod resolution_cache;
+pub mod rts_eval;
 pub mod scheduler;
 pub mod signature_diff;
 pub mod snapshot;

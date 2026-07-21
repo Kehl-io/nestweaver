@@ -101,6 +101,11 @@ pub struct AffectedTestsResult {
     /// Values: "selection-usable" | "run-full-suite".
     #[serde(default)]
     pub recommendation: String,
+    /// In-band measured-recall disclosure (nw-037): present only when the
+    /// rts-eval loop has >= 10 joined (selection, truth) pairs. Absence means
+    /// "no measured claim", never "perfect".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<crate::rts_eval::MeasuredRecall>,
 }
 
 /// A changed source symbol reference.
@@ -263,6 +268,7 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
         recommendation: derive_recommendation(status).to_string(),
         status,
         notifications,
+        measured: None,
     })
 }
 

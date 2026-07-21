@@ -1,0 +1,643 @@
+//! nw-037: the measured recall/precision loop for affected_tests-in-CI.
+//!
+//! The trust contract (status/gate/coverage/blind spots) is qualitative; the
+//! leaders in test selection publish *measured* unsafety (Facebook PTS ships
+//! >99.9% faulty-change recall as a production requirement; Launchable derives
+//! confidence curves from the customer's own history). This module closes that
+//! gap with a local, dashboard-free loop:
+//!
+//!   1. every `affected_tests` selection is appended to
+//!      `<db>.rts_selections.jsonl` (opt out: `NESTWEAVER_RTS_NO_RECORD=1`);
+//!   2. CI reports full-suite outcomes via `nestweaver rts-eval record-truth`
+//!      into `<db>.rts_truth.jsonl`;
+//!   3. `rts-eval report` joins the two by commit sha and emits rolling
+//!      file-recall / change-recall / selection-breadth / time-saved numbers —
+//!      every metric carries its `n`, and below `MIN_JOINED_FOR_METRICS`
+//!      joined pairs the report refuses to print percentages at all
+//!      (insufficient data must never read as a measured guarantee).
+//!
+//! Recording is strictly non-fatal: a broken sidecar must never degrade or
+//! fail the analysis it observes.
+
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::affected_tests::AffectedTestsResult;
+
+/// Sidecar suffix for recorded selections.
+pub const SELECTIONS_SUFFIX: &str = ".rts_selections.jsonl";
+/// Sidecar suffix for recorded ground truth (full-suite outcomes).
+pub const TRUTH_SUFFIX: &str = ".rts_truth.jsonl";
+/// Sidecar suffix for the cached latest report (feeds the in-band `measured`
+/// disclosure on affected_tests results).
+pub const REPORT_SUFFIX: &str = ".rts_report.json";
+
+/// Cap on retained selection/truth records; oldest are dropped on overflow.
+pub const MAX_RECORDS: usize = 10_000;
+
+/// Below this many joined (selection, truth) pairs the report refuses to emit
+/// percentages: a recall number derived from a handful of runs reads as a
+/// measured guarantee while carrying none of its weight.
+pub const MIN_JOINED_FOR_METRICS: usize = 10;
+
+/// Env var that disables selection recording entirely.
+pub const NO_RECORD_ENV: &str = "NESTWEAVER_RTS_NO_RECORD";
+
+/// One recorded affected_tests selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionRecord {
+    /// RFC3339 timestamp of the selection.
+    pub ts: String,
+    /// Owning repo of the changed symbols ("" when unresolved).
+    pub repo_uid: String,
+    /// Commit sha the selection was computed against ("unknown" when
+    /// unresolvable).
+    pub sha: String,
+    pub changed_files: Vec<String>,
+    /// Selected test files, tiers flattened (tier membership does not affect
+    /// the safety question "was the failing test selected at all").
+    pub selected_test_files: Vec<String>,
+    pub status: String,
+    pub recommendation: String,
+}
+
+/// One recorded full-suite outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TruthRecord {
+    pub ts: String,
+    pub repo_uid: String,
+    pub sha: String,
+    /// Test files that failed in the full run (empty = green run).
+    pub failed_test_files: Vec<String>,
+    /// Total test files executed, when the reporter knows it (feeds the
+    /// time-saved proxy; None when not provided).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_test_files: Option<usize>,
+}
+
+/// The joined metrics. All ratio fields are `None` until
+/// [`MIN_JOINED_FOR_METRICS`] pairs exist — absence IS the honesty signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtsEvalReport {
+    /// Joined (selection, truth) pairs the metrics are computed over.
+    pub n_joined: usize,
+    /// Selections with no matching truth record (disclosed, excluded).
+    pub n_unresolved_selections: usize,
+    /// Truth records with no matching selection (disclosed, excluded).
+    pub n_unmatched_truths: usize,
+    /// True when `n_joined < MIN_JOINED_FOR_METRICS`; all ratios are None.
+    pub insufficient_data: bool,
+    /// Of all failed test files across joined pairs, the fraction that the
+    /// selection had included (the safety-relevant number).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_recall: Option<f64>,
+    /// Of joined pairs with >=1 failure, the fraction where >=1 failed file
+    /// was selected (Facebook's faulty-change-recall analogue).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_recall: Option<f64>,
+    /// Mean fraction of the full suite the selection asked to run, over
+    /// joined pairs whose truth carried total_test_files. Labelled breadth,
+    /// not precision: unexecuted selected tests have unknown outcomes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_breadth: Option<f64>,
+    /// 1 - breadth, over the same pairs: the file-count proxy for CI time
+    /// saved (NOT wall-clock).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_saved_proxy: Option<f64>,
+    /// Failing joined pairs, for context on how much signal recall rests on.
+    pub n_failing_pairs: usize,
+    /// Window the report was computed over (last N joined pairs; 0 = all).
+    pub window: usize,
+}
+
+/// In-band measured-recall disclosure attached to affected_tests results
+/// once enough joined pairs exist. A compressed view of [`RtsEvalReport`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeasuredRecall {
+    pub file_recall: f64,
+    pub change_recall: f64,
+    pub n_joined: usize,
+    pub window: usize,
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn recording_disabled() -> bool {
+    std::env::var(NO_RECORD_ENV).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Append one JSON line to `path`, enforcing [`MAX_RECORDS`] by rewriting
+/// with the oldest lines dropped when the cap is exceeded.
+fn append_jsonl(path: &Path, line: &str) -> Result<()> {
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open {} for append", path.display()))?;
+        f.write_all(line.as_bytes()).context("append record")?;
+        f.write_all(b"\n").context("append newline")?;
+    }
+    // Rotation: cheap line count; rewrite only on overflow.
+    let content = std::fs::read_to_string(path).context("read for rotation check")?;
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() > MAX_RECORDS {
+        let keep = &lines[lines.len() - MAX_RECORDS..];
+        let mut out = keep.join("\n");
+        out.push('\n');
+        std::fs::write(path, out).context("rewrite rotated sidecar")?;
+    }
+    Ok(())
+}
+
+/// Load all parseable records from a JSONL sidecar. Corrupt lines are skipped
+/// (their count is returned) — one bad line must not disable measurement.
+fn load_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> (Vec<T>, usize) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return (Vec::new(), 0);
+    };
+    let mut out = Vec::new();
+    let mut corrupt = 0;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<T>(line) {
+            Ok(r) => out.push(r),
+            Err(_) => corrupt += 1,
+        }
+    }
+    (out, corrupt)
+}
+
+/// Record an affected_tests selection. Never fails the caller: all errors are
+/// returned for the caller to surface as a Note-level notification.
+pub fn record_selection(
+    db_path: &Path,
+    result: &AffectedTestsResult,
+    repo_uid: &str,
+    sha: &str,
+) -> Result<()> {
+    if recording_disabled() {
+        return Ok(());
+    }
+    let selected: Vec<String> = result
+        .tier_1
+        .iter()
+        .chain(&result.tier_2)
+        .chain(&result.tier_3)
+        .map(|f| f.test_file.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let rec = SelectionRecord {
+        ts: now_rfc3339(),
+        repo_uid: repo_uid.to_string(),
+        sha: sha.to_string(),
+        changed_files: result.changed_files.clone(),
+        selected_test_files: selected,
+        status: format!("{:?}", result.status).to_lowercase(),
+        recommendation: result.recommendation.clone(),
+    };
+    let line = serde_json::to_string(&rec).context("serialize selection record")?;
+    append_jsonl(&crate::sidecar_path(db_path, SELECTIONS_SUFFIX), &line)
+}
+
+/// Record a full-suite outcome (ground truth) for `sha`.
+pub fn record_truth(
+    db_path: &Path,
+    repo_uid: &str,
+    sha: &str,
+    failed_test_files: &[String],
+    total_test_files: Option<usize>,
+) -> Result<()> {
+    let rec = TruthRecord {
+        ts: now_rfc3339(),
+        repo_uid: repo_uid.to_string(),
+        sha: sha.to_string(),
+        failed_test_files: failed_test_files.to_vec(),
+        total_test_files,
+    };
+    let line = serde_json::to_string(&rec).context("serialize truth record")?;
+    append_jsonl(&crate::sidecar_path(db_path, TRUTH_SUFFIX), &line)
+}
+
+/// Join selections with truth by (sha, repo_uid when both carry one) and
+/// compute the report over the last `window` joined pairs (0 = all). The
+/// cached report is written to `<db>.rts_report.json` for the in-band
+/// `measured` disclosure.
+pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
+    let (selections, _sel_corrupt) =
+        load_jsonl::<SelectionRecord>(&crate::sidecar_path(db_path, SELECTIONS_SUFFIX));
+    let (truths, _truth_corrupt) =
+        load_jsonl::<TruthRecord>(&crate::sidecar_path(db_path, TRUTH_SUFFIX));
+
+    // Join: for each selection, the first truth with the same sha (and same
+    // repo_uid when both are non-empty). Later selections win a truth over
+    // none; a truth is consumable by multiple selections at the same sha
+    // (re-runs of the selector against one tested commit).
+    let mut joined: Vec<(&SelectionRecord, &TruthRecord)> = Vec::new();
+    let mut matched_truth: HashSet<usize> = HashSet::new();
+    let mut unresolved = 0usize;
+    for sel in &selections {
+        if sel.sha == "unknown" || sel.sha.is_empty() {
+            unresolved += 1;
+            continue;
+        }
+        let hit = truths.iter().enumerate().find(|(_, t)| {
+            t.sha == sel.sha
+                && (t.repo_uid.is_empty() || sel.repo_uid.is_empty() || t.repo_uid == sel.repo_uid)
+        });
+        match hit {
+            Some((idx, t)) => {
+                matched_truth.insert(idx);
+                joined.push((sel, t));
+            }
+            None => unresolved += 1,
+        }
+    }
+    let n_unmatched_truths = truths.len() - matched_truth.len();
+
+    if window > 0 && joined.len() > window {
+        let start = joined.len() - window;
+        joined.drain(..start);
+    }
+
+    let n_joined = joined.len();
+    let insufficient = n_joined < MIN_JOINED_FOR_METRICS;
+
+    let mut failed_total = 0usize;
+    let mut failed_caught = 0usize;
+    let mut failing_pairs = 0usize;
+    let mut failing_pairs_caught = 0usize;
+    let mut breadth_sum = 0.0f64;
+    let mut breadth_n = 0usize;
+    for (sel, truth) in &joined {
+        let selected: HashSet<&str> = sel.selected_test_files.iter().map(|s| s.as_str()).collect();
+        if !truth.failed_test_files.is_empty() {
+            failing_pairs += 1;
+            let caught_any = truth
+                .failed_test_files
+                .iter()
+                .any(|f| selected.contains(f.as_str()));
+            if caught_any {
+                failing_pairs_caught += 1;
+            }
+            for f in &truth.failed_test_files {
+                failed_total += 1;
+                if selected.contains(f.as_str()) {
+                    failed_caught += 1;
+                }
+            }
+        }
+        if let Some(total) = truth.total_test_files
+            && total > 0
+        {
+            breadth_sum += sel.selected_test_files.len() as f64 / total as f64;
+            breadth_n += 1;
+        }
+    }
+
+    let ratio = |num: usize, den: usize| -> Option<f64> {
+        if insufficient || den == 0 {
+            None
+        } else {
+            Some(num as f64 / den as f64)
+        }
+    };
+    let breadth = if insufficient || breadth_n == 0 {
+        None
+    } else {
+        Some(breadth_sum / breadth_n as f64)
+    };
+
+    let report = RtsEvalReport {
+        n_joined,
+        n_unresolved_selections: unresolved,
+        n_unmatched_truths,
+        insufficient_data: insufficient,
+        file_recall: ratio(failed_caught, failed_total),
+        change_recall: ratio(failing_pairs_caught, failing_pairs),
+        selection_breadth: breadth,
+        time_saved_proxy: breadth.map(|b| 1.0 - b),
+        n_failing_pairs: failing_pairs,
+        window,
+    };
+
+    // Cache for the in-band `measured` disclosure; best-effort.
+    if let Ok(json) = serde_json::to_string_pretty(&report) {
+        let _ = std::fs::write(crate::sidecar_path(db_path, REPORT_SUFFIX), json);
+    }
+
+    Ok(report)
+}
+
+/// Run `affected_tests` with the nw-037 measurement loop attached: record
+/// the selection (non-fatal; failure surfaces as a Note notification) and
+/// attach the in-band `measured` disclosure when the data clears the bar.
+/// `db_path: None` (no sidecar home) degrades to the plain analysis.
+pub fn run_recorded(
+    store: &nestweaver_store::GraphStore,
+    changed_files: &[String],
+    db_path: Option<&Path>,
+) -> Result<AffectedTestsResult> {
+    let mut result = crate::affected_tests::affected_tests(store, changed_files)?;
+    let Some(db) = db_path else {
+        return Ok(result);
+    };
+
+    // Owning repo of the selection = the first changed symbol's repo; the
+    // sha it was computed against = that repo's working-tree HEAD when a
+    // local root is known, else its indexed sha, else "unknown".
+    let repo_uid = result
+        .changed_symbols
+        .first()
+        .map(|cs| {
+            // ChangedSymbolRef has no repo field; derive from the uid prefix
+            // (sym:<repo_uid>:...) — uids are "sym:" + repo_uid + 2 segments.
+            cs.uid
+                .strip_prefix("sym:")
+                .and_then(|rest| {
+                    // repo uid itself contains ':'; take everything up to the
+                    // last two ':'-separated segments (file-hash:line).
+                    let parts: Vec<&str> = rest.rsplitn(3, ':').collect();
+                    parts.get(2).map(|s| s.to_string())
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let sha = resolve_selection_sha(store, &repo_uid);
+
+    if let Err(e) = record_selection(db, &result, &repo_uid, &sha) {
+        result
+            .notifications
+            .push(crate::blast_radius::Notification {
+                level: crate::blast_radius::NotificationLevel::Note,
+                message: format!("recording this selection for recall measurement failed: {e}"),
+                descriptor: "rts-record-failed".to_string(),
+            });
+    }
+    result.measured = load_measured(db);
+    Ok(result)
+}
+
+/// Best-effort sha resolution for a selection record.
+fn resolve_selection_sha(store: &nestweaver_store::GraphStore, repo_uid: &str) -> String {
+    if repo_uid.is_empty() {
+        return "unknown".to_string();
+    }
+    let Ok(repos) = store.list_repos(None) else {
+        return "unknown".to_string();
+    };
+    let Some(repo) = repos.iter().find(|r| r.uid == repo_uid) else {
+        return "unknown".to_string();
+    };
+    if let Some(root) = repo.local_root()
+        && let Ok(out) = std::process::Command::new("git")
+            .args(["-C", root, "rev-parse", "HEAD"])
+            .output()
+        && out.status.success()
+    {
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !head.is_empty() {
+            return head;
+        }
+    }
+    if !repo.indexed_sha.is_empty() {
+        return repo.indexed_sha.clone();
+    }
+    "unknown".to_string()
+}
+
+/// Load the cached report and compress it to the in-band disclosure, when the
+/// data clears the honesty bar. Absence is meaningful: no `measured` field
+/// means "no measured claim".
+pub fn load_measured(db_path: &Path) -> Option<MeasuredRecall> {
+    let content = std::fs::read_to_string(crate::sidecar_path(db_path, REPORT_SUFFIX)).ok()?;
+    let report: RtsEvalReport = serde_json::from_str(&content).ok()?;
+    if report.insufficient_data {
+        return None;
+    }
+    Some(MeasuredRecall {
+        file_recall: report.file_recall?,
+        change_recall: report.change_recall?,
+        n_joined: report.n_joined,
+        window: report.window,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::affected_tests::{AffectedTestFile, AffectedTestsResult};
+    use crate::blast_radius::AnalysisStatus;
+
+    fn scratch_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("scratch.lbug");
+        std::fs::write(&db, b"").expect("touch db");
+        (dir, db)
+    }
+
+    fn result_selecting(files: &[&str]) -> AffectedTestsResult {
+        AffectedTestsResult {
+            changed_files: vec!["src/a.rs".to_string()],
+            changed_symbols: Vec::new(),
+            tier_1: files
+                .iter()
+                .map(|f| AffectedTestFile {
+                    test_file: f.to_string(),
+                    tests: vec!["t".to_string()],
+                    symbol_uid: "sym:t".to_string(),
+                    confidence: 0.9,
+                })
+                .collect(),
+            tier_2: Vec::new(),
+            tier_3: Vec::new(),
+            summary: String::new(),
+            disclaimer: String::new(),
+            status: AnalysisStatus::Complete,
+            notifications: Vec::new(),
+            recommendation: "selection-usable".to_string(),
+            measured: None,
+        }
+    }
+
+    #[test]
+    fn record_selection_appends_jsonl() {
+        let (_dir, db) = scratch_db();
+        let r = result_selecting(&["tests/a.test.ts"]);
+        record_selection(&db, &r, "repo:1", "abc123").expect("record");
+        record_selection(&db, &r, "repo:1", "def456").expect("record 2");
+        let (loaded, corrupt) =
+            load_jsonl::<SelectionRecord>(&crate::sidecar_path(&db, SELECTIONS_SUFFIX));
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(corrupt, 0);
+        assert_eq!(loaded[0].sha, "abc123");
+        assert_eq!(loaded[0].selected_test_files, vec!["tests/a.test.ts"]);
+        assert_eq!(loaded[0].recommendation, "selection-usable");
+    }
+
+    #[test]
+    fn load_skips_corrupt_lines() {
+        let (_dir, db) = scratch_db();
+        let r = result_selecting(&["tests/a.test.ts"]);
+        record_selection(&db, &r, "repo:1", "abc123").expect("record");
+        let path = crate::sidecar_path(&db, SELECTIONS_SUFFIX);
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("{not json at all\n");
+        std::fs::write(&path, content).unwrap();
+        record_selection(&db, &r, "repo:1", "def456").expect("record after corrupt");
+        let (loaded, corrupt) = load_jsonl::<SelectionRecord>(&path);
+        assert_eq!(loaded.len(), 2, "valid records survive a corrupt line");
+        assert_eq!(corrupt, 1);
+    }
+
+    #[test]
+    fn report_round_trip_hand_checkable() {
+        let (_dir, db) = scratch_db();
+        // 12 selections/truths at distinct shas so we clear the n>=10 bar.
+        // Selection always picks tests/a.test.ts; truth: two runs fail —
+        // one where a.test.ts failed (caught), one where b.test.ts failed
+        // (missed). Total suite = 10 files each run.
+        for i in 0..12 {
+            let sha = format!("sha{i}");
+            record_selection(&db, &result_selecting(&["tests/a.test.ts"]), "repo:1", &sha)
+                .expect("sel");
+            let failed: Vec<String> = match i {
+                3 => vec!["tests/a.test.ts".to_string()],
+                7 => vec!["tests/b.test.ts".to_string()],
+                _ => Vec::new(),
+            };
+            record_truth(&db, "repo:1", &sha, &failed, Some(10)).expect("truth");
+        }
+        let report = compute_report(&db, 0).expect("report");
+        assert_eq!(report.n_joined, 12);
+        assert!(!report.insufficient_data);
+        assert_eq!(report.n_failing_pairs, 2);
+        // 2 failed files total, 1 caught.
+        assert_eq!(report.file_recall, Some(0.5));
+        // 2 failing runs, 1 with >=1 caught.
+        assert_eq!(report.change_recall, Some(0.5));
+        // 1 selected of 10 total, every run.
+        assert!((report.selection_breadth.unwrap() - 0.1).abs() < 1e-9);
+        assert!((report.time_saved_proxy.unwrap() - 0.9).abs() < 1e-9);
+        // Cached report feeds the in-band disclosure.
+        let measured = load_measured(&db).expect("measured present at n>=10");
+        assert_eq!(measured.n_joined, 12);
+        assert_eq!(measured.file_recall, 0.5);
+    }
+
+    #[test]
+    fn report_below_n10_refuses_percentages() {
+        let (_dir, db) = scratch_db();
+        for i in 0..3 {
+            let sha = format!("sha{i}");
+            record_selection(&db, &result_selecting(&["tests/a.test.ts"]), "repo:1", &sha)
+                .expect("sel");
+            record_truth(
+                &db,
+                "repo:1",
+                &sha,
+                &["tests/a.test.ts".to_string()],
+                Some(10),
+            )
+            .expect("truth");
+        }
+        let report = compute_report(&db, 0).expect("report");
+        assert_eq!(report.n_joined, 3);
+        assert!(report.insufficient_data);
+        assert_eq!(report.file_recall, None, "no percentages below n=10");
+        assert_eq!(report.change_recall, None);
+        assert_eq!(report.selection_breadth, None);
+        assert!(
+            load_measured(&db).is_none(),
+            "no in-band measured claim below the honesty bar"
+        );
+    }
+
+    #[test]
+    fn unresolved_selections_are_disclosed_not_counted() {
+        let (_dir, db) = scratch_db();
+        record_selection(
+            &db,
+            &result_selecting(&["tests/a.test.ts"]),
+            "repo:1",
+            "unknown",
+        )
+        .expect("sel");
+        record_selection(
+            &db,
+            &result_selecting(&["tests/a.test.ts"]),
+            "repo:1",
+            "sha-without-truth",
+        )
+        .expect("sel2");
+        let report = compute_report(&db, 0).expect("report");
+        assert_eq!(report.n_joined, 0);
+        assert_eq!(report.n_unresolved_selections, 2);
+    }
+
+    #[test]
+    fn rotation_caps_records() {
+        let (_dir, db) = scratch_db();
+        let path = crate::sidecar_path(&db, SELECTIONS_SUFFIX);
+        // Seed just over the cap cheaply (raw lines, same shape).
+        let mut bulk = String::new();
+        for i in 0..MAX_RECORDS {
+            bulk.push_str(&format!(
+                "{{\"ts\":\"t\",\"repo_uid\":\"r\",\"sha\":\"s{i}\",\"changed_files\":[],\"selected_test_files\":[],\"status\":\"complete\",\"recommendation\":\"selection-usable\"}}\n"
+            ));
+        }
+        std::fs::write(&path, bulk).unwrap();
+        record_selection(&db, &result_selecting(&[]), "repo:1", "newest").expect("record");
+        let (loaded, _) = load_jsonl::<SelectionRecord>(&path);
+        assert_eq!(loaded.len(), MAX_RECORDS, "capped at MAX_RECORDS");
+        assert_eq!(
+            loaded.last().map(|r| r.sha.as_str()),
+            Some("newest"),
+            "newest record survives rotation"
+        );
+        assert_ne!(
+            loaded.first().map(|r| r.sha.as_str()),
+            Some("s0"),
+            "oldest record dropped"
+        );
+    }
+
+    #[test]
+    fn run_recorded_writes_selection_and_notes_failures_nonfatally() {
+        use nestweaver_store::GraphStore;
+        let store = GraphStore::in_memory().expect("store");
+        let (_dir, db) = scratch_db();
+        let result =
+            run_recorded(&store, &["src/a.rs".to_string()], Some(&db)).expect("run_recorded");
+        // Empty store: selection still recorded (repo/sha unknown), analysis
+        // result untouched, no measured claim.
+        assert!(result.measured.is_none());
+        let (loaded, _) =
+            load_jsonl::<SelectionRecord>(&crate::sidecar_path(&db, SELECTIONS_SUFFIX));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].sha, "unknown");
+        // Unwritable sidecar home: analysis still succeeds, with a Note.
+        let ro = _dir.path().join("missing-dir").join("db.lbug");
+        let degraded =
+            run_recorded(&store, &["src/a.rs".to_string()], Some(&ro)).expect("nonfatal");
+        assert!(
+            degraded
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "rts-record-failed"),
+            "recording failure must surface as a note: {:?}",
+            degraded.notifications
+        );
+    }
+}

@@ -302,6 +302,7 @@ fn empty_affected_tests(
         status: nestweaver_engine::AnalysisStatus::Degraded,
         // Degraded hints => fail-safe widening (nw-060): CI must not narrow.
         recommendation: "run-full-suite".to_string(),
+        measured: None,
         notifications: vec![nestweaver_engine::Notification {
             level: nestweaver_engine::NotificationLevel::Warning,
             message: "Affected-test hints are unavailable for this scoped impact response; \

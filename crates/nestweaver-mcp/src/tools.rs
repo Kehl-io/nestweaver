@@ -4371,7 +4371,12 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         ));
     }
 
-    let result = affected_tests(store, &changed_files).context("affected_tests")?;
+    // nw-037: route through the recorded wrapper so every selection feeds the
+    // measured-recall loop and carries the in-band `measured` disclosure.
+    let db_path = current_db_path(store).ok();
+    let result =
+        nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
+            .context("affected_tests")?;
     Ok(serde_json::to_value(&result)?)
 }
 

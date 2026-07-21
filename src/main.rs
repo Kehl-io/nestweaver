@@ -5738,7 +5738,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            let result = affected_tests(&store, &changed_files)?;
+            let result =
+                nestweaver_engine::rts_eval::run_recorded(&store, &changed_files, Some(&db_path))?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
