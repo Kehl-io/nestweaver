@@ -30,7 +30,6 @@ use nestweaver_parser::is_test_file;
 use nestweaver_store::GraphStore;
 
 use crate::blast_radius::{AnalysisStatus, Notification, NotificationLevel};
-use crate::process::detect_changes_impact;
 
 /// Maximum reverse-traversal depth for finding dependent tests.
 const MAX_TEST_DEPTH: u32 = 3;
@@ -113,7 +112,7 @@ provably-safe subset. Misses reflection, DI, codegen, and data-driven/integratio
 /// Compute the affected tests for a set of changed files.
 ///
 /// Pipeline:
-///   1. changed_files → changed_symbols (via `detect_changes_impact`).
+///   1. changed_files → changed_symbols (direct `symbols_in_file` lookup).
 ///   2. for each changed symbol, reverse-traverse CALLS/IMPORTS to depth 3.
 ///   3. keep reached symbols whose file is a test file (`is_test_file`).
 ///   4. bucket by traversal depth (tier_1 = depth 1, etc.), ordering within a
@@ -124,28 +123,38 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     let mut status = AnalysisStatus::Complete;
     let mut notifications: Vec<Notification> = Vec::new();
 
-    // Step 1: changed files → changed symbols.
-    let changed_symbols: Vec<ChangedSymbolRef> =
-        match detect_changes_impact(store, changed_files, MAX_TEST_DEPTH) {
-            Ok(impact) => impact
-                .affected_symbols
-                .iter()
-                .map(|s| ChangedSymbolRef {
-                    uid: s.uid.clone(),
-                    name: s.name.clone(),
-                    file_path: s.file_path.clone(),
-                })
-                .collect(),
+    // Step 1: changed files → changed symbols, via direct per-file lookup.
+    //
+    // Deliberately NOT `detect_changes_impact`: that helper also runs
+    // `trace_processes` — a BFS from every entry-point-ish symbol across the
+    // ENTIRE store — whose process output this analysis never used. On large
+    // multi-repo stores that traversal hangs or crashes the native store
+    // layer (the 2.5.10 affected_tests daemon-crash/segfault report).
+    let mut changed_symbols: Vec<ChangedSymbolRef> = Vec::new();
+    let mut changed_uids: HashSet<String> = HashSet::new();
+    for file_path in changed_files {
+        match store.symbols_in_file(file_path) {
+            Ok(syms) => {
+                for s in syms {
+                    if changed_uids.insert(s.uid.clone()) {
+                        changed_symbols.push(ChangedSymbolRef {
+                            uid: s.uid,
+                            name: s.name,
+                            file_path: s.file_path,
+                        });
+                    }
+                }
+            }
             Err(e) => {
                 notifications.push(Notification {
                     level: NotificationLevel::Error,
-                    message: format!("mapping changed files to symbols failed: {e}"),
-                    descriptor: "store.detect-changes-failed".to_string(),
+                    message: format!("mapping changed file {file_path} to symbols failed: {e}"),
+                    descriptor: "store.symbols-in-file-failed".to_string(),
                 });
                 status = status.max(AnalysisStatus::Degraded);
-                Vec::new()
             }
-        };
+        }
+    }
 
     // Step 2 + 3: reverse-traverse from each changed symbol and keep tests.
     //
@@ -477,6 +486,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             result.summary
         );
+    }
+
+    #[test]
+    fn duplicate_changed_files_do_not_duplicate_changed_symbols() {
+        let store = GraphStore::in_memory().expect("store");
+        let changed = sym("sym:changed", "computeTotal", "src/billing.rs");
+        store.insert_symbol(&changed).expect("insert");
+
+        let result = affected_tests(
+            &store,
+            &["src/billing.rs".to_string(), "src/billing.rs".to_string()],
+        )
+        .expect("ok");
+
+        assert_eq!(
+            result
+                .changed_symbols
+                .iter()
+                .filter(|c| c.uid == "sym:changed")
+                .count(),
+            1,
+            "changed symbol must be deduplicated across duplicate changed_files entries"
+        );
+        assert_eq!(result.status, AnalysisStatus::Complete);
     }
 
     #[test]

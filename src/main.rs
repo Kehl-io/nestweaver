@@ -317,6 +317,17 @@ enum Commands {
         )]
         db: Option<PathBuf>,
     },
+    /// Check if the indexed graph is stale by comparing each repo's
+    /// indexed SHA against git HEAD. (Same as `brain stale-check`.)
+    StaleCheck {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
     /// List all services/modules in the graph
     ListServices {
         #[arg(long, help = "Filter by instance ID")]
@@ -5167,6 +5178,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
+        Commands::StaleCheck { json, db } => run_brain(
+            BrainCommands::StaleCheck { json, db },
+            out,
+            t0,
+            use_daemon,
+            no_embed,
+        ),
         Commands::Memory { command } => run_memory(*command, t0, use_daemon),
         Commands::Ranking { command } => run_ranking(command, t0, use_daemon),
         Commands::Eval { command } => run_eval_cmd(command, use_daemon).map(|c| (c, None)),
@@ -15765,5 +15783,30 @@ mod daemon_index_phase_tests {
                     .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_check_cli_tests {
+    use super::*;
+
+    #[test]
+    fn top_level_stale_check_parses() {
+        // Parsing the full Cli overflows the default 2 MiB test-thread stack
+        // in debug builds (the Commands enum is large); use a bigger stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["nestweaver", "stale-check", "--json"]).expect(
+                    "top-level stale-check must parse (regression: dropped in the CLI reorg)",
+                );
+                assert!(matches!(
+                    cli.command,
+                    Commands::StaleCheck { json: true, .. }
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 }

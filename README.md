@@ -236,7 +236,7 @@ cargo build --release
 | `brain watch` | Watch vaults for changes and re-index automatically |
 | `brain refresh` | Force re-index of all registered vaults |
 | `brain remove` | Remove a vault from the brain (cascade-deletes nodes; does not touch files on disk) |
-| `brain stale-check` | Check if the indexed graph is stale by comparing each repo's indexed SHA against git HEAD |
+| `brain stale-check` | Check if the indexed graph is stale by comparing each repo's indexed SHA against git HEAD (also available top-level as `stale-check`) |
 | `brain reindex-search` | Rebuild the Tantivy BM25 search index from current graph state |
 | `brain broken-links` | List wikilinks with ambiguous or low-confidence targets, with suggested fixes |
 | `brain orphans` | List notes with zero inbound and zero outbound wikilinks |

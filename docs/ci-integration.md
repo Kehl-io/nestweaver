@@ -273,6 +273,32 @@ The SARIF carries the full trust contract, so reviewers see it inline:
   results carry `severitySource: contract-verified` (a real signature diff),
   distinct from the reach-based cross-repo hints (`severitySource: reach-only`).
 
+### Field naming: MCP JSON vs SARIF
+
+The trust contract is one contract serialized on two surfaces with different
+casing conventions — this is deliberate, not drift. MCP/JSON tool output uses
+`snake_case` (Rust serde defaults); the SARIF *property-bag keys* follow the
+SARIF ecosystem's `camelCase` convention, namespaced under `nestweaver/`.
+Integrators parsing both surfaces should map:
+
+| MCP / JSON (snake_case) | SARIF property bag (camelCase key)                |
+| ----------------------- | ------------------------------------------------- |
+| `gate_state`            | `run.properties["nestweaver/gateState"]`          |
+| `status`                | `run.properties["nestweaver/status"]`             |
+| `risk_level`            | `run.properties["nestweaver/riskLevel"]`          |
+| `blind_spots`           | `run.properties["nestweaver/blindSpots"]`         |
+| `analysis_direction`    | `run.properties["nestweaver/analysisDirection"]`  |
+| `coverage`              | `run.properties["nestweaver/coverage"]`           |
+| (per-result severity provenance) | `result.properties["nestweaver/severitySource"]` |
+
+Two things do **not** change casing across surfaces:
+
+- **Enum values** are identical everywhere (e.g. `degraded-unknown`,
+  `dynamic-dispatch`, `contract-verified`).
+- **The `coverage` object's inner keys** stay `snake_case` inside the SARIF
+  property bag too (`stale_repos`, etc.) — the object is embedded verbatim;
+  only the top-level property-bag *keys* are camelCase.
+
 This is advisory: the workflow never fails the build. To gate, add a separate
 step that inspects `gateState`/`nw/contract-break` and exits non-zero, or use
 `pr-impact --base "$base" --strict`. By default `--strict` exits non-zero **only
