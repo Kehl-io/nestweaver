@@ -73,6 +73,11 @@ nestweaver hubs                          # most connected hub nodes (degree cent
 nestweaver bridges                       # architectural chokepoints (betweenness centrality)
 nestweaver clusters                      # functional communities (adaptive resolution: 0.3 for >10K symbols, 0.5 default)
 nestweaver pr-impact                     # PR blast radius with risk scoring (Low/Medium/High)
+nestweaver pr-impact --sarif             # SARIF 2.1.0 for GitHub code scanning / VS Code SARIF viewer
+nestweaver pr-impact --strict            # exit 2 on a contract-verified breaking change (advisory by default)
+nestweaver affected-tests --base-ref main  # tiered regression-test selection for a diff
+nestweaver rts-eval record-truth --sha X --failed-test-files a.test.ts  # CI reports full-suite outcome
+nestweaver rts-eval report               # measured recall/breadth of past selections (nw-037 loop)
 nestweaver dead-code                     # detect unreachable symbols via entry point reachability
 
 # Export

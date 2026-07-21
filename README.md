@@ -217,7 +217,7 @@ cargo build --release
 | `regex-search` | Regex search over indexed text |
 | `count-patterns` | Count regex matches per pattern |
 | `investigate` | Orient on a topic in one call |
-| `affected-tests` | Select tests for changed files |
+| `affected-tests` | Select tests for changed files (tiered; carries a `recommendation` CI directive — `run-full-suite` on any degraded run) |
 | `repo-map` | Generate a token-budgeted map of the repository structure |
 | `summary` | Hierarchical code summaries at symbol, file, or cluster level |
 
@@ -256,7 +256,9 @@ cargo build --release
 |---------|-------------|
 | `hubs` | Find most connected hub nodes (degree centrality + PageRank) |
 | `bridges` | Find architectural chokepoints (betweenness centrality) |
-| `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High) |
+| `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High); `--sarif` for code scanning, `--strict` to gate on contract-verified breaking changes |
+| `rts-eval record-truth` | Report a full-suite outcome from CI so selection quality can be measured |
+| `rts-eval report` | Measured file-recall / change-recall / selection-breadth of past selections (refuses percentages below 10 joined runs) |
 | `dead-code` | Detect unreachable symbols via entry point reachability |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
 | `contracts drift` | Routes declared in a spec but not implemented, and vice versa (presence-level) |
