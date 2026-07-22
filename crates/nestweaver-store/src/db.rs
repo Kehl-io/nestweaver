@@ -677,15 +677,39 @@ impl GraphStore {
     }
 
     /// Advance the live generation without ever wrapping to a reused value.
+    ///
+    /// This is the UNGATED administrative bump (the delete/merge finalize path
+    /// calls it without holding the publication lease). If a dirty reservation is
+    /// present it means either a live publication is mid-flight (lease held → fail
+    /// closed, never clobber it) OR a prior publisher crashed leaving an abandoned
+    /// reservation (lease unowned → RECOVER, rather than wedging every future admin
+    /// bump for the daemon's lifetime — nw-091 / Bug 3A). The old code always
+    /// failed closed, so one dropped lease permanently broke remove_vault /
+    /// merge_instance / prune_stale.
     pub fn try_bump_graph_generation(&self) -> Result<u64, StoreError> {
-        let reservation = self
-            .index_publication_generation_base
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if reservation.is_some() {
-            return Err(StoreError::Query(
-                "index publication generation is already reserved".to_string(),
-            ));
+        {
+            let mut reservation = self
+                .index_publication_generation_base
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(canonical) = *reservation {
+                // Probe ownership WHILE holding `base`. Lock order base → lease is
+                // safe: no path holds both (reserve drops the lease guard before
+                // locking base; acquire never touches base), so this cannot
+                // deadlock, and probing under the base lock closes the TOCTOU.
+                if self.index_publication_lease_is_unowned() {
+                    // Abandoned reservation from a crashed publisher: roll the
+                    // dirty N+1 back to the last clean generation and clear it (the
+                    // N+1 was never durably published as canonical, so reusing it is
+                    // safe — mirrors cancel_index_publication_generation), then bump.
+                    self.graph_generation.store(canonical, Ordering::Release);
+                    *reservation = None;
+                } else {
+                    return Err(StoreError::Query(
+                        "index publication generation is already reserved".to_string(),
+                    ));
+                }
+            }
         }
         self.graph_generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -794,6 +818,23 @@ impl GraphStore {
         }
     }
 
+    /// True when no in-process owner currently holds the index-publication lease.
+    ///
+    /// A leftover `index_publication_generation_base` while the lease is UNOWNED
+    /// is an abandoned reservation from a prior owner that dropped its lease
+    /// without completing (e.g. the daemon crashed mid-publish) — safe to recover.
+    /// While a lease IS held, a live publication is mid-flight and the reservation
+    /// must stay fail-closed. This is the live-vs-dead signal the admin path keys
+    /// on so a crash can't wedge every future generation bump forever (nw-091).
+    fn index_publication_lease_is_unowned(&self) -> bool {
+        self.index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .owner
+            .is_none()
+    }
+
     fn release_index_publication_lease(&self, token: u64) -> Result<(), StoreError> {
         let mut state = self
             .index_publication_lease
@@ -833,15 +874,19 @@ impl GraphStore {
         token: u64,
     ) -> Result<(), StoreError> {
         self.validate_index_publication_owner(token)?;
-        let base = self
+        let mut base = self
             .index_publication_generation_base
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if base.is_some() {
-            return Err(StoreError::Query(
-                "index publication generation is already reserved".into(),
-            ));
+        // Reaching here means THIS caller holds the exclusive lease (validated
+        // above), so no concurrent live publisher exists — a leftover reservation
+        // is abandoned by a prior owner that dropped its lease (crash). Recover it
+        // (restore canonical) instead of failing closed forever (nw-091 / Bug 3A),
+        // matching the persistent reserve path's recovery.
+        if let Some(canonical) = base.take() {
+            self.graph_generation.store(canonical, Ordering::Release);
         }
+        drop(base);
         self.graph_generation()
             .checked_add(1)
             .map(|_| ())
@@ -1773,6 +1818,63 @@ mod tests {
 
         assert_eq!(store.try_bump_graph_generation().unwrap(), u64::MAX);
         assert!(store.lookup_repo("repo:last-generation").unwrap().is_some());
+    }
+
+    #[test]
+    fn try_bump_recovers_an_abandoned_reservation_when_lease_is_unowned() {
+        // nw-091 / Bug 3A: a publisher that reserved the dirty generation then
+        // dropped its lease without completing (a crash) leaves `base = Some`. The
+        // old ungated admin bump failed closed on that forever ("already
+        // reserved"), wedging every remove_vault/merge_instance/prune_stale. Now
+        // an UNOWNED leftover reservation is recovered.
+        let store = GraphStore::in_memory().unwrap();
+        let g0 = store.graph_generation();
+        {
+            let lease = store.acquire_index_publication_lease().unwrap();
+            lease.reserve_generation().unwrap(); // base = Some(g0), generation = dirty g0+1
+            // Drop WITHOUT complete/cancel → abandoned: base stays Some, owner → None.
+        }
+        let bumped = store
+            .try_bump_graph_generation()
+            .expect("an abandoned reservation must be recovered, not wedge the admin bump");
+        assert!(bumped > g0, "generation advanced after recovery");
+        // A second bump also works — the abandoned base was cleared.
+        assert!(store.try_bump_graph_generation().unwrap() > bumped);
+    }
+
+    #[test]
+    fn try_bump_still_fails_closed_while_a_live_lease_holds_a_reservation() {
+        // The recovery must NOT clobber a genuinely in-flight publication: while a
+        // lease is HELD, the admin bump must still fail closed.
+        let store = GraphStore::in_memory().unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        lease.reserve_generation().unwrap(); // base = Some, owner = Some (held)
+        let err = store.try_bump_graph_generation().unwrap_err();
+        assert!(
+            err.to_string().contains("already reserved"),
+            "a live publication must not be clobbered, got: {err}"
+        );
+        drop(lease); // release the lease → the reservation becomes abandoned
+        assert!(
+            store.try_bump_graph_generation().is_ok(),
+            "after the lease is dropped, the abandoned reservation is recovered"
+        );
+    }
+
+    #[test]
+    fn transient_preflight_recovers_an_abandoned_reservation() {
+        // The lease-guarded transient/admin preflight must also recover (it holds
+        // the exclusive lease, so a leftover base is provably abandoned).
+        let store = GraphStore::in_memory().unwrap();
+        {
+            let lease = store.acquire_index_publication_lease().unwrap();
+            lease.reserve_generation().unwrap();
+            // abandon
+        }
+        let lease2 = store.acquire_index_publication_lease().unwrap();
+        lease2
+            .preflight_transient_generation()
+            .expect("transient preflight must recover an abandoned reservation, not fail closed");
     }
 
     #[test]
