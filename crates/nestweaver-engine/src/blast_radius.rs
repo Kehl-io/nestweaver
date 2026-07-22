@@ -48,6 +48,11 @@ pub struct AffectedSymbol {
     /// The repo_uid that owns this symbol (from the graph store).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub repo_uid: String,
+    /// Whether `repo_uid` came from an authoritative symbol lookup. Kept out
+    /// of serialized output so deserialized/legacy rows default to unknown and
+    /// cannot assert their own authorization provenance.
+    #[serde(skip)]
+    pub ownership_resolved: bool,
 }
 
 /// A cluster (community) that contains affected symbols.
@@ -703,6 +708,7 @@ pub fn analyze_blast_radius(
             start_line: node.start_line,
             impact_score: node.impact_score,
             repo_uid: affected_repo.clone(),
+            ownership_resolved: affected_sym.is_some(),
         });
     }
 

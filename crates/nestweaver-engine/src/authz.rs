@@ -51,9 +51,9 @@ pub enum VisibleRepos {
 impl VisibleRepos {
     /// Whether a symbol/edge in `repo_uid` is visible.
     ///
-    /// An empty `repo_uid` (unresolved / the local repo under review) is always
-    /// kept — dropping it would break the primary result, and it reveals
-    /// nothing cross-repo.
+    /// An empty `repo_uid` (the local repo under review) is allowed. Callers
+    /// whose data source can also use empty for unresolved ownership must first
+    /// require separate positive provenance; blast-radius affected rows do so.
     pub fn allows(&self, repo_uid: &str) -> bool {
         match self {
             VisibleRepos::All => true,
@@ -171,10 +171,16 @@ pub fn redact_blast_radius_for_visibility(
         VisibleRepos::Only(_) => visible,
     };
 
-    // Symbols carry their owning repo_uid directly.
+    // Affected traversal rows need positive ownership provenance in addition
+    // to a repo UID. An empty UID can mean a genuinely local symbol or a failed
+    // enrichment; only a successful authoritative lookup distinguishes them.
     result
         .affected_symbols
-        .retain(|s| visible_only.allows(&s.repo_uid));
+        .retain(|s| s.ownership_resolved && visible_only.allows(&s.repo_uid));
+
+    // Changed symbols come directly from a successful `symbols_in_file[_in_repo]`
+    // lookup and have no scan-data fallback/enrichment path. Their empty UID is
+    // therefore positively resolved local ownership rather than unknown.
     result
         .changed_symbols
         .retain(|s| visible_only.allows(&s.repo_uid));
@@ -344,10 +350,13 @@ pub fn classify_repo_listing(
 mod tests {
     use super::*;
     use crate::blast_radius::{
-        AffectedCluster, AffectedSymbol, AnalysisStatus, ChangedSymbol, CoChangedFile, Coverage,
-        Notification, NotificationLevel, OrgImpactItem, OrgWideImpact, StaleRepo,
+        AffectedCluster, AffectedSymbol, AnalysisStatus, BlastRadiusOptions, ChangedSymbol,
+        CoChangedFile, Coverage, Notification, NotificationLevel, OrgImpactItem, OrgWideImpact,
+        StaleRepo, analyze_blast_radius,
     };
     use crate::process::RiskLevel;
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
 
     fn repo(uid: &str, url: &str) -> Repo {
         Repo {
@@ -380,7 +389,8 @@ mod tests {
         let v = only(&["repo:a"]);
         assert!(v.allows("repo:a"));
         assert!(!v.allows("repo:b"));
-        // Empty repo_uid (unresolved / local repo under review) is always kept.
+        // Empty repo_uid represents the local repo at this primitive layer.
+        // Ambiguous affected rows require provenance in the redactor itself.
         assert!(v.allows(""));
     }
 
@@ -535,6 +545,7 @@ mod tests {
             start_line: 1,
             impact_score: 1.0,
             repo_uid: repo_uid.to_string(),
+            ownership_resolved: true,
         }
     }
 
@@ -611,6 +622,83 @@ mod tests {
             blind_spots: vec![],
             analysis_direction: String::new(),
         }
+    }
+
+    fn ownership_store(
+        caller_name: &str,
+        caller_repo_uid: &str,
+        corrupt_lookup: bool,
+    ) -> GraphStore {
+        let store = GraphStore::in_memory().expect("in-memory store");
+        let symbol =
+            |uid: &str, name: &str, repo_uid: &str, file_path: &str, signature: &str| Symbol {
+                uid: uid.to_string(),
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: repo_uid.to_string(),
+                file_path: file_path.to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: signature.to_string(),
+                summary: None,
+                content_hash: format!("hash:{uid}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            };
+
+        store
+            .insert_repo(&repo("repo:visible", "https://example.test/visible"))
+            .unwrap();
+        if !caller_repo_uid.is_empty() {
+            store
+                .insert_repo(&repo(caller_repo_uid, "https://example.test/hidden"))
+                .unwrap();
+        }
+        store
+            .insert_symbol(&symbol(
+                "target",
+                "VisibleTarget",
+                "repo:visible",
+                "src/target.rs",
+                "fn VisibleTarget()",
+            ))
+            .unwrap();
+        let caller_file = if corrupt_lookup {
+            "hidden/lookup-miss.rs"
+        } else {
+            "src/local.rs"
+        };
+        let caller_signature = if corrupt_lookup {
+            "fn HiddenLookupMiss()\0"
+        } else {
+            "fn LocalResolved()"
+        };
+        store
+            .insert_symbol(&symbol(
+                "caller",
+                caller_name,
+                caller_repo_uid,
+                caller_file,
+                caller_signature,
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        store
     }
 
     fn sample_repos() -> Vec<Repo> {
@@ -856,5 +944,92 @@ mod tests {
             sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["level"],
             "error"
         );
+    }
+
+    #[test]
+    fn redact_only_drops_affected_symbol_when_ownership_lookup_fails() {
+        let store = ownership_store("HiddenLookupMiss", "repo:hidden", true);
+        let mut result = analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from("src/target.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.affected_symbol_count, 1);
+        assert_eq!(result.affected_symbols[0].name, "HiddenLookupMiss");
+        assert_eq!(result.affected_symbols[0].repo_uid, "");
+
+        let repos = store.list_repos(None).unwrap();
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:visible"]), &repos);
+
+        assert!(result.affected_symbols.is_empty());
+        assert_eq!(result.affected_symbol_count, 0);
+        assert!(result.summary.contains("0 transitively affected"));
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("HiddenLookupMiss"));
+        assert!(!serialized.contains("hidden/lookup-miss.rs"));
+    }
+
+    #[test]
+    fn redact_only_keeps_affected_symbol_with_resolved_local_ownership() {
+        let store = ownership_store("LocalResolved", "", false);
+        let mut result = analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from("src/target.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let repos = store.list_repos(None).unwrap();
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:visible"]), &repos);
+
+        assert_eq!(result.affected_symbol_count, 1);
+        assert_eq!(result.affected_symbols[0].name, "LocalResolved");
+        assert_eq!(result.affected_symbols[0].repo_uid, "");
+    }
+
+    #[test]
+    fn redact_only_drops_deserialized_affected_symbol_without_provenance() {
+        let mut original = sample_result();
+        original.affected_symbols = vec![affected("legacy-visible", "repo:a")];
+        original.affected_symbol_count = 1;
+        let serialized = serde_json::to_value(original).unwrap();
+        assert!(
+            serialized["affected_symbols"][0]
+                .get("ownership_resolved")
+                .is_none()
+        );
+        let mut deserialized: BlastRadiusResult = serde_json::from_value(serialized).unwrap();
+        assert!(!deserialized.affected_symbols[0].ownership_resolved);
+
+        redact_blast_radius_for_visibility(&mut deserialized, &only(&["repo:a"]), &sample_repos());
+
+        assert!(deserialized.affected_symbols.is_empty());
+        assert_eq!(deserialized.affected_symbol_count, 0);
+    }
+
+    #[test]
+    fn redact_only_keeps_local_changed_symbol_from_successful_file_lookup() {
+        let store = ownership_store("LocalChanged", "", false);
+        let mut result = analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from("src/local.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.changed_symbols.len(), 1);
+
+        let repos = store.list_repos(None).unwrap();
+        redact_blast_radius_for_visibility(&mut result, &only(&[]), &repos);
+
+        assert_eq!(result.changed_symbols.len(), 1);
+        assert_eq!(result.changed_symbols[0].name, "LocalChanged");
+        assert_eq!(result.changed_symbols[0].repo_uid, "");
     }
 }

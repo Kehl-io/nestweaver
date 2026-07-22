@@ -325,6 +325,7 @@ mod tests {
             start_line: 42,
             impact_score: impact,
             repo_uid: "repo:1".to_string(),
+            ownership_resolved: true,
         }
     }
 

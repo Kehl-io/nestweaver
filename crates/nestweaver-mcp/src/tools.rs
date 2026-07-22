@@ -8890,6 +8890,73 @@ mod blast_radius_visibility_tests {
         store
     }
 
+    fn unresolved_affected_owner_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let repo = |uid: &str| Repo {
+            uid: uid.to_string(),
+            url: format!("https://example.test/{uid}"),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+        let symbol = |uid: &str, name: &str, repo_uid: &str, file: &str, signature: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: signature.to_string(),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        store.insert_repo(&repo("repo:visible")).unwrap();
+        store.insert_repo(&repo("repo:hidden")).unwrap();
+        store
+            .insert_symbol(&symbol(
+                "visible-target",
+                "VisibleTarget",
+                "repo:visible",
+                "src/target.rs",
+                "fn VisibleTarget()",
+            ))
+            .unwrap();
+        // The edge scan reads uid/name/path, but the authoritative symbol-row
+        // lookup rejects this corruption canary while decoding `signature`.
+        store
+            .insert_symbol(&symbol(
+                "hidden-lookup-miss",
+                "HiddenLookupMiss",
+                "repo:hidden",
+                "hidden/lookup-miss.rs",
+                "fn HiddenLookupMiss()\0",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "hidden-lookup-miss".to_string(),
+                target_uid: "visible-target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        store
+    }
+
     /// Redaction must strip the cross-repo (repo:client) org item and affected
     /// symbol when the caller may only see repo:api, while `None` (the
     /// backward-compatible default) leaves the full result intact.
@@ -9162,6 +9229,72 @@ mod blast_radius_visibility_tests {
         );
         let serialized = serde_json::to_string(&sarif).unwrap();
         assert!(!serialized.contains("hidden/private.rs"));
+    }
+
+    #[test]
+    fn blast_radius_authz_drops_unknown_affected_ownership_from_json_and_sarif() {
+        let store = unresolved_affected_owner_store();
+        let visible = VisibleRepos::Only(["repo:visible".to_string()].into_iter().collect());
+        let args = json!({ "changed_files": ["src/target.rs"] });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert_eq!(result["affected_symbol_count"], 0);
+        assert_eq!(result["returned_affected_symbol_count"], 0);
+        assert!(result["affected_symbols"].as_array().unwrap().is_empty());
+        assert!(
+            result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("0 transitively affected")
+        );
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("hidden-lookup-miss"));
+        assert!(!serialized.contains("HiddenLookupMiss"));
+        assert!(!serialized.contains("hidden/lookup-miss.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/target.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let props = &sarif["runs"][0]["properties"];
+        assert_eq!(props["nestweaver/affectedSymbolCount"], 0);
+        assert_eq!(props["nestweaver/returnedAffectedSymbolCount"], 0);
+        assert!(sarif["runs"][0]["results"].as_array().unwrap().is_empty());
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("hidden-lookup-miss"));
+        assert!(!serialized.contains("HiddenLookupMiss"));
+        assert!(!serialized.contains("hidden/lookup-miss.rs"));
+    }
+
+    #[test]
+    fn blast_radius_authz_keeps_resolved_local_affected_symbol_in_json_and_sarif() {
+        let store = mixed_visibility_store();
+        let visible = VisibleRepos::Only(["repo:a".to_string()].into_iter().collect());
+
+        let result = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/target.rs"] }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(serialized.contains("LocalCaller"));
+        assert!(serialized.contains("src/local.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/target.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(serialized.contains("LocalCaller"));
+        assert!(serialized.contains("src/local.rs"));
     }
 }
 
