@@ -4396,8 +4396,9 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
             .unwrap_or_default(),
     );
 
+    let base_ref = args.get("base_ref").and_then(|v| v.as_str());
     if changed_files.is_empty()
-        && let Some(base_ref) = args.get("base_ref").and_then(|v| v.as_str())
+        && let Some(base_ref) = base_ref
     {
         let repo_path = first_local_repo_path(store).unwrap_or_else(|| ".".to_string());
         let files =
@@ -4409,7 +4410,13 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
             .collect();
     }
 
-    if changed_files.is_empty() {
+    // Only a genuine "no input" (neither changed_files nor base_ref) is an error.
+    // A `base_ref` that resolves to ZERO changed files (e.g. HEAD vs HEAD) is a
+    // valid empty diff — run the analysis so the caller still gets the full trust
+    // contract (empty tiers + status/recommendation/disclaimer), matching the
+    // changed_files-with-no-symbols path, instead of an error that drops it
+    // (nw-088).
+    if changed_files.is_empty() && base_ref.is_none() {
         return Err(anyhow!(
             "provide either 'changed_files' (non-empty) or 'base_ref'"
         ));
@@ -4441,7 +4448,7 @@ fn first_local_repo_path(store: &GraphStore) -> Option<String> {
 fn tool_schema_clusters() -> Value {
     json!({
         "name": "clusters",
-        "description": "View the codebase's high-level architecture via Leiden community detection. Groups tightly-connected symbols into named functional clusters.\n\nGuidelines:\n- Adjust resolution: higher = more smaller clusters, lower = fewer larger clusters (default 0.5)\n- Returns cluster name, cohesion score, key files, and up to 20 member symbols per cluster\n- For specific symbol lookup use brain_search; for dependency analysis use brain_impact\n\nLimitations:\n- Clustering is computed on demand, not cached\n- Quality depends on the density and accuracy of indexed call/import edges",
+        "description": "View the codebase's high-level architecture via Leiden community detection. Groups tightly-connected symbols into named functional clusters.\n\nGuidelines:\n- Adjust resolution: higher = more smaller clusters, lower = fewer larger clusters (default 0.5)\n- Returns cluster name, cohesion score, key files, and a 20-member preview per cluster (full `size` reported)\n- Pass cluster_id to get ONE cluster's full member list (paging deep clusters); `members_truncated` flags when even that is capped\n- For specific symbol lookup use brain_search; for dependency analysis use brain_impact\n\nLimitations:\n- Clustering is computed on demand, not cached\n- Quality depends on the density and accuracy of indexed call/import edges",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4449,6 +4456,10 @@ fn tool_schema_clusters() -> Value {
                     "type": "number",
                     "description": "Leiden resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. Default 0.5 (0.3 for large graphs >10K symbols). Try 2.0 for fine-grained modules.",
                     "default": 0.5
+                },
+                "cluster_id": {
+                    "type": "integer",
+                    "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the 20-member preview. Use the same resolution as the call that produced the id."
                 }
             }
         }
@@ -4475,14 +4486,28 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         tracing::warn!("failed to persist clusters sidecar: {e}");
     }
 
+    // nw-090: `cluster_id` pages the FULL membership of a single cluster. Without
+    // it, every cluster returns a 20-member preview (`size` still reports the true
+    // count), which made large clusters' membership unretrievable from the tool.
+    let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
+    // Full membership when a specific cluster is requested (bounded so a giant
+    // cluster can't blow the context window), a small preview otherwise.
+    const FULL_MEMBER_CAP: usize = 2000;
+    const PREVIEW_MEMBER_CAP: usize = 20;
     let clusters_json: Vec<Value> = output
         .communities
         .iter()
+        .filter(|c| requested_id.is_none_or(|id| c.id as i64 == id))
         .map(|c| {
+            let member_cap = if requested_id.is_some() {
+                FULL_MEMBER_CAP
+            } else {
+                PREVIEW_MEMBER_CAP
+            };
             let members: Vec<Value> = c
                 .members
                 .iter()
-                .take(20)
+                .take(member_cap)
                 .map(|m| {
                     json!({
                         "uid": m.uid,
@@ -4498,6 +4523,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 "cohesion": c.cohesion,
                 "key_files": c.key_files,
                 "members": members,
+                "members_truncated": c.members.len() > member_cap,
             })
         })
         .collect();

@@ -24,10 +24,15 @@ use serde::{Deserialize, Serialize};
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
-/// Hard cap on candidate nodes considered in a single search. When the
-/// candidate set (after pre-filtering) exceeds this, results are truncated
-/// and `truncated` is set on the response.
-pub const CANDIDATE_CAP: usize = 5000;
+/// Safety ceiling on how many candidate nodes a single search will SCAN before
+/// stopping (and honestly reporting `truncated`). This is a last-resort bound
+/// well above any realistic corpus — the search is normally bounded by the
+/// wall-clock `deadline_ms`, not this. It must NOT be used to pre-truncate the
+/// candidate list before scanning: doing so (as an earlier 5000 cap did) drops
+/// real matches that sort past the cap in collect order — Sections → Notes →
+/// Symbols, so symbol matches on a large graph were systematically missed and
+/// dishonestly reported as `truncated:true, results:[]` (nw-076).
+pub const CANDIDATE_CAP: usize = 200_000;
 
 /// Default wall-clock budget for a single search, in milliseconds.
 pub const DEFAULT_MAX_MILLIS: u64 = 2000;
@@ -396,14 +401,15 @@ impl GraphStore {
             candidates.retain(|c| uids.contains(&c.uid));
         }
 
-        let mut truncated = candidates.len() > CANDIDATE_CAP;
-        if truncated {
-            candidates.truncate(CANDIDATE_CAP);
-        }
-
+        // Scan the full candidate set, bounded by the wall-clock deadline (and a
+        // high safety ceiling) — NOT a low pre-truncation. `truncated` is set
+        // ONLY when the scan actually stops early, so `truncated:true` with an
+        // empty `results` now genuinely means "incomplete scan" rather than
+        // "the match was ordered past a 5000 cap and never scanned" (nw-076).
+        let mut truncated = false;
         let mut results = Vec::new();
-        for c in &candidates {
-            if start.elapsed().as_millis() as u64 > deadline_ms {
+        for (i, c) in candidates.iter().enumerate() {
+            if start.elapsed().as_millis() as u64 > deadline_ms || i >= CANDIDATE_CAP {
                 truncated = true;
                 break;
             }
@@ -760,5 +766,81 @@ mod tests {
     #[test]
     fn compile_pattern_accepts_normal_pattern() {
         assert!(compile_pattern(r"fn\s+\w+\(").is_ok());
+    }
+
+    #[test]
+    fn regex_search_does_not_drop_a_match_ordered_late_in_the_candidate_set() {
+        // nw-076: the fallback scan used to pre-truncate the candidate list to
+        // the first 5000 nodes in collect order (Sections → Notes → Symbols), so
+        // a match on a symbol ordered past the cap was silently dropped and
+        // dishonestly reported as `truncated:true, results:[]`. With the fix the
+        // full set is scanned (bounded only by the deadline / high safety
+        // ceiling), so a late-ordered match is always found.
+        let store = GraphStore::in_memory().unwrap();
+        // Many non-matching symbols first, then the sole match LAST.
+        for i in 0..300 {
+            store
+                .insert_symbol(&Symbol {
+                    uid: format!("sym:pad:{i}"),
+                    name: format!("filler_{i}"),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:1".to_string(),
+                    file_path: "src/pad.rs".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: format!("fn filler_{i}()"),
+                    summary: None,
+                    content_hash: format!("h{i}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:needle".to_string(),
+                name: "zzz_uniquely_ordered_last".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:1".to_string(),
+                file_path: "src/needle.rs".to_string(),
+                start_line: 7,
+                end_line: 7,
+                signature: "fn zzz_uniquely_ordered_last()".to_string(),
+                summary: None,
+                content_hash: "hn".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let res = store
+            .regex_search("zzz_uniquely_ordered_last", None, None, None, None)
+            .unwrap();
+        assert!(res.scanned_fallback, "no trigram index → scanned_fallback");
+        let uids: HashSet<&str> = res.results.iter().map(|m| m.uid.as_str()).collect();
+        assert!(
+            uids.contains("sym:needle"),
+            "the late-ordered match must be found, got {} results",
+            res.results.len()
+        );
+        // Honesty invariant: a fully-scanned corpus never reports truncated with
+        // an empty result set.
+        assert!(
+            !(res.truncated && res.results.is_empty()),
+            "must never return truncated:true with empty results on a scannable corpus"
+        );
+        assert!(!res.truncated, "small corpus scans fully, so not truncated");
     }
 }
