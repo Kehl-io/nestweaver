@@ -24,6 +24,11 @@ pub struct SymbolWindow {
     pub start_line: u32,
     pub end_line: u32,
     pub body: String,
+    /// False when the source span could not be read (file not found from the
+    /// reader's working directory, or an out-of-range span) — the body is then
+    /// an empty string that would otherwise be indistinguishable from a genuinely
+    /// empty symbol. Callers should pass `root` or run from the repo to fix it.
+    pub body_available: bool,
     /// True when this symbol was pulled in via `neighbors`, not requested directly.
     pub is_neighbor: bool,
 }
@@ -135,8 +140,9 @@ pub fn read_symbols(
     // 3. Build windows, honoring the token budget (input order).
     let mut used = 0usize;
     for (sym, is_neighbor) in ordered {
-        let body =
-            read_span(reader, &sym.file_path, sym.start_line, sym.end_line).unwrap_or_default();
+        let body_opt = read_span(reader, &sym.file_path, sym.start_line, sym.end_line);
+        let body_available = body_opt.is_some();
+        let body = body_opt.unwrap_or_default();
         let cost = window_cost(&body);
         if let Some(budget) = token_budget
             && !result.symbols.is_empty()
@@ -155,6 +161,7 @@ pub fn read_symbols(
             start_line: sym.start_line,
             end_line: sym.end_line,
             body,
+            body_available,
             is_neighbor,
         });
     }
@@ -201,5 +208,27 @@ mod tests {
             w.body
         );
         assert!(w.end_line > w.start_line, "multi-line span");
+        assert!(w.body_available, "body was read, so body_available is true");
+    }
+
+    #[test]
+    fn read_symbols_flags_unreadable_body() {
+        // nw-084: reading with a reader rooted at a directory that doesn't
+        // contain the source file yields an empty body — flag it as unavailable
+        // so callers can tell it apart from a genuinely empty symbol.
+        let (_dir, _src, store) = test_repo();
+        let wrong_root = tempfile::tempdir().unwrap(); // no source files here
+        let reader = FilesystemReader::new(wrong_root.path());
+        let res = read_symbols(&store, &["greet".to_string()], &reader, 0, None);
+        assert_eq!(res.symbols.len(), 1, "symbol still resolves from the graph");
+        let w = &res.symbols[0];
+        assert!(
+            w.body.is_empty(),
+            "body is empty when the file can't be read"
+        );
+        assert!(
+            !w.body_available,
+            "an unreadable source span must set body_available = false"
+        );
     }
 }

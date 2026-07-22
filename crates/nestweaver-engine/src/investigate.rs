@@ -163,7 +163,12 @@ pub struct NeighborRef {
 #[derive(Debug, Clone, Serialize)]
 pub struct HydrateResult {
     pub bundle_id: String,
+    /// Entries whose body was fetched by THIS call.
     pub hydrated: usize,
+    /// Entries that already carried an inline body (nothing to do) — so a
+    /// `hydrated: 0` is distinguishable from a failure. `hydrated + already_hydrated`
+    /// is the count of entries with a body after this call.
+    pub already_hydrated: usize,
     pub entries: Vec<BundleEntry>,
 }
 
@@ -436,8 +441,10 @@ pub fn investigate_hydrate(
 
     let mut used_tokens = 0usize;
     let mut hydrated = 0usize;
+    let mut already_hydrated = 0usize;
     for entry in bundle.entries.iter_mut() {
         if entry.inline_body.is_some() {
+            already_hydrated += 1;
             continue;
         }
         let Some(body) = fetch_full_body(store, &entry.uid, root) else {
@@ -474,6 +481,7 @@ pub fn investigate_hydrate(
     Ok(HydrateResult {
         bundle_id: bundle_id.to_string(),
         hydrated,
+        already_hydrated,
         entries,
     })
 }

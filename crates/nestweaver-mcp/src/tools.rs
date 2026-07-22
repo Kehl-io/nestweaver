@@ -744,6 +744,30 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         }
     }
 
+    // Non-server mode: if any returned symbol's source span could not be read
+    // (file not found from the working directory), the body is an empty string
+    // that looks identical to a genuinely empty symbol. Surface an honest note so
+    // an agent in the wrong cwd knows to pass `root` instead of trusting "".
+    if !is_server_mode() {
+        let unreadable = value
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|s| s.get("body_available").and_then(|b| b.as_bool()) == Some(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        if unreadable > 0 {
+            value["note"] = serde_json::json!(format!(
+                "{unreadable} symbol(s) returned an empty body because their source file could \
+                 not be read from the working directory ({}). Pass `root` (the repo path) or run \
+                 from the repo root to get source spans.",
+                root.display()
+            ));
+        }
+    }
+
     Ok(value)
 }
 
@@ -924,7 +948,7 @@ fn tool_schema_read_symbols() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate token cap for the combined output."
+                    "description": "Approximate token cap for the combined output. The first requested symbol is always returned in full; subsequent symbols are dropped once the budget is exceeded. Omit for no cap; a budget of 0 therefore returns just the first symbol."
                 },
                 "root": {
                     "type": "string",
@@ -6077,7 +6101,12 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             None
         }
     };
+    // `no_cache` / `cache: "bypass"` must skip the summary sidecar too, not just
+    // the F16 response cache — otherwise a caller asking for fresh data got
+    // `cached: true` served from the sidecar, which reads as contradictory.
+    let bypass = cache_bypassed(&args);
     let (summaries, from_cache) = if let Some(ref db) = db_path
+        && !bypass
         && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
     {
         let level_filtered: Vec<nestweaver_engine::Summary> =
@@ -6999,6 +7028,19 @@ fn tool_schema_investigate_hydrate() -> Value {
 }
 
 fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    // hydrate is the BULK operation — it hydrates every un-hydrated entry in the
+    // bundle and takes no per-entry selector. A caller passing `targets`/`uid`/
+    // `uids` has confused it with investigate_expand; those keys were silently
+    // ignored (a no-op that reads as "nothing to hydrate"), so reject them with a
+    // pointer instead, matching investigate_expand's own strictness.
+    for key in ["targets", "uid", "uids"] {
+        if args.get(key).is_some() {
+            return Err(anyhow!(
+                "investigate_hydrate takes no '{key}' — it hydrates the whole bundle. \
+                 Use investigate_expand with 'targets' to hydrate specific entries."
+            ));
+        }
+    }
     let bundle_id = args
         .get("bundle_id")
         .and_then(|v| v.as_str())
@@ -7964,6 +8006,36 @@ mod arg_alias_tests {
         let via_target =
             tool_get_summary(&store, json!({ "level": "symbol", "target": "hello" })).unwrap();
         assert_eq!(via_target["count"], json!(1));
+    }
+
+    #[test]
+    fn investigate_hydrate_rejects_targeting_keys() {
+        // nw-084: hydrate is bulk (no per-entry selector). Passing targets/uid/
+        // uids was silently ignored (looked like "nothing hydrated"); now it's a
+        // clear error pointing to investigate_expand, matching expand's strictness.
+        let store = GraphStore::in_memory().unwrap();
+        for key in ["targets", "uid", "uids"] {
+            let err = tool_investigate_hydrate(
+                &store,
+                json!({ "bundle_id": "bndl_x", key: ["sym:whatever"] }),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("investigate_hydrate takes no") && err.contains("investigate_expand"),
+                "expected a pointer to investigate_expand for key {key}, got: {err}"
+            );
+        }
+        // A well-formed call (no targeting keys) gets PAST the new validation —
+        // it fails later on db-path/bundle resolution, not on a targeting-key
+        // rejection.
+        let err = tool_investigate_hydrate(&store, json!({ "bundle_id": "bndl_missing" }))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("investigate_hydrate takes no"),
+            "a well-formed call must pass targeting-key validation, got: {err}"
+        );
     }
 }
 
