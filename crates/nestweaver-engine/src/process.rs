@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use nestweaver_store::GraphStore;
 
+use crate::blast_radius::{AnalysisStatus, GateState, Notification, NotificationLevel};
+
 /// A traced execution process rooted at an entry-point symbol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessResult {
@@ -36,6 +38,12 @@ pub struct ChangeImpact {
     pub affected_processes: Vec<AffectedProcess>,
     pub risk: RiskLevel,
     pub blast_radius: usize,
+    #[serde(default)]
+    pub status: AnalysisStatus,
+    #[serde(default)]
+    pub notifications: Vec<Notification>,
+    #[serde(default)]
+    pub gate_state: GateState,
 }
 
 /// A symbol affected by a file change.
@@ -338,9 +346,28 @@ pub fn detect_changes_impact(
     // Step 1: collect all symbols in changed files.
     let mut affected_symbols = Vec::new();
     let mut affected_uids: HashSet<String> = HashSet::new();
+    let mut status = AnalysisStatus::Complete;
+    let mut notifications = Vec::new();
+    let mut unassessed = Vec::new();
 
     for file_path in changed_files {
-        let syms = store.symbols_in_file(file_path).unwrap_or_default();
+        let syms = match store.symbols_in_file(file_path) {
+            Ok(syms) => syms,
+            Err(e) => {
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!("mapping changed file {file_path} to symbols failed: {e}"),
+                    descriptor: "store.symbols-in-file-failed".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+                continue;
+            }
+        };
+        if syms.is_empty()
+            && nestweaver_parser::detect_language(std::path::Path::new(file_path)).is_some()
+        {
+            unassessed.push(file_path.as_str());
+        }
         for sym in syms {
             if affected_uids.insert(sym.uid.clone()) {
                 affected_symbols.push(AffectedSymbol {
@@ -351,14 +378,31 @@ pub fn detect_changes_impact(
             }
         }
     }
+    if !unassessed.is_empty() {
+        status = status.max(AnalysisStatus::Partial);
+        notifications.push(Notification {
+            level: NotificationLevel::Warning,
+            message: format!(
+                "changed source file(s) with no indexed symbols (new file, stale index, or path \
+                 drift) — their impact was not assessed: {}",
+                unassessed.join(", ")
+            ),
+            descriptor: "changed-file-no-symbols".to_string(),
+        });
+    }
 
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
     if affected_uids.is_empty() {
+        let risk = RiskLevel::Low;
+        let gate_state = crate::blast_radius::derive_gate_state(status, risk);
         return Ok(ChangeImpact {
             affected_symbols,
             affected_processes: Vec::new(),
-            risk: RiskLevel::Low,
+            risk,
             blast_radius: 0,
+            status,
+            notifications,
+            gate_state,
         });
     }
 
@@ -438,12 +482,16 @@ pub fn detect_changes_impact(
     };
 
     let blast_radius = affected_symbols.len() + affected_processes.len();
+    let gate_state = crate::blast_radius::derive_gate_state(status, risk);
 
     Ok(ChangeImpact {
         affected_symbols,
         affected_processes,
         risk,
         blast_radius,
+        status,
+        notifications,
+        gate_state,
     })
 }
 
@@ -459,13 +507,37 @@ mod tests {
     }
 
     #[test]
-    fn detect_changes_impact_returns_low_risk_for_unknown_files() {
+    fn detect_changes_impact_marks_unknown_source_incomplete() {
         let store = GraphStore::in_memory().expect("in_memory store");
         let impact = detect_changes_impact(&store, &["nonexistent/file.rs".to_string()], 10)
             .expect("detect_changes_impact");
         assert_eq!(impact.risk, RiskLevel::Low);
+        assert_eq!(impact.status, AnalysisStatus::Partial);
+        assert_eq!(impact.gate_state, GateState::DegradedUnknown);
+        assert!(
+            impact
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols")
+        );
         assert!(impact.affected_symbols.is_empty());
         assert!(impact.affected_processes.is_empty());
+    }
+
+    #[test]
+    fn detect_changes_impact_ignores_zero_symbol_non_source_files() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let impact = detect_changes_impact(&store, &["README.md".to_string()], 10)
+            .expect("detect_changes_impact");
+
+        assert_eq!(impact.status, AnalysisStatus::Complete);
+        assert_eq!(impact.gate_state, GateState::Ok);
+        assert!(
+            !impact
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols")
+        );
     }
 
     #[test]

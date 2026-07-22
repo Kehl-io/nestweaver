@@ -256,7 +256,7 @@ pub struct CoChangedFile {
 /// NON-NEGOTIABLE rule: a run that did not complete is never `RiskFlagged`
 /// (we cannot trust an incomplete traversal to have found the risk), it is
 /// `DegradedUnknown`.
-fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState {
+pub(crate) fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState {
     if status != AnalysisStatus::Complete {
         GateState::DegradedUnknown
     } else if matches!(risk_level, RiskLevel::High) {
@@ -419,43 +419,20 @@ pub fn analyze_blast_radius(
             }
         };
 
-        // A successful lookup that resolves 0 symbols is suspicious *only* when
-        // (a) we scoped to a repo the graph actually knows, and (b) the file is
-        // a recognized source file we would expect to have indexed. That points
-        // at path drift or a not-yet-reindexed source file. We deliberately stay
-        // silent for non-source files (docs, config, assets, lockfiles) — which
-        // most PRs touch — and when there is no target repo to judge against, so
-        // a healthy change never gates as degraded on benign files.
+        // A successful lookup that resolves 0 symbols is suspicious for any
+        // recognized source file: it may be new, the index may be stale, or the
+        // path may have drifted. Non-source files legitimately have no symbols.
         if syms.is_empty() {
-            let is_source = nestweaver_parser::detect_language(file).is_some();
-            if let Some(repo) = target_repo
-                && known_repo_uids.contains(repo)
-                && is_source
-            {
-                // Scoped to a known repo: a source file with no symbols is a real
-                // drift/stale signal — warn and degrade the run.
+            if nestweaver_parser::detect_language(file).is_some() {
                 notifications.push(Notification {
                     level: NotificationLevel::Warning,
                     message: format!(
-                        "changed file {file_str} mapped to 0 symbols (possible path-format \
-                         drift or unindexed file)"
+                        "changed source file {file_str} has no indexed symbols (new file, stale \
+                         index, or path drift) — its impact was not assessed"
                     ),
                     descriptor: "changed-file-no-symbols".to_string(),
                 });
                 status = status.max(AnalysisStatus::Partial);
-            } else if target_repo.is_none() && !known_repo_uids.is_empty() && is_source {
-                // Unscoped (e.g. pre-push CLI) against a non-empty index: a source
-                // file with no symbols is likely new or the index is stale. Inform
-                // without gating — new files are common and shouldn't degrade the
-                // verdict, but the reviewer should know its impact isn't assessed.
-                notifications.push(Notification {
-                    level: NotificationLevel::Note,
-                    message: format!(
-                        "changed source file {file_str} has no indexed symbols (new file or \
-                         stale index) — its impact was not assessed"
-                    ),
-                    descriptor: "changed-file-no-symbols".to_string(),
-                });
             }
             continue;
         }
@@ -1231,6 +1208,11 @@ mod tests {
             "empty index must surface an index-empty notification: {:?}",
             result.notifications
         );
+        assert!(result.notifications.iter().any(|n| {
+            n.level == NotificationLevel::Warning
+                && n.descriptor == "changed-file-no-symbols"
+                && n.message.contains("nonexistent.rs")
+        }));
     }
 
     #[test]
@@ -2004,6 +1986,41 @@ mod tests {
             result.notifications
         );
         assert_eq!(result.gate_state, GateState::Ok);
+    }
+
+    #[test]
+    fn unscoped_changed_source_without_symbols_is_unknown() {
+        use nestweaver_schema::Repo;
+
+        let store = GraphStore::in_memory().expect("store");
+        store
+            .insert_repo(&Repo {
+                uid: "repo:1".to_string(),
+                url: "https://example.com/repo".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst-1".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .expect("insert repo");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/new_module.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .expect("analysis");
+
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.gate_state, GateState::DegradedUnknown);
+        assert!(result.notifications.iter().any(|n| {
+            n.level == NotificationLevel::Warning
+                && n.descriptor == "changed-file-no-symbols"
+                && n.message.contains("src/new_module.rs")
+        }));
     }
 
     #[test]

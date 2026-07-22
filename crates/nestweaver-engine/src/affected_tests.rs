@@ -298,7 +298,7 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     // "recently new/changed" tests; missing them during the stale-index window
     // was a silent under-selection. A changed non-test SOURCE file is
     // disclosed as unassessed (mirrors blast_radius's changed-file-no-symbols
-    // honesty) without gating — new files are common.
+    // honesty) and forces fail-safe widening to the full suite.
     let selected_files: HashSet<&str> = tier_1
         .iter()
         .chain(&tier_2)
@@ -337,10 +337,12 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
         });
     }
     if !unassessed.is_empty() {
+        status = status.max(AnalysisStatus::Partial);
         notifications.push(Notification {
-            level: NotificationLevel::Note,
+            level: NotificationLevel::Warning,
             message: format!(
-                "changed source file(s) with no indexed symbols (new file or stale                  index) — their impact was not assessed: {}",
+                "changed source file(s) with no indexed symbols (new file or stale index) — \
+                 their impact was not assessed: {}",
                 unassessed.join(", ")
             ),
             descriptor: "changed-file-no-symbols".to_string(),
@@ -807,6 +809,30 @@ mod tests {
             "unindexed changed source must be disclosed: {:?}",
             result.notifications
         );
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.recommendation, "run-full-suite");
+        let notice = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "changed-file-no-symbols")
+            .expect("unknown source must be disclosed");
+        assert_eq!(notice.level, NotificationLevel::Warning);
+        assert!(notice.message.contains("src/also_new.rs"));
+    }
+
+    #[test]
+    fn unindexed_docs_only_change_keeps_selection_usable() {
+        let store = GraphStore::in_memory().expect("store");
+        let result = affected_tests(&store, &["README.md".to_string()]).expect("ok");
+
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.recommendation, "selection-usable");
+        assert!(
+            !result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols")
+        );
     }
 
     /// The always-include rule must not duplicate a test file the graph
@@ -837,7 +863,7 @@ mod tests {
     fn degraded_run_recommends_full_suite() {
         // Complete run: selection usable end-to-end.
         let store = GraphStore::in_memory().expect("store");
-        let ok = affected_tests(&store, &["src/a.rs".to_string()]).expect("ok");
+        let ok = affected_tests(&store, &["README.md".to_string()]).expect("ok");
         assert_eq!(ok.status, AnalysisStatus::Complete);
         assert_eq!(ok.recommendation, "selection-usable");
         // Fail-safe widening (TIA precedent): ANY non-complete status must

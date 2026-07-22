@@ -4287,7 +4287,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Treat `risk` as usable only when `status == complete`; `degraded-unknown` requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4352,6 +4352,9 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     Ok(json!({
         "files": files,
         "risk": risk_str,
+        "status": serde_json::to_value(impact.status)?,
+        "gate_state": serde_json::to_value(impact.gate_state)?,
+        "notifications": serde_json::to_value(&impact.notifications)?,
         "blast_radius": impact.blast_radius,
         "affected_symbols": affected_symbols,
         "affected_symbol_count": impact.affected_symbols.len(),
@@ -8141,6 +8144,29 @@ mod arg_alias_tests {
         let via_alias = tool_detect_changes(&store, json!({ "files": ["src/b.rs"] })).unwrap();
         assert_eq!(via_alias["files"], json!(["src/b.rs"]));
         assert!(tool_detect_changes(&store, json!({})).is_err());
+    }
+
+    #[test]
+    fn detect_changes_surfaces_unknown_source_trust_fields() {
+        let store = GraphStore::in_memory().unwrap();
+        let result = dispatch(
+            &store,
+            None,
+            "detect_changes",
+            json!({ "changed_files": ["src/new.rs"] }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["status"], json!("partial"));
+        assert_eq!(result["gate_state"], json!("degraded-unknown"));
+        assert!(
+            result["notifications"]
+                .as_array()
+                .expect("serialized notifications")
+                .iter()
+                .any(|n| n["descriptor"] == json!("changed-file-no-symbols"))
+        );
     }
 
     #[test]
