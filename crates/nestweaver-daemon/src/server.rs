@@ -1267,17 +1267,56 @@ fn finish_reconciled_mutation<T>(
     operation: &str,
     failures: Vec<nestweaver_engine::DeletionReconciliationFailure>,
 ) -> Result<T, Status> {
-    if failures.is_empty() {
-        return mutation;
-    }
-    let reconciliation = nestweaver_engine::DeletionReconciliationError::new(operation, failures);
     match mutation {
-        Ok(_) => Err(Status::internal(reconciliation.to_string())),
-        Err(mutation) => Err(Status::new(
-            mutation.code(),
-            format!("{}; {reconciliation}", mutation.message()),
-        )),
+        // The destructive mutation COMMITTED. Post-commit reconciliation failures
+        // (a generation-bump, a sidecar removal, an embedding/search reconcile)
+        // must NOT turn a durable success into a reported FAILURE (nw-091 / Bug 2)
+        // — that made a user believe a committed remove_vault had not happened and
+        // take corrective action against already-deleted data (752 → 1 notes).
+        // Return success; the reconciliation debt is logged loudly and is
+        // idempotently retryable by re-running the operation (a re-run is a
+        // confirmed no-op that re-runs finalize). Handlers whose response carries
+        // `committed` / `reconciliation_failures` stamp them BEFORE calling this.
+        Ok(response) => {
+            if !failures.is_empty() {
+                let reconciliation =
+                    nestweaver_engine::DeletionReconciliationError::new(operation, failures);
+                tracing::error!(
+                    operation,
+                    reconciliation = %reconciliation,
+                    "mutation COMMITTED but post-commit reconciliation failed; re-run the \
+                     operation to retry reconciliation"
+                );
+            }
+            Ok(response)
+        }
+        // Genuine failure: the mutation did NOT commit. Fold in any finalize noise.
+        Err(status) if failures.is_empty() => Err(status),
+        Err(status) => {
+            let reconciliation =
+                nestweaver_engine::DeletionReconciliationError::new(operation, failures);
+            Err(Status::new(
+                status.code(),
+                format!("{}; {reconciliation}", status.message()),
+            ))
+        }
     }
+}
+
+/// Convert engine reconciliation failures into their wire form so a committed
+/// mutation can honestly report "succeeded, but N post-commit steps failed"
+/// (nw-091 / Bug 2).
+fn to_proto_reconciliation_failures(
+    failures: &[nestweaver_engine::DeletionReconciliationFailure],
+) -> Vec<nestweaver_proto::ReconciliationFailure> {
+    failures
+        .iter()
+        .map(|f| nestweaver_proto::ReconciliationFailure {
+            stage: f.stage.to_string(),
+            repo_uid: f.repo_uid.clone().unwrap_or_default(),
+            message: f.message.clone(),
+        })
+        .collect()
 }
 
 fn append_search_reconciliation(
@@ -1334,6 +1373,7 @@ where
             .map(|()| RemoveRepoResponse {
                 files_deleted: file_count as u64,
                 symbols_deleted: sym_count as u64,
+                ..Default::default()
             }),
         Err(error) => Err(error),
     };
@@ -1348,6 +1388,14 @@ where
     .map(|error| error.failures)
     .unwrap_or_default();
 
+    // nw-091 / Bug 2: mark the committed response so a post-commit reconciliation
+    // failure is reported as success-with-warnings, never a bare error.
+    let reconciliation_failures = to_proto_reconciliation_failures(&reconciliation);
+    let mutation = mutation.map(|mut response| {
+        response.committed = true;
+        response.reconciliation_failures = reconciliation_failures;
+        response
+    });
     finish_reconciled_mutation(mutation, "repo removal", reconciliation)
 }
 
@@ -1400,6 +1448,7 @@ where
             (
                 Ok(RemoveProjectResponse {
                     project_name: outcome.project_name.unwrap_or_default(),
+                    ..Default::default()
                 }),
                 finalize_needed,
                 cleanup,
@@ -1456,6 +1505,12 @@ where
         failures.extend(finalize(state, "project removal"));
     }
 
+    let reconciliation_failures = to_proto_reconciliation_failures(&failures);
+    let mutation = mutation.map(|mut response| {
+        response.committed = true;
+        response.reconciliation_failures = reconciliation_failures;
+        response
+    });
     finish_reconciled_mutation(mutation, "project removal", failures)
 }
 
@@ -1538,6 +1593,8 @@ where
         None => Ok(PruneStaleResponse {
             removed_repos: removed_repos.names,
             removed_vaults,
+            committed: true,
+            reconciliation_failures: to_proto_reconciliation_failures(&failures),
         }),
     };
     finish_reconciled_mutation(mutation, "prune_stale", failures)
@@ -2050,9 +2107,15 @@ fn run_remove_vault_with_projection(
         }
     }
 
+    let reconciliation_failures = to_proto_reconciliation_failures(&failures);
     finish_reconciled_mutation(
         mutation.map(|outcome| RemoveVaultResponse {
             notes_deleted: outcome.notes_deleted as u64,
+            // committed reflects whether the delete actually changed durable state,
+            // so a confirmed no-op stays distinguishable from a committed delete
+            // (nw-091 / Bug 2 — "nothing happened" must remain a distinct signal).
+            committed: outcome.changed,
+            reconciliation_failures,
         }),
         "remove_vault",
         failures,
@@ -3315,6 +3378,12 @@ impl NestWeaverDaemon for DaemonService {
                 projects_reparented: result.projects as u64,
                 discarded_vaults,
                 repos_needing_reindex: result.repos_moved,
+                // Reaching here means the merge committed (nw-091 / Bug 2).
+                // Reconciliation warnings, if any, are logged by
+                // finish_reconciled_mutation; wire-surfacing them for merge would
+                // require threading them through the internal MergeResult path.
+                committed: true,
+                reconciliation_failures: Vec::new(),
             })
         })
         .await
@@ -8018,6 +8087,13 @@ mod startup_helper_tests {
         .unwrap();
 
         assert_eq!(response.notes_deleted, 0);
+        // nw-091 / Bug 2 boundary: a confirmed no-op stays distinguishable from a
+        // committed delete — committed:false and no reconciliation warnings.
+        assert!(
+            !response.committed,
+            "a confirmed no-op did not commit anything"
+        );
+        assert!(response.reconciliation_failures.is_empty());
         assert_eq!(state.store.graph_generation(), generation_before);
         assert!(pagerank_path.exists());
         assert!(state.store.has_embedding("note:nonexistent-vault-noop"));
@@ -8078,10 +8154,24 @@ mod startup_helper_tests {
         });
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
 
-        let error = service.remove_vault(request).await.unwrap_err();
+        // nw-091 / Bug 2: a post-commit reconciliation failure on an ALREADY-
+        // COMMITTED delete must be reported as success-with-warnings, NOT a bare
+        // error. The prior contract (unwrap_err / Code::Internal) is exactly what
+        // made a user believe a committed remove_vault had not happened and take
+        // corrective action against already-deleted data (752 → 1 notes).
+        let response = service.remove_vault(request).await.unwrap().into_inner();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("embedding-index"));
+        assert!(response.committed, "the vault delete durably committed");
+        assert!(
+            response
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("embedding")),
+            "the embedding-index reconciliation failure must surface as a warning, got: {:?}",
+            response.reconciliation_failures
+        );
+        // The mutation genuinely committed (this is what makes the honest
+        // "committed + warnings" response correct, not a lie).
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
         assert!(state.store.graph_generation() > generation_before);
         assert!(
@@ -8144,11 +8234,19 @@ mod startup_helper_tests {
                 Err(anyhow::anyhow!("injected Tantivy rebuild failure"))
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("search-index"));
-        assert!(error.message().contains("injected Tantivy rebuild failure"));
+        // nw-091 / Bug 2: committed prune → success-with-warnings (`error` binds the Ok response).
+        assert!(error.committed);
+        assert!(
+            error
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("search-index")
+                    || f.message.contains("injected Tantivy rebuild failure")),
+            "search-index failure must surface as a warning, got: {:?}",
+            error.reconciliation_failures
+        );
         assert!(
             state.store.graph_generation() > generation_before,
             "generation finalization must precede the surfaced search failure"
@@ -8214,7 +8312,7 @@ mod startup_helper_tests {
             "/missing/merge-search-failure",
         );
 
-        let error = run_merge_instance_with(
+        run_merge_instance_with(
             &state,
             "merge-search-source",
             "merge-search-target",
@@ -8225,11 +8323,10 @@ mod startup_helper_tests {
             },
             |_state, _mutation, _operation| Err(anyhow::anyhow!("injected merge search failure")),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("search-index"));
-        assert!(error.message().contains("injected merge search failure"));
+        // nw-091 / Bug 2: the merge COMMITTED (asserted below); the search
+        // finalizer failure is logged, not returned as an error.
         assert!(
             state
                 .store
@@ -8288,7 +8385,7 @@ mod startup_helper_tests {
             .unwrap();
         let generation_before = state.store.graph_generation();
 
-        let error = run_merge_instance_with_extension_ops(
+        run_merge_instance_with_extension_ops(
             &state,
             "old",
             "new",
@@ -8301,14 +8398,10 @@ mod startup_helper_tests {
             |_store, _db_path, _from, _to| Ok(((), true)),
             |_db_path, _migration| Err(anyhow::anyhow!("injected atomic finalize write failure")),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.message().contains("extension-metadata"));
-        assert!(
-            error
-                .message()
-                .contains("injected atomic finalize write failure")
-        );
+        // nw-091 / Bug 2: merge COMMITTED; the extension-metadata finalize failure
+        // is logged, not returned as an error.
         assert!(!state.store.project_exists("proj:old:finalize").unwrap());
         assert!(state.store.graph_generation() > generation_before);
         assert!(
@@ -8340,7 +8433,7 @@ mod startup_helper_tests {
             serde_json::json!({"retry": [true, {"depth": 2}]}),
         );
 
-        let first_error = run_merge_instance_with_extension_ops(
+        run_merge_instance_with_extension_ops(
             &state,
             "old",
             "new",
@@ -8364,8 +8457,9 @@ mod startup_helper_tests {
                 ))
             },
         )
-        .unwrap_err();
-        assert!(first_error.message().contains("extension-metadata"));
+        .unwrap();
+        // nw-091 / Bug 2: merge COMMITTED; the extension-metadata failure is logged
+        // and the durable journal drives the retry (asserted below).
         assert!(!state.store.project_exists(&source_uid).unwrap());
         let staged = nestweaver_engine::load_extensions(&state.db_path);
         assert!(staged.contains_key(&source_uid));
@@ -8825,7 +8919,7 @@ mod startup_helper_tests {
         let source_vault_uid = vault_uid("old", root);
         seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
 
-        let error = run_merge_instance_with(
+        run_merge_instance_with(
             &state,
             "old",
             "new",
@@ -8840,12 +8934,10 @@ mod startup_helper_tests {
                 ))
             },
         )
-        .unwrap_err();
-        assert!(
-            error
-                .message()
-                .contains("persisted search finalizer failure")
-        );
+        .unwrap();
+        // nw-091 / Bug 2: the merge COMMITTED; a post-commit finalizer failure is
+        // logged and the journal is retained at graph_applied for retry (asserted
+        // below), not returned as an error that reads as "the merge failed".
         let pending =
             nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
         assert!(pending.graph_applied());
@@ -8888,7 +8980,7 @@ mod startup_helper_tests {
         let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
         std::fs::create_dir(&generation_path).unwrap();
 
-        let error = run_merge_instance_with(
+        run_merge_instance_with(
             &state,
             "old",
             "new",
@@ -8899,8 +8991,9 @@ mod startup_helper_tests {
             },
             |_state, _mutation, _operation| Ok(()),
         )
-        .unwrap_err();
-        assert!(error.message().contains("generation-persistence"));
+        .unwrap();
+        // nw-091 / Bug 2: merge COMMITTED; the generation-persistence failure is
+        // logged and the journal is retained at graph_applied for retry, below.
         let pending =
             nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
         assert!(pending.graph_applied());
@@ -8925,7 +9018,7 @@ mod startup_helper_tests {
         Arc::get_mut(&mut state).unwrap().search_reconciliation =
             SearchIndexReconciliation::Unavailable("injected writer outage".to_string());
 
-        let error = run_merge_instance_with(
+        run_merge_instance_with(
             &state,
             "old",
             "new",
@@ -8936,12 +9029,9 @@ mod startup_helper_tests {
             },
             rebuild_tantivy_after_mutation,
         )
-        .unwrap_err();
-        assert!(
-            error
-                .message()
-                .contains("configured Tantivy index unavailable")
-        );
+        .unwrap();
+        // nw-091 / Bug 2: merge COMMITTED; the search-unavailable finalizer failure
+        // is logged and the journal is retained at graph_applied for retry, below.
         let pending =
             nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
         assert!(pending.graph_applied());
@@ -10061,10 +10151,18 @@ mod startup_helper_tests {
                 })
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("generation-persistence"));
+        // nw-091 / Bug 2: committed delete → success-with-warnings (`error` binds the Ok response).
+        assert!(error.committed);
+        assert!(
+            error
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("generation-persistence")),
+            "generation-persistence failure must surface as a warning, got: {:?}",
+            error.reconciliation_failures
+        );
         assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
         assert!(state.store.graph_generation() > generation_before);
     }
@@ -10098,9 +10196,20 @@ mod startup_helper_tests {
                 })
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.message().contains("extension-metadata"));
+        // nw-091 / Bug 2: a committed delete with a post-commit reconciliation
+        // failure returns success-with-warnings, never a bare error. (`error` here
+        // now binds the Ok response.)
+        assert!(error.committed);
+        assert!(
+            error
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("extension-metadata")),
+            "extension-metadata failure must surface as a warning, got: {:?}",
+            error.reconciliation_failures
+        );
         assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
         assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
 
@@ -10473,11 +10582,20 @@ mod startup_helper_tests {
             nestweaver_engine::remove_extension_uid_durable,
             finalize_node_graph_deletion,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("generation-persistence"));
-        assert!(error.message().contains("exhaust"));
+        // nw-091 / Bug 2: committed delete → success-with-warnings (`error` binds the Ok response).
+        assert!(error.committed);
+        assert!(
+            error
+                .reconciliation_failures
+                .iter()
+                .any(
+                    |f| f.stage.contains("generation-persistence") || f.message.contains("exhaust")
+                ),
+            "generation-persistence exhaustion must surface as a warning, got: {:?}",
+            error.reconciliation_failures
+        );
         assert!(
             state
                 .store
@@ -10514,16 +10632,22 @@ mod startup_helper_tests {
                 nestweaver_engine::remove_extension_uid_durable,
                 finalize_node_graph_deletion,
             )
-            .unwrap_err();
+            .unwrap();
 
-            assert_eq!(error.code(), tonic::Code::Internal);
+            // nw-091 / Bug 2: committed delete → success-with-warnings (`error` binds the Ok response).
+            assert!(error.committed);
+            let expected_stage = if failure == "generation" {
+                "generation-persistence"
+            } else {
+                "persisted-pagerank"
+            };
             assert!(
-                error.message().contains(if failure == "generation" {
-                    "generation-persistence"
-                } else {
-                    "persisted-pagerank"
-                }),
-                "unexpected {failure} error: {error}"
+                error
+                    .reconciliation_failures
+                    .iter()
+                    .any(|f| f.stage.contains(expected_stage)),
+                "unexpected {failure} reconciliation: {:?}",
+                error.reconciliation_failures
             );
             assert!(
                 state
@@ -10783,13 +10907,18 @@ mod startup_helper_tests {
             |_db_path, _uid| anyhow::bail!("injected extension cleanup failure"),
             finalize_node_graph_deletion,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.message().contains("extension-metadata"));
+        // nw-091 / Bug 2: committed delete → success-with-warnings (`error` binds the Ok response).
+        assert!(error.committed);
         assert!(
             error
-                .message()
-                .contains("injected extension cleanup failure")
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("extension-metadata")
+                    || f.message.contains("injected extension cleanup failure")),
+            "extension-metadata failure must surface as a warning, got: {:?}",
+            error.reconciliation_failures
         );
         assert!(nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid));
 

@@ -107,8 +107,22 @@ message RemoveVaultRequest {
   string vault_uid = 1;
 }
 
+// One post-commit reconciliation stage that failed AFTER a mutation durably
+// committed. Its presence on a response NEVER means the mutation was rolled back.
+message ReconciliationFailure {
+  string stage = 1;
+  string repo_uid = 2;  // empty when not repo-scoped
+  string message = 3;
+}
+
 message RemoveVaultResponse {
   uint64 notes_deleted = 1;
+  // True once the destructive mutation durably committed — even if post-commit
+  // reconciliation failed. When true, the delete HAPPENED.
+  bool committed = 2;
+  // Non-empty => the delete SUCCEEDED but N post-commit reconciliation steps
+  // failed (retry by re-running the op). NOT a rollback signal.
+  repeated ReconciliationFailure reconciliation_failures = 3;
 }
 
 message RemoveRepoRequest {
@@ -118,6 +132,8 @@ message RemoveRepoRequest {
 message RemoveRepoResponse {
   uint64 files_deleted = 1;
   uint64 symbols_deleted = 2;
+  bool committed = 3;
+  repeated ReconciliationFailure reconciliation_failures = 4;
 }
 
 message RemoveProjectRequest {
@@ -126,6 +142,8 @@ message RemoveProjectRequest {
 
 message RemoveProjectResponse {
   string project_name = 1;
+  bool committed = 2;
+  repeated ReconciliationFailure reconciliation_failures = 3;
 }
 
 message PruneStaleRequest {}
@@ -133,6 +151,8 @@ message PruneStaleRequest {}
 message PruneStaleResponse {
   repeated string removed_repos = 1;
   repeated string removed_vaults = 2;
+  bool committed = 3;
+  repeated ReconciliationFailure reconciliation_failures = 4;
 }
 
 message MergeInstanceRequest {
@@ -149,6 +169,8 @@ message MergeInstanceResponse {
   // removed during migration. Force re-index recreates those rows under the
   // target instance. Non-empty means the caller should warn the user.
   repeated string repos_needing_reindex = 5;
+  bool committed = 6;
+  repeated ReconciliationFailure reconciliation_failures = 7;
 }
 
 message PurgeInstanceRequest {

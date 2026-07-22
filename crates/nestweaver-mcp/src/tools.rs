@@ -6368,6 +6368,22 @@ pub fn is_server_mode() -> bool {
 pub type DaemonGrpcClient =
     nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient<tonic::transport::Channel>;
 
+/// Render post-commit reconciliation failures as human-readable warning strings
+/// for an MCP `reconciliation_warnings` field (nw-091 / Bug 2).
+#[cfg(feature = "daemon")]
+fn reconciliation_warnings(failures: &[nestweaver_proto::ReconciliationFailure]) -> Vec<String> {
+    failures
+        .iter()
+        .map(|f| {
+            if f.repo_uid.is_empty() {
+                format!("{}: {}", f.stage, f.message)
+            } else {
+                format!("{} ({}): {}", f.stage, f.repo_uid, f.message)
+            }
+        })
+        .collect()
+}
+
 /// Dispatch an MCP tool call through the daemon gRPC service instead of
 /// opening the DB directly. Maps each MCP tool name to the corresponding
 /// gRPC RPC on the `NestWeaverDaemon` service.
@@ -6431,7 +6447,12 @@ pub fn dispatch_via_daemon(
                 "name": repo.name.clone().unwrap_or_else(|| repo.url.clone()),
                 "uid": repo.uid,
                 "files_deleted": inner.files_deleted,
-                "symbols_deleted": inner.symbols_deleted
+                "symbols_deleted": inner.symbols_deleted,
+                // nw-091 / Bug 2: committed=true means the delete HAPPENED even if
+                // some post-commit reconciliation step failed — surfaced as warnings,
+                // never as an RPC error that reads as "nothing happened".
+                "committed": inner.committed,
+                "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
             }));
         }
 
@@ -6478,7 +6499,9 @@ pub fn dispatch_via_daemon(
                 "kind": "vault",
                 "name": vault.name.clone(),
                 "uid": vault.uid,
-                "notes_deleted": inner.notes_deleted
+                "notes_deleted": inner.notes_deleted,
+                "committed": inner.committed,
+                "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
             }));
         }
 
