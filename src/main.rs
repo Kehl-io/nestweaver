@@ -3511,9 +3511,13 @@ fn no_daemon_allowed() -> bool {
 ///
 /// A daemon bypass is *requested* by the flag or by `NESTWEAVER_NO_DAEMON`, but
 /// only *honored* when [`no_daemon_allowed`] is true. When a bypass is requested
-/// but refused, warn once and fall back to the daemon. Returns `true` to use the
-/// daemon, `false` to bypass it.
-fn resolve_use_daemon(no_daemon_flag: bool) -> bool {
+/// but refused, warn once (if `warn`) and fall back to the daemon. Returns `true`
+/// to use the daemon, `false` to bypass it.
+///
+/// `warn` is suppressed for the `daemon` subcommand: an autostarted daemon child
+/// inherits `NESTWEAVER_NO_DAEMON` from its parent, but it never bypasses (it *is*
+/// the server), so warning there just double-prints the parent's message.
+fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
     let requested = no_daemon_flag || std::env::var_os("NESTWEAVER_NO_DAEMON").is_some();
     if !requested {
         return true;
@@ -3521,11 +3525,13 @@ fn resolve_use_daemon(no_daemon_flag: bool) -> bool {
     if no_daemon_allowed() {
         return false; // genuine CI/test context — honor the bypass
     }
-    eprintln!(
-        "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a CI/test-only escape hatch that \
-         bypasses the daemon and risks WAL corruption. Ignoring it and routing through the \
-         daemon. Set NESTWEAVER_ALLOW_NO_DAEMON=1 (or run in CI) to force the bypass."
-    );
+    if warn {
+        eprintln!(
+            "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a CI/test-only escape hatch that \
+             bypasses the daemon and risks WAL corruption. Ignoring it and routing through the \
+             daemon. Set NESTWEAVER_ALLOW_NO_DAEMON=1 (or run in CI) to force the bypass."
+        );
+    }
     true
 }
 
@@ -3533,7 +3539,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
     let no_embed = cli.no_embed;
-    let use_daemon = resolve_use_daemon(cli.no_daemon);
+    let use_daemon = resolve_use_daemon(
+        cli.no_daemon,
+        !matches!(cli.command, Commands::Daemon { .. }),
+    );
     match cli.command {
         Commands::ListRepos {
             instance,
@@ -6075,7 +6084,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
-            let use_daemon_mcp = resolve_use_daemon(no_daemon);
+            let use_daemon_mcp = resolve_use_daemon(no_daemon, true);
             if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
