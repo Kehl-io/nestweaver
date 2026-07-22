@@ -182,22 +182,104 @@ fn tool_validators() -> &'static std::collections::HashMap<String, jsonschema::V
     })
 }
 
+const MAX_VALIDATION_ITEM_BYTES: usize = 192;
+const MAX_VALIDATION_ERROR_BYTES: usize = 1024;
+const MAX_TOOL_NAME_IN_ERROR_BYTES: usize = 96;
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    const ELLIPSIS: &str = "…";
+    let suffix = if max_bytes >= ELLIPSIS.len() {
+        ELLIPSIS
+    } else {
+        ""
+    };
+    let mut end = max_bytes - suffix.len();
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut bounded = String::with_capacity(max_bytes);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(suffix);
+    bounded
+}
+
+fn missing_alias_requirement(name: &str, args: &Value) -> Option<&'static str> {
+    if !args.is_object() {
+        return None;
+    }
+
+    let (first, second, message) = match name {
+        "read_symbols" => (
+            "targets",
+            "uids_or_fqns",
+            "missing required argument: expected 'targets' or 'uids_or_fqns'",
+        ),
+        "regex_search" => (
+            "pattern",
+            "query",
+            "missing required argument: expected 'pattern' or 'query'",
+        ),
+        "detect_changes" => (
+            "changed_files",
+            "files",
+            "missing required argument: expected 'changed_files' or 'files'",
+        ),
+        _ => return None,
+    };
+
+    (args.get(first).is_none() && args.get(second).is_none()).then_some(message)
+}
+
+fn render_validation_error(error: &jsonschema::ValidationError<'_>) -> String {
+    let instance_path = error.instance_path().to_string();
+    let instance_path = if instance_path.is_empty() {
+        "/".to_string()
+    } else {
+        truncate_utf8_bytes(&instance_path, MAX_VALIDATION_ITEM_BYTES / 2)
+    };
+    truncate_utf8_bytes(
+        &format!(
+            "{instance_path}: schema keyword '{}' failed",
+            error.kind().keyword()
+        ),
+        MAX_VALIDATION_ITEM_BYTES,
+    )
+}
+
 pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::Error> {
-    let validator = tool_validators()
-        .get(name)
-        .ok_or_else(|| anyhow!("unknown tool: {name}"))?;
-    let errors: Vec<String> = validator
-        .iter_errors(args)
-        .take(3)
-        .map(|error| format!("{}: {error}", error.instance_path()))
-        .collect();
+    let Some(validator) = tool_validators().get(name) else {
+        let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);
+        let message =
+            truncate_utf8_bytes(&format!("unknown tool: {name}"), MAX_VALIDATION_ERROR_BYTES);
+        return Err(anyhow!(message));
+    };
+
+    let errors: Vec<String> = if let Some(message) = missing_alias_requirement(name, args) {
+        vec![truncate_utf8_bytes(message, MAX_VALIDATION_ITEM_BYTES)]
+    } else {
+        validator
+            .iter_errors(args)
+            .take(3)
+            .map(|error| render_validation_error(&error))
+            .collect()
+    };
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(anyhow!(
-            "invalid arguments for tool '{name}': {}",
-            errors.join("; ")
-        ))
+        let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);
+        let message = format!("invalid arguments for tool '{name}': {}", errors.join("; "));
+        Err(anyhow!(truncate_utf8_bytes(
+            &message,
+            MAX_VALIDATION_ERROR_BYTES
+        )))
     }
 }
 
@@ -358,6 +440,60 @@ mod tool_schema_validation_tests {
             2,
             "validation should report exactly three of the four errors: {error}"
         );
+    }
+
+    #[test]
+    fn hostile_validation_values_produce_a_small_bounded_utf8_error() {
+        let huge = "界".repeat(700_000);
+        let error = assert_invalid(
+            "brain_search",
+            json!({
+                "query": 7,
+                "limit": huge,
+                "include_bodies": "🔥".repeat(600_000),
+                "prf": "é".repeat(1_000_000),
+            }),
+        );
+
+        assert!(
+            error.len() <= 1024,
+            "validation errors must stay within 1024 UTF-8 bytes, got {}",
+            error.len()
+        );
+        assert!(
+            error.contains("/limit") || error.contains("/include_bodies"),
+            "bounded error should retain an actionable instance path: {error}"
+        );
+    }
+
+    #[test]
+    fn oversized_unknown_tool_name_produces_a_small_bounded_utf8_error() {
+        let name = "工具".repeat(500_000);
+        let error = assert_invalid(&name, json!({}));
+
+        assert!(
+            error.len() <= 128,
+            "unknown-tool errors must stay within 128 UTF-8 bytes, got {}",
+            error.len()
+        );
+        assert!(error.starts_with("unknown tool: "));
+    }
+
+    #[test]
+    fn missing_alias_pairs_name_every_accepted_field() {
+        for (name, accepted) in [
+            ("read_symbols", ["targets", "uids_or_fqns"]),
+            ("regex_search", ["pattern", "query"]),
+            ("detect_changes", ["changed_files", "files"]),
+        ] {
+            let error = assert_invalid(name, json!({}));
+            for field in accepted {
+                assert!(
+                    error.contains(field),
+                    "{name} missing-argument error must name '{field}': {error}"
+                );
+            }
+        }
     }
 
     #[test]
