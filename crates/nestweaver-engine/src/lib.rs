@@ -176,7 +176,8 @@ pub use eval::{
 pub use export::{export_cypher, export_graphml, export_mermaid};
 pub use export_graph::export_in_memory_graph;
 pub use extensions::{
-    ExtensionStore, InstanceExtensionMigration, InstanceMigrationFinalizerPlan,
+    AbortMigrationOutcome, ExtensionStore, InstanceExtensionMigration,
+    InstanceMigrationFinalizerPlan, abort_instance_extension_migration,
     finalize_instance_extension_migration, get_all_properties, get_last_indexed_at, get_property,
     load_extensions, load_live_extensions, mark_instance_extension_migration_graph_applied,
     mark_instance_extension_migration_reconciled, pending_instance_extension_migration,

@@ -1819,6 +1819,65 @@ pub fn reconcile_extension_handoffs(
     Ok(resolved.len())
 }
 
+/// Outcome of [`abort_instance_extension_migration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortMigrationOutcome {
+    /// No pending migration journal existed — nothing to do.
+    NothingToAbort,
+    /// A `Prepared` journal (no graph mutation had happened) was removed cleanly.
+    AbortedPrepared,
+    /// A `graph_applied`/`reconciled` journal was force-discarded; the graph
+    /// mutation itself remains and may need manual reconciliation.
+    ForceDiscardedApplied,
+}
+
+/// Operator recovery (offline): clear a wedged instance-migration journal so the
+/// daemon can boot (nw-091 / Bug 3B). A `Prepared` journal is removed cleanly (no
+/// graph mutation happened). A `graph_applied`/`reconciled` journal is refused
+/// unless `force`, because the graph was already mutated and the correct action
+/// is forward completion (re-run the merge — which daemon boot now self-heals);
+/// `force` discards the journal regardless, leaving the graph as-is.
+pub fn abort_instance_extension_migration(
+    db_path: &Path,
+    force: bool,
+) -> Result<AbortMigrationOutcome, anyhow::Error> {
+    let pending = pending_instance_extension_migration(db_path)?;
+    if !pending.is_active() {
+        return Ok(AbortMigrationOutcome::NothingToAbort);
+    }
+    let graph_applied = pending.graph_applied();
+    if graph_applied && !force {
+        anyhow::bail!(
+            "instance migration is past graph mutation (phase graph-applied); aborting would \
+             leave the graph half-migrated. Restart the daemon (boot self-heals a re-runnable \
+             merge), or pass --force to discard the journal and reconcile manually."
+        );
+    }
+    let journal_path = instance_extension_migration_journal_path(db_path);
+    let handoff_path = extension_handoff_journal_path(db_path);
+    nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&journal_path).map_err(
+        |error| {
+            anyhow::anyhow!(
+                "durably remove migration journal {}: {error}",
+                journal_path.display()
+            )
+        },
+    )?;
+    nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&handoff_path).map_err(
+        |error| {
+            anyhow::anyhow!(
+                "durably remove handoff journal {}: {error}",
+                handoff_path.display()
+            )
+        },
+    )?;
+    Ok(if graph_applied {
+        AbortMigrationOutcome::ForceDiscardedApplied
+    } else {
+        AbortMigrationOutcome::AbortedPrepared
+    })
+}
+
 fn is_shared_finalizer_graph_uid(uid: &str) -> bool {
     // Only canonical instance-derived UIDs are safe for broad liveness
     // cleanup. Prefix-shaped application keys (for example
@@ -3017,5 +3076,48 @@ mod tests {
         assert!(retried.reconciled());
         finalize_instance_extension_migration(&db_path, &retried).unwrap();
         assert!(!instance_extension_migration_journal_path(&db_path).exists());
+    }
+
+    #[test]
+    fn abort_migration_clears_prepared_but_refuses_graph_applied_without_force() {
+        // nw-091 / Bug 3B: operator recovery for a wedged migration journal.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let mappings = vec![nestweaver_store::InstanceUidRemap {
+            source_uid: "proj:old:bbbbbbbbbbbb".to_string(),
+            destination_uid: "proj:new:bbbbbbbbbbbb".to_string(),
+        }];
+        let journal_path = instance_extension_migration_journal_path(&db_path);
+
+        // No journal → nothing to abort.
+        assert_eq!(
+            abort_instance_extension_migration(&db_path, false).unwrap(),
+            AbortMigrationOutcome::NothingToAbort
+        );
+
+        // A Prepared journal (no graph mutation) aborts cleanly.
+        prepare_instance_extension_migration(&db_path, "old", "new", &mappings).unwrap();
+        assert!(journal_path.exists());
+        assert_eq!(
+            abort_instance_extension_migration(&db_path, false).unwrap(),
+            AbortMigrationOutcome::AbortedPrepared
+        );
+        assert!(!journal_path.exists());
+
+        // A graph_applied journal is refused without --force (the journal survives).
+        let migration =
+            prepare_instance_extension_migration(&db_path, "old", "new", &mappings).unwrap();
+        mark_instance_extension_migration_graph_applied(&db_path, &migration).unwrap();
+        assert!(abort_instance_extension_migration(&db_path, false).is_err());
+        assert!(
+            journal_path.exists(),
+            "a refused abort must not remove the journal"
+        );
+        // --force discards it (the graph mutation stays; operator reconciles).
+        assert_eq!(
+            abort_instance_extension_migration(&db_path, true).unwrap(),
+            AbortMigrationOutcome::ForceDiscardedApplied
+        );
+        assert!(!journal_path.exists());
     }
 }

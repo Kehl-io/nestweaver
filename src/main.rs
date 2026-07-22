@@ -2499,6 +2499,24 @@ enum InstanceCommands {
         )]
         db: Option<PathBuf>,
     },
+    /// Clear a wedged instance-migration journal so the daemon can boot.
+    ///
+    /// A `Prepared` journal (no graph mutation happened) is removed cleanly. A
+    /// `graph-applied` journal is refused unless `--force`, because the graph was
+    /// already mutated — restart the daemon instead (boot self-heals a re-runnable
+    /// merge), or `--force` to discard the journal and reconcile manually. Run
+    /// while the daemon is stopped.
+    #[command(name = "abort-migration")]
+    AbortMigration {
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        /// Discard a graph-applied journal too (the graph mutation stays).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -13971,6 +13989,29 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 }
                 if !result.repos_needing_reindex.is_empty() {
                     eprintln!("{}", merge_reindex_guidance(&result.repos_needing_reindex));
+                }
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        InstanceCommands::AbortMigration { db, force } => {
+            // Offline recovery: operate on the sidecar journals directly (the
+            // daemon is wedged and won't boot). nw-091 / Bug 3B.
+            let db_path = db.unwrap_or_else(default_db_path);
+            match nestweaver_engine::abort_instance_extension_migration(&db_path, force)? {
+                nestweaver_engine::AbortMigrationOutcome::NothingToAbort => {
+                    println!("No pending instance-migration journal — nothing to abort.");
+                }
+                nestweaver_engine::AbortMigrationOutcome::AbortedPrepared => {
+                    println!(
+                        "Aborted a prepared instance-migration journal (no graph mutation had \
+                         happened). The daemon can boot now."
+                    );
+                }
+                nestweaver_engine::AbortMigrationOutcome::ForceDiscardedApplied => {
+                    eprintln!(
+                        "Force-discarded a graph-applied migration journal. The graph mutation \
+                         itself remains — verify the merge result and reconcile if needed."
+                    );
                 }
             }
             Ok(EXIT_SUCCESS)

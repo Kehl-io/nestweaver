@@ -2304,6 +2304,72 @@ mod tests {
     }
 
     #[test]
+    fn merge_instance_ids_conserves_notes_across_multiple_vaults() {
+        // nw-091 / Bug 4: reparent_vault is atomic per vault, so a multi-vault
+        // merge (and any interruption between vaults) must never lose a note —
+        // every note stays reachable under exactly one instance. Guards the
+        // multi-vault loop conservation invariant.
+        use nestweaver_schema::uid::vault_uid;
+        use nestweaver_schema::{Note, NoteKind, Vault};
+        let store = test_store();
+
+        let mut total_notes = 0usize;
+        for (v, root) in [("vlt:src:a", "/vault/a"), ("vlt:src:b", "/vault/b")] {
+            store
+                .insert_vault(&Vault {
+                    uid: v.to_string(),
+                    name: format!("vault-{v}"),
+                    root_path: root.to_string(),
+                    instance_id: "src".to_string(),
+                })
+                .unwrap();
+            let notes: Vec<Note> = (0..3)
+                .map(|n| Note {
+                    uid: format!("note:{v}:{n}"),
+                    vault_uid: v.to_string(),
+                    file_path: format!("n{n}.md"),
+                    title: format!("Note {n}"),
+                    note_kind: NoteKind::General,
+                    word_count: n,
+                    content_hash: format!("h{v}{n}"),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .collect();
+            total_notes += notes.len();
+            store.batch_insert_notes(&notes).unwrap();
+            let edges: Vec<(&str, &str)> =
+                notes.iter().map(|note| (v, note.uid.as_str())).collect();
+            store.batch_insert_vault_note_edges(&edges).unwrap();
+        }
+
+        let result = store.merge_instance_ids("src", "tgt").unwrap();
+        assert_eq!(result.vaults, 2);
+        assert!(result.discarded.is_empty(), "no vault discarded");
+
+        // Every note is conserved under the target instance; none lost, none left
+        // under the source.
+        let tgt_a = store
+            .list_notes(Some(&vault_uid("tgt", "/vault/a")))
+            .unwrap();
+        let tgt_b = store
+            .list_notes(Some(&vault_uid("tgt", "/vault/b")))
+            .unwrap();
+        assert_eq!(
+            tgt_a.len() + tgt_b.len(),
+            total_notes,
+            "all notes conserved across the multi-vault merge"
+        );
+        assert!(
+            store.list_vaults(Some("src")).unwrap().is_empty(),
+            "no source vault rows remain after merge"
+        );
+    }
+
+    #[test]
     fn merge_instance_ids_rejects_self_merge_without_mutation() {
         use nestweaver_schema::{Note, NoteKind, Vault};
         let store = test_store();

@@ -1797,7 +1797,7 @@ where
             ))
         },
     )?;
-    let migration = if pending.is_active() {
+    let (migration, graph_already_applied) = if pending.is_active() {
         if pending.from_id() != Some(from_id) || pending.to_id() != Some(to_id) {
             return Err(Status::internal(format!(
                 "pending instance migration {:?} -> {:?} conflicts with requested {from_id:?} -> {to_id:?}",
@@ -1844,14 +1844,25 @@ where
                     ))
                 })?
         };
-        if pending.graph_applied()
-            && graph_state != nestweaver_store::InstanceUidRemapPlanState::Applied
-        {
-            return Err(Status::internal(
-                "instance migration is marked graph-applied but source graph rows remain",
-            ));
+        // nw-091 / Bug 3B: SELF-HEAL instead of wedging the daemon. A journal
+        // marked `graph_applied` while the graph still holds source rows is a
+        // durability inversion (the journal sidecar landed, the DB commit didn't).
+        // `merge_instance_ids` is idempotent (reparented vaults are skipped by the
+        // instance_id guard), so we re-derive the ACTUAL applied state and re-run
+        // the merge below rather than erroring with no forward path. The `verify_`
+        // call above already failed closed on a non-reproducible plan, so reaching
+        // here means the plan is still reproducible and safe to re-drive.
+        let graph_already_applied =
+            graph_state == nestweaver_store::InstanceUidRemapPlanState::Applied;
+        if pending.graph_applied() && !graph_already_applied {
+            tracing::warn!(
+                from_id,
+                to_id,
+                "instance migration journal marked graph-applied but source rows remain; \
+                 re-driving the idempotent merge to self-heal"
+            );
         }
-        pending
+        (pending, graph_already_applied)
     } else {
         let plan = state
             .store
@@ -1871,7 +1882,7 @@ where
                 Status::internal(format!("merge failed to project source vaults: {error:#}"))
             })?
             .is_empty();
-        nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
+        let fresh_migration = nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
             &state.db_path,
             from_id,
             to_id,
@@ -1885,7 +1896,9 @@ where
             Status::internal(format!(
                 "merge_instance migration-journal preparation failed: {error:#}"
             ))
-        })?
+        })?;
+        // A freshly prepared migration has not mutated the graph yet.
+        (fresh_migration, false)
     };
 
     if migration.reconciled() {
@@ -1898,7 +1911,11 @@ where
         return Ok(empty_instance_merge_result());
     }
 
-    let mutation = if migration.graph_applied() {
+    // Use the ACTUAL applied state, not just the journal's graph_applied flag, so a
+    // journal that claims applied while the graph still has source rows (a
+    // durability inversion) re-drives the idempotent merge instead of skipping it
+    // (nw-091 / Bug 3B).
+    let mutation = if graph_already_applied {
         Ok(empty_instance_merge_result())
     } else {
         merge(&state.store, from_id, to_id)
@@ -8908,6 +8925,53 @@ mod startup_helper_tests {
         assert!(
             !nestweaver_engine::sidecar_path(&state.db_path, ".extensions.migration.json").exists()
         );
+    }
+
+    #[test]
+    fn boot_self_heals_graph_applied_journal_with_remaining_source_rows() {
+        // nw-091 / Bug 3B: a journal marked graph_applied while the graph still
+        // holds source rows (a durability inversion — the journal sidecar landed,
+        // the DB commit didn't) used to WEDGE daemon boot with no forward path.
+        // Recovery must self-heal by re-driving the idempotent merge.
+        use nestweaver_schema::uid::vault_uid;
+        let state = test_state_with_writer();
+        let root = "/self-heal/vault";
+        let source_vault_uid = vault_uid("old", root);
+        seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
+
+        // Prepare a migration journal and advance it to GraphApplied WITHOUT
+        // mutating the graph — exactly the wedge state.
+        let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+        let migration = nestweaver_engine::prepare_instance_extension_migration(
+            &state.db_path,
+            "old",
+            "new",
+            &mappings,
+        )
+        .unwrap();
+        nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &migration,
+        )
+        .unwrap();
+        // Precondition: journal says graph_applied, but the source vault remains.
+        assert!(
+            nestweaver_engine::pending_instance_extension_migration(&state.db_path)
+                .unwrap()
+                .graph_applied()
+        );
+        assert!(!state.store.list_vaults(Some("old")).unwrap().is_empty());
+
+        // Recovery must SELF-HEAL (re-drive the idempotent merge), not error.
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        // The source vault's notes are reparented under "new"; none remain under
+        // "old" — no data lost, and the daemon boots.
+        assert!(
+            state.store.list_vaults(Some("old")).unwrap().is_empty(),
+            "self-heal must finish migrating the remaining source rows"
+        );
+        assert!(!state.store.list_vaults(Some("new")).unwrap().is_empty());
     }
 
     #[test]
