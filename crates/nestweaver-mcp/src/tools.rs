@@ -377,6 +377,9 @@ fn dispatch_uncached(
 ///   A single call made from a wrong cwd (or a bare clone) would cache an EMPTY
 ///   body and then serve it for the correct args forever — a silent-wrong result
 ///   on a core retrieval tool. It's a cheap disk-span read, so leave it uncached.
+/// - `query_extensions` — reads the extensions sidecar, which `set_extension`
+///   mutates WITHOUT bumping the graph generation, so a cached result would serve
+///   stale values after a write (nw-089). Cheap sidecar read; leave it uncached.
 const CACHEABLE_TOOLS: &[&str] = &[
     "brain_context",
     "brain_search",
@@ -386,7 +389,6 @@ const CACHEABLE_TOOLS: &[&str] = &[
     "brain_impact",
     "flow_trace",
     "clusters",
-    "query_extensions",
     "brain_diff",
     "project_context",
     "dead_code",
@@ -3418,14 +3420,16 @@ fn tool_schema_brain_remove_source() -> Value {
     })
 }
 
-fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let target = args
-        .get("target")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'target' is required"))?
-        .to_string();
-
-    // Inline tilde expansion (the cfg-gated expand_tilde is not available in daemon builds).
+/// Match a user-supplied `target` (repo UID, name, filesystem path, `file://`
+/// URL, or git-origin URL) against the indexed repos. Shared by the daemon-side
+/// `tool_brain_remove_source` and the client-proxy `dispatch_via_daemon` path so
+/// both resolve a target to a repo IDENTICALLY — the client proxy used to send
+/// the raw target as a `repo_uid`, which never matched a path/name and silently
+/// removed nothing (nw-089).
+fn match_repo_target<'a>(
+    repos: &'a [nestweaver_schema::Repo],
+    target: &str,
+) -> Vec<&'a nestweaver_schema::Repo> {
     let expand = |input: &str| -> String {
         if let Some(stripped) = input.strip_prefix("~/")
             && let Ok(home) = std::env::var("HOME")
@@ -3434,28 +3438,25 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         }
         input.to_string()
     };
-
-    // Try to resolve as a repo first, then as a vault.
-    let repos = store.list_repos(None)?;
-
-    let canonical_target = std::fs::canonicalize(&target)
+    let target_trimmed = target.trim_end_matches('/');
+    let canonical_target = std::fs::canonicalize(expand(target_trimmed))
         .map(|p| format!("file://{}", p.display()))
         .unwrap_or_default();
-    let url_target = if target.starts_with("file://") {
-        target.clone()
-    } else if std::path::Path::new(&target).is_absolute() || target.starts_with("~/") {
-        let expanded = expand(&target);
+    let url_target = if target_trimmed.starts_with("file://") {
+        target_trimmed.to_string()
+    } else if std::path::Path::new(target_trimmed).is_absolute() || target_trimmed.starts_with("~/")
+    {
+        let expanded = expand(target_trimmed);
         std::fs::canonicalize(&expanded)
             .map(|p| format!("file://{}", p.display()))
-            .unwrap_or_else(|_| format!("file://{}", expanded))
+            .unwrap_or_else(|_| format!("file://{expanded}"))
     } else {
         String::new()
     };
-
-    // When the target is a filesystem path, the repo it refers to may be
-    // identified by its git origin remote rather than a file:// URL — try
-    // that identity too (read from git config; never fetched).
-    let origin_target = std::fs::canonicalize(expand(&target))
+    // A path target may refer to a repo identified by its git origin remote
+    // rather than a file:// URL — try that identity too (read from git config,
+    // never fetched).
+    let origin_target = std::fs::canonicalize(expand(target_trimmed))
         .ok()
         .filter(|p| p.join(".git").exists())
         .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
@@ -3465,8 +3466,7 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         .unwrap_or_default()
         .to_string();
 
-    let target_trimmed = target.trim_end_matches('/');
-    let matched_repo: Vec<&nestweaver_schema::Repo> = repos
+    repos
         .iter()
         .filter(|r| {
             let r_url = r.url.trim_end_matches('/');
@@ -3480,7 +3480,22 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
                         == Some(canonical_path.trim_end_matches('/')))
                 || r_url.ends_with(&format!("/{target_trimmed}"))
         })
-        .collect();
+        .collect()
+}
+
+fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'target' is required"))?
+        .to_string();
+
+    // Try to resolve as a repo first, then as a vault.
+    let repos = store.list_repos(None)?;
+    let canonical_target = std::fs::canonicalize(&target)
+        .map(|p| format!("file://{}", p.display()))
+        .unwrap_or_default();
+    let matched_repo = match_repo_target(&repos, &target);
 
     if matched_repo.len() == 1 {
         #[cfg(feature = "daemon")]
@@ -6358,32 +6373,85 @@ pub fn dispatch_via_daemon(
             .ok_or_else(|| anyhow::anyhow!("'target' is required"))?
             .to_string();
 
-        // Try repo first — ask the daemon for matching repo by name/uid.
-        // We send the target as repo_uid; the daemon resolves it.
-        // However, the proto only accepts a uid. We need to resolve locally
-        // or just try the RPC and fall back. For simplicity, try as repo_uid
-        // first (covers uid and name for well-known targets), then vault_uid.
-        let repo_result = rt.block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
-            repo_uid: target.clone(),
-        }));
-        if let Ok(resp) = repo_result {
+        // nw-089: RESOLVE the target (path / name / url / uid) to the actual repo
+        // (or vault) UID before deleting. The RPC's repo_uid is an exact uid, so
+        // the previous code that sent the raw `target` never matched a path/name
+        // and silently deleted nothing (a no-op reported as success). Fetch the
+        // repo list from the daemon and match with the same logic the CLI uses.
+        let repos: Vec<nestweaver_schema::Repo> = {
+            let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+                args_json: "{}".to_string(),
+            });
+            let resp = rt
+                .block_on(client.list_repos_json(req))
+                .map_err(|s| anyhow::anyhow!("list_repos RPC failed: {}", s.message()))?;
+            serde_json::from_str(&resp.into_inner().result_json).unwrap_or_default()
+        };
+        let matched_repo = match_repo_target(&repos, &target);
+        if matched_repo.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "'{target}' matches multiple repos — pass a full UID to disambiguate."
+            ));
+        }
+        if let Some(repo) = matched_repo.first() {
+            let resp = rt
+                .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                    repo_uid: repo.uid.clone(),
+                }))
+                .map_err(|s| anyhow::anyhow!("remove_repo RPC failed: {}", s.message()))?;
             let inner = resp.into_inner();
             return Ok(json!({
                 "kind": "repo",
-                "uid": target,
+                "name": repo.name.clone().unwrap_or_else(|| repo.url.clone()),
+                "uid": repo.uid,
                 "files_deleted": inner.files_deleted,
                 "symbols_deleted": inner.symbols_deleted
             }));
         }
 
-        let vault_result = rt.block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
-            vault_uid: target.clone(),
-        }));
-        if let Ok(resp) = vault_result {
+        // Not a repo — resolve as a vault (by uid, name, or root path).
+        let vaults: Vec<nestweaver_schema::Vault> = {
+            let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+                args_json: "{}".to_string(),
+            });
+            match rt.block_on(client.list_vaults_json(req)) {
+                Ok(resp) => {
+                    serde_json::from_str(&resp.into_inner().result_json).unwrap_or_default()
+                }
+                Err(_) => Vec::new(),
+            }
+        };
+        let canonical_target = std::fs::canonicalize(&target)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let target_trimmed = target.trim_end_matches('/');
+        let matched_vault: Vec<&nestweaver_schema::Vault> = vaults
+            .iter()
+            .filter(|v| {
+                v.uid == target
+                    || v.name == target_trimmed
+                    || v.root_path.trim_end_matches('/') == target_trimmed
+                    || (!canonical_target.is_empty()
+                        && v.root_path.trim_end_matches('/')
+                            == canonical_target.trim_end_matches('/'))
+            })
+            .collect();
+        if matched_vault.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "'{target}' matches multiple vaults — pass a full UID to disambiguate."
+            ));
+        }
+        if let Some(vault) = matched_vault.first() {
+            let resp = rt
+                .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                    vault_uid: vault.uid.clone(),
+                }))
+                .map_err(|s| anyhow::anyhow!("remove_vault RPC failed: {}", s.message()))?;
             let inner = resp.into_inner();
             return Ok(json!({
                 "kind": "vault",
-                "uid": target,
+                "name": vault.name.clone(),
+                "uid": vault.uid,
                 "notes_deleted": inner.notes_deleted
             }));
         }
@@ -6693,6 +6761,58 @@ where
         .map_err(|error| anyhow::anyhow!("{} index failed: {error}", source.label()))
 }
 
+/// Heuristic vault detector for `brain_add_source`: true when markdown files are
+/// the majority of the "content" files in a bounded shallow scan of `dir`. Used
+/// to distinguish a notes vault from a code directory so a code dir without a
+/// `.git` isn't misclassified as a vault (nw-089). Bounded (depth ≤ 3, ≤ 4000
+/// files, skips VCS/dependency dirs) so it stays cheap on large trees.
+#[cfg(feature = "daemon")]
+fn dir_is_markdown_dominant(dir: &std::path::Path) -> bool {
+    const CODE_EXTS: &[&str] = &[
+        "rs", "js", "ts", "jsx", "tsx", "py", "go", "java", "c", "h", "cpp", "hpp", "cc", "cs",
+        "rb", "php", "swift", "kt", "scala", "lua", "sh", "sql", "hcl", "dart", "ex", "exs", "zig",
+        "m", "mm",
+    ];
+    let mut md = 0usize;
+    let mut code = 0usize;
+    let mut seen = 0usize;
+    let mut stack = vec![(dir.to_path_buf(), 0u32)];
+    while let Some((d, depth)) = stack.pop() {
+        if depth > 3 || seen > 4000 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            seen += 1;
+            if seen > 4000 {
+                break;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if name.starts_with('.')
+                    || matches!(
+                        name,
+                        "node_modules" | "target" | "vendor" | "dist" | "build"
+                    )
+                {
+                    continue;
+                }
+                stack.push((p, depth + 1));
+            } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                if ext == "md" || ext == "markdown" {
+                    md += 1;
+                } else if CODE_EXTS.contains(&ext) {
+                    code += 1;
+                }
+            }
+        }
+    }
+    md > 0 && md >= code
+}
+
 #[cfg(feature = "daemon")]
 fn dispatch_add_source_via_daemon(
     client: &mut DaemonGrpcClient,
@@ -6712,23 +6832,30 @@ fn dispatch_add_source_via_daemon(
         .to_string();
 
     let resolved = std::path::Path::new(&path);
-    let is_repo = resolved.join(".git").exists();
-    let is_vault = !is_repo
-        && (resolved.join(".obsidian").exists()
-            || std::fs::read_dir(resolved)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .any(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-                })
-                .unwrap_or(false));
+    // nw-089: validate the path exists — the old code returned a phantom
+    // `status:"indexed"` vault for a nonexistent path (no validation).
+    if !resolved.exists() {
+        return Err(anyhow::anyhow!("path does not exist: {path}"));
+    }
+    if !resolved.is_dir() {
+        return Err(anyhow::anyhow!(
+            "path is not a directory (index a source directory, not a file): {path}"
+        ));
+    }
+    // nw-089: classify by a POSITIVE vault signal, then default to CODE. The old
+    // `if is_vault || !is_repo` indexed any non-git directory as a vault, so a
+    // plain code dir without a `.git` was indexed as a vault and its source was
+    // never picked up (vault indexing only ingests markdown). A directory is a
+    // vault only when it is an Obsidian vault or is markdown-dominant; everything
+    // else — including a code dir with no `.git` — indexes as code.
+    let is_vault = resolved.join(".obsidian").exists() || dir_is_markdown_dominant(resolved);
 
     let instance_id = current_instance_config()
         .map(|c| c.instance_id.clone())
         .unwrap_or_default();
 
     rt.block_on(async {
-        if is_vault || !is_repo {
+        if is_vault {
             let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
                 vault_path: path.clone(),
                 vault_name: name,
@@ -7639,6 +7766,9 @@ mod cache_dispatch_tests {
         // dependent), so it must NOT be cached — a call from a wrong cwd would
         // otherwise poison the cache with an empty body served forever.
         assert!(!is_cacheable_tool("read_symbols"));
+        // nw-089: query_extensions reads a sidecar that set_extension mutates
+        // without bumping the generation, so a cached result would go stale.
+        assert!(!is_cacheable_tool("query_extensions"));
         // And a representative read tool IS cacheable.
         assert!(is_cacheable_tool("hub_nodes"));
 
@@ -8146,6 +8276,94 @@ mod blast_radius_visibility_tests {
         assert!(
             scoped["org_wide"].is_null(),
             "org_wide collapses to null once its only item (repo:client) is hidden"
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_management_tests {
+    use super::*;
+
+    fn repo(
+        uid: &str,
+        url: &str,
+        name: Option<&str>,
+        root: Option<&str>,
+    ) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: "sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: name.map(String::from),
+            root_path: root.map(String::from),
+        }
+    }
+
+    #[test]
+    fn match_repo_target_resolves_by_uid_name_and_path() {
+        // nw-089: brain_remove_source must resolve a path/name/url/uid to the
+        // repo, not send the raw string as a uid (which matched nothing).
+        let repos = vec![
+            repo(
+                "repo:aa:bb",
+                "file:///tmp/nw_match_test_xyz",
+                Some("my-repo"),
+                Some("/tmp/nw_match_test_xyz"),
+            ),
+            repo("repo:cc:dd", "file:///other/place", None, None),
+        ];
+        // by uid
+        assert_eq!(match_repo_target(&repos, "repo:aa:bb").len(), 1);
+        // by name
+        assert_eq!(match_repo_target(&repos, "my-repo").len(), 1);
+        // by file:// URL
+        assert_eq!(
+            match_repo_target(&repos, "file:///tmp/nw_match_test_xyz").len(),
+            1
+        );
+        // by absolute path (canonicalize fails on a nonexistent path → falls back
+        // to file://<path>, which matches the repo url)
+        let m = match_repo_target(&repos, "/tmp/nw_match_test_xyz");
+        assert_eq!(m.len(), 1, "a path target must resolve to its repo");
+        assert_eq!(m[0].uid, "repo:aa:bb");
+        // trailing slash tolerated
+        assert_eq!(
+            match_repo_target(&repos, "/tmp/nw_match_test_xyz/").len(),
+            1
+        );
+        // no match
+        assert!(match_repo_target(&repos, "/nope/nope").is_empty());
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn dir_is_markdown_dominant_classifies_code_vs_notes() {
+        use std::fs;
+        // nw-089: a code dir (no .git, no markdown) must NOT be seen as a vault.
+        let code = tempfile::tempdir().unwrap();
+        fs::write(code.path().join("lib.rs"), "pub fn a() {}").unwrap();
+        fs::write(code.path().join("app.ts"), "export const x = 1;").unwrap();
+        assert!(
+            !dir_is_markdown_dominant(code.path()),
+            "a code directory is not markdown-dominant"
+        );
+
+        // A notes dir (all markdown) IS a vault.
+        let notes = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("a.md"), "# a").unwrap();
+        fs::write(notes.path().join("b.md"), "# b").unwrap();
+        assert!(dir_is_markdown_dominant(notes.path()));
+
+        // A code dir with a single README.md is still code (md not the majority).
+        let mixed = tempfile::tempdir().unwrap();
+        fs::write(mixed.path().join("README.md"), "# readme").unwrap();
+        fs::write(mixed.path().join("a.rs"), "fn a() {}").unwrap();
+        fs::write(mixed.path().join("b.rs"), "fn b() {}").unwrap();
+        assert!(
+            !dir_is_markdown_dominant(mixed.path()),
+            "a code dir with a README is not a vault"
         );
     }
 }
