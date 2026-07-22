@@ -491,6 +491,17 @@ fn resolve_scope(
     scope: &str,
 ) -> Result<(Vec<String>, Option<Vec<String>>), anyhow::Error> {
     let mut seeds = vec![query.to_string()];
+    // Multi-word queries: also seed each whitespace token. Seed resolution does
+    // exact title / substring symbol-name lookups, which can NEVER match a phrase
+    // containing spaces ("blast radius" is not a substring of any symbol name), so
+    // a multi-word query collapsed to zero results. The hybrid seed loop resolves
+    // each seed independently and unions/dedupes the UIDs, so adding the per-token
+    // seeds gives a natural OR across terms. Single-token queries split to exactly
+    // one token equal to the whole query, so their behavior is unchanged.
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.len() > 1 {
+        seeds.extend(tokens.iter().map(|t| t.to_string()));
+    }
     let scope = scope.trim();
 
     if let Some(slug) = scope.strip_prefix("project:") {
@@ -1055,5 +1066,62 @@ mod tests {
         // No matches → empty entries/domains, but a valid persisted bundle id.
         assert!(result.bundle_id.starts_with("bndl_"));
         assert!(load_bundle(&db_path, &result.bundle_id).is_some());
+    }
+
+    #[test]
+    fn investigate_multiword_query_unions_token_seeds() {
+        // nw-080 regression: a multi-word query must union its per-token seeds
+        // instead of matching the whole phrase literally (which resolves nothing,
+        // since no symbol name contains a space). Runs with tantivy/embed = None,
+        // proving the fix is at the seed layer, not the Tantivy fallback.
+        //
+        // A richer fixture than make_store(): tokens `alpha`/`gamma` resolve to a
+        // strict subset of the graph, leaving non-seed neighbors (beta, delta) to
+        // surface — so a working union yields real entries, while the old
+        // whole-phrase seeding ("alpha gamma" matches no symbol) yields none.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("chain.js"),
+            "function alpha() { return beta(); }\n\
+             function beta() { return gamma(); }\n\
+             function gamma() { return 1; }\n\
+             function delta() { return alpha(); }",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let multi = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "alpha gamma",
+            "vault",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !multi.entries.is_empty(),
+            "multi-word query must union per-token seeds, got 0 entries"
+        );
+
+        // Single-token behavior is preserved (still non-empty).
+        let single = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "alpha",
+            "vault",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+        assert!(!single.entries.is_empty());
     }
 }
