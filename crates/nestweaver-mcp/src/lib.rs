@@ -847,6 +847,30 @@ mod tests {
     }
 
     #[test]
+    fn tools_call_with_invalid_arguments_returns_schema_error_envelope() {
+        let store = GraphStore::in_memory().unwrap();
+        let req = make_request(
+            "tools/call",
+            31,
+            json!({ "name": "brain_search", "arguments": { "query": 42 } }),
+        );
+
+        match dispatch_method(&store, None, &req, None) {
+            Frame::Success(resp) => {
+                assert_eq!(resp.id, json!(31));
+                assert_eq!(resp.result["isError"], json!(true));
+                let result = resp.result.to_string();
+                assert!(result.contains("invalid arguments for tool"), "{result}");
+                assert!(result.contains("/query"), "{result}");
+            }
+            Frame::Error(e) => panic!(
+                "invalid tool arguments must be an in-band MCP error, got {}",
+                e.error.message
+            ),
+        }
+    }
+
+    #[test]
     fn unknown_method_returns_method_not_found() {
         let store = GraphStore::in_memory().unwrap();
         let req = make_request("not_a_real_method", 4, json!({}));

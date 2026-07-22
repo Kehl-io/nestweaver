@@ -202,6 +202,21 @@ impl Drop for DaemonGuard {
 /// Send an MCP JSON-RPC request sequence (initialize + notification + tool call)
 /// to `nestweaver mcp` and return the stdout.
 fn mcp_tool_call(db_path: &Path, tool_name: &str, arguments: serde_json::Value) -> String {
+    mcp_tool_call_in_mode(db_path, tool_name, arguments, McpMode::Direct)
+}
+
+#[derive(Clone, Copy)]
+enum McpMode {
+    Direct,
+    Daemon,
+}
+
+fn mcp_tool_call_in_mode(
+    db_path: &Path,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    mode: McpMode,
+) -> String {
     let init_req = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -226,10 +241,23 @@ fn mcp_tool_call(db_path: &Path, tool_name: &str, arguments: serde_json::Value) 
         serde_json::to_string(&tool_req).unwrap(),
     );
 
-    let mut child = StdCommand::new(bin_path())
-        .args(["mcp", "--db", &db_path.display().to_string()])
-        .env("NESTWEAVER_NO_DAEMON", "1")
-        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+    let mut command = StdCommand::new(bin_path());
+    command.args(["mcp", "--db", &db_path.display().to_string()]);
+    match mode {
+        McpMode::Direct => {
+            command
+                .env("NESTWEAVER_NO_DAEMON", "1")
+                .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
+        }
+        McpMode::Daemon => {
+            command
+                .env_remove("NESTWEAVER_NO_DAEMON")
+                .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+                .env_remove("NESTWEAVER_UPSTREAM")
+                .env("NESTWEAVER_DAEMON_FORK", "1");
+        }
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -472,6 +500,116 @@ fn daemon_index_and_query() {
         result_str.contains("repo") || result_str.contains("Repo"),
         "brain_status should mention repos; got: {result_str}"
     );
+}
+
+#[test]
+fn mcp_argument_validation_matches_direct_and_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("validation").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let original_pid = std::fs::read_to_string(&pidfile)
+        .expect("daemon must have a pidfile")
+        .trim()
+        .parse::<i32>()
+        .expect("daemon pidfile must contain a pid");
+
+    let tool_response = |output: &str| {
+        output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value.get("id") == Some(&serde_json::json!(2)))
+            .unwrap_or_else(|| panic!("tools/call response missing from: {output}"))
+    };
+    let assert_daemon_unchanged = || {
+        let current_pid = std::fs::read_to_string(&pidfile)
+            .expect("validation calls must not remove the daemon pidfile")
+            .trim()
+            .parse::<i32>()
+            .expect("daemon pidfile must remain valid");
+        assert_eq!(
+            current_pid, original_pid,
+            "validation calls must not crash or restart the daemon"
+        );
+        assert!(
+            nestweaver_client::autostart::is_process_alive(current_pid),
+            "daemon must remain alive after validation calls"
+        );
+    };
+
+    let invalid_calls = [
+        ("brain_search", serde_json::json!({ "query": 17 }), "/query"),
+        (
+            "blast_radius",
+            serde_json::json!({ "changed_files": "src/lib.rs" }),
+            "/changed_files",
+        ),
+        (
+            "read_symbols",
+            serde_json::json!({ "targets": [17] }),
+            "/targets/0",
+        ),
+    ];
+    let valid_alias_calls = [
+        (
+            "read_symbols",
+            serde_json::json!({ "uids_or_fqns": ["greet"] }),
+        ),
+        ("regex_search", serde_json::json!({ "query": "greet" })),
+        (
+            "detect_changes",
+            serde_json::json!({ "files": ["main.js"] }),
+        ),
+    ];
+
+    for (mode_name, mode) in [("direct", McpMode::Direct), ("daemon", McpMode::Daemon)] {
+        for (name, arguments, instance_path) in &invalid_calls {
+            let output = mcp_tool_call_in_mode(&db_path, name, arguments.clone(), mode);
+            let response = tool_response(&output);
+            assert!(
+                response.get("error").is_none(),
+                "{mode_name} {name} must succeed at JSON-RPC level: {response}"
+            );
+            assert_eq!(
+                response["result"]["isError"],
+                serde_json::json!(true),
+                "{mode_name} {name} must return an MCP tool error: {response}"
+            );
+            let result = response["result"].to_string();
+            assert!(
+                result.contains("invalid arguments for tool"),
+                "{mode_name} {name} must report schema validation: {result}"
+            );
+            assert!(
+                result.contains(instance_path),
+                "{mode_name} {name} must identify {instance_path}: {result}"
+            );
+            assert_daemon_unchanged();
+        }
+
+        for (name, arguments) in &valid_alias_calls {
+            let output = mcp_tool_call_in_mode(&db_path, name, arguments.clone(), mode);
+            let response = tool_response(&output);
+            assert!(
+                response.get("error").is_none(),
+                "{mode_name} alias call for {name} must succeed at JSON-RPC level: {response}"
+            );
+            assert_eq!(
+                response["result"]["isError"],
+                serde_json::json!(false),
+                "{mode_name} legacy alias for {name} must reach the handler: {response}"
+            );
+            assert_daemon_unchanged();
+        }
+    }
 }
 
 #[test]

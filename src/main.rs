@@ -14560,6 +14560,14 @@ fn run_mcp_hybrid(
                         "id": id,
                         "error": { "code": -32602, "message": "tools/call: 'name' is required" }
                     })
+                } else if let Err(error) =
+                    nestweaver_mcp::tools::validate_tool_arguments(name, &arguments)
+                {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                    })
                 } else if write_tools.contains(name) {
                     // Write operations go through standard gRPC dispatch.
                     let grpc = hybrid.inner_mut();

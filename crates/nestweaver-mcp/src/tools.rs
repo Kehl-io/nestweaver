@@ -526,6 +526,57 @@ mod tool_schema_validation_tests {
         let error = assert_invalid("not_a_tool", json!({}));
         assert_eq!(error, "unknown tool: not_a_tool");
     }
+
+    #[test]
+    fn direct_dispatch_validates_arguments_and_preserves_aliases() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let error = dispatch(&store, None, "brain_search", json!({ "query": 42 }), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid arguments"), "{error}");
+        assert!(error.contains("/query"), "{error}");
+
+        dispatch(
+            &store,
+            None,
+            "brain_search",
+            json!({ "query": "needle" }),
+            None,
+        )
+        .expect("valid canonical arguments should reach the handler");
+        dispatch(
+            &store,
+            None,
+            "read_symbols",
+            json!({ "uids_or_fqns": ["sym:missing"] }),
+            None,
+        )
+        .expect("valid legacy aliases should reach the handler");
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn daemon_proxy_rejects_invalid_arguments_before_rpc() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let channel = {
+            let _guard = runtime.enter();
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy()
+        };
+        let mut client = DaemonGrpcClient::new(channel);
+
+        let error = dispatch_via_daemon(
+            &mut client,
+            &runtime,
+            "brain_search",
+            json!({ "query": 42 }),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("invalid arguments for tool"), "{error}");
+        assert!(error.contains("/query"), "{error}");
+    }
 }
 
 /// Returns structured documentation metadata for every registered tool.
@@ -649,6 +700,8 @@ pub fn dispatch_cancellable(
             names.join(", ")
         ));
     }
+
+    validate_tool_arguments(name, &args)?;
 
     // F16: serve cacheable read tools from (or populate) the response cache.
     // Correctness rests on the cache KEY — see `maybe_cached`.
@@ -6781,6 +6834,8 @@ pub fn dispatch_via_daemon(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
     use nestweaver_proto::JsonRequest;
+
+    validate_tool_arguments(name, &args)?;
 
     let args_json = serde_json::to_string(&args)?;
 
