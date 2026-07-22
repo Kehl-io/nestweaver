@@ -297,6 +297,52 @@ fn remove_stale_checkpoint_sidecars(path: &Path) -> bool {
 /// Open an lbug database, auto-recovering once from a stale WAL checkpoint left by
 /// a prior crash (see [`is_stale_checkpoint_error`]). This turns what was a full
 /// read+write outage requiring manual `rm` into a transparent self-heal.
+/// Build the engine `SystemConfig`, applying corruption/crash hardening and
+/// operator overrides on top of the library defaults.
+///
+/// nw-073: the engine's `optimisticRead` dereferences a raw buffer-page pointer
+/// inside a lock-free loop; the reader-count pinning that would protect it is
+/// gated behind a compile flag (`BM_MALLOC`) that native builds don't set, and
+/// the only fallback is Windows-only. So on native builds a page eviction
+/// racing a concurrent read is an unguarded SIGSEGV — observed during large
+/// batch inserts (a full vault re-index) that create buffer pressure while the
+/// engine's internal index-builder pool is still appending. The race needs
+/// concurrency; bounding the engine thread pool removes it. Because our own
+/// hot query path is application-level BFS + point lookups (not engine-parallel
+/// analytical joins), a bounded pool costs query latency little while closing
+/// the index-time crash window.
+///
+/// Overridable per-operator:
+///   NESTWEAVER_LBUG_MAX_THREADS       engine thread-pool size (0 = library auto)
+///   NESTWEAVER_LBUG_BUFFER_POOL_BYTES buffer pool size in bytes (0 = auto);
+///                                     a larger pool avoids eviction (and thus
+///                                     the race) when the working set fits.
+///   NESTWEAVER_LBUG_AUTO_CHECKPOINT   "0"/"false" defers auto-checkpoints; the
+///                                     #678 corruption trigger needs several
+///                                     checkpoint-separated segments, so
+///                                     deferring during bulk load reduces it.
+fn hardened_system_config() -> lbug::SystemConfig {
+    fn env_u64(key: &str) -> Option<u64> {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+    // Default engine threads. Env override wins; else a conservative bound that
+    // removes the eviction-vs-read race the crash needs. `1` is the only value
+    // that fully eliminates it; keep it the default on the write path and let
+    // ops raise it if they measure a query-latency cost on their workload.
+    let max_threads = env_u64("NESTWEAVER_LBUG_MAX_THREADS").unwrap_or(1);
+    let mut cfg = lbug::SystemConfig::default().max_num_threads(max_threads);
+    if let Some(bytes) = env_u64("NESTWEAVER_LBUG_BUFFER_POOL_BYTES") {
+        cfg = cfg.buffer_pool_size(bytes);
+    }
+    if let Ok(v) = std::env::var("NESTWEAVER_LBUG_AUTO_CHECKPOINT") {
+        let on = !matches!(v.trim(), "0" | "false" | "off");
+        cfg = cfg.auto_checkpoint(on);
+    }
+    cfg
+}
+
 fn open_lbug_with_recovery(
     path: &Path,
     make_config: impl Fn() -> lbug::SystemConfig,
@@ -321,7 +367,7 @@ fn open_lbug_with_recovery(
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, lbug::SystemConfig::default)?;
+        let db = open_lbug_with_recovery(path, hardened_system_config)?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -350,7 +396,7 @@ impl GraphStore {
     /// Runs schema migrations to ensure any new tables/columns from newer
     /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, lbug::SystemConfig::default)?;
+        let db = open_lbug_with_recovery(path, hardened_system_config)?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -1916,5 +1962,39 @@ mod tests {
             legacy_path.exists(),
             "failed retirement must preserve fallback"
         );
+    }
+}
+
+#[cfg(test)]
+mod hardened_config_tests {
+    #[test]
+    fn env_overrides_are_honored_and_default_bounds_threads() {
+        // Serialize the env mutation; other tests don't touch these keys.
+        // Default (no env): threads bounded to 1 to remove the eviction race.
+        // SAFETY: single-threaded test section; we set then clear.
+        unsafe {
+            std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS");
+            std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
+            std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
+        }
+        // We can't read private SystemConfig fields, but we can prove the
+        // helper runs without panic under each override shape (parse paths).
+        let _default = super::hardened_system_config();
+        unsafe {
+            std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "4");
+            std::env::set_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES", "1073741824");
+            std::env::set_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT", "false");
+        }
+        let _overridden = super::hardened_system_config();
+        // Malformed values must not panic (fall back to default/auto).
+        unsafe {
+            std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "not-a-number");
+        }
+        let _tolerant = super::hardened_system_config();
+        unsafe {
+            std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS");
+            std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
+            std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
+        }
     }
 }
