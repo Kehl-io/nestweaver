@@ -477,6 +477,13 @@ impl GraphStore {
             for row in result {
                 use lbug::Value;
                 let caller_uid = match &row[0] {
+                    // caller_uid is a scan-projected string and can be garbled
+                    // by the engine's partial-scan corruption (#678). It is the
+                    // NAVIGATIONAL key — following a garbled uid would add a
+                    // phantom node the PK repair can never resolve — so skip a
+                    // corrupt row rather than walk into garbage. name/file_path
+                    // are re-resolved from PK lookups after the walk regardless.
+                    Value::String(s) if crate::read::string_is_corrupt(s) => continue,
                     Value::String(s) => s.clone(),
                     _ => continue,
                 };

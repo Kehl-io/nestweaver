@@ -80,11 +80,28 @@ pub struct CrossRepoRef {
 }
 
 /// Extract a String value from a row column, returning an error on type mismatch or out-of-bounds.
+/// Corruption canary for a returned string. An embedded NUL byte is never
+/// valid in any column NestWeaver stores (symbol names, uids, paths, note
+/// bodies, signatures — none contain NUL), and both corruption patterns
+/// observed from the storage engine's partial string scans (LadybugDB #678)
+/// contained NUL: fully-zeroed values and garbage-prefixed ones alike. It is a
+/// one-byte scan with zero false-positive risk. Broader control-character
+/// checks are deliberately left to field-aware callers (a note body may hold a
+/// form feed); NUL is the universal, safe-to-fail-on signal (Google SRE Ch. 26
+/// on validating only invariants that cause user-facing devastation).
+pub(crate) fn string_is_corrupt(s: &str) -> bool {
+    s.as_bytes().contains(&0)
+}
+
 pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreError> {
     let val = row
         .get(idx)
         .ok_or_else(|| StoreError::Query(format!("column {idx} out of bounds")))?;
     match val {
+        Value::String(s) if string_is_corrupt(s) => Err(StoreError::CorruptValue {
+            column: idx,
+            reason: "embedded NUL byte (storage-engine partial-scan corruption)".to_string(),
+        }),
         Value::String(s) => Ok(s.clone()),
         Value::Null(_) => Ok(String::new()),
         other => Err(StoreError::Query(format!(
@@ -99,6 +116,10 @@ fn extract_opt_string(row: &[Value], idx: usize) -> Result<Option<String>, Store
         .ok_or_else(|| StoreError::Query(format!("column {idx} out of bounds")))?;
     match val {
         Value::String(s) if s.is_empty() => Ok(None),
+        Value::String(s) if string_is_corrupt(s) => Err(StoreError::CorruptValue {
+            column: idx,
+            reason: "embedded NUL byte (storage-engine partial-scan corruption)".to_string(),
+        }),
         Value::String(s) => Ok(Some(s.clone())),
         Value::Null(_) => Ok(None),
         other => Err(StoreError::Query(format!(
@@ -2457,5 +2478,54 @@ impl GraphStore {
             return Ok(None);
         }
         Ok(Some((model_id, dimension)))
+    }
+}
+
+#[cfg(test)]
+mod corruption_canary_tests {
+    use super::*;
+
+    #[test]
+    fn nul_byte_is_flagged_corrupt() {
+        assert!(string_is_corrupt("bad\0name"));
+        assert!(string_is_corrupt("\0\0\0\0"));
+        // The real observed garbage-prefix pattern contained a NUL.
+        assert!(string_is_corrupt("\u{2}S\u{0}\u{19}y_on_empty_is_noop"));
+    }
+
+    #[test]
+    fn legitimate_strings_are_not_flagged() {
+        // Identifiers.
+        assert!(!string_is_corrupt("analyze_blast_radius"));
+        assert!(!string_is_corrupt("sym:repo:c37ccf01:abc:def:42"));
+        assert!(!string_is_corrupt("crates/nestweaver-store/src/read.rs"));
+        // Free text that legitimately contains tabs, newlines, CR, and Unicode
+        // — must NOT be flagged (the false-positive trap; Google SRE Ch. 26).
+        assert!(!string_is_corrupt(
+            "# Heading\n\n- a bullet\twith a tab\r\nand an em-dash — plus ✓ and 日本語"
+        ));
+        assert!(!string_is_corrupt("fn foo(a: i32) -> i32 {\n    a + 1\n}"));
+    }
+
+    #[test]
+    fn extract_string_errors_on_nul_never_returns_it() {
+        let row = vec![
+            Value::String("good".into()),
+            Value::String("bad\0val".into()),
+        ];
+        assert_eq!(extract_string(&row, 0).unwrap(), "good");
+        match extract_string(&row, 1) {
+            Err(StoreError::CorruptValue { column, .. }) => assert_eq!(column, 1),
+            other => panic!("expected CorruptValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_opt_string_errors_on_nul() {
+        let row = vec![Value::String("x\0y".into())];
+        assert!(matches!(
+            extract_opt_string(&row, 0),
+            Err(StoreError::CorruptValue { .. })
+        ));
     }
 }
