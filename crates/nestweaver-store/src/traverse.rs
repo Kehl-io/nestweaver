@@ -126,7 +126,11 @@ struct CallerRow {
     confidence: f32,
 }
 
-const IMPACT_EDGE_TYPES: &[EdgeType] = &[
+/// Structural reverse-impact edge set. The confidence-weighted reverse BFS
+/// (`impact_bfs`) and any in-memory equivalent (e.g. `affected_tests`) must use
+/// exactly this set, so it is public to keep the two implementations from
+/// drifting.
+pub const IMPACT_EDGE_TYPES: &[EdgeType] = &[
     EdgeType::Calls,
     EdgeType::Imports,
     EdgeType::Extends,

@@ -198,10 +198,48 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     // and among equal depths the highest-confidence edge.
     let mut best: HashMap<String, AffectedTestSymbol> = HashMap::new();
 
-    // A changed symbol may itself live in a test file (a test was edited).
-    // Such tests are directly affected — treat them as tier 1 (depth 1).
+    // Load the reverse-impact graph ONCE (a handful of bulk queries) and walk it
+    // in memory, instead of the old path that issued a DB round-trip per visited
+    // node for EVERY changed symbol — that re-walked heavily-overlapping reverse
+    // cones and cost ~21ms/changed-symbol, dominating wall time on hot files
+    // (nw-085). The per-symbol walk below is the identical confidence-weighted
+    // max-product reverse BFS (same edge set, depth cap, confidence + threshold
+    // pruning), just over the in-memory adjacency.
+    let symbols = store.list_all_symbols().unwrap_or_default();
+    let sym_by_uid: HashMap<String, &nestweaver_schema::Symbol> =
+        symbols.iter().map(|s| (s.uid.clone(), s)).collect();
+    let rev_adj = match store.load_typed_edges() {
+        Ok(edges) => build_rev_impact_adjacency(&edges),
+        Err(e) => {
+            // Do NOT silently proceed — an empty impact graph that reads as
+            // "few tests" is the dangerous failure mode this tool exists to
+            // avoid. Degrade loudly.
+            notifications.push(Notification {
+                level: NotificationLevel::Error,
+                message: format!("loading the reverse-impact graph failed: {e}"),
+                descriptor: "store.load-edges-failed".to_string(),
+            });
+            status = status.max(AnalysisStatus::Degraded);
+            RevImpactAdj::default()
+        }
+    };
+
+    // A test symbol is any symbol whose file is a test file, OR any symbol the
+    // parser flagged as a test entry point (e.g. a Rust `#[test]` fn living in an
+    // inline `#[cfg(test)]` module inside a non-test `src/*.rs` file — nw-085).
+    let is_test_symbol = |sym: &nestweaver_schema::Symbol| -> bool {
+        is_test_file(&sym.file_path)
+            || sym.entry_point_kind == Some(nestweaver_schema::EntryPointKind::TestEntry)
+    };
+
+    // A changed symbol may itself be a test (a test was edited). Such tests are
+    // directly affected — treat them as tier 1 (depth 1).
     for cs in &changed_symbols {
-        if is_test_file(&cs.file_path) {
+        let is_test = sym_by_uid
+            .get(&cs.uid)
+            .map(|s| is_test_symbol(s))
+            .unwrap_or_else(|| is_test_file(&cs.file_path));
+        if is_test {
             consider(
                 &mut best,
                 AffectedTestSymbol {
@@ -217,30 +255,19 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     }
 
     for cs in &changed_symbols {
-        let callers = match store.impact(&cs.uid, MAX_TEST_DEPTH, MIN_CONFIDENCE) {
-            Ok(callers) => callers,
-            Err(e) => {
-                // Do NOT propagate/drop silently — an incomplete affected-tests
-                // set that reads as "few tests" is the dangerous failure mode.
-                notifications.push(Notification {
-                    level: NotificationLevel::Error,
-                    message: format!("reverse traversal for {} failed: {e}", cs.uid),
-                    descriptor: "store.impact-failed".to_string(),
-                });
-                status = status.max(AnalysisStatus::Degraded);
+        for node in impact_reachers_in_memory(&cs.uid, &rev_adj, MAX_TEST_DEPTH, MIN_CONFIDENCE) {
+            let Some(sym) = sym_by_uid.get(&node.uid) else {
                 continue;
-            }
-        };
-        for node in callers {
-            if !is_test_file(&node.file_path) {
+            };
+            if !is_test_symbol(sym) {
                 continue;
             }
             consider(
                 &mut best,
                 AffectedTestSymbol {
                     symbol_uid: node.uid,
-                    name: node.name,
-                    test_file: node.file_path,
+                    name: sym.name.clone(),
+                    test_file: sym.file_path.clone(),
                     depth: node.depth,
                     edge_type: node.edge_type,
                     confidence: node.confidence,
@@ -340,6 +367,105 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
         notifications,
         measured: None,
     })
+}
+
+/// Impact threshold: prune reverse paths whose cumulative confidence product
+/// falls below this. Mirrors the store's `DEFAULT_IMPACT_THRESHOLD` so the
+/// in-memory walk matches the DB `impact_bfs`.
+const IMPACT_THRESHOLD: f64 = 0.10;
+
+/// Reverse adjacency over [`nestweaver_store::IMPACT_EDGE_TYPES`]: for each
+/// symbol uid, the direct callers reaching it as `(caller_uid, edge_type_name,
+/// confidence)`.
+type RevImpactAdj = HashMap<String, Vec<(String, String, f32)>>;
+
+/// A caller reached by the in-memory reverse-impact walk (the fields
+/// affected-tests needs from the store's `ImpactNode`).
+struct Reacher {
+    uid: String,
+    edge_type: String,
+    confidence: f32,
+    depth: u32,
+}
+
+/// Build the reverse-impact adjacency from a bulk typed-edge load, keeping only
+/// the structural impact edge types (dropping DEFINES/data/other edges).
+fn build_rev_impact_adjacency(
+    typed_edges: &[(String, String, String, f64, String)],
+) -> RevImpactAdj {
+    let impact_names: HashSet<&str> = nestweaver_store::IMPACT_EDGE_TYPES
+        .iter()
+        .map(|e| e.rel_table_name())
+        .collect();
+    let mut adj: RevImpactAdj = HashMap::new();
+    for (src, dst, etype, conf, _evidence) in typed_edges {
+        if impact_names.contains(etype.as_str()) {
+            // Edge src -[etype]-> dst means src is a caller of dst.
+            adj.entry(dst.clone())
+                .or_default()
+                .push((src.clone(), etype.clone(), *conf as f32));
+        }
+    }
+    adj
+}
+
+/// In-memory equivalent of `store.impact(seed, max_depth, min_confidence)` — the
+/// confidence-weighted reverse BFS: score starts at 1.0 at the seed and decays
+/// multiplicatively through each edge's confidence; a node's score is the max
+/// over all paths (re-enqueued when improved, Dijkstra-with-max); edges below
+/// `min_confidence` and cumulative scores below [`IMPACT_THRESHOLD`] are pruned;
+/// depth is capped at `max_depth`. Byte-equivalent to the store's structural
+/// `impact_bfs`, but over the prebuilt adjacency so it costs nothing per node.
+fn impact_reachers_in_memory(
+    seed: &str,
+    adj: &RevImpactAdj,
+    max_depth: u32,
+    min_confidence: f32,
+) -> Vec<Reacher> {
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    scores.insert(seed.to_string(), 1.0);
+    let mut queue: std::collections::VecDeque<(String, u32)> = std::collections::VecDeque::new();
+    queue.push_back((seed.to_string(), 0));
+    let mut result: HashMap<String, Reacher> = HashMap::new();
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let parent_score = scores.get(&current).copied().unwrap_or(0.0);
+        let Some(callers) = adj.get(&current) else {
+            continue;
+        };
+        for (caller_uid, edge_type, confidence) in callers {
+            // The DB query filters callers by min_confidence; mirror it.
+            if *confidence < min_confidence {
+                continue;
+            }
+            // Skip the seed appearing as its own (transitive) caller.
+            if caller_uid == seed {
+                continue;
+            }
+            let candidate_score = parent_score * *confidence as f64;
+            if candidate_score < IMPACT_THRESHOLD {
+                continue;
+            }
+            let prev_score = scores.get(caller_uid).copied().unwrap_or(0.0);
+            if candidate_score > prev_score {
+                scores.insert(caller_uid.clone(), candidate_score);
+                result.insert(
+                    caller_uid.clone(),
+                    Reacher {
+                        uid: caller_uid.clone(),
+                        edge_type: edge_type.clone(),
+                        confidence: *confidence,
+                        depth: depth + 1,
+                    },
+                );
+                queue.push_back((caller_uid.clone(), depth + 1));
+            }
+        }
+    }
+    result.into_values().collect()
 }
 
 /// Record `candidate` as the best-known selection for its symbol UID, keeping
@@ -701,5 +827,57 @@ mod tests {
             derive_recommendation(AnalysisStatus::Failed),
             "run-full-suite"
         );
+    }
+
+    #[test]
+    fn in_memory_impact_matches_store_impact() {
+        // nw-085 Part A: the in-memory reverse walk must reproduce the store's
+        // confidence-weighted `impact` exactly. Build a DAG with overlapping
+        // reverse cones and DISTINCT confidences (no score ties, where the DB
+        // and in-memory tie-break order could legitimately differ), then compare
+        // the reached uid->depth map for each seed.
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+        let store = GraphStore::in_memory().expect("store");
+        for name in ["a", "b", "c", "d", "e"] {
+            store
+                .insert_symbol(&sym(&format!("sym:{name}"), name, "src/lib.rs"))
+                .unwrap();
+        }
+        let e = |src: &str, dst: &str, conf: f32, et: EdgeType| ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: dst.to_string(),
+            edge_type: et,
+            confidence: conf,
+            link_type: None,
+            evidence: vec![],
+        };
+        // b -> a, c -> b, d -> a (shallower), e -> c ; mixed edge types + confs.
+        for edge in [
+            e("sym:b", "sym:a", 0.9, EdgeType::Calls),
+            e("sym:c", "sym:b", 0.8, EdgeType::Imports),
+            e("sym:d", "sym:a", 0.7, EdgeType::Calls),
+            e("sym:e", "sym:c", 0.95, EdgeType::Extends),
+        ] {
+            store.insert_edge(&edge).unwrap();
+        }
+
+        let adj = build_rev_impact_adjacency(&store.load_typed_edges().unwrap());
+        for seed in ["sym:a", "sym:b", "sym:c"] {
+            let db: HashMap<String, u32> = store
+                .impact(seed, MAX_TEST_DEPTH, MIN_CONFIDENCE)
+                .unwrap()
+                .into_iter()
+                .map(|n| (n.uid, n.depth))
+                .collect();
+            let mem: HashMap<String, u32> =
+                impact_reachers_in_memory(seed, &adj, MAX_TEST_DEPTH, MIN_CONFIDENCE)
+                    .into_iter()
+                    .map(|r| (r.uid, r.depth))
+                    .collect();
+            assert_eq!(
+                db, mem,
+                "in-memory impact must match store.impact for {seed}"
+            );
+        }
     }
 }

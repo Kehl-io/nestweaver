@@ -34,7 +34,7 @@ pub use tantivy_index::{
     PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K, SearchHit,
     TantivyError, TantivyIndex,
 };
-pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
+pub use traverse::{IMPACT_EDGE_TYPES, ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{
     DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
     DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery, InstanceUidHandoff,
