@@ -80,7 +80,15 @@ pub struct OrgWideImpact {
 pub struct OrgImpactItem {
     pub change_name: String,
     pub change_kind: String,
+    /// Stable repo identity for the changed/source symbol. Authorization must
+    /// use this field rather than a display label.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub change_repo_uid: String,
     pub affected_name: String,
+    /// Stable repo identity for the affected/destination symbol. The
+    /// `affected_repo` field below is presentation-only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub affected_repo_uid: String,
     pub affected_repo: String,
     pub affected_file: String,
     pub affected_line: i32,
@@ -560,7 +568,7 @@ pub fn analyze_blast_radius(
     // kind/owning-repo lookup into ONE store query afterwards instead of N.
     // Buffering in first-seen order (the same order the old per-node path pushed
     // into `affected_symbols`) keeps the pre-sort ordering byte-identical.
-    let mut buffered: Vec<(ImpactNode, String, String)> = Vec::new();
+    let mut buffered: Vec<(ImpactNode, String, String, String)> = Vec::new();
 
     for cs in &changed_symbols {
         // Check the deadline before starting another symbol's traversal so a
@@ -614,7 +622,7 @@ pub fn analyze_blast_radius(
             // node plus its surfacing changed symbol; the kind/repo lookup is
             // deferred to a single batched query below.
             if affected_uids.insert(node.uid.clone()) {
-                buffered.push((node, cs.name.clone(), cs.kind.clone()));
+                buffered.push((node, cs.name.clone(), cs.kind.clone(), cs.repo_uid.clone()));
             }
         }
     }
@@ -623,7 +631,7 @@ pub fn analyze_blast_radius(
     // replacing the former N per-affected-node `lookup_symbol` round-trips.
     let uid_refs: Vec<&str> = buffered
         .iter()
-        .map(|(node, _, _)| node.uid.as_str())
+        .map(|(node, _, _, _)| node.uid.as_str())
         .collect();
     let lookup_map = match store.batch_lookup_symbols(&uid_refs) {
         Ok(map) => map,
@@ -645,7 +653,7 @@ pub fn analyze_blast_radius(
     // Second pass: rebuild affected_symbols (and the org-wide items) from the
     // buffered nodes + the batch lookup map, in the same first-seen order, so the
     // pre-sort output is identical to the old per-node path.
-    for (node, change_name, change_kind) in buffered {
+    for (node, change_name, change_kind, change_repo_uid) in buffered {
         let affected_sym = lookup_map.get(&node.uid);
         if affected_sym.is_none() {
             lookup_failures += 1;
@@ -664,7 +672,9 @@ pub fn analyze_blast_radius(
             let item = OrgImpactItem {
                 change_name,
                 change_kind,
+                change_repo_uid,
                 affected_name: node.name.clone(),
+                affected_repo_uid: affected_repo.clone(),
                 affected_repo: repo_label,
                 affected_file: node.file_path.clone(),
                 affected_line: node.start_line as i32,
@@ -1398,6 +1408,15 @@ mod tests {
                 .any(|i| i.affected_name == "Caller" && i.affected_repo == "repo:client"),
             "org-wide item should describe the cross-repo consumer"
         );
+        let item = org
+            .breaking
+            .iter()
+            .chain(&org.warnings)
+            .chain(&org.info)
+            .find(|i| i.affected_name == "Caller")
+            .expect("cross-repo item");
+        assert_eq!(item.change_repo_uid, "repo:api");
+        assert_eq!(item.affected_repo_uid, "repo:client");
     }
 
     #[test]

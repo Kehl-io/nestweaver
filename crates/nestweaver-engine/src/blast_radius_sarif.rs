@@ -420,7 +420,9 @@ mod tests {
             breaking: vec![OrgImpactItem {
                 change_name: "Handler".to_string(),
                 change_kind: "Function".to_string(),
+                change_repo_uid: "repo:api".to_string(),
                 affected_name: "Caller".to_string(),
+                affected_repo_uid: "repo:client".to_string(),
                 affected_repo: "repo:client".to_string(),
                 affected_file: "src/client.rs".to_string(),
                 affected_line: 12,

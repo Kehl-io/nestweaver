@@ -8702,9 +8702,9 @@ mod blast_radius_visibility_tests {
 
     /// Build a two-repo (repo:api → repo:client) cross-repo store, mirroring the
     /// engine's `org_wide_populated_for_cross_repo_impact` fixture. Changing the
-    /// api symbol surfaces repo:client as an org-wide impact. Repo records are
-    /// inserted (with `url == uid`) so `redact_blast_radius_for_visibility` can
-    /// resolve an org item's `affected_repo` display label back to a repo_uid.
+    /// api symbol surfaces repo:client as an org-wide impact. Repo records use
+    /// `url == uid` only to keep the expected presentation labels concise;
+    /// authorization uses the org item's stable source and destination UIDs.
     fn cross_repo_store() -> GraphStore {
         let store = GraphStore::in_memory().expect("in_memory store");
 
@@ -8817,6 +8817,76 @@ mod blast_radius_visibility_tests {
                 })
                 .unwrap();
         }
+        store
+    }
+
+    fn duplicate_url_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let repo = |uid: &str, url: &str| Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+        let symbol = |uid: &str, name: &str, repo_uid: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        store
+            .insert_repo(&repo("repo:hidden", "https://example.test/shared"))
+            .unwrap();
+        store
+            .insert_repo(&repo("repo:alias", "https://example.test/shared"))
+            .unwrap();
+        store
+            .insert_repo(&repo("repo:source", "https://example.test/source"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol(
+                "source",
+                "VisibleSource",
+                "repo:source",
+                "src/source.rs",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&symbol(
+                "hidden-duplicate",
+                "HiddenDuplicateCaller",
+                "repo:hidden",
+                "hidden/duplicate.rs",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "hidden-duplicate".to_string(),
+                target_uid: "source".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: vec![],
+            })
+            .unwrap();
         store
     }
 
@@ -8945,6 +9015,9 @@ mod blast_radius_visibility_tests {
         assert!(!serialized.contains("repo:b"));
         assert!(!serialized.contains("HiddenCaller"));
         assert!(!serialized.contains("src/hidden.rs"));
+        assert!(!serialized.contains("repo:api"));
+        assert!(!serialized.contains("Target"));
+        assert!(result["org_wide"].is_null());
 
         let sarif = tool_blast_radius(
             &store,
@@ -8965,6 +9038,130 @@ mod blast_radius_visibility_tests {
         assert!(!serialized.contains("repo:b"));
         assert!(!serialized.contains("HiddenCaller"));
         assert!(!serialized.contains("src/hidden.rs"));
+        assert!(!serialized.contains("repo:api"));
+        assert!(!serialized.contains("Target"));
+        assert!(
+            sarif["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| result["ruleId"] != "nw/org-impact")
+        );
+    }
+
+    #[test]
+    fn blast_radius_authz_ignores_duplicate_repo_display_urls() {
+        let store = duplicate_url_store();
+        let visible = VisibleRepos::Only(
+            ["repo:source".to_string(), "repo:alias".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let args = json!({ "changed_files": ["src/source.rs"] });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert!(result["org_wide"].is_null());
+        assert_eq!(result["affected_symbol_count"], 0);
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("repo:hidden"));
+        assert!(!serialized.contains("HiddenDuplicateCaller"));
+        assert!(!serialized.contains("hidden/duplicate.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/source.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        assert!(sarif["runs"][0]["results"].as_array().unwrap().is_empty());
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("repo:hidden"));
+        assert!(!serialized.contains("HiddenDuplicateCaller"));
+        assert!(!serialized.contains("hidden/duplicate.rs"));
+    }
+
+    #[test]
+    fn blast_radius_authz_hides_unqualified_cochange_data_from_json_and_sarif() {
+        use nestweaver_engine::cochange::{CoChangeEdge, save_cochange_sidecar};
+
+        let store = cross_repo_store();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cochange-authz.lbug");
+        std::fs::write(&db_path, b"").unwrap();
+        save_cochange_sidecar(
+            &[CoChangeEdge {
+                file_a: "src/api.rs".to_string(),
+                file_b: "hidden/private.sql".to_string(),
+                cochange_count: 8675309,
+                total_commits_a: 8675310,
+                total_commits_b: 8675311,
+                confidence: 0.99,
+            }],
+            &nestweaver_engine::sidecar_path(&db_path, ".cochange.json"),
+        )
+        .unwrap();
+        set_current_db_path(db_path);
+        let visible = VisibleRepos::Only(["repo:api".to_string()].into_iter().collect());
+        let args = json!({ "changed_files": ["src/api.rs"] });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert!(result["cochanged_files"].as_array().unwrap().is_empty());
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("hidden/private.sql"));
+        assert!(!serialized.contains("8675309"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/api.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("hidden/private.sql"));
+        assert!(!serialized.contains("8675309"));
+    }
+
+    #[test]
+    fn blast_radius_authz_sanitizes_degraded_notifications_in_json_and_sarif() {
+        let store = GraphStore::in_memory().unwrap();
+        let visible = VisibleRepos::Only(HashSet::new());
+        let args = json!({ "changed_files": ["hidden/private.rs"] });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert_eq!(result["status"], "degraded");
+        assert_eq!(result["gate_state"], "degraded-unknown");
+        let notifications = result["notifications"].as_array().unwrap();
+        let changed_file_note = notifications
+            .iter()
+            .find(|note| note["descriptor"] == "changed-file-no-symbols")
+            .expect("changed-file-no-symbols notification");
+        assert_eq!(changed_file_note["level"], "warning");
+        assert_eq!(
+            changed_file_note["message"],
+            "blast-radius analysis details withheld by repository visibility policy"
+        );
+        let notifications_json = serde_json::to_string(notifications).unwrap();
+        assert!(!notifications_json.contains("hidden/private.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["hidden/private.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(
+            sarif["runs"][0]["properties"]["nestweaver/status"],
+            "degraded"
+        );
+        assert_eq!(
+            sarif["runs"][0]["properties"]["nestweaver/gateState"],
+            "degraded-unknown"
+        );
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("hidden/private.rs"));
     }
 }
 

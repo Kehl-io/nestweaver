@@ -157,13 +157,13 @@ impl PermissionSource for StaticConfigPermissionSource {
 /// `visible` is [`VisibleRepos::All`] (the disabled-policy / single-trust-domain
 /// path), which is what preserves zero behavior change for existing callers.
 ///
-/// `repos` is required to resolve an [`OrgImpactItem`]'s `affected_repo` — a
-/// *display label* (a repo's `url` or `uid`), not a `repo_uid` — back to a
-/// concrete `repo_uid` before the visibility check.
+/// `repos` is retained in the signature for caller compatibility. Authorization
+/// deliberately does not consult display labels: org items carry stable source
+/// and destination repo UIDs and legacy/unattributed rows fail closed.
 pub fn redact_blast_radius_for_visibility(
     result: &mut BlastRadiusResult,
     visible: &VisibleRepos,
-    repos: &[Repo],
+    _repos: &[Repo],
 ) {
     // All ⇒ nothing is hidden; leave the result byte-for-byte unchanged.
     let visible_only = match visible {
@@ -180,32 +180,21 @@ pub fn redact_blast_radius_for_visibility(
         .retain(|s| visible_only.allows(&s.repo_uid));
     result.affected_symbol_count = result.affected_symbols.len();
 
-    // Map every display label (url and uid) to its repo_uid so an
-    // OrgImpactItem's `affected_repo` label can be resolved before the check.
-    let label_to_uid: HashMap<&str, &str> = repos
-        .iter()
-        .flat_map(|r| {
-            [
-                (r.url.as_str(), r.uid.as_str()),
-                (r.uid.as_str(), r.uid.as_str()),
-            ]
-        })
-        .collect();
-
-    // An org item is visible when its resolved repo_uid is allowed. A label we
-    // cannot resolve to a known repo is dropped — under an enabled policy we
-    // cannot prove it is visible, so we fail closed rather than leak it.
-    let item_visible = |affected_repo: &str| -> bool {
-        match label_to_uid.get(affected_repo) {
-            Some(uid) => visible_only.allows(uid),
-            None => false,
-        }
+    // Org items reference both a source/change repo and a destination/affected
+    // repo. Authorize exclusively by their stable UIDs: display URLs/names may
+    // collide and are presentation-only. Legacy items lack one or both UIDs and
+    // therefore fail closed under an enabled policy.
+    let item_visible = |item: &crate::blast_radius::OrgImpactItem| -> bool {
+        !item.change_repo_uid.is_empty()
+            && !item.affected_repo_uid.is_empty()
+            && visible_only.allows(&item.change_repo_uid)
+            && visible_only.allows(&item.affected_repo_uid)
     };
 
     if let Some(org) = result.org_wide.as_mut() {
-        org.breaking.retain(|i| item_visible(&i.affected_repo));
-        org.warnings.retain(|i| item_visible(&i.affected_repo));
-        org.info.retain(|i| item_visible(&i.affected_repo));
+        org.breaking.retain(&item_visible);
+        org.warnings.retain(&item_visible);
+        org.info.retain(&item_visible);
 
         // Recompute impacted_repos to the surviving visible display labels,
         // de-duplicated and order-preserving.
@@ -254,6 +243,24 @@ pub fn redact_blast_radius_for_visibility(
     // rather than emit numbers/names that encode hidden-repo membership.
     result.affected_clusters.clear();
 
+    // Co-change rows currently carry paths and cardinalities but no repo UID.
+    // Until the sidecar format can prove ownership, fail closed under scoping.
+    result.cochanged_files.clear();
+
+    // Notification detail may contain symbol names, paths, or raw store errors.
+    // Preserve the stable descriptor and severity for machine handling, retain
+    // the detail in server-side logs, and expose only a fixed generic message.
+    for notification in &mut result.notifications {
+        tracing::debug!(
+            descriptor = %notification.descriptor,
+            level = ?notification.level,
+            detail = %notification.message,
+            "redacting blast-radius notification detail for a restricted response"
+        );
+        notification.message =
+            "blast-radius analysis details withheld by repository visibility policy".to_string();
+    }
+
     // Regenerate the human summary from the REDACTED vecs. The baked-in string
     // embedded pre-redaction counts (transitively-affected + clusters), which
     // both disagreed with the redacted `affected_symbols` and leaked the
@@ -274,8 +281,8 @@ pub fn redact_blast_radius_for_visibility(
         result.status,
     );
 
-    // risk_level, gate_state, status, blind_spots, analysis_direction,
-    // notifications, coverage.traversal_truncated: intentionally NOT redacted.
+    // risk_level, gate_state, status, blind_spots, analysis_direction, and
+    // coverage.traversal_truncated are intentionally NOT redacted.
     //
     // The gate verdict must reflect the TRUE risk of the change. Recomputing it
     // from only the visible subset could report "safe" while real impact lives in
@@ -337,8 +344,8 @@ pub fn classify_repo_listing(
 mod tests {
     use super::*;
     use crate::blast_radius::{
-        AffectedCluster, AffectedSymbol, ChangedSymbol, Coverage, OrgImpactItem, OrgWideImpact,
-        StaleRepo,
+        AffectedCluster, AffectedSymbol, AnalysisStatus, ChangedSymbol, CoChangedFile, Coverage,
+        Notification, NotificationLevel, OrgImpactItem, OrgWideImpact, StaleRepo,
     };
     use crate::process::RiskLevel;
 
@@ -532,16 +539,34 @@ mod tests {
     }
 
     fn org_item(affected_repo: &str) -> OrgImpactItem {
+        let affected_repo_uid = match affected_repo {
+            "github.com/acme/a" => "repo:a",
+            "github.com/acme/b" => "repo:b",
+            _ => "",
+        };
         OrgImpactItem {
             change_name: "c".to_string(),
             change_kind: "function".to_string(),
+            change_repo_uid: "repo:a".to_string(),
             affected_name: "a".to_string(),
+            affected_repo_uid: affected_repo_uid.to_string(),
             affected_repo: affected_repo.to_string(),
             affected_file: "f.rs".to_string(),
             affected_line: 1,
             severity: "warning".to_string(),
             reason: "r".to_string(),
         }
+    }
+
+    fn org_item_with_uids(
+        affected_repo: &str,
+        change_repo_uid: &str,
+        affected_repo_uid: &str,
+    ) -> OrgImpactItem {
+        let mut item = org_item(affected_repo);
+        item.change_repo_uid = change_repo_uid.to_string();
+        item.affected_repo_uid = affected_repo_uid.to_string();
+        item
     }
 
     fn sample_result() -> BlastRadiusResult {
@@ -714,5 +739,122 @@ mod tests {
         result.org_wide.as_mut().unwrap().breaking.clear();
         redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
         assert!(result.org_wide.is_none());
+    }
+
+    #[test]
+    fn redact_only_requires_visible_source_and_destination_uids() {
+        let mut result = sample_result();
+        let org = result.org_wide.as_mut().unwrap();
+        org.breaking.clear();
+        org.warnings = vec![org_item_with_uids("github.com/acme/a", "repo:b", "repo:a")];
+        org.info.clear();
+        org.impacted_repos = vec!["github.com/acme/a".to_string()];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        assert!(
+            result.org_wide.is_none(),
+            "a visible destination must not expose a hidden source"
+        );
+    }
+
+    #[test]
+    fn redact_only_uses_destination_uid_when_repo_urls_collide() {
+        let repos = vec![
+            repo("repo:hidden", "github.com/acme/shared"),
+            repo("repo:visible", "github.com/acme/shared"),
+        ];
+        let mut result = sample_result();
+        let org = result.org_wide.as_mut().unwrap();
+        org.breaking.clear();
+        org.warnings = vec![org_item_with_uids(
+            "github.com/acme/shared",
+            "repo:visible",
+            "repo:hidden",
+        )];
+        org.info.clear();
+        org.impacted_repos = vec!["github.com/acme/shared".to_string()];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:visible"]), &repos);
+
+        assert!(
+            result.org_wide.is_none(),
+            "a duplicate display URL must not authorize the hidden destination"
+        );
+    }
+
+    #[test]
+    fn redact_only_drops_legacy_unattributed_org_items() {
+        let mut result = sample_result();
+        let mut legacy_value = serde_json::to_value(org_item("github.com/acme/a")).unwrap();
+        let legacy_object = legacy_value.as_object_mut().unwrap();
+        legacy_object.remove("change_repo_uid");
+        legacy_object.remove("affected_repo_uid");
+        let legacy_item = serde_json::from_value(legacy_value).unwrap();
+        let org = result.org_wide.as_mut().unwrap();
+        org.breaking.clear();
+        org.warnings = vec![legacy_item];
+        org.info.clear();
+        org.impacted_repos = vec!["github.com/acme/a".to_string()];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        assert!(result.org_wide.is_none());
+    }
+
+    #[test]
+    fn redact_only_clears_unqualified_cochange_rows() {
+        let mut result = sample_result();
+        result.cochanged_files = vec![CoChangedFile {
+            file: "hidden/private.sql".to_string(),
+            coupled_to: "hidden/source.rs".to_string(),
+            cochange_count: 8675309,
+            confidence: 0.99,
+            note: "hidden/private.sql changed with hidden/source.rs 8675309 times".to_string(),
+        }];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        assert!(result.cochanged_files.is_empty());
+    }
+
+    #[test]
+    fn redact_only_sanitizes_notification_messages_for_json_and_sarif() {
+        let mut result = sample_result();
+        result.status = AnalysisStatus::Degraded;
+        result.notifications = vec![Notification {
+            level: NotificationLevel::Error,
+            message: "impact failed for HiddenTarget at hidden/private.rs: raw-store-secret"
+                .to_string(),
+            descriptor: "store.impact-failed".to_string(),
+        }];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        let notification = &result.notifications[0];
+        assert_eq!(notification.level, NotificationLevel::Error);
+        assert_eq!(notification.descriptor, "store.impact-failed");
+        assert_eq!(
+            notification.message,
+            "blast-radius analysis details withheld by repository visibility policy"
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("HiddenTarget"));
+        assert!(!json.contains("hidden/private.rs"));
+        assert!(!json.contains("raw-store-secret"));
+
+        let sarif = crate::blast_radius_sarif::blast_radius_to_sarif(&result, "test");
+        let sarif_json = serde_json::to_string(&sarif).unwrap();
+        assert!(!sarif_json.contains("HiddenTarget"));
+        assert!(!sarif_json.contains("hidden/private.rs"));
+        assert!(!sarif_json.contains("raw-store-secret"));
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["descriptor"]["id"],
+            "store.impact-failed"
+        );
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["level"],
+            "error"
+        );
     }
 }
