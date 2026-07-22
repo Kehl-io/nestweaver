@@ -96,18 +96,7 @@ pub fn trace_processes(store: &GraphStore, max_depth: u32) -> Result<Vec<Process
 
     let entry_points: Vec<&nestweaver_schema::Symbol> = symbols
         .iter()
-        .filter(|sym| {
-            if sym.is_entry_point {
-                return true;
-            }
-            let name_lower = sym.name.to_lowercase();
-            let is_heuristic_entry = ENTRY_POINT_NAMES.iter().any(|ep| name_lower == *ep)
-                || ENTRY_POINT_SUFFIXES
-                    .iter()
-                    .any(|suffix| name_lower.ends_with(suffix));
-            let is_root = !has_caller.contains(&sym.uid);
-            is_heuristic_entry || is_root
-        })
+        .filter(|sym| symbol_is_entry_point(sym, &has_caller))
         .collect();
 
     let mut processes = Vec::new();
@@ -117,6 +106,125 @@ pub fn trace_processes(store: &GraphStore, max_depth: u32) -> Result<Vec<Process
     }
 
     Ok(processes)
+}
+
+/// Whether a symbol is treated as a process entry point: explicitly flagged, a
+/// heuristic entry name/suffix, or a root (no callers). `has_caller` is the set
+/// of uids that appear as a callee somewhere (i.e. have at least one caller).
+fn symbol_is_entry_point(sym: &nestweaver_schema::Symbol, has_caller: &HashSet<String>) -> bool {
+    if sym.is_entry_point {
+        return true;
+    }
+    let name_lower = sym.name.to_lowercase();
+    let is_heuristic_entry = ENTRY_POINT_NAMES.iter().any(|ep| name_lower == *ep)
+        || ENTRY_POINT_SUFFIXES
+            .iter()
+            .any(|suffix| name_lower.ends_with(suffix));
+    let is_root = !has_caller.contains(&sym.uid);
+    is_heuristic_entry || is_root
+}
+
+/// Edge types that constitute a forward "process" step — the same set
+/// `callees_of` traverses. The reverse-reachability that scopes change impact
+/// MUST use the reverse of exactly this set, or it would miss entry points that
+/// reach a changed symbol through a non-CALLS edge.
+const PROCESS_EDGE_TYPES: [&str; 3] = ["CALLS", "IMPORTS", "CROSS_REPO_LINK"];
+
+/// In-memory forward adjacency over [`PROCESS_EDGE_TYPES`]. Prebuilt once from a
+/// bulk edge load so process tracing needs no per-node DB round-trips.
+type Adjacency = std::collections::HashMap<String, Vec<String>>;
+
+/// Breadth-first reachability over a prebuilt adjacency, from every seed up to
+/// `max_depth` hops (seeds included at depth 0). Pure in-memory — O(edges).
+fn reachable_in_memory(
+    adj: &Adjacency,
+    seeds: &HashSet<String>,
+    max_depth: u32,
+) -> HashSet<String> {
+    let mut visited: HashSet<String> = seeds.iter().cloned().collect();
+    let mut queue: VecDeque<(String, u32)> = seeds.iter().map(|u| (u.clone(), 0u32)).collect();
+    while let Some((uid, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        if let Some(neighbors) = adj.get(&uid) {
+            for n in neighbors {
+                if visited.insert(n.clone()) {
+                    queue.push_back((n.clone(), depth + 1));
+                }
+            }
+        }
+    }
+    visited
+}
+
+/// Forward trace of one entry point over a prebuilt adjacency — the in-memory
+/// twin of [`trace_single_process`], with member metadata looked up from
+/// `sym_by_uid`.
+fn trace_single_process_in_memory(
+    entry_point: &nestweaver_schema::Symbol,
+    fwd_adj: &Adjacency,
+    sym_by_uid: &std::collections::HashMap<String, &nestweaver_schema::Symbol>,
+    max_depth: u32,
+) -> ProcessResult {
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(entry_point.uid.clone());
+    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+    queue.push_back((entry_point.uid.clone(), 0));
+
+    let mut members = vec![ProcessMember {
+        uid: entry_point.uid.clone(),
+        name: entry_point.name.clone(),
+        file_path: entry_point.file_path.clone(),
+        call_depth: 0,
+    }];
+    let mut deepest: u32 = 0;
+
+    while let Some((current_uid, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let Some(callees) = fwd_adj.get(&current_uid) else {
+            continue;
+        };
+        for callee in callees {
+            if !visited.insert(callee.clone()) {
+                continue;
+            }
+            let member_depth = depth + 1;
+            deepest = deepest.max(member_depth);
+            // Prefer rich metadata; fall back to the uid if the callee isn't in
+            // the symbol table (e.g. an unresolved foreign leaf).
+            let (name, file_path) = sym_by_uid
+                .get(callee)
+                .map(|s| (s.name.clone(), s.file_path.clone()))
+                .unwrap_or_else(|| (callee.clone(), String::new()));
+            members.push(ProcessMember {
+                uid: callee.clone(),
+                name,
+                file_path,
+                call_depth: member_depth,
+            });
+            queue.push_back((callee.clone(), member_depth));
+        }
+    }
+    // Deterministic member order regardless of adjacency iteration.
+    members.sort_by(|a, b| (a.call_depth, &a.uid).cmp(&(b.call_depth, &b.uid)));
+
+    let uid = {
+        let key = format!("process:{}", entry_point.uid);
+        let hash = crate::hash::blake3_hex(&key);
+        format!("proc:{}", &hash[..16])
+    };
+    ProcessResult {
+        uid,
+        name: derive_process_name(entry_point),
+        entry_point_uid: entry_point.uid.clone(),
+        repo_uid: entry_point.repo_uid.clone(),
+        depth: deepest,
+        symbol_count: members.len() as u32,
+        members,
+    }
 }
 
 /// BFS forward from a single entry point to build one `ProcessResult`.
@@ -214,7 +322,12 @@ fn derive_process_name(entry_point: &nestweaver_schema::Symbol) -> String {
 /// Detect the impact of changed files on traced processes.
 ///
 /// 1. Maps changed file paths to affected symbols via `symbols_in_file`.
-/// 2. Traces all processes in the store.
+/// 2. Finds ONLY the processes whose entry point can reach an affected symbol
+///    (reverse-BFS from the affected set, intersected with entry points), then
+///    forward-traces just those — bounded by the blast radius, not the whole
+///    graph. This is equivalent to tracing every process and keeping the ones
+///    that overlap the affected set, but without the O(all-entry-points × BFS)
+///    scan that made this hang on a large store.
 /// 3. Cross-references to find which processes contain affected symbols.
 /// 4. Assigns a risk level: High (>3 processes), Medium (1-3), Low (0).
 pub fn detect_changes_impact(
@@ -239,8 +352,62 @@ pub fn detect_changes_impact(
         }
     }
 
-    // Step 2: trace processes.
-    let processes = trace_processes(store, max_depth)?;
+    // Early out: no changed file mapped to an indexed symbol → nothing to trace.
+    if affected_uids.is_empty() {
+        return Ok(ChangeImpact {
+            affected_symbols,
+            affected_processes: Vec::new(),
+            risk: RiskLevel::Low,
+            blast_radius: 0,
+        });
+    }
+
+    // Step 2 (scoped, in-memory): identify entry points that can reach an
+    // affected symbol, then forward-trace only those. A process overlaps the
+    // affected set iff its entry point reaches an affected symbol within
+    // `max_depth` — exactly the entry points found by a reverse-BFS from the
+    // affected symbols over the process edge set.
+    //
+    // The whole graph is loaded once via a handful of bulk queries and both the
+    // reverse and forward walks run in memory, so cost is O(edges) and constant
+    // in the number of processes — instead of the old O(entry-points × BFS) with
+    // a DB round-trip per visited node, which hung on a large store.
+    let symbols = store
+        .list_all_symbols()
+        .context("list_all_symbols for change impact")?;
+    let sym_by_uid: std::collections::HashMap<String, &nestweaver_schema::Symbol> =
+        symbols.iter().map(|s| (s.uid.clone(), s)).collect();
+
+    let typed_edges = store
+        .load_typed_edges()
+        .context("load_typed_edges for change impact")?;
+    let mut fwd_adj: Adjacency = std::collections::HashMap::new();
+    let mut rev_adj: Adjacency = std::collections::HashMap::new();
+    // `has_caller` mirrors `all_callee_uids`: targets of CALLS edges. Used by the
+    // entry-point predicate's root test.
+    let mut has_caller: HashSet<String> = HashSet::new();
+    for edge in &typed_edges {
+        let (src, dst, etype) = (&edge.0, &edge.1, edge.2.as_str());
+        if etype == "CALLS" {
+            has_caller.insert(dst.clone());
+        }
+        if PROCESS_EDGE_TYPES.contains(&etype) {
+            fwd_adj.entry(src.clone()).or_default().push(dst.clone());
+            rev_adj.entry(dst.clone()).or_default().push(src.clone());
+        }
+    }
+
+    // Reverse-reachable ancestors of the affected symbols, then keep the entry
+    // points among them (deterministic order via the symbols list).
+    let ancestors = reachable_in_memory(&rev_adj, &affected_uids, max_depth);
+    let relevant_entry_points: Vec<&nestweaver_schema::Symbol> = symbols
+        .iter()
+        .filter(|sym| ancestors.contains(&sym.uid) && symbol_is_entry_point(sym, &has_caller))
+        .collect();
+    let processes: Vec<ProcessResult> = relevant_entry_points
+        .iter()
+        .map(|ep| trace_single_process_in_memory(ep, &fwd_adj, &sym_by_uid, max_depth))
+        .collect();
 
     // Step 3: cross-reference.
     let mut affected_processes = Vec::new();
@@ -259,6 +426,9 @@ pub fn detect_changes_impact(
             });
         }
     }
+
+    // Deterministic output order (entry-point iteration order is not stable).
+    affected_processes.sort_by(|a, b| (&a.name, &a.uid).cmp(&(&b.name, &b.uid)));
 
     // Step 4: risk level.
     let risk = match affected_processes.len() {
@@ -436,5 +606,80 @@ mod tests {
         assert!(!impact.affected_symbols.is_empty());
         assert!(impact.affected_symbols.iter().any(|s| s.name == "helper"),);
         assert!(!impact.affected_processes.is_empty());
+    }
+
+    #[test]
+    fn detect_changes_impact_scopes_to_affected_blast_radius() {
+        // nw-078: the scoped tracer must report ONLY processes whose entry point
+        // reaches an affected symbol, and never fan out over unrelated processes.
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str, entry: bool| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: entry,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        // Chain 1: entryA -> mid -> target (target lives in the changed file).
+        // Chain 2: entryB -> other (entirely unrelated to the change).
+        for s in [
+            mk("sym:entryA", "entryA", "src/a.rs", true),
+            mk("sym:mid", "mid", "src/mid.rs", false),
+            mk("sym:target", "target", "src/target.rs", false),
+            mk("sym:entryB", "entryB", "src/b.rs", true),
+            mk("sym:other", "other", "src/other.rs", false),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        for (src, dst) in [
+            ("sym:entryA", "sym:mid"),
+            ("sym:mid", "sym:target"),
+            ("sym:entryB", "sym:other"),
+        ] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: dst.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+
+        let impact = detect_changes_impact(&store, &["src/target.rs".to_string()], 10)
+            .expect("detect_changes_impact");
+
+        // Exactly one affected process — the one rooted at entryA that reaches
+        // target. entryB's process must NOT appear (it doesn't reach target).
+        assert_eq!(impact.affected_processes.len(), 1);
+        assert!(
+            impact.affected_processes[0].name.contains("entryA"),
+            "expected the entryA process, got {}",
+            impact.affected_processes[0].name
+        );
+        assert!(
+            impact
+                .affected_processes
+                .iter()
+                .all(|p| !p.name.contains("entryB")),
+            "unrelated entryB process must not be reported"
+        );
     }
 }
