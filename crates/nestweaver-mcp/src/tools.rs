@@ -114,8 +114,8 @@ const LITE_TOOLS: &[&str] = &[
 /// Returns the `tools/list` payload — schemas + descriptions for every tool
 /// the brain exposes. When `lite` is true only the 6 core tools are included.
 /// When `--tools` was specified, only those named tools are included.
-pub fn tool_list(lite: bool) -> Value {
-    let mut tools = vec![
+fn all_tool_schemas() -> Vec<Value> {
+    vec![
         tool_schema_brain_context(),
         tool_schema_brain_search(),
         tool_schema_note_get(),
@@ -156,7 +156,53 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_brain_memory_lint(),
         tool_schema_brain_memory_consolidate(),
         tool_schema_brain_memory_related(),
-    ];
+    ]
+}
+
+static TOOL_VALIDATORS: std::sync::OnceLock<
+    std::collections::HashMap<String, jsonschema::Validator>,
+> = std::sync::OnceLock::new();
+
+fn tool_validators() -> &'static std::collections::HashMap<String, jsonschema::Validator> {
+    TOOL_VALIDATORS.get_or_init(|| {
+        all_tool_schemas()
+            .into_iter()
+            .map(|tool| {
+                let name = tool["name"]
+                    .as_str()
+                    .expect("registered tool has a string name")
+                    .to_string();
+                let validator = jsonschema::options()
+                    .with_draft(jsonschema::Draft::Draft202012)
+                    .build(&tool["inputSchema"])
+                    .unwrap_or_else(|error| panic!("invalid input schema for {name}: {error}"));
+                (name, validator)
+            })
+            .collect()
+    })
+}
+
+pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::Error> {
+    let validator = tool_validators()
+        .get(name)
+        .ok_or_else(|| anyhow!("unknown tool: {name}"))?;
+    let errors: Vec<String> = validator
+        .iter_errors(args)
+        .take(3)
+        .map(|error| format!("{}: {error}", error.instance_path()))
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "invalid arguments for tool '{name}': {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+pub fn tool_list(lite: bool) -> Value {
+    let mut tools = all_tool_schemas();
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
     }
@@ -170,6 +216,180 @@ pub fn tool_list(lite: bool) -> Value {
         });
     }
     json!({ "tools": tools })
+}
+
+#[cfg(test)]
+mod tool_schema_validation_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn assert_valid(name: &str, args: Value) {
+        validate_tool_arguments(name, &args)
+            .unwrap_or_else(|error| panic!("expected valid arguments for {name}: {error}"));
+    }
+
+    fn assert_invalid(name: &str, args: Value) -> String {
+        validate_tool_arguments(name, &args)
+            .expect_err("arguments should fail schema validation")
+            .to_string()
+    }
+
+    #[test]
+    fn registry_contains_exactly_the_40_advertised_unique_names() {
+        let expected: BTreeSet<&str> = [
+            "affected_tests",
+            "backlinks",
+            "blast_radius",
+            "brain_add_source",
+            "brain_broken_links",
+            "brain_context",
+            "brain_diff",
+            "brain_doc_stats",
+            "brain_guide",
+            "brain_impact",
+            "brain_memory_consolidate",
+            "brain_memory_lint",
+            "brain_memory_related",
+            "brain_orphan_documents",
+            "brain_remove_source",
+            "brain_search",
+            "brain_status",
+            "brain_tag_graph",
+            "brain_topic_clusters",
+            "bridge_nodes",
+            "clusters",
+            "contract_drift",
+            "count_patterns",
+            "cross_repo_contracts",
+            "dead_code",
+            "detect_changes",
+            "flow_trace",
+            "get_summary",
+            "hub_nodes",
+            "investigate",
+            "investigate_expand",
+            "investigate_hydrate",
+            "note_get",
+            "project_context",
+            "prune_stale",
+            "query_extensions",
+            "read_symbols",
+            "regex_search",
+            "set_extension",
+            "stale_check",
+        ]
+        .into_iter()
+        .collect();
+
+        let schemas = all_tool_schemas();
+        assert_eq!(
+            schemas.len(),
+            40,
+            "registry must contain exactly 40 schemas"
+        );
+        let names: BTreeSet<&str> = schemas
+            .iter()
+            .map(|schema| {
+                schema["name"]
+                    .as_str()
+                    .expect("registered tool has a string name")
+            })
+            .collect();
+        assert_eq!(names.len(), schemas.len(), "tool names must be unique");
+        assert_eq!(names, expected, "registry must match the advertised tools");
+    }
+
+    #[test]
+    fn every_registered_input_schema_compiles_as_draft_2020_12() {
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap();
+            jsonschema::options()
+                .with_draft(jsonschema::Draft::Draft202012)
+                .build(&tool["inputSchema"])
+                .unwrap_or_else(|error| panic!("invalid input schema for {name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn required_arguments_reject_empty_objects() {
+        for name in [
+            "brain_search",
+            "blast_radius",
+            "read_symbols",
+            "regex_search",
+            "detect_changes",
+        ] {
+            assert!(
+                assert_invalid(name, json!({})).contains("invalid arguments"),
+                "{name} should reject an empty object"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_errors_include_actionable_instance_paths() {
+        let error = assert_invalid("brain_search", json!({ "query": 7 }));
+        assert!(
+            error.contains("/query"),
+            "error should identify /query: {error}"
+        );
+    }
+
+    #[test]
+    fn property_and_array_member_types_are_enforced() {
+        assert_invalid("brain_search", json!({ "query": "x", "limit": "many" }));
+        assert_invalid("brain_search", json!({ "query": "x", "include_bodies": 1 }));
+        assert_invalid("read_symbols", json!({ "targets": ["sym:x", 7] }));
+    }
+
+    #[test]
+    fn validation_reports_at_most_three_errors() {
+        let error = assert_invalid(
+            "brain_search",
+            json!({
+                "query": 7,
+                "limit": "many",
+                "include_bodies": 1,
+                "prf": "yes"
+            }),
+        );
+        assert_eq!(
+            error.matches("; ").count(),
+            2,
+            "validation should report exactly three of the four errors: {error}"
+        );
+    }
+
+    #[test]
+    fn runtime_aliases_and_canonical_spellings_validate() {
+        assert_valid("read_symbols", json!({ "uids_or_fqns": ["sym:x"] }));
+        assert_valid("regex_search", json!({ "query": "fn\\s+x" }));
+        assert_valid("detect_changes", json!({ "files": ["src/a.rs"] }));
+
+        assert_valid("read_symbols", json!({ "targets": ["sym:x"] }));
+        assert_valid("regex_search", json!({ "pattern": "fn\\s+x" }));
+        assert_valid("detect_changes", json!({ "changed_files": ["src/a.rs"] }));
+
+        assert_valid("hub_nodes", json!({ "top_n": 5 }));
+        assert_valid("bridge_nodes", json!({ "top_n": 5 }));
+        assert_valid("get_summary", json!({ "name": "x" }));
+    }
+
+    #[test]
+    fn aliases_require_non_empty_string_arrays() {
+        for (name, args) in [
+            ("read_symbols", json!({ "uids_or_fqns": [] })),
+            ("detect_changes", json!({ "files": [] })),
+        ] {
+            assert_invalid(name, args);
+        }
+    }
+
+    #[test]
+    fn unknown_tool_is_reported() {
+        let error = assert_invalid("not_a_tool", json!({}));
+        assert_eq!(error, "unknown tool: not_a_tool");
+    }
 }
 
 /// Returns structured documentation metadata for every registered tool.
@@ -942,7 +1162,14 @@ fn tool_schema_read_symbols() -> Value {
                 "targets": {
                     "type": "array",
                     "items": { "type": "string" },
+                    "minItems": 1,
                     "description": "Symbol UIDs (sym:...), names, or FQNs to read."
+                },
+                "uids_or_fqns": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Backward-compatible alias for targets."
                 },
                 "include_neighbors": {
                     "type": "integer",
@@ -957,7 +1184,10 @@ fn tool_schema_read_symbols() -> Value {
                     "description": "Repository root for resolving file paths (default: server working directory)."
                 }
             },
-            "required": ["targets"]
+            "anyOf": [
+                { "required": ["targets"] },
+                { "required": ["uids_or_fqns"] }
+            ]
         }
     })
 }
@@ -1011,6 +1241,7 @@ fn tool_schema_regex_search() -> Value {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\"." },
+                "query": { "type": "string", "description": "Backward-compatible alias for pattern." },
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
                     "type": "array",
@@ -1020,7 +1251,10 @@ fn tool_schema_regex_search() -> Value {
                 "limit": { "type": "integer", "description": "Maximum results to return. Default: unlimited (capped by the candidate budget)." },
                 "max_millis": { "type": "integer", "description": "Wall-clock time budget in milliseconds. Default 2000." }
             },
-            "required": ["pattern"]
+            "anyOf": [
+                { "required": ["pattern"] },
+                { "required": ["query"] }
+            ]
         }
     })
 }
@@ -4294,10 +4528,20 @@ fn tool_schema_detect_changes() -> Value {
                 "changed_files": {
                     "type": "array",
                     "items": { "type": "string" },
+                    "minItems": 1,
                     "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
+                },
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Backward-compatible alias for changed_files."
                 }
             },
-            "required": ["changed_files"]
+            "anyOf": [
+                { "required": ["changed_files"] },
+                { "required": ["files"] }
+            ]
         }
     })
 }
