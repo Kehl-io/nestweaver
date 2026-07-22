@@ -798,6 +798,18 @@ async fn handle_mcp(
                 );
             };
 
+            if let Err(error) = tools::validate_tool_arguments(&name, &arguments) {
+                return (
+                    axum::http::StatusCode::OK,
+                    HeaderMap::new(),
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": tools::wrap_tool_error(&error.to_string()),
+                    })),
+                );
+            }
+
             // Read-only snapshot replica: reject EVERY mutating tool before
             // dispatch, regardless of auth/admin. A replica opens its store
             // read-only, so a mutating tool would otherwise dispatch and fail
@@ -1110,6 +1122,34 @@ mod tests {
             false,
         ));
         router(state)
+    }
+
+    fn test_server_app() -> Router {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let state = Arc::new(McpHttpState::new(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            true,
+        ));
+        router(state)
+    }
+
+    fn valid_mutating_arguments(tool: &str) -> Value {
+        match tool {
+            "brain_add_source" => json!({ "path": "/tmp/not-dispatched" }),
+            "brain_remove_source" => json!({ "target": "repo:not-dispatched" }),
+            "brain_memory_consolidate" => json!({}),
+            "set_extension" => json!({
+                "uid": "sym:not-dispatched",
+                "key": "reviewed",
+                "value": true,
+            }),
+            "prune_stale" => json!({}),
+            other => panic!("missing schema-valid mutating fixture for {other}"),
+        }
     }
 
     fn test_auth_app() -> Router {
@@ -1458,6 +1498,119 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn malformed_brain_search_returns_in_band_schema_error_before_safeguards() {
+        let app = test_server_app();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "tools/call",
+            "params": {
+                "name": "brain_search",
+                "arguments": { "query": 17, "depth": MAX_DEPTH + 1 },
+            },
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(json.get("error").is_none(), "{json}");
+        assert_eq!(json["result"]["isError"], serde_json::json!(true));
+        let result = json["result"].to_string();
+        assert!(result.contains("invalid arguments for tool"), "{result}");
+        assert!(result.contains("/query"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn malformed_mutating_tools_return_in_band_schema_errors_before_authorization() {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let mut state = McpHttpState::with_auth(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            true,
+            "query-token".to_string(),
+            Some("admin-token".to_string()),
+        );
+        state.read_only = true;
+        let gate_cases = [
+            (router(Arc::new(state)), "admin-token", "read-only"),
+            (test_auth_app(), "query-token", "admin"),
+        ];
+
+        let malformed_calls = [
+            ("brain_add_source", json!({ "path": 17 }), "/path"),
+            ("brain_remove_source", json!({ "target": 17 }), "/target"),
+            (
+                "brain_memory_consolidate",
+                json!({ "apply": "yes" }),
+                "/apply",
+            ),
+            (
+                "set_extension",
+                json!({ "uid": 17, "key": "reviewed", "value": true }),
+                "/uid",
+            ),
+            ("prune_stale", json!([]), "/"),
+        ];
+
+        for (tool, arguments, instance_path) in malformed_calls {
+            for (app, token, gate) in &gate_cases {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": tool,
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments },
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{tool} before {gate} gate");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+                assert!(
+                    json.get("error").is_none(),
+                    "{tool} before {gate} gate: {json}"
+                );
+                assert_eq!(
+                    json["result"]["isError"],
+                    serde_json::json!(true),
+                    "{tool} before {gate} gate: {json}"
+                );
+                let result = json["result"].to_string();
+                assert!(
+                    result.contains("invalid arguments for tool"),
+                    "{tool} before {gate} gate: {result}"
+                );
+                assert!(
+                    result.contains(instance_path),
+                    "{tool} before {gate} gate must identify {instance_path}: {result}"
+                );
+            }
+        }
+    }
+
     /// A read-only snapshot replica must reject every mutating MCP tool over
     /// `tools/call` BEFORE dispatch — even when the caller presents the admin
     /// token — so the mutation never reaches the read-only store. This is the
@@ -1480,11 +1633,14 @@ mod tests {
 
         // Every mutating tool must be rejected, even with the admin token.
         for tool in MUTATING_TOOLS {
+            let arguments = valid_mutating_arguments(tool);
+            tools::validate_tool_arguments(tool, &arguments)
+                .unwrap_or_else(|error| panic!("invalid test fixture for {tool}: {error}"));
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": tool,
                 "method": "tools/call",
-                "params": { "name": tool, "arguments": {} },
+                "params": { "name": tool, "arguments": arguments },
             });
             let req = Request::builder()
                 .method("POST")
