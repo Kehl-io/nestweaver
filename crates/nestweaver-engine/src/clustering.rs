@@ -1,6 +1,7 @@
 // Leiden community detection for code call graphs.
 // Clusters graph nodes into functional communities to enable process-grouped search.
 
+use rand::SeedableRng as _;
 use rand::seq::SliceRandom as _;
 
 /// Undirected weighted graph representation.
@@ -90,7 +91,12 @@ pub fn leiden(graph: &Graph, resolution: f64, max_iterations: u32) -> Clustering
     // sigma[c] = sum of degrees of all nodes in community c.
     let mut sigma: Vec<f64> = degrees.clone();
 
-    let mut rng = rand::rng();
+    // Seed the RNG with a fixed constant so the shuffled visit order — and thus
+    // the community labels and total count — are identical across processes. An
+    // unseeded `rand::rng()` reseeds from OS entropy every run, which made a
+    // handful of borderline nodes land in different communities and drift the
+    // reported cluster_id / cluster_count between calls on the same graph.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x_4E57_C105); // "NW CLuS"
     let mut order: Vec<usize> = (0..graph.n).collect();
 
     for _ in 0..max_iterations {
@@ -102,8 +108,12 @@ pub fn leiden(graph: &Graph, resolution: f64, max_iterations: u32) -> Clustering
 
             // Compute w_in for each neighbouring community (including c_old).
             // w_in_to[c] = sum of weights from i to nodes in community c.
-            let mut w_in_to: std::collections::HashMap<usize, f64> =
-                std::collections::HashMap::new();
+            // BTreeMap (not HashMap) so `keys()` below yields candidate
+            // communities in a deterministic ascending order — equal-`delta`
+            // ties then resolve to the lowest community index every run instead
+            // of depending on per-process HashMap iteration order.
+            let mut w_in_to: std::collections::BTreeMap<usize, f64> =
+                std::collections::BTreeMap::new();
             for (j, w) in &graph.neighbors[i] {
                 let cj = assignment[*j] as usize;
                 *w_in_to.entry(cj).or_insert(0.0) += w;
@@ -383,6 +393,57 @@ mod tests {
                     c.cohesion
                 );
             }
+        }
+    }
+
+    #[test]
+    fn leiden_is_deterministic_across_runs() {
+        // nw-081 regression: a symmetric graph with several borderline nodes,
+        // whose community membership depends on visit order and tie-breaking.
+        // Four triangles joined in a ring by equal-weight bridges — the bridge
+        // endpoints sit near delta ~= 0, so an unseeded RNG or HashMap-ordered
+        // tie-break used to move them differently between runs, drifting both
+        // the labels and the total count. Both a fresh `rand::rng()` and a fresh
+        // HashMap RandomState differ per call, so an in-process repeat reproduces
+        // the old cross-process drift. After the fix, every run is identical.
+        // 4 triangles: (0,1,2)(3,4,5)(6,7,8)(9,10,11); ring bridges 2-3,5-6,8-9,11-0.
+        let b = 0.3; // equal-weight bridges — deliberately borderline
+        let neighbors = vec![
+            vec![(1, 1.0), (2, 1.0), (11, b)],  // 0
+            vec![(0, 1.0), (2, 1.0)],           // 1
+            vec![(0, 1.0), (1, 1.0), (3, b)],   // 2
+            vec![(2, b), (4, 1.0), (5, 1.0)],   // 3
+            vec![(3, 1.0), (5, 1.0)],           // 4
+            vec![(3, 1.0), (4, 1.0), (6, b)],   // 5
+            vec![(5, b), (7, 1.0), (8, 1.0)],   // 6
+            vec![(6, 1.0), (8, 1.0)],           // 7
+            vec![(6, 1.0), (7, 1.0), (9, b)],   // 8
+            vec![(8, b), (10, 1.0), (11, 1.0)], // 9
+            vec![(9, 1.0), (11, 1.0)],          // 10
+            vec![(9, 1.0), (10, 1.0), (0, b)],  // 11
+        ];
+        let raw: f64 = neighbors
+            .iter()
+            .flat_map(|v| v.iter().map(|(_, w)| w))
+            .sum();
+        let make = || Graph {
+            n: 12,
+            neighbors: neighbors.clone(),
+            total_weight: raw / 2.0,
+        };
+
+        let first = leiden(&make(), 1.0, 100);
+        for run in 0..5 {
+            let again = leiden(&make(), 1.0, 100);
+            assert_eq!(
+                first.assignment, again.assignment,
+                "run {run}: per-node cluster labels must be identical across runs"
+            );
+            assert_eq!(
+                first.communities.len(),
+                again.communities.len(),
+                "run {run}: cluster_count must be identical across runs"
+            );
         }
     }
 }
