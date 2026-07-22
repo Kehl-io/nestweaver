@@ -6002,11 +6002,71 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
 
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
-    let target = args.get("target").and_then(|v| v.as_str());
+    // Accept `name` as an alias for `target` — agents naturally pass a symbol as
+    // `name`, and silently dropping it used to force a full-store regeneration.
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .or_else(|| args.get("name").and_then(|v| v.as_str()));
     let token_budget = args
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
+
+    // ── Symbol level: bounded, target-pushed-down path (nw-079) ───────────────
+    // Symbol summaries are O(symbols × per-symbol caller/callee queries). An
+    // untargeted call over a large graph used to hang for tens of seconds and
+    // never cache (so every call re-hung). Route symbol level through the bounded
+    // engine API instead: a `target` filters BEFORE the expensive queries (fast),
+    // and an untargeted call is hard-capped and reports the truncation honestly.
+    // We deliberately do NOT touch the sidecar cache here — a targeted or capped
+    // result is a partial set and must never be persisted as "the" summaries.
+    if level == SummaryLevel::Symbol {
+        let out = nestweaver_engine::generate_symbol_summaries_bounded(
+            store,
+            target,
+            nestweaver_engine::DEFAULT_SYMBOL_SUMMARY_CAP,
+        )?;
+        let matched_total = out.matched_total;
+        let capped = out.capped;
+        let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
+            truncate_to_budget(&out.summaries, budget)
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            out.summaries
+        };
+        let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
+        let truncated_by_budget = display.len() < matched_total;
+        let note = if capped {
+            Some(format!(
+                "symbol-level summary is capped at {} symbols of {matched_total}; pass `target` \
+                 (a symbol name or file substring) to summarize a specific area",
+                nestweaver_engine::DEFAULT_SYMBOL_SUMMARY_CAP
+            ))
+        } else if target.is_some() && display.is_empty() {
+            Some(format!(
+                "no symbol matched target {:?}",
+                target.unwrap_or_default()
+            ))
+        } else {
+            None
+        };
+        return Ok(json!({
+            "level": level_str,
+            "target": target,
+            "count": display.len(),
+            "total_available": matched_total,
+            "tokens_used": total_tokens,
+            "token_budget": token_budget,
+            "truncated": truncated_by_budget || capped,
+            "partial": capped,
+            "cached": false,
+            "note": note,
+            "summaries": render_text(&display),
+        }));
+    }
 
     // Try loading cached summaries from the sidecar first; only use the
     // cache when it contains entries at the requested level.
@@ -7860,6 +7920,50 @@ mod arg_alias_tests {
         let via_alias = tool_detect_changes(&store, json!({ "files": ["src/b.rs"] })).unwrap();
         assert_eq!(via_alias["files"], json!(["src/b.rs"]));
         assert!(tool_detect_changes(&store, json!({})).is_err());
+    }
+
+    #[test]
+    fn get_summary_symbol_honors_name_alias_and_target() {
+        // nw-079: `name` is accepted as an alias for `target`, and a targeted
+        // symbol-level summary returns only the match (not a full-store scan).
+        let store = GraphStore::in_memory().unwrap();
+        for name in ["greet", "hello"] {
+            let sym = nestweaver_schema::Symbol {
+                uid: format!("sym:test:abc:{name}"),
+                name: name.to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:test".to_string(),
+                file_path: "src/main.js".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("function {name}()"),
+                summary: None,
+                content_hash: name.to_string(),
+                embedding: None,
+                pagerank_score: Some(0.5),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            };
+            store.insert_symbol(&sym).unwrap();
+        }
+        // `name` alias is honored (not silently dropped) and filters to one match.
+        let via_name =
+            tool_get_summary(&store, json!({ "level": "symbol", "name": "greet" })).unwrap();
+        assert_eq!(via_name["count"], json!(1));
+        assert_eq!(via_name["total_available"], json!(1));
+        assert_eq!(via_name["partial"], json!(false));
+        assert!(
+            via_name["summaries"].as_str().unwrap().contains("greet"),
+            "summary should describe the targeted symbol"
+        );
+        // `target` works identically.
+        let via_target =
+            tool_get_summary(&store, json!({ "level": "symbol", "target": "hello" })).unwrap();
+        assert_eq!(via_target["count"], json!(1));
     }
 }
 

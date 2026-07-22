@@ -92,7 +92,13 @@ pub struct SummaryStore {
 /// Generate summaries at the given level from the graph store.
 pub fn generate_summaries(store: &GraphStore, level: SummaryLevel) -> Result<Vec<Summary>> {
     match level {
-        SummaryLevel::Symbol => generate_symbol_summaries(store),
+        // Untargeted symbol-level generation is bounded so it can't hang on a
+        // large graph; callers wanting a specific symbol should use
+        // `generate_symbol_summaries_bounded` with a target for the fast path.
+        SummaryLevel::Symbol => {
+            generate_symbol_summaries_bounded(store, None, DEFAULT_SYMBOL_SUMMARY_CAP)
+                .map(|r| r.summaries)
+        }
         SummaryLevel::File => generate_file_summaries(store),
         SummaryLevel::Cluster => generate_cluster_summaries(store),
         SummaryLevel::Hub => generate_hub_summaries(store),
@@ -144,13 +150,66 @@ fn generate_hub_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     Ok(summaries)
 }
 
-/// Symbol-level: one-line summary per function/class.
+/// Default cap on how many symbols an *untargeted* symbol-level summary will
+/// process. Each symbol costs ~4 graph queries (callers + 3 callee edge types),
+/// so an unbounded scan over a large graph hangs for tens of seconds (~11s even
+/// at 1000). This path is the one the tool description steers away from ("use
+/// target"), so keep the ceiling low enough to stay responsive and rely on the
+/// `partial`/note signal to point callers at a `target`. A targeted call bypasses
+/// the cap entirely since it only touches matches.
+pub const DEFAULT_SYMBOL_SUMMARY_CAP: usize = 500;
+
+/// Result of a bounded / target-filtered symbol-summary generation.
+pub struct SymbolSummaries {
+    pub summaries: Vec<Summary>,
+    /// Symbols that matched the `target` filter (or the whole store when no
+    /// target) BEFORE the cap — so callers can report honest truncation.
+    pub matched_total: usize,
+    /// True when the untargeted cap dropped some matches (`matched_total` >
+    /// `summaries.len()`).
+    pub capped: bool,
+}
+
+/// Symbol-level summaries with the `target` filter pushed DOWN before the
+/// expensive per-symbol caller/callee queries, and a hard cap so an untargeted
+/// call over a large graph can't hang.
 ///
-/// Format: `{kind} {name}({params}) -> {return} | callers: [list] | callees: [list] | file: {path}:{line}`
-fn generate_symbol_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
-    let symbols = store
+/// - `target = Some(t)`: only symbols whose name or uid contains `t`
+///   (case-insensitive) are summarized. The cap does not apply — a targeted
+///   query is inherently small — so `capped` is always false.
+/// - `target = None`: at most `cap` symbols (deterministic by uid) are
+///   summarized; `capped` is set when more exist. This is the pathological case
+///   the tool description already steers away from ("use target to filter").
+pub fn generate_symbol_summaries_bounded(
+    store: &GraphStore,
+    target: Option<&str>,
+    cap: usize,
+) -> Result<SymbolSummaries> {
+    let mut symbols = store
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("list_all_symbols: {e}"))?;
+
+    // Push the target filter down: match name/uid substring BEFORE any of the
+    // per-symbol caller/callee queries, mirroring `filter_by_target` so the two
+    // stay consistent. This turns the common single-symbol lookup into O(matches)
+    // graph queries instead of O(all symbols).
+    if let Some(t) = target {
+        let needle = t.to_lowercase();
+        symbols.retain(|s| {
+            s.name.to_lowercase().contains(&needle) || s.uid.to_lowercase().contains(&needle)
+        });
+    }
+
+    let matched_total = symbols.len();
+
+    // Untargeted: bound the work. Sort by uid so the retained subset is
+    // deterministic across runs, then cap.
+    let mut capped = false;
+    if target.is_none() && symbols.len() > cap {
+        symbols.sort_by(|a, b| a.uid.cmp(&b.uid));
+        symbols.truncate(cap);
+        capped = true;
+    }
 
     let mut summaries = Vec::with_capacity(symbols.len());
 
@@ -186,7 +245,11 @@ fn generate_symbol_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     // Sort by content string for deterministic output.
     summaries.sort_by(|a, b| a.content.cmp(&b.content));
 
-    Ok(summaries)
+    Ok(SymbolSummaries {
+        summaries,
+        matched_total,
+        capped,
+    })
 }
 
 /// File-level: exports and import sources per file.
@@ -653,12 +716,63 @@ mod tests {
         };
         store.insert_symbol(&sym).unwrap();
 
-        let summaries = generate_symbol_summaries(&store).unwrap();
+        let out =
+            generate_symbol_summaries_bounded(&store, None, DEFAULT_SYMBOL_SUMMARY_CAP).unwrap();
+        let summaries = out.summaries;
         assert_eq!(summaries.len(), 1);
+        assert!(!out.capped);
+        assert_eq!(out.matched_total, 1);
         assert!(summaries[0].content.contains("greet"));
         assert!(summaries[0].content.contains("src/main.js:10"));
         assert_eq!(summaries[0].level, SummaryLevel::Symbol);
         assert!(summaries[0].token_estimate > 0);
+    }
+
+    #[test]
+    fn symbol_summaries_target_pushdown_and_cap() {
+        // nw-079: a target filter returns only matching symbols (fast path), and
+        // an untargeted call over more than `cap` symbols is bounded + flagged.
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..5 {
+            let sym = nestweaver_schema::Symbol {
+                uid: format!("sym:test:abc:{i}"),
+                name: if i == 0 {
+                    "analyzeBlastRadius".to_string()
+                } else {
+                    format!("helper{i}")
+                },
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:test".to_string(),
+                file_path: "src/main.js".to_string(),
+                start_line: 10 + i as u32,
+                end_line: 10 + i as u32,
+                signature: format!("function s{i}()"),
+                summary: None,
+                content_hash: format!("h{i}"),
+                embedding: None,
+                pagerank_score: Some(0.5),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            };
+            store.insert_symbol(&sym).unwrap();
+        }
+
+        // Targeted: only the one matching symbol, cap irrelevant, not capped.
+        let hit = generate_symbol_summaries_bounded(&store, Some("blastradius"), 1).unwrap();
+        assert_eq!(hit.summaries.len(), 1);
+        assert_eq!(hit.matched_total, 1);
+        assert!(!hit.capped);
+        assert_eq!(hit.summaries[0].target_name, "analyzeBlastRadius");
+
+        // Untargeted with cap=2 over 5 symbols: bounded to 2 and flagged capped.
+        let all = generate_symbol_summaries_bounded(&store, None, 2).unwrap();
+        assert_eq!(all.summaries.len(), 2);
+        assert_eq!(all.matched_total, 5);
+        assert!(all.capped);
     }
 
     #[test]

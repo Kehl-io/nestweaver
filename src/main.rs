@@ -4926,19 +4926,31 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             out.status(&format!("Generating {} summaries...", parsed_level));
-            let summaries = generate_summaries(&store, parsed_level)?;
 
-            // Save to sidecar for later use.
-            save_summaries(&db_path, store.graph_generation(), &summaries)?;
-
-            // Optional target filter, then token budget truncation.
-            let after_filter: Vec<Summary> = if let Some(ref t) = target {
-                filter_by_target(&summaries, t)
-                    .into_iter()
-                    .cloned()
-                    .collect()
+            // Symbol level is bounded + target-pushed-down (nw-079): an untargeted
+            // full-store scan would hang, so cap it and push any `target` filter
+            // ahead of the per-symbol queries. A targeted or capped set is partial,
+            // so it must NOT be persisted to the sidecar as the canonical summaries.
+            let after_filter: Vec<Summary> = if parsed_level == SummaryLevel::Symbol {
+                let out = nestweaver_engine::generate_symbol_summaries_bounded(
+                    &store,
+                    target.as_deref(),
+                    nestweaver_engine::DEFAULT_SYMBOL_SUMMARY_CAP,
+                )?;
+                out.summaries
             } else {
-                summaries
+                let summaries = generate_summaries(&store, parsed_level)?;
+                // Save to sidecar for later use.
+                save_summaries(&db_path, store.graph_generation(), &summaries)?;
+                // Optional target filter.
+                if let Some(ref t) = target {
+                    filter_by_target(&summaries, t)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                } else {
+                    summaries
+                }
             };
 
             let display: Vec<Summary> = if let Some(budget) = token_budget {

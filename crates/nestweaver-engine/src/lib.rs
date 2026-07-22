@@ -252,7 +252,8 @@ pub use suggest::{
     materialize_declared_links, persist_cross_repo_links, suggest_links,
 };
 pub use summaries::{
-    Summary, SummaryLevel, SummaryStore, filter_by_target, generate_summaries, load_summaries,
+    DEFAULT_SYMBOL_SUMMARY_CAP, Summary, SummaryLevel, SummaryStore, SymbolSummaries,
+    filter_by_target, generate_summaries, generate_symbol_summaries_bounded, load_summaries,
     merge_and_save_summaries, render_text, save_summaries, truncate_to_budget,
 };
 pub use watch_code::CodeWatcher;
