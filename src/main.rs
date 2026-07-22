@@ -1053,6 +1053,7 @@ enum Commands {
         token_budget: Option<usize>,
         #[arg(
             long,
+            visible_alias = "name",
             help = "Filter to a specific target (file path, symbol name, or cluster name)"
         )]
         target: Option<String>,
@@ -6425,7 +6426,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let mut args = serde_json::json!({
                     "targets": targets,
-                    "neighbors": neighbors,
+                    // The tool reads `include_neighbors`; sending `neighbors` was
+                    // silently ignored, making --neighbors a no-op on the daemon
+                    // path (nw-088).
+                    "include_neighbors": neighbors,
                     "token_budget": token_budget,
                 });
                 if let Some(ref r) = root {
@@ -7172,7 +7176,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     match value.get("status").and_then(|v| v.as_str()) {
                         Some("not_found") => {
                             if json {
-                                println!("{}", serde_json::to_string_pretty(&value)?);
+                                // nw-086: identical --json shape as the direct path.
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "error": "not found",
+                                        "name": name_or_uid,
+                                    }))?
+                                );
                             } else if !out.quiet {
                                 println!("No symbol found: '{name_or_uid}'.");
                             }
@@ -7180,7 +7191,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         Some("ambiguous") => {
                             if json {
-                                println!("{}", serde_json::to_string_pretty(&value)?);
+                                // nw-086: bare candidates array, matching the direct path.
+                                let cands = value
+                                    .get("candidates")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!([]));
+                                println!("{}", serde_json::to_string_pretty(&cands)?);
                             } else if !out.quiet {
                                 println!("Ambiguous symbol '{name_or_uid}' — multiple matches:");
                                 if let Some(cands) =
@@ -7207,7 +7223,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         _ => {}
                     }
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        // nw-086: emit the bare node array, NOT the daemon's
+                        // {_meta, impact_nodes, total, ...} envelope, so a --json
+                        // consumer sees the same top-level shape as the direct path.
+                        let payload = value
+                            .get("impact_nodes")
+                            .cloned()
+                            .unwrap_or_else(|| value.clone());
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
                     } else if let Some(arr) = value.get("impact_nodes") {
                         #[derive(serde::Deserialize)]
                         struct DaemonImpactNode {
@@ -7340,7 +7363,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
                 ResolveResult::NotFound => {
-                    eprintln!("Symbol '{name_or_uid}' not found.");
+                    // nw-086: under --json, emit a JSON error object (matching the
+                    // `symbol` command and the daemon path) instead of only a
+                    // plain-text stderr line a --json consumer can't parse.
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "error": "not found",
+                                "name": name_or_uid,
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Symbol '{name_or_uid}' not found.");
+                    }
                     Ok((EXIT_NOT_FOUND, None))
                 }
                 ResolveResult::Ambiguous(candidates) => {
@@ -9803,6 +9839,20 @@ fn try_hybrid_json_rpc(
     }
     let rt = tokio::runtime::Runtime::new().ok()?;
     let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // nw-087: a read/query against a NONEXISTENT local db must not autostart a
+    // daemon that CREATES an empty store — that turns a typo'd `--db` path into a
+    // silent "0 results / status: complete" success (false-green in CI). Skip the
+    // local connect when the db file is absent; still try configured upstreams
+    // (federated read), else return None so the caller's direct path reports
+    // `db_not_found` and a non-zero exit. `index` creates dbs and does NOT route
+    // through here, so it is unaffected.
+    if !db_path.exists() {
+        return rt
+            .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+                config, &start_dir, rpc_name, &args,
+            ))
+            .ok();
+    }
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {

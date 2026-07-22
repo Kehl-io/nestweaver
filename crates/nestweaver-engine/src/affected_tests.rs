@@ -580,7 +580,9 @@ mod tests {
         inline_test.entry_point_kind = Some(nestweaver_schema::EntryPointKind::TestEntry);
         store.insert_symbol(&changed).unwrap();
         store.insert_symbol(&inline_test).unwrap();
-        store.insert_edge(&edge("sym:test_util", "sym:util")).unwrap();
+        store
+            .insert_edge(&edge("sym:test_util", "sym:util"))
+            .unwrap();
 
         let result = affected_tests(&store, &["src/util.rs".to_string()]).expect("ok");
         // Without the flag this would be empty (the old path-only bug). Now the

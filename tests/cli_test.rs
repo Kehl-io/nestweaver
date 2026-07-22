@@ -734,6 +734,96 @@ fn cli_impact_on_empty_db_exits_not_found() {
 }
 
 #[test]
+fn cli_impact_json_is_array_and_notfound_is_object() {
+    // nw-086: `impact --json` must emit a bare node ARRAY on success and a JSON
+    // error OBJECT on not-found (never a plain-text-only stderr line), so a
+    // --json consumer can always parse the output.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.lbug");
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("m.js"),
+        "function a(){ return b(); }\nfunction b(){ return 1; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Found → bare array (a calls b, so impact(b) is non-empty).
+    let out = nestweaver_cmd()
+        .args([
+            "impact",
+            "b",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("impact --json (found) must be valid JSON");
+    assert!(
+        v.is_array(),
+        "impact --json (found) must be a bare array, got: {v}"
+    );
+
+    // Not-found → JSON object with an `error` field, exit 2.
+    let out = nestweaver_cmd()
+        .args([
+            "impact",
+            "zzz_no_symbol",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "not-found exits 2");
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("impact --json (not-found) must be valid JSON");
+    assert!(
+        v.get("error").is_some(),
+        "not-found --json must carry an error field, got: {v}"
+    );
+}
+
+#[test]
+fn cli_read_on_missing_db_daemon_path_does_not_create_it() {
+    // nw-087: a query against a NONEXISTENT db (parent dir exists) on the DAEMON
+    // path must fail loudly — not autostart a daemon that materializes an empty
+    // store, which would read as a false-green "0 results / complete" success.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("typo_never_created.lbug");
+    // Raw command WITHOUT the allow-hatch and WITHOUT any CI marker → routes
+    // through the daemon path (the one that used to create the store).
+    let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    cmd.env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .args([
+            "impact",
+            "anySymbol",
+            "--db",
+            &db_path.display().to_string(),
+        ]);
+    cmd.assert().failure();
+    assert!(
+        !db_path.exists(),
+        "a read against a missing db must not create it (nw-087)"
+    );
+}
+
+#[test]
 fn cli_incremental_index_picks_up_new_symbol() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");

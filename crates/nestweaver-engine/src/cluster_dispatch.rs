@@ -112,7 +112,11 @@ pub fn compute_clusters(store: &GraphStore, resolution: f64) -> Result<Clusterin
             .into_iter()
             .map(|(f, c)| (f.to_string(), c))
             .collect();
-        file_pairs.sort_by_key(|pair| std::cmp::Reverse(pair.1));
+        // Count descending, then file path ascending as a deterministic
+        // tie-break — otherwise equal-count files keep the source HashMap's
+        // per-process iteration order, making key_files (and thus the clusters
+        // output) drift between runs (nw-088).
+        file_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let key_files: Vec<String> = file_pairs.into_iter().take(5).map(|(f, _)| f).collect();
 
         communities.push(CommunityInfo {
