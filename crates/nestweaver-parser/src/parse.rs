@@ -216,6 +216,32 @@ fn has_export_ancestor(node: &tree_sitter::Node) -> bool {
     false
 }
 
+/// Collect the text of `attribute_item` siblings immediately preceding `node`.
+///
+/// In tree-sitter-rust an outer attribute like `#[test]` is a *preceding sibling*
+/// of the `function_item` it decorates, not part of it — so the function's
+/// signature (its first line, starting at `fn`) never contains the attribute.
+/// Entry-point detection needs the attribute to recognize `#[test]` /
+/// `#[tokio::test]` functions, so gather the leading attributes here and prepend
+/// them to the signature passed to detection (only — the stored signature is
+/// unchanged). Returns an empty string when there are no leading attributes.
+fn leading_rust_attributes(node: &tree_sitter::Node, source: &[u8]) -> String {
+    let mut attrs = String::new();
+    let mut sib = node.prev_sibling();
+    while let Some(s) = sib {
+        if s.kind() == "attribute_item" {
+            if let Ok(text) = s.utf8_text(source) {
+                attrs.push_str(text);
+                attrs.push('\n');
+            }
+            sib = s.prev_sibling();
+        } else {
+            break;
+        }
+    }
+    attrs
+}
+
 /// Infer symbol visibility from name and surrounding source text based on language conventions.
 fn infer_visibility(name: &str, node_text: &str, lang: Language, exported: bool) -> Visibility {
     match lang {
@@ -871,11 +897,25 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let ep_kind = if node.kind() == "call_expression" {
                     Some(EntryPointKind::TestEntry)
                 } else {
+                    // Rust `#[test]`/`#[tokio::test]` attributes are preceding
+                    // siblings, not part of the signature — prepend them (for
+                    // detection only) so inline `#[cfg(test)]`-module tests are
+                    // flagged TestEntry instead of being invisible to RTS.
+                    let detect_sig: std::borrow::Cow<str> = if lang_str == "rust" {
+                        let attrs = leading_rust_attributes(&node, source_bytes);
+                        if attrs.is_empty() {
+                            std::borrow::Cow::Borrowed(signature.as_str())
+                        } else {
+                            std::borrow::Cow::Owned(format!("{attrs}{signature}"))
+                        }
+                    } else {
+                        std::borrow::Cow::Borrowed(signature.as_str())
+                    };
                     detect_entry_point(
                         &name,
                         &file_path_str,
                         kind_label,
-                        Some(&signature),
+                        Some(&detect_sig),
                         lang_str,
                     )
                 };
@@ -1470,6 +1510,46 @@ mod tests {
             test_sym.start_line,
             test_sym.end_line
         );
+    }
+
+    #[test]
+    fn parse_rust_flags_inline_cfg_test_functions_as_test_entries() {
+        // nw-085: Rust unit tests live in an inline `#[cfg(test)] mod tests`
+        // inside a non-test src file, decorated with `#[test]` — a preceding
+        // sibling attribute the signature never captured. They must be flagged
+        // TestEntry so regression-test selection can reach them.
+        let source = "pub fn util() -> u32 { 1 }\n\
+                      #[cfg(test)]\n\
+                      mod tests {\n\
+                          use super::*;\n\
+                          #[test]\n\
+                          fn test_util_returns_one() { assert_eq!(util(), 1); }\n\
+                          #[tokio::test]\n\
+                          async fn test_util_async() { let _ = util(); }\n\
+                      }\n";
+        let parsed = parse_source(Path::new("src/util.rs"), source).unwrap();
+
+        for name in ["test_util_returns_one", "test_util_async"] {
+            let sym = parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "should find '{name}'; got: {:?}",
+                        parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                sym.entry_point_kind,
+                Some(EntryPointKind::TestEntry),
+                "'{name}' should be a TestEntry (has a #[test]/#[tokio::test] attribute)"
+            );
+        }
+
+        // A plain non-test function must NOT be flagged.
+        let util = parsed.symbols.iter().find(|s| s.name == "util").unwrap();
+        assert_eq!(util.entry_point_kind, None, "util() is not a test entry");
     }
 
     #[test]

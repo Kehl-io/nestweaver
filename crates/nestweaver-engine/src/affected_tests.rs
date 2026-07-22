@@ -568,6 +568,35 @@ mod tests {
     }
 
     #[test]
+    fn rust_inline_test_in_src_file_is_selected() {
+        // nw-085 Part B: a Rust `#[test]` fn flagged TestEntry that lives in a
+        // NON-test src file (inline `#[cfg(test)] mod tests`) must still be
+        // selected — path-based is_test_file misses it, the entry_point_kind
+        // flag catches it.
+        let store = GraphStore::in_memory().expect("store");
+        let changed = sym("sym:util", "util", "src/util.rs");
+        // The test lives in a plain src file (NOT a *.test.* / tests/ path).
+        let mut inline_test = sym("sym:test_util", "test_util", "src/other.rs");
+        inline_test.entry_point_kind = Some(nestweaver_schema::EntryPointKind::TestEntry);
+        store.insert_symbol(&changed).unwrap();
+        store.insert_symbol(&inline_test).unwrap();
+        store.insert_edge(&edge("sym:test_util", "sym:util")).unwrap();
+
+        let result = affected_tests(&store, &["src/util.rs".to_string()]).expect("ok");
+        // Without the flag this would be empty (the old path-only bug). Now the
+        // inline test is tier-1.
+        let tier1_names: Vec<&str> = result
+            .tier_1
+            .iter()
+            .flat_map(|f| f.tests.iter().map(|t| t.as_str()))
+            .collect();
+        assert!(
+            tier1_names.contains(&"test_util"),
+            "the TestEntry-flagged inline test must be selected as tier-1; got {tier1_names:?}"
+        );
+    }
+
+    #[test]
     fn empty_store_yields_empty_tiers() {
         let store = GraphStore::in_memory().expect("store");
         let result = affected_tests(&store, &["src/missing.rs".to_string()]).expect("ok");
