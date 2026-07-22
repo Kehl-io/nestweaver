@@ -370,7 +370,13 @@ fn dispatch_uncached(
 /// - stateful bundle tools (`investigate`, `investigate_expand`,
 ///   `investigate_hydrate`) — they accumulate per-session state;
 /// - `brain_status` / `stale_check` — they report live process/lock state and
-///   the cache's own stats, which must not be frozen.
+///   the cache's own stats, which must not be frozen;
+/// - `read_symbols` — its body text is read from the FILESYSTEM (resolved from
+///   cwd/`root`, or empty under a bare-clone/server), so the response is NOT a
+///   pure function of the graph generation + scope digest that keys this cache.
+///   A single call made from a wrong cwd (or a bare clone) would cache an EMPTY
+///   body and then serve it for the correct args forever — a silent-wrong result
+///   on a core retrieval tool. It's a cheap disk-span read, so leave it uncached.
 const CACHEABLE_TOOLS: &[&str] = &[
     "brain_context",
     "brain_search",
@@ -388,7 +394,6 @@ const CACHEABLE_TOOLS: &[&str] = &[
     "bridge_nodes",
     "blast_radius",
     "get_summary",
-    "read_symbols",
     "regex_search",
     "count_patterns",
     "brain_broken_links",
@@ -7528,6 +7533,10 @@ mod cache_dispatch_tests {
         assert!(!is_cacheable_tool("investigate_hydrate"));
         assert!(!is_cacheable_tool("brain_status"));
         assert!(!is_cacheable_tool("stale_check"));
+        // nw-077: read_symbols reads bodies from the filesystem (cwd/root-
+        // dependent), so it must NOT be cached — a call from a wrong cwd would
+        // otherwise poison the cache with an empty body served forever.
+        assert!(!is_cacheable_tool("read_symbols"));
         // And a representative read tool IS cacheable.
         assert!(is_cacheable_tool("hub_nodes"));
 
