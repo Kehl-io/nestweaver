@@ -194,6 +194,10 @@ pub enum BlindSpot {
 pub struct BlastRadiusResult {
     pub changed_symbols: Vec<ChangedSymbol>,
     pub affected_symbols: Vec<AffectedSymbol>,
+    /// Total affected symbols before presentation limits, within the result's
+    /// current visibility scope.
+    #[serde(default)]
+    pub affected_symbol_count: usize,
     pub affected_clusters: Vec<AffectedCluster>,
     pub risk_level: RiskLevel,
     pub summary: String,
@@ -287,6 +291,24 @@ pub(crate) fn render_blast_summary(
         summary.push_str(&format!(" [status: {}]", status.label()));
     }
     summary
+}
+
+/// Apply the presentation-only cap after analysis and any authorization
+/// redaction have established the result's visible total.
+pub fn apply_affected_symbol_limit(result: &mut BlastRadiusResult, limit: Option<usize>) {
+    if let Some(n) = limit
+        && result.affected_symbols.len() > n
+    {
+        let total = result.affected_symbol_count;
+        result.affected_symbols.truncate(n);
+        result.notifications.push(Notification {
+            level: NotificationLevel::Note,
+            message: format!(
+                "affected symbols truncated to {n} of {total} (raise `limit` for the full set)"
+            ),
+            descriptor: "results-truncated".to_string(),
+        });
+    }
 }
 
 /// Depth to which data-dependence edges (type references and field access)
@@ -700,24 +722,6 @@ pub fn analyze_blast_radius(
     // non-safe by definition (Rothermel-Harrold; audit nw-058).
     let total_affected = affected_symbols.len();
 
-    // R7: cap the returned set to the caller's `limit`, keeping the most-
-    // impactful symbols (already sorted). A display cap is a user request, not
-    // a failure, so it never escalates status — but the note carries the true
-    // total so a consumer knows the set was trimmed.
-    if let Some(n) = options.limit
-        && affected_symbols.len() > n
-    {
-        let total = affected_symbols.len();
-        affected_symbols.truncate(n);
-        notifications.push(Notification {
-            level: NotificationLevel::Note,
-            message: format!(
-                "affected symbols truncated to {n} of {total} (raise `limit` for the full set)"
-            ),
-            descriptor: "results-truncated".to_string(),
-        });
-    }
-
     // Step 3: Group by clusters if cluster data is available.
     let mut affected_clusters: Vec<AffectedCluster> = Vec::new();
     let all_affected_uids: HashSet<&str> = changed_uids
@@ -957,9 +961,10 @@ pub fn analyze_blast_radius(
         }
     }
 
-    Ok(BlastRadiusResult {
+    let mut result = BlastRadiusResult {
         changed_symbols,
         affected_symbols,
+        affected_symbol_count: total_affected,
         affected_clusters,
         risk_level,
         summary,
@@ -971,7 +976,9 @@ pub fn analyze_blast_radius(
         blind_spots,
         cochanged_files,
         analysis_direction,
-    })
+    };
+    apply_affected_symbol_limit(&mut result, options.limit);
+    Ok(result)
 }
 
 /// Classify a cross-repo impact by its decayed impact score.
@@ -2584,6 +2591,8 @@ mod tests {
         // truncated sets are non-safe by definition).
         assert_eq!(with_limit.risk_level, no_limit.risk_level);
         assert_eq!(with_limit.gate_state, no_limit.gate_state);
+        assert_eq!(with_limit.summary, no_limit.summary);
+        assert_eq!(with_limit.affected_symbol_count, 60);
         assert_eq!(
             with_limit.affected_symbols.len(),
             5,

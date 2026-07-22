@@ -6330,16 +6330,26 @@ fn tool_blast_radius(
         .unwrap_or(false);
 
     // Optional cap on returned affected_symbols (most-impactful first).
-    let limit = args
+    let requested_limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
+    let visibility_restricted = matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    );
 
     let options = BlastRadiusOptions {
         target_repo: target_repo.map(str::to_string),
         max_depth,
         include_data_edges,
-        limit,
+        // Restricted callers must be redacted against the complete result so
+        // their total is exact and contains no pre-authz cardinality.
+        limit: if visibility_restricted {
+            None
+        } else {
+            requested_limit
+        },
     };
 
     let db_path = current_db_path(store).ok();
@@ -6362,6 +6372,7 @@ fn tool_blast_radius(
             anyhow!("authz repo listing unavailable")
         })?;
         nestweaver_engine::authz::redact_blast_radius_for_visibility(&mut result, v, &repos);
+        nestweaver_engine::blast_radius::apply_affected_symbol_limit(&mut result, requested_limit);
     }
 
     // SARIF output: emit a standard SARIF v2.1.0 run (with namespaced
@@ -6455,7 +6466,9 @@ fn tool_blast_radius(
         "changed_symbols": changed_json,
         "changed_symbol_count": changed_json.len(),
         "affected_symbols": affected_json,
-        "affected_symbol_count": affected_json.len(),
+        "affected_symbol_count": result.affected_symbol_count,
+        "returned_affected_symbol_count": affected_json.len(),
+        "affected_symbols_truncated": affected_json.len() < result.affected_symbol_count,
         "affected_clusters": clusters_json,
         "affected_cluster_count": clusters_json.len(),
         // Always present so consumers can distinguish "no cross-repo impact"
@@ -8747,6 +8760,66 @@ mod blast_radius_visibility_tests {
         store
     }
 
+    fn mixed_visibility_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, repo: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let mk_repo = |uid: &str| Repo {
+            uid: uid.to_string(),
+            url: uid.to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+
+        for repo in ["repo:api", "repo:a", "repo:b"] {
+            store.insert_repo(&mk_repo(repo)).unwrap();
+        }
+        store
+            .insert_symbol(&mk("target", "Target", "repo:api", "src/target.rs"))
+            .unwrap();
+        for (uid, name, repo, confidence) in [
+            ("hidden", "HiddenCaller", "repo:b", 0.95_f32),
+            ("visible", "VisibleCaller", "repo:a", 0.9_f32),
+            ("local", "LocalCaller", "", 0.8_f32),
+        ] {
+            store
+                .insert_symbol(&mk(uid, name, repo, &format!("src/{uid}.rs")))
+                .unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid.to_string(),
+                    target_uid: "target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
     /// Redaction must strip the cross-repo (repo:client) org item and affected
     /// symbol when the caller may only see repo:api, while `None` (the
     /// backward-compatible default) leaves the full result intact.
@@ -8787,6 +8860,111 @@ mod blast_radius_visibility_tests {
             scoped["org_wide"].is_null(),
             "org_wide collapses to null once its only item (repo:client) is hidden"
         );
+    }
+
+    #[test]
+    fn blast_radius_count_is_independent_of_limit() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:api".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        store
+            .insert_symbol(&mk("target", "fn_target", "src/target.rs"))
+            .unwrap();
+        for i in 0..60 {
+            let uid = format!("caller:{i}");
+            store
+                .insert_symbol(&mk(
+                    &uid,
+                    &format!("fn_caller_{i}"),
+                    &format!("src/caller_{i}.rs"),
+                ))
+                .unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid,
+                    target_uid: "target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+
+        let result = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/target.rs"], "limit": 5 }),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["affected_symbol_count"], json!(60));
+        assert_eq!(result["returned_affected_symbol_count"], json!(5));
+        assert_eq!(result["affected_symbols_truncated"], json!(true));
+        assert_eq!(result["affected_symbols"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn blast_radius_authz_precedes_limit_and_sarif_count_exposure() {
+        let store = mixed_visibility_store();
+        let visible = VisibleRepos::Only(["repo:a".to_string()].into_iter().collect());
+        let args = json!({ "changed_files": ["src/target.rs"], "limit": 1 });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert_eq!(result["affected_symbol_count"], json!(2));
+        assert_eq!(result["returned_affected_symbol_count"], json!(1));
+        assert_eq!(result["affected_symbols_truncated"], json!(true));
+        assert_eq!(result["affected_symbols"].as_array().unwrap().len(), 1);
+        assert!(
+            result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("2 transitively affected")
+        );
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("repo:b"));
+        assert!(!serialized.contains("HiddenCaller"));
+        assert!(!serialized.contains("src/hidden.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({
+                "changed_files": ["src/target.rs"],
+                "limit": 1,
+                "format": "sarif"
+            }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let props = &sarif["runs"][0]["properties"];
+        assert_eq!(props["nestweaver/affectedSymbolCount"], json!(2));
+        assert_eq!(props["nestweaver/returnedAffectedSymbolCount"], json!(1));
+        assert_eq!(props["nestweaver/affectedSymbolsTruncated"], json!(true));
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("repo:b"));
+        assert!(!serialized.contains("HiddenCaller"));
+        assert!(!serialized.contains("src/hidden.rs"));
     }
 }
 

@@ -178,6 +178,7 @@ pub fn redact_blast_radius_for_visibility(
     result
         .changed_symbols
         .retain(|s| visible_only.allows(&s.repo_uid));
+    result.affected_symbol_count = result.affected_symbols.len();
 
     // Map every display label (url and uid) to its repo_uid so an
     // OrgImpactItem's `affected_repo` label can be resolved before the check.
@@ -267,7 +268,7 @@ pub fn redact_blast_radius_for_visibility(
     result.summary = crate::blast_radius::render_blast_summary(
         result.changed_symbols.len(),
         changed_files,
-        result.affected_symbols.len(),
+        result.affected_symbol_count,
         result.affected_clusters.len(),
         result.risk_level,
         result.status,
@@ -555,6 +556,7 @@ mod tests {
                 affected("s:b", "repo:b"),
                 affected("s:local", ""),
             ],
+            affected_symbol_count: 3,
             affected_clusters: vec![],
             risk_level: RiskLevel::Medium,
             summary: "s".to_string(),
@@ -686,6 +688,7 @@ mod tests {
             "summary must not leak pre-redaction counts, got: {}",
             result.summary
         );
+        assert_eq!(result.affected_symbol_count, 2);
     }
 
     #[test]

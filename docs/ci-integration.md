@@ -290,10 +290,19 @@ Integrators parsing both surfaces should map:
 | `gate_state`            | `run.properties["nestweaver/gateState"]`          |
 | `status`                | `run.properties["nestweaver/status"]`             |
 | `risk_level`            | `run.properties["nestweaver/riskLevel"]`          |
+| `affected_symbol_count` | `run.properties["nestweaver/affectedSymbolCount"]` |
+| `returned_affected_symbol_count` | `run.properties["nestweaver/returnedAffectedSymbolCount"]` |
+| `affected_symbols_truncated` | `run.properties["nestweaver/affectedSymbolsTruncated"]` |
 | `blind_spots`           | `run.properties["nestweaver/blindSpots"]`         |
 | `analysis_direction`    | `run.properties["nestweaver/analysisDirection"]`  |
 | `coverage`              | `run.properties["nestweaver/coverage"]`           |
 | (per-result severity provenance) | `result.properties["nestweaver/severitySource"]` |
+
+`affected_symbol_count` is the authorized total before the presentation
+`limit`; `returned_affected_symbol_count` is the number of rows actually
+serialized. Authorization redaction always precedes count exposure and SARIF
+rendering, so hidden symbols cannot influence these totals or appear as SARIF
+results.
 
 Two things do **not** change casing across surfaces:
 

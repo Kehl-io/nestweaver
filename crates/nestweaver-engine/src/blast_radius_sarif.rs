@@ -198,6 +198,10 @@ pub fn blast_radius_to_sarif(result: &BlastRadiusResult, tool_version: &str) -> 
         "nestweaver/gateState": serde_json::to_value(result.gate_state).unwrap_or(Value::Null),
         "nestweaver/status": serde_json::to_value(result.status).unwrap_or(Value::Null),
         "nestweaver/riskLevel": risk_level_label(result.risk_level),
+        "nestweaver/affectedSymbolCount": result.affected_symbol_count,
+        "nestweaver/returnedAffectedSymbolCount": result.affected_symbols.len(),
+        "nestweaver/affectedSymbolsTruncated":
+            result.affected_symbols.len() < result.affected_symbol_count,
         "nestweaver/blindSpots": blind_spots,
         "nestweaver/coverage": serde_json::to_value(&result.coverage).unwrap_or(Value::Null),
         "nestweaver/summary": result.summary,
@@ -294,6 +298,7 @@ mod tests {
         BlastRadiusResult {
             changed_symbols: vec![],
             affected_symbols: vec![],
+            affected_symbol_count: 0,
             affected_clusters: vec![],
             risk_level: RiskLevel::Low,
             summary: "0 changed, 0 affected".to_string(),
@@ -386,6 +391,7 @@ mod tests {
     fn sarif_affected_symbol_becomes_result_with_rank() {
         let mut result = base_result();
         result.affected_symbols = vec![affected("fn_b", "src/b.rs", 0.9)];
+        result.affected_symbol_count = 1;
         let sarif = blast_radius_to_sarif(&result, "1.0.0");
         let results = sarif["runs"][0]["results"].as_array().expect("results");
         assert_eq!(results.len(), 1);
@@ -448,6 +454,19 @@ mod tests {
         assert_eq!(props["nestweaver/analysisDirection"], "over-approximate");
         assert!(props["nestweaver/blindSpots"].is_array());
         assert!(props["nestweaver/coverage"].is_object());
+    }
+
+    #[test]
+    fn sarif_distinguishes_total_from_returned_affected_symbols() {
+        let mut result = base_result();
+        result.affected_symbols = vec![affected("fn_visible", "src/visible.rs", 0.9)];
+        result.affected_symbol_count = 3;
+
+        let sarif = blast_radius_to_sarif(&result, "1.0.0");
+        let props = &sarif["runs"][0]["properties"];
+        assert_eq!(props["nestweaver/affectedSymbolCount"], 3);
+        assert_eq!(props["nestweaver/returnedAffectedSymbolCount"], 1);
+        assert_eq!(props["nestweaver/affectedSymbolsTruncated"], true);
     }
 
     #[test]
