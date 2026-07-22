@@ -42,7 +42,8 @@ fn normal_daemon_cmd() -> Command {
 /// creation (before daemon tests).
 fn no_daemon_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
-    cmd.env("NESTWEAVER_NO_DAEMON", "1");
+    cmd.env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
     cmd
 }
 
@@ -228,6 +229,7 @@ fn mcp_tool_call(db_path: &Path, tool_name: &str, arguments: serde_json::Value) 
     let mut child = StdCommand::new(bin_path())
         .args(["mcp", "--db", &db_path.display().to_string()])
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

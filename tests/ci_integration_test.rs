@@ -47,7 +47,8 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 /// Build a nestweaver command with daemon suppressed.
 fn nestweaver() -> StdCommand {
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
-    cmd.env("NESTWEAVER_NO_DAEMON", "1");
+    cmd.env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
     cmd
 }
 

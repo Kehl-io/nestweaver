@@ -96,6 +96,7 @@ fn index_repo(repo_dir: &std::path::Path, db_path: &std::path::Path) -> String {
     }
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -180,6 +181,7 @@ fn server_starts_and_writes_port_file() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -210,6 +212,7 @@ async fn server_tcp_brain_status() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -260,6 +263,7 @@ async fn server_transport_parity() {
     // Index (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -350,6 +354,7 @@ async fn server_auth_rejects_unauthenticated() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -399,6 +404,7 @@ async fn server_auth_passes_valid_token() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -549,6 +555,7 @@ async fn server_tls_connection() {
     // Index first so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -611,6 +618,7 @@ async fn server_tls_rejects_plain_tcp() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -666,6 +674,7 @@ async fn server_repo_states_rpc() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -721,6 +730,7 @@ async fn server_mcp_http_initialize() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -768,6 +778,7 @@ async fn server_mcp_http_tools_list() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -816,6 +827,7 @@ async fn server_mcp_http_brain_status_tool() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -878,6 +890,7 @@ async fn server_mcp_sessions_tracked() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -997,6 +1010,7 @@ async fn server_mcp_http_reports_server_mode_true() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1053,6 +1067,7 @@ async fn server_mcp_http_read_symbols_takes_server_path() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1130,6 +1145,7 @@ async fn server_webhook_enqueues_job() {
     // Index once so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1200,6 +1216,7 @@ async fn server_webhook_gitea_enqueues_job() {
     // Index once so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1270,6 +1287,7 @@ async fn server_webhook_rejects_invalid_sig() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1327,6 +1345,7 @@ async fn server_webhook_dual_secret_rotation_accepts_old() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1408,6 +1427,7 @@ async fn server_webhook_rejects_missing_sig() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1453,6 +1473,7 @@ async fn server_webhook_rejects_bad_json() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1502,6 +1523,7 @@ async fn server_device_flow_grants_query_token_after_admin_approval() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1613,6 +1635,7 @@ async fn server_status_cli_happy_path_and_401() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1688,6 +1711,7 @@ async fn export_graph_rejects_file_output() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1748,6 +1772,7 @@ async fn export_graph_rejects_msgpack_file_output() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -2319,6 +2344,7 @@ async fn server_backup_rpc_produces_snapshot() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",

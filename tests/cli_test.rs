@@ -6,7 +6,8 @@ use std::process::Command as StdCommand;
 
 fn nestweaver_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
-    cmd.env("NESTWEAVER_NO_DAEMON", "1");
+    cmd.env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
     cmd
 }
 
@@ -819,6 +820,7 @@ fn setup_does_not_overwrite_existing_skill_file() {
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -856,6 +858,7 @@ fn setup_force_overwrites_existing_skill_file() {
         ])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -881,6 +884,7 @@ fn setup_does_not_overwrite_existing_cursor_rule() {
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -916,6 +920,7 @@ fn setup_strips_deprecated_args_from_existing_config() {
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -947,6 +952,7 @@ fn daemon_status_accepts_db_after_subcommand() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["daemon", "status", "--db", db_path.to_str().unwrap()])
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -1449,6 +1455,7 @@ fn nw047_repo_instances(db_path: &std::path::Path) -> Vec<String> {
         .args(["list-repos", "--json", "--db"])
         .arg(db_path)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1478,6 +1485,7 @@ fn no_daemon_index_uses_config_instance_id() {
         .arg("--config")
         .arg(&config_path)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
@@ -1513,6 +1521,7 @@ fn no_daemon_index_empty_instance_flag_falls_back_to_config() {
         .arg("--instance")
         .arg("")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
@@ -1548,6 +1557,7 @@ fn no_daemon_index_rejects_colon_in_instance_flag() {
         .arg("--instance")
         .arg("a:b")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .failure()
         .stderr(contains("colon"));
@@ -1680,6 +1690,7 @@ fn index_does_not_write_setup_files_into_unrelated_cwd() {
         ])
         .current_dir(&cwd)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1740,6 +1751,7 @@ fn index_setup_prints_banner_at_most_once_with_multiple_tools() {
         ])
         .current_dir(&repo)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1779,6 +1791,7 @@ fn index_setup_quiet_suppresses_setup_banner() {
         ])
         .current_dir(&repo)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1822,6 +1835,7 @@ fn index_setup_flag_forces_setup_anchored_to_repo_root() {
         ])
         .current_dir(&cwd)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1856,6 +1870,7 @@ fn index_setup_failure_does_not_write_done_marker() {
         .arg(&db)
         .arg("--setup")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
@@ -1880,6 +1895,7 @@ fn index_setup_retries_secondary_before_writing_done_marker() {
         .arg(&db)
         .arg("--setup")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
@@ -1895,6 +1911,7 @@ fn index_setup_retries_secondary_before_writing_done_marker() {
         .arg(&db)
         .arg("--setup")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 

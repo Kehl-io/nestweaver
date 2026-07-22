@@ -19,6 +19,11 @@
 #   NW_RUNS  number of runs per file (default: 3; overridden by the 2nd arg)
 set -euo pipefail
 
+# This harness deliberately uses the daemon-bypass path (NESTWEAVER_NO_DAEMON=1)
+# for hermetic, single-process runs. That bypass is now refused outside CI unless
+# explicitly allowed, so opt in for the whole script.
+export NESTWEAVER_ALLOW_NO_DAEMON=1
+
 DB="${1:?usage: golden-check.sh <db-path> [runs] [files...]}"
 shift || true
 RUNS="${1:-${NW_RUNS:-3}}"

@@ -3469,24 +3469,71 @@ fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Pure core of [`no_daemon_allowed`], split out so the policy is unit-testable
+/// without mutating process-global environment variables (which race under
+/// parallel `cargo test`). The daemon bypass is permitted when an explicit
+/// local opt-in is set, or when we are running under a CI system.
+fn no_daemon_allowed_from(allow_optin: bool, github_actions: bool, ci: Option<&str>) -> bool {
+    if allow_optin || github_actions {
+        return true;
+    }
+    // `CI` is set to a truthy value by virtually every CI provider. Treat the
+    // conventional falsey spellings as "not CI" so `CI=0`/`CI=false` don't count.
+    match ci {
+        Some(v) => {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    }
+}
+
+/// Whether the daemon-bypass escape hatch (`--no-daemon` / `NESTWEAVER_NO_DAEMON`)
+/// is permitted in the current environment.
+///
+/// Bypassing the daemon writes to the store directly, which risks WAL corruption
+/// and is strictly a CI/test convenience — yet the env var kept getting set in
+/// interactive and agent contexts, silently engaging the unsafe path. So outside
+/// a CI context we now *refuse* it and route through the daemon instead. It is
+/// honored only when one of these is present:
+///   - `NESTWEAVER_ALLOW_NO_DAEMON` — explicit local-test opt-in, or
+///   - `GITHUB_ACTIONS` — set by GitHub Actions, or
+///   - `CI` set to a truthy value — set by virtually every CI system.
+fn no_daemon_allowed() -> bool {
+    no_daemon_allowed_from(
+        std::env::var_os("NESTWEAVER_ALLOW_NO_DAEMON").is_some(),
+        std::env::var_os("GITHUB_ACTIONS").is_some(),
+        std::env::var("CI").ok().as_deref(),
+    )
+}
+
+/// Resolve whether to route through the daemon, given the `--no-daemon` flag.
+///
+/// A daemon bypass is *requested* by the flag or by `NESTWEAVER_NO_DAEMON`, but
+/// only *honored* when [`no_daemon_allowed`] is true. When a bypass is requested
+/// but refused, warn once and fall back to the daemon. Returns `true` to use the
+/// daemon, `false` to bypass it.
+fn resolve_use_daemon(no_daemon_flag: bool) -> bool {
+    let requested = no_daemon_flag || std::env::var_os("NESTWEAVER_NO_DAEMON").is_some();
+    if !requested {
+        return true;
+    }
+    if no_daemon_allowed() {
+        return false; // genuine CI/test context — honor the bypass
+    }
+    eprintln!(
+        "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a CI/test-only escape hatch that \
+         bypasses the daemon and risks WAL corruption. Ignoring it and routing through the \
+         daemon. Set NESTWEAVER_ALLOW_NO_DAEMON=1 (or run in CI) to force the bypass."
+    );
+    true
+}
+
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
     let no_embed = cli.no_embed;
-    let use_daemon = if cli.no_daemon {
-        if std::env::var("NESTWEAVER_NO_DAEMON").is_ok() {
-            false
-        } else {
-            eprintln!(
-                "Warning: --no-daemon bypasses the daemon and risks WAL corruption. \
-                 It is only for CI/testing. Set NESTWEAVER_NO_DAEMON=1 to confirm. \
-                 Ignoring flag and routing through daemon."
-            );
-            true
-        }
-    } else {
-        std::env::var("NESTWEAVER_NO_DAEMON").is_err()
-    };
+    let use_daemon = resolve_use_daemon(cli.no_daemon);
     match cli.command {
         Commands::ListRepos {
             instance,
@@ -6016,19 +6063,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
-            let use_daemon_mcp = if no_daemon {
-                if std::env::var("NESTWEAVER_NO_DAEMON").is_ok() {
-                    false
-                } else {
-                    eprintln!(
-                        "Warning: --no-daemon is only supported for testing \
-                         (set NESTWEAVER_NO_DAEMON=1). Ignoring flag."
-                    );
-                    true
-                }
-            } else {
-                std::env::var("NESTWEAVER_NO_DAEMON").is_err()
-            };
+            let use_daemon_mcp = resolve_use_daemon(no_daemon);
             if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
@@ -14970,6 +15005,34 @@ mod abs_for_daemon_tests {
         let dir = std::env::temp_dir();
         let out = abs_for_daemon(&dir);
         assert!(out.is_absolute());
+    }
+}
+
+#[cfg(test)]
+mod no_daemon_gate_tests {
+    use super::*;
+
+    #[test]
+    fn bypass_refused_outside_ci() {
+        // No opt-in, not GitHub Actions, and CI unset/falsey → refuse the bypass.
+        assert!(!no_daemon_allowed_from(false, false, None));
+        assert!(!no_daemon_allowed_from(false, false, Some("")));
+        assert!(!no_daemon_allowed_from(false, false, Some("0")));
+        assert!(!no_daemon_allowed_from(false, false, Some("false")));
+        assert!(!no_daemon_allowed_from(false, false, Some("False")));
+        assert!(!no_daemon_allowed_from(false, false, Some("  ")));
+    }
+
+    #[test]
+    fn bypass_allowed_in_ci_or_with_optin() {
+        // Explicit local opt-in.
+        assert!(no_daemon_allowed_from(true, false, None));
+        // GitHub Actions.
+        assert!(no_daemon_allowed_from(false, true, None));
+        // Generic CI truthy spellings.
+        assert!(no_daemon_allowed_from(false, false, Some("1")));
+        assert!(no_daemon_allowed_from(false, false, Some("true")));
+        assert!(no_daemon_allowed_from(false, false, Some("yes")));
     }
 }
 
