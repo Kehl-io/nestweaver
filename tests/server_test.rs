@@ -2880,12 +2880,64 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
     let db_local = dir.path().join("local").join("local.lbug");
     write_repo_files(
         &visible_repo,
-        &[(
-            "shared/entry.js",
-            "export function visiblefederationcanary() { return 1; }",
-        )],
+        &[
+            (
+                "shared/entry.js",
+                "export function visiblefederationcanary() { return 1; }",
+            ),
+            (
+                "tests/visible-federation.test.js",
+                "export function visiblefederationtest() { return 1; }",
+            ),
+        ],
     );
     index_repo(&visible_repo, &db_local);
+
+    // Keep a second local repository in the same fronting daemon. Its symbols
+    // and tests prove that repository scoping applies before each local
+    // TwoTier result is counted or serialized, not only before federation.
+    let hidden_local_repo = dir.path().join("hidden_local_repo");
+    write_repo_files(
+        &hidden_local_repo,
+        &[
+            (
+                "hidden/local-caller.js",
+                "export function hiddenlocalcaller() { return 1; }",
+            ),
+            (
+                "hidden/secret-local-path.test.js",
+                "export function hiddenlocaltest() { return 1; }",
+            ),
+        ],
+    );
+    index_repo(&hidden_local_repo, &db_local);
+    {
+        let store = nestweaver_store::GraphStore::open(&db_local).expect("open local graph");
+        let target = store
+            .lookup_symbols_by_name("visiblefederationcanary")
+            .expect("lookup visible target")
+            .remove(0);
+        for caller_name in [
+            "visiblefederationtest",
+            "hiddenlocalcaller",
+            "hiddenlocaltest",
+        ] {
+            let caller = store
+                .lookup_symbols_by_name(caller_name)
+                .unwrap_or_else(|error| panic!("lookup {caller_name}: {error}"))
+                .remove(0);
+            store
+                .insert_edge(&nestweaver_schema::ResolvedEdge {
+                    source_uid: caller.uid,
+                    target_uid: target.uid.clone(),
+                    edge_type: nestweaver_schema::EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap_or_else(|error| panic!("insert {caller_name} edge: {error}"));
+        }
+    }
 
     let query_token = "restricted-query-token-0123456789abcdef";
     let admin_token = "restricted-admin-token-0123456789abcdef";
@@ -2909,20 +2961,21 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
     );
     let client = reqwest::Client::new();
     let endpoint = format!("{}/mcp", fronting.mcp_addr());
-    let request = |id| {
+    let request = |id, tool_name: &str, arguments: Value| {
         json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
             "params": {
-                "name": "blast_radius",
-                "arguments": {
-                    "changed_files": ["shared/entry.js"],
-                    "max_depth": 3
-                }
+                "name": tool_name,
+                "arguments": arguments
             }
         })
     };
+    let blast_arguments = json!({
+        "changed_files": ["shared/entry.js"],
+        "max_depth": 3
+    });
 
     // Prove the configured service credential is broad enough to expose the
     // upstream-only canary. This also warms the unrestricted local cache,
@@ -2930,7 +2983,7 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
     let admin_response = client
         .post(&endpoint)
         .bearer_auth(admin_token)
-        .json(&request(61))
+        .json(&request(61, "blast_radius", blast_arguments.clone()))
         .send()
         .await
         .expect("admin MCP request");
@@ -2957,7 +3010,7 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
     let restricted_response = client
         .post(&endpoint)
         .bearer_auth(query_token)
-        .json(&request(62))
+        .json(&request(62, "blast_radius", blast_arguments))
         .send()
         .await
         .expect("restricted MCP request");
@@ -2991,6 +3044,11 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
         "hidden/secret-derived-path.js",
         "hiddenfederationcanary",
         "hiddenfederationcaller",
+        "hidden_local_repo",
+        "hidden/local-caller.js",
+        "hidden/secret-local-path.test.js",
+        "hiddenlocalcaller",
+        "hiddenlocaltest",
         "broad-org",
     ] {
         assert!(
@@ -3005,6 +3063,134 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
         meta["nestweaver.io/stale_repos"],
         json!([]),
         "global staleness cache must not leak repo URLs across caller scope"
+    );
+
+    // The unrestricted local tier proves both local repositories participate
+    // in impact traversal. The restricted HTTP route must remove hidden local
+    // rows before computing totals and before the federation envelope is
+    // assembled.
+    let impact_arguments = json!({
+        "symbol": "visiblefederationcanary",
+        "depth": 3
+    });
+    let admin_impact_response = client
+        .post(&endpoint)
+        .bearer_auth(admin_token)
+        .json(&request(63, "brain_impact", impact_arguments.clone()))
+        .send()
+        .await
+        .expect("admin brain_impact request");
+    assert_eq!(admin_impact_response.status(), 200);
+    let admin_impact_body: Value = admin_impact_response
+        .json()
+        .await
+        .expect("admin brain_impact JSON");
+    assert!(
+        admin_impact_body["result"]["structuredContent"]["local_impact"]
+            .to_string()
+            .contains("hiddenlocalcaller"),
+        "fixture must prove the unrestricted local impact includes a hidden-repo caller: \
+         {admin_impact_body}"
+    );
+
+    let restricted_impact_response = client
+        .post(&endpoint)
+        .bearer_auth(query_token)
+        .json(&request(64, "brain_impact", impact_arguments))
+        .send()
+        .await
+        .expect("restricted brain_impact request");
+    assert_eq!(restricted_impact_response.status(), 200);
+    let restricted_impact_body: Value = restricted_impact_response
+        .json()
+        .await
+        .expect("restricted brain_impact JSON");
+    let restricted_impact = &restricted_impact_body["result"]["structuredContent"]["local_impact"];
+    assert_eq!(restricted_impact["status"], "ok");
+    assert_eq!(restricted_impact["total"], 1);
+    assert_eq!(restricted_impact["returned"], 1);
+    assert!(
+        restricted_impact
+            .to_string()
+            .contains("visiblefederationtest"),
+        "authorized caller must remain in the local impact: {restricted_impact_body}"
+    );
+    assert!(
+        !restricted_impact_body.to_string().contains("hiddenlocal"),
+        "restricted brain_impact leaked a hidden local row or count marker: \
+         {restricted_impact_body}"
+    );
+    assert_eq!(
+        restricted_impact_body["result"]["structuredContent"]["org_wide_impact"],
+        json!({
+            "status": "withheld",
+            "reason": "authorization-unproven"
+        })
+    );
+
+    // The same boundary contract applies to affected-test selection: the
+    // hidden test is present for an admin, but it cannot contribute a row,
+    // path, summary count, or learned aggregate for the restricted caller.
+    let tests_arguments = json!({ "changed_files": ["shared/entry.js"] });
+    let admin_tests_response = client
+        .post(&endpoint)
+        .bearer_auth(admin_token)
+        .json(&request(65, "affected_tests", tests_arguments.clone()))
+        .send()
+        .await
+        .expect("admin affected_tests request");
+    assert_eq!(admin_tests_response.status(), 200);
+    let admin_tests_body: Value = admin_tests_response
+        .json()
+        .await
+        .expect("admin affected_tests JSON");
+    assert!(
+        admin_tests_body["result"]["structuredContent"]["local_impact"]
+            .to_string()
+            .contains("hiddenlocaltest"),
+        "fixture must prove the unrestricted selection includes the hidden local test: \
+         {admin_tests_body}"
+    );
+
+    let restricted_tests_response = client
+        .post(&endpoint)
+        .bearer_auth(query_token)
+        .json(&request(66, "affected_tests", tests_arguments))
+        .send()
+        .await
+        .expect("restricted affected_tests request");
+    assert_eq!(restricted_tests_response.status(), 200);
+    let restricted_tests_body: Value = restricted_tests_response
+        .json()
+        .await
+        .expect("restricted affected_tests JSON");
+    let restricted_tests = &restricted_tests_body["result"]["structuredContent"]["local_impact"];
+    assert_eq!(
+        restricted_tests["summary"],
+        "1 tier-1, 0 tier-2, 0 tier-3 tests affected"
+    );
+    assert!(
+        restricted_tests
+            .to_string()
+            .contains("visiblefederationtest"),
+        "authorized test must remain selected: {restricted_tests_body}"
+    );
+    assert!(
+        !restricted_tests_body.to_string().contains("hiddenlocal"),
+        "restricted affected_tests leaked a hidden local row, path, or count marker: \
+         {restricted_tests_body}"
+    );
+    assert!(
+        restricted_tests["measured"].is_null(),
+        "restricted affected_tests must not expose an unscoped measured aggregate: \
+         {restricted_tests_body}"
+    );
+    assert_eq!(
+        restricted_tests_body["result"]["structuredContent"]["org_wide_impact"],
+        json!({
+            "status": "withheld",
+            "reason": "authorization-unproven"
+        })
     );
 }
 

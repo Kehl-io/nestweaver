@@ -133,7 +133,10 @@ fn inject_bearer_token<T>(request: &mut tonic::Request<T>, auth_token: Option<&s
     }
 }
 
-fn brain_search_response_to_json(response: &nestweaver_proto::BrainSearchResponse) -> Value {
+fn brain_search_response_to_json(
+    response: &nestweaver_proto::BrainSearchResponse,
+    concise: bool,
+) -> Value {
     let results: Vec<Value> = response
         .results
         .iter()
@@ -142,15 +145,17 @@ fn brain_search_response_to_json(response: &nestweaver_proto::BrainSearchRespons
                 "uid": result.uid,
                 "kind": result.kind,
                 "title": result.title,
-                "score": result.score,
             });
+            if !concise {
+                item["score"] = Value::from(result.score);
+            }
             if let Some(location) = &result.location {
                 item["location"] = Value::String(location.clone());
             }
             if !result.matched_headings.is_empty() {
                 item["matched_headings"] = serde_json::json!(result.matched_headings);
             }
-            if let Some(body) = &result.inline_body {
+            if !concise && let Some(body) = &result.inline_body {
                 item["inline_body"] = Value::String(body.clone());
             }
             if let Some(canonical_id) = &result.canonical_id {
@@ -221,7 +226,8 @@ async fn dispatch_typed_brain_search(
         .await
         .context("brain_search RPC failed")?
         .into_inner();
-    Ok(brain_search_response_to_json(&resp))
+    let concise = params.get("response_format").and_then(Value::as_str) == Some("concise");
+    Ok(brain_search_response_to_json(&resp, concise))
 }
 
 /// Typed dispatch for `brain_context` -> `GetContext` RPC.
@@ -494,8 +500,8 @@ mod tests {
                 title: "needle".to_string(),
                 score: 1.0,
                 location: Some("src/lib.rs:1".to_string()),
-                matched_headings: Vec::new(),
-                inline_body: None,
+                matched_headings: vec!["Needle heading".to_string()],
+                inline_body: Some("detailed body".to_string()),
             }],
             expansion_terms: vec!["expanded".to_string()],
             returned_matches: 0,
@@ -505,7 +511,7 @@ mod tests {
             truncated: false,
         };
 
-        let value = brain_search_response_to_json(&response);
+        let value = brain_search_response_to_json(&response, false);
 
         assert_eq!(value["total_matches"], 1);
         assert_eq!(value["total_matches_relation"], "gte");
@@ -513,5 +519,22 @@ mod tests {
         assert_eq!(value["truncated"], true);
         assert_eq!(value["results"][0]["canonical_id"], "canonical-needle");
         assert_eq!(value["expansion_terms"], serde_json::json!(["expanded"]));
+
+        let concise = brain_search_response_to_json(&response, true);
+        assert_eq!(concise["results"][0]["uid"], "sym:needle");
+        assert_eq!(concise["results"][0]["canonical_id"], "canonical-needle");
+        assert!(
+            concise["results"][0].get("score").is_none(),
+            "typed federation concise rows must stay score-free: {concise}"
+        );
+        assert_eq!(
+            concise["results"][0]["matched_headings"],
+            serde_json::json!(["Needle heading"]),
+            "typed federation concise note rows must retain matched headings: {concise}"
+        );
+        assert!(
+            concise["results"][0].get("inline_body").is_none(),
+            "typed federation concise rows must omit inline bodies: {concise}"
+        );
     }
 }

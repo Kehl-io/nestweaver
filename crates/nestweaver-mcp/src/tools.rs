@@ -7,7 +7,7 @@
 //! Tool descriptions are written in the "when to use" style — Claude reads
 //! these to pick the right tool. Lead with the trigger, not the mechanism.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
@@ -100,6 +100,39 @@ fn build_vault_name_map(store: &GraphStore) -> std::collections::HashMap<String,
         .iter()
         .map(|v| (v.uid.clone(), v.name.clone()))
         .collect()
+}
+
+/// Resolve authoritative symbol ownership only when repository scoping is
+/// active. Restricted impact/test-selection responses fail closed if this
+/// global ownership view cannot be loaded; emitting unowned rows would leak.
+fn restricted_symbol_owners(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Option<HashMap<String, String>>, anyhow::Error> {
+    let Some(nestweaver_engine::authz::VisibleRepos::Only(_)) = visible else {
+        return Ok(None);
+    };
+    let symbols = store
+        .list_all_symbols()
+        .context("loading symbol ownership for repository-scoped response")?;
+    Ok(Some(
+        symbols
+            .into_iter()
+            .map(|symbol| (symbol.uid, symbol.repo_uid))
+            .collect(),
+    ))
+}
+
+fn repo_is_visible(
+    repo_uid: &str,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> bool {
+    match visible {
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_)) => {
+            !repo_uid.is_empty() && visible.is_some_and(|scope| scope.allows(repo_uid))
+        }
+        _ => true,
+    }
 }
 
 // ── Tool catalogue ──────────────────────────────────────────────────────────
@@ -720,8 +753,9 @@ pub fn dispatch(
 /// `visible` carries the caller's per-repo visibility (R9/R9b), resolved by the
 /// HTTP boundary from the bearer identity. `None` (and `Some(VisibleRepos::All)`)
 /// means no scoping — the backward-compatible single-trust-domain default, in
-/// which repo-scoped authorization is a no-op. `brain_search` and
-/// `blast_radius` enforce it; tools whose data is not repo-scoped ignore it.
+/// which repo-scoped authorization is a no-op. `brain_search`, `brain_impact`,
+/// `blast_radius`, and `affected_tests` enforce it; tools whose data is not
+/// repo-scoped ignore it.
 pub fn dispatch_cancellable(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -773,7 +807,7 @@ fn dispatch_uncached(
         "brain_remove_source" => tool_brain_remove_source(store, args),
         "prune_stale" => tool_prune_stale(store),
         "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
-        "brain_impact" => tool_brain_impact(store, args, cancel),
+        "brain_impact" => tool_brain_impact(store, args, cancel, visible),
         "brain_guide" => tool_brain_guide(store, args),
         "flow_trace" => tool_flow_trace(store, args, cancel),
         "detect_changes" => tool_detect_changes(store, args),
@@ -796,7 +830,7 @@ fn dispatch_uncached(
         "brain_topic_clusters" => tool_brain_topic_clusters(store, args),
         "brain_tag_graph" => tool_brain_tag_graph(store, args),
         "brain_doc_stats" => tool_brain_doc_stats(store, args),
-        "affected_tests" => tool_affected_tests(store, args),
+        "affected_tests" => tool_affected_tests(store, args, visible),
         "investigate" => tool_investigate(store, tantivy, args, embed_model),
         "investigate_expand" => tool_investigate_expand(store, args),
         "investigate_hydrate" => tool_investigate_hydrate(store, args),
@@ -5024,6 +5058,7 @@ fn tool_brain_impact(
     store: &GraphStore,
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let symbol = args
         .get("symbol")
@@ -5036,16 +5071,35 @@ fn tool_brain_impact(
         .map(|n| n as usize)
         .unwrap_or_else(configured_result_limit);
     let concise = is_concise(&args);
+    let owners = restricted_symbol_owners(store, visible)?;
+    let uid_is_visible = |uid: &str| {
+        owners.as_ref().is_none_or(|owners| {
+            owners
+                .get(uid)
+                .is_some_and(|repo_uid| repo_is_visible(repo_uid, visible))
+        })
+    };
 
     // Resolve with an explicit status so the CLI can honor the not-found/ambiguous exit-code
     // contract in daemon mode, instead of the daemon path silently returning the best of
     // several matches (which diverged from the direct path).
     let uid = if symbol.contains(':') {
-        symbol.to_string()
+        if uid_is_visible(symbol) {
+            symbol.to_string()
+        } else {
+            return Ok(json!({
+                "status": "not_found",
+                "symbol": symbol,
+                "impact_nodes": [],
+                "total": 0,
+                "returned": 0,
+            }));
+        }
     } else {
-        let matches = store
+        let mut matches = store
             .lookup_symbols_by_name(symbol)
             .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+        matches.retain(|candidate| repo_is_visible(&candidate.repo_uid, visible));
         match matches.len() {
             0 => {
                 return Ok(json!({
@@ -5078,7 +5132,8 @@ fn tool_brain_impact(
         }
     };
 
-    let nodes = store.impact_cancellable(&uid, depth, 0.0, cancel)?;
+    let mut nodes = store.impact_cancellable(&uid, depth, 0.0, cancel)?;
+    nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
 
     let rows: Vec<Value> = nodes
@@ -5512,7 +5567,11 @@ fn tool_schema_affected_tests() -> Value {
     })
 }
 
-fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_affected_tests(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
     let mut changed_files: Vec<String> = bound_identifiers(
         args.get("changed_files")
@@ -5554,9 +5613,81 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     // nw-037: route through the recorded wrapper so every selection feeds the
     // measured-recall loop and carries the in-band `measured` disclosure.
     let db_path = current_db_path(store).ok();
-    let result =
+    let mut result =
         nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
             .context("affected_tests")?;
+
+    if let Some(owners) = restricted_symbol_owners(store, visible)? {
+        let mut ownership_unproven = false;
+        result.changed_symbols.retain(|symbol| {
+            let repo_uid = if symbol.repo_uid.is_empty() {
+                owners.get(&symbol.uid).map(String::as_str)
+            } else {
+                Some(symbol.repo_uid.as_str())
+            };
+            match repo_uid {
+                Some(repo_uid) => repo_is_visible(repo_uid, visible),
+                None => {
+                    ownership_unproven = true;
+                    false
+                }
+            }
+        });
+        for tier in [&mut result.tier_1, &mut result.tier_2, &mut result.tier_3] {
+            tier.retain(|file| match owners.get(&file.symbol_uid) {
+                Some(repo_uid) => repo_is_visible(repo_uid, visible),
+                None => {
+                    ownership_unproven = true;
+                    false
+                }
+            });
+        }
+
+        // This aggregate is learned across recorded selections and is not
+        // caller-scope keyed, so it cannot be disclosed under repo scoping.
+        result.measured = None;
+        if ownership_unproven {
+            result.status = result
+                .status
+                .max(nestweaver_engine::blast_radius::AnalysisStatus::Degraded);
+            result
+                .notifications
+                .push(nestweaver_engine::blast_radius::Notification {
+                    level: nestweaver_engine::blast_radius::NotificationLevel::Error,
+                    message: "affected-test ownership could not be proven".to_string(),
+                    descriptor: "authorization.symbol-ownership-unproven".to_string(),
+                });
+        }
+
+        for notification in &mut result.notifications {
+            tracing::debug!(
+                descriptor = %notification.descriptor,
+                detail = %notification.message,
+                "redacting affected-test notification detail for a restricted response"
+            );
+            notification.message =
+                "affected-test analysis details withheld by repository visibility policy"
+                    .to_string();
+        }
+        let count_tests = |tier: &[nestweaver_engine::affected_tests::AffectedTestFile]| {
+            tier.iter().map(|file| file.tests.len()).sum::<usize>()
+        };
+        result.summary = format!(
+            "{} tier-1, {} tier-2, {} tier-3 tests affected",
+            count_tests(&result.tier_1),
+            count_tests(&result.tier_2),
+            count_tests(&result.tier_3),
+        );
+        result.recommendation = if matches!(
+            result.status,
+            nestweaver_engine::blast_radius::AnalysisStatus::Complete
+        ) {
+            "selection-usable"
+        } else {
+            "run-full-suite"
+        }
+        .to_string();
+    }
     Ok(serde_json::to_value(&result)?)
 }
 
@@ -9719,6 +9850,82 @@ mod blast_radius_visibility_tests {
         assert!(
             scoped["org_wide"].is_null(),
             "org_wide collapses to null once its only item (repo:client) is hidden"
+        );
+    }
+
+    #[test]
+    fn two_tier_local_tools_redact_hidden_repo_symbols_and_counts() {
+        let store = mixed_visibility_store();
+        let visible = VisibleRepos::Only(
+            ["repo:api".to_string(), "repo:a".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let mut hidden_target = store
+            .lookup_symbols_by_name("HiddenCaller")
+            .expect("hidden template")
+            .remove(0);
+        hidden_target.uid = "hidden-target".to_string();
+        hidden_target.name = "Target".to_string();
+        hidden_target.file_path = "hidden/target.rs".to_string();
+        store
+            .insert_symbol(&hidden_target)
+            .expect("hidden same-name target");
+
+        let impact = tool_brain_impact(&store, json!({ "symbol": "Target" }), None, Some(&visible))
+            .expect("scoped impact");
+        let impact_text = impact.to_string();
+        assert_eq!(
+            impact["status"], "ok",
+            "a hidden same-name symbol must not make the visible target ambiguous"
+        );
+        assert!(impact_text.contains("VisibleCaller"), "{impact}");
+        assert!(!impact_text.contains("HiddenCaller"), "{impact}");
+        assert!(!impact_text.contains("LocalCaller"), "{impact}");
+        assert!(!impact_text.contains("hidden/target.rs"), "{impact}");
+        assert_eq!(impact["total"], 1);
+        assert_eq!(impact["returned"], 1);
+
+        let mut visible_test = store
+            .lookup_symbols_by_name("VisibleCaller")
+            .expect("visible template")
+            .remove(0);
+        visible_test.uid = "visible-test".to_string();
+        visible_test.name = "visible_target_test".to_string();
+        visible_test.file_path = "tests/visible_target_test.rs".to_string();
+        store.insert_symbol(&visible_test).expect("visible test");
+        let mut hidden_test = visible_test.clone();
+        hidden_test.uid = "hidden-test".to_string();
+        hidden_test.name = "hidden_target_test".to_string();
+        hidden_test.repo_uid = "repo:b".to_string();
+        hidden_test.file_path = "hidden/tests/hidden_target_test.rs".to_string();
+        store.insert_symbol(&hidden_test).expect("hidden test");
+        for source_uid in ["visible-test", "hidden-test"] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source_uid.to_string(),
+                    target_uid: "target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .expect("test edge");
+        }
+
+        let tests = tool_affected_tests(
+            &store,
+            json!({ "changed_files": ["src/target.rs"] }),
+            Some(&visible),
+        )
+        .expect("scoped affected tests");
+        let tests_text = tests.to_string();
+        assert!(tests_text.contains("visible_target_test"), "{tests}");
+        assert!(!tests_text.contains("hidden_target_test"), "{tests}");
+        assert!(!tests_text.contains("hidden/tests"), "{tests}");
+        assert_eq!(
+            tests["summary"],
+            "1 tier-1, 0 tier-2, 0 tier-3 tests affected"
         );
     }
 
