@@ -25,16 +25,28 @@ pub struct TlsBundle {
     pub client_key_pem: Option<String>,
 }
 
+/// Maximum accepted certificate validity. 100 years keeps the `time` crate
+/// date math far from its representable range (huge day counts overflowed the
+/// not-after computation and panicked — F-23). The CLI flag enforces the same
+/// 1..=36500 range.
+pub const MAX_VALIDITY_DAYS: u32 = 36500;
+
 /// Generate a complete TLS bundle: CA, server cert, and optionally a client
 /// cert for mTLS.
 ///
 /// `server_names` are Subject Alternative Names — hostnames and/or IP
 /// addresses. Defaults to `["localhost", "127.0.0.1"]` if empty.
+///
+/// `validity_days` must be in `1..=MAX_VALIDITY_DAYS`; anything else is an
+/// error (never a panic).
 pub fn generate_tls_bundle(
     server_names: &[String],
     validity_days: u32,
     generate_client: bool,
 ) -> Result<TlsBundle> {
+    if validity_days == 0 || validity_days > MAX_VALIDITY_DAYS {
+        anyhow::bail!("validity_days must be in 1..={MAX_VALIDITY_DAYS}, got {validity_days}");
+    }
     let names: Vec<String> = if server_names.is_empty() {
         vec!["localhost".into(), "127.0.0.1".into()]
     } else {
@@ -217,6 +229,22 @@ mod tests {
         ];
         let bundle = generate_tls_bundle(&names, 30, false).unwrap();
         assert!(bundle.server_cert_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn rejects_invalid_validity_days() {
+        // F-23: 0 and absurdly large day counts must be a clean error, not a
+        // panic from overflowing the not-after date computation.
+        let err = generate_tls_bundle(&[], 0, false)
+            .err()
+            .expect("0 must fail");
+        assert!(err.to_string().contains("validity_days"), "{err}");
+        let err = generate_tls_bundle(&[], 999_999_999, false)
+            .err()
+            .expect("huge day count must fail");
+        assert!(err.to_string().contains("999999999"), "{err}");
+        // The boundary itself stays valid.
+        assert!(generate_tls_bundle(&[], MAX_VALIDITY_DAYS, false).is_ok());
     }
 
     #[test]

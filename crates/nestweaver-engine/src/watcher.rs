@@ -658,7 +658,9 @@ impl BrainWatcher {
             crate::cross_domain::discover_cross_domain_links_for_note(store, &n_uid)
         };
         if let Err(e) = cd_result {
-            tracing::warn!("cross-domain refresh for {n_uid} failed: {e}");
+            // `{e:#}` — include the cause chain; `{e}` shows only the
+            // outermost context (a bare function name).
+            tracing::warn!("cross-domain refresh for {n_uid} failed: {e:#}");
         }
 
         // Mirror the update into Tantivy. Best-effort: log on failure.

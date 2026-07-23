@@ -66,6 +66,19 @@ pub fn materialize_projects(
 ) -> Result<ProjectMaterializationResult, anyhow::Error> {
     let mut ext_store = load_extensions(db_path);
 
+    // Reject duplicate project names up front: two entries with the same name
+    // map to the same project UID, so the per-entry edge reset below would
+    // silently wipe the previous entry's edges (F-08).
+    let mut seen_names = std::collections::HashSet::new();
+    for project_config in &config.projects {
+        if !seen_names.insert(project_config.name.as_str()) {
+            anyhow::bail!(
+                "duplicate project name {:?} in instance config — project names must be unique",
+                project_config.name
+            );
+        }
+    }
+
     // Clean existing project edges before re-materializing (idempotent).
     for project_config in &config.projects {
         let uid = project_uid(instance_id, &project_config.name);
@@ -536,6 +549,52 @@ pub fn detect_implicit_projects(
 #[cfg(test)]
 mod tests {
     use super::looks_like_fetch_error;
+
+    #[test]
+    fn materialize_projects_rejects_duplicate_names() {
+        // F-08: two [[projects]] entries with the same name map to the same
+        // project UID; the per-entry edge reset would silently wipe the first
+        // entry's edges. Materialization must refuse instead.
+        let toml = r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[[projects]]
+name = "dup"
+components = ["child-a"]
+
+[[projects]]
+name = "dup"
+components = ["child-b"]
+"#;
+        let config = crate::config::InstanceConfig::from_toml_str(toml).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.lbug");
+
+        let err = super::materialize_projects(&store, &config, "test-instance", &db_path)
+            .err()
+            .expect("duplicate project names must be rejected");
+        assert!(
+            err.to_string().contains("\"dup\""),
+            "error must name the duplicate project, got: {err}"
+        );
+    }
 
     #[test]
     fn error_detection_tls_certificate() {

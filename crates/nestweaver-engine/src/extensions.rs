@@ -1829,6 +1829,10 @@ pub enum AbortMigrationOutcome {
     /// A `graph_applied`/`reconciled` journal was force-discarded; the graph
     /// mutation itself remains and may need manual reconciliation.
     ForceDiscardedApplied,
+    /// An unreadable/unparseable journal was force-discarded. Its phase is
+    /// unknown (F-19): the graph may or may not have been mutated, so manual
+    /// reconciliation may be needed.
+    ForceDiscardedUnknownPhase,
 }
 
 /// Operator recovery (offline): clear a wedged instance-migration journal so the
@@ -1837,11 +1841,44 @@ pub enum AbortMigrationOutcome {
 /// unless `force`, because the graph was already mutated and the correct action
 /// is forward completion (re-run the merge — which daemon boot now self-heals);
 /// `force` discards the journal regardless, leaving the graph as-is.
+///
+/// A journal that fails to parse/validate wedges daemon boot exactly like a
+/// valid one but carries no trustworthy phase information (F-19): without
+/// `force` the abort refuses and says so; with `force` the corrupt journal is
+/// discarded with a loud warning, the outcome reports the phase as unknown
+/// (`ForceDiscardedUnknownPhase`), and the operator reconciles manually.
 pub fn abort_instance_extension_migration(
     db_path: &Path,
     force: bool,
 ) -> Result<AbortMigrationOutcome, anyhow::Error> {
-    let pending = pending_instance_extension_migration(db_path)?;
+    let pending = match pending_instance_extension_migration(db_path) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let journal_path = instance_extension_migration_journal_path(db_path);
+            if !force || !journal_path.exists() {
+                return Err(error.context(format!(
+                    "instance-migration journal {} could not be read; abort needs a parseable \
+                     journal to know whether the graph was mutated — re-run with --force to \
+                     discard it and reconcile manually",
+                    journal_path.display()
+                )));
+            }
+            eprintln!(
+                "warning: force-discarding unreadable instance-migration journal {} \
+                 (phase unknown — the graph may or may not have been mutated; reconcile \
+                 manually): {error:#}",
+                journal_path.display()
+            );
+            nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&journal_path)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "durably remove migration journal {}: {error}",
+                        journal_path.display()
+                    )
+                })?;
+            return Ok(AbortMigrationOutcome::ForceDiscardedUnknownPhase);
+        }
+    };
     if !pending.is_active() {
         return Ok(AbortMigrationOutcome::NothingToAbort);
     }
@@ -3147,6 +3184,59 @@ mod tests {
         assert_eq!(
             abort_instance_extension_migration(&db_path, true).unwrap(),
             AbortMigrationOutcome::ForceDiscardedApplied
+        );
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn abort_migration_force_discards_unparseable_journal() {
+        // F-19: a corrupt journal wedges daemon boot but yields no trustworthy
+        // phase information — --force must still be able to clear it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let journal_path = instance_extension_migration_journal_path(&db_path);
+        std::fs::write(&journal_path, b"{ not valid json").unwrap();
+
+        // Without --force: refused, journal survives, error points at --force.
+        let err = abort_instance_extension_migration(&db_path, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--force"),
+            "error should direct the operator to --force: {err:#}"
+        );
+        assert!(
+            journal_path.exists(),
+            "a refused abort must not remove the journal"
+        );
+
+        // With --force: discarded so the daemon can boot again. The journal was
+        // unreadable, so the outcome must report the phase as unknown (F-19) —
+        // claiming graph-applied would assert something unknowable.
+        assert_eq!(
+            abort_instance_extension_migration(&db_path, true).unwrap(),
+            AbortMigrationOutcome::ForceDiscardedUnknownPhase
+        );
+        assert!(!journal_path.exists());
+
+        // A structurally-valid-but-semantically-tampered journal (fails
+        // validation, not JSON parsing) is equally unrecoverable: same path.
+        prepare_instance_extension_migration(
+            &db_path,
+            "old",
+            "new",
+            &[nestweaver_store::InstanceUidRemap {
+                source_uid: "proj:old:bbbbbbbbbbbb".to_string(),
+                destination_uid: "proj:new:bbbbbbbbbbbb".to_string(),
+            }],
+        )
+        .unwrap();
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        journal["version"] = serde_json::json!(999);
+        std::fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        assert!(abort_instance_extension_migration(&db_path, false).is_err());
+        assert_eq!(
+            abort_instance_extension_migration(&db_path, true).unwrap(),
+            AbortMigrationOutcome::ForceDiscardedUnknownPhase
         );
         assert!(!journal_path.exists());
     }

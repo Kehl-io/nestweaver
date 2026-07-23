@@ -160,8 +160,9 @@ pub fn repo_identity_key(repo_uid: &str) -> String {
 /// store), reduced to its instance-independent identity via
 /// [`repo_identity_key`] so the local and server tiers reconcile despite their
 /// differing instance segments. Falls back to `file_path` as a whole-path key
-/// when `repo_uid` is absent, so entries are still tracked but dedup is
-/// path-exact rather than repo-level.
+/// when `repo_uid` is absent, so the entry is still tracked — but note that
+/// [`filter_org_results`] only dedups on repo identity and always KEEPS
+/// org-side rows that carry no `repo_uid`, so path keys never strip org rows.
 pub fn extract_local_repos(local: &Value) -> std::collections::HashSet<String> {
     let mut repos = std::collections::HashSet::new();
 
@@ -192,9 +193,18 @@ pub fn extract_local_repos(local: &Value) -> std::collections::HashSet<String> {
 /// whose repo matches a repo already present in the local impact set. Repo
 /// identity is compared instance-independently via [`repo_identity_key`] — the
 /// full `repo_uid` carries an `{instance}` segment that differs between the
-/// local daemon and the server, so a full-string match never dedups. Falls back
-/// to full `file_path` matching when `repo_uid` is absent (for backward
-/// compatibility with older servers that don't emit it).
+/// local daemon and the server, so a full-string match never dedups.
+///
+/// Rows WITHOUT a `repo_uid` are always kept: a bare `file_path` match would
+/// collapse rows from DIFFERENT repos that happen to share a path (the local
+/// `src/refund.js` hiding the org repo's `src/refund.js`). For impact
+/// analysis a duplicate row (false positive) beats a hidden one (false
+/// negative).
+///
+/// After filtering, the count fields (`changed_symbol_count`,
+/// `affected_symbol_count`, `affected_cluster_count`, …) and the human
+/// `summary` are recomputed from the post-filter rows so the response can
+/// never report counts for rows that were stripped.
 pub fn filter_org_results(
     server: &Value,
     local_repos: &std::collections::HashSet<String>,
@@ -208,18 +218,13 @@ pub fn filter_org_results(
     for key in &["affected_symbols", "changed_symbols"] {
         if let Some(arr) = filtered.get_mut(key).and_then(|v| v.as_array_mut()) {
             arr.retain(|item| {
-                // Prefer repo_uid for matching; fall back to full file_path.
-                let dominated = item
+                // Dedup on repo identity only — rows without a repo_uid are
+                // kept (see fn docs).
+                !item
                     .get("repo_uid")
                     .and_then(|v| v.as_str())
                     .filter(|r| !r.is_empty())
-                    .map(|repo| local_repos.contains(&repo_identity_key(repo)))
-                    .unwrap_or_else(|| {
-                        item.get("file_path")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|fp| local_repos.contains(fp))
-                    });
-                !dominated
+                    .is_some_and(|repo| local_repos.contains(&repo_identity_key(repo)))
             });
         }
     }
@@ -230,23 +235,121 @@ pub fn filter_org_results(
         .and_then(|v| v.as_array_mut())
     {
         clusters.retain(|cluster| {
-            // Prefer repo_uid; fall back to full representative_file path.
-            let dominated = cluster
+            !cluster
                 .get("repo_uid")
                 .and_then(|v| v.as_str())
                 .filter(|r| !r.is_empty())
-                .map(|repo| local_repos.contains(&repo_identity_key(repo)))
-                .unwrap_or_else(|| {
-                    cluster
-                        .get("representative_file")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|fp| local_repos.contains(fp))
-                });
-            !dominated
+                .is_some_and(|repo| local_repos.contains(&repo_identity_key(repo)))
         });
     }
 
+    recompute_filtered_counts(&mut filtered);
+
     filtered
+}
+
+/// Recompute a filtered org-wide result's count fields and human `summary`
+/// from its post-filter rows. Without this the response would echo the
+/// server's pre-filter counts — e.g. `changed_symbol_count: 2` next to
+/// `changed_symbols: []`, with `status: complete` / `gate_state: ok` telling
+/// the consumer to trust a result whose rows are gone.
+///
+/// Only fields already present are rewritten (brain_impact / affected_tests
+/// org results carry a different field set than blast_radius). The summary
+/// mirrors the engine's `render_blast_summary` format; it is re-rendered
+/// only when every input it needs is derivable from the payload.
+fn recompute_filtered_counts(filtered: &mut Value) {
+    let changed = filtered
+        .get("changed_symbols")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len());
+    let affected = filtered
+        .get("affected_symbols")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len());
+    let clusters = filtered
+        .get("affected_clusters")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len());
+    // File count for the summary: distinct file_paths among the post-filter
+    // changed symbols (the engine's `changed_files` list is the query input
+    // and is not filtered here).
+    let changed_files = filtered
+        .get("changed_symbols")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("file_path").and_then(|v| v.as_str()))
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        });
+
+    let Some(obj) = filtered.as_object_mut() else {
+        return;
+    };
+
+    if let Some(n) = changed
+        && obj.contains_key("changed_symbol_count")
+    {
+        obj.insert("changed_symbol_count".into(), Value::from(n));
+    }
+    if let Some(n) = affected {
+        if obj.contains_key("affected_symbol_count") {
+            obj.insert("affected_symbol_count".into(), Value::from(n));
+        }
+        if obj.contains_key("returned_affected_symbol_count") {
+            obj.insert("returned_affected_symbol_count".into(), Value::from(n));
+        }
+        // After dedup the returned rows ARE the org-tier view — there is no
+        // hidden remainder within this filtered scope.
+        if obj.contains_key("affected_symbols_truncated") {
+            obj.insert("affected_symbols_truncated".into(), Value::from(false));
+        }
+    }
+    if let Some(n) = clusters
+        && obj.contains_key("affected_cluster_count")
+    {
+        obj.insert("affected_cluster_count".into(), Value::from(n));
+    }
+
+    // Re-render the human summary from the post-filter counts, mirroring the
+    // engine's render_blast_summary format. Only when the payload carries a
+    // string summary and all three row sets were filtered.
+    let summary = if obj.get("summary").is_some_and(|v| v.is_string())
+        && let (Some(c), Some(f), Some(a), Some(cl)) = (changed, changed_files, affected, clusters)
+    {
+        // JSON risk is lowercase ("low"); the engine's summary uses the
+        // Debug variant name ("Low").
+        let risk = obj
+            .get("risk")
+            .and_then(|v| v.as_str())
+            .map(|r| {
+                let mut chars = r.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .unwrap_or_else(|| "Unknown".to_string());
+        let mut s = format!(
+            "{c} changed symbol(s) in {f} file(s), \
+             {a} transitively affected symbol(s), \
+             {cl} cluster(s) touched. Risk: {risk}."
+        );
+        // Non-complete runs carry the status in the summary, matching the
+        // engine's render. Status is lowercase in JSON, same as the label.
+        if let Some(status) = obj.get("status").and_then(|v| v.as_str())
+            && status != "complete"
+        {
+            s.push_str(&format!(" [status: {status}]"));
+        }
+        Some(s)
+    } else {
+        None
+    };
+    if let Some(s) = summary {
+        obj.insert("summary".into(), Value::from(s));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,5 +472,162 @@ mod tests {
             1,
             "a server symbol in a repo not covered locally must be retained"
         );
+    }
+
+    #[test]
+    fn filter_org_results_keeps_rows_without_repo_uid_despite_matching_path() {
+        // Final-hunt finding: org rows carry no `repo_uid`, and a local row
+        // shares the same `file_path` in a DIFFERENT repo. Matching on the
+        // bare path over-dedups — the local `src/refund.js` would hide the
+        // org repo's `src/refund.js`. For impact analysis a false-positive
+        // duplicate beats a false-negative hidden row, so path-only org rows
+        // must be KEPT.
+        let local = json!({
+            "changed_symbols": [
+                {"name": "process_refund", "file_path": "src/refund.js"},
+            ],
+            "affected_symbols": []
+        });
+        let local_repos = extract_local_repos(&local);
+        // Local side fell back to the path key (no repo_uid available).
+        assert!(local_repos.contains("src/refund.js"));
+
+        let server = json!({
+            "changed_symbols": [
+                {"name": "process_refund", "file_path": "src/refund.js"},
+            ],
+            "affected_symbols": [
+                {"name": "apply_credit", "file_path": "src/refund.js"},
+            ],
+            "affected_clusters": [
+                {"representative_file": "src/refund.js"},
+            ]
+        });
+        let filtered = filter_org_results(&server, &local_repos);
+
+        assert_eq!(
+            filtered["changed_symbols"].as_array().unwrap().len(),
+            1,
+            "path-only org changed_symbols must be kept"
+        );
+        assert_eq!(
+            filtered["affected_symbols"].as_array().unwrap().len(),
+            1,
+            "path-only org affected_symbols must be kept"
+        );
+        assert_eq!(
+            filtered["affected_clusters"].as_array().unwrap().len(),
+            1,
+            "path-only org clusters must be kept"
+        );
+    }
+
+    #[test]
+    fn filter_org_results_recomputes_counts_and_summary_after_stripping() {
+        // Final-hunt finding: after stripping locally-covered rows the
+        // response still reported the server's pre-filter counts —
+        // `changed_symbol_count: 2` next to `changed_symbols: []` with
+        // `status: complete` / `gate_state: ok`. Counts and the human summary
+        // must be recomputed from the post-filter rows.
+        let url_hash = "abc123def456";
+        let local = json!({
+            "changed_symbols": [
+                {"name": "process_payment", "file_path": "src/billing.rs",
+                 "repo_uid": format!("repo:local:{url_hash}")},
+            ],
+            "affected_symbols": []
+        });
+        let local_repos = extract_local_repos(&local);
+
+        let server = json!({
+            "changed_files": ["src/billing.rs"],
+            "risk": "low",
+            "status": "complete",
+            "gate_state": "ok",
+            "summary": "2 changed symbol(s) in 1 file(s), 1 transitively \
+                        affected symbol(s), 1 cluster(s) touched. Risk: Low.",
+            "changed_symbols": [
+                {"name": "process_payment", "file_path": "src/billing.rs",
+                 "repo_uid": format!("repo:nestweaver-server:{url_hash}")},
+                {"name": "process_payout", "file_path": "src/payout.rs",
+                 "repo_uid": format!("repo:nestweaver-server:{url_hash}")},
+            ],
+            "changed_symbol_count": 2,
+            "affected_symbols": [
+                {"name": "charge_card", "file_path": "src/charge.rs",
+                 "repo_uid": format!("repo:nestweaver-server:{url_hash}")},
+            ],
+            "affected_symbol_count": 1,
+            "returned_affected_symbol_count": 1,
+            "affected_symbols_truncated": false,
+            "affected_clusters": [
+                {"id": 3, "representative_file": "src/billing.rs",
+                 "repo_uid": format!("repo:nestweaver-server:{url_hash}")},
+            ],
+            "affected_cluster_count": 1,
+        });
+        let filtered = filter_org_results(&server, &local_repos);
+
+        assert!(filtered["changed_symbols"].as_array().unwrap().is_empty());
+        assert!(filtered["affected_symbols"].as_array().unwrap().is_empty());
+        assert!(filtered["affected_clusters"].as_array().unwrap().is_empty());
+        assert_eq!(filtered["changed_symbol_count"], json!(0));
+        assert_eq!(filtered["affected_symbol_count"], json!(0));
+        assert_eq!(filtered["returned_affected_symbol_count"], json!(0));
+        assert_eq!(filtered["affected_symbols_truncated"], json!(false));
+        assert_eq!(filtered["affected_cluster_count"], json!(0));
+        assert_eq!(
+            filtered["summary"],
+            json!(
+                "0 changed symbol(s) in 0 file(s), 0 transitively affected \
+                 symbol(s), 0 cluster(s) touched. Risk: Low."
+            ),
+            "summary must be re-rendered from the post-filter rows"
+        );
+        // Untouched trust fields pass through unchanged.
+        assert_eq!(filtered["status"], json!("complete"));
+        assert_eq!(filtered["gate_state"], json!("ok"));
+    }
+
+    #[test]
+    fn filter_org_results_summary_marks_non_complete_status() {
+        // A degraded server result that gets fully filtered must still carry
+        // its [status: degraded] marker in the re-rendered summary.
+        let url_hash = "abc123def456";
+        let local = json!({
+            "changed_symbols": [
+                {"name": "f", "file_path": "src/a.rs",
+                 "repo_uid": format!("repo:local:{url_hash}")},
+            ],
+            "affected_symbols": []
+        });
+        let local_repos = extract_local_repos(&local);
+
+        let server = json!({
+            "risk": "medium",
+            "status": "degraded",
+            "summary": "1 changed symbol(s) in 1 file(s), 1 transitively \
+                        affected symbol(s), 0 cluster(s) touched. Risk: Medium. \
+                        [status: degraded]",
+            "changed_symbols": [
+                {"name": "f", "file_path": "src/a.rs",
+                 "repo_uid": format!("repo:nestweaver-server:{url_hash}")},
+            ],
+            "changed_symbol_count": 1,
+            "affected_symbols": [
+                {"name": "g", "file_path": "src/b.rs",
+                 "repo_uid": format!("repo:nestweaver-server:{url_hash}")},
+            ],
+            "affected_symbol_count": 1,
+            "affected_clusters": [],
+            "affected_cluster_count": 0,
+        });
+        let filtered = filter_org_results(&server, &local_repos);
+        let summary = filtered["summary"].as_str().unwrap();
+        assert!(
+            summary.ends_with("[status: degraded]"),
+            "non-complete status must survive the re-render, got {summary:?}"
+        );
+        assert!(summary.contains("Risk: Medium."));
     }
 }

@@ -344,10 +344,7 @@ async fn dispatch_typed_project_context(
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32,
         kinds: json_str_array(params, "kinds"),
-        include_components: params
-            .get("include_components")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        include_components: bool_or(params, "include_components", true),
         intent: params
             .get("intent")
             .and_then(|v| v.as_str())
@@ -408,10 +405,7 @@ async fn dispatch_typed_note_get(
             .get("title")
             .and_then(|v| v.as_str())
             .map(String::from),
-        include_body: params
-            .get("include_body")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        include_body: bool_or(params, "include_body", true),
         sections: json_str_array(params, "sections"),
     };
     let mut request = tonic::Request::new(req);
@@ -428,6 +422,23 @@ async fn dispatch_typed_note_get(
         "note_kind": resp.note_kind,
         "word_count": resp.word_count,
         "section_count": resp.section_count,
+        // Match the daemon-proxy note_get shape (tools.rs): frontmatter and
+        // outline are always present (local defaults to {} / []).
+        "frontmatter": serde_json::from_str::<Value>(&resp.frontmatter_json)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        "outline": resp
+            .outline
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "uid": h.uid,
+                    "level": h.level,
+                    "text": h.text,
+                    "slug": h.slug,
+                    "line": h.line,
+                })
+            })
+            .collect::<Vec<_>>(),
     });
     if let Some(body) = resp.body {
         result["body"] = Value::String(body);
@@ -479,6 +490,17 @@ fn json_str_array(params: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Presence-aware bool extraction (F-16): proto3 scalar bools carry no
+/// presence, so an arg the caller left unset would forward as explicit
+/// `false`, and the daemon's typed handlers write that `false` back into the
+/// tool args — overriding tool defaults that are TRUE
+/// (`project_context.include_components`, `note_get.include_body`). Forward
+/// the tool's own default when the caller did not specify the flag; an
+/// explicit `false` is still honored.
+fn bool_or(params: &Value, key: &str, default: bool) -> bool {
+    params.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -547,5 +569,23 @@ mod tests {
             "title-only concise note rows must retain an empty matched-headings field: \
              {concise_note}"
         );
+    }
+
+    #[test]
+    fn bool_or_forwards_default_true_when_arg_absent() {
+        // F-16: absent include_components/include_body must NOT collapse to
+        // false (proto3 has no presence); the tool default is true.
+        let empty = serde_json::json!({});
+        assert!(bool_or(&empty, "include_components", true));
+        assert!(bool_or(&empty, "include_body", true));
+
+        // Explicit values are honored in both directions.
+        let explicit_false = serde_json::json!({ "include_components": false });
+        assert!(!bool_or(&explicit_false, "include_components", true));
+        let explicit_true = serde_json::json!({ "include_body": true });
+        assert!(bool_or(&explicit_true, "include_body", true));
+
+        // Default-false bools keep their old behavior.
+        assert!(!bool_or(&empty, "prf", false));
     }
 }

@@ -89,9 +89,97 @@ pub fn runtime_dir(instance_id: &str) -> PathBuf {
         .join(instance_id)
 }
 
+/// Maximum unix socket path length (sun_path) on macOS/BSD — 104 bytes
+/// including the NUL terminator.
+const SUN_PATH_LIMIT: usize = 104;
+
+/// Outcome of [`secure_fallback_sock_dir`].
+#[derive(Debug, PartialEq, Eq)]
+enum FallbackDirStatus {
+    /// We created the directory (mode 0700).
+    Created,
+    /// Already existed with the right owner and mode.
+    Verified,
+    /// Existed with the right owner but a wider mode — tightened to 0700.
+    ModeTightened,
+}
+
+/// Create or verify the `/tmp/nw-sock-<uid>` fallback socket dir (B-5).
+///
+/// Anyone can create paths in `/tmp`, so a pre-existing dir owned by ANOTHER
+/// user is a squat: binding our socket inside it would let that user swap or
+/// delete the socket. We refuse (PermissionDenied) rather than use it — a
+/// foreign-owned dir in sticky `/tmp` can be neither repaired nor removed by
+/// us. Dirs we own are tightened to mode 0700 so no other user can reach in.
+fn secure_fallback_sock_dir(dir: &Path, expected_uid: u32) -> std::io::Result<FallbackDirStatus> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)?;
+        // create_dir_all honors umask — set 0700 explicitly.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        return Ok(FallbackDirStatus::Created);
+    }
+
+    let meta = std::fs::metadata(dir)?;
+    if meta.uid() != expected_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "socket fallback dir {} is owned by uid {} (expected {}) — refusing to use \
+                 a squatted directory; remove it as its owner or as root",
+                dir.display(),
+                meta.uid(),
+                expected_uid
+            ),
+        ));
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        return Ok(FallbackDirStatus::ModeTightened);
+    }
+    Ok(FallbackDirStatus::Verified)
+}
+
 /// Path to the Unix domain socket for the given instance.
+///
+/// LOW (SUN_LEN): a state dir nested too deeply (long `$XDG_RUNTIME_DIR` or
+/// home path) would push the socket path past the 104-byte `sun_path` limit
+/// and every bind/connect would fail with ENAMETOOLONG. Fall back to a short
+/// /tmp-based path and say so. All callers derive the socket through this
+/// function, so client and daemon always agree on the fallback.
+///
+/// B-5: the /tmp fallback dir is created mode 0700 and ownership-checked.
+/// A dir squatted by another uid is never used — the error is logged and we
+/// fall back to the (over-long) runtime-dir path so the bind fails loudly
+/// instead of trusting the squatted dir.
 pub fn socket_path(instance_id: &str) -> PathBuf {
-    runtime_dir(instance_id).join("daemon.sock")
+    let default = runtime_dir(instance_id).join("daemon.sock");
+    if default.as_os_str().len() < SUN_PATH_LIMIT {
+        return default;
+    }
+    let uid = unsafe { libc::getuid() };
+    let fallback_dir = PathBuf::from("/tmp").join(format!("nw-sock-{uid}"));
+    if let Err(e) = secure_fallback_sock_dir(&fallback_dir, uid) {
+        tracing::error!(
+            error = %e,
+            dir = %fallback_dir.display(),
+            "refusing squatted /tmp socket fallback dir"
+        );
+        return default;
+    }
+    let fallback = fallback_dir.join(instance_id);
+    // The bind fails if the parent doesn't exist; create it eagerly since
+    // `runtime_dir` (which callers create) is NOT the fallback's parent.
+    let _ = std::fs::create_dir_all(&fallback);
+    let fallback = fallback.join("daemon.sock");
+    tracing::warn!(
+        intended = %default.display(),
+        fallback = %fallback.display(),
+        "socket path exceeds the {SUN_PATH_LIMIT}-byte sun_path limit — using /tmp fallback"
+    );
+    fallback
 }
 
 /// Path to the PID file for the given instance.
@@ -371,6 +459,83 @@ mod tests {
         let sock = socket_path("test1234");
         assert!(sock.ends_with("daemon.sock"));
         assert!(sock.starts_with(runtime_dir("test1234")));
+    }
+
+    /// LOW (SUN_LEN): an over-long runtime dir must not produce an unbindable
+    /// socket path — fall back to a short /tmp-based one (and create it).
+    #[test]
+    fn socket_path_falls_back_to_tmp_when_over_sun_len() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let long = format!("/run/user/{}", "x".repeat(120));
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &long);
+        }
+        let sock = socket_path("test1234");
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        assert!(
+            sock.as_os_str().len() < 104,
+            "fallback socket path must fit sun_path: {}",
+            sock.display()
+        );
+        assert!(sock.starts_with("/tmp"), "got {}", sock.display());
+        assert!(sock.ends_with("daemon.sock"));
+        assert!(sock.parent().is_some_and(|p| p.exists()));
+    }
+
+    /// B-5: the /tmp fallback dir is created mode 0700 so no other user can
+    /// reach in and swap or delete our socket.
+    #[test]
+    fn fallback_sock_dir_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("nw-sock-test");
+        let uid = unsafe { libc::getuid() };
+
+        let status = secure_fallback_sock_dir(&dir, uid).unwrap();
+        assert_eq!(status, FallbackDirStatus::Created);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "fallback dir must be mode 0700"
+        );
+        // Second call verifies without changes.
+        let status = secure_fallback_sock_dir(&dir, uid).unwrap();
+        assert_eq!(status, FallbackDirStatus::Verified);
+    }
+
+    /// B-5: a pre-existing dir we own but with a permissive mode is tightened
+    /// to 0700 rather than trusted as-is.
+    #[test]
+    fn fallback_sock_dir_tightens_permissive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("nw-sock-test");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let uid = unsafe { libc::getuid() };
+
+        let status = secure_fallback_sock_dir(&dir, uid).unwrap();
+        assert_eq!(status, FallbackDirStatus::ModeTightened);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "permissive fallback dir must be tightened to 0700"
+        );
+    }
+
+    /// B-5: a dir owned by a DIFFERENT uid (a squat) is refused — never used.
+    #[test]
+    fn fallback_sock_dir_refuses_foreign_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("nw-sock-test");
+        std::fs::create_dir(&dir).unwrap();
+        let our_uid = unsafe { libc::getuid() };
+        // Simulate the squat check from the victim's perspective: the dir is
+        // owned by us, but the expected uid is someone else's → mismatch.
+        let err = secure_fallback_sock_dir(&dir, our_uid + 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

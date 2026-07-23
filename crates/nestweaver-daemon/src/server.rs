@@ -111,6 +111,16 @@ enum SearchIndexReconciliation {
     Unavailable(String),
 }
 
+/// A registered daemon-side file watcher and its shutdown handle.
+///
+/// The `id` lets the watcher thread clear only ITS OWN registration on exit:
+/// without it, a force-replaced watcher's exit (B-2) would wipe the
+/// replacement's registration and re-orphan the slot.
+pub struct WatcherRegistration {
+    id: u64,
+    handle: nestweaver_engine::ShutdownHandle,
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
@@ -132,7 +142,9 @@ pub struct DaemonState {
     pub active_writes: Arc<AtomicU32>,
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
-    pub watcher_stop: std::sync::Mutex<Option<nestweaver_engine::ShutdownHandle>>,
+    pub watcher_stop: std::sync::Mutex<Option<WatcherRegistration>>,
+    /// Monotonic id source for [`WatcherRegistration`]s.
+    pub next_watcher_id: std::sync::atomic::AtomicU64,
     /// Parsed `nestweaver-instance.toml` if `--config` was supplied at
     /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
     /// `brain_search`) via the `set_current_instance_config` thread-local.
@@ -175,6 +187,9 @@ pub struct DaemonState {
     /// Handle to the server-mode worker-pool task. Awaited on shutdown so an
     /// in-flight index write is allowed to finish rather than being abandoned.
     pub worker_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Handle to the `serve_ui` web-server task, aborted by `stop_ui` so the
+    /// listen port is released when the CLI exits (LOW: ui port leak).
+    pub ui_server: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DaemonState {
@@ -250,6 +265,65 @@ fn resolve_effective_instance_id(requested: &str, configured: &str) -> Result<St
     nestweaver_engine::validate_instance_id(effective)
         .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
     Ok(effective.to_string())
+}
+
+/// Stop and unregister any active file watcher. Idempotent.
+///
+/// B-2: called on EVERY shutdown path (gRPC Shutdown, SIGTERM, post-serve
+/// cleanup) so a watcher orphaned by a kill -9'd `watch` CLI can't pin
+/// daemon shutdown — the watcher runs on a `spawn_blocking` thread that
+/// Tokio's runtime drop waits for, so an unstopped watcher hangs the
+/// process until the client's SIGKILL.
+fn stop_active_watcher(state: &DaemonState) {
+    if let Ok(mut guard) = state.watcher_stop.lock()
+        && let Some(reg) = guard.take()
+    {
+        tracing::info!(watcher_id = reg.id, "stopping active watcher");
+        reg.handle.stop();
+    }
+}
+
+/// Register a watcher's shutdown handle, returning its registration id (the
+/// watcher thread passes it to [`clear_watcher_registration`] on exit).
+///
+/// B-2: refuses when a watcher is already registered unless `force` — in
+/// which case the incumbent (possibly orphaned by a kill -9'd `watch` CLI)
+/// is stopped and replaced instead of failing new watch sessions forever.
+fn register_watcher(
+    state: &DaemonState,
+    handle: nestweaver_engine::ShutdownHandle,
+    force: bool,
+) -> Result<u64, Status> {
+    let mut guard = state
+        .watcher_stop
+        .lock()
+        .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+    if let Some(existing) = guard.as_ref() {
+        if !force {
+            return Err(Status::already_exists(
+                "a watcher is already running; stop it first (StopWatch) or retry with force",
+            ));
+        }
+        tracing::info!(
+            watcher_id = existing.id,
+            "force-stopping existing watcher (possibly orphaned)"
+        );
+        existing.handle.stop();
+    }
+    let id = state.next_watcher_id.fetch_add(1, Ordering::Relaxed);
+    *guard = Some(WatcherRegistration { id, handle });
+    Ok(id)
+}
+
+/// Clear a watcher registration on watcher-thread exit — but only when the
+/// slot still holds THIS watcher. A force-replaced watcher's exit must not
+/// wipe its replacement's registration (B-2).
+fn clear_watcher_registration(state: &DaemonState, id: u64) {
+    if let Ok(mut guard) = state.watcher_stop.lock()
+        && guard.as_ref().is_some_and(|reg| reg.id == id)
+    {
+        *guard = None;
+    }
 }
 
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
@@ -2156,6 +2230,9 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
+            // B-1: the daemon's own PID, so the CLI can cross-check a pidfile
+            // PID against the socket-reported PID before signaling it.
+            pid: std::process::id(),
         }))
     }
 
@@ -2177,12 +2254,10 @@ impl NestWeaverDaemon for DaemonService {
         // shutdown burns the full drain ceiling doing work it will abandon.
         self.state.drained.store(true, Ordering::Relaxed);
 
-        if let Ok(mut guard) = self.state.watcher_stop.lock()
-            && let Some(handle) = guard.take()
-        {
-            tracing::info!("stopping active watcher before shutdown");
-            handle.stop();
-        }
+        // B-2: stop any active watcher BEFORE the drain wait — an orphaned
+        // watcher's blocking thread would otherwise pin shutdown until the
+        // client's SIGKILL.
+        stop_active_watcher(&self.state);
 
         let state = self.state.clone();
         tokio::spawn(async move {
@@ -2337,29 +2412,14 @@ impl NestWeaverDaemon for DaemonService {
             Status::invalid_argument(format!("cannot canonicalize vault path: {e}"))
         })?;
 
-        // Only allow paths registered in the instance config.
-        if let Some(ref cfg) = self.state.instance_cfg {
-            let allowed: Vec<PathBuf> = cfg
-                .repos
-                .iter()
-                .filter(|r| r.repo_type == Some(nestweaver_engine::config::RepoType::Vault))
-                .filter_map(|r| {
-                    let p = PathBuf::from(&r.url);
-                    p.canonicalize().ok()
-                })
-                .collect();
-            if !allowed.iter().any(|a| vault_path.starts_with(a)) {
-                return Err(Status::invalid_argument(format!(
-                    "vault path {} is not in the instance's registered sources",
-                    vault_path.display()
-                )));
-            }
-        } else {
-            return Err(Status::failed_precondition(
-                "watch_vault requires an instance config (--config); \
-                 path validation cannot be performed without one",
-            ));
-        }
+        // Only allow paths registered in the instance config; without a
+        // config, fall back to the unsafe-root denylist (F-01).
+        watch_path_allowed(
+            self.state.instance_cfg.as_ref().map(|c| c.repos.as_slice()),
+            &vault_path,
+            "vault",
+            true,
+        )?;
 
         let db_path = self.state.db_path.clone();
         let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
@@ -2386,22 +2446,18 @@ impl NestWeaverDaemon for DaemonService {
 
         let shutdown_handle = watcher.shutdown_handle();
 
-        // Hold the lock across check + store to prevent TOCTOU race.
-        {
-            let mut guard = self
-                .state
-                .watcher_stop
-                .lock()
-                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
-            if guard.is_some() {
+        // register_watcher holds the lock across check + store (TOCTOU-safe).
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, false) {
+            Ok(id) => id,
+            Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchVaultResponse {
                     ok: false,
                     message: "A watcher is already running. Stop it first with StopWatch."
                         .to_string(),
                 }));
             }
-            *guard = Some(shutdown_handle);
-        }
+            Err(e) => return Err(e),
+        };
 
         let guard = ConnectionGuard::write(&self.state);
         let write_lock = self.state.write_mutex.clone();
@@ -2425,9 +2481,7 @@ impl NestWeaverDaemon for DaemonService {
                 Err(_) => tracing::error!("watcher thread panicked"),
             }
 
-            if let Ok(mut guard) = state.watcher_stop.lock() {
-                *guard = None;
-            }
+            clear_watcher_registration(&state, watcher_id);
         });
 
         Ok(Response::new(WatchVaultResponse {
@@ -2450,6 +2504,7 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
+        let force = req.force;
         let instance_id =
             resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
 
@@ -2464,50 +2519,36 @@ impl NestWeaverDaemon for DaemonService {
             .canonicalize()
             .map_err(|e| Status::invalid_argument(format!("cannot canonicalize repo path: {e}")))?;
 
-        // Only allow paths registered in the instance config.
-        if let Some(ref cfg) = self.state.instance_cfg {
-            let allowed: Vec<PathBuf> = cfg
-                .repos
-                .iter()
-                .filter_map(|r| {
-                    let p = PathBuf::from(&r.url);
-                    p.canonicalize().ok()
-                })
-                .collect();
-            if !allowed.iter().any(|a| repo_path.starts_with(a)) {
-                return Err(Status::invalid_argument(format!(
-                    "repo path {} is not in the instance's registered sources",
-                    repo_path.display()
-                )));
-            }
-        } else {
-            return Err(Status::failed_precondition(
-                "watch_code requires an instance config (--config); \
-                 path validation cannot be performed without one",
-            ));
-        }
+        // Only allow paths registered in the instance config; without a
+        // config, fall back to the unsafe-root denylist (F-01).
+        watch_path_allowed(
+            self.state.instance_cfg.as_ref().map(|c| c.repos.as_slice()),
+            &repo_path,
+            "repo",
+            false,
+        )?;
 
         let db_path = self.state.db_path.clone();
 
         let watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id);
         let shutdown_handle = watcher.shutdown_handle();
 
-        // Hold the lock across check + store to prevent TOCTOU race.
-        {
-            let mut guard = self
-                .state
-                .watcher_stop
-                .lock()
-                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
-            if guard.is_some() {
+        // register_watcher holds the lock across check + store (TOCTOU-safe).
+        // With `force`, an already-running watcher (e.g. orphaned by a
+        // kill -9'd `watch` CLI, B-2) is stopped and replaced instead of
+        // failing every new watch session.
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, force) {
+            Ok(id) => id,
+            Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchCodeResponse {
                     ok: false,
-                    message: "A watcher is already running. Stop it first with StopWatch."
+                    message: "A watcher is already running. Stop it first with StopWatch \
+                              (or retry with --force)."
                         .to_string(),
                 }));
             }
-            *guard = Some(shutdown_handle);
-        }
+            Err(e) => return Err(e),
+        };
 
         let guard = ConnectionGuard::write(&self.state);
         let write_lock = self.state.write_mutex.clone();
@@ -2531,9 +2572,7 @@ impl NestWeaverDaemon for DaemonService {
                 Err(_) => tracing::error!("code watcher thread panicked"),
             }
 
-            if let Ok(mut guard) = state.watcher_stop.lock() {
-                *guard = None;
-            }
+            clear_watcher_registration(&state, watcher_id);
         });
 
         Ok(Response::new(WatchCodeResponse {
@@ -2557,9 +2596,9 @@ impl NestWeaverDaemon for DaemonService {
             .lock()
             .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
 
-        if let Some(handle) = guard.take() {
-            tracing::info!("stop_watch: stopping active watcher");
-            handle.stop();
+        if let Some(reg) = guard.take() {
+            tracing::info!(watcher_id = reg.id, "stop_watch: stopping active watcher");
+            reg.handle.stop();
             Ok(Response::new(StopWatchResponse { ok: true }))
         } else {
             Ok(Response::new(StopWatchResponse { ok: false }))
@@ -2713,6 +2752,34 @@ impl NestWeaverDaemon for DaemonService {
         let port = if req.port > 0 { req.port as u16 } else { 3000 };
         let open_browser = req.open_browser;
 
+        // LOW (ui port leak): re-asking for the UI while it is already served
+        // is a no-op success, but a FOREIGN process bound to the port must be a
+        // clear error — the old code spawned a task whose bind failure was only
+        // logged, and reported ok:true regardless.
+        {
+            let guard = self
+                .state
+                .ui_server
+                .lock()
+                .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
+            if let Some(handle) = guard.as_ref()
+                && !handle.is_finished()
+            {
+                return Ok(Response::new(ServeUiResponse {
+                    ok: true,
+                    message: format!("UI server already running on port {port}"),
+                }));
+            }
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            return Ok(Response::new(ServeUiResponse {
+                ok: false,
+                message: format!(
+                    "port {port} is already in use by another process — pick another --port"
+                ),
+            }));
+        }
+
         // Build web UI router, mounting the admin API when available so the
         // admin dashboard SPA can reach its backend on the same origin.
         let mut web_router = nestweaver_web::create_router(app_state);
@@ -2724,14 +2791,24 @@ impl NestWeaverDaemon for DaemonService {
             tracing::info!("admin API also mounted on web UI server");
         }
 
-        // Spawn web server as a background task inside the daemon.
-        tokio::spawn(async move {
+        // Spawn web server as a background task inside the daemon. The handle
+        // is tracked so `stop_ui` can abort it and release the listen port
+        // (LOW: ui port leak).
+        let handle = tokio::spawn(async move {
             if let Err(e) =
                 nestweaver_web::start_server_with_router(web_router, port, open_browser).await
             {
                 tracing::error!("UI server error: {e}");
             }
         });
+        {
+            let mut guard = self
+                .state
+                .ui_server
+                .lock()
+                .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
+            *guard = Some(handle);
+        }
 
         // If watch mode requested, spawn a CodeWatcher.
         if req.watch && !req.watch_repo_path.is_empty() {
@@ -2752,6 +2829,39 @@ impl NestWeaverDaemon for DaemonService {
             ok: true,
             message: format!("UI server started on port {port}"),
         }))
+    }
+
+    async fn stop_ui(
+        &self,
+        request: Request<StopUiRequest>,
+    ) -> Result<Response<StopUiResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
+        let handle = {
+            let mut guard = self
+                .state
+                .ui_server
+                .lock()
+                .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
+            guard.take()
+        };
+        match handle {
+            Some(handle) if !handle.is_finished() => {
+                // Aborting the task drops the axum listener, releasing the port.
+                handle.abort();
+                Ok(Response::new(StopUiResponse {
+                    ok: true,
+                    message: "UI server stopped".to_string(),
+                }))
+            }
+            _ => Ok(Response::new(StopUiResponse {
+                ok: false,
+                message: "UI server is not running".to_string(),
+            })),
+        }
     }
 
     // ── Indexing ─────────────────────────────────────────────────────
@@ -3863,6 +3973,40 @@ impl NestWeaverDaemon for DaemonService {
                 .get("section_count")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0) as i32,
+            // Parity with the local note_get JSON: frontmatter (a JSON object)
+            // and the heading outline ride the typed response too — the MCP
+            // daemon path used to drop both.
+            frontmatter_json: value
+                .get("frontmatter")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            outline: value
+                .get("outline")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|h| nestweaver_proto::NoteHeading {
+                            uid: h
+                                .get("uid")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            level: h.get("level").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                            text: h
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            slug: h
+                                .get("slug")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            line: h.get("line").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }))
     }
 
@@ -4252,27 +4396,31 @@ impl NestWeaverDaemon for DaemonService {
         let req = r.into_inner();
         let db_path = self.state.db_path.clone();
 
+        // Errors are wrapped in the standard `tool <name> failed:` format (see
+        // dispatch_err_to_status) so MCP clients don't mislabel tool argument
+        // errors as gRPC transport failures.
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let args: serde_json::Value = serde_json::from_str(&req.args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
-            let uid = args
-                .get("uid")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| Status::invalid_argument("'uid' must be a string"))?;
-            let key = args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| Status::invalid_argument("'key' must be a string"))?;
-            let value = args
-                .get("value")
-                .cloned()
-                .ok_or_else(|| Status::invalid_argument("'value' is required"))?;
+            let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "tool set_extension failed: invalid JSON in args_json: {e}"
+                ))
+            })?;
+            let uid = args.get("uid").and_then(|v| v.as_str()).ok_or_else(|| {
+                Status::invalid_argument("tool set_extension failed: 'uid' must be a string")
+            })?;
+            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                Status::invalid_argument("tool set_extension failed: 'key' must be a string")
+            })?;
+            let value = args.get("value").cloned().ok_or_else(|| {
+                Status::invalid_argument("tool set_extension failed: 'value' is required")
+            })?;
 
             let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
             nestweaver_engine::extensions::set_property(&mut store, uid, key, value.clone());
-            nestweaver_engine::extensions::save_extensions(&db_path, &store)
-                .map_err(|e| Status::internal(format!("save_extensions failed: {e:#}")))?;
+            nestweaver_engine::extensions::save_extensions(&db_path, &store).map_err(|e| {
+                Status::internal(format!("tool set_extension failed: save_extensions: {e:#}"))
+            })?;
 
             let result_json = serde_json::json!({
                 "uid": uid,
@@ -4284,7 +4432,7 @@ impl NestWeaverDaemon for DaemonService {
             Ok::<_, Status>(JsonResponse { result_json })
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+        .map_err(|e| Status::internal(format!("tool set_extension failed: spawn_blocking: {e}")))?;
 
         result.map(Response::new)
     }
@@ -4295,12 +4443,19 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
-            .map_err(|error| Status::invalid_argument(format!("invalid args JSON: {error}")))?;
+        // Same `tool <name> failed:` wrapping as set_extension above.
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "tool query_extensions failed: invalid args JSON: {error}"
+                ))
+            })?;
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
             let extensions = nestweaver_engine::load_live_extensions(&state.store, &state.db_path)
                 .map_err(|error| {
-                    Status::internal(format!("query extension liveness failed: {error:#}"))
+                    Status::internal(format!(
+                        "tool query_extensions failed: extension liveness: {error:#}"
+                    ))
                 })?;
             if let Some(uid) = args.get("uid").and_then(|value| value.as_str()) {
                 return Ok(serde_json::json!({
@@ -4312,10 +4467,14 @@ impl NestWeaverDaemon for DaemonService {
                 .get("key")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
-                    Status::invalid_argument("provide either 'uid' or both 'key' and 'value'")
+                    Status::invalid_argument(
+                        "tool query_extensions failed: provide either 'uid' or both 'key' and 'value'",
+                    )
                 })?;
             let value = args.get("value").cloned().ok_or_else(|| {
-                Status::invalid_argument("'value' is required when 'key' is given")
+                Status::invalid_argument(
+                    "tool query_extensions failed: 'value' is required when 'key' is given",
+                )
             })?;
             let results: Vec<_> = nestweaver_engine::query_by_property(&extensions, key, &value)
                 .into_iter()
@@ -4334,10 +4493,18 @@ impl NestWeaverDaemon for DaemonService {
             }))
         })
         .await
-        .map_err(|error| Status::internal(format!("spawn_blocking panicked: {error}")))??;
+        .map_err(|error| {
+            Status::internal(format!(
+                "tool query_extensions failed: spawn_blocking panicked: {error}"
+            ))
+        })??;
         serde_json::to_string(&result)
             .map(|result_json| Response::new(JsonResponse { result_json }))
-            .map_err(|error| Status::internal(format!("serialization failed: {error}")))
+            .map_err(|error| {
+                Status::internal(format!(
+                    "tool query_extensions failed: serialization: {error}"
+                ))
+            })
     }
 
     // ── Read RPCs — direct store access (no MCP tool) ──────────────
@@ -5094,6 +5261,51 @@ fn is_unsafe_index_root(path: &std::path::Path) -> bool {
     false
 }
 
+/// Canonicalize a config repo entry URL into an allow-list path.
+///
+/// Config `[[repos]]` entries store `file://`-prefixed identity URLs;
+/// `PathBuf::from("file:///x")` is a *relative* path that never canonicalizes,
+/// which silently emptied the watcher allow-list (F-01).
+fn config_repo_canonical_path(url: &str) -> Option<PathBuf> {
+    let stripped = url.strip_prefix("file://").unwrap_or(url);
+    std::fs::canonicalize(stripped).ok()
+}
+
+/// Validate a watcher target path against the instance config's registered
+/// sources (allow-list), or — when the daemon runs without `--config` —
+/// against the system-root denylist so an explicit `watch --repo X --db Y`
+/// works without an instance config (F-01). `vault_only` restricts the
+/// allow-list to `type = "vault"` entries (used by `watch_vault`).
+fn watch_path_allowed(
+    repos: Option<&[nestweaver_engine::config::RepoConfig]>,
+    path: &std::path::Path,
+    kind: &str,
+    vault_only: bool,
+) -> Result<(), Status> {
+    let Some(repos) = repos else {
+        if is_unsafe_index_root(path) {
+            return Err(Status::invalid_argument(format!(
+                "refusing to watch {kind} path {}: system roots and home directories \
+                 are not watchable",
+                path.display()
+            )));
+        }
+        return Ok(());
+    };
+    let allowed: Vec<PathBuf> = repos
+        .iter()
+        .filter(|r| !vault_only || r.repo_type == Some(nestweaver_engine::config::RepoType::Vault))
+        .filter_map(|r| config_repo_canonical_path(&r.url))
+        .collect();
+    if !allowed.iter().any(|a| path.starts_with(a)) {
+        return Err(Status::invalid_argument(format!(
+            "{kind} path {} is not in the instance's registered sources",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// The daemon is idle only when there is no active read/write AND no index job
 /// in flight. Index jobs bump `indexing_active` (not `active_writes`), so an
 /// idle-timeout check that ignores it could fire mid-index — the same footgun
@@ -5651,7 +5863,11 @@ mod depth_clamp_tests {
 /// cold-cache download can't delay the socket bind; the download is bounded by a 180s prefetch
 /// timeout so it can't hang. During the load, non-semantic RPCs are served normally and
 /// semantic search returns "model not loaded" until it completes.
-#[cfg(feature = "embed")]
+///
+/// Gated `not(test)` like its call site: unit-test servers run on tokio worker threads, which
+/// can never satisfy the main-thread requirement, and with the call site compiled out this fn
+/// would be dead code under `--all-targets`.
+#[cfg(all(feature = "embed", not(test)))]
 async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     #[cfg(target_os = "macos")]
     {
@@ -6053,6 +6269,7 @@ pub async fn run_server(
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
+        next_watcher_id: std::sync::atomic::AtomicU64::new(0),
         instance_cfg,
         permission_source,
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
@@ -6067,6 +6284,7 @@ pub async fn run_server(
         admin_token,
         admin_state: std::sync::OnceLock::new(),
         worker_handle: std::sync::Mutex::new(None),
+        ui_server: std::sync::Mutex::new(None),
     });
 
     if !read_only {
@@ -6191,6 +6409,7 @@ pub async fn run_server(
     {
         let tx = shutdown_tx.clone();
         let drained = Arc::clone(&state.drained);
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("register SIGTERM handler");
@@ -6200,6 +6419,11 @@ pub async fn run_server(
             // shutdown, mirroring the gRPC Shutdown handler. In-flight jobs
             // still drain via the worker loop's JoinSet; only NEW claims stop.
             drained.store(true, Ordering::Relaxed);
+            // B-2: stop any active watcher too — its `spawn_blocking` thread
+            // would otherwise outlive the broadcast and pin process exit
+            // (Tokio's runtime drop waits for blocking threads) until the
+            // client's stop grace elapses and it SIGKILLs us.
+            stop_active_watcher(&state);
             let _ = tx.send(true);
         });
     }
@@ -7315,7 +7539,17 @@ pub async fn run_server(
     // Race the load against shutdown: a `daemon stop` during a cold-cache model download must
     // not park the main flow inside the 180s prefetch (which would defer cleanup and risk a
     // SIGKILL + stale socket). If shutdown fires first, abandon the load and proceed to drain.
-    #[cfg(feature = "embed")]
+    //
+    // `not(test)`: the load asserts it runs on the PROCESS main thread
+    // (`pthread_main_np`, Metal shader compilation) — a guarantee the test
+    // harness can never provide (unit tests drive `run_server` from a tokio
+    // worker thread). Under `cargo test --workspace`, feature unification
+    // compiles this crate's unit tests WITH `embed` enabled (the root bin's
+    // default features), so without this gate an in-process `run_server`
+    // under test panics on that assert. Skipping the load in unit-test
+    // builds only matches the feature-off behavior those tests already get
+    // from `cargo test -p nestweaver-daemon`.
+    #[cfg(all(feature = "embed", not(test)))]
     {
         let mut load_shutdown = shutdown_tx.subscribe();
         tokio::select! {
@@ -7333,6 +7567,11 @@ pub async fn run_server(
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
     tracing::info!("daemon shutting down, cleaning up");
+
+    // B-2: belt-and-suspenders watcher stop covering shutdown triggers that
+    // don't pass through the gRPC Shutdown handler or the SIGTERM handler
+    // (e.g. idle timeout). Idempotent — no-op when already stopped.
+    stop_active_watcher(&state);
 
     // Await the worker pool so an in-flight index write finishes before we exit.
     // The worker loop sees the same shutdown signal, breaks, and drains its
@@ -11899,6 +12138,7 @@ mod startup_helper_tests {
             idle_notify: Arc::new(Notify::new()),
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
+            next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             permission_source: build_daemon_permission_source(None),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
@@ -11914,6 +12154,7 @@ mod startup_helper_tests {
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
+            ui_server: std::sync::Mutex::new(None),
         })
     }
 
@@ -11937,6 +12178,7 @@ mod startup_helper_tests {
             idle_notify: Arc::new(Notify::new()),
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
+            next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             permission_source,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
@@ -11952,6 +12194,7 @@ mod startup_helper_tests {
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
+            ui_server: std::sync::Mutex::new(None),
         })
     }
 
@@ -12233,6 +12476,105 @@ mod startup_helper_tests {
         );
     }
 
+    /// B-1: health_check must report the daemon process's own PID so the CLI
+    /// can cross-check a pidfile PID against the socket-reported PID before
+    /// signaling it (a foreign PID planted in the pidfile fails that check).
+    #[tokio::test]
+    async fn health_check_reports_own_pid() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+        let resp = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("health check ok")
+            .into_inner();
+        assert_eq!(resp.pid, std::process::id());
+    }
+
+    /// B-2: a second watcher registration is refused without force; with
+    /// force the incumbent (possibly orphaned by a kill -9'd `watch` CLI) is
+    /// stopped and replaced — and the replaced watcher's exit-clear must not
+    /// wipe the replacement's registration.
+    #[test]
+    fn register_watcher_force_replaces_orphaned_incumbent() {
+        let state = test_state_with_writer();
+        let flag_a = Arc::new(AtomicBool::new(false));
+        let flag_b = Arc::new(AtomicBool::new(false));
+
+        let id_a = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag_a.clone()),
+            false,
+        )
+        .expect("first registration");
+
+        // Without force: refused, incumbent untouched.
+        let err = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag_b.clone()),
+            false,
+        )
+        .expect_err("second registration without force must fail");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(
+            !flag_a.load(Ordering::Relaxed),
+            "refused registration must not stop the incumbent"
+        );
+
+        // With force: incumbent stopped, replacement installed.
+        let id_b = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag_b.clone()),
+            true,
+        )
+        .expect("force registration");
+        assert!(
+            flag_a.load(Ordering::Relaxed),
+            "force must stop the orphaned incumbent"
+        );
+        assert_ne!(id_a, id_b);
+        assert!(!flag_b.load(Ordering::Relaxed));
+
+        // The replaced watcher's exit-clear must NOT wipe the replacement.
+        clear_watcher_registration(&state, id_a);
+        assert!(
+            state.watcher_stop.lock().unwrap().is_some(),
+            "stale watcher exit must not clear the replacement's registration"
+        );
+        clear_watcher_registration(&state, id_b);
+        assert!(state.watcher_stop.lock().unwrap().is_none());
+    }
+
+    /// B-2: the shutdown RPC stops any active watcher up front, so an
+    /// orphaned watcher's blocking thread can't pin the drain until the
+    /// client's SIGKILL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_stops_active_watcher() {
+        let state = test_state_with_writer();
+        let flag = Arc::new(AtomicBool::new(false));
+        register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
+            false,
+        )
+        .unwrap();
+
+        let service = DaemonService::new(state.clone());
+        let mut req = Request::new(ShutdownRequest {});
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let resp = service.shutdown(req).await.expect("shutdown ok");
+        assert!(resp.into_inner().ok);
+
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "shutdown must stop the active watcher"
+        );
+        assert!(
+            state.watcher_stop.lock().unwrap().is_none(),
+            "shutdown must unregister the watcher"
+        );
+    }
+
     // ── Read-only replica: single-chokepoint mutating-RPC rejection ─────
 
     /// The FULL set of gRPC RPCs that mutate daemon/graph state. Includes the
@@ -12504,5 +12846,238 @@ mod startup_helper_tests {
         assert!(!replica_mounts_admin_api(true, false));
         assert!(replica_mounts_admin_api(false, true));
         assert!(!replica_mounts_admin_api(false, false));
+    }
+}
+
+#[cfg(test)]
+mod watch_path_allowed_tests {
+    use super::*;
+    use nestweaver_engine::{RepoConfig, RepoType};
+
+    fn repo_cfg(url: &str, repo_type: Option<RepoType>) -> RepoConfig {
+        RepoConfig {
+            url: url.to_string(),
+            repo_type,
+            name: None,
+            sparse: None,
+            pin_sha: None,
+            use_git_activity: None,
+            branch: None,
+            poll: None,
+        }
+    }
+
+    /// F-01: config repo URLs are `file://`-prefixed; the allow-list must
+    /// strip the scheme before canonicalizing, otherwise every entry drops
+    /// out and every watch is rejected.
+    #[test]
+    fn config_repo_canonical_path_strips_file_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let via_file_url = config_repo_canonical_path(&format!("file://{}", tmp.path().display()));
+        assert_eq!(via_file_url.as_deref(), Some(canonical.as_path()));
+
+        let via_plain = config_repo_canonical_path(&tmp.path().display().to_string());
+        assert_eq!(via_plain.as_deref(), Some(canonical.as_path()));
+
+        assert!(config_repo_canonical_path("file:///definitely/missing/path").is_none());
+    }
+
+    /// F-01: without an instance config, an explicit `--repo` path must be
+    /// watchable (guarded by the unsafe-root denylist instead of failing
+    /// `failed_precondition`).
+    #[test]
+    fn no_config_allows_explicit_safe_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(watch_path_allowed(None, &canonical, "repo", false).is_ok());
+        assert!(watch_path_allowed(None, &canonical, "vault", true).is_ok());
+    }
+
+    /// F-01: without a config, system roots are still refused.
+    #[test]
+    fn no_config_rejects_unsafe_roots() {
+        assert!(watch_path_allowed(None, std::path::Path::new("/"), "repo", false).is_err());
+        assert!(watch_path_allowed(None, std::path::Path::new("/usr"), "repo", false).is_err());
+    }
+
+    /// F-01: with a config, a repo registered via `file://` URL must pass the
+    /// allow-list (previously rejected because the scheme was never stripped).
+    #[test]
+    fn config_allows_file_url_registered_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        let canonical = std::fs::canonicalize(&repo_dir).unwrap();
+        let repos = vec![repo_cfg(
+            &format!("file://{}", repo_dir.display()),
+            Some(RepoType::Code),
+        )];
+        assert!(watch_path_allowed(Some(&repos), &canonical, "repo", false).is_ok());
+        // A subdirectory of a registered repo also passes (starts_with).
+        let sub = repo_dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let sub = std::fs::canonicalize(&sub).unwrap();
+        assert!(watch_path_allowed(Some(&repos), &sub, "repo", false).is_ok());
+    }
+
+    /// Paths outside the config's registered sources are still rejected, and
+    /// `vault_only` skips code-type entries.
+    #[test]
+    fn config_rejects_unregistered_and_vault_filter_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code_dir = tmp.path().join("code");
+        let vault_dir = tmp.path().join("vault");
+        std::fs::create_dir(&code_dir).unwrap();
+        std::fs::create_dir(&vault_dir).unwrap();
+        let code_canon = std::fs::canonicalize(&code_dir).unwrap();
+        let vault_canon = std::fs::canonicalize(&vault_dir).unwrap();
+        let repos = vec![
+            repo_cfg(
+                &format!("file://{}", code_dir.display()),
+                Some(RepoType::Code),
+            ),
+            repo_cfg(
+                &format!("file://{}", vault_dir.display()),
+                Some(RepoType::Vault),
+            ),
+        ];
+
+        assert!(watch_path_allowed(Some(&repos), &code_canon, "repo", false).is_ok());
+        // Vault watch must not match a code-type entry.
+        assert!(watch_path_allowed(Some(&repos), &code_canon, "vault", true).is_err());
+        assert!(watch_path_allowed(Some(&repos), &vault_canon, "vault", true).is_ok());
+        // Unregistered path rejected.
+        let other = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(watch_path_allowed(Some(&repos), &other, "repo", false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod watcher_e2e_tests {
+    use super::*;
+    use hyper_util::rt::TokioIo;
+    use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
+    use tonic::transport::{Channel, Endpoint, Uri};
+    use tower::service_fn;
+
+    async fn connect_uds(sock: &std::path::Path) -> Result<NestWeaverDaemonClient<Channel>, ()> {
+        let path = sock.to_path_buf();
+        let channel = Endpoint::try_from("http://[::]:50051")
+            .map_err(|_| ())?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let path = path.clone();
+                async move {
+                    let stream = tokio::net::UnixStream::connect(path).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
+            }))
+            .await
+            .map_err(|_| ())?;
+        Ok(NestWeaverDaemonClient::new(channel))
+    }
+
+    /// B-1 + B-2 end-to-end over a real unix socket:
+    ///  - health_check reports the daemon's own PID (CLI pidfile cross-check);
+    ///  - a watch session whose CLI vanished (no StopWatch — the kill -9
+    ///    scenario) blocks a plain re-watch but is adoptable with force;
+    ///  - shutdown with an ACTIVE watcher completes promptly instead of
+    ///    hanging on the watcher's blocking thread until the drain ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn daemon_e2e_pid_watch_force_and_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("brain.lbug");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        let db_for_server = db_path.clone();
+        let server =
+            tokio::spawn(async move { run_server(&db_for_server, None, None, None).await });
+
+        let instance_id = lifecycle::instance_id_from_db_path(&db_path);
+        let sock = lifecycle::socket_path(&instance_id);
+
+        // Wait for the daemon's socket to accept connections.
+        let mut client = None;
+        for _ in 0..100 {
+            if sock.exists()
+                && let Ok(c) = connect_uds(&sock).await
+            {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut client = client.expect("daemon socket did not come up within 10s");
+
+        // B-1: the socket reports the daemon's own PID (in-process here, so
+        // it equals the test process PID).
+        let health = client
+            .health_check(nestweaver_proto::HealthCheckRequest {})
+            .await
+            .expect("health check")
+            .into_inner();
+        assert_eq!(health.pid, std::process::id());
+
+        let repo_str = repo.to_string_lossy().into_owned();
+        let mk_req = |force: bool| nestweaver_proto::WatchCodeRequest {
+            repo_path: repo_str.clone(),
+            instance_id: String::new(),
+            force,
+        };
+
+        let r1 = client
+            .watch_code(mk_req(false))
+            .await
+            .expect("watch_code")
+            .into_inner();
+        assert!(r1.ok, "first watch must start: {}", r1.message);
+
+        // Simulated orphan: the first "CLI" never calls StopWatch.
+        let r2 = client
+            .watch_code(mk_req(false))
+            .await
+            .expect("watch_code")
+            .into_inner();
+        assert!(!r2.ok, "second watch without force must be refused");
+        assert!(
+            r2.message.contains("already running"),
+            "unexpected refusal message: {}",
+            r2.message
+        );
+
+        // B-2: force adopts the orphaned watcher slot.
+        let r3 = client
+            .watch_code(mk_req(true))
+            .await
+            .expect("watch_code")
+            .into_inner();
+        assert!(
+            r3.ok,
+            "force watch must adopt the orphaned slot: {}",
+            r3.message
+        );
+
+        // B-2: shutdown with the watcher ACTIVE must stop it and exit
+        // promptly — the pre-fix SIGTERM/cleanup path left the watcher's
+        // blocking thread running, pinning process exit.
+        client
+            .shutdown(nestweaver_proto::ShutdownRequest {})
+            .await
+            .expect("shutdown RPC");
+
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(30), server)
+            .await
+            .expect("daemon must exit promptly with an active watcher (no drain hang)");
+        finished
+            .expect("server task panicked")
+            .expect("run_server error");
+
+        // run_server writes its log under the real per-user state dir —
+        // clean up this instance's artifacts.
+        let _ = std::fs::remove_dir_all(lifecycle::log_dir(&instance_id));
+        let _ = std::fs::remove_dir_all(lifecycle::runtime_dir(&instance_id));
     }
 }

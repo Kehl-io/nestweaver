@@ -773,7 +773,7 @@ fn render_legacy_tool_tables(out: &mut String) {
     out.push_str("| `detect_changes` | Risk assessment for a list of changed files. Maps files to affected flows. | `files` |\n");
     out.push_str("| `cross_repo_contracts` | Symbols shared across repositories with confidence scores. | `symbol`, `limit` |\n");
     out.push_str(
-        "| `clusters` | Functional communities detected by the Leiden algorithm. | `min_size`, `repo` |\n\n",
+        "| `clusters` | Functional communities detected by Louvain-style local moving. | `min_size`, `repo` |\n\n",
     );
 
     out.push_str("### Status and maintenance\n\n");

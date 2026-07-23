@@ -127,6 +127,10 @@ pub fn pull_repo(
 
         let output = Command::new("git").args(&args).output()?;
         if !output.status.success() {
+            // F-14: a failed pull must clean up the workspace dir it created —
+            // validate_repo_dest pre-creates `dest`, and a partial clone must
+            // not be mistaken for a real checkout on the next run.
+            let _ = std::fs::remove_dir_all(&dest);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(classify_git_error(&stderr));
         }
@@ -376,5 +380,31 @@ mod tests {
         let escape = dir.path().join("escaped");
         let result = validate_repo_dest(&ws, &escape);
         assert!(result.is_err());
+    }
+
+    /// F-14: a failed pull must clean up the workspace dir it created — no
+    /// empty/partial dest may survive to masquerade as a checkout later.
+    #[test]
+    fn failed_pull_cleans_up_created_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        let url = "/definitely/missing/nw-f14-repo.git";
+        let result = pull_repo(
+            &ws,
+            url,
+            "",
+            &PullOptions {
+                mode: PullMode::Full,
+                sha_policy: ShaPolicy::Head,
+                ephemeral: false,
+            },
+        );
+        assert!(result.is_err(), "cloning a missing repo must fail");
+        let dest = ws.join(clone_dir_name_from_url(url));
+        assert!(
+            !dest.exists(),
+            "failed pull must not leave its workspace dir behind: {}",
+            dest.display()
+        );
     }
 }

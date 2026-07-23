@@ -14,6 +14,9 @@ message HealthCheckResponse {
   uint32 active_connections = 5;
   reserved 6;
   reserved "db_opened_at";
+  // The daemon's own OS PID. Lets the CLI cross-check a pidfile PID against
+  // the socket-reported PID before signaling it (B-1: pidfile PID hole).
+  uint32 pid = 7;
 }
 
 message ShutdownRequest {}
@@ -65,6 +68,9 @@ message WatchVaultResponse {
 message WatchCodeRequest {
   string repo_path = 1;
   string instance_id = 2;
+  // Replace an already-running watcher (e.g. one orphaned when its owning
+  // `watch` CLI was kill -9'd) instead of failing with "already running".
+  bool force = 3;
 }
 
 message WatchCodeResponse {
@@ -266,6 +272,18 @@ message NoteGetResponse {
   int32 word_count = 5;
   optional string body = 6;
   int32 section_count = 7;
+  // Parsed frontmatter serialized as a JSON object string ("" when absent),
+  // matching the local note_get 'frontmatter' field.
+  string frontmatter_json = 8;
+  // Heading outline, matching the local note_get 'outline' field.
+  repeated NoteHeading outline = 9;
+}
+message NoteHeading {
+  string uid = 1;
+  int32 level = 2;
+  string text = 3;
+  string slug = 4;
+  int32 line = 5;
 }
 
 // brain_context (typed request, JSON response)
@@ -341,6 +359,13 @@ message ServeUiRequest {
 }
 
 message ServeUiResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message StopUiRequest {}
+
+message StopUiResponse {
   bool ok = 1;
   string message = 2;
 }
@@ -514,6 +539,7 @@ service NestWeaverDaemon {
 
   // UI
   rpc ServeUi(ServeUiRequest) returns (ServeUiResponse);
+  rpc StopUi(StopUiRequest) returns (StopUiResponse);
 
   // Phase 4 — typed RPCs
   rpc FlowTraceContinue(FlowTraceContinueRequest) returns (FlowTraceContinueResponse);

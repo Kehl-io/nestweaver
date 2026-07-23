@@ -37,12 +37,22 @@ pub struct ClusterMember {
     pub kind: String,
 }
 
-/// Run Leiden community detection on the code graph.
+/// Run Louvain-style local-moving community detection on the code graph.
 ///
 /// Loads all Symbol nodes and code-level edges (CALLS, IMPORTS, EXTENDS_SYM,
 /// IMPLEMENTS_SYM, MEMBER_OF) from the store, builds an undirected weighted
-/// graph, runs the Leiden algorithm, and returns structured output.
+/// graph, runs the Louvain-style local-moving algorithm (single-level; no
+/// Leiden refinement/aggregation), and returns structured output.
 pub fn compute_clusters(store: &GraphStore, resolution: f64) -> Result<ClusteringOutput> {
+    // Sanitize BEFORE the value is stored in `ClusteringOutput`: `leiden`
+    // clamps invalid resolutions for the computation, but the raw value is
+    // also persisted to the sidecar JSON — and NaN/inf serialize as `null`,
+    // which then fails to parse in `load_clusters` (f64 != null).
+    let resolution = if resolution.is_finite() && resolution > 0.0 {
+        resolution
+    } else {
+        1.0
+    };
     let (symbols, edges) = store
         .load_code_symbols_and_edges()
         .map_err(|e| anyhow::anyhow!(e))
@@ -84,7 +94,7 @@ pub fn compute_clusters(store: &GraphStore, resolution: f64) -> Result<Clusterin
         total_weight,
     };
 
-    // Run Leiden clustering.
+    // Run Louvain-style local-moving clustering.
     let result = clustering::leiden(&graph, resolution, 100);
 
     // Build community output from the result.
@@ -300,5 +310,26 @@ mod tests {
         let db = Path::new("/tmp/test.lbug");
         let expected = PathBuf::from("/tmp/test.lbug.clusters.json");
         assert_eq!(sidecar_path(db), expected);
+    }
+
+    #[test]
+    fn compute_clusters_sanitizes_invalid_resolution_before_storing() {
+        // Raw NaN/inf would serialize as `null` in the sidecar JSON and break
+        // load_clusters; compute_clusters must store a finite positive value.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let output = compute_clusters(&store, bad).unwrap();
+            assert!(
+                output.resolution.is_finite() && output.resolution > 0.0,
+                "resolution {bad} must be sanitized before storing, got {}",
+                output.resolution
+            );
+            save_clusters(&db_path, &output).unwrap();
+            let loaded = load_clusters(&db_path).unwrap().unwrap();
+            assert_eq!(loaded.resolution, output.resolution);
+        }
     }
 }

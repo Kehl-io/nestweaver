@@ -726,9 +726,11 @@ where
             if let Err(e) =
                 crate::cross_domain::discover_cross_domain_links_with_readers(store, &vault_readers)
             {
+                // `{e:#}` — include the cause chain; `{e}` shows only the
+                // outermost context (a bare function name).
                 tracing::warn!(
                     repo = %prepared.repo_url,
-                    "cross-domain discovery after vault index failed: {e}"
+                    "cross-domain discovery after vault index failed: {e:#}"
                 );
             }
 

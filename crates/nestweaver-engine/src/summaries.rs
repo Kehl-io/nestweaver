@@ -337,7 +337,7 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     Ok(summaries)
 }
 
-/// Maximum number of clusters to summarize. On large graphs, Leiden can
+/// Maximum number of clusters to summarize. On large graphs, local moving can
 /// produce thousands of tiny communities; summarizing all of them yields
 /// noise rather than signal. We keep only the top-N largest clusters.
 const MAX_CLUSTER_SUMMARIES: usize = 50;
@@ -351,8 +351,8 @@ const FALLBACK_CLUSTER_RESOLUTION: f64 = 0.5;
 ///
 /// Format: `Cluster {id} ({name}, {n} symbols): key types: [{top symbols}] | files: [{file list}] | depends on: [other clusters]`
 ///
-/// At scale (tens of thousands of symbols), Leiden with resolution=1.0 can
-/// produce thousands of singleton or near-singleton communities that are not
+/// At scale (tens of thousands of symbols), local moving with resolution=1.0
+/// can produce thousands of singleton or near-singleton communities that are not
 /// useful for summarization. This function:
 /// 1. Filters out singleton clusters (1 member).
 /// 2. If the default resolution produces no non-singleton clusters, retries

@@ -980,8 +980,24 @@ fn parse_openapi(path: &str, source: &str) -> Option<openapiv3::OpenAPI> {
     match spec_kind(path) {
         Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str(source).ok(),
         Some(SpecFileKind::OpenApiJson) => serde_json::from_str(source).ok(),
-        _ => None,
+        // F-18: `contracts diff` takes explicit user paths, so an OpenAPI spec
+        // named e.g. `api-v1.yaml` must not be rejected by the filename gate
+        // (the gate exists so indexing doesn't parse every YAML in the repo).
+        // Sniff the content for an `openapi`/`swagger` top-level key instead.
+        _ => parse_openapi_by_content(source),
     }
+}
+
+/// Content-sniffed OpenAPI parse for explicit user-supplied paths: accept any
+/// YAML/JSON document carrying a top-level `openapi` or `swagger` key. (YAML
+/// is a superset of JSON, so one parse covers both.)
+fn parse_openapi_by_content(source: &str) -> Option<openapiv3::OpenAPI> {
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(source).ok()?;
+    let has_spec_key = value.get("openapi").is_some() || value.get("swagger").is_some();
+    if !has_spec_key {
+        return None;
+    }
+    serde_yaml_ng::from_value(value).ok()
 }
 
 /// Compare a base and head OpenAPI spec, classifying each operation/field/type
@@ -1292,6 +1308,38 @@ paths:
     #[test]
     fn diff_openapi_returns_none_for_non_openapi() {
         assert!(diff_openapi("notes.md", "# hi", "notes.md", "# hi").is_none());
+    }
+
+    #[test]
+    fn diff_openapi_sniffs_content_for_explicit_paths() {
+        // F-18: explicit user paths must not be gated on the openapi./swagger.
+        // filename convention — a spec named `api-v1.yaml` diffs the same.
+        let spec = r#"
+openapi: 3.0.0
+info: {title: t, version: "1"}
+paths:
+  /x:
+    get:
+      responses:
+        '200':
+          description: ok
+"#;
+        let changes =
+            diff_openapi("api-v1.yaml", spec, "whatever.txt", spec).expect("content-sniffed parse");
+        assert!(changes.is_empty(), "identical specs: {changes:?}");
+        // JSON content under an arbitrary name works too.
+        let json = r#"{"openapi":"3.0.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        assert!(diff_openapi("service.spec", json, "service.spec", json).is_some());
+        // A YAML doc WITHOUT an openapi/swagger key is still rejected.
+        assert!(
+            diff_openapi(
+                "ci.yml",
+                "name: build\non: push\n",
+                "ci.yml",
+                "name: build\non: push\n"
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -354,7 +354,16 @@ fn affected_tests_within(
         }
         if is_test_file(file_path) {
             always_included.push(file_path.clone());
-        } else if nestweaver_parser::detect_language(std::path::Path::new(file_path)).is_some() {
+        } else if nestweaver_parser::is_markdown(std::path::Path::new(file_path)) {
+            // Docs-only changes cannot break tests — keep the selection
+            // usable (deliberate nw-064 behavior).
+        } else {
+            // F-24: a recognized source file with no indexed symbols is
+            // "new file or stale index"; an UNRECOGNIZED extension (Makefile,
+            // ci.yml, …) means we cannot even tell what the file is — the
+            // parser may simply not cover a real source language. Both must
+            // fail safe (partial + notification) instead of silently claiming
+            // a complete selection.
             unassessed.push(file_path);
         }
     }
@@ -382,8 +391,8 @@ fn affected_tests_within(
         notifications.push(Notification {
             level: NotificationLevel::Warning,
             message: format!(
-                "changed source file(s) with no indexed symbols (new file or stale index) — \
-                 their impact was not assessed: {}",
+                "changed file(s) with no indexed symbols (new file, unrecognized file type, or \
+                 stale index) — their impact was not assessed: {}",
                 unassessed.join(", ")
             ),
             descriptor: "changed-file-no-symbols".to_string(),
@@ -915,6 +924,34 @@ mod tests {
                 .iter()
                 .any(|n| n.descriptor == "changed-file-no-symbols")
         );
+    }
+
+    /// F-24: changed files whose extension we don't recognize (Makefile,
+    /// ci.yml, …) must NOT yield a silent "complete" — the parser may simply
+    /// not cover a real source language, so fail safe like an unindexed
+    /// source file.
+    #[test]
+    fn unknown_extension_files_fail_safe_to_partial() {
+        let store = GraphStore::in_memory().expect("store");
+        let result = affected_tests(
+            &store,
+            &[
+                "Makefile".to_string(),
+                ".github/workflows/ci.yml".to_string(),
+            ],
+        )
+        .expect("ok");
+
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.recommendation, "run-full-suite");
+        let notice = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "changed-file-no-symbols")
+            .expect("unrecognized file types must be disclosed");
+        assert_eq!(notice.level, NotificationLevel::Warning);
+        assert!(notice.message.contains("Makefile"));
+        assert!(notice.message.contains("ci.yml"));
     }
 
     /// The always-include rule must not duplicate a test file the graph

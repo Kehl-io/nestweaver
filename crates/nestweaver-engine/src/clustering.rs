@@ -1,5 +1,9 @@
-// Leiden community detection for code call graphs.
+// Louvain-style local-moving community detection for code call graphs.
 // Clusters graph nodes into functional communities to enable process-grouped search.
+//
+// NOTE: this is single-level local moving (the Louvain first phase), NOT the
+// full Leiden algorithm — there is no refinement or aggregation phase. The
+// entry point keeps the historical `leiden` name for API stability.
 
 use rand::SeedableRng as _;
 use rand::seq::SliceRandom as _;
@@ -31,7 +35,15 @@ pub struct ClusteringResult {
     pub modularity: f64,
 }
 
-/// Newman–Girvan modularity: Q = (1/2m) * Σ_ij [A_ij − k_i*k_j/(2m)] δ(c_i, c_j)
+/// Newman–Girvan modularity over ALL intra-community pairs (F-22):
+///
+///   Q = Σ_c [ l_c/m − (d_c/2m)² ]
+///
+/// where `m` is the total edge weight, `l_c` the internal edge weight of
+/// community c (each undirected edge counted once), and `d_c` the sum of
+/// weighted degrees of c's members. The degree-product term applies to every
+/// pair of nodes in a community — not just adjacent ones — which is why the
+/// per-community closed form is used. An all-in-one community yields Q = 0.
 ///
 /// Returns 0.0 when total_weight is 0.
 pub fn modularity(graph: &Graph, assignment: &[u32]) -> f64 {
@@ -40,30 +52,45 @@ pub fn modularity(graph: &Graph, assignment: &[u32]) -> f64 {
         return 0.0;
     }
 
-    // Degree (weighted) of each node.
-    let degrees: Vec<f64> = (0..graph.n)
-        .map(|i| graph.neighbors[i].iter().map(|(_, w)| w).sum())
-        .collect();
-
-    let mut q = 0.0_f64;
+    // Per-community internal edge weight (adjacency counts each undirected
+    // edge twice, once per direction) and summed weighted degree.
+    let mut internal: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    let mut degree_sum: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
     for i in 0..graph.n {
+        let c = assignment[i];
+        let deg_i: f64 = graph.neighbors[i].iter().map(|(_, w)| w).sum();
+        *degree_sum.entry(c).or_insert(0.0) += deg_i;
         for (j, a_ij) in &graph.neighbors[i] {
-            if assignment[i] == assignment[*j] {
-                q += a_ij - degrees[i] * degrees[*j] / (2.0 * m);
+            if assignment[*j] == c {
+                *internal.entry(c).or_insert(0.0) += a_ij;
             }
         }
     }
-    q / (2.0 * m)
+
+    let mut q = 0.0_f64;
+    for (c, d_c) in &degree_sum {
+        let l_c = internal.get(c).copied().unwrap_or(0.0) / 2.0;
+        q += l_c / m - (d_c / (2.0 * m)).powi(2);
+    }
+    q
 }
 
-/// Leiden community detection.
+/// Louvain-style local-moving community detection (single-level; no Leiden
+/// refinement/aggregation phases — see the module note).
 ///
 /// - `resolution` controls community size (typical range 0.5–2.0; 1.0 = standard modularity).
+///   Non-finite or non-positive values are clamped to 1.0 so a garbage CLI/MCP
+///   argument degrades to the standard partition instead of a nonsense one.
 /// - `max_iterations` caps the local-moving phase.
 pub fn leiden(graph: &Graph, resolution: f64, max_iterations: u32) -> ClusteringResult {
+    let resolution = if resolution.is_finite() && resolution > 0.0 {
+        resolution
+    } else {
+        1.0
+    };
     if graph.n == 0 || graph.total_weight <= 0.0 {
         // No nodes or no edges — each node is its own singleton community.
-        // Without edges, Leiden's delta-Q formula would divide by zero
+        // Without edges, the delta-Q formula would divide by zero
         // (2 * total_weight), so bail out early.
         let assignment: Vec<u32> = (0..graph.n as u32).collect();
         let communities: Vec<Community> = (0..graph.n)
@@ -251,14 +278,64 @@ mod tests {
     }
 
     #[test]
-    fn single_community_has_positive_modularity() {
+    fn single_community_has_zero_modularity() {
+        // F-22: true Newman–Girvan Q puts ALL nodes in one community at
+        // Q = 0 (l_c = m and d_c = 2m, so m/m − (2m/2m)² = 0). The old
+        // adjacent-pairs-only computation wrongly returned a positive value.
         let graph = triangle(1.0);
         let assignment = vec![0u32; 3];
         let q = modularity(&graph, &assignment);
         assert!(
-            q > 0.0,
-            "expected positive modularity for all-in-one community, got {q}"
+            q.abs() < 1e-12,
+            "expected ~0 modularity for all-in-one community, got {q}"
         );
+    }
+
+    #[test]
+    fn modularity_matches_newman_girvan_closed_form() {
+        // Two triangles joined by a weak bridge (0.1), partitioned along the
+        // bridge: m = 6.1, each community has l_c = 3.0 and d_c = 6.1, so
+        // Q = 2 * (3/6.1 − (6.1/12.2)²) ≈ 0.4836.
+        let neighbors = vec![
+            vec![(1, 1.0), (2, 1.0)],
+            vec![(0, 1.0), (2, 1.0)],
+            vec![(0, 1.0), (1, 1.0), (3, 0.1)],
+            vec![(2, 0.1), (4, 1.0), (5, 1.0)],
+            vec![(3, 1.0), (5, 1.0)],
+            vec![(3, 1.0), (4, 1.0)],
+        ];
+        let raw: f64 = neighbors
+            .iter()
+            .flat_map(|v| v.iter().map(|(_, w)| w))
+            .sum();
+        let graph = Graph {
+            n: 6,
+            neighbors,
+            total_weight: raw / 2.0,
+        };
+        let assignment = vec![0u32, 0, 0, 1, 1, 1];
+        let q = modularity(&graph, &assignment);
+        let expected = 2.0 * (3.0 / 6.1 - (6.1 / 12.2_f64).powi(2));
+        assert!(
+            (q - expected).abs() < 1e-12,
+            "expected Q ≈ {expected}, got {q}"
+        );
+    }
+
+    #[test]
+    fn leiden_clamps_invalid_resolution() {
+        // clusters --resolution NaN/inf/-1 must degrade to the standard
+        // (resolution = 1.0) partition instead of producing garbage.
+        let graph = triangle(1.0);
+        let baseline = leiden(&graph, 1.0, 100);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            let result = leiden(&graph, bad, 100);
+            assert_eq!(
+                result.assignment, baseline.assignment,
+                "resolution {bad} must clamp to 1.0"
+            );
+            assert!(result.modularity.is_finite());
+        }
     }
 
     #[test]

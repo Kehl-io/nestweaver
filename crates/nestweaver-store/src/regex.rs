@@ -9,12 +9,15 @@
 //!
 //! The trigram posting table is purely an optimization. Correctness never
 //! depends on it: when no posting table exists (the `index --with-trigrams`
-//! flag was not used) or when the pattern yields no usable literal trigrams
-//! (e.g. `.{4,}`), we fall back to scanning every candidate node's text and
-//! running the compiled regex against it. The trigram pre-filter only ever
-//! *narrows* the candidate set — we always confirm with the real regex.
+//! flag was not used), when the pattern yields no usable literal trigrams
+//! (e.g. `.{4,}`), or when the posting table is *stale* (the graph changed
+//! since it was built — F-03), we fall back to scanning every candidate
+//! node's text and running the compiled regex against it. The trigram
+//! pre-filter only ever *narrows* the candidate set — we always confirm with
+//! the real regex.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use lbug::Value;
@@ -23,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
+use crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX;
 
 /// Safety ceiling on how many candidate nodes a single search will SCAN before
 /// stopping (and honestly reporting `truncated`). This is a last-resort bound
@@ -41,6 +45,17 @@ pub const DEFAULT_MAX_MILLIS: u64 = 2000;
 /// before compilation so an untrusted client cannot force a large compile just
 /// by sending a huge pattern.
 pub const MAX_PATTERN_BYTES: usize = 4096;
+
+/// `Meta` table key under which `build_trigram_index` records provenance for
+/// the posting table as `"<graph_generation>:<candidate_node_count>"`. A
+/// reader compares both values against the current graph; any drift means the
+/// postings no longer reflect the indexed text and the pre-filter must not be
+/// used (F-03).
+const TRIGRAM_INDEX_META_KEY: &str = "trigram_index";
+
+/// One-shot latch so the stale-index warning is printed once per process
+/// instead of on every search.
+static TRIGRAM_STALE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Compiled-program size limit for a single regex. The `regex` crate defaults to
 /// 10 MiB; we cap lower because patterns arrive from untrusted clients. The
@@ -91,6 +106,13 @@ pub struct RegexSearchResult {
     /// True when the trigram pre-filter could not be used and we scanned all
     /// candidate text directly (either no posting table, or no usable literals).
     pub scanned_fallback: bool,
+    /// True when a trigram posting table EXISTS but was bypassed because it is
+    /// stale (the graph changed since it was built — F-03). This lets callers
+    /// surface staleness in-band: on the daemon path the once-per-process
+    /// stderr warning is invisible. Implies `scanned_fallback` when the
+    /// pattern has usable literals; always false when no index was ever built.
+    #[serde(default)]
+    pub stale_index: bool,
 }
 
 /// Per-file aggregate count for `count_patterns`.
@@ -107,6 +129,11 @@ pub struct PatternCount {
     pub total_matches: u64,
     pub files_matched: u64,
     pub top_files: Vec<FileCount>,
+    /// True when a trigram posting table EXISTS but was bypassed because it is
+    /// stale (the graph changed since it was built — F-03), so this pattern
+    /// was counted via a full scan. Lets callers surface staleness in-band on
+    /// the daemon path, where the stderr warning is invisible.
+    pub stale_index: bool,
 }
 
 /// A unit of indexed text plus its node metadata. Internal to this module.
@@ -124,8 +151,16 @@ struct Candidate {
 
 /// Lowercase 3-grams of `s`, deduplicated. Operates on Unicode scalar values
 /// (chars), so multi-byte text is handled without panicking on byte slices.
+///
+/// The fold is per-char (`char::to_lowercase`), NOT `str::to_lowercase`: the
+/// `str` version is context-sensitive — Greek 'Σ' folds to final 'ς' at a word
+/// boundary but 'σ' mid-word. The index side folds whole note bodies while the
+/// query side folds short extracted literals, so the same characters could
+/// fold differently on each side and the pre-filter would silently drop real
+/// matches (e.g. pattern `ΓΟΣ` vs. text `ΓΟΣΑΝΘΡΑΞ`). A context-free per-char
+/// fold keeps the two sides consistent.
 fn trigrams(s: &str) -> HashSet<String> {
-    let chars: Vec<char> = s.to_lowercase().chars().collect();
+    let chars: Vec<char> = s.chars().flat_map(char::to_lowercase).collect();
     let mut out = HashSet::new();
     if chars.len() < 3 {
         return out;
@@ -139,9 +174,18 @@ fn trigrams(s: &str) -> HashSet<String> {
 /// Extract the set of trigrams that any matching text MUST contain, expressed
 /// as an AND-of-ORs (CNF): the outer Vec is ANDed, each inner set is ORed.
 ///
+/// The literal extractor already resolves alternations into alternative
+/// literals: for `(alpha|beta)` it yields both `alpha` and `beta`, and a match
+/// needs only ONE of them. All extracted literals are therefore unioned into
+/// a single OR clause. ANDing them per literal (the earlier behavior, F-02)
+/// required every alternation branch to appear in the same text and silently
+/// dropped real matches.
+///
 /// Returns `None` when the regex has no usable required literals (e.g. `.{4,}`,
-/// leading `.*`, alternations with an empty branch) — the caller then falls
-/// back to a full scan.
+/// leading `.*`) or when ANY literal yields no trigrams (e.g. an alternation
+/// branch shorter than 3 chars, or a non-literal branch): that branch is then
+/// unconstrainable, so the only safe pre-filter is none at all — the caller
+/// falls back to a full scan.
 fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
     let hir = regex_syntax::parse(pattern).ok()?;
     let extractor = Extractor::new();
@@ -156,10 +200,11 @@ fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
         return None;
     }
 
-    // Each literal becomes an OR-clause of its trigrams. A literal shorter than
-    // 3 chars yields no trigrams → it cannot constrain the search, so the whole
-    // prefilter is unusable (any text could match that branch).
-    let mut clauses: Vec<HashSet<String>> = Vec::new();
+    // Union every literal's trigrams into ONE OR clause: the literals are
+    // alternatives (a match needs any one of them), not conjuncts. A literal
+    // shorter than 3 chars yields no trigrams → that branch cannot constrain
+    // the search, so the whole prefilter is unusable.
+    let mut clause: HashSet<String> = HashSet::new();
     for lit in literals {
         // Inexact literals are prefixes/fragments; their trigrams are still a
         // necessary condition for the branch, so they remain usable.
@@ -169,12 +214,12 @@ fn required_trigram_clauses(pattern: &str) -> Option<Vec<HashSet<String>>> {
             // This alternation branch has no usable trigram → cannot prefilter.
             return None;
         }
-        clauses.push(tg);
+        clause.extend(tg);
     }
-    if clauses.is_empty() {
+    if clause.is_empty() {
         return None;
     }
-    Some(clauses)
+    Some(vec![clause])
 }
 
 impl GraphStore {
@@ -231,7 +276,98 @@ impl GraphStore {
             )
             .map_err(|e| StoreError::Query(format!("insert trigram: {e}")))?;
         }
+
+        // Record provenance so a later reader can detect that the posting
+        // table no longer reflects the graph (nodes added/edited after this
+        // build) and fall back to a full scan instead of silently missing
+        // matches (F-03). Upsert pattern mirrors the other `Meta` singletons.
+        let meta_value = format!("{}:{}", self.graph_generation(), candidates.len());
+        let mut del = conn
+            .prepare("MATCH (m:Meta {key: $k}) DETACH DELETE m")
+            .map_err(|e| StoreError::Query(format!("prepare trigram meta delete: {e}")))?;
+        conn.execute(
+            &mut del,
+            vec![("k", Value::String(TRIGRAM_INDEX_META_KEY.to_string()))],
+        )
+        .map_err(|e| StoreError::Query(format!("clear trigram meta: {e}")))?;
+        let mut ins = conn
+            .prepare("CREATE (:Meta {key: $k, value: $v})")
+            .map_err(|e| StoreError::Query(format!("prepare trigram meta insert: {e}")))?;
+        conn.execute(
+            &mut ins,
+            vec![
+                ("k", Value::String(TRIGRAM_INDEX_META_KEY.to_string())),
+                ("v", Value::String(meta_value)),
+            ],
+        )
+        .map_err(|e| StoreError::Query(format!("write trigram meta: {e}")))?;
         Ok(postings.len())
+    }
+
+    /// Read the provenance recorded by [`GraphStore::build_trigram_index`].
+    /// Returns `None` when the `Meta` table or key is absent (postings built
+    /// before provenance tracking — F-03) or the value is unparseable.
+    fn trigram_index_meta(&self) -> Option<(u64, u64)> {
+        let conn = self.conn().ok()?;
+        let mut stmt = conn
+            .prepare("MATCH (m:Meta {key: $k}) RETURN m.value")
+            .ok()?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("k", Value::String(TRIGRAM_INDEX_META_KEY.to_string()))],
+            )
+            .ok()?;
+        for row in result {
+            if let Some(Value::String(value)) = row.first() {
+                let (generation, count) = value.split_once(':')?;
+                return Some((generation.parse().ok()?, count.parse().ok()?));
+            }
+        }
+        None
+    }
+
+    /// Number of text-bearing candidate nodes (Sections with body text, Notes
+    /// with a title, Symbols with a signature) — the same set
+    /// `collect_candidates(None, None)` would yield, counted cheaply.
+    fn searchable_candidate_count(&self) -> Result<u64, StoreError> {
+        let conn = self.conn()?;
+        let mut total = 0u64;
+        for query in [
+            "MATCH (s:Section) WHERE s.text_content <> '' RETURN count(s)",
+            "MATCH (n:Note) WHERE n.title <> '' RETURN count(n)",
+            "MATCH (s:Symbol) WHERE s.signature <> '' RETURN count(s)",
+        ] {
+            let result = conn
+                .query(query)
+                .map_err(|e| StoreError::Query(format!("candidate count: {e}")))?;
+            for row in result {
+                if let Some(Value::Int64(n)) = row.first() {
+                    total += (*n).max(0) as u64;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// True when the posting table exists but was built against a different
+    /// graph state: the graph generation advanced (any mutation, e.g. an
+    /// in-place edit) or the candidate-node count drifted (nodes added or
+    /// removed) since `index --with-trigrams` ran (F-03). Postings without
+    /// provenance (built by an older version) cannot be trusted and count as
+    /// stale.
+    fn trigram_index_is_stale(&self) -> bool {
+        let Some((indexed_generation, indexed_count)) = self.trigram_index_meta() else {
+            return true;
+        };
+        if indexed_generation != self.graph_generation() {
+            return true;
+        }
+        match self.searchable_candidate_count() {
+            Ok(count) => count != indexed_count,
+            // On a read error, distrust the index (safe direction).
+            Err(_) => true,
+        }
     }
 
     /// Collect all searchable candidate nodes (Sections, Notes, Symbols),
@@ -332,15 +468,36 @@ impl GraphStore {
     /// For each AND-clause we union the postings of its OR-trigrams; the final
     /// candidate set is the intersection across all AND-clauses.
     ///
-    /// Returns `None` if the posting table is empty (caller falls back to a
-    /// full scan).
+    /// Returns `(uids, stale_index)`. `uids` is `None` when the posting table
+    /// is missing OR stale (the graph changed since it was built — F-03); the
+    /// caller then falls back to a full scan. `stale_index` is true only when
+    /// a posting table exists but was bypassed as stale, so callers can
+    /// surface that in-band (the stderr warning below fires once per process
+    /// and is invisible on the daemon path). Observing a fresh (non-stale)
+    /// index re-arms the one-shot warning latch, so a long-lived daemon warns
+    /// again if a later rebuild is followed by another restale.
     fn trigram_candidate_uids(
         &self,
         clauses: &[HashSet<String>],
-    ) -> Result<Option<HashSet<String>>, StoreError> {
+    ) -> Result<(Option<HashSet<String>>, bool), StoreError> {
         if !self.has_trigram_index() {
-            return Ok(None);
+            return Ok((None, false));
         }
+        if self.trigram_index_is_stale() {
+            // Correctness first: a stale pre-filter can drop real matches
+            // (nodes added after the build are invisible to it), so fall back
+            // to a full scan and say so once on stderr.
+            if !TRIGRAM_STALE_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "warning: trigram index is stale (graph changed since it was built); \
+                     falling back to full scan — rerun `index --with-trigrams` to restore the pre-filter"
+                );
+            }
+            return Ok((None, true));
+        }
+        // A fresh index was observed: re-arm the one-shot warning latch so a
+        // long-lived process can warn again after a rebuild + restale.
+        TRIGRAM_STALE_WARNED.store(false, Ordering::Relaxed);
         let conn = self.conn()?;
         let mut acc: Option<HashSet<String>> = None;
         for clause in clauses {
@@ -367,12 +524,16 @@ impl GraphStore {
                 break;
             }
         }
-        Ok(acc)
+        Ok((acc, false))
     }
 
     /// First-party regex search over indexed text with an optional trigram
     /// pre-filter. Always confirms candidate matches with the compiled regex,
     /// so results are correct regardless of whether the trigram index exists.
+    ///
+    /// `limit` is bounded by [`SEARCH_PRESENTATION_LIMIT_MAX`], the same
+    /// presentation ceiling `brain_search` enforces, so both search entry
+    /// points accept the same range.
     pub fn regex_search(
         &self,
         pattern: &str,
@@ -381,16 +542,24 @@ impl GraphStore {
         limit: Option<usize>,
         max_millis: Option<u64>,
     ) -> Result<RegexSearchResult, StoreError> {
+        if let Some(l) = limit
+            && l > SEARCH_PRESENTATION_LIMIT_MAX
+        {
+            return Err(StoreError::Query(format!(
+                "regex_search limit {l} exceeds the presentation maximum of {SEARCH_PRESENTATION_LIMIT_MAX}"
+            )));
+        }
         let re = compile_pattern(pattern)?;
         let deadline_ms = max_millis.unwrap_or(DEFAULT_MAX_MILLIS);
         let start = Instant::now();
         let limit = limit.unwrap_or(usize::MAX);
 
-        // Decide whether a trigram pre-filter is possible.
+        // Decide whether a trigram pre-filter is possible. A pattern with no
+        // usable literals never consults the index, so it reports no staleness.
         let clauses = required_trigram_clauses(pattern);
-        let prefilter_uids = match &clauses {
+        let (prefilter_uids, stale_index) = match &clauses {
             Some(c) => self.trigram_candidate_uids(c)?,
-            None => None,
+            None => (None, false),
         };
         // scanned_fallback: we did NOT narrow via trigrams (no literals, or no
         // posting table built).
@@ -414,16 +583,36 @@ impl GraphStore {
                 break;
             }
             if let Some(m) = re.find(&c.text) {
+                // Check the limit BEFORE pushing: with `--limit 0` the caller
+                // asked for no results, so even the first match must not be
+                // returned (previously one result slipped through).
+                if results.len() >= limit {
+                    truncated = true;
+                    break;
+                }
                 let (line_in_text, snippet) = line_and_snippet(&c.text, m.start());
                 // Translate the line *within* the node's text into a file line:
                 // the node's text starts at `c.start_line`, so the match on the
                 // first text line (line_in_text == 1) is at c.start_line.
                 let file_line = c.start_line.saturating_add(line_in_text.saturating_sub(1));
+                // Point the location at the match's file line, not the node's
+                // start line, so plain-text renderings of `location` show where
+                // the match actually is (G9). Note locations carry no `:line`
+                // suffix and are left untouched.
+                let location = match c.location.rfind(':') {
+                    Some(idx)
+                        if !c.location[idx + 1..].is_empty()
+                            && c.location[idx + 1..].chars().all(|ch| ch.is_ascii_digit()) =>
+                    {
+                        format!("{}:{file_line}", &c.location[..idx])
+                    }
+                    _ => c.location.clone(),
+                };
                 results.push(RegexMatch {
                     uid: c.uid.clone(),
                     kind: c.kind.clone(),
                     title: c.title.clone(),
-                    location: c.location.clone(),
+                    location,
                     line: Some(file_line),
                     snippet,
                 });
@@ -438,6 +627,7 @@ impl GraphStore {
             results,
             truncated,
             scanned_fallback,
+            stale_index,
         })
     }
 
@@ -460,9 +650,9 @@ impl GraphStore {
 
             // Optional trigram narrowing.
             let clauses = required_trigram_clauses(pattern);
-            let prefilter_uids = match &clauses {
+            let (prefilter_uids, stale_index) = match &clauses {
                 Some(c) => self.trigram_candidate_uids(c)?,
-                None => None,
+                None => (None, false),
             };
 
             let mut per_file: HashMap<String, u64> = HashMap::new();
@@ -493,6 +683,7 @@ impl GraphStore {
                 total_matches: total,
                 files_matched,
                 top_files,
+                stale_index,
             });
         }
         Ok(out)
@@ -842,5 +1033,413 @@ mod tests {
             "must never return truncated:true with empty results on a scannable corpus"
         );
         assert!(!res.truncated, "small corpus scans fully, so not truncated");
+    }
+
+    /// F-02: an alternation is an OR, so the trigram pre-filter must union the
+    /// branch literals — ANDing them per branch used to drop every match
+    /// unless ALL branches appeared in the same text. The pre-filtered result
+    /// set must be identical to the full-scan result set across the matrix.
+    #[test]
+    fn alternation_prefilter_matches_full_scan() {
+        let patterns = [
+            "(login|token)",
+            "(alpha|beta|gamma)",
+            "(authenticateUser|needle_word)",
+            "((login|issuing) flow|Result)",
+        ];
+        for pattern in patterns {
+            let scan = store_with_text()
+                .regex_search(pattern, None, None, None, None)
+                .unwrap();
+            assert!(scan.scanned_fallback, "{pattern}: baseline must scan");
+
+            let indexed = store_with_text();
+            indexed.build_trigram_index().unwrap();
+            let filtered = indexed
+                .regex_search(pattern, None, None, None, None)
+                .unwrap();
+            let scan_uids: HashSet<&str> = scan.results.iter().map(|m| m.uid.as_str()).collect();
+            let filtered_uids: HashSet<&str> =
+                filtered.results.iter().map(|m| m.uid.as_str()).collect();
+            assert_eq!(
+                scan_uids, filtered_uids,
+                "{pattern}: trigram pre-filter must not change the result set"
+            );
+            if pattern == "(authenticateUser|needle_word)" {
+                assert!(
+                    !filtered.scanned_fallback,
+                    "{pattern}: literal alternation must still use the pre-filter"
+                );
+                assert!(
+                    filtered_uids.contains("sec:v:1:a") && filtered_uids.contains("sym:1"),
+                    "{pattern}: matches from the literal branch must survive the pre-filter"
+                );
+            }
+        }
+    }
+
+    /// F-02: when ANY alternation branch yields no usable trigram (too short
+    /// or non-literal), the pre-filter must be disabled entirely — unioning
+    /// only the literal branches would drop matches coming from the other
+    /// branch.
+    #[test]
+    fn alternation_with_unusable_branch_disables_prefilter() {
+        let store = store_with_text();
+        store.build_trigram_index().unwrap();
+        for pattern in ["(tokenize|ok)", "(authenticateUser|x.*)"] {
+            let res = store.regex_search(pattern, None, None, None, None).unwrap();
+            assert!(
+                res.scanned_fallback,
+                "{pattern}: a branch without usable trigrams must disable the pre-filter"
+            );
+        }
+        // "ok" (the short branch) matches inside "token" in the section body;
+        // a pre-filter built from "tokenize" alone would have missed it.
+        let res = store
+            .regex_search("(tokenize|ok)", None, None, None, None)
+            .unwrap();
+        assert!(
+            res.results.iter().any(|m| m.uid == "sec:v:1:a"),
+            "the unconstrained branch's match must be found via the scan"
+        );
+    }
+
+    /// F-03: nodes added after the trigram build must not be invisible — the
+    /// stale posting table is detected and the search falls back to a full
+    /// scan that still finds the new node.
+    #[test]
+    fn stale_trigram_index_falls_back_to_scan_and_finds_new_nodes() {
+        let store = store_with_text();
+        store.build_trigram_index().unwrap();
+
+        // Sanity: a fresh index is used (no drift since the build).
+        let fresh = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(
+            !fresh.scanned_fallback,
+            "freshly built index must be trusted"
+        );
+
+        // Add a node AFTER the build. The raw insert does not touch the
+        // generation counter, so this exercises the candidate-count staleness
+        // signal.
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:2".to_string(),
+                name: "postbuildHook".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:1".to_string(),
+                file_path: "src/hook.rs".to_string(),
+                start_line: 3,
+                end_line: 9,
+                signature: "fn postbuildHook()".to_string(),
+                summary: None,
+                content_hash: "c2".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let res = store
+            .regex_search("postbuildHook", None, None, None, None)
+            .unwrap();
+        assert!(
+            res.scanned_fallback,
+            "stale index must fall back to a full scan"
+        );
+        assert!(
+            res.results.iter().any(|m| m.uid == "sym:2"),
+            "a node added after the build must still be found"
+        );
+    }
+
+    /// F-03: a generation bump without a count change (e.g. an in-place edit
+    /// through the engine) must also mark the index stale.
+    #[test]
+    fn generation_bump_marks_trigram_index_stale() {
+        let store = store_with_text();
+        store.build_trigram_index().unwrap();
+        store.bump_graph_generation();
+        let res = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(
+            res.scanned_fallback,
+            "a generation bump must stale the index"
+        );
+        assert!(
+            !res.results.is_empty(),
+            "the fallback scan still returns correct results"
+        );
+    }
+
+    /// F-03: postings built before provenance tracking (no `Meta` key) cannot
+    /// be trusted — treat them as stale and scan.
+    #[test]
+    fn trigram_index_without_provenance_is_treated_as_stale() {
+        let store = store_with_text();
+        store.build_trigram_index().unwrap();
+        // Simulate a legacy index: drop the provenance row.
+        let conn = store.conn().unwrap();
+        conn.query("MATCH (m:Meta {key: 'trigram_index'}) DETACH DELETE m")
+            .unwrap();
+        let res = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(
+            res.scanned_fallback,
+            "postings without provenance must not be trusted"
+        );
+        assert!(
+            !res.results.is_empty(),
+            "the fallback scan still returns correct results"
+        );
+    }
+
+    /// F-03 observability: `stale_index` must report in-band whether a posting
+    /// table existed but was bypassed as stale — false when no index was ever
+    /// built, false for a fresh index, true once the graph drifts.
+    #[test]
+    fn stale_index_flag_reflects_index_state() {
+        // No index at all: fallback, but NOT stale (nothing to be stale).
+        let store = store_with_text();
+        let res = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(res.scanned_fallback);
+        assert!(!res.stale_index, "no posting table → not stale");
+
+        // Fresh index: pre-filter used, not stale.
+        store.build_trigram_index().unwrap();
+        let res = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(!res.scanned_fallback);
+        assert!(!res.stale_index, "fresh index → not stale");
+
+        // Graph drifts (in-place-edit style generation bump): stale.
+        store.bump_graph_generation();
+        let res = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(res.scanned_fallback, "stale index forces the full scan");
+        assert!(res.stale_index, "bypassed stale index must be reported");
+
+        // count_patterns reports the same flag per pattern.
+        let counts = store
+            .count_patterns(&["token".to_string()], None, None)
+            .unwrap();
+        assert!(
+            counts[0].stale_index,
+            "count_patterns must surface staleness per pattern"
+        );
+        // A fresh count is not stale.
+        store.build_trigram_index().unwrap();
+        let counts = store
+            .count_patterns(&["token".to_string()], None, None)
+            .unwrap();
+        assert!(!counts[0].stale_index);
+    }
+
+    /// F-03 observability: observing a fresh (non-stale) index re-arms the
+    /// one-shot stale warning latch, so a long-lived daemon can warn again
+    /// after a rebuild + restale instead of staying latched forever.
+    #[test]
+    fn fresh_index_observation_rearms_stale_warning_latch() {
+        let store = store_with_text();
+        store.build_trigram_index().unwrap();
+
+        // Latch the warning as if a stale index was already observed.
+        TRIGRAM_STALE_WARNED.store(true, Ordering::Relaxed);
+        // A fresh-index search must reset the latch.
+        let res = store
+            .regex_search("authenticateUser", None, None, None, None)
+            .unwrap();
+        assert!(!res.stale_index, "freshly built index must be trusted");
+        assert!(
+            !TRIGRAM_STALE_WARNED.load(Ordering::Relaxed),
+            "observing a fresh index must re-arm the stale warning latch"
+        );
+        // Leave the latch clean for other tests in this process.
+        TRIGRAM_STALE_WARNED.store(false, Ordering::Relaxed);
+    }
+
+    /// Unicode final sigma: `str::to_lowercase` folds 'Σ' context-sensitively
+    /// ('ς' at a word end, 'σ' mid-word), so index-side trigrams (folded from
+    /// a whole note body) and query-side trigrams (folded from a short
+    /// literal) could disagree and the pre-filter would drop real matches.
+    /// The per-char fold must keep both sides consistent.
+    #[test]
+    fn trigrams_use_context_free_case_folding() {
+        // 'ΓΟΣ' standalone folds to final sigma under str::to_lowercase;
+        // mid-word it folds to medial sigma. Per-char folding is stable.
+        assert_eq!(
+            trigrams("ΓΟΣ"),
+            trigrams("γοσ"),
+            "standalone uppercase must fold like its per-char lowercase form"
+        );
+        let midword = trigrams("ΓΟΣΑΝΘΡΑΞ");
+        for tg in trigrams("ΓΟΣ") {
+            assert!(
+                midword.contains(&tg),
+                "trigram {tg} of a standalone literal must also appear mid-word"
+            );
+        }
+    }
+
+    /// Unicode final sigma, end to end: a pattern whose literal is a word
+    /// PREFIX in the indexed text must survive the trigram pre-filter.
+    #[test]
+    fn greek_final_sigma_prefilter_does_not_drop_matches() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:v:greek".to_string(),
+                vault_uid: "vlt:v".to_string(),
+                file_path: "notes/greek.md".to_string(),
+                title: "Greek".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 0,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:greek".to_string(),
+                note_uid: "note:v:greek".to_string(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 1,
+                text_hash: "th".to_string(),
+                // 'ΓΟΣ' appears only as a mid-word prefix here.
+                text_content: "Η ΓΟΣΑΝΘΡΑΞ δοκιμή".to_string(),
+                word_count: 3,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store.build_trigram_index().unwrap();
+
+        let res = store.regex_search("ΓΟΣ", None, None, None, None).unwrap();
+        assert!(
+            !res.scanned_fallback,
+            "the literal pattern must use the pre-filter"
+        );
+        assert!(
+            res.results.iter().any(|m| m.uid == "sec:greek"),
+            "the mid-word prefix match must survive the pre-filter"
+        );
+    }
+
+    /// LOW: `--limit 0` must return zero results — the limit is checked
+    /// before a match is pushed, not after (previously one slipped through).
+    #[test]
+    fn limit_zero_returns_no_results() {
+        let store = store_with_text();
+        let res = store
+            .regex_search("authenticateUser", None, None, Some(0), None)
+            .unwrap();
+        assert!(
+            res.results.is_empty(),
+            "limit 0 must return no results, got {:?}",
+            res.results
+        );
+    }
+
+    /// LOW: regex-search aligns with brain-search's presentation bound
+    /// (`SEARCH_PRESENTATION_LIMIT_MAX`) instead of accepting any limit.
+    #[test]
+    fn limit_above_presentation_max_is_rejected() {
+        let store = store_with_text();
+        let err = store
+            .regex_search(
+                "token",
+                None,
+                None,
+                Some(SEARCH_PRESENTATION_LIMIT_MAX + 1),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds"),
+            "unexpected error message: {err}"
+        );
+        assert!(
+            store
+                .regex_search(
+                    "token",
+                    None,
+                    None,
+                    Some(SEARCH_PRESENTATION_LIMIT_MAX),
+                    None
+                )
+                .is_ok(),
+            "the maximum itself must be accepted"
+        );
+    }
+
+    /// G9: `location` must point at the match's line, not the node's start
+    /// line, so plain-text output (which renders `location`) shows where the
+    /// match actually is.
+    #[test]
+    fn location_points_at_match_line_not_section_start() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:v:ml".to_string(),
+                vault_uid: "vlt:v".to_string(),
+                file_path: "notes/multi.md".to_string(),
+                title: "Multi".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 0,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:v:ml".to_string(),
+                note_uid: "note:v:ml".to_string(),
+                heading_uid: None,
+                start_line: 10,
+                end_line: 12,
+                text_hash: "th".to_string(),
+                text_content: "first line\nsecond line has needle_word here\nthird line"
+                    .to_string(),
+                word_count: 9,
+                pagerank_score: None,
+            })
+            .unwrap();
+
+        let res = store
+            .regex_search("needle_word", None, None, None, None)
+            .unwrap();
+        let hit = res
+            .results
+            .iter()
+            .find(|m| m.uid == "sec:v:ml")
+            .expect("section match present");
+        // The match is on the section's second text line → file line 11, not
+        // the section's start line 10.
+        assert_eq!(hit.line, Some(11));
+        assert_eq!(
+            hit.location, "notes/multi.md:11",
+            "location must carry the match line, not the section start line"
+        );
     }
 }

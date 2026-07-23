@@ -252,6 +252,11 @@ pub fn record_selection(
 }
 
 /// Record a full-suite outcome (ground truth) for `sha`.
+///
+/// A re-record for the same `(repo_uid, sha)` UPSERTS: the report join takes
+/// the first matching truth, so appending a corrected record after the
+/// original would silently keep the stale one forever (F-low). Replacements
+/// are logged, not silent.
 #[allow(clippy::too_many_arguments)]
 pub fn record_truth(
     db_path: &Path,
@@ -272,7 +277,48 @@ pub fn record_truth(
         reruns,
     };
     let line = serde_json::to_string(&rec).context("serialize truth record")?;
-    append_jsonl(&crate::sidecar_path(db_path, TRUTH_SUFFIX), &line)
+    let path = crate::sidecar_path(db_path, TRUTH_SUFFIX);
+
+    // Drop any existing record for the same (repo_uid, sha) before appending.
+    // Unparseable lines are preserved verbatim (one bad line must not disable
+    // measurement), matching load_jsonl's skip-corrupt tolerance.
+    let mut lines: Vec<String> = match std::fs::read_to_string(&path) {
+        Ok(content) => content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let before = lines.len();
+    lines.retain(|l| {
+        serde_json::from_str::<TruthRecord>(l)
+            .map(|t| !(t.sha == rec.sha && t.repo_uid == rec.repo_uid))
+            .unwrap_or(true)
+    });
+    let replaced = before - lines.len();
+    if replaced > 0 {
+        tracing::warn!(
+            sha = %rec.sha,
+            repo_uid = %rec.repo_uid,
+            replaced,
+            "rts-eval record-truth: replacing existing truth record(s) for this sha"
+        );
+    }
+    lines.push(line);
+    // Rotation: oldest records dropped on overflow, same cap as append_jsonl.
+    if lines.len() > MAX_RECORDS {
+        lines.drain(..lines.len() - MAX_RECORDS);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    // Atomic replace (write tmp + rename + sync) instead of a bare rewrite:
+    // `std::fs::write` truncates in place, so a crash mid-write would destroy
+    // the entire truth history. Mirrors the generation sidecar's durability.
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |f| f.write_all(out.as_bytes()))
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 /// Join selections with truth by (sha, repo_uid when both carry one) and
@@ -598,6 +644,89 @@ mod tests {
         let (loaded, corrupt) = load_jsonl::<SelectionRecord>(&path);
         assert_eq!(loaded.len(), 2, "valid records survive a corrupt line");
         assert_eq!(corrupt, 1);
+    }
+
+    #[test]
+    fn record_truth_upserts_duplicate_sha() {
+        // F-low: re-recording truth for the same (repo, sha) must REPLACE the
+        // stale record — the report join takes the first match, so appending
+        // would silently keep the original forever.
+        let (_dir, db) = scratch_db();
+        record_truth(
+            &db,
+            "repo:1",
+            "abc123",
+            &["tests/a.test.ts".to_string()],
+            Some(10),
+            &[],
+            None,
+        )
+        .expect("first");
+        record_truth(&db, "repo:1", "abc123", &[], Some(10), &[], Some(2)).expect("correction");
+        // A different sha and a different repo are untouched.
+        record_truth(&db, "repo:1", "def456", &[], Some(10), &[], Some(2)).expect("other sha");
+        record_truth(
+            &db,
+            "repo:2",
+            "abc123",
+            &["tests/z.test.ts".to_string()],
+            None,
+            &[],
+            None,
+        )
+        .expect("other repo");
+
+        let (loaded, corrupt) = load_jsonl::<TruthRecord>(&crate::sidecar_path(&db, TRUTH_SUFFIX));
+        assert_eq!(corrupt, 0);
+        let matching: Vec<_> = loaded
+            .iter()
+            .filter(|t| t.sha == "abc123" && t.repo_uid == "repo:1")
+            .collect();
+        assert_eq!(matching.len(), 1, "duplicate sha must upsert, not append");
+        assert!(
+            matching[0].failed_test_files.is_empty(),
+            "the corrected record must win"
+        );
+        assert_eq!(matching[0].reruns, Some(2));
+        assert_eq!(loaded.len(), 3);
+    }
+
+    #[test]
+    fn record_truth_writes_atomically_without_leftover_temp_files() {
+        // record_truth rewrites the whole JSONL sidecar; a bare
+        // `std::fs::write` would truncate in place and a crash mid-write
+        // would destroy the entire truth history. The write goes through
+        // `durable_sidecar::atomic_replace_file` (temp + rename), so after
+        // the call the directory holds only the final sidecar — no temp
+        // debris — and the content round-trips.
+        let (dir, db) = scratch_db();
+        record_truth(
+            &db,
+            "repo:1",
+            "abc123",
+            &["tests/a.test.ts".to_string()],
+            Some(10),
+            &[],
+            None,
+        )
+        .expect("first");
+        record_truth(&db, "repo:1", "abc123", &[], Some(10), &[], Some(1)).expect("upsert");
+
+        let (loaded, corrupt) = load_jsonl::<TruthRecord>(&crate::sidecar_path(&db, TRUTH_SUFFIX));
+        assert_eq!(corrupt, 0);
+        assert_eq!(loaded.len(), 1, "upserted content must round-trip");
+        assert_eq!(loaded[0].reruns, Some(1));
+
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "scratch.lbug" && !name.ends_with(TRUTH_SUFFIX))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "atomic replace must not leave temp debris: {stray:?}"
+        );
     }
 
     #[test]

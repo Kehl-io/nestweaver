@@ -77,11 +77,22 @@ pub struct BundleEntry {
     /// Whether the entry has been expanded (full body + neighbors fetched).
     #[serde(default)]
     pub expanded: bool,
+    /// F-09: `true` when this entry was one of the query's resolved seed nodes
+    /// (a direct hit), as opposed to a node surfaced by graph proximity.
+    /// Skipped from JSON when `false` so existing consumers see unchanged
+    /// output.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_seed: bool,
     pub relevance: f64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -184,25 +195,153 @@ pub fn bundle_sidecar_path(db_path: &Path) -> std::path::PathBuf {
 }
 
 /// Load the bundle store, dropping any bundles whose `created_at` is older than
-/// the TTL. Returns an empty store when the sidecar is missing or unparseable.
+/// the TTL. Returns an empty store when the sidecar is missing. A corrupt
+/// sidecar no longer silently drops every bundle (F-20): individually
+/// parseable bundles are salvaged and a warning is emitted.
 pub fn load_bundle_store(db_path: &Path) -> BundleStore {
     let path = bundle_sidecar_path(db_path);
-    let mut store: BundleStore = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
+    let mut store: BundleStore = match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "bundle sidecar is corrupt; salvaging individually parseable bundles"
+                );
+                salvage_bundles(&text)
+            }
+        },
+        Err(_) => BundleStore::default(),
+    };
     let cutoff = now_epoch() - BUNDLE_TTL_SECS;
     store.bundles.retain(|_, b| b.created_at >= cutoff);
     store
 }
 
+/// Best-effort recovery of a corrupt sidecar: parse the top-level container
+/// leniently and keep each bundle that still deserializes, dropping (with a
+/// warning) only the corrupt entries.
+fn salvage_bundles(text: &str) -> BundleStore {
+    let mut store = BundleStore::default();
+    let Ok(serde_json::Value::Object(top)) = serde_json::from_str(text) else {
+        return store;
+    };
+    store.version = top.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    if let Some(serde_json::Value::Object(bundles)) = top.get("bundles") {
+        for (id, value) in bundles {
+            match serde_json::from_value::<Bundle>(value.clone()) {
+                Ok(b) => {
+                    store.bundles.insert(id.clone(), b);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        bundle_id = %id,
+                        error = %e,
+                        "dropping corrupt bundle entry from sidecar"
+                    );
+                }
+            }
+        }
+    }
+    store
+}
+
 /// Persist the bundle store via atomic write-then-rename.
+///
+/// F-20: the temp file name is unique per process and per call — the previous
+/// fixed `.json.tmp` name let two concurrent writers rename each other's temp
+/// file out from under themselves (ENOENT) or interleave writes.
 pub fn save_bundle_store(db_path: &Path, store: &BundleStore) -> Result<(), anyhow::Error> {
     let path = bundle_sidecar_path(db_path);
-    let tmp = path.with_extension("json.tmp");
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, serde_json::to_string(store)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+/// Advisory lock guarding the load→mutate→save cycle of the bundle sidecar
+/// (F-20). Implemented as a lock file created with `create_new` so it works
+/// across both threads and processes; stale locks (holder crashed) are broken
+/// after [`LOCK_STALE_SECS`]. Acquisition failure degrades to proceeding
+/// unlocked rather than failing the investigation.
+struct BundleStoreLock {
+    path: std::path::PathBuf,
+    /// `false` when the lock was not actually acquired (timeout / IO error) —
+    /// Drop must not remove a lock file owned by someone else.
+    owned: bool,
+}
+
+/// Seconds to wait for the sidecar lock before proceeding without it.
+const LOCK_WAIT_SECS: u64 = 10;
+/// Age after which an existing lock file is considered abandoned.
+const LOCK_STALE_SECS: u64 = 60;
+
+impl BundleStoreLock {
+    fn acquire(db_path: &Path) -> Self {
+        let path = bundle_sidecar_path(db_path).with_extension("lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(LOCK_WAIT_SECS);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self { path, owned: true },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Break abandoned locks (holder crashed between create and
+                    // Drop) so one bad exit doesn't wedge the sidecar forever.
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() > LOCK_STALE_SECS);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "bundle sidecar lock not acquired within deadline; proceeding unlocked"
+                        );
+                        return Self { path, owned: false };
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                // Read-only dir etc.: proceed without a lock rather than fail.
+                Err(_) => return Self { path, owned: false },
+            }
+        }
+    }
+}
+
+impl Drop for BundleStoreLock {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Load → mutate → save the bundle store under the sidecar lock so concurrent
+/// investigators never lose each other's bundles (F-20). When the closure
+/// errors, nothing is written.
+fn update_bundle_store<T>(
+    db_path: &Path,
+    f: impl FnOnce(&mut BundleStore) -> Result<T, anyhow::Error>,
+) -> Result<T, anyhow::Error> {
+    let _lock = BundleStoreLock::acquire(db_path);
+    let mut store = load_bundle_store(db_path);
+    let out = f(&mut store)?;
+    store.version = 1;
+    save_bundle_store(db_path, &store)?;
+    Ok(out)
 }
 
 /// Load a single live (non-expired) bundle by id.
@@ -217,9 +356,15 @@ pub fn load_bundle(db_path: &Path, bundle_id: &str) -> Option<Bundle> {
 /// `bundle_id` for follow-up drill-in.
 ///
 /// `scope` accepts:
-/// - `project:<slug>` — restrict retrieval seeds to a project's members,
-/// - `repo:<name>` — restrict results to symbols in a named repo,
+/// - `project:<slug>` — seed the project's members and post-filter results to
+///   the project's member symbols (errors when the project does not exist),
+/// - `repo:<name>` — restrict results to symbols in a named repo (errors when
+///   no repo matches),
 /// - `vault` / `all` / empty — no restriction (default).
+///
+/// Any other scope string is rejected with an error (F-21) instead of being
+/// silently treated as "no restriction". Note/section/tag nodes are
+/// vault-global and pass through both filters unscoped.
 ///
 /// When `db_path` is `Some`, the resulting bundle is persisted to the sidecar.
 /// When `None` (e.g. an in-memory store), the bundle is returned but not saved;
@@ -239,8 +384,8 @@ pub fn investigate(
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
         .min(MAX_TOKEN_BUDGET);
 
-    // 1. Resolve scope into the seed inputs and an optional repo filter.
-    let (seed_inputs, repo_filter) = resolve_scope(store, query, scope)?;
+    // 1. Resolve scope into the seed inputs and an optional post-filter.
+    let (seed_inputs, scope_filter) = resolve_scope(store, query, scope)?;
 
     // 2. Hybrid retrieval with PRF enabled.
     let config = HybridSearchConfig {
@@ -263,12 +408,25 @@ pub fn investigate(
         embed_model,
         None,
     );
+    // F-09: the query's own resolved seed nodes are first-class map entries,
+    // ordered ahead of the graph-proximity nodes so an exact-match query for
+    // an isolated symbol still returns that symbol instead of an empty map.
+    let mut seed_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut connected: Vec<BrainNode> = match connected_result {
-        Ok(ctx) => ctx.connected,
+        Ok(ctx) => {
+            seed_uids = ctx.seeds.iter().map(|n| n.uid.clone()).collect();
+            let mut nodes = ctx.seeds;
+            nodes.extend(
+                ctx.connected
+                    .into_iter()
+                    .filter(|n| !seed_uids.contains(&n.uid)),
+            );
+            nodes
+        }
         Err(_) => bm25_fallback(store, tantivy, query, DEFAULT_RETRIEVAL_BREADTH),
     };
-    if let Some(ref repo_uids) = repo_filter {
-        connected.retain(|n| node_in_repo(store, n, repo_uids));
+    if let Some(ref filter) = scope_filter {
+        connected.retain(|n| node_in_scope(store, n, filter));
     }
     connected.truncate(DEFAULT_RETRIEVAL_BREADTH);
 
@@ -319,6 +477,7 @@ pub fn investigate(
             inline_body: node.inline_body.clone(),
             body_complete: node.body_complete,
             expanded: false,
+            is_seed: seed_uids.contains(&node.uid),
             relevance: node.relevance,
         };
         let cost = entry_token_cost(&entry);
@@ -335,7 +494,8 @@ pub fn investigate(
     // 6. Group into domains.
     let domains = group_into_domains(store, &entries);
 
-    // 7. Persist the bundle (24h TTL handled on load).
+    // 7. Persist the bundle (24h TTL handled on load) under the sidecar lock
+    //    so concurrent investigators don't lose each other's bundles (F-20).
     let bundle = Bundle {
         bundle_id: bundle_id.clone(),
         created_at: now_epoch(),
@@ -344,10 +504,11 @@ pub fn investigate(
         entries: entries.clone(),
     };
     if let Some(db) = db_path {
-        let mut bundle_store = load_bundle_store(db);
-        bundle_store.version = 1;
-        bundle_store.bundles.insert(bundle_id.clone(), bundle);
-        save_bundle_store(db, &bundle_store)?;
+        let id = bundle_id.clone();
+        update_bundle_store(db, |bundle_store| {
+            bundle_store.bundles.insert(id, bundle);
+            Ok(())
+        })?;
     }
 
     Ok(InvestigateResult {
@@ -372,46 +533,60 @@ pub fn investigate_expand(
     bundle_id: &str,
     targets: &[String],
 ) -> Result<ExpandResult, anyhow::Error> {
-    let mut bundle_store = load_bundle_store(db_path);
-    let bundle = bundle_store
-        .bundles
-        .get_mut(bundle_id)
-        .ok_or_else(|| anyhow::anyhow!("bundle '{bundle_id}' not found or expired"))?;
+    let (expanded, neighbors, unresolved) = update_bundle_store(db_path, |bundle_store| {
+        let bundle = bundle_store
+            .bundles
+            .get_mut(bundle_id)
+            .ok_or_else(|| anyhow::anyhow!("bundle '{bundle_id}' not found or expired"))?;
 
-    let mut expanded: Vec<BundleEntry> = Vec::new();
-    let mut neighbors: Vec<NeighborRef> = Vec::new();
-    let mut unresolved: Vec<String> = Vec::new();
+        let mut expanded: Vec<BundleEntry> = Vec::new();
+        let mut neighbors: Vec<NeighborRef> = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        // Duplicate targets (or an asset_id + uid naming the same entry) are
+        // expanded once instead of being echoed twice in the result.
+        let mut seen_entries: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    for target in targets {
-        let Some(idx) = bundle
-            .entries
-            .iter()
-            .position(|e| &e.asset_id == target || &e.uid == target)
-        else {
-            unresolved.push(target.clone());
-            continue;
-        };
-        let uid = bundle.entries[idx].uid.clone();
-        let asset_id = bundle.entries[idx].asset_id.clone();
-
-        if let Some(body) = fetch_full_body(store, &uid, root) {
-            // Bug H: `investigate_expand` stores the full body without
-            // truncation, so the entry is unconditionally body-complete.
-            if bundle.entries[idx].summary.is_none() {
-                let s = summarize(&body);
-                if !s.is_empty() {
-                    bundle.entries[idx].summary = Some(s);
+        for target in targets {
+            let Some(idx) = bundle
+                .entries
+                .iter()
+                .position(|e| &e.asset_id == target || &e.uid == target)
+            else {
+                // Unresolved targets get no entry-index dedup (there is no
+                // entry to key on), so dedupe the echo itself, order-preserving.
+                if !unresolved.contains(target) {
+                    unresolved.push(target.clone());
                 }
+                continue;
+            };
+            if !seen_entries.insert(idx) {
+                continue;
             }
-            bundle.entries[idx].inline_body = Some(body);
-            bundle.entries[idx].body_complete = true;
-        }
-        bundle.entries[idx].expanded = true;
-        neighbors.extend(fetch_neighbors(store, &uid, &asset_id));
-        expanded.push(bundle.entries[idx].clone());
-    }
+            let uid = bundle.entries[idx].uid.clone();
+            let asset_id = bundle.entries[idx].asset_id.clone();
 
-    save_bundle_store(db_path, &bundle_store)?;
+            // Guard against an unreadable root / empty source span: storing an
+            // empty body marked `body_complete` would poison the entry and
+            // prevent a later hydrate from retrying it.
+            if let Some(body) = fetch_full_body(store, &uid, root).filter(|b| !b.is_empty()) {
+                // Bug H: `investigate_expand` stores the full body without
+                // truncation, so the entry is unconditionally body-complete.
+                if bundle.entries[idx].summary.is_none() {
+                    let s = summarize(&body);
+                    if !s.is_empty() {
+                        bundle.entries[idx].summary = Some(s);
+                    }
+                }
+                bundle.entries[idx].inline_body = Some(body);
+                bundle.entries[idx].body_complete = true;
+            }
+            bundle.entries[idx].expanded = true;
+            neighbors.extend(fetch_neighbors(store, &uid, &asset_id));
+            expanded.push(bundle.entries[idx].clone());
+        }
+
+        Ok((expanded, neighbors, unresolved))
+    })?;
 
     Ok(ExpandResult {
         bundle_id: bundle_id.to_string(),
@@ -433,50 +608,55 @@ pub fn investigate_hydrate(
     let budget = token_budget
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
         .min(MAX_TOKEN_BUDGET);
-    let mut bundle_store = load_bundle_store(db_path);
-    let bundle = bundle_store
-        .bundles
-        .get_mut(bundle_id)
-        .ok_or_else(|| anyhow::anyhow!("bundle '{bundle_id}' not found or expired"))?;
 
-    let mut used_tokens = 0usize;
-    let mut hydrated = 0usize;
-    let mut already_hydrated = 0usize;
-    for entry in bundle.entries.iter_mut() {
-        if entry.inline_body.is_some() {
-            already_hydrated += 1;
-            continue;
-        }
-        let Some(body) = fetch_full_body(store, &entry.uid, root) else {
-            continue;
-        };
-        if body.is_empty() {
-            continue;
-        }
-        let max_chars = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
-        // Bug H: newline-aware truncation — see `truncate_body_to_chars`. The
-        // `complete` flag is propagated to BundleEntry.body_complete so
-        // consumers can decide whether to fall back to `read_symbols` for the
-        // full source.
-        let (body, complete) = crate::query::truncate_body_to_chars(body, max_chars);
-        let cost = body.len().div_ceil(4);
-        if hydrated > 0 && used_tokens + cost > budget {
-            break;
-        }
-        used_tokens += cost;
-        if entry.summary.is_none() {
-            let s = summarize(&body);
-            if !s.is_empty() {
-                entry.summary = Some(s);
+    let (hydrated, already_hydrated, entries) = update_bundle_store(db_path, |bundle_store| {
+        let bundle = bundle_store
+            .bundles
+            .get_mut(bundle_id)
+            .ok_or_else(|| anyhow::anyhow!("bundle '{bundle_id}' not found or expired"))?;
+
+        let mut used_tokens = 0usize;
+        let mut hydrated = 0usize;
+        let mut already_hydrated = 0usize;
+        for entry in bundle.entries.iter_mut() {
+            if entry.inline_body.is_some() {
+                already_hydrated += 1;
+                continue;
             }
+            let Some(body) = fetch_full_body(store, &entry.uid, root) else {
+                continue;
+            };
+            if body.is_empty() {
+                continue;
+            }
+            let max_chars = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
+            // Bug H: newline-aware truncation — see `truncate_body_to_chars`. The
+            // `complete` flag is propagated to BundleEntry.body_complete so
+            // consumers can decide whether to fall back to `read_symbols` for the
+            // full source.
+            let (body, complete) = crate::query::truncate_body_to_chars(body, max_chars);
+            let cost = body.len().div_ceil(4);
+            if hydrated > 0 && used_tokens + cost > budget {
+                // Over budget: skip THIS body and keep going — a later, smaller
+                // body may still fit. (Previously a `break` aborted every
+                // remaining entry.)
+                continue;
+            }
+            used_tokens += cost;
+            if entry.summary.is_none() {
+                let s = summarize(&body);
+                if !s.is_empty() {
+                    entry.summary = Some(s);
+                }
+            }
+            entry.inline_body = Some(body);
+            entry.body_complete = complete;
+            hydrated += 1;
         }
-        entry.inline_body = Some(body);
-        entry.body_complete = complete;
-        hydrated += 1;
-    }
 
-    let entries = bundle.entries.clone();
-    save_bundle_store(db_path, &bundle_store)?;
+        let entries = bundle.entries.clone();
+        Ok((hydrated, already_hydrated, entries))
+    })?;
 
     Ok(HydrateResult {
         bundle_id: bundle_id.to_string(),
@@ -488,16 +668,47 @@ pub fn investigate_hydrate(
 
 // ── Scope resolution ──────────────────────────────────────────────────────
 
-/// Resolve a scope string into (seed_inputs, optional repo-uid filter).
+/// Post-retrieval scope filter produced by [`resolve_scope`].
+enum ScopeFilter {
+    /// Keep only symbols belonging to one of these repos (`repo:` scope).
+    Repos(Vec<String>),
+    /// Keep only symbols that are members of the project (`project:` scope).
+    ProjectSymbols(std::collections::HashSet<String>),
+}
+
+/// Resolve a scope string into (seed_inputs, optional scope filter).
 ///
 /// The `query` always seeds retrieval; project scope additionally seeds the
-/// project's member UIDs; repo scope returns a UID set used to post-filter the
-/// connected nodes.
+/// project's member UIDs and post-filters the results to its member symbols;
+/// repo scope returns a repo-UID set used to post-filter the connected nodes.
+///
+/// F-21: unrecognized scope strings, an empty `repo:`/`project:` name, a
+/// `project:` naming a nonexistent project, or a `repo:` matching no repo are
+/// all hard errors naming the scope — previously they silently degraded to
+/// "no restriction" (or, for an unmatched `repo:`, to filtering out every
+/// symbol).
+/// Strip a `project:`/`repo:` scope prefix case-insensitively (so
+/// `Project:Foo` / `REPO:x` resolve the same as their lowercase spellings,
+/// matching the already case-insensitive `vault`/`all` and project/repo name
+/// matching). Returns the remainder of the ORIGINAL string — the name's own
+/// case is preserved for the lookups that follow.
+fn strip_scope_prefix<'a>(scope: &'a str, prefix: &str) -> Option<&'a str> {
+    // `prefix` is pure ASCII, so `prefix.len()` can only split `scope` at a
+    // char boundary when the leading bytes really are the ASCII prefix.
+    if !scope
+        .get(..prefix.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+    {
+        return None;
+    }
+    scope.get(prefix.len()..)
+}
+
 fn resolve_scope(
     store: &GraphStore,
     query: &str,
     scope: &str,
-) -> Result<(Vec<String>, Option<Vec<String>>), anyhow::Error> {
+) -> Result<(Vec<String>, Option<ScopeFilter>), anyhow::Error> {
     let mut seeds = vec![query.to_string()];
     // Multi-word queries: also seed each whitespace token. Seed resolution does
     // exact title / substring symbol-name lookups, which can NEVER match a phrase
@@ -512,21 +723,37 @@ fn resolve_scope(
     }
     let scope = scope.trim();
 
-    if let Some(slug) = scope.strip_prefix("project:") {
-        let slug = slug.trim();
-        if let Ok(Some(project)) = store.lookup_project_by_name(slug) {
-            if let Ok(note_uids) = store.list_project_note_uids(&project.uid) {
-                seeds.extend(note_uids);
-            }
-            if let Ok(sym_uids) = store.list_project_symbol_uids(&project.uid) {
-                seeds.extend(sym_uids);
-            }
-        }
+    // vault / all / empty → no restriction.
+    if scope.is_empty() || scope.eq_ignore_ascii_case("vault") || scope.eq_ignore_ascii_case("all")
+    {
         return Ok((seeds, None));
     }
 
-    if let Some(name) = scope.strip_prefix("repo:") {
+    if let Some(slug) = strip_scope_prefix(scope, "project:") {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            anyhow::bail!("invalid scope '{scope}': 'project:' requires a project name");
+        }
+        let project = store
+            .lookup_project_by_name(slug)
+            .map_err(|e| anyhow::anyhow!("lookup project '{slug}': {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("unknown scope '{scope}': no project named '{slug}'"))?;
+        if let Ok(note_uids) = store.list_project_note_uids(&project.uid) {
+            seeds.extend(note_uids);
+        }
+        let mut member_symbols = std::collections::HashSet::new();
+        if let Ok(sym_uids) = store.list_project_symbol_uids(&project.uid) {
+            seeds.extend(sym_uids.iter().cloned());
+            member_symbols.extend(sym_uids);
+        }
+        return Ok((seeds, Some(ScopeFilter::ProjectSymbols(member_symbols))));
+    }
+
+    if let Some(name) = strip_scope_prefix(scope, "repo:") {
         let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("invalid scope 'repo:': 'repo:' requires a repo name");
+        }
         let repos = store
             .list_repos(None)
             .map_err(|e| anyhow::anyhow!("list_repos: {e}"))?;
@@ -537,11 +764,15 @@ fn resolve_scope(
             })
             .map(|r| r.uid)
             .collect();
-        return Ok((seeds, Some(matches)));
+        if matches.is_empty() {
+            anyhow::bail!("unknown scope '{scope}': no repo matching '{name}'");
+        }
+        return Ok((seeds, Some(ScopeFilter::Repos(matches))));
     }
 
-    // vault / all / empty → no restriction.
-    Ok((seeds, None))
+    anyhow::bail!(
+        "unknown scope '{scope}': expected 'project:<name>', 'repo:<name>', 'vault', or 'all'"
+    )
 }
 
 /// BM25-only retrieval against the vault index when graph-seed resolution
@@ -577,16 +808,22 @@ fn bm25_fallback(
     nodes
 }
 
-/// Whether a node belongs to one of the given repos. Only symbol nodes are
-/// repo-scoped; non-symbol nodes (notes/sections) pass through unfiltered.
-fn node_in_repo(store: &GraphStore, node: &BrainNode, repo_uids: &[String]) -> bool {
+/// Whether a node survives the scope filter. Only symbol nodes are scoped;
+/// non-symbol nodes (notes/sections/tags) are vault-global and pass through
+/// unfiltered — this mirrors the long-standing `repo:` notes handling.
+fn node_in_scope(store: &GraphStore, node: &BrainNode, filter: &ScopeFilter) -> bool {
     if !node.uid.starts_with("sym:") {
         return true;
     }
-    let Ok(sym) = store.lookup_symbol(&node.uid) else {
-        return false;
-    };
-    repo_uids.contains(&sym.repo_uid)
+    match filter {
+        ScopeFilter::ProjectSymbols(members) => members.contains(&node.uid),
+        ScopeFilter::Repos(repo_uids) => {
+            let Ok(sym) = store.lookup_symbol(&node.uid) else {
+                return false;
+            };
+            repo_uids.contains(&sym.repo_uid)
+        }
+    }
 }
 
 // ── Domain grouping ──────────────────────────────────────────────────────
@@ -1131,5 +1368,604 @@ mod tests {
         )
         .unwrap();
         assert!(!single.entries.is_empty());
+    }
+
+    // ── F-09: seed nodes are first-class map entries ─────────────────────
+
+    #[test]
+    fn investigate_includes_resolved_seeds_first() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "hello",
+            "vault",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+
+        // The queried symbol itself must appear in the map, marked as a seed.
+        let hello = result
+            .entries
+            .iter()
+            .find(|e| e.title == "hello")
+            .expect("the queried symbol must appear in the map");
+        assert!(hello.is_seed, "direct-hit entry must be marked is_seed");
+        // Seeds sort ahead of graph-proximity entries.
+        let last_seed = result.entries.iter().rposition(|e| e.is_seed);
+        let first_non_seed = result.entries.iter().position(|e| !e.is_seed);
+        if let (Some(l), Some(f)) = (last_seed, first_non_seed) {
+            assert!(l < f, "all seed entries must precede non-seed entries");
+        }
+    }
+
+    #[test]
+    fn investigate_isolated_symbol_exact_match_is_not_empty() {
+        // F-09 acceptance: an exact-match query for an isolated symbol (no
+        // callers/callees) must not yield an empty map, and the entry must be
+        // drillable via expand.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lonely.js"),
+            "function lonelyIsland() { return 42; }",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "lonelyIsland",
+            "vault",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !result.entries.is_empty(),
+            "exact-match for an isolated symbol must not yield an empty map"
+        );
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.title == "lonelyIsland")
+            .expect("the queried symbol must be in the map");
+        assert!(entry.is_seed);
+
+        // expand can target the seed entry.
+        let expanded = investigate_expand(
+            &store,
+            &db_path,
+            &src,
+            &result.bundle_id,
+            std::slice::from_ref(&entry.asset_id),
+        )
+        .unwrap();
+        assert_eq!(expanded.expanded.len(), 1);
+        assert!(
+            expanded.expanded[0]
+                .inline_body
+                .as_deref()
+                .is_some_and(|b| b.contains("42")),
+            "expand on a seed entry must fetch its body"
+        );
+    }
+
+    // ── F-20: bundle sidecar race + corrupt tolerance ────────────────────
+
+    #[test]
+    fn parallel_bundle_updates_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        std::thread::scope(|s| {
+            for i in 0..12 {
+                let db_path = &db_path;
+                s.spawn(move || {
+                    update_bundle_store(db_path, |store| {
+                        store.bundles.insert(
+                            format!("bndl_{i}"),
+                            Bundle {
+                                bundle_id: format!("bndl_{i}"),
+                                created_at: now_epoch(),
+                                query: "q".to_string(),
+                                scope: "vault".to_string(),
+                                entries: vec![],
+                            },
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let store = load_bundle_store(&db_path);
+        assert_eq!(
+            store.bundles.len(),
+            12,
+            "every concurrent update must survive the sidecar race"
+        );
+        // Unique temp files were all renamed away; lock file removed.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.contains(".tmp.") || n.ends_with(".lock")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp/lock files may be left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_investigates_persist_all_bundles() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let store = &store;
+        let db_path = &db_path;
+        let src = &src;
+        let ids: Vec<String> = std::thread::scope(|s| {
+            (0..12)
+                .map(|_| {
+                    s.spawn(move || {
+                        investigate(
+                            store,
+                            None,
+                            Some(db_path),
+                            src,
+                            "greet",
+                            "vault",
+                            Some(2000),
+                            None,
+                        )
+                        .unwrap()
+                        .bundle_id
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        let persisted = load_bundle_store(db_path);
+        for id in &ids {
+            assert!(
+                persisted.bundles.contains_key(id),
+                "bundle {id} was lost to a sidecar race"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_sidecar_salvages_valid_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let good = Bundle {
+            bundle_id: "good".to_string(),
+            created_at: now_epoch(),
+            query: "q".to_string(),
+            scope: "vault".to_string(),
+            entries: vec![],
+        };
+        // One valid bundle + one structurally invalid entry in the container.
+        let text = format!(
+            "{{\"version\":1,\"bundles\":{{\"good\":{},\"bad\":{{\"bundle_id\":42}}}}}}",
+            serde_json::to_string(&good).unwrap()
+        );
+        fs::write(bundle_sidecar_path(&db_path), text).unwrap();
+        let store = load_bundle_store(&db_path);
+        assert!(
+            store.bundles.contains_key("good"),
+            "valid bundle must be salvaged from a corrupt sidecar"
+        );
+        assert!(
+            !store.bundles.contains_key("bad"),
+            "only the corrupt entry is dropped, not the whole store"
+        );
+
+        // Complete garbage → empty store, no panic.
+        fs::write(bundle_sidecar_path(&db_path), "this is not json {").unwrap();
+        let store = load_bundle_store(&db_path);
+        assert!(store.bundles.is_empty());
+    }
+
+    // ── F-21: scope validation + project post-filter ─────────────────────
+
+    #[test]
+    fn investigate_rejects_unknown_and_empty_scopes() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        for scope in [
+            "bogus",
+            "vaults",
+            "repo:",
+            "project:",
+            "repo:no-such-repo-zzz",
+            "project:No Such Project ZZZ",
+        ] {
+            let err = investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "greet",
+                scope,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("scope"),
+                "error must explain the scope problem, got: {err}"
+            );
+        }
+
+        // Accepted no-restriction spellings still work.
+        for scope in ["vault", "all", "", "  vault  "] {
+            investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "greet",
+                scope,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // repo: with a matching name works.
+        investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "repo:test",
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scope_prefixes_are_case_insensitive() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        // REPO: / Repo: / mixed-case prefixes must resolve like `repo:`.
+        for scope in ["REPO:test", "Repo:test", "rEpO:test"] {
+            investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "greet",
+                scope,
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("scope '{scope}' should resolve: {e}"));
+        }
+
+        // Same for project: — set up a member-less project and address it with
+        // an upper/mixed-case prefix.
+        let project = nestweaver_schema::Project {
+            uid: "proj:test:onlyhello".to_string(),
+            name: "onlyhello".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+        for scope in [
+            "PROJECT:onlyhello",
+            "Project:onlyhello",
+            "pRoJeCt:onlyhello",
+        ] {
+            investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "greet",
+                scope,
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("scope '{scope}' should resolve: {e}"));
+        }
+    }
+
+    #[test]
+    fn project_scope_filters_symbols_to_members() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        // A project containing ONLY the `hello` symbol.
+        let hello_uid = store
+            .lookup_symbols_by_name("hello")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "hello")
+            .expect("hello symbol exists")
+            .uid;
+        let project = nestweaver_schema::Project {
+            uid: "proj:test:onlyhello".to_string(),
+            name: "onlyhello".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.upsert_project(&project).unwrap();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, std::slice::from_ref(&hello_uid), 1.0)
+            .unwrap();
+
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "project:onlyhello",
+            Some(4000),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !result.entries.is_empty(),
+            "the member symbol seed must survive the filter"
+        );
+        for e in &result.entries {
+            if e.uid.starts_with("sym:") {
+                assert_eq!(
+                    e.uid, hello_uid,
+                    "non-member symbol leaked through the project scope filter"
+                );
+            }
+        }
+    }
+
+    // ── LOW: expand/hydrate hygiene ──────────────────────────────────────
+
+    #[test]
+    fn investigate_expand_dedupes_duplicate_targets() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "vault",
+            None,
+            None,
+        )
+        .unwrap();
+        let target = result
+            .entries
+            .iter()
+            .find(|e| e.uid.starts_with("sym:"))
+            .expect("at least one symbol entry");
+        let aid = target.asset_id.clone();
+        let uid = target.uid.clone();
+
+        // Same entry named three ways: asset_id twice + raw uid.
+        let expanded = investigate_expand(
+            &store,
+            &db_path,
+            &src,
+            &result.bundle_id,
+            &[aid.clone(), aid, uid],
+        )
+        .unwrap();
+        assert_eq!(
+            expanded.expanded.len(),
+            1,
+            "duplicate targets must be expanded exactly once"
+        );
+        assert!(expanded.unresolved.is_empty());
+    }
+
+    #[test]
+    fn investigate_expand_dedupes_unresolved_targets() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "vault",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The same unknown target named twice must be echoed once, and the
+        // first-seen order of distinct unresolved targets preserved.
+        let expanded = investigate_expand(
+            &store,
+            &db_path,
+            &src,
+            &result.bundle_id,
+            &[
+                "nope-a".to_string(),
+                "nope-b".to_string(),
+                "nope-a".to_string(),
+                "nope-b".to_string(),
+            ],
+        )
+        .unwrap();
+        assert!(expanded.expanded.is_empty());
+        assert_eq!(
+            expanded.unresolved,
+            vec!["nope-a".to_string(), "nope-b".to_string()],
+            "duplicate unresolved targets must be echoed exactly once, in order"
+        );
+    }
+
+    #[test]
+    fn investigate_expand_unreadable_root_does_not_poison_entry() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        // Synthetic bundle with one un-hydrated symbol entry (deterministic —
+        // does not depend on how many bodies the initial map inlines).
+        let greet_uid = store
+            .lookup_symbols_by_name("greet")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "greet")
+            .expect("greet symbol exists")
+            .uid;
+        let mut bundle_store = BundleStore::default();
+        bundle_store.bundles.insert(
+            "bndl_test".to_string(),
+            Bundle {
+                bundle_id: "bndl_test".to_string(),
+                created_at: now_epoch(),
+                query: "q".to_string(),
+                scope: "vault".to_string(),
+                entries: vec![BundleEntry {
+                    asset_id: "a_greet".to_string(),
+                    uid: greet_uid,
+                    kind: "Symbol".to_string(),
+                    title: "greet".to_string(),
+                    location: "greet/main.js:1".to_string(),
+                    summary: None,
+                    inline_body: None,
+                    body_complete: true,
+                    expanded: false,
+                    is_seed: false,
+                    relevance: 1.0,
+                }],
+            },
+        );
+        save_bundle_store(&db_path, &bundle_store).unwrap();
+
+        // Expand against a root where the source file cannot be read: the
+        // entry must NOT be poisoned with an empty "complete" body.
+        let missing_root = dir.path().join("does-not-exist");
+        let expanded = investigate_expand(
+            &store,
+            &db_path,
+            &missing_root,
+            "bndl_test",
+            &["a_greet".to_string()],
+        )
+        .unwrap();
+        assert_eq!(expanded.expanded.len(), 1);
+        assert!(
+            expanded.expanded[0].inline_body.is_none(),
+            "an unreadable root must leave inline_body unset so hydrate can retry"
+        );
+
+        // A later hydrate against the real root still fills the body.
+        let hydrated =
+            investigate_hydrate(&store, &db_path, &src, "bndl_test", Some(4000)).unwrap();
+        let entry = hydrated
+            .entries
+            .iter()
+            .find(|e| e.asset_id == "a_greet")
+            .unwrap();
+        assert!(
+            entry.inline_body.as_deref().is_some_and(|b| !b.is_empty()),
+            "hydrate must be able to retry an entry expand could not read"
+        );
+    }
+
+    #[test]
+    fn investigate_hydrate_skips_over_budget_body_instead_of_aborting() {
+        // Fixture: two huge functions and one tiny one. With a budget that fits
+        // one huge body plus the tiny one — but not two huge bodies — the old
+        // `break` aborted hydration of the tiny entry; skipping must not.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        let padding = "    let x = 1; // padding padding padding padding\n".repeat(80);
+        fs::write(
+            src.join("big.js"),
+            format!(
+                "function hugeA() {{\n{padding}}}\nfunction hugeB() {{\n{padding}}}\nfunction tinyC() {{ return 1; }}"
+            ),
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        let uid_of = |name: &str| {
+            store
+                .lookup_symbols_by_name(name)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} symbol exists"))
+                .uid
+        };
+        let mk_entry = |name: &str| BundleEntry {
+            asset_id: format!("a_{name}"),
+            uid: uid_of(name),
+            kind: "Symbol".to_string(),
+            title: name.to_string(),
+            location: "big.js:1".to_string(),
+            summary: None,
+            inline_body: None,
+            body_complete: true,
+            expanded: false,
+            is_seed: false,
+            relevance: 1.0,
+        };
+        let mut bundle_store = BundleStore::default();
+        bundle_store.bundles.insert(
+            "bndl_test".to_string(),
+            Bundle {
+                bundle_id: "bndl_test".to_string(),
+                created_at: now_epoch(),
+                query: "q".to_string(),
+                scope: "vault".to_string(),
+                // Order matters: huge, huge, tiny.
+                entries: vec![mk_entry("hugeA"), mk_entry("hugeB"), mk_entry("tinyC")],
+            },
+        );
+        save_bundle_store(&db_path, &bundle_store).unwrap();
+
+        // A huge body truncates to INLINE_MAX_BODY_TOKENS (400) tokens; the
+        // tiny body costs only a few. Budget 450 fits hugeA + tinyC.
+        let res = investigate_hydrate(&store, &db_path, &src, "bndl_test", Some(450)).unwrap();
+        assert_eq!(
+            res.hydrated, 2,
+            "the tiny entry after an over-budget body must still hydrate"
+        );
+        let body_of = |name: &str| {
+            res.entries
+                .iter()
+                .find(|e| e.title == name)
+                .and_then(|e| e.inline_body.as_deref())
+        };
+        assert!(body_of("hugeA").is_some());
+        assert!(
+            body_of("hugeB").is_none(),
+            "the over-budget body is skipped, not hydrated"
+        );
+        assert!(
+            body_of("tinyC").is_some(),
+            "entries after a skipped body must still be hydrated"
+        );
     }
 }
