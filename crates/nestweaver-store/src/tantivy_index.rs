@@ -14,14 +14,20 @@
 //! Persistence: the index lives at `<db_path>.tantivy/`. Tantivy handles
 //! its own mmap/segment lifecycle; we just point it at the directory.
 
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::collector::{Collector, SegmentCollector, TopDocs};
+use tantivy::query::{Query, QueryParser};
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
-use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term, doc};
+use tantivy::store::StoreReader;
+use tantivy::{
+    DocAddress, DocId, Index, IndexReader, ReloadPolicy, Score, SegmentOrdinal, SegmentReader,
+    TantivyDocument, Term, doc,
+};
 use thiserror::Error;
 
 use crate::db::GraphStore;
@@ -58,6 +64,11 @@ pub const PRF_EXPANSION_WEIGHT: f32 = 0.3;
 /// Hard cap on the total number of terms in the pass-2 query.
 pub const PRF_MAX_QUERY_TERMS: usize = 64;
 
+/// Maximum number of distinct logical entities retained while counting a
+/// Tantivy query. Reaching this cap yields a lower-bound total instead of
+/// growing memory with corpus cardinality.
+pub const TANTIVY_LOGICAL_COUNT_CAP: usize = 100_000;
+
 /// Single search result from the BM25 index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
@@ -66,6 +77,196 @@ pub struct SearchHit {
     pub title: String,
     pub vault_uid: String,
     pub score: f32,
+}
+
+/// Whether a bounded search total is exact or only a guaranteed lower bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTotalRelation {
+    Exact,
+    LowerBound,
+}
+
+/// Honest cardinality metadata shared by counted search APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchTotal {
+    pub value: usize,
+    pub relation: SearchTotalRelation,
+}
+
+impl SearchTotal {
+    pub const fn exact(value: usize) -> Self {
+        Self {
+            value,
+            relation: SearchTotalRelation::Exact,
+        }
+    }
+
+    pub const fn lower_bound(value: usize) -> Self {
+        Self {
+            value,
+            relation: SearchTotalRelation::LowerBound,
+        }
+    }
+}
+
+/// A ranked Tantivy hit page plus limit-independent logical cardinality.
+///
+/// `hits` remain raw ranked index documents for compatibility. `total`
+/// instead counts logical entities: a note and all of its heading/section
+/// fragments share the owning `note_uid`; standalone entities use
+/// `(kind, uid)`. Titles never participate in identity.
+#[derive(Debug, Clone)]
+pub struct TantivySearchPage {
+    pub hits: Vec<SearchHit>,
+    pub total: SearchTotal,
+}
+
+/// Counted result of the final PRF query plus its mined expansion terms.
+#[derive(Debug, Clone)]
+pub struct TantivyPrfSearchPage {
+    pub hits: Vec<SearchHit>,
+    pub total: SearchTotal,
+    pub expansion_terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LogicalEntityIdentity {
+    Note(String),
+    Standalone { kind: String, uid: String },
+}
+
+#[derive(Default)]
+struct LogicalEntityCountState {
+    identities: HashSet<LogicalEntityIdentity>,
+    error: Option<String>,
+}
+
+/// Tantivy collector that keeps only a capped set of logical identities.
+/// The shared state makes the cap global across segments, including when
+/// Tantivy evaluates segment collectors concurrently.
+struct LogicalEntityCountCollector {
+    cap: usize,
+    uid: Field,
+    kind: Field,
+    note_uid: Field,
+    state: Arc<Mutex<LogicalEntityCountState>>,
+    saturated: Arc<AtomicBool>,
+}
+
+impl LogicalEntityCountCollector {
+    fn new(cap: usize, fields: &Fields) -> Self {
+        Self {
+            cap,
+            uid: fields.uid,
+            kind: fields.kind,
+            note_uid: fields.note_uid,
+            state: Arc::new(Mutex::new(LogicalEntityCountState::default())),
+            saturated: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+struct LogicalEntitySegmentCollector {
+    cap: usize,
+    uid: Field,
+    kind: Field,
+    note_uid: Field,
+    store: StoreReader,
+    state: Arc<Mutex<LogicalEntityCountState>>,
+    saturated: Arc<AtomicBool>,
+}
+
+impl SegmentCollector for LogicalEntitySegmentCollector {
+    type Fruit = ();
+
+    fn collect(&mut self, doc_id: DocId, _score: Score) {
+        if self.saturated.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let doc: TantivyDocument = match self.store.get(doc_id) {
+            Ok(doc) => doc,
+            Err(error) => {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.error = Some(format!("decode matched document: {error}"));
+                self.saturated.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let uid = extract_text(&doc, self.uid);
+        let kind = extract_text(&doc, self.kind);
+        let note_uid = extract_text(&doc, self.note_uid);
+        let identity = if !note_uid.is_empty() {
+            LogicalEntityIdentity::Note(note_uid)
+        } else if matches!(kind.as_str(), "heading" | "section") {
+            // Indices created before note_uid became STORED cannot identify a
+            // fragment's owner. Refuse a misleading raw-document total; the
+            // legacy hit-only API remains available until the index is rebuilt.
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.error = Some(
+                "counted search requires reindex: matched fragment has no stored note_uid"
+                    .to_string(),
+            );
+            self.saturated.store(true, Ordering::Relaxed);
+            return;
+        } else {
+            LogicalEntityIdentity::Standalone { kind, uid }
+        };
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.error.is_some() {
+            return;
+        }
+        if state.identities.len() >= self.cap {
+            self.saturated.store(true, Ordering::Relaxed);
+            return;
+        }
+        state.identities.insert(identity);
+        if state.identities.len() >= self.cap {
+            self.saturated.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn harvest(self) -> Self::Fruit {}
+}
+
+impl Collector for LogicalEntityCountCollector {
+    type Fruit = SearchTotal;
+    type Child = LogicalEntitySegmentCollector;
+
+    fn for_segment(
+        &self,
+        _segment_local_id: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(LogicalEntitySegmentCollector {
+            cap: self.cap,
+            uid: self.uid,
+            kind: self.kind,
+            note_uid: self.note_uid,
+            store: segment.get_store_reader(10)?,
+            state: Arc::clone(&self.state),
+            saturated: Arc::clone(&self.saturated),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(&self, _segment_fruits: Vec<()>) -> tantivy::Result<Self::Fruit> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = &state.error {
+            return Err(tantivy::TantivyError::InternalError(error.clone()));
+        }
+        let value = state.identities.len();
+        if self.saturated.load(Ordering::Relaxed) {
+            Ok(SearchTotal::lower_bound(value))
+        } else {
+            Ok(SearchTotal::exact(value))
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -392,18 +593,77 @@ impl TantivyIndex {
     /// BM25 search across title + body fields. Returns up to `limit`
     /// hits ranked by Tantivy's default BM25 scoring.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, TantivyError> {
-        if query.trim().is_empty() {
+        if limit == 0 {
             return Ok(Vec::new());
         }
-        // Ensure the reader sees the latest committed segments (cheap no-op
-        // when nothing changed). Covers the case where a background worker
-        // committed new documents since the reader was last opened.
-        let _ = self.reader.reload();
-        let searcher = self.reader.searcher();
+        let Some(parsed) = self.parse_query(query) else {
+            return Ok(Vec::new());
+        };
+        let searcher = self.current_searcher();
+        let top = searcher.search(
+            parsed.as_ref(),
+            &TopDocs::with_limit(limit).order_by_score(),
+        )?;
+        self.decode_hits(&searcher, top)
+    }
+
+    /// BM25 search with a logical-entity total independent of `limit`.
+    ///
+    /// Ranked hits intentionally remain raw Tantivy documents so existing
+    /// ordering and downstream grouping do not change. The total collapses a
+    /// note's whole-note, heading, and section documents by `note_uid`; other
+    /// entities use `(kind, uid)`. Once [`TANTIVY_LOGICAL_COUNT_CAP`] distinct
+    /// identities are observed, the total is returned as a lower bound.
+    pub fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<TantivySearchPage, TantivyError> {
+        self.search_page_with_count_cap(query, limit, TANTIVY_LOGICAL_COUNT_CAP)
+    }
+
+    fn search_page_with_count_cap(
+        &self,
+        query: &str,
+        limit: usize,
+        count_cap: usize,
+    ) -> Result<TantivySearchPage, TantivyError> {
+        let Some(parsed) = self.parse_query(query) else {
+            return Ok(TantivySearchPage {
+                hits: Vec::new(),
+                total: SearchTotal::exact(0),
+            });
+        };
+        let searcher = self.current_searcher();
+        let counter = LogicalEntityCountCollector::new(count_cap, &self.fields);
+        if limit == 0 {
+            let total = searcher.search(parsed.as_ref(), &counter)?;
+            return Ok(TantivySearchPage {
+                hits: Vec::new(),
+                total,
+            });
+        }
+        let (total, top) = searcher.search(
+            parsed.as_ref(),
+            &(counter, TopDocs::with_limit(limit).order_by_score()),
+        )?;
+        Ok(TantivySearchPage {
+            hits: self.decode_hits(&searcher, top)?,
+            total,
+        })
+    }
+
+    /// Parse user input with the legacy lenient fallbacks shared by hit-only
+    /// and counted search. `None` means the input is empty or cannot be parsed
+    /// even as a literal phrase, preserving the old empty-result behavior.
+    fn parse_query(&self, query: &str) -> Option<Box<dyn Query>> {
+        if query.trim().is_empty() {
+            return None;
+        }
         let mut parser =
             QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
         parser.set_field_boost(self.fields.title, 3.0);
-        let parsed = match parser.parse_query(query) {
+        match parser.parse_query(query) {
             Ok(q) => q,
             Err(_) => {
                 // Fall back to a "lenient" parse that escapes special
@@ -422,13 +682,28 @@ impl TantivyIndex {
                         let phrase = format!("\"{}\"", query.replace('"', " "));
                         match parser.parse_query(&phrase) {
                             Ok(q) => q,
-                            Err(_) => return Ok(Vec::new()),
+                            Err(_) => return None,
                         }
                     }
                 }
             }
-        };
-        let top = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;
+        }
+        .into()
+    }
+
+    fn current_searcher(&self) -> tantivy::Searcher {
+        // Preserve the legacy best-effort reload behavior: a transient reload
+        // failure does not make an otherwise readable committed generation
+        // unavailable.
+        let _ = self.reader.reload();
+        self.reader.searcher()
+    }
+
+    fn decode_hits(
+        &self,
+        searcher: &tantivy::Searcher,
+        top: Vec<(Score, DocAddress)>,
+    ) -> Result<Vec<SearchHit>, TantivyError> {
         let mut hits = Vec::with_capacity(top.len());
         for (score, address) in top {
             let doc: TantivyDocument = searcher.doc(address)?;
@@ -467,10 +742,54 @@ impl TantivyIndex {
         limit: usize,
         stopwords: &[&str],
     ) -> Result<(Vec<SearchHit>, Vec<String>), TantivyError> {
-        use std::collections::HashSet;
         if query.trim().is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        let (mut pass1, terms) = self.prf_pass1_and_terms(query, limit, stopwords)?;
+        if terms.is_empty() {
+            pass1.truncate(limit);
+            return Ok((pass1, terms));
+        }
+        let expanded = build_prf_query(query, &terms, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS);
+        Ok((self.search(&expanded, limit)?, terms))
+    }
+
+    /// Counted PRF search. `total` always describes the final query: the
+    /// expanded second pass when expansion succeeds, otherwise the original
+    /// first pass.
+    pub fn search_prf_page(
+        &self,
+        query: &str,
+        limit: usize,
+        stopwords: &[&str],
+    ) -> Result<TantivyPrfSearchPage, TantivyError> {
+        if query.trim().is_empty() {
+            return Ok(TantivyPrfSearchPage {
+                hits: Vec::new(),
+                total: SearchTotal::exact(0),
+                expansion_terms: Vec::new(),
+            });
+        }
+        let (_pass1, terms) = self.prf_pass1_and_terms(query, limit, stopwords)?;
+        let final_query = if terms.is_empty() {
+            query.to_string()
+        } else {
+            build_prf_query(query, &terms, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS)
+        };
+        let page = self.search_page(&final_query, limit)?;
+        Ok(TantivyPrfSearchPage {
+            hits: page.hits,
+            total: page.total,
+            expansion_terms: terms,
+        })
+    }
+
+    fn prf_pass1_and_terms(
+        &self,
+        query: &str,
+        limit: usize,
+        stopwords: &[&str],
+    ) -> Result<(Vec<SearchHit>, Vec<String>), TantivyError> {
         // Pass 1: original query, take the top-K as the pseudo-relevant set.
         let pass1 = self.search(query, limit.max(PRF_TOP_K))?;
         // The full-text corpus holds several documents per note (a whole-note
@@ -499,21 +818,7 @@ impl TantivyIndex {
             }
         }
         let terms = self.prf_expand_terms(query, &top_k, stopwords)?;
-        if terms.is_empty() {
-            // Nothing to expand with — fall back to the pass-1 ordering.
-            let mut hits = pass1;
-            hits.truncate(limit);
-            return Ok((hits, terms));
-        }
-
-        // Pass 2: original terms (weight 1.0) + expansion terms (down-weighted).
-        // Built as a Tantivy boost query string: `(orig) (term^0.3) ...`. The
-        // original query keeps its natural weight; each expansion term is
-        // appended with the down-weight boost. The whole thing is capped at
-        // PRF_MAX_QUERY_TERMS to bound drift and parser cost.
-        let expanded = build_prf_query(query, &terms, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS);
-        let hits = self.search(&expanded, limit)?;
-        Ok((hits, terms))
+        Ok((pass1, terms))
     }
 
     /// Mine expansion terms from a pseudo-relevant set of hits (Feature F7).
@@ -970,6 +1275,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn counted_page_totals_logical_entities_independently_of_hit_limit() {
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+        idx.update_note(
+            "note:payment-a",
+            "Payment Architecture",
+            "vlt:t",
+            &["payment orchestration".to_string()],
+            &[("head:payment-a".to_string(), "Payment flow".to_string())],
+            &[(
+                "sec:payment-a".to_string(),
+                "payment settlement".to_string(),
+                "Payment flow".to_string(),
+            )],
+            &[],
+        )
+        .unwrap();
+        idx.update_note(
+            "note:payment-b",
+            "Payment Operations",
+            "vlt:t",
+            &["payment reconciliation".to_string()],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let page = idx.search_page("payment", 1).unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.total.value, 2);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+        assert!(page.total.value > page.hits.len());
+
+        let legacy = idx.search("payment", 1).unwrap();
+        assert_eq!(
+            page.hits.iter().map(|hit| &hit.uid).collect::<Vec<_>>(),
+            legacy.iter().map(|hit| &hit.uid).collect::<Vec<_>>(),
+            "counting must not perturb legacy ranking"
+        );
+    }
+
+    #[test]
+    fn counted_page_uses_uid_identity_instead_of_title_identity() {
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+        for uid in ["note:same-title-a", "note:same-title-b"] {
+            idx.update_note(
+                uid,
+                "Payment",
+                "vlt:t",
+                &["payment".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        }
+
+        let page = idx.search_page("payment", 1).unwrap();
+        assert_eq!(page.total.value, 2);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+    }
+
+    #[test]
+    fn zero_hit_limit_still_counts_logical_entities() {
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+        idx.update_note(
+            "note:zero-limit",
+            "Payment",
+            "vlt:t",
+            &["payment".to_string()],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert!(idx.search("payment", 0).unwrap().is_empty());
+        let page = idx.search_page("payment", 0).unwrap();
+        assert!(page.hits.is_empty());
+        assert_eq!(page.total.value, 1);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+    }
+
+    #[test]
+    fn logical_entity_count_reports_a_lower_bound_at_its_cap() {
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+        for i in 0..3 {
+            idx.update_note(
+                &format!("note:cap-{i}"),
+                "Payment",
+                "vlt:t",
+                &["payment".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        }
+
+        let page = idx.search_page_with_count_cap("payment", 1, 2).unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.total.value, 2);
+        assert_eq!(page.total.relation, SearchTotalRelation::LowerBound);
+    }
+
     /// A `reindex_from_store` must rebuild the Tantivy index atomically: the
     /// `delete_all_documents` and the re-adds land in ONE commit, so a
     /// concurrent reader querying a non-empty corpus always sees the old-or-new
@@ -1204,6 +1619,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_prf_search_remains_compatible_with_pre_count_indices() {
+        let dir = tempdir().unwrap();
+        let mut schema_builder = Schema::builder();
+        let uid = schema_builder.add_text_field("uid", STRING | STORED);
+        let kind = schema_builder.add_text_field("kind", STRING | STORED);
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let body = schema_builder.add_text_field("body", TEXT);
+        let vault_uid = schema_builder.add_text_field("vault_uid", STRING | STORED);
+        let note_uid = schema_builder.add_text_field("note_uid", STRING);
+        let index = Index::create_in_dir(dir.path(), schema_builder.build()).unwrap();
+        let mut writer = index.writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                uid => "head:legacy",
+                kind => "heading",
+                title => "Payment",
+                body => "payment",
+                vault_uid => "vlt:t",
+                note_uid => "note:legacy",
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(index);
+
+        let idx = TantivyIndex::open_reader_only(dir.path()).unwrap();
+        let (hits, terms) = idx.search_prf("payment", 5, &[]).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(terms.is_empty());
+
+        let error = idx.search_page("payment", 5).unwrap_err();
+        assert!(error.to_string().contains("requires reindex"));
+    }
+
     // ── PRF (Feature F7) tests ──────────────────────────────────────────
 
     /// Build a corpus where several docs that match the query "payment" also
@@ -1284,6 +1734,45 @@ mod tests {
                 "idempotency-rich note:p1 should outrank UI-only note:u1 under PRF; order={prf_order:?}"
             );
         }
+    }
+
+    #[test]
+    fn counted_prf_page_totals_the_final_expanded_query() {
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_prf_corpus(&idx);
+        idx.update_note(
+            "note:idempotency-only",
+            "Idempotency Guide",
+            "vlt:t",
+            &["idempotency idempotency safeguards".to_string()],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let plain = idx.search_page("payment", 2).unwrap();
+        let page = idx
+            .search_prf_page("payment", 2, &["the", "a", "with", "and", "of", "we"])
+            .unwrap();
+        assert!(
+            page.expansion_terms
+                .iter()
+                .any(|term| term == "idempotency")
+        );
+        assert!(page.total.value > plain.total.value);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+        assert_eq!(page.hits.len(), 2);
+
+        let (legacy_hits, legacy_terms) = idx
+            .search_prf("payment", 2, &["the", "a", "with", "and", "of", "we"])
+            .unwrap();
+        assert_eq!(page.expansion_terms, legacy_terms);
+        assert_eq!(
+            page.hits.iter().map(|hit| &hit.uid).collect::<Vec<_>>(),
+            legacy_hits.iter().map(|hit| &hit.uid).collect::<Vec<_>>()
+        );
     }
 
     #[test]

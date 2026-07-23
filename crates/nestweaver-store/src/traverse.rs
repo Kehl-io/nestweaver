@@ -1,10 +1,61 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use nestweaver_schema::{EdgeType, SymbolKind};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
 use crate::ranking::{PathDeboostRule, SeedResolutionConfig};
+use crate::tantivy_index::SearchTotal;
+
+/// Maximum precision of symbol-match totals. Ranking still scans the cached
+/// symbol snapshot so late high-quality hits are not missed, but only the
+/// caller-requested top results are retained. Reaching this cap reports a
+/// lower bound instead of an unbounded exact-match collection.
+pub const SYMBOL_SEARCH_COUNT_CAP: usize = 100_000;
+
+/// A ranked symbol page with an independently bounded match total.
+#[derive(Debug, Clone)]
+pub struct SymbolSearchPage {
+    pub symbols: Vec<nestweaver_schema::Symbol>,
+    pub total: SearchTotal,
+}
+
+struct RankedSymbol<'a> {
+    adjusted_score: f64,
+    kind_rank: usize,
+    file_path: &'a str,
+    ordinal: usize,
+    symbol: &'a nestweaver_schema::Symbol,
+}
+
+impl PartialEq for RankedSymbol<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for RankedSymbol<'_> {}
+
+impl PartialOrd for RankedSymbol<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedSymbol<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // "Less" means better-ranked. BinaryHeap therefore keeps the worst
+        // retained candidate at peek(), making bounded top-K replacement O(log K).
+        other
+            .adjusted_score
+            .partial_cmp(&self.adjusted_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.kind_rank.cmp(&other.kind_rank))
+            .then_with(|| self.file_path.cmp(other.file_path))
+            // Preserve stable DB/cache order for otherwise identical keys.
+            .then_with(|| self.ordinal.cmp(&other.ordinal))
+    }
+}
 
 /// Compute the multiplicative path-factor for a symbol's `file_path` against
 /// a list of [`PathDeboostRule`]s. Matching rules multiply; factor=1.0 when
@@ -709,7 +760,27 @@ impl GraphStore {
         limit: usize,
         seed_resolution: &SeedResolutionConfig,
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
-        self.search_symbols_by_name_impl(query, limit, seed_resolution, || {}, || {})
+        Ok(self
+            .search_symbols_by_name_page(query, limit, seed_resolution)?
+            .symbols)
+    }
+
+    /// Counted symbol-name search. Result retention is bounded by `limit`, and
+    /// total precision is bounded by [`SYMBOL_SEARCH_COUNT_CAP`].
+    pub fn search_symbols_by_name_page(
+        &self,
+        query: &str,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+    ) -> Result<SymbolSearchPage, StoreError> {
+        self.search_symbols_by_name_page_impl(
+            query,
+            limit,
+            seed_resolution,
+            SYMBOL_SEARCH_COUNT_CAP,
+            || {},
+            || {},
+        )
     }
 
     /// Test-only entry to the exact public-search implementation with
@@ -723,23 +794,47 @@ impl GraphStore {
         after_db_scan: impl FnOnce(),
         inside_publication_barrier: impl FnOnce(),
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
-        self.search_symbols_by_name_impl(
+        Ok(self
+            .search_symbols_by_name_page_impl(
+                query,
+                limit,
+                seed_resolution,
+                SYMBOL_SEARCH_COUNT_CAP,
+                after_db_scan,
+                inside_publication_barrier,
+            )?
+            .symbols)
+    }
+
+    #[cfg(test)]
+    fn search_symbols_by_name_page_with_hooks(
+        &self,
+        query: &str,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+        count_cap: usize,
+        after_db_scan: impl FnOnce(),
+        inside_publication_barrier: impl FnOnce(),
+    ) -> Result<SymbolSearchPage, StoreError> {
+        self.search_symbols_by_name_page_impl(
             query,
             limit,
             seed_resolution,
+            count_cap,
             after_db_scan,
             inside_publication_barrier,
         )
     }
 
-    fn search_symbols_by_name_impl(
+    fn search_symbols_by_name_page_impl(
         &self,
         query: &str,
         limit: usize,
         seed_resolution: &SeedResolutionConfig,
+        count_cap: usize,
         after_db_scan: impl FnOnce(),
         inside_publication_barrier: impl FnOnce(),
-    ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
+    ) -> Result<SymbolSearchPage, StoreError> {
         let needle = query.to_lowercase();
         // --- Step 1: coherently snapshot publication state + cache ----------
         // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
@@ -782,10 +877,20 @@ impl GraphStore {
         // kind-priority + file-path tiebreaks. This prevents test/playwright
         // files from dominating when a PascalCase name also appears in
         // production code, and gives a deterministic order across calls.
-        let mut candidates: Vec<(f64, &nestweaver_schema::Symbol)> = Vec::new();
-        for (lower, sym) in &entry.symbols {
+        let mut candidates = BinaryHeap::new();
+        let mut counted = 0usize;
+        let mut count_saturated = false;
+        for (ordinal, (lower, sym)) in entry.symbols.iter().enumerate() {
             if !lower.contains(&needle) {
                 continue;
+            }
+            if counted < count_cap {
+                counted += 1;
+                if counted == count_cap {
+                    count_saturated = true;
+                }
+            } else {
+                count_saturated = true;
             }
             let base_score = if *lower == needle {
                 4.0_f64 // exact
@@ -796,26 +901,35 @@ impl GraphStore {
             };
             let path_factor = compute_path_factor(&sym.file_path, &seed_resolution.path_deboost);
             let adjusted = base_score * path_factor;
-            candidates.push((adjusted, sym));
+            if limit == 0 {
+                continue;
+            }
+            let ranked = RankedSymbol {
+                adjusted_score: adjusted,
+                kind_rank: kind_rank(sym.kind, &seed_resolution.kind_priority),
+                file_path: &sym.file_path,
+                ordinal,
+                symbol: sym,
+            };
+            if candidates.len() < limit {
+                candidates.push(ranked);
+            } else if candidates.peek().is_some_and(|worst| ranked < *worst) {
+                candidates.pop();
+                candidates.push(ranked);
+            }
         }
-        candidates.sort_by(|(a_score, a_sym), (b_score, b_sym)| {
-            // 1) adjusted DESC
-            b_score
-                .partial_cmp(a_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                // 2) kind_priority ASC (lower index = higher priority)
-                .then_with(|| {
-                    kind_rank(a_sym.kind, &seed_resolution.kind_priority)
-                        .cmp(&kind_rank(b_sym.kind, &seed_resolution.kind_priority))
-                })
-                // 3) file_path lexicographic ASC for deterministic stability
-                .then_with(|| a_sym.file_path.cmp(&b_sym.file_path))
-        });
-        Ok(candidates
+        let mut candidates = candidates.into_vec();
+        candidates.sort();
+        let symbols = candidates
             .into_iter()
-            .take(limit)
-            .map(|(_, sym)| sym.clone())
-            .collect())
+            .map(|candidate| candidate.symbol.clone())
+            .collect();
+        let total = if count_saturated {
+            SearchTotal::lower_bound(counted)
+        } else {
+            SearchTotal::exact(counted)
+        };
+        Ok(SymbolSearchPage { symbols, total })
     }
 }
 
@@ -828,6 +942,7 @@ mod tests {
     use super::{compute_path_factor, kind_rank};
     use crate::db::GraphStore;
     use crate::ranking::{PathDeboostRule, SeedResolutionConfig, default_kind_priority};
+    use crate::tantivy_index::SearchTotalRelation;
 
     fn make_symbol(uid: &str, name: &str) -> Symbol {
         Symbol {
@@ -959,6 +1074,63 @@ mod tests {
             path_deboost: Vec::new(),
             kind_priority: Vec::new(),
         }
+    }
+
+    #[test]
+    fn search_symbols_by_name_page_counts_before_the_presentation_limit() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [
+            ("s1", "Payment"),
+            ("s2", "PaymentGateway"),
+            ("s3", "RetryPayment"),
+        ] {
+            store.insert_symbol(&make_symbol(uid, name)).unwrap();
+        }
+
+        let page = store
+            .search_symbols_by_name_page("payment", 1, &no_rules())
+            .unwrap();
+        assert_eq!(page.symbols.len(), 1);
+        assert_eq!(page.total.value, 3);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+
+        let legacy = store
+            .search_symbols_by_name("payment", 1, &no_rules())
+            .unwrap();
+        assert_eq!(page.symbols[0].uid, legacy[0].uid);
+    }
+
+    #[test]
+    fn search_symbols_by_name_page_reports_lower_bound_without_changing_top_hits() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [
+            ("s1", "Payment"),
+            ("s2", "PaymentGateway"),
+            ("s3", "RetryPayment"),
+        ] {
+            store.insert_symbol(&make_symbol(uid, name)).unwrap();
+        }
+
+        let page = store
+            .search_symbols_by_name_page_with_hooks("payment", 1, &no_rules(), 2, || {}, || {})
+            .unwrap();
+        assert_eq!(page.symbols.len(), 1);
+        assert_eq!(page.symbols[0].uid, "s1");
+        assert_eq!(page.total.value, 2);
+        assert_eq!(page.total.relation, SearchTotalRelation::LowerBound);
+    }
+
+    #[test]
+    fn search_symbols_by_name_page_zero_limit_does_not_materialize_results() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&make_symbol("s1", "Payment")).unwrap();
+
+        let page = store
+            .search_symbols_by_name_page("payment", 0, &no_rules())
+            .unwrap();
+        assert!(page.symbols.is_empty());
+        assert_eq!(page.total.value, 1);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
     }
 
     /// Verify that `search_symbols_by_name` returns consistent results across

@@ -103,6 +103,14 @@ pub struct SymbolCandidate {
     pub start_line: u32,
 }
 
+/// Engine-facing counted symbol candidates. The total relation is preserved
+/// verbatim from the bounded store search.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SymbolCandidatePage {
+    pub results: Vec<SymbolCandidate>,
+    pub total: nestweaver_store::tantivy_index::SearchTotal,
+}
+
 impl From<&Symbol> for SymbolCandidate {
     fn from(s: &Symbol) -> Self {
         SymbolCandidate {
@@ -252,14 +260,102 @@ pub fn search_symbols(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SymbolCandidate>, anyhow::Error> {
-    let syms = store
-        .search_symbols_by_name(
+    Ok(search_symbols_page(store, query, limit)?.results)
+}
+
+/// Search for a bounded page of ranked symbols and independent total metadata.
+pub fn search_symbols_page(
+    store: &GraphStore,
+    query: &str,
+    limit: usize,
+) -> Result<SymbolCandidatePage, anyhow::Error> {
+    let page = store
+        .search_symbols_by_name_page(
             query,
             limit,
             &nestweaver_store::SeedResolutionConfig::default(),
         )
         .context("search_symbols_by_name")?;
-    Ok(syms.iter().map(SymbolCandidate::from).collect())
+    Ok(SymbolCandidatePage {
+        results: page.symbols.iter().map(SymbolCandidate::from).collect(),
+        total: page.total,
+    })
+}
+
+#[cfg(test)]
+mod counted_symbol_search_tests {
+    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+    use nestweaver_store::{GraphStore, TantivyIndex, tantivy_index::SearchTotalRelation};
+
+    use super::{search_symbols, search_symbols_page};
+
+    fn symbol(uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: format!("src/{uid}.rs"),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    #[test]
+    fn search_symbols_page_preserves_ranked_results_and_count_metadata() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&symbol("s1", "Payment")).unwrap();
+        store
+            .insert_symbol(&symbol("s2", "PaymentGateway"))
+            .unwrap();
+
+        let page = search_symbols_page(&store, "payment", 1).unwrap();
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.total.value, 2);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+
+        let legacy = search_symbols(&store, "payment", 1).unwrap();
+        assert_eq!(page.results[0].uid, legacy[0].uid);
+    }
+
+    #[test]
+    fn search_symbols_keeps_same_title_note_and_code_symbol_in_distinct_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index
+            .update_note(
+                "note:payment",
+                "Payment",
+                "vlt:t",
+                &["payment".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let note_page = index.search_page("payment", 1).unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&symbol("sym:payment", "Payment"))
+            .unwrap();
+        let symbol_page = search_symbols_page(&store, "payment", 1).unwrap();
+
+        assert_eq!(note_page.total.value, 1);
+        assert_eq!(symbol_page.total.value, 1);
+        assert_eq!(note_page.total.value + symbol_page.total.value, 2);
+    }
 }
 
 // ── Context command types ─────────────────────────────────────────────────────
