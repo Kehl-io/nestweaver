@@ -31,8 +31,8 @@ pub use regex::{
 };
 pub use search::{EmbeddingIndex, SearchResult};
 pub use tantivy_index::{
-    PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K, SearchHit,
-    TantivyError, TantivyIndex,
+    PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K,
+    SEARCH_PRESENTATION_LIMIT_MAX, SearchHit, TantivyError, TantivyIndex,
 };
 pub use traverse::{IMPACT_EDGE_TYPES, ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{

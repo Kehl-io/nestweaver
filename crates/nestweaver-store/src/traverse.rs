@@ -835,6 +835,12 @@ impl GraphStore {
         after_db_scan: impl FnOnce(),
         inside_publication_barrier: impl FnOnce(),
     ) -> Result<SymbolSearchPage, StoreError> {
+        if limit > crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX {
+            return Err(StoreError::PresentationLimitExceeded {
+                limit,
+                max: crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX,
+            });
+        }
         let needle = query.to_lowercase();
         // --- Step 1: coherently snapshot publication state + cache ----------
         // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
@@ -1131,6 +1137,43 @@ mod tests {
         assert!(page.symbols.is_empty());
         assert_eq!(page.total.value, 1);
         assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+    }
+
+    #[test]
+    fn symbol_search_entry_points_reject_extreme_presentation_limits() {
+        use crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX;
+
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&make_symbol("s1", "Payment")).unwrap();
+
+        assert!(
+            store
+                .search_symbols_by_name("payment", 0, &no_rules())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_symbols_by_name("payment", SEARCH_PRESENTATION_LIMIT_MAX, &no_rules())
+                .is_ok()
+        );
+        assert!(
+            store
+                .search_symbols_by_name_page("payment", SEARCH_PRESENTATION_LIMIT_MAX, &no_rules(),)
+                .is_ok()
+        );
+
+        for over_limit in [SEARCH_PRESENTATION_LIMIT_MAX + 1, usize::MAX] {
+            assert!(matches!(
+                store.search_symbols_by_name("payment", over_limit, &no_rules()),
+                Err(crate::StoreError::PresentationLimitExceeded { .. })
+            ));
+            assert!(
+                store
+                    .search_symbols_by_name_page("payment", over_limit, &no_rules())
+                    .is_err()
+            );
+        }
     }
 
     /// Verify that `search_symbols_by_name` returns consistent results across

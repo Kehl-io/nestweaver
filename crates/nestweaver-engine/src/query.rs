@@ -330,6 +330,28 @@ mod counted_symbol_search_tests {
     }
 
     #[test]
+    fn engine_symbol_search_rejects_extreme_presentation_limits() {
+        use nestweaver_store::SEARCH_PRESENTATION_LIMIT_MAX;
+
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&symbol("s1", "Payment")).unwrap();
+
+        assert!(search_symbols(&store, "payment", 0).unwrap().is_empty());
+        assert!(
+            search_symbols_page(&store, "payment", 0)
+                .unwrap()
+                .results
+                .is_empty()
+        );
+        assert!(search_symbols(&store, "payment", SEARCH_PRESENTATION_LIMIT_MAX).is_ok());
+        assert!(search_symbols_page(&store, "payment", SEARCH_PRESENTATION_LIMIT_MAX).is_ok());
+        for over_limit in [SEARCH_PRESENTATION_LIMIT_MAX + 1, usize::MAX] {
+            assert!(search_symbols(&store, "payment", over_limit).is_err());
+            assert!(search_symbols_page(&store, "payment", over_limit).is_err());
+        }
+    }
+
+    #[test]
     fn search_symbols_keeps_same_title_note_and_code_symbol_in_distinct_domains() {
         let dir = tempfile::tempdir().unwrap();
         let index = TantivyIndex::open_or_create(dir.path()).unwrap();

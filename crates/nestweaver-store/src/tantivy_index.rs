@@ -15,7 +15,7 @@
 //! its own mmap/segment lifecycle; we just point it at the directory.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -68,6 +68,10 @@ pub const PRF_MAX_QUERY_TERMS: usize = 64;
 /// Tantivy query. Reaching this cap yields a lower-bound total instead of
 /// growing memory with corpus cardinality.
 pub const TANTIVY_LOGICAL_COUNT_CAP: usize = 100_000;
+
+/// Maximum number of ranked hits any public search entry point may retain.
+/// Cardinality precision has its own, independent 100K bound above.
+pub const SEARCH_PRESENTATION_LIMIT_MAX: usize = 10_000;
 
 /// Single search result from the BM25 index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,21 +201,14 @@ impl SegmentCollector for LogicalEntitySegmentCollector {
         let uid = extract_text(&doc, self.uid);
         let kind = extract_text(&doc, self.kind);
         let note_uid = extract_text(&doc, self.note_uid);
-        let identity = if !note_uid.is_empty() {
-            LogicalEntityIdentity::Note(note_uid)
-        } else if matches!(kind.as_str(), "heading" | "section") {
-            // Indices created before note_uid became STORED cannot identify a
-            // fragment's owner. Refuse a misleading raw-document total; the
-            // legacy hit-only API remains available until the index is rebuilt.
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.error = Some(
-                "counted search requires reindex: matched fragment has no stored note_uid"
-                    .to_string(),
-            );
-            self.saturated.store(true, Ordering::Relaxed);
-            return;
-        } else {
-            LogicalEntityIdentity::Standalone { kind, uid }
+        let identity = match logical_entity_identity(&uid, &kind, &note_uid) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.error = Some(error);
+                self.saturated.store(true, Ordering::Relaxed);
+                return;
+            }
         };
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -229,6 +226,51 @@ impl SegmentCollector for LogicalEntitySegmentCollector {
     }
 
     fn harvest(self) -> Self::Fruit {}
+}
+
+fn logical_entity_identity(
+    uid: &str,
+    kind: &str,
+    note_uid: &str,
+) -> Result<LogicalEntityIdentity, String> {
+    if kind.trim().is_empty() || kind.trim() != kind || kind.contains('\0') {
+        return Err("invalid logical identity: kind is missing or malformed".to_string());
+    }
+    if uid.trim().is_empty() || uid.trim() != uid || uid.contains('\0') {
+        return Err(format!(
+            "invalid logical identity: {kind} document UID is missing or malformed"
+        ));
+    }
+
+    match kind {
+        "note" => {
+            if note_uid.trim().is_empty() || note_uid.trim() != note_uid || note_uid.contains('\0')
+            {
+                return Err(format!(
+                    "invalid logical identity: note {uid} has no owning note_uid"
+                ));
+            }
+            if note_uid != uid {
+                return Err(format!(
+                    "invalid logical identity: note UID {uid} disagrees with note_uid {note_uid}"
+                ));
+            }
+            Ok(LogicalEntityIdentity::Note(uid.to_string()))
+        }
+        "heading" | "section" => {
+            if note_uid.trim().is_empty() || note_uid.trim() != note_uid || note_uid.contains('\0')
+            {
+                return Err(format!(
+                    "invalid logical identity: {kind} {uid} has no owning note_uid"
+                ));
+            }
+            Ok(LogicalEntityIdentity::Note(note_uid.to_string()))
+        }
+        _ => Ok(LogicalEntityIdentity::Standalone {
+            kind: kind.to_string(),
+            uid: uid.to_string(),
+        }),
+    }
 }
 
 impl Collector for LogicalEntityCountCollector {
@@ -277,6 +319,14 @@ pub enum TantivyError {
     Io(String),
     #[error("writer unavailable: index opened in read-only mode")]
     WriterUnavailable,
+    #[error("presentation limit {limit} exceeds maximum {max}")]
+    PresentationLimitExceeded { limit: usize, max: usize },
+    #[error("counted search requires reindex: index schema does not store note ownership")]
+    CountedSearchRequiresReindex,
+    #[error("invalid index schema: {0}")]
+    InvalidSchema(String),
+    #[error("index was migrated to the current schema; reopen it before further use")]
+    IndexReopenRequired,
 }
 
 impl From<tantivy::TantivyError> for TantivyError {
@@ -293,7 +343,12 @@ impl From<std::io::Error> for TantivyError {
 
 impl From<TantivyError> for StoreError {
     fn from(e: TantivyError) -> Self {
-        StoreError::Query(e.to_string())
+        match e {
+            TantivyError::PresentationLimitExceeded { limit, max } => {
+                StoreError::PresentationLimitExceeded { limit, max }
+            }
+            other => StoreError::Query(other.to_string()),
+        }
     }
 }
 
@@ -315,10 +370,14 @@ pub struct TantivyIndex {
     reader: IndexReader,
     writer: Option<Mutex<tantivy::IndexWriter>>,
     fields: Fields,
+    path: PathBuf,
+    counted_search_supported: bool,
+    migration_completed: AtomicBool,
 }
 
 /// Field handles bundled together so we don't look them up by name on
 /// every operation.
+#[derive(Clone, Copy)]
 struct Fields {
     uid: Field,
     kind: Field,
@@ -334,14 +393,21 @@ impl TantivyIndex {
     /// segments; callers wanting a fresh start should remove the
     /// directory first.
     pub fn open_or_create(path: &Path) -> Result<Self, TantivyError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        recover_interrupted_reindex(path)?;
         std::fs::create_dir_all(path)?;
-        let schema = build_schema();
 
-        // Try open first; fall back to creation.
+        // Only create into an empty directory. A malformed non-empty index is
+        // surfaced instead of being mistaken for a missing index.
         let index = match Index::open_in_dir(path) {
             Ok(idx) => idx,
-            Err(_) => Index::create_in_dir(path, schema.clone())?,
+            Err(_) if directory_is_empty(path)? => Index::create_in_dir(path, build_schema())?,
+            Err(open_error) => return Err(open_error.into()),
         };
+        let schema = index.schema();
+        let schema = inspect_schema(&schema)?;
 
         // ~50 MB write buffer — sufficient for vaults up to ~50K
         // documents per the architecture doc's memory budget.
@@ -351,13 +417,14 @@ impl TantivyIndex {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
 
-        let fields = lookup_fields(&schema);
-
         Ok(Self {
             index,
             reader,
             writer: Some(Mutex::new(writer)),
-            fields,
+            fields: schema.fields,
+            path: path.to_path_buf(),
+            counted_search_supported: schema.current,
+            migration_completed: AtomicBool::new(false),
         })
     }
 
@@ -368,19 +435,22 @@ impl TantivyIndex {
     ///
     /// Returns `Err` if the index directory does not exist or is corrupt.
     pub fn open_reader_only(path: &Path) -> Result<Self, TantivyError> {
+        recover_interrupted_reindex(path)?;
         let index = Index::open_in_dir(path)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
-        let schema = index.schema();
-        let fields = lookup_fields(&schema);
+        let schema = inspect_schema(&index.schema())?;
 
         Ok(Self {
             index,
             reader,
             writer: None,
-            fields,
+            fields: schema.fields,
+            path: path.to_path_buf(),
+            counted_search_supported: schema.current,
+            migration_completed: AtomicBool::new(false),
         })
     }
 
@@ -394,6 +464,7 @@ impl TantivyIndex {
     /// empty window. Do NOT add an intermediate `commit()` after the delete —
     /// see `reindex_from_store_is_atomic_for_readers`.
     pub fn reindex_from_store(&self, store: &GraphStore) -> Result<usize, TantivyError> {
+        self.ensure_reopen_not_required()?;
         let writer_mutex = self
             .writer
             .as_ref()
@@ -401,12 +472,113 @@ impl TantivyIndex {
         let mut writer = writer_mutex
             .lock()
             .map_err(|e| TantivyError::Tantivy(format!("writer lock poisoned: {e}")))?;
+        if !self.counted_search_supported {
+            return self.rebuild_current_schema_atomically(store, writer);
+        }
         writer.delete_all_documents()?;
         let count = self.write_full_corpus(&mut writer, store)?;
         writer.commit()?;
         // Manually reload the reader so subsequent searches see the new
         // segments without waiting for the OnCommitWithDelay tick.
         self.reader.reload()?;
+        Ok(count)
+    }
+
+    fn ensure_reopen_not_required(&self) -> Result<(), TantivyError> {
+        if self.migration_completed.load(Ordering::Acquire) {
+            Err(TantivyError::IndexReopenRequired)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn rebuild_current_schema_atomically(
+        &self,
+        store: &GraphStore,
+        old_writer: std::sync::MutexGuard<'_, tantivy::IndexWriter>,
+    ) -> Result<usize, TantivyError> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let staging_dir = tempfile::Builder::new()
+            .prefix(".nestweaver-tantivy-reindex-")
+            .tempdir_in(parent)?;
+        let staging_index = Index::create_in_dir(staging_dir.path(), build_schema())?;
+        let staging_schema = inspect_schema(&staging_index.schema())?;
+        if !staging_schema.current {
+            return Err(TantivyError::InvalidSchema(
+                "newly built schema is not current".to_string(),
+            ));
+        }
+        let mut staging_writer = staging_index.writer(50_000_000)?;
+        let count = Self::write_full_corpus_with_fields(
+            &mut staging_writer,
+            store,
+            &staging_schema.fields,
+        )?;
+        staging_writer.commit()?;
+        drop(staging_writer);
+        drop(staging_index);
+
+        // Validate the complete replacement before touching the usable index.
+        let verification = Index::open_in_dir(staging_dir.path())?;
+        if !inspect_schema(&verification.schema())?.current {
+            return Err(TantivyError::InvalidSchema(
+                "rebuilt index did not persist the current schema".to_string(),
+            ));
+        }
+        drop(verification);
+
+        let backup = reindex_backup_path(&self.path);
+        if backup.exists() {
+            return Err(TantivyError::Io(format!(
+                "refusing index migration while recovery directory exists: {}",
+                backup.display()
+            )));
+        }
+        let staging_path = staging_dir.keep();
+
+        std::fs::rename(&self.path, &backup).map_err(|error| {
+            let _ = std::fs::remove_dir_all(&staging_path);
+            TantivyError::Io(format!(
+                "move existing index {} to recovery directory {}: {error}",
+                self.path.display(),
+                backup.display()
+            ))
+        })?;
+        if let Err(error) = crate::durable_sidecar::sync_parent_directory_durable(&self.path) {
+            let rollback = std::fs::rename(&backup, &self.path);
+            let _ = crate::durable_sidecar::sync_parent_directory_durable(&self.path);
+            let _ = std::fs::remove_dir_all(&staging_path);
+            return Err(TantivyError::Io(format!(
+                "persist index recovery rename: {error}; rollback: {rollback:?}"
+            )));
+        }
+
+        if let Err(error) = std::fs::rename(&staging_path, &self.path) {
+            let rollback = std::fs::rename(&backup, &self.path);
+            let _ = crate::durable_sidecar::sync_parent_directory_durable(&self.path);
+            let _ = std::fs::remove_dir_all(&staging_path);
+            return Err(TantivyError::Io(format!(
+                "install rebuilt index at {}: {error}; rollback: {rollback:?}",
+                self.path.display()
+            )));
+        }
+        self.migration_completed.store(true, Ordering::Release);
+
+        // From here onward a complete new index and the old recovery copy both
+        // exist. Persist and verify the new namespace before retiring the old.
+        crate::durable_sidecar::sync_parent_directory_durable(&self.path)?;
+        let installed = Index::open_in_dir(&self.path)?;
+        if !inspect_schema(&installed.schema())?.current {
+            return Err(TantivyError::InvalidSchema(
+                "installed replacement schema is not current; old index remains recoverable"
+                    .to_string(),
+            ));
+        }
+        drop(installed);
+        drop(old_writer);
+
+        std::fs::remove_dir_all(&backup)?;
+        crate::durable_sidecar::sync_parent_directory_durable(&backup)?;
         Ok(count)
     }
 
@@ -429,6 +601,7 @@ impl TantivyIndex {
         sections: &[(String, String, String)],
         tags: &[String],
     ) -> Result<(), TantivyError> {
+        self.ensure_reopen_not_required()?;
         let writer_mutex = self
             .writer
             .as_ref()
@@ -508,6 +681,7 @@ impl TantivyIndex {
             Vec<String>,
         )],
     ) -> Result<(), TantivyError> {
+        self.ensure_reopen_not_required()?;
         let writer_mutex = self
             .writer
             .as_ref()
@@ -569,6 +743,7 @@ impl TantivyIndex {
     /// Drop every Tantivy doc belonging to `note_uid`. Called by the
     /// watcher on file delete.
     pub fn remove_note(&self, note_uid: &str) -> Result<(), TantivyError> {
+        self.ensure_reopen_not_required()?;
         let writer_mutex = self
             .writer
             .as_ref()
@@ -593,6 +768,7 @@ impl TantivyIndex {
     /// BM25 search across title + body fields. Returns up to `limit`
     /// hits ranked by Tantivy's default BM25 scoring.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, TantivyError> {
+        validate_presentation_limit(limit)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -628,6 +804,10 @@ impl TantivyIndex {
         limit: usize,
         count_cap: usize,
     ) -> Result<TantivySearchPage, TantivyError> {
+        validate_presentation_limit(limit)?;
+        if !self.counted_search_supported {
+            return Err(TantivyError::CountedSearchRequiresReindex);
+        }
         let Some(parsed) = self.parse_query(query) else {
             return Ok(TantivySearchPage {
                 hits: Vec::new(),
@@ -742,6 +922,7 @@ impl TantivyIndex {
         limit: usize,
         stopwords: &[&str],
     ) -> Result<(Vec<SearchHit>, Vec<String>), TantivyError> {
+        validate_presentation_limit(limit)?;
         if query.trim().is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -763,6 +944,10 @@ impl TantivyIndex {
         limit: usize,
         stopwords: &[&str],
     ) -> Result<TantivyPrfSearchPage, TantivyError> {
+        validate_presentation_limit(limit)?;
+        if !self.counted_search_supported {
+            return Err(TantivyError::CountedSearchRequiresReindex);
+        }
         if query.trim().is_empty() {
             return Ok(TantivyPrfSearchPage {
                 hits: Vec::new(),
@@ -975,6 +1160,14 @@ impl TantivyIndex {
         writer: &mut tantivy::IndexWriter,
         store: &GraphStore,
     ) -> Result<usize, TantivyError> {
+        Self::write_full_corpus_with_fields(writer, store, &self.fields)
+    }
+
+    fn write_full_corpus_with_fields(
+        writer: &mut tantivy::IndexWriter,
+        store: &GraphStore,
+        fields: &Fields,
+    ) -> Result<usize, TantivyError> {
         use std::collections::HashMap;
 
         let mut count = 0usize;
@@ -1026,23 +1219,23 @@ impl TantivyIndex {
 
             let note_body = body_from_disk.as_deref().unwrap_or(&note.title);
             writer.add_document(doc!(
-                self.fields.uid => note.uid.clone(),
-                self.fields.kind => "note".to_string(),
-                self.fields.title => note.title.clone(),
-                self.fields.body => note_body.to_string(),
-                self.fields.vault_uid => note.vault_uid.clone(),
-                self.fields.note_uid => note.uid.clone(),
+                fields.uid => note.uid.clone(),
+                fields.kind => "note".to_string(),
+                fields.title => note.title.clone(),
+                fields.body => note_body.to_string(),
+                fields.vault_uid => note.vault_uid.clone(),
+                fields.note_uid => note.uid.clone(),
             ))?;
             count += 1;
 
             for h in headings {
                 writer.add_document(doc!(
-                    self.fields.uid => h.uid.clone(),
-                    self.fields.kind => "heading".to_string(),
-                    self.fields.title => h.text.clone(),
-                    self.fields.body => h.text.clone(),
-                    self.fields.vault_uid => note.vault_uid.clone(),
-                    self.fields.note_uid => note.uid.clone(),
+                    fields.uid => h.uid.clone(),
+                    fields.kind => "heading".to_string(),
+                    fields.title => h.text.clone(),
+                    fields.body => h.text.clone(),
+                    fields.vault_uid => note.vault_uid.clone(),
+                    fields.note_uid => note.uid.clone(),
                 ))?;
                 count += 1;
             }
@@ -1073,12 +1266,12 @@ impl TantivyIndex {
                     .map(|h| h.text.clone())
                     .unwrap_or_default();
                 writer.add_document(doc!(
-                    self.fields.uid => s.uid.clone(),
-                    self.fields.kind => "section".to_string(),
-                    self.fields.title => section_title,
-                    self.fields.body => section_text,
-                    self.fields.vault_uid => note.vault_uid.clone(),
-                    self.fields.note_uid => note.uid.clone(),
+                    fields.uid => s.uid.clone(),
+                    fields.kind => "section".to_string(),
+                    fields.title => section_title,
+                    fields.body => section_text,
+                    fields.vault_uid => note.vault_uid.clone(),
+                    fields.note_uid => note.uid.clone(),
                 ))?;
                 count += 1;
             }
@@ -1091,12 +1284,12 @@ impl TantivyIndex {
             .map_err(|e| TantivyError::Tantivy(e.to_string()))?;
         for tag in &tags {
             writer.add_document(doc!(
-                self.fields.uid => tag.uid.clone(),
-                self.fields.kind => "tag".to_string(),
-                self.fields.title => tag.name.clone(),
-                self.fields.body => tag.name.clone(),
-                self.fields.vault_uid => tag.vault_uid.clone(),
-                self.fields.note_uid => String::new(),
+                fields.uid => tag.uid.clone(),
+                fields.kind => "tag".to_string(),
+                fields.title => tag.name.clone(),
+                fields.body => tag.name.clone(),
+                fields.vault_uid => tag.vault_uid.clone(),
+                fields.note_uid => String::new(),
             ))?;
             count += 1;
         }
@@ -1125,15 +1318,130 @@ fn build_schema() -> Schema {
     builder.build()
 }
 
-fn lookup_fields(schema: &Schema) -> Fields {
-    Fields {
-        uid: schema.get_field("uid").expect("uid field"),
-        kind: schema.get_field("kind").expect("kind field"),
-        title: schema.get_field("title").expect("title field"),
-        body: schema.get_field("body").expect("body field"),
-        vault_uid: schema.get_field("vault_uid").expect("vault_uid field"),
-        note_uid: schema.get_field("note_uid").expect("note_uid field"),
+struct SchemaInspection {
+    fields: Fields,
+    current: bool,
+}
+
+fn inspect_schema(schema: &Schema) -> Result<SchemaInspection, TantivyError> {
+    let field = |name: &str| {
+        schema
+            .get_field(name)
+            .map_err(|_| TantivyError::InvalidSchema(format!("missing required field {name:?}")))
+    };
+    let fields = Fields {
+        uid: field("uid")?,
+        kind: field("kind")?,
+        title: field("title")?,
+        body: field("body")?,
+        vault_uid: field("vault_uid")?,
+        note_uid: field("note_uid")?,
+    };
+
+    for (name, field) in [
+        ("uid", fields.uid),
+        ("kind", fields.kind),
+        ("title", fields.title),
+        ("body", fields.body),
+        ("vault_uid", fields.vault_uid),
+        ("note_uid", fields.note_uid),
+    ] {
+        let entry = schema.get_field_entry(field);
+        if !entry.field_type().is_str() || !entry.is_indexed() {
+            return Err(TantivyError::InvalidSchema(format!(
+                "required field {name:?} must be indexed text"
+            )));
+        }
     }
+    for (name, field) in [
+        ("uid", fields.uid),
+        ("kind", fields.kind),
+        ("title", fields.title),
+        ("vault_uid", fields.vault_uid),
+    ] {
+        if !schema.get_field_entry(field).is_stored() {
+            return Err(TantivyError::InvalidSchema(format!(
+                "required field {name:?} must be stored"
+            )));
+        }
+    }
+
+    // Equality against the canonical entries validates all current text
+    // options (tokenizer, record detail, storage), not merely field presence.
+    let canonical = build_schema();
+    let current = ["uid", "kind", "title", "body", "vault_uid", "note_uid"]
+        .into_iter()
+        .all(|name| {
+            let actual = schema.get_field(name).ok();
+            let expected = canonical.get_field(name).ok();
+            match (actual, expected) {
+                (Some(actual), Some(expected)) => {
+                    schema.get_field_entry(actual) == canonical.get_field_entry(expected)
+                }
+                _ => false,
+            }
+        });
+
+    Ok(SchemaInspection { fields, current })
+}
+
+fn validate_presentation_limit(limit: usize) -> Result<(), TantivyError> {
+    if limit > SEARCH_PRESENTATION_LIMIT_MAX {
+        Err(TantivyError::PresentationLimitExceeded {
+            limit,
+            max: SEARCH_PRESENTATION_LIMIT_MAX,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool, TantivyError> {
+    Ok(std::fs::read_dir(path)?.next().is_none())
+}
+
+fn reindex_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".reindexing");
+    PathBuf::from(backup)
+}
+
+fn recover_interrupted_reindex(path: &Path) -> Result<(), TantivyError> {
+    let backup = reindex_backup_path(path);
+    if !backup.exists() {
+        return Ok(());
+    }
+
+    let target_present = path.exists() && !directory_is_empty(path)?;
+    if target_present {
+        // A replacement may have been installed before the crash. Retire the
+        // recovery copy only after validating it. If validation fails, first
+        // validate the recovery copy, then restore it over the failed install.
+        let target_valid = Index::open_in_dir(path)
+            .map_err(TantivyError::from)
+            .and_then(|index| inspect_schema(&index.schema()).map(|_| index));
+        if let Ok(index) = target_valid {
+            drop(index);
+            std::fs::remove_dir_all(&backup)?;
+            crate::durable_sidecar::sync_parent_directory_durable(&backup)?;
+            return Ok(());
+        }
+
+        let recovery = Index::open_in_dir(&backup)?;
+        inspect_schema(&recovery.schema())?;
+        drop(recovery);
+        std::fs::remove_dir_all(path)?;
+        std::fs::rename(&backup, path)?;
+        crate::durable_sidecar::sync_parent_directory_durable(path)?;
+        return Ok(());
+    }
+
+    if path.exists() {
+        std::fs::remove_dir(path)?;
+    }
+    std::fs::rename(&backup, path)?;
+    crate::durable_sidecar::sync_parent_directory_durable(path)?;
+    Ok(())
 }
 
 fn extract_text(doc: &TantivyDocument, field: Field) -> String {
@@ -1207,8 +1515,25 @@ fn escape_query(q: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nestweaver_schema::{Note, NoteKind, Tag, Vault};
+    use nestweaver_schema::{Heading, Note, NoteKind, Section, Tag, Vault};
     use tempfile::tempdir;
+
+    fn add_raw_document(idx: &TantivyIndex, uid: &str, kind: &str, note_uid: &str, text: &str) {
+        let mut writer = idx.writer.as_ref().unwrap().lock().unwrap();
+        writer
+            .add_document(doc!(
+                idx.fields.uid => uid.to_string(),
+                idx.fields.kind => kind.to_string(),
+                idx.fields.title => text.to_string(),
+                idx.fields.body => text.to_string(),
+                idx.fields.vault_uid => "vlt:t".to_string(),
+                idx.fields.note_uid => note_uid.to_string(),
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        idx.reader.reload().unwrap();
+    }
 
     fn make_store_with_notes() -> GraphStore {
         let store = GraphStore::in_memory().unwrap();
@@ -1360,6 +1685,83 @@ mod tests {
         assert!(page.hits.is_empty());
         assert_eq!(page.total.value, 1);
         assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+    }
+
+    #[test]
+    fn search_entry_points_bound_presentation_limits_before_allocation() {
+        assert_eq!(SEARCH_PRESENTATION_LIMIT_MAX, 10_000);
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+        idx.update_note(
+            "note:bounded-limit",
+            "Payment",
+            "vlt:t",
+            &["payment".to_string()],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert!(idx.search_prf("payment", 0, &[]).unwrap().0.is_empty());
+        let zero_prf_page = idx.search_prf_page("payment", 0, &[]).unwrap();
+        assert!(zero_prf_page.hits.is_empty());
+        assert_eq!(zero_prf_page.total, SearchTotal::exact(1));
+        assert!(idx.search("payment", SEARCH_PRESENTATION_LIMIT_MAX).is_ok());
+        assert!(
+            idx.search_page("payment", SEARCH_PRESENTATION_LIMIT_MAX)
+                .is_ok()
+        );
+        assert!(
+            idx.search_prf("payment", SEARCH_PRESENTATION_LIMIT_MAX, &[])
+                .is_ok()
+        );
+        assert!(
+            idx.search_prf_page("payment", SEARCH_PRESENTATION_LIMIT_MAX, &[])
+                .is_ok()
+        );
+
+        for over_limit in [SEARCH_PRESENTATION_LIMIT_MAX + 1, usize::MAX] {
+            assert!(matches!(
+                idx.search("payment", over_limit),
+                Err(TantivyError::PresentationLimitExceeded { .. })
+            ));
+            assert!(idx.search_page("payment", over_limit).is_err());
+            assert!(idx.search_prf("payment", over_limit, &[]).is_err());
+            assert!(idx.search_prf_page("payment", over_limit, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn counted_identity_is_derived_from_kind_and_rejects_malformed_documents() {
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+
+        // Standalone kinds ignore stale ownership metadata and remain distinct
+        // from the note whose UID happens to appear in note_uid.
+        add_raw_document(&idx, "note:owner", "note", "note:owner", "payment");
+        add_raw_document(&idx, "tag:payment", "tag", "note:owner", "payment");
+        let page = idx.search_page("payment", 10).unwrap();
+        assert_eq!(page.total, SearchTotal::exact(2));
+
+        for (uid, kind, note_uid) in [
+            ("note:missing-owner", "note", ""),
+            ("", "note", "note:missing-uid"),
+            ("note:mismatch", "note", "note:other"),
+            ("head:missing-owner", "heading", ""),
+            ("sec:missing-owner", "section", ""),
+            ("tag:missing-kind", "", ""),
+            ("", "tag", ""),
+        ] {
+            let malformed_dir = tempdir().unwrap();
+            let malformed = TantivyIndex::open_or_create(malformed_dir.path()).unwrap();
+            add_raw_document(&malformed, uid, kind, note_uid, "payment");
+            let error = malformed.search_page("payment", 10).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid logical identity"),
+                "unexpected error for ({uid:?}, {kind:?}, {note_uid:?}): {error}"
+            );
+        }
     }
 
     #[test]
@@ -1623,12 +2025,14 @@ mod tests {
     fn legacy_prf_search_remains_compatible_with_pre_count_indices() {
         let dir = tempdir().unwrap();
         let mut schema_builder = Schema::builder();
-        let uid = schema_builder.add_text_field("uid", STRING | STORED);
-        let kind = schema_builder.add_text_field("kind", STRING | STORED);
-        let title = schema_builder.add_text_field("title", TEXT | STORED);
-        let body = schema_builder.add_text_field("body", TEXT);
-        let vault_uid = schema_builder.add_text_field("vault_uid", STRING | STORED);
+        // Deliberately use a different field order from the current schema:
+        // open paths must derive handles from the schema on disk.
         let note_uid = schema_builder.add_text_field("note_uid", STRING);
+        let body = schema_builder.add_text_field("body", TEXT);
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let uid = schema_builder.add_text_field("uid", STRING | STORED);
+        let vault_uid = schema_builder.add_text_field("vault_uid", STRING | STORED);
+        let kind = schema_builder.add_text_field("kind", STRING | STORED);
         let index = Index::create_in_dir(dir.path(), schema_builder.build()).unwrap();
         let mut writer = index.writer(15_000_000).unwrap();
         writer
@@ -1652,6 +2056,171 @@ mod tests {
 
         let error = idx.search_page("payment", 5).unwrap_err();
         assert!(error.to_string().contains("requires reindex"));
+    }
+
+    #[test]
+    fn public_reindex_migrates_pre_count_schema_for_exact_fragment_totals() {
+        let dir = tempdir().unwrap();
+        let mut schema_builder = Schema::builder();
+        let uid = schema_builder.add_text_field("uid", STRING | STORED);
+        let kind = schema_builder.add_text_field("kind", STRING | STORED);
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let body = schema_builder.add_text_field("body", TEXT);
+        let vault_uid = schema_builder.add_text_field("vault_uid", STRING | STORED);
+        let note_uid = schema_builder.add_text_field("note_uid", STRING);
+        let index = Index::create_in_dir(dir.path(), schema_builder.build()).unwrap();
+        let mut writer = index.writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                uid => "note:legacy",
+                kind => "note",
+                title => "Old Payment",
+                body => "payment",
+                vault_uid => "vlt:t",
+                note_uid => "note:legacy",
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(index);
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:t".to_string(),
+                name: "t".to_string(),
+                root_path: dir.path().join("vault").display().to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:legacy".to_string(),
+                vault_uid: "vlt:t".to_string(),
+                file_path: "legacy.md".to_string(),
+                title: "Payment Note".to_string(),
+                note_kind: NoteKind::Design,
+                word_count: 3,
+                content_hash: "note-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: "head:legacy".to_string(),
+                note_uid: "note:legacy".to_string(),
+                level: 1,
+                text: "Payment Heading".to_string(),
+                slug: "payment-heading".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: "heading-hash".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:legacy".to_string(),
+                note_uid: "note:legacy".to_string(),
+                heading_uid: Some("head:legacy".to_string()),
+                start_line: 2,
+                end_line: 3,
+                text_hash: "section-hash".to_string(),
+                text_content: "payment section".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+
+        let legacy = TantivyIndex::open_or_create(dir.path()).unwrap();
+        assert_eq!(legacy.search("payment", 10).unwrap().len(), 1);
+        assert_eq!(legacy.reindex_from_store(&store).unwrap(), 3);
+        drop(legacy);
+
+        let reopened = TantivyIndex::open_reader_only(dir.path()).unwrap();
+        let page = reopened.search_page("payment", 10).unwrap();
+        assert_eq!(page.hits.len(), 3);
+        assert_eq!(page.total, SearchTotal::exact(1));
+        assert!(
+            reopened
+                .index
+                .schema()
+                .get_field_entry(reopened.fields.note_uid)
+                .is_stored()
+        );
+    }
+
+    #[test]
+    fn interrupted_schema_migration_recovers_the_rename_aside_copy() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        let idx = TantivyIndex::open_or_create(&index_path).unwrap();
+        idx.update_note(
+            "note:recover",
+            "Payment Recovery",
+            "vlt:t",
+            &["payment".to_string()],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        drop(idx);
+
+        let recovery_path = reindex_backup_path(&index_path);
+        std::fs::rename(&index_path, &recovery_path).unwrap();
+        let reopened = TantivyIndex::open_reader_only(&index_path).unwrap();
+        assert_eq!(reopened.search("payment", 10).unwrap().len(), 1);
+        assert!(index_path.exists());
+        assert!(!recovery_path.exists());
+    }
+
+    #[test]
+    fn failed_schema_migration_leaves_the_old_index_usable() {
+        let root = tempdir().unwrap();
+        let index_path = root.path().join("search-index");
+        std::fs::create_dir(&index_path).unwrap();
+        let mut schema_builder = Schema::builder();
+        let uid = schema_builder.add_text_field("uid", STRING | STORED);
+        let kind = schema_builder.add_text_field("kind", STRING | STORED);
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let body = schema_builder.add_text_field("body", TEXT);
+        let vault_uid = schema_builder.add_text_field("vault_uid", STRING | STORED);
+        let note_uid = schema_builder.add_text_field("note_uid", STRING);
+        let index = Index::create_in_dir(&index_path, schema_builder.build()).unwrap();
+        let mut writer = index.writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                uid => "note:old",
+                kind => "note",
+                title => "Payment Old",
+                body => "payment",
+                vault_uid => "vlt:t",
+                note_uid => "note:old",
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(index);
+
+        let legacy = TantivyIndex::open_or_create(&index_path).unwrap();
+        let recovery_path = reindex_backup_path(&index_path);
+        std::fs::create_dir(&recovery_path).unwrap();
+        let error = legacy
+            .reindex_from_store(&GraphStore::in_memory().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("recovery directory exists"));
+        assert_eq!(legacy.search("payment", 10).unwrap().len(), 1);
+        assert!(index_path.exists());
+        std::fs::remove_dir(&recovery_path).unwrap();
+        drop(legacy);
+
+        let reopened = TantivyIndex::open_reader_only(&index_path).unwrap();
+        assert_eq!(reopened.search("payment", 10).unwrap().len(), 1);
     }
 
     // ── PRF (Feature F7) tests ──────────────────────────────────────────

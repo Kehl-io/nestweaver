@@ -31,6 +31,8 @@ pub enum StoreError {
     Query(String),
     #[error("not found")]
     NotFound,
+    #[error("presentation limit {limit} exceeds maximum {max}")]
+    PresentationLimitExceeded { limit: usize, max: usize },
     /// The computation was cancelled cooperatively before it could finish.
     /// Distinct from an empty result so callers never cache a truncated answer.
     #[error("query cancelled: {0}")]
@@ -54,9 +56,10 @@ impl StoreError {
                     || lower.contains("unique")
                     || lower.contains("constraint")
             }
-            StoreError::NotFound | StoreError::Cancelled(_) | StoreError::CorruptValue { .. } => {
-                false
-            }
+            StoreError::NotFound
+            | StoreError::PresentationLimitExceeded { .. }
+            | StoreError::Cancelled(_)
+            | StoreError::CorruptValue { .. } => false,
         }
     }
 
