@@ -205,7 +205,18 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     // (nw-085). The per-symbol walk below is the identical confidence-weighted
     // max-product reverse BFS (same edge set, depth cap, confidence + threshold
     // pruning), just over the in-memory adjacency.
-    let symbols = store.list_all_symbols().unwrap_or_default();
+    let symbols = match store.list_all_symbols() {
+        Ok(symbols) => symbols,
+        Err(e) => {
+            notifications.push(Notification {
+                level: NotificationLevel::Error,
+                message: format!("listing symbols for affected-test resolution failed: {e}"),
+                descriptor: "store.list-symbols-failed".to_string(),
+            });
+            status = status.max(AnalysisStatus::Degraded);
+            Vec::new()
+        }
+    };
     let sym_by_uid: HashMap<String, &nestweaver_schema::Symbol> =
         symbols.iter().map(|s| (s.uid.clone(), s)).collect();
     let rev_adj = match store.load_typed_edges() {
@@ -598,6 +609,44 @@ mod tests {
             tier1_names.contains(&"test_util"),
             "the TestEntry-flagged inline test must be selected as tier-1; got {tier1_names:?}"
         );
+    }
+
+    #[test]
+    fn corrupt_unrelated_symbol_forces_full_suite_fallback() {
+        let store = GraphStore::in_memory().expect("store");
+        let changed = sym("sym:changed", "changed", "src/changed.rs");
+        let test = sym("sym:test", "changed_is_covered", "tests/changed_test.rs");
+        store.insert_symbol(&changed).expect("changed symbol");
+        store.insert_symbol(&test).expect("test symbol");
+        store
+            .insert_edge(&edge("sym:test", "sym:changed"))
+            .expect("test edge");
+
+        let mut corrupt = sym("sym:corrupt", "unrelated", "src/unrelated.rs");
+        corrupt.name = "unrelated\0corrupt".to_string();
+        store.insert_symbol(&corrupt).expect("corrupt canary");
+
+        assert_eq!(
+            store
+                .symbols_in_file("src/changed.rs")
+                .expect("changed-file lookup remains usable")
+                .len(),
+            1
+        );
+        assert!(
+            store.list_all_symbols().is_err(),
+            "global enumeration must encounter the unrelated corruption canary"
+        );
+
+        let result =
+            affected_tests(&store, &["src/changed.rs".to_string()]).expect("partial result");
+
+        assert_eq!(result.status, AnalysisStatus::Degraded);
+        assert_eq!(result.recommendation, "run-full-suite");
+        assert!(result.notifications.iter().any(|notification| {
+            notification.level == NotificationLevel::Error
+                && notification.descriptor == "store.list-symbols-failed"
+        }));
     }
 
     #[test]
