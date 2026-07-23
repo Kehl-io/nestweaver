@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use nestweaver_schema::uid::{SearchEntityUidKind, normalize_search_entity_uid};
 use serde_json::Value;
 
 use crate::merge::rrf_merge;
@@ -22,15 +23,15 @@ fn search_count_metadata(value: &Value, result_count: usize) -> SearchCountMetad
     let truncated = value.get("truncated").and_then(Value::as_bool);
     let actual = result_count as u64;
 
-    let valid = matches!(
-        (total, returned, relation, truncated),
-        (Some(total), Some(returned), Some("eq"), Some(truncated))
-            if returned == actual && total >= returned && (truncated || total == returned)
-    ) || matches!(
-        (total, returned, relation, truncated),
-        (Some(total), Some(returned), Some("gte"), Some(true))
-            if returned == actual && total >= returned
-    );
+    let valid = match (total, returned, relation, truncated) {
+        (Some(total), Some(returned), Some("eq"), Some(truncated)) => {
+            returned == actual && total >= returned && truncated == (returned < total)
+        }
+        (Some(total), Some(returned), Some("gte"), Some(true)) => {
+            returned == actual && total >= returned
+        }
+        _ => false,
+    };
     let complete = valid
         && matches!(
             (total, returned, relation, truncated),
@@ -46,35 +47,21 @@ fn search_count_metadata(value: &Value, result_count: usize) -> SearchCountMetad
 
 /// Return the canonical logical identity carried by a `brain_search` row.
 ///
-/// Search UIDs are presentation-independent and domain-qualified: notes,
-/// standalone tags, and symbols use distinct prefixes, while symbol UIDs also
-/// encode repository ownership. Older concise responses can have an empty UID;
-/// those rows are deliberately unkeyed and cannot prove union cardinality.
+/// The shared schema parser enforces the exact constructor grammar before
+/// removing the instance component. This layer additionally checks that the
+/// row's presentation kind agrees with the parsed UID domain. Older concise or
+/// malformed responses remain unkeyed and cannot prove union cardinality.
 fn brain_search_logical_uid(value: &Value) -> Option<String> {
     let uid = value.get("uid").and_then(Value::as_str)?;
     let kind = value.get("kind").and_then(Value::as_str)?;
-    let parts: Vec<&str> = uid.split(':').collect();
-    let supported_domain = match parts.as_slice() {
-        ["note" | "tag", "vlt", _, _, ..] => kind == "note",
-        ["sym", "repo", _, _, ..] => kind.starts_with("Symbol/"),
-        _ => false,
+    let (uid_kind, normalized) = normalize_search_entity_uid(uid)?;
+    let kind_matches = match uid_kind {
+        SearchEntityUidKind::Note | SearchEntityUidKind::Tag => kind == "note",
+        SearchEntityUidKind::Symbol => kind
+            .strip_prefix("Symbol/")
+            .is_some_and(|symbol_kind| !symbol_kind.is_empty()),
     };
-    if !supported_domain {
-        return None;
-    }
-
-    // UIDs include the indexing instance as their third component. The same
-    // logical repo/vault indexed by a laptop and an org server must still
-    // coalesce, so remove only that transport-local component and retain the
-    // domain plus every ownership/content component after it.
-    Some(
-        parts[..2]
-            .iter()
-            .chain(parts[3..].iter())
-            .copied()
-            .collect::<Vec<_>>()
-            .join(":"),
-    )
+    kind_matches.then_some(normalized)
 }
 
 fn has_proven_unique_search_identities(items: &[Value]) -> bool {
@@ -470,6 +457,7 @@ pub fn inject_or_wrap_provenance(result: &mut Value, sources: &[&str], stale_rep
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nestweaver_schema::uid::{note_uid, repo_uid, symbol_uid, tag_uid, vault_uid};
     use serde_json::json;
 
     #[test]
@@ -706,26 +694,69 @@ mod tests {
         })
     }
 
+    fn symbol_search_uid(
+        instance: &str,
+        repo_url: &str,
+        file_path: &str,
+        name: &str,
+        line: u32,
+    ) -> String {
+        symbol_uid(&repo_uid(instance, repo_url), file_path, name, line)
+    }
+
+    fn symbol_search_row(
+        instance: &str,
+        repo_url: &str,
+        file_path: &str,
+        name: &str,
+        line: u32,
+    ) -> Value {
+        json!({
+            "uid": symbol_search_uid(instance, repo_url, file_path, name, line),
+            "kind": "Symbol/Function",
+            "title": name,
+            "location": format!("{file_path}:{line}")
+        })
+    }
+
+    fn note_search_row(instance: &str, root_path: &str, rel_path: &str, title: &str) -> Value {
+        json!({
+            "uid": note_uid(&vault_uid(instance, root_path), rel_path),
+            "kind": "note",
+            "title": title
+        })
+    }
+
+    fn tag_search_row(instance: &str, root_path: &str, tag: &str) -> Value {
+        json!({
+            "uid": tag_uid(&vault_uid(instance, root_path), tag),
+            "kind": "note",
+            "title": tag
+        })
+    }
+
     #[test]
     fn merge_json_results_reports_exact_union_for_disjoint_complete_searches() {
         let mut local = complete_search_response(
             "needle",
-            vec![json!({
-                "uid": "sym:repo:local:a:one",
-                "kind": "Symbol/Function",
-                "title": "local_needle",
-                "location": "src/local.rs:1"
-            })],
+            vec![symbol_search_row(
+                "local",
+                "https://github.com/acme/local",
+                "src/local.rs",
+                "local_needle",
+                1,
+            )],
         );
         local["expansion_terms"] = json!(["local", "common"]);
         let mut server = complete_search_response(
             "needle",
-            vec![json!({
-                "uid": "sym:repo:server:b:two",
-                "kind": "Symbol/Function",
-                "title": "server_needle",
-                "location": "src/server.rs:1"
-            })],
+            vec![symbol_search_row(
+                "server",
+                "https://github.com/acme/server",
+                "src/server.rs",
+                "server_needle",
+                1,
+            )],
         );
         server["expansion_terms"] = json!(["server", "common"]);
 
@@ -745,18 +776,20 @@ mod tests {
 
     #[test]
     fn merge_json_results_reports_exact_union_for_overlapping_complete_searches() {
-        let local_shared = json!({
-            "uid": "sym:repo:local-instance:repo-hash:file-hash:name-hash:1",
-            "kind": "Symbol/Function",
-            "title": "shared_needle",
-            "location": "src/shared.rs:1"
-        });
-        let server_shared = json!({
-            "uid": "sym:repo:server-instance:repo-hash:file-hash:name-hash:1",
-            "kind": "Symbol/Function",
-            "title": "shared_needle",
-            "location": "src/shared.rs:1"
-        });
+        let local_shared = symbol_search_row(
+            "local-instance",
+            "git@github.com:acme/shared.git",
+            "src/shared.rs",
+            "shared_needle",
+            1,
+        );
+        let server_shared = symbol_search_row(
+            "server-instance",
+            "https://github.com/acme/shared",
+            "src/shared.rs",
+            "shared_needle",
+            1,
+        );
         let local = complete_search_response("needle", vec![local_shared]);
         let server = complete_search_response("needle", vec![server_shared]);
 
@@ -773,12 +806,20 @@ mod tests {
     fn merge_json_results_reports_safe_lower_bound_when_one_search_is_truncated() {
         let local = complete_search_response(
             "needle",
-            vec![json!({
-                "uid": "sym:repo:local:a:one",
-                "kind": "Symbol/Function",
-                "title": "local_needle",
-                "location": "src/local.rs:1"
-            })],
+            vec![symbol_search_row(
+                "local",
+                "https://github.com/acme/local",
+                "src/local.rs",
+                "local_needle",
+                1,
+            )],
+        );
+        let server_row = symbol_search_row(
+            "server",
+            "https://github.com/acme/server",
+            "src/server.rs",
+            "server_needle",
+            1,
         );
         let server = json!({
             "query": "needle",
@@ -787,12 +828,7 @@ mod tests {
             "total_matches_relation": "eq",
             "returned_matches": 1,
             "truncated": true,
-            "results": [{
-                "uid": "sym:repo:server:b:two",
-                "kind": "Symbol/Function",
-                "title": "server_needle",
-                "location": "src/server.rs:1"
-            }],
+            "results": [server_row],
             "expansion_terms": ["remote", "common"],
         });
 
@@ -815,12 +851,26 @@ mod tests {
                 "location": "src/lib.rs:1"
             })
         };
-        let complete = complete_search_response("needle", vec![keyed("sym:repo:local:a:one")]);
+        let local_uid = symbol_search_uid(
+            "local",
+            "https://github.com/acme/local",
+            "src/lib.rs",
+            "needle",
+            1,
+        );
+        let server_uid = symbol_search_uid(
+            "server",
+            "https://github.com/acme/server",
+            "src/lib.rs",
+            "needle",
+            1,
+        );
+        let complete = complete_search_response("needle", vec![keyed(&local_uid)]);
 
         let missing = json!({
             "query": "needle",
             "engine": "bm25",
-            "results": [keyed("sym:repo:server:b:two")],
+            "results": [keyed(&server_uid)],
         });
         assert_eq!(
             merge_json_results(&complete, &missing)["total_matches_relation"],
@@ -835,7 +885,7 @@ mod tests {
                 "total_matches_relation": "eq",
                 "returned_matches": 1,
                 "truncated": false,
-                "results": [keyed("sym:repo:server:b:two")],
+                "results": [keyed(&server_uid)],
             }),
             json!({
                 "query": "needle",
@@ -844,7 +894,7 @@ mod tests {
                 "total_matches_relation": "eq",
                 "returned_matches": 1,
                 "truncated": false,
-                "results": [keyed("sym:repo:server:b:two")],
+                "results": [keyed(&server_uid)],
             }),
             json!({
                 "query": "needle",
@@ -853,7 +903,7 @@ mod tests {
                 "total_matches_relation": "eq",
                 "returned_matches": "1",
                 "truncated": false,
-                "results": [keyed("sym:repo:server:b:two")],
+                "results": [keyed(&server_uid)],
             }),
             json!({
                 "query": "needle",
@@ -862,7 +912,7 @@ mod tests {
                 "total_matches_relation": "eq",
                 "returned_matches": 1,
                 "truncated": "false",
-                "results": [keyed("sym:repo:server:b:two")],
+                "results": [keyed(&server_uid)],
             }),
         ] {
             assert_eq!(
@@ -877,19 +927,21 @@ mod tests {
     fn merge_json_results_rejects_truncated_or_row_count_inconsistent_exact_sources() {
         let local = complete_search_response(
             "needle",
-            vec![json!({
-                "uid": "sym:repo:local:a:one",
-                "kind": "Symbol/Function",
-                "title": "local",
-                "location": "src/local.rs:1"
-            })],
+            vec![symbol_search_row(
+                "local",
+                "https://github.com/acme/local",
+                "src/local.rs",
+                "local",
+                1,
+            )],
         );
-        let row = json!({
-            "uid": "sym:repo:server:b:two",
-            "kind": "Symbol/Function",
-            "title": "server",
-            "location": "src/server.rs:1"
-        });
+        let row = symbol_search_row(
+            "server",
+            "https://github.com/acme/server",
+            "src/server.rs",
+            "server",
+            1,
+        );
         let explicitly_truncated = json!({
             "query": "needle",
             "engine": "bm25",
@@ -922,6 +974,13 @@ mod tests {
     #[test]
     fn merge_json_results_inconsistent_metadata_cannot_inflate_the_lower_bound() {
         let local = complete_search_response("needle", Vec::new());
+        let server_row = symbol_search_row(
+            "server",
+            "https://github.com/acme/server",
+            "src/server.rs",
+            "server",
+            1,
+        );
         let inconsistent = json!({
             "query": "needle",
             "engine": "bm25",
@@ -929,12 +988,7 @@ mod tests {
             "total_matches_relation": "eq",
             "returned_matches": 999,
             "truncated": false,
-            "results": [{
-                "uid": "sym:repo:server:repo-hash:file-hash:name-hash:1",
-                "kind": "Symbol/Function",
-                "title": "server",
-                "location": "src/server.rs:1"
-            }],
+            "results": [server_row],
         });
 
         let merged = merge_json_results(&local, &inconsistent);
@@ -947,19 +1001,164 @@ mod tests {
     }
 
     #[test]
+    fn merge_json_results_rejects_noncanonical_or_kind_inconsistent_search_uids() {
+        let valid_note = note_uid(&vault_uid("local", "/shared/vault"), "notes/needle.md");
+        let valid_symbol = symbol_search_uid(
+            "local",
+            "https://github.com/acme/repo",
+            "src/lib.rs",
+            "needle",
+            7,
+        );
+        for (uid, kind) in [
+            // Missing, extra, and empty components.
+            (
+                "note:vlt:local:0123456789ab".to_string(),
+                "note".to_string(),
+            ),
+            (
+                "note:vlt:local:0123456789ab:abcdef012345:extra".to_string(),
+                "note".to_string(),
+            ),
+            (
+                "note:vlt::0123456789ab:abcdef012345".to_string(),
+                "note".to_string(),
+            ),
+            (
+                "sym:repo:local:0123456789ab:abcdef012345:123456789abc".to_string(),
+                "Symbol/Function".to_string(),
+            ),
+            (
+                "sym:repo:local:0123456789ab:abcdef012345:123456789abc:7:extra".to_string(),
+                "Symbol/Function".to_string(),
+            ),
+            // Invalid instance and noncanonical hashes.
+            (
+                "note:vlt:local box:0123456789ab:abcdef012345".to_string(),
+                "note".to_string(),
+            ),
+            (
+                "note:vlt:local:0123456789AB:abcdef012345".to_string(),
+                "note".to_string(),
+            ),
+            (
+                "tag:vlt:local:0123456789ab:abcdef01234g".to_string(),
+                "note".to_string(),
+            ),
+            (
+                "sym:repo:local:0123456789ab:abcdef01234:123456789abc:7".to_string(),
+                "Symbol/Function".to_string(),
+            ),
+            // Bad, overflowing, and empty symbol lines.
+            (
+                "sym:repo:local:0123456789ab:abcdef012345:123456789abc:not-a-line".to_string(),
+                "Symbol/Function".to_string(),
+            ),
+            (
+                "sym:repo:local:0123456789ab:abcdef012345:123456789abc:4294967296".to_string(),
+                "Symbol/Function".to_string(),
+            ),
+            (
+                "sym:repo:local:0123456789ab:abcdef012345:123456789abc:".to_string(),
+                "Symbol/Function".to_string(),
+            ),
+            // A canonical UID must agree with the row's presentation domain.
+            (valid_note, "Symbol/Function".to_string()),
+            (valid_symbol, "note".to_string()),
+        ] {
+            let local = complete_search_response(
+                "needle",
+                vec![json!({"uid": uid, "kind": kind, "title": "needle"})],
+            );
+            let merged =
+                merge_json_results(&local, &complete_search_response("needle", Vec::new()));
+            assert_eq!(
+                merged["total_matches_relation"], "gte",
+                "invalid UID must remain unkeyed and cannot prove exactness: {local}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_json_results_invalid_uids_do_not_inflate_the_proven_lower_bound() {
+        let local = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": "note:vlt:local:0123456789ab",
+                "kind": "note",
+                "title": "local"
+            })],
+        );
+        let server = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": "note:vlt:server:fedcba987654",
+                "kind": "note",
+                "title": "server"
+            })],
+        );
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["returned_matches"], 2);
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(
+            merged["total_matches"], 1,
+            "invalid presentation IDs cannot prove two distinct logical entities"
+        );
+    }
+
+    #[test]
+    fn merge_json_results_discards_contradictory_equal_count_exact_metadata() {
+        let duplicate = note_search_row("local", "/shared/vault", "notes/needle.md", "needle");
+        let contradictory = json!({
+            "query": "needle",
+            "engine": "bm25",
+            "total_matches": 2,
+            "total_matches_relation": "eq",
+            "returned_matches": 2,
+            "truncated": true,
+            "results": [duplicate.clone(), duplicate],
+            "expansion_terms": [],
+        });
+
+        let merged = merge_json_results(
+            &contradictory,
+            &complete_search_response("needle", Vec::new()),
+        );
+
+        assert_eq!(merged["returned_matches"], 1);
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(
+            merged["total_matches"], 1,
+            "contradictory source total must not outrank the one proven identity"
+        );
+    }
+
+    #[test]
     fn merge_json_results_uses_uid_identity_for_concise_notes_and_tags() {
         let local = complete_search_response(
             "needle",
             vec![
-                json!({"uid": "note:vlt:local-instance:vault-hash:note-hash", "kind": "note", "title": "needle"}),
-                json!({"uid": "tag:vlt:local-instance:vault-hash:tag-hash", "kind": "note", "title": "needle"}),
+                note_search_row(
+                    "local-instance",
+                    "/shared/vault",
+                    "notes/needle.md",
+                    "needle",
+                ),
+                tag_search_row("local-instance", "/shared/vault", "needle"),
             ],
         );
         let server = complete_search_response(
             "needle",
             vec![
-                json!({"uid": "note:vlt:server-instance:vault-hash:note-hash", "kind": "note", "title": "needle"}),
-                json!({"uid": "tag:vlt:server-instance:vault-hash:tag-hash", "kind": "note", "title": "needle"}),
+                note_search_row(
+                    "server-instance",
+                    "/shared/vault",
+                    "notes/needle.md",
+                    "needle",
+                ),
+                tag_search_row("server-instance", "/shared/vault", "needle"),
             ],
         );
 
@@ -972,16 +1171,26 @@ mod tests {
 
     #[test]
     fn merge_json_results_keeps_same_path_symbols_from_distinct_repos() {
-        let row = |uid: &str| {
-            json!({
-                "uid": uid,
-                "kind": "Symbol/Function",
-                "title": "same",
-                "location": "src/lib.rs:7"
-            })
-        };
-        let local = complete_search_response("needle", vec![row("sym:repo:local:abc:same:7")]);
-        let server = complete_search_response("needle", vec![row("sym:repo:server:def:same:7")]);
+        let local = complete_search_response(
+            "needle",
+            vec![symbol_search_row(
+                "local",
+                "https://github.com/acme/one",
+                "src/lib.rs",
+                "same",
+                7,
+            )],
+        );
+        let server = complete_search_response(
+            "needle",
+            vec![symbol_search_row(
+                "server",
+                "https://github.com/acme/two",
+                "src/lib.rs",
+                "same",
+                7,
+            )],
+        );
 
         let merged = merge_json_results(&local, &server);
 
@@ -992,15 +1201,15 @@ mod tests {
 
     #[test]
     fn merge_json_results_deduplicates_detailed_substring_notes_without_locations() {
-        let note = json!({
-            "uid": "note:vlt:a:one",
-            "kind": "note",
-            "title": "needle",
-            "score": 1.0,
-            "matched_headings": ["needle heading"]
-        });
-        let local = complete_search_response("needle", vec![note.clone()]);
-        let server = complete_search_response("needle", vec![note]);
+        let mut local_note = note_search_row("local", "/shared/vault", "notes/needle.md", "needle");
+        local_note["score"] = json!(1.0);
+        local_note["matched_headings"] = json!(["needle heading"]);
+        let mut server_note =
+            note_search_row("server", "/shared/vault", "notes/needle.md", "needle");
+        server_note["score"] = json!(1.0);
+        server_note["matched_headings"] = json!(["needle heading"]);
+        let local = complete_search_response("needle", vec![local_note]);
+        let server = complete_search_response("needle", vec![server_note]);
 
         let merged = merge_json_results(&local, &server);
 
@@ -1013,20 +1222,22 @@ mod tests {
     fn merge_json_results_keeps_same_title_note_and_symbol_distinct() {
         let local = complete_search_response(
             "needle",
-            vec![json!({
-                "uid": "note:vlt:a:one",
-                "kind": "note",
-                "title": "needle"
-            })],
+            vec![note_search_row(
+                "local",
+                "/shared/vault",
+                "notes/needle.md",
+                "needle",
+            )],
         );
         let server = complete_search_response(
             "needle",
-            vec![json!({
-                "uid": "sym:repo:server:def:needle:7",
-                "kind": "Symbol/Function",
-                "title": "needle",
-                "location": "src/lib.rs:7"
-            })],
+            vec![symbol_search_row(
+                "server",
+                "https://github.com/acme/server",
+                "src/lib.rs",
+                "needle",
+                7,
+            )],
         );
 
         let merged = merge_json_results(&local, &server);
@@ -1055,11 +1266,12 @@ mod tests {
 
     #[test]
     fn merge_json_results_duplicate_uid_inside_a_source_cannot_prove_exactness() {
-        let duplicate = json!({
-            "uid": "note:vlt:local-instance:vault-hash:note-hash",
-            "kind": "note",
-            "title": "needle"
-        });
+        let duplicate = note_search_row(
+            "local-instance",
+            "/shared/vault",
+            "notes/needle.md",
+            "needle",
+        );
         let local = complete_search_response("needle", vec![duplicate.clone(), duplicate]);
         let server = complete_search_response("needle", Vec::new());
 

@@ -79,6 +79,81 @@ pub fn tag_uid(vault_uid: &str, name: &str) -> String {
     format!("tag:{}:{}", vault_uid, truncated_hash(&name.to_lowercase()))
 }
 
+/// Canonical UID domains that can identify a top-level `brain_search` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchEntityUidKind {
+    Note,
+    Tag,
+    Symbol,
+}
+
+/// Parse a canonical search-entity UID and remove only its instance component.
+///
+/// Accepted constructor grammars are:
+///
+/// - `note|tag:vlt:<instance>:<12-lower-hex-vault>:<12-lower-hex-entity>`;
+/// - `sym:repo:<instance>:<12-lower-hex-repo>:<12-lower-hex-file>:<12-lower-hex-name>:<u32-line>`.
+///
+/// Instances follow the graph UID rule: nonempty, with no whitespace. A colon
+/// necessarily changes the exact component count and is therefore rejected.
+/// The normalized value retains the domain plus all ownership/content
+/// components so unrelated repositories, vaults, notes, tags, and symbols
+/// remain distinct.
+pub fn normalize_search_entity_uid(uid: &str) -> Option<(SearchEntityUidKind, String)> {
+    let parts: Vec<&str> = uid.split(':').collect();
+    match parts.as_slice() {
+        [
+            domain @ ("note" | "tag"),
+            "vlt",
+            instance,
+            vault_hash,
+            entity_hash,
+        ] if valid_uid_instance(instance)
+            && is_lowercase_12_hex(vault_hash)
+            && is_lowercase_12_hex(entity_hash) =>
+        {
+            let kind = if *domain == "note" {
+                SearchEntityUidKind::Note
+            } else {
+                SearchEntityUidKind::Tag
+            };
+            Some((kind, format!("{domain}:vlt:{vault_hash}:{entity_hash}")))
+        }
+        [
+            "sym",
+            "repo",
+            instance,
+            repo_hash,
+            file_hash,
+            name_hash,
+            line,
+        ] if valid_uid_instance(instance)
+            && is_lowercase_12_hex(repo_hash)
+            && is_lowercase_12_hex(file_hash)
+            && is_lowercase_12_hex(name_hash)
+            && line.bytes().all(|byte| byte.is_ascii_digit())
+            && line.parse::<u32>().is_ok() =>
+        {
+            Some((
+                SearchEntityUidKind::Symbol,
+                format!("sym:repo:{repo_hash}:{file_hash}:{name_hash}:{line}"),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn valid_uid_instance(instance: &str) -> bool {
+    !instance.is_empty() && !instance.chars().any(char::is_whitespace)
+}
+
+fn is_lowercase_12_hex(value: &str) -> bool {
+    value.len() == 12
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// "proj:{instance}:{name_hash}"
 pub fn project_uid(instance: &str, name: &str) -> String {
     format!("proj:{}:{}", instance, truncated_hash(name))
@@ -323,6 +398,85 @@ mod tests {
         let ruid = repo_uid("local", "https://example.com/repo");
         let uid = service_uid(&ruid, "my-service");
         assert!(uid.starts_with("svc:"), "got: {uid}");
+    }
+
+    #[test]
+    fn search_entity_uid_normalization_accepts_constructor_output_across_instances() {
+        let local_repo = repo_uid("local", "git@github.com:acme/api.git");
+        let server_repo = repo_uid("server", "https://github.com/acme/api");
+        let local_symbol = symbol_uid(&local_repo, "src/lib.rs", "needle", 42);
+        let server_symbol = symbol_uid(&server_repo, "src/lib.rs", "needle", 42);
+        let (local_kind, local_normalized) =
+            normalize_search_entity_uid(&local_symbol).expect("constructor output must parse");
+        let (server_kind, server_normalized) =
+            normalize_search_entity_uid(&server_symbol).expect("constructor output must parse");
+        assert_eq!(local_kind, SearchEntityUidKind::Symbol);
+        assert_eq!(server_kind, SearchEntityUidKind::Symbol);
+        assert_eq!(local_normalized, server_normalized);
+        assert!(!local_normalized.contains("local"));
+        assert!(!server_normalized.contains("server"));
+
+        let local_vault = vault_uid("local", "/same/vault");
+        let server_vault = vault_uid("server", "/same/vault");
+        for (local, server, expected_kind) in [
+            (
+                note_uid(&local_vault, "notes/needle.md"),
+                note_uid(&server_vault, "notes/needle.md"),
+                SearchEntityUidKind::Note,
+            ),
+            (
+                tag_uid(&local_vault, "Needle"),
+                tag_uid(&server_vault, "Needle"),
+                SearchEntityUidKind::Tag,
+            ),
+        ] {
+            let (local_kind, local_normalized) =
+                normalize_search_entity_uid(&local).expect("constructor output must parse");
+            let (server_kind, server_normalized) =
+                normalize_search_entity_uid(&server).expect("constructor output must parse");
+            assert_eq!(local_kind, expected_kind);
+            assert_eq!(server_kind, expected_kind);
+            assert_eq!(local_normalized, server_normalized);
+        }
+    }
+
+    #[test]
+    fn search_entity_uid_normalization_rejects_noncanonical_shapes() {
+        for invalid in [
+            // Note/tag IDs require exactly five components.
+            "note:vlt:local:0123456789ab",
+            "note:vlt:local:0123456789ab:abcdef012345:extra",
+            "tag:vlt:local:0123456789ab",
+            // Instances are nonempty and cannot contain whitespace.
+            "note:vlt::0123456789ab:abcdef012345",
+            "note:vlt:local box:0123456789ab:abcdef012345",
+            // Every ownership/content hash is lowercase 12-hex.
+            "note:vlt:local:0123456789AB:abcdef012345",
+            "note:vlt:local:0123456789ag:abcdef012345",
+            "note:vlt:local:0123456789a:abcdef012345",
+            "tag:vlt:local:0123456789ab:ABCDEF012345",
+            // Symbol IDs require exactly seven components and three hashes.
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:42:extra",
+            "sym:repo::0123456789ab:abcdef012345:123456789abc:42",
+            "sym:repo:local box:0123456789ab:abcdef012345:123456789abc:42",
+            "sym:repo:local:0123456789ag:abcdef012345:123456789abc:42",
+            "sym:repo:local:0123456789ab:ABCDEF012345:123456789abc:42",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789ab:42",
+            // The final component must be a decimal u32.
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:-1",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:not-a-line",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:4294967296",
+            // Search identity supports only note, tag, and symbol domains.
+            "head:vlt:local:0123456789ab:abcdef012345",
+        ] {
+            assert_eq!(
+                normalize_search_entity_uid(invalid),
+                None,
+                "invalid UID must fail closed: {invalid}"
+            );
+        }
     }
 
     #[test]
