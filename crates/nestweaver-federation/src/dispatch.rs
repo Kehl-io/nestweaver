@@ -162,7 +162,7 @@ fn brain_search_response_to_json(response: &nestweaver_proto::BrainSearchRespons
         response.returned_matches
     };
     let relation = if response.total_matches_relation.is_empty() {
-        "eq"
+        "gte"
     } else {
         &response.total_matches_relation
     };
@@ -483,7 +483,7 @@ mod tests {
         let response = nestweaver_proto::BrainSearchResponse {
             query: "needle".to_string(),
             engine: "bm25".to_string(),
-            total_matches: 3,
+            total_matches: 1,
             results: vec![nestweaver_proto::SearchResultItem {
                 uid: "sym:needle".to_string(),
                 kind: "Symbol/Function".to_string(),
@@ -503,8 +503,8 @@ mod tests {
 
         let value = brain_search_response_to_json(&response);
 
-        assert_eq!(value["total_matches"], 3);
-        assert_eq!(value["total_matches_relation"], "eq");
+        assert_eq!(value["total_matches"], 1);
+        assert_eq!(value["total_matches_relation"], "gte");
         assert_eq!(value["returned_matches"], 1);
         assert_eq!(value["truncated"], true);
         assert_eq!(value["expansion_terms"], serde_json::json!(["expanded"]));

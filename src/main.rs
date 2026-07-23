@@ -12579,7 +12579,7 @@ fn brain_search_display_metadata(
         response.returned_matches
     };
     let total_matches_relation = if response.total_matches_relation.is_empty() {
-        "eq"
+        "gte"
     } else {
         &response.total_matches_relation
     };
@@ -12708,7 +12708,7 @@ mod brain_search_renderer_tests {
         let response = nestweaver_proto::BrainSearchResponse {
             query: "needle".to_string(),
             engine: "bm25".to_string(),
-            total_matches: 3,
+            total_matches: 1,
             results: vec![nestweaver_proto::SearchResultItem {
                 uid: "sym:needle".to_string(),
                 kind: "Symbol/Function".to_string(),
@@ -12727,7 +12727,7 @@ mod brain_search_renderer_tests {
         let metadata = brain_search_display_metadata(&response);
 
         assert_eq!(metadata.returned_matches, 1);
-        assert_eq!(metadata.total_matches_relation, "eq");
+        assert_eq!(metadata.total_matches_relation, "gte");
         assert!(metadata.truncated);
     }
 
@@ -12775,7 +12775,7 @@ fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
     let total_matches_relation = result
         .get("total_matches_relation")
         .and_then(|v| v.as_str())
-        .unwrap_or("eq");
+        .unwrap_or("gte");
     let explicit_truncated = result
         .get("truncated")
         .and_then(|v| v.as_bool())

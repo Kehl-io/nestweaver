@@ -586,7 +586,7 @@ mod tool_schema_validation_tests {
         let response = nestweaver_proto::BrainSearchResponse {
             query: "needle".to_string(),
             engine: "bm25".to_string(),
-            total_matches: 3,
+            total_matches: 1,
             results: vec![nestweaver_proto::SearchResultItem {
                 uid: "sym:needle".to_string(),
                 kind: "Symbol/Function".to_string(),
@@ -606,8 +606,8 @@ mod tool_schema_validation_tests {
 
         let value = daemon_brain_search_response_to_json(&response, false);
 
-        assert_eq!(value["total_matches"], 3);
-        assert_eq!(value["total_matches_relation"], "eq");
+        assert_eq!(value["total_matches"], 1);
+        assert_eq!(value["total_matches_relation"], "gte");
         assert_eq!(value["returned_matches"], 1);
         assert_eq!(value["truncated"], true);
         assert_eq!(value["expansion_terms"], json!(["expanded"]));
@@ -7527,7 +7527,7 @@ fn daemon_brain_search_response_to_json(
         response.returned_matches
     };
     let relation = if response.total_matches_relation.is_empty() {
-        "eq"
+        "gte"
     } else {
         &response.total_matches_relation
     };

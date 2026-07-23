@@ -842,6 +842,39 @@ mod tests {
     }
 
     #[test]
+    fn merge_json_results_legacy_missing_relation_cannot_prove_exact_union() {
+        let local = complete_search_response(
+            "needle",
+            vec![symbol_search_row(
+                "local",
+                "https://github.com/acme/local",
+                "src/local.rs",
+                "local_needle",
+                1,
+            )],
+        );
+        let server = json!({
+            "query": "needle",
+            "engine": "bm25",
+            "total_matches": 1,
+            "returned_matches": 1,
+            "truncated": true,
+            "results": [symbol_search_row(
+                "server",
+                "https://github.com/acme/server",
+                "src/server.rs",
+                "server_needle",
+                1,
+            )],
+        });
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(merged["truncated"], true);
+    }
+
+    #[test]
     fn merge_json_results_requires_complete_consistent_metadata_from_both_searches() {
         let keyed = |uid: &str| {
             json!({
