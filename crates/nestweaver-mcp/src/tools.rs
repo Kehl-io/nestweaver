@@ -28,7 +28,7 @@ use nestweaver_engine::{
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
-use nestweaver_store::{GraphStore, TantivyIndex};
+use nestweaver_store::{GraphStore, SearchLogicalIdentity, TantivyIndex};
 use serde_json::{Value, json};
 // In non-daemon builds, brain_add_source and set_extension write directly using
 // these primitives; in daemon builds those writes route through the daemon.
@@ -2666,7 +2666,7 @@ fn tool_brain_search(
                 .map_err(|e| anyhow!("tantivy search: {e}"))?;
             (page.hits, page.total)
         };
-        let results = group_search_hits_by_note(store, &hits, total, limit, concise);
+        let results = group_search_hits_by_note(store, &hits, total, limit, concise)?;
         (results, "bm25")
     } else {
         // Substring fallback: search note titles, heading text, and section bodies.
@@ -3110,7 +3110,7 @@ fn group_search_hits_by_note(
     total: SearchTotal,
     limit: usize,
     concise: bool,
-) -> GroupedNoteResults {
+) -> Result<GroupedNoteResults, anyhow::Error> {
     use std::collections::HashMap;
 
     struct NoteGroup {
@@ -3122,32 +3122,30 @@ fn group_search_hits_by_note(
         matched_headings: Vec<String>,
     }
 
-    let mut groups: HashMap<String, NoteGroup> = HashMap::new();
-    let mut note_order: Vec<String> = Vec::new();
+    let mut groups: HashMap<SearchLogicalIdentity, NoteGroup> = HashMap::new();
+    let mut note_order: Vec<SearchLogicalIdentity> = Vec::new();
 
     for h in hits {
-        // Determine the parent note UID based on the hit kind.
-        let parent_note_uid = match h.kind.as_str() {
-            "note" => h.uid.clone(),
-            "heading" => store
-                .lookup_heading(&h.uid)
-                .map(|hd| hd.note_uid)
-                .unwrap_or_else(|_| h.uid.clone()),
-            "section" => store
-                .lookup_section(&h.uid)
-                .map(|s| s.note_uid)
-                .unwrap_or_else(|_| h.uid.clone()),
-            _ => h.uid.clone(),
+        // Use the exact validated indexed identity used by Task 5's logical
+        // count collector. Graph lookups can drift independently and must not
+        // split one indexed note into fragment-UID presentation groups.
+        let identity = h
+            .logical_identity()
+            .map_err(|error| anyhow!("invalid counted search hit identity: {error}"))?;
+        let entity_uid = match &identity {
+            SearchLogicalIdentity::Note(uid) | SearchLogicalIdentity::Standalone { uid, .. } => {
+                uid.clone()
+            }
         };
 
-        let group = groups.entry(parent_note_uid.clone()).or_insert_with(|| {
-            note_order.push(parent_note_uid.clone());
+        let group = groups.entry(identity.clone()).or_insert_with(|| {
+            note_order.push(identity);
             let file_path = store
-                .lookup_note(&parent_note_uid)
+                .lookup_note(&entity_uid)
                 .map(|n| n.file_path)
                 .unwrap_or_default();
             NoteGroup {
-                note_uid: parent_note_uid.clone(),
+                note_uid: entity_uid,
                 best_score: 0.0,
                 best_title: String::new(),
                 vault_uid: h.vault_uid.clone(),
@@ -3219,7 +3217,7 @@ fn group_search_hits_by_note(
             }
         })
         .collect();
-    GroupedNoteResults { rows, total }
+    Ok(GroupedNoteResults { rows, total })
 }
 
 // ── 3. note_get ─────────────────────────────────────────────────────────────
@@ -3228,7 +3226,9 @@ fn group_search_hits_by_note(
 mod brain_search_total_contract_tests {
     use super::*;
     use nestweaver_engine::authz::VisibleRepos;
-    use nestweaver_schema::{Heading, Note, NoteKind, Section, Symbol, SymbolKind, Visibility};
+    use nestweaver_schema::{
+        Heading, Note, NoteKind, Section, Symbol, SymbolKind, Tag, Visibility,
+    };
     use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
 
     const QUERY: &str = "searchneedle";
@@ -3505,6 +3505,67 @@ mod brain_search_total_contract_tests {
             shared_title
                 .iter()
                 .any(|row| row["kind"].as_str().unwrap().starts_with("Symbol/"))
+        );
+    }
+
+    #[test]
+    fn brain_search_groups_missing_fragments_by_indexed_owner_and_keeps_tag_distinct() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&note("note:index-owner", "Indexed Owner"))
+            .unwrap();
+        store
+            .insert_tag(&Tag {
+                uid: "tag:searchneedle".to_string(),
+                vault_uid: "vlt:search".to_string(),
+                name: "searchneedle".to_string(),
+            })
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index.reindex_from_store(&store).unwrap();
+        index
+            .update_note(
+                "note:index-owner",
+                "Indexed Owner",
+                "vlt:search",
+                &["unrelated body".to_string()],
+                &[(
+                    "heading:missing".to_string(),
+                    "searchneedle heading".to_string(),
+                )],
+                &[(
+                    "section:missing".to_string(),
+                    "searchneedle section".to_string(),
+                    "Missing heading".to_string(),
+                )],
+                &[],
+            )
+            .unwrap();
+
+        let result = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10 }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["total_matches"], json!(2));
+        assert_eq!(result["total_matches_relation"], "eq");
+        assert_eq!(result["returned_matches"], json!(2));
+        assert_eq!(result["truncated"], json!(false));
+        let uids: HashSet<&str> = result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["uid"].as_str())
+            .collect();
+        assert_eq!(
+            uids,
+            HashSet::from(["note:index-owner", "tag:searchneedle"])
         );
     }
 

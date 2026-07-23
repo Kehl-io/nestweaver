@@ -15,6 +15,7 @@ fn test_semantic_leg_improves_nl_query() {
         kind: "note".to_string(),
         title: "Authentication Guide".to_string(),
         vault_uid: "v1".to_string(),
+        note_uid: "note:auth-guide".to_string(),
         score: 12.5,
     }];
 

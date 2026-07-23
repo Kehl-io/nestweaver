@@ -3540,6 +3540,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<BrainSearchRequest>,
     ) -> Result<Response<BrainSearchResponse>, Status> {
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let req = r.into_inner();
         let mut args = serde_json::json!({
             "query": req.query,
@@ -3557,16 +3558,10 @@ impl NestWeaverDaemon for DaemonService {
             args["root"] = serde_json::json!(root);
         }
 
-        // This typed handler only ever dispatches a fixed non-blast_radius
-        // tool, which ignores the visibility arg, so pass `VisibleRepos::All`
-        // (no scoping needed, and no per-request `list_repos` cost on the hot
-        // path). blast_radius scoping happens on the `json_rpc!` macro path.
+        // `brain_search` includes repo-owned symbols, so the typed hot path
+        // must enforce the same request-derived scope as generic JSON-RPC.
         let value = self
-            .dispatch_tool_json(
-                "brain_search",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("brain_search", args, visible)
             .await?;
 
         // Parse JSON result into typed response.
@@ -11934,6 +11929,87 @@ mod startup_helper_tests {
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
         })
+    }
+
+    #[tokio::test]
+    async fn typed_search_enforces_request_repo_visibility() {
+        use nestweaver_engine::authz::{Identity, StaticConfigPermissionSource};
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        for repo in [
+            test_repo("repo:visible", "https://github.com/acme/visible.git", None),
+            test_repo("repo:hidden", "https://github.com/acme/hidden.git", None),
+        ] {
+            store.insert_repo(&repo).unwrap();
+        }
+        for (uid, repo_uid, name) in [
+            ("sym:visible", "repo:visible", "searchneedle_visible"),
+            ("sym:hidden", "repo:hidden", "searchneedle_hidden"),
+        ] {
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.to_string(),
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: repo_uid.to_string(),
+                    file_path: format!("src/{name}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: format!("fn {name}()"),
+                    summary: None,
+                    content_hash: format!("hash:{uid}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+
+        let token = "scoped-query-token";
+        let source = Arc::new(StaticConfigPermissionSource::new(
+            [(token.to_string(), vec!["repo:visible".to_string()])]
+                .into_iter()
+                .collect(),
+        ));
+        let service = DaemonService::new(test_state_with_authz(store, source));
+        let search_request = || BrainSearchRequest {
+            query: "searchneedle".to_string(),
+            limit: 10,
+            response_format: None,
+            include_bodies: false,
+            prf: false,
+            rerank: false,
+            root: None,
+        };
+
+        // Warm the unrestricted cache scope first. The subsequent restricted
+        // request must neither reuse this response nor dispatch as `All`.
+        let mut unrestricted = Request::new(search_request());
+        unrestricted.extensions_mut().insert(Identity::Admin);
+        let unrestricted = service.search(unrestricted).await.unwrap().into_inner();
+        assert_eq!(unrestricted.total_matches, 2);
+        assert_eq!(unrestricted.results.len(), 2);
+
+        let mut request = Request::new(search_request());
+        request
+            .extensions_mut()
+            .insert(Identity::Token(token.to_string()));
+
+        let response = service.search(request).await.unwrap().into_inner();
+
+        assert_eq!(response.total_matches, 1);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].uid, "sym:visible");
+        assert!(
+            response.results.iter().all(|row| row.uid != "sym:hidden"),
+            "typed Search must not leak hidden symbol rows"
+        );
     }
 
     /// nw-050: a UDS trusted-admin request must see ALL repos under an enabled

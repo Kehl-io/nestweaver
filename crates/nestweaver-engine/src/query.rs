@@ -2965,6 +2965,7 @@ mod fusion_tests {
                 kind: "function".into(),
                 title: "b".into(),
                 vault_uid: "v".into(),
+                note_uid: String::new(),
                 score: 10.0,
             },
             SearchHit {
@@ -2972,6 +2973,7 @@ mod fusion_tests {
                 kind: "function".into(),
                 title: "c".into(),
                 vault_uid: "v".into(),
+                note_uid: String::new(),
                 score: 8.0,
             },
         ];
@@ -2992,6 +2994,7 @@ mod fusion_tests {
             kind: "function".into(),
             title: "a".into(),
             vault_uid: "v".into(),
+            note_uid: String::new(),
             score: 5.0,
         }];
         let results = weighted_score_fuse(&ppr, &bm25, &[], 0.70, 0.30, 0.0);

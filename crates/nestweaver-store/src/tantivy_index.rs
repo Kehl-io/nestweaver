@@ -80,7 +80,19 @@ pub struct SearchHit {
     pub kind: String,
     pub title: String,
     pub vault_uid: String,
+    /// Owning note identity stored in the indexed document. Notes carry their
+    /// own UID, headings/sections carry their parent note UID, and standalone
+    /// entities leave this empty.
+    #[serde(default)]
+    pub note_uid: String,
     pub score: f32,
+}
+
+impl SearchHit {
+    /// Return the same validated logical identity used by counted search.
+    pub fn logical_identity(&self) -> Result<SearchLogicalIdentity, String> {
+        logical_entity_identity(&self.uid, &self.kind, &self.note_uid)
+    }
 }
 
 /// Whether a bounded search total is exact or only a guaranteed lower bound.
@@ -134,15 +146,16 @@ pub struct TantivyPrfSearchPage {
     pub expansion_terms: Vec<String>,
 }
 
+/// Validated logical entity identity shared by counted totals and hit grouping.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum LogicalEntityIdentity {
+pub enum SearchLogicalIdentity {
     Note(String),
     Standalone { kind: String, uid: String },
 }
 
 #[derive(Default)]
 struct LogicalEntityCountState {
-    identities: HashSet<LogicalEntityIdentity>,
+    identities: HashSet<SearchLogicalIdentity>,
     error: Option<String>,
 }
 
@@ -232,7 +245,7 @@ fn logical_entity_identity(
     uid: &str,
     kind: &str,
     note_uid: &str,
-) -> Result<LogicalEntityIdentity, String> {
+) -> Result<SearchLogicalIdentity, String> {
     if kind.trim().is_empty() || kind.trim() != kind || kind.contains('\0') {
         return Err("invalid logical identity: kind is missing or malformed".to_string());
     }
@@ -255,7 +268,7 @@ fn logical_entity_identity(
                     "invalid logical identity: note UID {uid} disagrees with note_uid {note_uid}"
                 ));
             }
-            Ok(LogicalEntityIdentity::Note(uid.to_string()))
+            Ok(SearchLogicalIdentity::Note(uid.to_string()))
         }
         "heading" | "section" => {
             if note_uid.trim().is_empty() || note_uid.trim() != note_uid || note_uid.contains('\0')
@@ -264,9 +277,9 @@ fn logical_entity_identity(
                     "invalid logical identity: {kind} {uid} has no owning note_uid"
                 ));
             }
-            Ok(LogicalEntityIdentity::Note(note_uid.to_string()))
+            Ok(SearchLogicalIdentity::Note(note_uid.to_string()))
         }
-        _ => Ok(LogicalEntityIdentity::Standalone {
+        _ => Ok(SearchLogicalIdentity::Standalone {
             kind: kind.to_string(),
             uid: uid.to_string(),
         }),
@@ -901,6 +914,7 @@ impl TantivyIndex {
                 kind: extract_text(&doc, self.fields.kind),
                 title: extract_text(&doc, self.fields.title),
                 vault_uid: extract_text(&doc, self.fields.vault_uid),
+                note_uid: extract_text(&doc, self.fields.note_uid),
                 score,
             });
         }
