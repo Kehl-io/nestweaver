@@ -420,12 +420,18 @@ alongside the returned rows:
   display limit and any hybrid deduplication.
 - `truncated` is true whenever the total is a lower bound or fewer rows were
   returned than the exact total.
+- Every row, including `response_format: "concise"`, carries its canonical
+  domain-qualified `uid`. Hybrid deduplication uses that identity rather than
+  presentation fields such as title or location.
 
 For a hybrid merge, NestWeaver reports an exact union only when both local and
-server responses are exact and complete. RRF can then deduplicate the complete
-union and use its length. If either source is incomplete, the merged total is
-`gte max(local total, server total, merged rows)`; source totals are never
-summed because local and server data can overlap.
+server responses have valid, internally consistent exact-count metadata and
+every returned row has a unique canonical identity within its source. RRF can
+then deduplicate the complete logical union by UID. If either source is
+incomplete or any row is unkeyed, the merged total is a conservative lower
+bound derived from trustworthy source totals and proven distinct UIDs, never
+from the raw merged-row length. Source totals are not summed because local and
+server data can overlap.
 
 ### Staleness detection
 

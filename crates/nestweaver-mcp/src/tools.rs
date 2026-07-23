@@ -599,7 +599,9 @@ mod tool_schema_validation_tests {
             expansion_terms: vec!["expanded".to_string()],
             returned_matches: 0,
             total_matches_relation: String::new(),
-            truncated: true,
+            // Proto3 defaults from a pre-Task-7 daemon: the new scalar fields
+            // decode as zero/empty/false because they were absent on the wire.
+            truncated: false,
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -609,6 +611,9 @@ mod tool_schema_validation_tests {
         assert_eq!(value["returned_matches"], 1);
         assert_eq!(value["truncated"], true);
         assert_eq!(value["expansion_terms"], json!(["expanded"]));
+
+        let concise = daemon_brain_search_response_to_json(&response, true);
+        assert_eq!(concise["results"][0]["uid"], "sym:needle");
     }
 }
 
@@ -2619,7 +2624,7 @@ fn tool_schema_brain_search() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns note titles and kinds only; \"detailed\" (default) adds section text excerpts, BM25 scores, and vault UIDs."
+                    "description": "\"concise\" returns stable entity UIDs, titles, and kinds; \"detailed\" (default) adds section text excerpts, BM25 scores, and location metadata."
                 },
                 "include_bodies": {
                     "type": "boolean",
@@ -2821,6 +2826,7 @@ fn tool_brain_search(
             .map(|g| {
                 if concise {
                     json!({
+                        "uid": g.note_uid,
                         "kind": "note",
                         "title": g.best_title,
                         "matched_headings": g.matched_headings,
@@ -2890,6 +2896,7 @@ fn tool_brain_search(
         let kind = format!("Symbol/{}", sym.kind);
         if concise {
             note_results.push(json!({
+                "uid": sym.uid,
                 "kind": kind,
                 "title": sym.name,
                 "location": location,
@@ -2913,8 +2920,8 @@ fn tool_brain_search(
     });
 
     // Feature F17: rerank the top-N before truncation. OFF by default →
-    // byte-identical output. Detailed mode only (concise rows carry no UID to
-    // key the reorder on). The default scorer is a transparent monotonic
+    // byte-identical output. Detailed mode only (concise rows intentionally
+    // omit scores used by the reranker). The default scorer is a transparent monotonic
     // heuristic, NOT a validated nDCG win; an optional `<db>.rerank.json`
     // learned-weights file is used if present and version-matched. Reranking
     // only reorders an already-retrieved set; recall is unchanged.
@@ -2976,7 +2983,8 @@ fn tool_brain_search(
     // multiplicative priors keyed by file-path glob, then fold the adjusted
     // relevance back into the row's `score`. No config → no-op (byte-identical
     // output to the pre-F6 path).
-    if let Some(cfg) = current_instance_config()
+    if !concise
+        && let Some(cfg) = current_instance_config()
         && !cfg.ranking.is_empty()
     {
         let mut probe: Vec<nestweaver_engine::BrainNode> = Vec::new();
@@ -3042,7 +3050,7 @@ fn tool_brain_search(
     // that need a hard total cap should pass a smaller `limit`.
 
     // Feature F8: embed high-relevance bodies inline when opted in. Off by
-    // default. Concise mode carries no UID/score, so inline bodies are skipped
+    // default. Concise mode carries no score, so inline bodies are skipped
     // there. Bodies are computed via the shared engine helper for parity with
     // brain_context (normalized-relevance threshold + per-body truncation).
     let include_bodies = args
@@ -3231,6 +3239,7 @@ fn group_search_hits_by_note(
         .map(|g| {
             if concise {
                 json!({
+                    "uid": g.note_uid,
                     "kind": "note",
                     "title": g.best_title,
                     "matched_headings": g.matched_headings,
@@ -3540,6 +3549,40 @@ mod brain_search_total_contract_tests {
     }
 
     #[test]
+    fn brain_search_concise_rows_keep_stable_uids_without_detailed_scores() {
+        let store = search_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_fixture(&index);
+
+        for tantivy in [None, Some(&index)] {
+            let result = dispatch(
+                &store,
+                tantivy,
+                "brain_search",
+                json!({
+                    "query": QUERY,
+                    "limit": 10,
+                    "response_format": "concise"
+                }),
+                None,
+            )
+            .unwrap();
+            let rows = result["results"].as_array().unwrap();
+            assert!(!rows.is_empty());
+            assert!(
+                rows.iter()
+                    .all(|row| row["uid"].as_str().is_some_and(|uid| !uid.is_empty())),
+                "every concise row must preserve its canonical entity UID: {result}"
+            );
+            assert!(
+                rows.iter().all(|row| row.get("score").is_none()),
+                "concise presentation must not gain detailed scores: {result}"
+            );
+        }
+    }
+
+    #[test]
     fn brain_search_groups_missing_fragments_by_indexed_owner_and_keeps_tag_distinct() {
         let store = GraphStore::in_memory().unwrap();
         store
@@ -3734,6 +3777,12 @@ mod brain_search_total_contract_tests {
         let description = schema["description"].as_str().unwrap();
         assert!(description.contains("total_matches_relation"));
         assert!(description.contains("returned_matches"));
+        assert!(
+            schema["inputSchema"]["properties"]["response_format"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("stable entity UIDs")
+        );
         assert!(
             validate_tool_arguments("brain_search", &json!({ "query": QUERY, "limit": 0 }))
                 .is_err()
@@ -7445,6 +7494,7 @@ fn daemon_brain_search_response_to_json(
         .map(|result| {
             if concise {
                 let mut item = json!({
+                    "uid": result.uid,
                     "kind": result.kind,
                     "title": result.title,
                     "matched_headings": result.matched_headings,
@@ -7481,13 +7531,15 @@ fn daemon_brain_search_response_to_json(
     } else {
         &response.total_matches_relation
     };
+    let truncated =
+        response.truncated || relation != "eq" || returned_matches < response.total_matches;
     let mut value = json!({
         "query": response.query,
         "engine": response.engine,
         "total_matches": response.total_matches,
         "total_matches_relation": relation,
         "returned_matches": returned_matches,
-        "truncated": response.truncated,
+        "truncated": truncated,
         "results": results,
     });
     if !response.expansion_terms.is_empty() {

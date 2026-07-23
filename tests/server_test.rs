@@ -1992,6 +1992,39 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
         resp_local.to_string().contains("localfn"),
         "merged results must contain the local-only symbol 'localfn'; got {resp_local}"
     );
+
+    // Exercise the real non-JSON CLI renderer through daemon + configured
+    // merge routing. A hybrid result must never claim it is a substring
+    // fallback merely because its engine is not the single-source "bm25".
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "server", &server.grpc_addr(), HYBRID_TOKEN);
+    let cli = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .args([
+            "brain",
+            "search",
+            "fn",
+            "--db",
+            &db_local.display().to_string(),
+            "--config",
+            &cfg_path.display().to_string(),
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("run real hybrid text-mode CLI search");
+    assert!(
+        cli.status.success(),
+        "hybrid text-mode CLI failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&cli.stdout);
+    assert!(
+        stdout.contains("Brain search (hybrid)"),
+        "hybrid text output must identify the hybrid engine: {stdout}"
+    );
+    assert!(
+        !stdout.contains("substring fallback"),
+        "hybrid text output must not claim substring fallback: {stdout}"
+    );
 }
 
 /// ATTEMPT: two-tier `blast_radius`. The local daemon indexes a file under

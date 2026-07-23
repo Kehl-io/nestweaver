@@ -3644,10 +3644,13 @@ impl NestWeaverDaemon for DaemonService {
             .and_then(|v| v.as_str())
             .unwrap_or("eq")
             .to_string();
-        let truncated = value
+        let explicit_truncated = value
             .get("truncated")
             .and_then(|v| v.as_bool())
-            .unwrap_or(returned_matches < total_matches);
+            .unwrap_or(false);
+        let truncated = explicit_truncated
+            || total_matches_relation != "eq"
+            || returned_matches < total_matches;
 
         Ok(Response::new(BrainSearchResponse {
             query: query_echo,

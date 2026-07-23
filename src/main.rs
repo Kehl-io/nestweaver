@@ -12564,20 +12564,52 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
 /// results into a single `results` array, distinguished by `kind`
 /// (`"note"` vs `"Symbol/<Kind>"`); text mode splits them back out so the
 /// per-row format matches the legacy output.
+struct BrainSearchDisplayMetadata<'a> {
+    returned_matches: i32,
+    total_matches_relation: &'a str,
+    truncated: bool,
+}
+
+fn brain_search_display_metadata(
+    response: &nestweaver_proto::BrainSearchResponse,
+) -> BrainSearchDisplayMetadata<'_> {
+    let returned_matches = if response.returned_matches == 0 && !response.results.is_empty() {
+        response.results.len() as i32
+    } else {
+        response.returned_matches
+    };
+    let total_matches_relation = if response.total_matches_relation.is_empty() {
+        "eq"
+    } else {
+        &response.total_matches_relation
+    };
+    let truncated = response.truncated
+        || total_matches_relation != "eq"
+        || returned_matches < response.total_matches;
+    BrainSearchDisplayMetadata {
+        returned_matches,
+        total_matches_relation,
+        truncated,
+    }
+}
+
+fn brain_search_engine_header(engine: &str) -> &'static str {
+    match engine {
+        "bm25" => "Brain search (BM25)",
+        "hybrid" => "Brain search (hybrid)",
+        "substring" => "Brain search (substring fallback)",
+        _ => "Brain search",
+    }
+}
+
 fn render_brain_search_response(
     resp: &nestweaver_proto::BrainSearchResponse,
     json: bool,
 ) -> anyhow::Result<()> {
-    let returned_matches = if resp.returned_matches == 0 && !resp.results.is_empty() {
-        resp.results.len() as i32
-    } else {
-        resp.returned_matches
-    };
-    let total_matches_relation = if resp.total_matches_relation.is_empty() {
-        "eq"
-    } else {
-        &resp.total_matches_relation
-    };
+    let metadata = brain_search_display_metadata(resp);
+    let returned_matches = metadata.returned_matches;
+    let total_matches_relation = metadata.total_matches_relation;
+    let truncated = metadata.truncated;
     if json {
         let mut results: Vec<serde_json::Value> = Vec::with_capacity(resp.results.len());
         for item in &resp.results {
@@ -12605,7 +12637,7 @@ fn render_brain_search_response(
             "total_matches": resp.total_matches,
             "total_matches_relation": total_matches_relation,
             "returned_matches": returned_matches,
-            "truncated": resp.truncated,
+            "truncated": truncated,
         });
         if !resp.expansion_terms.is_empty() {
             payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
@@ -12619,12 +12651,8 @@ fn render_brain_search_response(
         return Ok(());
     }
 
-    let header = if resp.engine == "bm25" {
-        "Brain search (BM25)"
-    } else {
-        "Brain search (substring fallback)"
-    };
-    if resp.truncated {
+    let header = brain_search_engine_header(&resp.engine);
+    if truncated {
         if total_matches_relation == "gte" {
             println!(
                 "{}: {} of at least {} result(s)",
@@ -12671,6 +12699,47 @@ fn render_brain_search_response(
     Ok(())
 }
 
+#[cfg(test)]
+mod brain_search_renderer_tests {
+    use super::*;
+
+    #[test]
+    fn typed_old_wire_defaults_are_rendered_as_truncated() {
+        let response = nestweaver_proto::BrainSearchResponse {
+            query: "needle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 3,
+            results: vec![nestweaver_proto::SearchResultItem {
+                uid: "sym:needle".to_string(),
+                kind: "Symbol/Function".to_string(),
+                title: "needle".to_string(),
+                score: 1.0,
+                location: Some("src/lib.rs:1".to_string()),
+                matched_headings: Vec::new(),
+                inline_body: None,
+            }],
+            expansion_terms: Vec::new(),
+            returned_matches: 0,
+            total_matches_relation: String::new(),
+            truncated: false,
+        };
+
+        let metadata = brain_search_display_metadata(&response);
+
+        assert_eq!(metadata.returned_matches, 1);
+        assert_eq!(metadata.total_matches_relation, "eq");
+        assert!(metadata.truncated);
+    }
+
+    #[test]
+    fn hybrid_engine_has_an_honest_text_label() {
+        assert_eq!(
+            brain_search_engine_header("hybrid"),
+            "Brain search (hybrid)"
+        );
+    }
+}
+
 /// Render a brain search response from a JSON `Value` (hybrid path).
 ///
 /// The JSON shape matches the proto `BrainSearchResponse` serialized by
@@ -12707,21 +12776,19 @@ fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
         .get("total_matches_relation")
         .and_then(|v| v.as_str())
         .unwrap_or("eq");
-    let truncated = result
+    let explicit_truncated = result
         .get("truncated")
         .and_then(|v| v.as_bool())
-        .unwrap_or(total_matches_relation != "eq" || returned_matches < total_matches);
+        .unwrap_or(false);
+    let truncated =
+        explicit_truncated || total_matches_relation != "eq" || returned_matches < total_matches;
 
     if results.is_empty() {
         println!("No results for '{}'.", query);
         return Ok(());
     }
 
-    let header = if engine == "bm25" {
-        "Brain search (BM25)"
-    } else {
-        "Brain search (substring fallback)"
-    };
+    let header = brain_search_engine_header(engine);
     // Include provenance scope if present (hybrid/local/server).
     let scope = result
         .get("_meta")

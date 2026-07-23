@@ -166,13 +166,15 @@ fn brain_search_response_to_json(response: &nestweaver_proto::BrainSearchRespons
     } else {
         &response.total_matches_relation
     };
+    let truncated =
+        response.truncated || relation != "eq" || returned_matches < response.total_matches;
     serde_json::json!({
         "query": response.query,
         "engine": response.engine,
         "total_matches": response.total_matches,
         "total_matches_relation": relation,
         "returned_matches": returned_matches,
-        "truncated": response.truncated,
+        "truncated": truncated,
         "results": results,
         "expansion_terms": response.expansion_terms,
     })
@@ -494,7 +496,9 @@ mod tests {
             expansion_terms: vec!["expanded".to_string()],
             returned_matches: 0,
             total_matches_relation: String::new(),
-            truncated: true,
+            // Proto3 defaults from a pre-Task-7 daemon: the new scalar fields
+            // decode as zero/empty/false because they were absent on the wire.
+            truncated: false,
         };
 
         let value = brain_search_response_to_json(&response);

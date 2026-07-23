@@ -3,33 +3,150 @@
 //! dedup, structured-schema preservation, fan-out concatenation), and
 //! injecting `_meta` provenance / staleness annotations.
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::Value;
 
 use crate::merge::rrf_merge;
 
 #[derive(Clone, Copy)]
 struct SearchCountMetadata {
-    total: u64,
-    returned: u64,
-    exact: bool,
+    lower_bound: Option<u64>,
+    complete: bool,
 }
 
-fn search_count_metadata(value: &Value, result_count: usize) -> Option<SearchCountMetadata> {
-    let total = value.get("total_matches")?.as_u64()?;
-    let returned = value
-        .get("returned_matches")
-        .and_then(Value::as_u64)
-        .unwrap_or(result_count as u64);
-    let exact = value
-        .get("total_matches_relation")
-        .and_then(Value::as_str)
-        .unwrap_or("eq")
-        == "eq";
-    Some(SearchCountMetadata {
-        total,
-        returned,
-        exact,
-    })
+fn search_count_metadata(value: &Value, result_count: usize) -> SearchCountMetadata {
+    let total = value.get("total_matches").and_then(Value::as_u64);
+    let returned = value.get("returned_matches").and_then(Value::as_u64);
+    let relation = value.get("total_matches_relation").and_then(Value::as_str);
+    let truncated = value.get("truncated").and_then(Value::as_bool);
+    let actual = result_count as u64;
+
+    let valid = matches!(
+        (total, returned, relation, truncated),
+        (Some(total), Some(returned), Some("eq"), Some(truncated))
+            if returned == actual && total >= returned && (truncated || total == returned)
+    ) || matches!(
+        (total, returned, relation, truncated),
+        (Some(total), Some(returned), Some("gte"), Some(true))
+            if returned == actual && total >= returned
+    );
+    let complete = valid
+        && matches!(
+            (total, returned, relation, truncated),
+            (Some(total), Some(returned), Some("eq"), Some(false))
+                if returned == total
+        );
+
+    SearchCountMetadata {
+        lower_bound: total.filter(|_| valid),
+        complete,
+    }
+}
+
+/// Return the canonical logical identity carried by a `brain_search` row.
+///
+/// Search UIDs are presentation-independent and domain-qualified: notes,
+/// standalone tags, and symbols use distinct prefixes, while symbol UIDs also
+/// encode repository ownership. Older concise responses can have an empty UID;
+/// those rows are deliberately unkeyed and cannot prove union cardinality.
+fn brain_search_logical_uid(value: &Value) -> Option<String> {
+    let uid = value.get("uid").and_then(Value::as_str)?;
+    let kind = value.get("kind").and_then(Value::as_str)?;
+    let parts: Vec<&str> = uid.split(':').collect();
+    let supported_domain = match parts.as_slice() {
+        ["note" | "tag", "vlt", _, _, ..] => kind == "note",
+        ["sym", "repo", _, _, ..] => kind.starts_with("Symbol/"),
+        _ => false,
+    };
+    if !supported_domain {
+        return None;
+    }
+
+    // UIDs include the indexing instance as their third component. The same
+    // logical repo/vault indexed by a laptop and an org server must still
+    // coalesce, so remove only that transport-local component and retain the
+    // domain plus every ownership/content component after it.
+    Some(
+        parts[..2]
+            .iter()
+            .chain(parts[3..].iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+fn has_proven_unique_search_identities(items: &[Value]) -> bool {
+    let mut seen = HashSet::with_capacity(items.len());
+    items
+        .iter()
+        .all(|item| brain_search_logical_uid(item).is_some_and(|uid| seen.insert(uid)))
+}
+
+struct RankedSearchResult {
+    value: Value,
+    score: f64,
+    tiebreaker: String,
+}
+
+/// Brain-search-only weighted RRF keyed by canonical entity UID.
+///
+/// The generic merger intentionally keeps its symbol scope-hash identity for
+/// every non-search tool. Search rows need a different contract because notes
+/// may have no location and concise symbols omit presentation metadata.
+fn merge_brain_search_items(
+    local_items: Vec<Value>,
+    server_items: Vec<Value>,
+) -> (Vec<Value>, u64) {
+    const RRF_K: f64 = 60.0;
+    const LOCAL_WEIGHT: f64 = 1.5;
+    const SERVER_WEIGHT: f64 = 1.0;
+
+    let mut keyed: HashMap<String, RankedSearchResult> = HashMap::new();
+    let mut unkeyed = Vec::new();
+
+    for (source, items, weight) in [
+        ("local", local_items, LOCAL_WEIGHT),
+        ("server", server_items, SERVER_WEIGHT),
+    ] {
+        for (rank, value) in items.into_iter().enumerate() {
+            let score = weight / (rank as f64 + RRF_K + 1.0);
+            if let Some(uid) = brain_search_logical_uid(&value) {
+                if let Some(existing) = keyed.get_mut(&uid) {
+                    existing.score += score;
+                } else {
+                    keyed.insert(
+                        uid.clone(),
+                        RankedSearchResult {
+                            value,
+                            score,
+                            tiebreaker: uid,
+                        },
+                    );
+                }
+            } else {
+                unkeyed.push(RankedSearchResult {
+                    tiebreaker: format!("\u{7f}{source}:{rank}:{value}"),
+                    value,
+                    score,
+                });
+            }
+        }
+    }
+
+    let proven_identity_count = keyed.len() as u64;
+    let mut ranked: Vec<RankedSearchResult> = keyed.into_values().chain(unkeyed).collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.tiebreaker.cmp(&b.tiebreaker))
+    });
+    (
+        ranked.into_iter().map(|result| result.value).collect(),
+        proven_identity_count,
+    )
 }
 
 fn union_expansion_terms(local: &Value, server: &Value) -> Vec<String> {
@@ -105,34 +222,37 @@ pub fn extract_result_items(value: &Value) -> Vec<Value> {
 pub fn merge_json_results(local: &Value, server: &Value) -> Value {
     let local_items = extract_result_items(local);
     let server_items = extract_result_items(server);
+    let is_brain_search =
+        local.get("total_matches").is_some() || server.get("total_matches").is_some();
     let local_count = search_count_metadata(local, local_items.len());
     let server_count = search_count_metadata(server, server_items.len());
+    let local_identities_complete = has_proven_unique_search_identities(&local_items);
+    let server_identities_complete = has_proven_unique_search_identities(&server_items);
 
-    let merged = rrf_merge(local_items, server_items);
-    let values: Vec<Value> = merged.into_iter().map(|mr| mr.value).collect();
+    let (values, proven_identity_count) = if is_brain_search {
+        merge_brain_search_items(local_items, server_items)
+    } else {
+        let merged = rrf_merge(local_items, server_items);
+        (merged.into_iter().map(|mr| mr.value).collect(), 0_u64)
+    };
     let returned = values.len() as u64;
 
     let mut response = wrap_merged_response(values, &["local", "server"]);
-    if local_count.is_some() || server_count.is_some() {
-        let local_count = local_count.unwrap_or(SearchCountMetadata {
-            total: 0,
-            returned: 0,
-            exact: true,
-        });
-        let server_count = server_count.unwrap_or(SearchCountMetadata {
-            total: 0,
-            returned: 0,
-            exact: true,
-        });
-        let complete = local_count.exact
-            && local_count.returned == local_count.total
-            && server_count.exact
-            && server_count.returned == server_count.total;
+    if is_brain_search {
+        let complete = local_count.complete
+            && server_count.complete
+            && local_identities_complete
+            && server_identities_complete;
         let (total, relation) = if complete {
-            (returned, "eq")
+            (proven_identity_count, "eq")
         } else {
             (
-                local_count.total.max(server_count.total).max(returned),
+                local_count
+                    .lower_bound
+                    .unwrap_or(0)
+                    .max(server_count.lower_bound.unwrap_or(0))
+                    .max(proven_identity_count)
+                    .max(u64::from(returned > 0)),
                 "gte",
             )
         };
@@ -625,14 +745,20 @@ mod tests {
 
     #[test]
     fn merge_json_results_reports_exact_union_for_overlapping_complete_searches() {
-        let shared = json!({
-            "uid": "sym:repo:shared:a:one",
+        let local_shared = json!({
+            "uid": "sym:repo:local-instance:repo-hash:file-hash:name-hash:1",
             "kind": "Symbol/Function",
             "title": "shared_needle",
             "location": "src/shared.rs:1"
         });
-        let local = complete_search_response("needle", vec![shared.clone()]);
-        let server = complete_search_response("needle", vec![shared]);
+        let server_shared = json!({
+            "uid": "sym:repo:server-instance:repo-hash:file-hash:name-hash:1",
+            "kind": "Symbol/Function",
+            "title": "shared_needle",
+            "location": "src/shared.rs:1"
+        });
+        let local = complete_search_response("needle", vec![local_shared]);
+        let server = complete_search_response("needle", vec![server_shared]);
 
         let merged = merge_json_results(&local, &server);
 
@@ -677,6 +803,271 @@ mod tests {
         assert_eq!(merged["returned_matches"], 2);
         assert_eq!(merged["truncated"], true);
         assert_eq!(merged["expansion_terms"], json!(["remote", "common"]));
+    }
+
+    #[test]
+    fn merge_json_results_requires_complete_consistent_metadata_from_both_searches() {
+        let keyed = |uid: &str| {
+            json!({
+                "uid": uid,
+                "kind": "Symbol/Function",
+                "title": "needle",
+                "location": "src/lib.rs:1"
+            })
+        };
+        let complete = complete_search_response("needle", vec![keyed("sym:repo:local:a:one")]);
+
+        let missing = json!({
+            "query": "needle",
+            "engine": "bm25",
+            "results": [keyed("sym:repo:server:b:two")],
+        });
+        assert_eq!(
+            merge_json_results(&complete, &missing)["total_matches_relation"],
+            "gte"
+        );
+
+        for invalid in [
+            json!({
+                "query": "needle",
+                "engine": "bm25",
+                "total_matches": -1,
+                "total_matches_relation": "eq",
+                "returned_matches": 1,
+                "truncated": false,
+                "results": [keyed("sym:repo:server:b:two")],
+            }),
+            json!({
+                "query": "needle",
+                "engine": "bm25",
+                "total_matches": "1",
+                "total_matches_relation": "eq",
+                "returned_matches": 1,
+                "truncated": false,
+                "results": [keyed("sym:repo:server:b:two")],
+            }),
+            json!({
+                "query": "needle",
+                "engine": "bm25",
+                "total_matches": 1,
+                "total_matches_relation": "eq",
+                "returned_matches": "1",
+                "truncated": false,
+                "results": [keyed("sym:repo:server:b:two")],
+            }),
+            json!({
+                "query": "needle",
+                "engine": "bm25",
+                "total_matches": 1,
+                "total_matches_relation": "eq",
+                "returned_matches": 1,
+                "truncated": "false",
+                "results": [keyed("sym:repo:server:b:two")],
+            }),
+        ] {
+            assert_eq!(
+                merge_json_results(&complete, &invalid)["total_matches_relation"],
+                "gte",
+                "malformed metadata must never prove an exact union: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_json_results_rejects_truncated_or_row_count_inconsistent_exact_sources() {
+        let local = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": "sym:repo:local:a:one",
+                "kind": "Symbol/Function",
+                "title": "local",
+                "location": "src/local.rs:1"
+            })],
+        );
+        let row = json!({
+            "uid": "sym:repo:server:b:two",
+            "kind": "Symbol/Function",
+            "title": "server",
+            "location": "src/server.rs:1"
+        });
+        let explicitly_truncated = json!({
+            "query": "needle",
+            "engine": "bm25",
+            "total_matches": 1,
+            "total_matches_relation": "eq",
+            "returned_matches": 1,
+            "truncated": true,
+            "results": [row.clone()],
+        });
+        let wrong_actual_count = json!({
+            "query": "needle",
+            "engine": "bm25",
+            "total_matches": 2,
+            "total_matches_relation": "eq",
+            "returned_matches": 2,
+            "truncated": false,
+            "results": [row],
+        });
+
+        assert_eq!(
+            merge_json_results(&local, &explicitly_truncated)["total_matches_relation"],
+            "gte"
+        );
+        assert_eq!(
+            merge_json_results(&local, &wrong_actual_count)["total_matches_relation"],
+            "gte"
+        );
+    }
+
+    #[test]
+    fn merge_json_results_inconsistent_metadata_cannot_inflate_the_lower_bound() {
+        let local = complete_search_response("needle", Vec::new());
+        let inconsistent = json!({
+            "query": "needle",
+            "engine": "bm25",
+            "total_matches": 999,
+            "total_matches_relation": "eq",
+            "returned_matches": 999,
+            "truncated": false,
+            "results": [{
+                "uid": "sym:repo:server:repo-hash:file-hash:name-hash:1",
+                "kind": "Symbol/Function",
+                "title": "server",
+                "location": "src/server.rs:1"
+            }],
+        });
+
+        let merged = merge_json_results(&local, &inconsistent);
+
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(
+            merged["total_matches"], 1,
+            "internally inconsistent source totals are not trustworthy lower bounds"
+        );
+    }
+
+    #[test]
+    fn merge_json_results_uses_uid_identity_for_concise_notes_and_tags() {
+        let local = complete_search_response(
+            "needle",
+            vec![
+                json!({"uid": "note:vlt:local-instance:vault-hash:note-hash", "kind": "note", "title": "needle"}),
+                json!({"uid": "tag:vlt:local-instance:vault-hash:tag-hash", "kind": "note", "title": "needle"}),
+            ],
+        );
+        let server = complete_search_response(
+            "needle",
+            vec![
+                json!({"uid": "note:vlt:server-instance:vault-hash:note-hash", "kind": "note", "title": "needle"}),
+                json!({"uid": "tag:vlt:server-instance:vault-hash:tag-hash", "kind": "note", "title": "needle"}),
+            ],
+        );
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["total_matches"], 2);
+        assert_eq!(merged["total_matches_relation"], "eq");
+    }
+
+    #[test]
+    fn merge_json_results_keeps_same_path_symbols_from_distinct_repos() {
+        let row = |uid: &str| {
+            json!({
+                "uid": uid,
+                "kind": "Symbol/Function",
+                "title": "same",
+                "location": "src/lib.rs:7"
+            })
+        };
+        let local = complete_search_response("needle", vec![row("sym:repo:local:abc:same:7")]);
+        let server = complete_search_response("needle", vec![row("sym:repo:server:def:same:7")]);
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["total_matches"], 2);
+        assert_eq!(merged["total_matches_relation"], "eq");
+    }
+
+    #[test]
+    fn merge_json_results_deduplicates_detailed_substring_notes_without_locations() {
+        let note = json!({
+            "uid": "note:vlt:a:one",
+            "kind": "note",
+            "title": "needle",
+            "score": 1.0,
+            "matched_headings": ["needle heading"]
+        });
+        let local = complete_search_response("needle", vec![note.clone()]);
+        let server = complete_search_response("needle", vec![note]);
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 1);
+        assert_eq!(merged["total_matches"], 1);
+        assert_eq!(merged["total_matches_relation"], "eq");
+    }
+
+    #[test]
+    fn merge_json_results_keeps_same_title_note_and_symbol_distinct() {
+        let local = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": "note:vlt:a:one",
+                "kind": "note",
+                "title": "needle"
+            })],
+        );
+        let server = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": "sym:repo:server:def:needle:7",
+                "kind": "Symbol/Function",
+                "title": "needle",
+                "location": "src/lib.rs:7"
+            })],
+        );
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["total_matches"], 2);
+        assert_eq!(merged["total_matches_relation"], "eq");
+    }
+
+    #[test]
+    fn merge_json_results_unkeyed_rows_never_prove_or_inflate_a_union() {
+        let unkeyed = json!({"kind": "note", "title": "needle"});
+        let local = complete_search_response("needle", vec![unkeyed.clone()]);
+        let server = complete_search_response("needle", vec![unkeyed]);
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["returned_matches"], 2);
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(
+            merged["total_matches"], 1,
+            "unkeyed presentation rows cannot prove distinct logical entities"
+        );
+    }
+
+    #[test]
+    fn merge_json_results_duplicate_uid_inside_a_source_cannot_prove_exactness() {
+        let duplicate = json!({
+            "uid": "note:vlt:local-instance:vault-hash:note-hash",
+            "kind": "note",
+            "title": "needle"
+        });
+        let local = complete_search_response("needle", vec![duplicate.clone(), duplicate]);
+        let server = complete_search_response("needle", Vec::new());
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 1);
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(merged["truncated"], true);
     }
 
     #[test]
