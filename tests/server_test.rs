@@ -2847,6 +2847,167 @@ async fn daemon_mcp_boundary_federates_two_tier() {
     );
 }
 
+/// A repository-restricted HTTP caller must never inherit the broader
+/// configured upstream credential. The admin request proves the upstream
+/// fixture can return its hidden canary; the restricted request must keep only
+/// its already-authorized local tier and a generic, count-free withheld status.
+#[tokio::test]
+async fn daemon_mcp_boundary_withholds_two_tier_for_repo_restricted_caller() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let hidden_repo = dir.path().join("hidden_upstream_repo");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &hidden_repo,
+        &[
+            (
+                "shared/entry.js",
+                "export function hiddenfederationcanary() { return 1; }",
+            ),
+            (
+                "hidden/secret-derived-path.js",
+                r#"
+import { hiddenfederationcanary } from "../shared/entry.js";
+export function hiddenfederationcaller() { return hiddenfederationcanary(); }
+"#,
+            ),
+        ],
+    );
+    index_repo(&hidden_repo, &db_server);
+    let upstream = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+
+    let visible_repo = dir.path().join("visible_local_repo");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &visible_repo,
+        &[(
+            "shared/entry.js",
+            "export function visiblefederationcanary() { return 1; }",
+        )],
+    );
+    index_repo(&visible_repo, &db_local);
+
+    let query_token = "restricted-query-token-0123456789abcdef";
+    let admin_token = "restricted-admin-token-0123456789abcdef";
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "broad-org", &upstream.grpc_addr(), HYBRID_TOKEN);
+    let mut config = std::fs::read_to_string(&cfg_path).expect("read instance config");
+    config.push_str(&format!(
+        r#"
+
+[authz.rules]
+"{query_token}" = ["*visible_local_repo*"]
+"#
+    ));
+    std::fs::write(&cfg_path, config).expect("write authz rule");
+
+    let fronting = helpers::server_guard::ServerGuard::start_with_admin_auth_and_config(
+        &db_local,
+        query_token,
+        admin_token,
+        &cfg_path,
+    );
+    let client = reqwest::Client::new();
+    let endpoint = format!("{}/mcp", fronting.mcp_addr());
+    let request = |id| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "blast_radius",
+                "arguments": {
+                    "changed_files": ["shared/entry.js"],
+                    "max_depth": 3
+                }
+            }
+        })
+    };
+
+    // Prove the configured service credential is broad enough to expose the
+    // upstream-only canary. This also warms the unrestricted local cache,
+    // guarding the restricted request against cross-scope reuse.
+    let admin_response = client
+        .post(&endpoint)
+        .bearer_auth(admin_token)
+        .json(&request(61))
+        .send()
+        .await
+        .expect("admin MCP request");
+    assert_eq!(admin_response.status(), 200);
+    let admin_body: Value = admin_response.json().await.expect("admin JSON");
+    let admin_structured = &admin_body["result"]["structuredContent"];
+    assert_eq!(
+        admin_structured["org_wide_impact"]["source_server"], "broad-org",
+        "fixture must reach the broad upstream: {admin_structured}"
+    );
+    assert!(
+        admin_structured["org_wide_impact"]
+            .to_string()
+            .contains("hiddenfederationcaller"),
+        "fixture must prove the upstream returns a hidden-only symbol: {admin_structured}"
+    );
+    assert!(
+        admin_structured["org_wide_impact"]
+            .to_string()
+            .contains("hidden/secret-derived-path.js"),
+        "fixture must prove the upstream returns a hidden-only path: {admin_structured}"
+    );
+
+    let restricted_response = client
+        .post(&endpoint)
+        .bearer_auth(query_token)
+        .json(&request(62))
+        .send()
+        .await
+        .expect("restricted MCP request");
+    assert_eq!(restricted_response.status(), 200);
+    let restricted_body: Value = restricted_response.json().await.expect("restricted JSON");
+    assert_eq!(
+        restricted_body["result"]["isError"], false,
+        "restricted request failed: {restricted_body}"
+    );
+
+    let structured = &restricted_body["result"]["structuredContent"];
+    assert_eq!(structured["tier"], "two_tier");
+    assert!(
+        structured["local_impact"]
+            .to_string()
+            .contains("visiblefederationcanary"),
+        "authorized local tier must remain available: {structured}"
+    );
+    let org = &structured["org_wide_impact"];
+    assert_eq!(org["status"], "withheld");
+    assert_eq!(org["reason"], "authorization-unproven");
+    assert_eq!(
+        org.as_object().expect("org status object").len(),
+        2,
+        "withheld org tier must expose no rows, paths, sources, or counts: {org}"
+    );
+
+    let serialized = restricted_body.to_string();
+    for hidden_marker in [
+        "hidden_upstream_repo",
+        "hidden/secret-derived-path.js",
+        "hiddenfederationcanary",
+        "hiddenfederationcaller",
+        "broad-org",
+    ] {
+        assert!(
+            !serialized.contains(hidden_marker),
+            "restricted response leaked hidden upstream marker {hidden_marker}: {restricted_body}"
+        );
+    }
+    let meta = &restricted_body["result"]["_meta"];
+    assert_eq!(meta["nestweaver.io/sources"], json!(["daemon"]));
+    assert_eq!(meta["nestweaver.io/scope"], "single-node");
+    assert_eq!(
+        meta["nestweaver.io/stale_repos"],
+        json!([]),
+        "global staleness cache must not leak repo URLs across caller scope"
+    );
+}
+
 /// A daemon with NO upstream configured is ONE node: its `/mcp` boundary must
 /// keep the honest single-node stamp (`sources=["daemon"]`, `scope=single-node`)
 /// AND now also carry `stale_repos` as an (empty) array — the staleness key is

@@ -35,6 +35,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use nestweaver_engine::authz::VisibleRepos;
 use nestweaver_federation::discovery::{RoutingMode, UpstreamConfig};
 use nestweaver_federation::health::MaintenanceProbe;
 use nestweaver_federation::routing::{ToolRouting, tool_routing};
@@ -195,14 +196,37 @@ fn expand_env(s: &str) -> String {
 /// Only `TwoTier`-routed tools federate here (see module docs for the Stage B
 /// scoping rationale). The upstream call + adaptive timeout + ejection flow is
 /// the shared [`nestweaver_federation::two_tier::two_tier_query`] machinery.
+/// A repository-restricted caller is stopped before that machinery: the
+/// configured service credential is not proof of the caller's upstream scope,
+/// so the response retains the scoped local result and a generic withheld
+/// org-tier status without making upstream I/O.
 pub async fn federate_two_tier(
     fed: &FederationState,
     tool_name: &str,
     arguments: &Value,
     local: Value,
+    visible: &VisibleRepos,
 ) -> (Value, Option<String>) {
     if !matches!(tool_routing(tool_name), ToolRouting::TwoTier) {
         return (local, None);
+    }
+    if matches!(visible, VisibleRepos::Only(_)) {
+        // The configured upstream credential can be broader than the inbound
+        // caller's repository scope. Until a caller-bound credential can be
+        // forwarded and authorized upstream, attaching any org result would
+        // cross the HTTP authorization boundary. Preserve the already-scoped
+        // local result and disclose only a stable, count-free withheld status.
+        return (
+            serde_json::json!({
+                "tier": "two_tier",
+                "local_impact": local,
+                "org_wide_impact": {
+                    "status": "withheld",
+                    "reason": "authorization-unproven",
+                },
+            }),
+            None,
+        );
     }
     if !fed.has_healthy_upstream() {
         // Upstream(s) configured but currently ejected: serve the local
@@ -529,8 +553,14 @@ timeout = "2s"
         // single-node stamp honest.
         let fed = state_with_upstream("http://127.0.0.1:19999");
         let local = json!({ "results": [{"uid": "a"}] });
-        let (value, source) =
-            federate_two_tier(&fed, "brain_search", &json!({}), local.clone()).await;
+        let (value, source) = federate_two_tier(
+            &fed,
+            "brain_search",
+            &json!({}),
+            local.clone(),
+            &VisibleRepos::All,
+        )
+        .await;
         assert_eq!(value, local, "non-two-tier tools must pass through");
         assert_eq!(source, None);
     }
@@ -543,10 +573,55 @@ timeout = "2s"
         let fed = state_with_upstream("http://127.0.0.1:19999");
         fed.upstreams[0].mark_unhealthy();
         let local = json!({ "changed_symbols": [] });
-        let (value, source) =
-            federate_two_tier(&fed, "blast_radius", &json!({}), local.clone()).await;
+        let (value, source) = federate_two_tier(
+            &fed,
+            "blast_radius",
+            &json!({}),
+            local.clone(),
+            &VisibleRepos::All,
+        )
+        .await;
         assert_eq!(value, local);
         assert_eq!(source, None);
+    }
+
+    #[tokio::test]
+    async fn restricted_callers_withhold_every_two_tier_tool_without_upstream_io() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind request canary");
+        let fed = state_with_upstream(&format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        ));
+        let visible = nestweaver_engine::authz::VisibleRepos::Only(Default::default());
+
+        for tool_name in ["blast_radius", "brain_impact", "affected_tests"] {
+            let local = json!({
+                "tool": tool_name,
+                "local_canary": "authorized-local-only"
+            });
+            let (value, source) =
+                federate_two_tier(&fed, tool_name, &json!({}), local.clone(), &visible).await;
+
+            assert_eq!(value["tier"], "two_tier");
+            assert_eq!(value["local_impact"], local);
+            assert_eq!(value["org_wide_impact"]["status"], "withheld");
+            assert_eq!(value["org_wide_impact"]["reason"], "authorization-unproven");
+            assert_eq!(
+                value["org_wide_impact"].as_object().unwrap().len(),
+                2,
+                "withheld tier must be generic and count-free: {value}"
+            );
+            assert_eq!(source, None);
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "restricted TwoTier tools must not open an upstream connection"
+        );
     }
 
     #[tokio::test]
@@ -557,8 +632,14 @@ timeout = "2s"
         // source, so scope stays single-node.
         let fed = state_with_upstream("http://127.0.0.1:1");
         let local = json!({ "changed_symbols": [{"name": "f", "file_path": "src/a.rs"}] });
-        let (value, source) =
-            federate_two_tier(&fed, "brain_impact", &json!({"symbol": "f"}), local).await;
+        let (value, source) = federate_two_tier(
+            &fed,
+            "brain_impact",
+            &json!({"symbol": "f"}),
+            local,
+            &VisibleRepos::All,
+        )
+        .await;
         assert_eq!(source, None, "an unreachable upstream is not a source");
         // The envelope still discloses the degradation in-band.
         assert_eq!(value["tier"], json!("two_tier"));

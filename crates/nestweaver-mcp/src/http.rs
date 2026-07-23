@@ -916,12 +916,15 @@ async fn handle_mcp(
             // the upstream with the SAME (post-safeguard) arguments the local
             // tier saw. Capture them now, before `arguments` is moved into the
             // blocking dispatch closure — but only when an upstream is actually
-            // configured, so the common single-node daemon pays no clone. The
-            // tool name is not captured here: `name` outlives the closure (only
-            // its `tool_name` clone is moved in), so the federation call borrows
-            // `&name` directly rather than cloning it a second time.
+            // configured, so the common single-node daemon pays no clone. Keep
+            // the caller's resolved visibility with those arguments: the local
+            // dispatch consumes its copy on the blocking thread, while the
+            // post-local federation gate must make its decision from the same
+            // authorization verdict before any upstream I/O.
             #[cfg(feature = "daemon")]
-            let fed_capture = federation.as_ref().map(|_| arguments.clone());
+            let fed_capture = federation
+                .as_ref()
+                .map(|_| (arguments.clone(), visible.clone()));
 
             // Run tool dispatch on a blocking thread — graph queries are
             // CPU-bound and must not starve the tokio runtime.
@@ -969,11 +972,25 @@ async fn handle_mcp(
                     // stamped on every result (empty without an upstream).
                     #[cfg(feature = "daemon")]
                     let (value, upstream_source, stale_repos) = match (&federation, fed_capture) {
-                        (Some(fed), Some(fed_args)) => {
-                            let (v, src) =
-                                crate::federation::federate_two_tier(fed, &name, &fed_args, value)
-                                    .await;
-                            (v, src, fed.stale_repos())
+                        (Some(fed), Some((fed_args, fed_visible))) => {
+                            let expose_staleness =
+                                matches!(fed_visible, nestweaver_engine::authz::VisibleRepos::All);
+                            let (v, src) = crate::federation::federate_two_tier(
+                                fed,
+                                &name,
+                                &fed_args,
+                                value,
+                                &fed_visible,
+                            )
+                            .await;
+                            let stale_repos = if expose_staleness {
+                                fed.stale_repos()
+                            } else {
+                                // The cached verdict contains org-wide repo
+                                // URLs and is not keyed by caller scope.
+                                Vec::new()
+                            };
+                            (v, src, stale_repos)
                         }
                         _ => (value, None, Vec::new()),
                     };
