@@ -65,6 +65,28 @@ impl ServerGuard {
         )
     }
 
+    /// Spawn the server with query/admin tokens and an instance config.
+    ///
+    /// This lets process-level tests exercise authenticated MCP-HTTP requests
+    /// under an enabled `[authz]` policy.
+    pub fn start_with_admin_auth_and_config(
+        db_path: &Path,
+        auth_token: &str,
+        admin_token: &str,
+        config_path: &Path,
+    ) -> Self {
+        Self::spawn_inner(
+            db_path,
+            Some(auth_token),
+            None,
+            None,
+            None,
+            Some(admin_token),
+            Some(config_path),
+            None,
+        )
+    }
+
     /// Spawn the server with TLS enabled.
     pub fn start_with_tls(db_path: &Path, cert: &Path, key: &Path) -> Self {
         Self::spawn_inner(db_path, None, Some(cert), Some(key), None, None, None, None)

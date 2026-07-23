@@ -154,6 +154,41 @@ fn write_test_repo(dir: &Path) {
         .unwrap();
 }
 
+/// Create a git repo populated with the given `(relative_path, contents)` files.
+fn write_repo_files(dir: &Path, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir).unwrap();
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    for (relative_path, contents) in files {
+        let path = dir.join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args([
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+}
+
 /// Create a minimal vault (directory with `.md` files, no `.obsidian/`).
 fn write_test_vault(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
@@ -609,6 +644,172 @@ fn mcp_argument_validation_matches_direct_and_daemon() {
             );
             assert_daemon_unchanged();
         }
+    }
+}
+
+#[test]
+fn mcp_trust_and_count_contracts_match_direct_and_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("trust-counts").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_repo_files(
+        &repo_dir,
+        &[
+            (
+                "src/root.js",
+                "export function impacttarget() { return 1; }",
+            ),
+            (
+                "src/callers.js",
+                r#"
+import { impacttarget } from "./root.js";
+export function transportcountneedle_one() { return impacttarget(); }
+export function transportcountneedle_two() { return impacttarget(); }
+export function transportcountneedle_three() { return impacttarget(); }
+"#,
+            ),
+        ],
+    );
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let structured_content = |output: &str| {
+        let response = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value.get("id") == Some(&serde_json::json!(2)))
+            .unwrap_or_else(|| panic!("tools/call response missing from: {output}"));
+        assert_eq!(
+            response["result"]["isError"],
+            serde_json::json!(false),
+            "tool call must succeed: {response}"
+        );
+        response["result"]["structuredContent"].clone()
+    };
+
+    for (mode_name, mode) in [("direct", McpMode::Direct), ("daemon", McpMode::Daemon)] {
+        let detect = structured_content(&mcp_tool_call_in_mode(
+            &db_path,
+            "detect_changes",
+            serde_json::json!({ "changed_files": ["src/new.rs"] }),
+            mode,
+        ));
+        assert_eq!(
+            detect["status"],
+            serde_json::json!("partial"),
+            "{mode_name} detect_changes must mark an unassessed source partial: {detect}"
+        );
+        assert_eq!(
+            detect["gate_state"],
+            serde_json::json!("degraded-unknown"),
+            "{mode_name} detect_changes must not report a green gate: {detect}"
+        );
+
+        let blast_unknown = structured_content(&mcp_tool_call_in_mode(
+            &db_path,
+            "blast_radius",
+            serde_json::json!({ "changed_files": ["src/new.rs"] }),
+            mode,
+        ));
+        assert_eq!(
+            blast_unknown["status"],
+            serde_json::json!("partial"),
+            "{mode_name} blast_radius must mark an unassessed source partial: {blast_unknown}"
+        );
+        assert_eq!(
+            blast_unknown["gate_state"],
+            serde_json::json!("degraded-unknown"),
+            "{mode_name} blast_radius must not report a green gate: {blast_unknown}"
+        );
+
+        let affected_tests = structured_content(&mcp_tool_call_in_mode(
+            &db_path,
+            "affected_tests",
+            serde_json::json!({ "changed_files": ["src/new.rs"] }),
+            mode,
+        ));
+        assert_eq!(
+            affected_tests["status"],
+            serde_json::json!("partial"),
+            "{mode_name} affected_tests must mark an unassessed source partial: {affected_tests}"
+        );
+        assert_eq!(
+            affected_tests["recommendation"],
+            serde_json::json!("run-full-suite"),
+            "{mode_name} affected_tests must widen a degraded selection: {affected_tests}"
+        );
+
+        let search_small = structured_content(&mcp_tool_call_in_mode(
+            &db_path,
+            "brain_search",
+            serde_json::json!({ "query": "transportcountneedle", "limit": 1 }),
+            mode,
+        ));
+        let search_large = structured_content(&mcp_tool_call_in_mode(
+            &db_path,
+            "brain_search",
+            serde_json::json!({ "query": "transportcountneedle", "limit": 20 }),
+            mode,
+        ));
+        assert_eq!(
+            search_small["total_matches"], search_large["total_matches"],
+            "{mode_name} search total must be independent of the display limit"
+        );
+        assert_eq!(
+            search_small["total_matches_relation"],
+            serde_json::json!("eq"),
+            "{mode_name} fixture search should have an exact total: {search_small}"
+        );
+        assert_eq!(
+            search_small["total_matches"],
+            serde_json::json!(3),
+            "{mode_name} fixture should produce exactly three search matches: {search_small}"
+        );
+        assert_eq!(
+            search_small["returned_matches"],
+            serde_json::json!(1),
+            "{mode_name} small search should return one row: {search_small}"
+        );
+        assert_eq!(
+            search_large["returned_matches"],
+            serde_json::json!(3),
+            "{mode_name} large search should return all three matches: {search_large}"
+        );
+
+        let blast_small = structured_content(&mcp_tool_call_in_mode(
+            &db_path,
+            "blast_radius",
+            serde_json::json!({ "changed_files": ["src/root.js"], "limit": 1 }),
+            mode,
+        ));
+        let blast_large = structured_content(&mcp_tool_call_in_mode(
+            &db_path,
+            "blast_radius",
+            serde_json::json!({ "changed_files": ["src/root.js"], "limit": 20 }),
+            mode,
+        ));
+        assert_eq!(
+            blast_small["affected_symbol_count"], blast_large["affected_symbol_count"],
+            "{mode_name} blast total must be independent of the display limit"
+        );
+        assert_eq!(
+            blast_small["affected_symbol_count"],
+            serde_json::json!(3),
+            "{mode_name} fixture should produce exactly three affected symbols: {blast_small}"
+        );
+        assert_eq!(
+            blast_small["returned_affected_symbol_count"],
+            serde_json::json!(1),
+            "{mode_name} small blast should return one affected symbol: {blast_small}"
+        );
+        assert_eq!(
+            blast_large["returned_affected_symbol_count"],
+            serde_json::json!(3),
+            "{mode_name} large blast should return all three affected symbols: {blast_large}"
+        );
     }
 }
 

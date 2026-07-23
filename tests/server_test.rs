@@ -1120,6 +1120,192 @@ async fn server_mcp_http_read_symbols_takes_server_path() {
     );
 }
 
+/// Regression guard: the authenticated MCP-HTTP boundary must redact blast
+/// totals before applying `limit`. A query-scoped caller must never receive the
+/// larger admin-visible total or any hidden repo identifiers.
+#[tokio::test]
+async fn server_mcp_http_blast_count_is_exact_within_visible_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("authz").join("test.lbug");
+    let visible_repo = dir.path().join("visible_repo");
+    let hidden_repo = dir.path().join("hidden_repo");
+
+    write_repo_files(
+        &visible_repo,
+        &[
+            (
+                "src/visible_target.js",
+                "export function visibleimpacttarget() { return 1; }",
+            ),
+            (
+                "src/visible_callers.js",
+                r#"
+import { visibleimpacttarget } from "./visible_target.js";
+export function visiblecaller_one() { return visibleimpacttarget(); }
+export function visiblecaller_two() { return visibleimpacttarget(); }
+"#,
+            ),
+        ],
+    );
+    write_repo_files(
+        &hidden_repo,
+        &[
+            (
+                "src/hidden_target.js",
+                "export function hiddenimpacttarget() { return 1; }",
+            ),
+            (
+                "src/hidden_callers.js",
+                r#"
+import { hiddenimpacttarget } from "./hidden_target.js";
+export function hiddencaller_one() { return hiddenimpacttarget(); }
+export function hiddencaller_two() { return hiddenimpacttarget(); }
+export function hiddencaller_three() { return hiddenimpacttarget(); }
+"#,
+            ),
+        ],
+    );
+    index_repo(&visible_repo, &db_path);
+    index_repo(&hidden_repo, &db_path);
+
+    let query_token = "authz-query-token-0123456789abcdef012345";
+    let admin_token = "authz-admin-token-0123456789abcdef012345";
+    let config_path = dir.path().join("instance.toml");
+    let config = format!(
+        r#"
+instance_id = "authz-process-test"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nw-authz-test-snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nw-authz-test-workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[authz.rules]
+"{query_token}" = ["*visible_repo*"]
+"#,
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let guard = helpers::server_guard::ServerGuard::start_with_admin_auth_and_config(
+        &db_path,
+        query_token,
+        admin_token,
+        &config_path,
+    );
+    let mcp_addr = guard.mcp_addr();
+    let client = reqwest::Client::new();
+    let arguments = json!({
+        "changed_files": ["src/visible_target.js", "src/hidden_target.js"],
+        "limit": 50
+    });
+
+    let admin_response = client
+        .post(format!("{mcp_addr}/mcp"))
+        .bearer_auth(admin_token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 51,
+            "method": "tools/call",
+            "params": {
+                "name": "blast_radius",
+                "arguments": arguments.clone()
+            }
+        }))
+        .send()
+        .await
+        .expect("admin MCP HTTP blast_radius request failed");
+    assert_eq!(admin_response.status(), 200);
+    let admin_body: Value = admin_response.json().await.unwrap();
+    assert_eq!(
+        admin_body["result"]["isError"],
+        json!(false),
+        "admin blast_radius failed: {admin_body}"
+    );
+    let admin = &admin_body["result"]["structuredContent"];
+
+    let query_response = client
+        .post(format!("{mcp_addr}/mcp"))
+        .bearer_auth(query_token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 52,
+            "method": "tools/call",
+            "params": {
+                "name": "blast_radius",
+                "arguments": {
+                    "changed_files": ["src/visible_target.js", "src/hidden_target.js"],
+                    "limit": 1
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("query MCP HTTP blast_radius request failed");
+    assert_eq!(query_response.status(), 200);
+    let query_body: Value = query_response.json().await.unwrap();
+    assert_eq!(
+        query_body["result"]["isError"],
+        json!(false),
+        "query-scoped blast_radius failed: {query_body}"
+    );
+    let visible = &query_body["result"]["structuredContent"];
+
+    let admin_total = admin["affected_symbol_count"]
+        .as_u64()
+        .expect("admin affected_symbol_count");
+    let visible_total = visible["affected_symbol_count"]
+        .as_u64()
+        .expect("visible affected_symbol_count");
+    assert_eq!(
+        admin_total, 5,
+        "admin fixture should include two visible and three hidden affected symbols: {admin}"
+    );
+    assert_eq!(
+        visible_total, 2,
+        "restricted total must count only the two visible affected symbols: {visible}"
+    );
+    assert_eq!(
+        visible["returned_affected_symbol_count"],
+        json!(1),
+        "small limit should return one visible row: {visible}"
+    );
+    assert_eq!(
+        visible["affected_symbols_truncated"],
+        json!(true),
+        "restricted total should remain exact when the visible rows are truncated: {visible}"
+    );
+
+    let admin_serialized = admin.to_string();
+    assert!(
+        admin_serialized.contains("hiddencaller"),
+        "admin fixture must prove hidden affected rows exist: {admin}"
+    );
+    let visible_serialized = visible.to_string();
+    for hidden_marker in [
+        "hidden_repo",
+        "hidden_callers.js",
+        "hiddenimpacttarget",
+        "hiddencaller",
+    ] {
+        assert!(
+            !visible_serialized.contains(hidden_marker),
+            "query-scoped output leaked {hidden_marker}: {visible}"
+        );
+    }
+}
+
 // ── Webhook integration tests ───────────────────────────────────────────
 
 /// Compute HMAC-SHA256 signature in GitHub's `sha256=<hex>` format.
