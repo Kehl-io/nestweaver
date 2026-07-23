@@ -458,6 +458,12 @@ impl TantivyIndex {
     /// Use after a fresh `index_markdown_directory` or as a manual escape
     /// hatch (`nestweaver brain reindex-search`).
     ///
+    /// When this call successfully migrates a legacy schema, it atomically
+    /// replaces the index directory and retires this handle's cached Tantivy
+    /// state. Every subsequent fallible operation on this handle returns
+    /// [`TantivyError::IndexReopenRequired`]; drop it and reopen the index
+    /// before further use.
+    ///
     /// Atomicity invariant: the `delete_all_documents` and the re-adds MUST
     /// land in a SINGLE commit. Tantivy commits are atomic per generation, so
     /// a concurrent reader then sees the old-or-new full corpus and never an
@@ -761,6 +767,7 @@ impl TantivyIndex {
     /// segments. This is cheap: it just checks for new segment metadata
     /// and opens any new segment readers. A no-op when nothing changed.
     pub fn reload(&self) -> Result<(), TantivyError> {
+        self.ensure_reopen_not_required()?;
         self.reader.reload()?;
         Ok(())
     }
@@ -769,6 +776,7 @@ impl TantivyIndex {
     /// hits ranked by Tantivy's default BM25 scoring.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, TantivyError> {
         validate_presentation_limit(limit)?;
+        self.ensure_reopen_not_required()?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -805,6 +813,7 @@ impl TantivyIndex {
         count_cap: usize,
     ) -> Result<TantivySearchPage, TantivyError> {
         validate_presentation_limit(limit)?;
+        self.ensure_reopen_not_required()?;
         if !self.counted_search_supported {
             return Err(TantivyError::CountedSearchRequiresReindex);
         }
@@ -923,6 +932,7 @@ impl TantivyIndex {
         stopwords: &[&str],
     ) -> Result<(Vec<SearchHit>, Vec<String>), TantivyError> {
         validate_presentation_limit(limit)?;
+        self.ensure_reopen_not_required()?;
         if query.trim().is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -945,6 +955,7 @@ impl TantivyIndex {
         stopwords: &[&str],
     ) -> Result<TantivyPrfSearchPage, TantivyError> {
         validate_presentation_limit(limit)?;
+        self.ensure_reopen_not_required()?;
         if !self.counted_search_supported {
             return Err(TantivyError::CountedSearchRequiresReindex);
         }
@@ -1024,6 +1035,7 @@ impl TantivyIndex {
     ) -> Result<Vec<String>, TantivyError> {
         use std::collections::{HashMap, HashSet};
 
+        self.ensure_reopen_not_required()?;
         if hits.is_empty() {
             return Ok(Vec::new());
         }
@@ -2095,9 +2107,9 @@ mod tests {
             .unwrap();
         store
             .insert_note(&Note {
-                uid: "note:legacy".to_string(),
+                uid: "note:replacement".to_string(),
                 vault_uid: "vlt:t".to_string(),
-                file_path: "legacy.md".to_string(),
+                file_path: "replacement.md".to_string(),
                 title: "Payment Note".to_string(),
                 note_kind: NoteKind::Design,
                 word_count: 3,
@@ -2111,8 +2123,8 @@ mod tests {
             .unwrap();
         store
             .insert_heading(&Heading {
-                uid: "head:legacy".to_string(),
-                note_uid: "note:legacy".to_string(),
+                uid: "head:replacement".to_string(),
+                note_uid: "note:replacement".to_string(),
                 level: 1,
                 text: "Payment Heading".to_string(),
                 slug: "payment-heading".to_string(),
@@ -2124,9 +2136,9 @@ mod tests {
             .unwrap();
         store
             .insert_section(&Section {
-                uid: "sec:legacy".to_string(),
-                note_uid: "note:legacy".to_string(),
-                heading_uid: Some("head:legacy".to_string()),
+                uid: "sec:replacement".to_string(),
+                note_uid: "note:replacement".to_string(),
+                heading_uid: Some("head:replacement".to_string()),
                 start_line: 2,
                 end_line: 3,
                 text_hash: "section-hash".to_string(),
@@ -2139,12 +2151,59 @@ mod tests {
         let legacy = TantivyIndex::open_or_create(dir.path()).unwrap();
         assert_eq!(legacy.search("payment", 10).unwrap().len(), 1);
         assert_eq!(legacy.reindex_from_store(&store).unwrap(), 3);
+
+        macro_rules! assert_reopen_required {
+            ($operation:expr) => {
+                let error = $operation.unwrap_err();
+                assert!(
+                    matches!(error, TantivyError::IndexReopenRequired),
+                    "expected IndexReopenRequired, got {error}"
+                );
+            };
+        }
+        macro_rules! assert_presentation_limit_exceeded {
+            ($operation:expr) => {
+                let error = $operation.unwrap_err();
+                assert!(
+                    matches!(error, TantivyError::PresentationLimitExceeded { .. }),
+                    "expected PresentationLimitExceeded, got {error}"
+                );
+            };
+        }
+
+        let over_limit = SEARCH_PRESENTATION_LIMIT_MAX + 1;
+        assert_presentation_limit_exceeded!(legacy.search("payment", over_limit));
+        assert_presentation_limit_exceeded!(legacy.search_page("payment", over_limit));
+        assert_presentation_limit_exceeded!(legacy.search_prf("payment", over_limit, &[]));
+        assert_presentation_limit_exceeded!(legacy.search_prf_page("payment", over_limit, &[]));
+
+        assert_reopen_required!(legacy.reload());
+        assert_reopen_required!(legacy.search("payment", 10));
+        assert_reopen_required!(legacy.search_page("payment", 10));
+        assert_reopen_required!(legacy.search_prf("payment", 10, &[]));
+        assert_reopen_required!(legacy.search_prf_page("payment", 10, &[]));
+        assert_reopen_required!(legacy.prf_expand_terms("payment", &[], &[]));
+        assert_reopen_required!(legacy.update_note(
+            "note:stale",
+            "Stale",
+            "vlt:t",
+            &[],
+            &[],
+            &[],
+            &[],
+        ));
+        assert_reopen_required!(legacy.update_notes_batch(&[]));
+        assert_reopen_required!(legacy.remove_note("note:stale"));
+        assert_reopen_required!(legacy.reindex_from_store(&store));
         drop(legacy);
 
         let reopened = TantivyIndex::open_reader_only(dir.path()).unwrap();
         let page = reopened.search_page("payment", 10).unwrap();
         assert_eq!(page.hits.len(), 3);
         assert_eq!(page.total, SearchTotal::exact(1));
+        let replacement_hits = reopened.search("section", 10).unwrap();
+        assert_eq!(replacement_hits.len(), 1);
+        assert_eq!(replacement_hits[0].uid, "sec:replacement");
         assert!(
             reopened
                 .index
