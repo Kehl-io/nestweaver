@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
+use nestweaver_engine::query::search_symbols_page;
 use nestweaver_engine::{
     BlastRadiusOptions, BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig,
     SummaryLevel, ToolDocEntry, analyze_blast_radius, attach_cluster_ids, attach_communities,
@@ -22,10 +23,11 @@ use nestweaver_engine::{
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
     load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, search_symbols,
-    tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, tag_graph,
+    tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_schema::SymbolKind;
+use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
 use nestweaver_store::{GraphStore, TantivyIndex};
 use serde_json::{Value, json};
 // In non-daemon builds, brain_add_source and set_extension write directly using
@@ -679,8 +681,8 @@ pub fn dispatch(
 /// `visible` carries the caller's per-repo visibility (R9/R9b), resolved by the
 /// HTTP boundary from the bearer identity. `None` (and `Some(VisibleRepos::All)`)
 /// means no scoping — the backward-compatible single-trust-domain default, in
-/// which blast-radius redaction is a no-op. Only `blast_radius` reads it; every
-/// other tool ignores it, exactly like `cancel`.
+/// which repo-scoped authorization is a no-op. `brain_search` and
+/// `blast_radius` enforce it; tools whose data is not repo-scoped ignore it.
 pub fn dispatch_cancellable(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -724,7 +726,7 @@ fn dispatch_uncached(
 ) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel),
-        "brain_search" => tool_brain_search(store, tantivy, args),
+        "brain_search" => tool_brain_search(store, tantivy, args, visible),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
         "brain_status" => tool_brain_status(store, tantivy),
@@ -2527,10 +2529,47 @@ fn render_cost(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
 
 // ── 2. brain_search ─────────────────────────────────────────────────────────
 
+const BRAIN_SEARCH_MAX_PER_KIND: usize = 1_000;
+const BRAIN_SEARCH_COUNT_CANDIDATES: usize = 10_000;
+
+fn combine_search_totals(notes: SearchTotal, symbols: SearchTotal) -> SearchTotal {
+    let value = notes.value.saturating_add(symbols.value);
+    if notes.relation == SearchTotalRelation::Exact
+        && symbols.relation == SearchTotalRelation::Exact
+    {
+        SearchTotal::exact(value)
+    } else {
+        SearchTotal::lower_bound(value)
+    }
+}
+
+fn search_results_are_truncated(total: SearchTotal, returned: usize) -> bool {
+    total.relation == SearchTotalRelation::LowerBound || returned < total.value
+}
+
+fn search_total_relation_label(relation: SearchTotalRelation) -> &'static str {
+    match relation {
+        SearchTotalRelation::Exact => "eq",
+        SearchTotalRelation::LowerBound => "gte",
+    }
+}
+
+fn authorized_symbol_total(
+    global: SearchTotal,
+    fetched_candidates: usize,
+    authorized_entities: usize,
+) -> SearchTotal {
+    if global.relation == SearchTotalRelation::Exact && global.value == fetched_candidates {
+        SearchTotal::exact(authorized_entities)
+    } else {
+        SearchTotal::lower_bound(authorized_entities)
+    }
+}
+
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
+        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2541,7 +2580,9 @@ fn tool_schema_brain_search() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum results to return. Default 20. Set lower for focused lookups, higher for broad discovery.",
-                    "default": 20
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 1000
                 },
                 "response_format": {
                     "type": "string",
@@ -2578,6 +2619,7 @@ fn tool_brain_search(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
     args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let raw_query = args
         .get("query")
@@ -2589,10 +2631,9 @@ fn tool_brain_search(
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(20)
-        // Clamp to >=1: `limit:0` flows into `limit * 5` → `TopDocs::with_limit(0)`,
-        // which Tantivy asserts against ("Limit must be greater than 0") — a panic
-        // on a plausible client input.
-        .max(1);
+        // Schema validation rejects out-of-range MCP calls; keep a defensive
+        // clamp for direct unit/internal calls that bypass dispatch validation.
+        .clamp(1, BRAIN_SEARCH_MAX_PER_KIND);
     let concise = is_concise(&args);
 
     // Expand the query with taxonomy aliases for better recall.
@@ -2607,29 +2648,29 @@ fn tool_brain_search(
     // ── Vault note results ──────────────────────────────────────────────
 
     let mut expansion_terms: Vec<String> = Vec::new();
-    let (mut note_results, engine) = if let Some(idx) = tantivy {
+    let (grouped_notes, engine) = if let Some(idx) = tantivy {
         // Tantivy BM25 path (preferred).
-        let raw_limit = limit * 5;
-        let hits = if prf {
-            let (hits, terms) = idx
-                .search_prf(
+        let (hits, total) = if prf {
+            let page = idx
+                .search_prf_page(
                     &query,
-                    raw_limit,
+                    BRAIN_SEARCH_COUNT_CANDIDATES,
                     nestweaver_engine::query::nestweaver_store_stoplist(),
                 )
                 .map_err(|e| anyhow!("tantivy prf search: {e}"))?;
-            expansion_terms = terms;
-            hits
+            expansion_terms = page.expansion_terms;
+            (page.hits, page.total)
         } else {
-            idx.search(&query, raw_limit)
-                .map_err(|e| anyhow!("tantivy search: {e}"))?
+            let page = idx
+                .search_page(&query, BRAIN_SEARCH_COUNT_CANDIDATES)
+                .map_err(|e| anyhow!("tantivy search: {e}"))?;
+            (page.hits, page.total)
         };
-        let results = group_search_hits_by_note(store, &hits, limit, concise);
+        let results = group_search_hits_by_note(store, &hits, total, limit, concise);
         (results, "bm25")
     } else {
         // Substring fallback: search note titles, heading text, and section bodies.
         let needle = query.to_lowercase();
-        let raw_limit = limit * 5;
 
         struct RawHit {
             kind: String,
@@ -2643,7 +2684,7 @@ fn tool_brain_search(
         // Note title matches.
         let notes = store.list_notes(None).context("list_notes")?;
         for n in &notes {
-            if n.title.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
+            if n.title.to_lowercase().contains(&needle) {
                 raw_hits.push(RawHit {
                     kind: "note".to_string(),
                     title: n.title.clone(),
@@ -2654,38 +2695,34 @@ fn tool_brain_search(
         }
 
         // Heading text matches.
-        if raw_hits.len() < raw_limit {
-            let headings = store.list_all_headings().context("list_all_headings")?;
-            for h in &headings {
-                if h.text.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
-                    raw_hits.push(RawHit {
-                        kind: "heading".to_string(),
-                        title: h.text.clone(),
-                        note_uid: h.note_uid.clone(),
-                        score: 0.8,
-                    });
-                }
+        let headings = store.list_all_headings().context("list_all_headings")?;
+        for h in &headings {
+            if h.text.to_lowercase().contains(&needle) {
+                raw_hits.push(RawHit {
+                    kind: "heading".to_string(),
+                    title: h.text.clone(),
+                    note_uid: h.note_uid.clone(),
+                    score: 0.8,
+                });
             }
         }
 
         // Section body matches.
-        if raw_hits.len() < raw_limit {
-            let sections = store.list_all_sections().context("list_all_sections")?;
-            for s in &sections {
-                if s.text_content.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
-                    let title = s
-                        .heading_uid
-                        .as_deref()
-                        .and_then(|h_uid| store.lookup_heading(h_uid).ok())
-                        .map(|h| h.text)
-                        .unwrap_or_else(|| "(untitled section)".to_string());
-                    raw_hits.push(RawHit {
-                        kind: "section".to_string(),
-                        title,
-                        note_uid: s.note_uid.clone(),
-                        score: 0.6,
-                    });
-                }
+        let sections = store.list_all_sections().context("list_all_sections")?;
+        for s in &sections {
+            if s.text_content.to_lowercase().contains(&needle) {
+                let title = s
+                    .heading_uid
+                    .as_deref()
+                    .and_then(|h_uid| store.lookup_heading(h_uid).ok())
+                    .map(|h| h.text)
+                    .unwrap_or_else(|| "(untitled section)".to_string());
+                raw_hits.push(RawHit {
+                    kind: "section".to_string(),
+                    title,
+                    note_uid: s.note_uid.clone(),
+                    score: 0.6,
+                });
             }
         }
 
@@ -2745,7 +2782,8 @@ fn tool_brain_search(
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let results: Vec<Value> = note_order
+        let matched_entities = groups.len();
+        let rows: Vec<Value> = note_order
             .iter()
             .take(limit)
             .filter_map(|nuid| groups.get(nuid))
@@ -2768,41 +2806,71 @@ fn tool_brain_search(
             })
             .collect();
 
-        (results, "substring")
+        (
+            GroupedNoteResults {
+                rows,
+                total: SearchTotal::exact(matched_entities),
+            },
+            "substring",
+        )
     };
+    let note_total = grouped_notes.total;
+    let mut note_results = grouped_notes.rows;
 
     // ── Code symbol results ─────────────────────────────────────────────
 
-    // Collect note titles (lowercased) for dedup against code symbols.
-    let seen_titles: HashSet<String> = note_results
-        .iter()
-        .filter_map(|v| v.get("title").and_then(|t| t.as_str()))
-        .map(|t| t.to_lowercase())
-        .collect();
+    let restricted_repos = match visible {
+        Some(nestweaver_engine::authz::VisibleRepos::Only(repos)) => Some(repos),
+        None | Some(nestweaver_engine::authz::VisibleRepos::All) => None,
+    };
+    let symbol_fetch_limit = if restricted_repos.is_some() {
+        BRAIN_SEARCH_COUNT_CANDIDATES
+    } else {
+        limit
+    };
+    let symbol_page =
+        search_symbols_page(store, &query, symbol_fetch_limit).context("search code symbols")?;
+    let fetched_symbol_candidates = symbol_page.results.len();
+    let mut code_hits = symbol_page.results;
+    if let Some(repos) = restricted_repos {
+        code_hits.retain(|candidate| {
+            store
+                .lookup_symbol(&candidate.uid)
+                .ok()
+                .is_some_and(|symbol| {
+                    !symbol.repo_uid.trim().is_empty() && repos.contains(&symbol.repo_uid)
+                })
+        });
+    }
+    let symbol_total = if restricted_repos.is_some() {
+        authorized_symbol_total(
+            symbol_page.total,
+            fetched_symbol_candidates,
+            code_hits.len(),
+        )
+    } else {
+        symbol_page.total
+    };
 
-    // Search code symbols and merge into results, skipping duplicates.
-    if let Ok(code_hits) = search_symbols(store, &query, limit) {
-        for sym in &code_hits {
-            if seen_titles.contains(&sym.name.to_lowercase()) {
-                continue;
-            }
-            let location = format!("{}:{}", sym.file_path, sym.start_line);
-            let kind = format!("Symbol/{}", sym.kind);
-            if concise {
-                note_results.push(json!({
-                    "kind": kind,
-                    "title": sym.name,
-                    "location": location,
-                }));
-            } else {
-                note_results.push(json!({
-                    "uid": sym.uid,
-                    "kind": kind,
-                    "title": sym.name,
-                    "score": 0.5,
-                    "location": location,
-                }));
-            }
+    // Titles never define identity. A note and a code symbol with the same
+    // display title remain distinct entities and distinct rows.
+    for sym in code_hits.iter().take(limit) {
+        let location = format!("{}:{}", sym.file_path, sym.start_line);
+        let kind = format!("Symbol/{}", sym.kind);
+        if concise {
+            note_results.push(json!({
+                "kind": kind,
+                "title": sym.name,
+                "location": location,
+            }));
+        } else {
+            note_results.push(json!({
+                "uid": sym.uid,
+                "kind": kind,
+                "title": sym.name,
+                "score": 0.5,
+                "location": location,
+            }));
         }
     }
 
@@ -2936,7 +3004,7 @@ fn tool_brain_search(
 
     // Bug C / symbol-parity fix: `limit` is interpreted per-kind. Notes
     // (capped at `limit` in `group_search_hits_by_note` / substring `.take`)
-    // and symbols (capped at `limit` in `search_symbols`) are each bounded
+    // and symbols (capped at `limit` from `search_symbols_page`) are each bounded
     // upstream, so we deliberately skip a cross-kind truncate here. A merged
     // cap would evict every symbol whenever ≥ `limit` notes match because
     // symbols carry a fixed 0.5 score while BM25 notes score 15+. Callers
@@ -3002,12 +3070,17 @@ fn tool_brain_search(
         }
     }
 
-    let total = note_results.len();
+    let total = combine_search_totals(note_total, symbol_total);
+    let returned_matches = note_results.len();
+    let truncated = search_results_are_truncated(total, returned_matches);
     let mut response = json!({
         "query": query,
         "engine": engine,
         "results": note_results,
-        "total_matches": total,
+        "total_matches": total.value,
+        "total_matches_relation": search_total_relation_label(total.relation),
+        "returned_matches": returned_matches,
+        "truncated": truncated,
     });
     if engine == "substring" {
         response["engine_warning"] = json!(
@@ -3026,12 +3099,18 @@ fn tool_brain_search(
 /// For each note, picks the highest-scoring hit and collects matched
 /// heading/section titles. Returns at most `limit` note-level results
 /// sorted by best score.
+struct GroupedNoteResults {
+    rows: Vec<Value>,
+    total: SearchTotal,
+}
+
 fn group_search_hits_by_note(
     store: &GraphStore,
     hits: &[nestweaver_store::SearchHit],
+    total: SearchTotal,
     limit: usize,
     concise: bool,
-) -> Vec<Value> {
+) -> GroupedNoteResults {
     use std::collections::HashMap;
 
     struct NoteGroup {
@@ -3116,7 +3195,7 @@ fn group_search_hits_by_note(
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    note_order
+    let rows = note_order
         .iter()
         .take(limit)
         .filter_map(|nuid| groups.get(nuid))
@@ -3139,10 +3218,440 @@ fn group_search_hits_by_note(
                 })
             }
         })
-        .collect()
+        .collect();
+    GroupedNoteResults { rows, total }
 }
 
 // ── 3. note_get ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod brain_search_total_contract_tests {
+    use super::*;
+    use nestweaver_engine::authz::VisibleRepos;
+    use nestweaver_schema::{Heading, Note, NoteKind, Section, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
+
+    const QUERY: &str = "searchneedle";
+
+    fn note(uid: &str, title: &str) -> Note {
+        Note {
+            uid: uid.to_string(),
+            vault_uid: "vlt:search".to_string(),
+            file_path: format!("{uid}.md"),
+            title: title.to_string(),
+            note_kind: NoteKind::General,
+            word_count: 20,
+            content_hash: format!("hash-{uid}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    fn heading(uid: &str, note_uid: &str, text: &str) -> Heading {
+        Heading {
+            uid: uid.to_string(),
+            note_uid: note_uid.to_string(),
+            level: 2,
+            text: text.to_string(),
+            slug: uid.to_string(),
+            start_line: 2,
+            end_line: 4,
+            content_hash: format!("hash-{uid}"),
+            embedding: None,
+        }
+    }
+
+    fn section(uid: &str, note_uid: &str, heading_uid: &str, text: &str) -> Section {
+        Section {
+            uid: uid.to_string(),
+            note_uid: note_uid.to_string(),
+            heading_uid: Some(heading_uid.to_string()),
+            start_line: 3,
+            end_line: 4,
+            text_hash: format!("hash-{uid}"),
+            text_content: text.to_string(),
+            word_count: 5,
+            pagerank_score: None,
+        }
+    }
+
+    fn symbol(uid: &str, repo_uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: format!("src/{uid}.rs"),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash-{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn search_fixture() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for n in [
+            note("note:fragment-rich", "SearchneedleShared"),
+            note("note:second", "Second Searchneedle Note"),
+        ] {
+            store.insert_note(&n).unwrap();
+        }
+        for h in [
+            heading(
+                "heading:first",
+                "note:fragment-rich",
+                "Searchneedle First Heading",
+            ),
+            heading(
+                "heading:second",
+                "note:fragment-rich",
+                "Searchneedle Second Heading",
+            ),
+        ] {
+            store.insert_heading(&h).unwrap();
+        }
+        for s in [
+            section(
+                "section:first",
+                "note:fragment-rich",
+                "heading:first",
+                "searchneedle orchid migration details",
+            ),
+            section(
+                "section:second",
+                "note:fragment-rich",
+                "heading:second",
+                "searchneedle quartz rollout details",
+            ),
+        ] {
+            store.insert_section(&s).unwrap();
+        }
+        for s in [
+            symbol("sym:shared-title", "repo:visible", "SearchneedleShared"),
+            symbol("sym:second", "repo:visible", "SearchneedleBeta"),
+            symbol("sym:hidden", "repo:hidden", "SearchneedleGamma"),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        store
+    }
+
+    fn index_fixture(index: &TantivyIndex) {
+        index
+            .update_note(
+                "note:fragment-rich",
+                "SearchneedleShared",
+                "vlt:search",
+                &["searchneedle orchid quartz migration rollout".to_string()],
+                &[
+                    (
+                        "heading:first".to_string(),
+                        "Searchneedle First Heading".to_string(),
+                    ),
+                    (
+                        "heading:second".to_string(),
+                        "Searchneedle Second Heading".to_string(),
+                    ),
+                ],
+                &[
+                    (
+                        "section:first".to_string(),
+                        "searchneedle orchid migration details".to_string(),
+                        "Searchneedle First Heading".to_string(),
+                    ),
+                    (
+                        "section:second".to_string(),
+                        "searchneedle quartz rollout details".to_string(),
+                        "Searchneedle Second Heading".to_string(),
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+        index
+            .update_note(
+                "note:second",
+                "Second Searchneedle Note",
+                "vlt:search",
+                &["searchneedle cedar deployment guide".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn brain_search_combines_exact_and_lower_bound_domain_totals() {
+        let cases = [
+            (
+                SearchTotal::exact(4),
+                SearchTotal::exact(3),
+                7,
+                SearchTotalRelation::Exact,
+            ),
+            (
+                SearchTotal::lower_bound(4),
+                SearchTotal::exact(3),
+                7,
+                SearchTotalRelation::LowerBound,
+            ),
+            (
+                SearchTotal::exact(4),
+                SearchTotal::lower_bound(3),
+                7,
+                SearchTotalRelation::LowerBound,
+            ),
+            (
+                SearchTotal::lower_bound(4),
+                SearchTotal::lower_bound(3),
+                7,
+                SearchTotalRelation::LowerBound,
+            ),
+        ];
+
+        for (notes, symbols, expected_value, expected_relation) in cases {
+            let combined = combine_search_totals(notes, symbols);
+            assert_eq!(combined.value, expected_value);
+            assert_eq!(combined.relation, expected_relation);
+        }
+
+        assert_eq!(
+            combine_search_totals(SearchTotal::exact(usize::MAX), SearchTotal::exact(1)).value,
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn brain_search_truncation_respects_relation_and_returned_count() {
+        assert!(!search_results_are_truncated(SearchTotal::exact(4), 4));
+        assert!(search_results_are_truncated(SearchTotal::exact(4), 3));
+        assert!(search_results_are_truncated(SearchTotal::lower_bound(4), 4));
+        assert_eq!(
+            search_total_relation_label(SearchTotalRelation::Exact),
+            "eq"
+        );
+        assert_eq!(
+            search_total_relation_label(SearchTotalRelation::LowerBound),
+            "gte"
+        );
+    }
+
+    #[test]
+    fn brain_search_total_is_limit_independent_and_collapses_note_fragments() {
+        let store = search_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_fixture(&index);
+
+        let small = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 1 }),
+            None,
+        )
+        .unwrap();
+        let large = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10 }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(small["total_matches"], large["total_matches"]);
+        assert_eq!(small["total_matches"], json!(5));
+        assert_eq!(small["total_matches_relation"], "eq");
+        assert_eq!(large["total_matches_relation"], "eq");
+        assert!(
+            small["returned_matches"].as_u64().unwrap()
+                < large["returned_matches"].as_u64().unwrap()
+        );
+        assert_eq!(small["returned_matches"], json!(2));
+        assert_eq!(large["returned_matches"], json!(5));
+        assert_eq!(small["truncated"], json!(true));
+        assert_eq!(large["truncated"], json!(false));
+
+        let rows = large["results"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["uid"] == "note:fragment-rich")
+                .count(),
+            1,
+            "one note row must represent every matching heading/section fragment"
+        );
+        let shared_title: Vec<&Value> = rows
+            .iter()
+            .filter(|row| row["title"] == "SearchneedleShared")
+            .collect();
+        assert_eq!(shared_title.len(), 2);
+        assert!(shared_title.iter().any(|row| row["kind"] == "note"));
+        assert!(
+            shared_title
+                .iter()
+                .any(|row| row["kind"].as_str().unwrap().starts_with("Symbol/"))
+        );
+    }
+
+    #[test]
+    fn brain_search_substring_fallback_counts_full_note_groups() {
+        let store = search_fixture();
+        let small = dispatch(
+            &store,
+            None,
+            "brain_search",
+            json!({ "query": QUERY, "limit": 1 }),
+            None,
+        )
+        .unwrap();
+        let large = dispatch(
+            &store,
+            None,
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10 }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(small["engine"], "substring");
+        assert_eq!(small["total_matches"], json!(5));
+        assert_eq!(small["total_matches"], large["total_matches"]);
+        assert_eq!(small["total_matches_relation"], "eq");
+        assert_eq!(large["returned_matches"], json!(5));
+    }
+
+    #[test]
+    fn brain_search_prf_uses_counted_final_query_totals() {
+        let store = search_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_fixture(&index);
+
+        let small = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 1, "prf": true }),
+            None,
+        )
+        .unwrap();
+        let large = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10, "prf": true }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(small["engine"], "bm25");
+        assert_eq!(small["total_matches"], large["total_matches"]);
+        assert_eq!(small["total_matches_relation"], "eq");
+        assert!(small["truncated"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn brain_search_zero_matches_are_exact_and_not_truncated() {
+        let store = search_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_fixture(&index);
+        for tantivy in [None, Some(&index)] {
+            let result = dispatch(
+                &store,
+                tantivy,
+                "brain_search",
+                json!({ "query": "absentneedle", "limit": 1 }),
+                None,
+            )
+            .unwrap();
+            assert_eq!(result["total_matches"], json!(0));
+            assert_eq!(result["total_matches_relation"], "eq");
+            assert_eq!(result["returned_matches"], json!(0));
+            assert_eq!(result["truncated"], json!(false));
+        }
+    }
+
+    #[test]
+    fn brain_search_visibility_never_counts_hidden_symbols() {
+        let store = search_fixture();
+        store
+            .insert_symbol(&symbol("sym:unknown-owner", "", "SearchneedleUnknown"))
+            .unwrap();
+        let visible = VisibleRepos::Only(
+            ["repo:visible".to_string(), String::new()]
+                .into_iter()
+                .collect(),
+        );
+        let result = dispatch_cancellable(
+            &store,
+            None,
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10 }),
+            None,
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+
+        assert_eq!(result["total_matches"], json!(4));
+        assert_eq!(result["total_matches_relation"], "eq");
+        assert_eq!(result["returned_matches"], json!(4));
+        assert!(
+            result["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["uid"] != "sym:hidden" && row["uid"] != "sym:unknown-owner")
+        );
+
+        assert_eq!(
+            authorized_symbol_total(SearchTotal::exact(4), 4, 1),
+            SearchTotal::exact(1)
+        );
+        assert_eq!(
+            authorized_symbol_total(SearchTotal::exact(10_001), 10_000, 1),
+            SearchTotal::lower_bound(1),
+            "a bounded authorized scan must not reveal the global hidden total"
+        );
+    }
+
+    #[test]
+    fn brain_search_schema_bounds_limit_and_documents_total_contract() {
+        let schema = tool_schema_brain_search();
+        assert_eq!(schema["inputSchema"]["properties"]["limit"]["minimum"], 1);
+        assert_eq!(
+            schema["inputSchema"]["properties"]["limit"]["maximum"],
+            1000
+        );
+        let description = schema["description"].as_str().unwrap();
+        assert!(description.contains("total_matches_relation"));
+        assert!(description.contains("returned_matches"));
+        assert!(
+            validate_tool_arguments("brain_search", &json!({ "query": QUERY, "limit": 0 }))
+                .is_err()
+        );
+        assert!(
+            validate_tool_arguments("brain_search", &json!({ "query": QUERY, "limit": 1001 }))
+                .is_err()
+        );
+    }
+}
 
 fn tool_schema_note_get() -> Value {
     json!({
