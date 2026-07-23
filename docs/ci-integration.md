@@ -390,6 +390,11 @@ What we do about it, rather than hiding it:
 - **We never claim safety.** The tiers are a prioritized signal; `status`,
   `gate_state`, and `recommendation` tell CI when not to trust them.
 - **Degraded runs widen, never narrow** — `recommendation: run-full-suite`.
+- **Unrecognized file types widen too** — a changed file whose extension the
+  indexer doesn't know (Makefile, CI YAML, `.sql`, `.proto`, …) can't be mapped
+  to symbols, so the result reports `status: partial` with
+  `recommendation: run-full-suite` instead of silently reporting `complete`.
+  Markdown-only changes stay `complete` (docs can't break code).
 - **Changed and recently-failed tests are always included** regardless of what
   the graph says, so the common miss cases are covered by rule rather than by
   traversal.
@@ -400,6 +405,25 @@ What we do about it, rather than hiding it:
 The honest summary: run `affected_tests` for fast feedback, keep a periodic
 full-suite run as the safety net, and use `rts-eval report` to learn what your
 *actual* recall is on your codebase rather than trusting anyone's marketing.
+
+## Index freshness gate
+
+`affected_tests` and blast-radius results are only as current as the index.
+`stale-check` doubles as a CI freshness gate: it exits **1** when any repo's
+indexed SHA is behind git HEAD **or** its working tree has been deleted
+(flagged `[missing]` in text output, `status: "missing"` in JSON). The JSON
+carries an accurate `stale_repos` array, so a job can fail fast and name the
+repos to re-index:
+
+```yaml
+- name: Fail if the NestWeaver index is stale
+  run: nestweaver stale-check --db nestweaver.lbug   # exit 1 = re-index needed
+```
+
+Read/lookup commands against a non-existent database also fail (exit 1,
+`db_not_found`) instead of creating an empty DB and reporting success — a CI
+job pointed at the wrong `--db` path fails loudly rather than passing on an
+empty graph.
 
 ## Networking
 

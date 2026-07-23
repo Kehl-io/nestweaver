@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+
+### Bug Fixes
+
+* **search:** `regex-search`/`count-patterns` — fix trigram pre-filter correctness for alternation patterns; detect a stale trigram index and fall back to a full scan (`stale_index: true` in JSON, note in text output; remedy: re-run `index --with-trigrams`); bound `--limit` to 1–10000 and `--max-millis` to 1–600000
+* **impact/trust:** `impact`/`brain_impact` fail closed on unknown or foreign UIDs (CLI exit 2, MCP `not_found`) instead of returning an empty result; `--depth` bounded to 1–15 on CLI and MCP (`pr-impact --depth` same)
+* **impact/trust:** `affected-tests` — changed files with unrecognized extensions (Makefile, CI YAML, `.sql`, `.proto`, …) now report `status: partial` with `recommendation: run-full-suite` instead of a silent `complete`; markdown-only changes stay `complete`
+* **impact/trust:** `dead-code`/`dead_code` JSON gains `matching_count` (post-`--min-confidence`); `unreachable_count` is again the unfiltered total, consistent with `total_symbols`/`reachable_symbols`/`dead_percentage`; `--limit` bounded to 1–1000
+* **MCP validation:** enforce `--tools`/`--lite` allowlists on all transports (local stdio, daemon proxy, hybrid, MCP-over-HTTP); add numeric bounds to tool schemas (`token_budget` 1–16000, `depth`/`max_depth` 1–15, `limit` 1–1000, `include_neighbors` 0–255); hardened tools reject unknown argument names instead of silently ignoring them; `regex_search` rejects conflicting `pattern`+`query` and invalid `kinds`; stdio tool errors no longer carry a misleading `gRPC error:` prefix; `brain_guide` via daemon errors if `config` is passed (use CLI `generate-guide --config`)
+* **investigate:** the query's own seed/direct-hit nodes appear first in the map with `is_seed: true`; `--scope` is validated strictly (`project:<name>`, `repo:<name>`, `vault`, `all`; unknown scopes error); `project:` scope filters symbols to project members; bundle storage is concurrency-safe and salvages corrupt sidecars; hydrate skips over-budget bodies instead of aborting
+* **daemon/watch:** `watch` works without an instance config (daemon-side watcher with a safe-root denylist); `--force` replaces an existing watcher; direct fallback only when no daemon is running; lock errors hint at `daemon stop`
+* **daemon/watch:** `daemon stop`/`status` verify the pidfile PID belongs to this DB's daemon (cmdline + socket peer-PID cross-check) and refuse to signal foreign processes; `daemon start` waits for real health (up to 60s) with a "still booting" message instead of a false failure, and refuses to install over a not-yet-exited old daemon; `ui` releases its port on Ctrl-C and errors clearly on an already-bound port
+* **CLI correctness:** `stale-check` exits 1 when any repo is stale (CI freshness gate), flags deleted working trees as `[missing]`, and reports an accurate `stale_repos`
+* **CLI correctness:** `clusters`/`cluster` docs and output correctly describe the algorithm as Louvain-style local moving (single-level, not full Leiden) with true Newman–Girvan modularity; non-finite/non-positive `--resolution` clamps to 1.0; `cluster <id|name>` reads the cached sidecar
+* **CLI correctness:** `export` — cypher/graphml/mermaid carry real PageRank scores and mermaid `--top N` ranks by actual PageRank; msgpack always writes to `--output`/`<db>.graph.msgpack`, never stdout
+* **CLI correctness:** `contracts diff` content-sniffs explicit spec paths (any filename works for OpenAPI JSON/YAML); `generate-guide --format` is validated; `materialize-projects` rejects duplicate project names in the instance config (exit 1); `index --repo` rejects non-directory paths (exit 1, naming the path); `embed` reports a clear "stop the daemon first" error when a daemon holds the DB lock and requires `--batch-size` ≥ 1; `server init-tls --validity-days` bounded to 1–36500 and re-running over an existing CA warns about invalidating signed certs
+* **CLI correctness:** read/lookup commands (`list-repos`, `stale-check`, `prune-stale`, `remove-repo`, `export`, brain/memory reads, `hubs`, `instance merge`/`remove --purge-graph`) fail with `db_not_found` (exit 1) against a missing database instead of creating an empty DB and reporting success
+* **CLI correctness:** `pull --ephemeral` uses a unique temp workspace (never deletes a persistent checkout) and failed pulls clean up after themselves; `instance abort-migration --force` can discard an unreadable/corrupt migration journal (phase unknown — reconcile manually); `rts-eval record-truth` re-recording the same (repo, sha) upserts (correction wins) instead of first-record-wins
+* **docs:** README, CI guide, instance-config and instance-migration guides, server-mode doc, and integration READMEs updated to match the above
+
 ## [2.5.11](https://github.com/Kehl-io/nestweaver/compare/v2.5.10...v2.5.11) (2026-07-21)
 
 

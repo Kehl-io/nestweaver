@@ -208,16 +208,16 @@ cargo build --release
 | Command | Description |
 |---------|-------------|
 | `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. |
-| `watch` | Live re-indexing via filesystem watcher with debouncing |
+| `watch` | Live re-indexing via filesystem watcher with debouncing. Runs daemon-side (no instance config required; unsafe roots are denylisted); `--force` replaces an existing watcher |
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |
 | `symbol` | Look up a symbol by name and display its metadata |
-| `impact` | Trace the blast radius of a symbol through the dependency graph |
+| `impact` | Trace the blast radius of a symbol through the dependency graph (fails closed on unknown/foreign UIDs, exit 2; `--depth` 1–15) |
 | `read-symbols` | Read a symbol's source span |
-| `regex-search` | Regex search over indexed text |
+| `regex-search` | Regex search over indexed text (trigram pre-filter; falls back to a full scan with `stale_index: true` when the trigram index is stale — re-run `index --with-trigrams`) |
 | `count-patterns` | Count regex matches per pattern |
 | `investigate` | Orient on a topic in one call |
-| `affected-tests` | Select tests for changed files (tiered; carries a `recommendation` CI directive — `run-full-suite` on any degraded run) |
+| `affected-tests` | Select tests for changed files (tiered; carries a `recommendation` CI directive — `run-full-suite` on any degraded run or when changed files have unrecognized extensions like Makefile/CI YAML/`.sql`) |
 | `repo-map` | Generate a token-budgeted map of the repository structure |
 | `summary` | Hierarchical code summaries at symbol, file, or cluster level |
 
@@ -236,11 +236,11 @@ cargo build --release
 | `brain watch` | Watch vaults for changes and re-index automatically |
 | `brain refresh` | Force re-index of all registered vaults |
 | `brain remove` | Remove a vault from the brain (cascade-deletes nodes; does not touch files on disk) |
-| `brain stale-check` | Check if the indexed graph is stale by comparing each repo's indexed SHA against git HEAD (also available top-level as `stale-check`) |
+| `brain stale-check` | Check if the indexed graph is stale by comparing each repo's indexed SHA against git HEAD (also available top-level as `stale-check`). Exits 1 when any repo is stale or its working tree is missing (`[missing]`) — usable as a CI freshness gate |
 | `brain reindex-search` | Rebuild the Tantivy BM25 search index from current graph state |
 | `brain broken-links` | List wikilinks with ambiguous or low-confidence targets, with suggested fixes |
 | `brain orphans` | List notes with zero inbound and zero outbound wikilinks |
-| `brain topic-clusters` | Detect topic clusters via Leiden community detection over note wikilinks |
+| `brain topic-clusters` | Detect topic clusters via Louvain-style local-moving community detection over note wikilinks |
 | `brain tag-graph` | Show a tag's note count and co-occurring tags (or dump the full tag graph) |
 | `brain doc-stats` | One-shot health summary: note/wikilink counts, broken links, orphans, top tags |
 | `memory lint` | Health checks over the vault (stale notes, broken links, orphans) |
@@ -259,13 +259,13 @@ cargo build --release
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High); `--sarif` for code scanning, `--strict` to gate on contract-verified breaking changes |
 | `rts-eval record-truth` | Report a full-suite outcome from CI so selection quality can be measured |
 | `rts-eval report` | Measured file-recall / change-recall / selection-breadth of past selections (refuses percentages below 10 joined runs) |
-| `dead-code` | Detect unreachable symbols via entry point reachability |
+| `dead-code` | Detect unreachable symbols via entry point reachability (`unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`) |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
 | `contracts drift` | Routes declared in a spec but not implemented, and vice versa (presence-level) |
 | `contracts diff` | Field/type-level OpenAPI breaking-change diff between two spec versions (`--base`/`--head`, `--fail-on-breaking` for CI) |
 | `ranking` | Inspect ranking priors |
 | `eval` | Offline retrieval-quality evaluation |
-| `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format |
+| `export` | Export the graph in Cypher, GraphML, Mermaid, or MessagePack format (cypher/graphml/mermaid carry real PageRank scores; mermaid `--top N` ranks by PageRank; msgpack always writes to `--output`/`<db>.graph.msgpack`, never stdout) |
 
 </details>
 
@@ -281,7 +281,7 @@ cargo build --release
 | `suggest-links` | Discover potential cross-repo links between symbols |
 | `list-links` | List all cross-repo links in the instance |
 | `list-features` | List features spanning multiple repositories |
-| `clusters` | Detect community clusters in the dependency graph |
+| `clusters` | Detect community clusters in the dependency graph (Louvain-style local moving, single-level; results cached in a sidecar, `cluster <id\|name>` reads the cache) |
 | `cross-repo-refs` | Find references that cross repository boundaries |
 
 </details>
@@ -386,7 +386,7 @@ Three retrieval signals are fused via Convex Combination: PPR (graph structure),
 
 **Model selection.** The default is the light, fast `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~90MB) — a good fit for most repos and CPU-only servers. For higher-quality retrieval, embed with a stronger model, e.g. `nestweaver embed --model-id thenlper/gte-base` (768-dim). NestWeaver **records which model a database was embedded with**, and the daemon automatically loads that same model at startup — so you can pick a model per-database (or override the default in `instance.toml`) without dimension mismatches.
 
-**External embedding endpoints.** Instead of a local model you can embed via an OpenAI-compatible endpoint: `nestweaver embed --endpoint http://localhost:11434 --model nomic-embed-text` (Ollama), or a hosted gateway. For **keyed** gateways (OpenAI, Azure), set `NESTWEAVER_EMBED_API_KEY` — it is sent as a bearer token and is **never** written to config, the graph, or a snapshot. Omit it for a local Ollama endpoint. NestWeaver records the index dimension and rejects vectors of a mismatched dimension, so switching models requires re-embedding with `--force`.
+**External embedding endpoints.** Instead of a local model you can embed via an OpenAI-compatible endpoint: `nestweaver embed --endpoint http://localhost:11434 --model nomic-embed-text` (Ollama), or a hosted gateway. For **keyed** gateways (OpenAI, Azure), set `NESTWEAVER_EMBED_API_KEY` — it is sent as a bearer token and is **never** written to config, the graph, or a snapshot. Omit it for a local Ollama endpoint. NestWeaver records the index dimension and rejects vectors of a mismatched dimension, so switching models requires re-embedding with `--force`. The direct path (`--endpoint`/`--local`) can't run while a daemon holds the DB write lock — `embed` detects this and tells you to stop the daemon first (or embed through the daemon by dropping `--endpoint`/`--local`).
 
 **Performance:** 7ms query embedding (Metal), 37ms (CPU) for all-MiniLM; heavier models trade speed for quality. Query-time embedding runs on the GPU in the daemon (the model is loaded on the daemon's main thread so Metal is reachable). Forward Push PPR replaces power iteration for sub-10ms graph walks. LRU cache makes repeated queries instant (~8ms).
 
@@ -491,7 +491,7 @@ nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon manually
 pgrep -a nestweaver-daemon                        # find running daemons (Linux)
 ```
 
-40 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need.
+40 tools including type-aware context retrieval, confidence-weighted impact analysis (`impact_score` shows how strongly changes propagate), investigation bundles, co-change detection, dead code analysis, community detection, and vault/notes integration. Use `--tools` to expose only the tools you need. The `--tools`/`--lite` allowlists are enforced on every transport (local stdio, daemon proxy, hybrid, and MCP-over-HTTP), and tool schemas validate their arguments — numeric bounds (e.g. `token_budget` 1–16000, `depth`/`max_depth` 1–15) are enforced and unknown argument names are rejected instead of silently ignored.
 
 ### Key capabilities
 

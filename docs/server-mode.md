@@ -85,7 +85,9 @@ The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web
 
 `daemon run --server` starts the gRPC (:9378) and MCP HTTP (:9379) listeners. The web UI (default :3000, :9377 in the macOS .app) is started separately via `nestweaver ui` and is not part of the server container default.
 
-The MCP HTTP listener is always **gRPC port + 1** and inherits the `--bind` IP. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker.
+The MCP HTTP listener inherits the `--bind` IP and is **gRPC port + 1** for fixed binds. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker. Exception: with an ephemeral `--bind 127.0.0.1:0` the gRPC port is OS-assigned at runtime, so the MCP listener binds its own ephemeral port (`:0`) instead of gRPC + 1; read both actual ports from the daemon's port file or startup log.
+
+Tool exposure and validation are identical on every MCP transport — local stdio, daemon proxy, hybrid, and MCP-over-HTTP all enforce the `--tools`/`--lite` allowlists, and tool schemas reject unknown argument names and out-of-range numeric values (e.g. `token_budget` outside 1–16000, `depth` outside 1–15) instead of silently ignoring them.
 
 | Port | Protocol | Auth | Purpose |
 |------|----------|------|---------|
@@ -136,6 +138,9 @@ curl -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
 # Generate a self-signed certificate (development/internal use)
 nestweaver server init-tls --output-dir ./tls
 
+# Custom validity (1-36500 days; default 365)
+nestweaver server init-tls --output-dir ./tls --validity-days 90
+
 # Start with TLS
 nestweaver daemon --db ./brain.lbug run \
   --server \
@@ -144,6 +149,9 @@ nestweaver daemon --db ./brain.lbug run \
   --tls-key ./tls/server-key.pem \
   --auth-token "$NESTWEAVER_AUTH_TOKEN"
 ```
+
+Re-running `init-tls` over an existing CA warns that the new CA invalidates
+certificates signed by the old one — re-issue client/server certs afterwards.
 
 ### Manual certificate setup
 
@@ -625,7 +633,7 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 | `/admin/api/dead-letter` | GET | View failed jobs |
 | `/admin/api/dead-letter/{id}/retry` | POST | Retry a failed job |
 | `/admin/api/dead-letter/{id}` | DELETE | Dismiss a failed job |
-| `/metrics` | GET | Prometheus metrics (served by the daemon on the MCP HTTP port `:9379`; no admin token required) |
+| `/metrics` | GET | Prometheus metrics (served by the daemon on the MCP HTTP port `:9379`; requires a valid bearer token when `auth_token` is configured — the query token or the admin token both work, it is not admin-only; open only on unauthenticated loopback dev binds) |
 
 ```bash
 # List repos
