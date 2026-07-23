@@ -14,11 +14,11 @@ use nestweaver_engine::{
     analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
     build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
     changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
-    discover_cross_domain_links, embedding::generate_embeddings_batch, expand_query_with_aliases,
-    export_cypher, export_graphml, export_in_memory_graph, export_mermaid, filter_by_target,
-    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
-    generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
-    generate_repo_map, generate_summaries, get_last_indexed_at, incremental_index_with_name,
+    discover_cross_domain_links, embedding::generate_embeddings_batch, export_cypher,
+    export_graphml, export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes,
+    find_hub_nodes, generate_agents_md_with_rules, generate_claude_md_with_rules,
+    generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
+    generate_summaries, get_last_indexed_at, incremental_index_with_name,
     index_directory_with_options, index_markdown_directory_since_with_ignore,
     index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
     load_clusters, load_extensions, lookup_symbol, record_last_indexed_at, render_text,
@@ -11500,212 +11500,43 @@ fn run_brain(
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
-            // Parse the instance config once and reuse for ranking priors and
-            // the Feature F7 `[ranking] enable_prf` default.
-            let instance_cfg = load_instance_config_opt(config.as_deref());
-            // Feature F6: per-path ranking priors from `[ranking]`. None → no-op.
-            let ranking_config = instance_cfg
-                .as_ref()
-                .map(|c| c.ranking.clone())
-                .filter(|r| !r.is_empty());
             // Feature F7: PRF is enabled by the --prf flag OR `[ranking] enable_prf`.
-            let prf_enabled = prf
-                || instance_cfg
-                    .as_ref()
-                    .map(|c| c.ranking.enable_prf)
-                    .unwrap_or(false);
+            let prf_enabled = prf || cfg.as_ref().map(|c| c.ranking.enable_prf).unwrap_or(false);
 
-            // Expand the query with taxonomy aliases for better recall.
-            let aliases = load_alias_sidecar(&db_path);
-            let query = expand_query_with_aliases(&raw_query, &aliases);
-
-            // ── Vault note results ──────────────────────────────────────
-            let mut expansion_terms: Vec<String> = Vec::new();
-            let (note_results, engine) = if let Some(ref idx) = tantivy {
-                let raw_limit = limit * 5;
-                let hits = if prf_enabled {
-                    let (hits, terms) = idx
-                        .search_prf(
-                            &query,
-                            raw_limit,
-                            nestweaver_engine::query::nestweaver_store_stoplist(),
-                        )
-                        .with_context(|| "tantivy prf search")?;
-                    expansion_terms = terms;
-                    hits
-                } else {
-                    idx.search(&query, raw_limit)
-                        .with_context(|| "tantivy search")?
-                };
-                let grouped = group_bm25_hits_by_note(&store, &hits, limit);
-                (grouped, "bm25")
-            } else {
-                let needle = query.to_lowercase();
-                let notes = store.list_notes(None).context("list_notes")?;
-                let matches: Vec<NoteSearchResult> = notes
-                    .iter()
-                    .filter(|n| n.title.to_lowercase().contains(&needle))
-                    .take(limit)
-                    .map(|n| NoteSearchResult {
-                        note_uid: n.uid.clone(),
-                        title: n.title.clone(),
-                        best_score: 1.0,
-                        matched_headings: Vec::new(),
-                    })
-                    .collect();
-                (matches, "substring")
-            };
-
-            // ── Code symbol results ─────────────────────────────────────
-            let seen_titles: std::collections::HashSet<String> = note_results
-                .iter()
-                .map(|r| r.title.to_lowercase())
-                .collect();
-
-            let code_results = search_symbols(&store, &query, limit).unwrap_or_default();
-            let code_results: Vec<_> = code_results
-                .into_iter()
-                .filter(|sym| !seen_titles.contains(&sym.name.to_lowercase()))
-                .collect();
-
-            // Feature F6: apply per-path ranking priors as a multiplier on each
-            // result's relevance, keyed by file-path glob. Reuse the engine
-            // helper by projecting results into BrainNodes, then map the
-            // adjusted relevance back by UID. No config → empty map (no-op).
-            let mut note_results = note_results;
-            let prior_scores: std::collections::HashMap<String, f64> =
-                if let Some(ref ranking) = ranking_config {
-                    let mut probe: Vec<nestweaver_engine::BrainNode> = Vec::new();
-                    for n in &note_results {
-                        let location = store
-                            .lookup_note(&n.note_uid)
-                            .map(|note| note.file_path)
-                            .unwrap_or_default();
-                        probe.push(nestweaver_engine::BrainNode {
-                            uid: n.note_uid.clone(),
-                            kind: "Note".to_string(),
-                            title: n.title.clone(),
-                            location,
-                            relevance: n.best_score as f64,
-                            inline_body: None,
-                            body_complete: true,
-                        });
-                    }
-                    for sym in &code_results {
-                        probe.push(nestweaver_engine::BrainNode {
-                            uid: sym.uid.clone(),
-                            kind: format!("Symbol/{}", sym.kind),
-                            title: sym.name.clone(),
-                            location: format!("{}:{}", sym.file_path, sym.start_line),
-                            relevance: 0.5,
-                            inline_body: None,
-                            body_complete: true,
-                        });
-                    }
-                    nestweaver_engine::apply_ranking_priors(&mut probe, ranking);
-                    probe.into_iter().map(|n| (n.uid, n.relevance)).collect()
-                } else {
-                    std::collections::HashMap::new()
-                };
-            // Fold adjusted note scores back in.
-            for n in &mut note_results {
-                if let Some(&adj) = prior_scores.get(&n.note_uid) {
-                    n.best_score = adj as f32;
-                }
-            }
-            // Symbol display score: prior-adjusted when present, else 0.5.
-            let code_score = |uid: &str| prior_scores.get(uid).copied().unwrap_or(0.5);
-
-            let result_count = note_results.len() + code_results.len();
+            // Reuse the canonical MCP search implementation in-process so the
+            // direct CLI, daemon, and MCP share counted search pages, logical
+            // grouping, identity rules, and ranking behavior. This performs no
+            // network I/O and uses the already-open direct-disk store/index.
+            nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+            nestweaver_mcp::tools::set_current_instance_config(cfg.map(std::sync::Arc::new));
+            let response = nestweaver_mcp::tools::dispatch(
+                &store,
+                tantivy.as_ref(),
+                "brain_search",
+                serde_json::json!({
+                    "query": raw_query,
+                    "limit": limit,
+                    "prf": prf_enabled,
+                }),
+                None,
+            );
+            nestweaver_mcp::tools::set_current_instance_config(None);
+            let response = response?;
 
             if json {
-                let mut results: Vec<serde_json::Value> = note_results
-                    .iter()
-                    .map(|g| {
-                        let mut v = serde_json::json!({
-                            "uid": g.note_uid,
-                            "kind": "note",
-                            "title": g.title,
-                            "score": g.best_score,
-                        });
-                        if !g.matched_headings.is_empty() {
-                            v["matched_headings"] = serde_json::json!(g.matched_headings);
-                        }
-                        v
-                    })
-                    .collect();
-                for sym in &code_results {
-                    results.push(serde_json::json!({
-                        "uid": sym.uid,
-                        "kind": format!("Symbol/{}", sym.kind),
-                        "title": sym.name,
-                        "score": code_score(&sym.uid),
-                        "location": format!("{}:{}", sym.file_path, sym.start_line),
-                    }));
-                }
-                // Sort by score descending. `limit` is interpreted per-kind
-                // (each of notes/symbols is already capped upstream); a
-                // cross-kind truncate here would evict every symbol whenever
-                // ≥ `limit` notes match because symbols carry a fixed 0.5
-                // score while BM25 notes score 15+. Mirrors the daemon-side
-                // `tool_brain_search` semantics.
-                results.sort_by(|a, b| {
-                    let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut payload = serde_json::json!({
-                    "query": query,
-                    "engine": engine,
-                    "results": results,
-                    "total_matches": results.len(),
-                });
-                // Feature F7: surface PRF-mined expansion terms for auditing.
-                if !expansion_terms.is_empty() {
-                    payload["expansion_terms"] = serde_json::json!(expansion_terms);
-                }
-                println!("{}", serde_json::to_string_pretty(&payload)?);
-            } else if note_results.is_empty() && code_results.is_empty() {
-                println!("No results for '{query}'.");
+                println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
-                let header = if engine == "bm25" {
-                    "Brain search (BM25)"
-                } else {
-                    "Brain search (substring fallback)"
-                };
-                println!(
-                    "{}: {} result(s)",
-                    header,
-                    note_results.len() + code_results.len()
-                );
-                // Feature F7: show PRF-mined expansion terms for auditing.
-                if !expansion_terms.is_empty() {
-                    println!("  PRF expansion terms: {}", expansion_terms.join(", "));
-                }
-                println!();
-                for g in &note_results {
-                    if g.matched_headings.is_empty() {
-                        println!("  [{:.2}] {}", g.best_score, g.title);
-                    } else {
-                        println!(
-                            "  [{:.2}] {} (matched: {})",
-                            g.best_score,
-                            g.title,
-                            g.matched_headings.join(", "),
-                        );
-                    }
-                }
-                for sym in &code_results {
-                    println!(
-                        "  [{:.2}] {} [{}] @ {}:{}",
-                        code_score(&sym.uid),
-                        sym.name,
-                        sym.kind,
-                        sym.file_path,
-                        sym.start_line,
-                    );
-                }
+                render_brain_search_json(&response)?;
             }
+            let result_count = response
+                .get("returned_matches")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(|| {
+                    response
+                        .get("results")
+                        .and_then(|value| value.as_array())
+                        .map_or(0, |results| results.len() as u64)
+                });
             let stats = format!(
                 "{} results in {}",
                 result_count,
@@ -12604,99 +12435,6 @@ fn context_token_budgeted_truncate(
     taken
 }
 
-/// A note-level search result after grouping BM25 hits by parent note.
-struct NoteSearchResult {
-    note_uid: String,
-    title: String,
-    best_score: f32,
-    matched_headings: Vec<String>,
-}
-
-/// Group BM25 search hits by their parent Note, picking the highest-scoring
-/// hit per note and collecting matched heading/section titles.
-fn group_bm25_hits_by_note(
-    store: &nestweaver_store::GraphStore,
-    hits: &[nestweaver_store::SearchHit],
-    limit: usize,
-) -> Vec<NoteSearchResult> {
-    use std::collections::HashMap;
-
-    struct Group {
-        note_uid: String,
-        best_score: f32,
-        title: String,
-        matched_headings: Vec<String>,
-    }
-
-    let mut groups: HashMap<String, Group> = HashMap::new();
-    let mut note_order: Vec<String> = Vec::new();
-
-    for h in hits {
-        let parent_note_uid = match h.kind.as_str() {
-            "note" => h.uid.clone(),
-            "heading" => store
-                .lookup_heading(&h.uid)
-                .map(|hd| hd.note_uid)
-                .unwrap_or_else(|_| h.uid.clone()),
-            "section" => store
-                .lookup_section(&h.uid)
-                .map(|s| s.note_uid)
-                .unwrap_or_else(|_| h.uid.clone()),
-            _ => h.uid.clone(),
-        };
-
-        let group = groups.entry(parent_note_uid.clone()).or_insert_with(|| {
-            note_order.push(parent_note_uid.clone());
-            Group {
-                note_uid: parent_note_uid.clone(),
-                best_score: 0.0,
-                title: String::new(),
-                matched_headings: Vec::new(),
-            }
-        });
-
-        if h.score > group.best_score {
-            group.best_score = h.score;
-        }
-        if h.kind == "note" {
-            group.title = h.title.clone();
-        }
-        if h.kind == "heading" || h.kind == "section" {
-            group.matched_headings.push(h.title.clone());
-        }
-    }
-
-    // Look up note titles for groups that had no direct note-title match.
-    for group in groups.values_mut() {
-        if group.title.is_empty() {
-            group.title = store
-                .lookup_note(&group.note_uid)
-                .map(|n| n.title)
-                .unwrap_or_else(|_| group.note_uid.clone());
-        }
-    }
-
-    // Sort by best_score descending.
-    note_order.sort_by(|a, b| {
-        let sa = groups.get(a).map(|g| g.best_score).unwrap_or(0.0);
-        let sb = groups.get(b).map(|g| g.best_score).unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    note_order
-        .into_iter()
-        .take(limit)
-        .filter_map(|nuid| {
-            groups.remove(&nuid).map(|g| NoteSearchResult {
-                note_uid: g.note_uid,
-                title: g.title,
-                best_score: g.best_score,
-                matched_headings: g.matched_headings,
-            })
-        })
-        .collect()
-}
-
 /// Apply age-decay score boost to non-Symbol nodes (CLI variant).
 fn apply_recency_bias_cli(
     store: &nestweaver_store::GraphStore,
@@ -12830,6 +12568,16 @@ fn render_brain_search_response(
     resp: &nestweaver_proto::BrainSearchResponse,
     json: bool,
 ) -> anyhow::Result<()> {
+    let returned_matches = if resp.returned_matches == 0 && !resp.results.is_empty() {
+        resp.results.len() as i32
+    } else {
+        resp.returned_matches
+    };
+    let total_matches_relation = if resp.total_matches_relation.is_empty() {
+        "eq"
+    } else {
+        &resp.total_matches_relation
+    };
     if json {
         let mut results: Vec<serde_json::Value> = Vec::with_capacity(resp.results.len());
         for item in &resp.results {
@@ -12855,6 +12603,9 @@ fn render_brain_search_response(
             "engine": resp.engine,
             "results": results,
             "total_matches": resp.total_matches,
+            "total_matches_relation": total_matches_relation,
+            "returned_matches": returned_matches,
+            "truncated": resp.truncated,
         });
         if !resp.expansion_terms.is_empty() {
             payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
@@ -12873,7 +12624,21 @@ fn render_brain_search_response(
     } else {
         "Brain search (substring fallback)"
     };
-    println!("{}: {} result(s)", header, resp.results.len());
+    if resp.truncated {
+        if total_matches_relation == "gte" {
+            println!(
+                "{}: {} of at least {} result(s)",
+                header, returned_matches, resp.total_matches
+            );
+        } else {
+            println!(
+                "{}: {} of {} result(s)",
+                header, returned_matches, resp.total_matches
+            );
+        }
+    } else {
+        println!("{}: {} result(s)", header, returned_matches);
+    }
     if !resp.expansion_terms.is_empty() {
         println!("  PRF expansion terms: {}", resp.expansion_terms.join(", "));
     }
@@ -12930,6 +12695,22 @@ fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    let returned_matches = result
+        .get("returned_matches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(results.len() as u64);
+    let total_matches = result
+        .get("total_matches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(returned_matches);
+    let total_matches_relation = result
+        .get("total_matches_relation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("eq");
+    let truncated = result
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(total_matches_relation != "eq" || returned_matches < total_matches);
 
     if results.is_empty() {
         println!("No results for '{}'.", query);
@@ -12947,7 +12728,21 @@ fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
         .and_then(|m| m.get("scope"))
         .and_then(|v| v.as_str())
         .unwrap_or("local");
-    println!("{}: {} result(s) [{}]", header, results.len(), scope);
+    if truncated {
+        if total_matches_relation == "gte" {
+            println!(
+                "{}: {} of at least {} result(s) [{}]",
+                header, returned_matches, total_matches, scope
+            );
+        } else {
+            println!(
+                "{}: {} of {} result(s) [{}]",
+                header, returned_matches, total_matches, scope
+            );
+        }
+    } else {
+        println!("{}: {} result(s) [{}]", header, returned_matches, scope);
+    }
     if !expansion_terms.is_empty() {
         println!("  PRF expansion terms: {}", expansion_terms.join(", "));
     }

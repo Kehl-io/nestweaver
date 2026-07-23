@@ -15,7 +15,9 @@ use nestweaver_client::hybrid::{
 };
 use nestweaver_client::upstream::UpstreamHandle;
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
-use nestweaver_proto::{BackupRequest, BrainStatusRequest, JsonRequest, RepoStatesRequest};
+use nestweaver_proto::{
+    BackupRequest, BrainSearchRequest, BrainStatusRequest, JsonRequest, RepoStatesRequest,
+};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tonic::transport::{Certificate, ClientTlsConfig};
@@ -1839,7 +1841,7 @@ async fn export_graph_rejects_msgpack_file_output() {
 /// actually flowed across the boundary rather than the sources label being
 /// cosmetic.
 #[tokio::test]
-async fn hybrid_merge_combines_local_and_server_sources() {
+async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     let dir = tempfile::tempdir().unwrap();
 
     // Server side: repo A in its own subdir/DB (separate `server.port`).
@@ -1869,9 +1871,82 @@ async fn hybrid_merge_combines_local_and_server_sources() {
     let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
     let _local_guard = helpers::server_guard::ServerGuard::start(&db_local);
 
-    let local = connect_local(&db_local).await;
+    let mut local = connect_local(&db_local).await;
+
+    // The typed local transport must preserve the display-independent total.
+    let local_small = local
+        .inner_mut()
+        .search(BrainSearchRequest {
+            query: "fn".to_string(),
+            limit: 1,
+            response_format: None,
+            include_bodies: false,
+            prf: false,
+            rerank: false,
+            root: None,
+        })
+        .await
+        .expect("typed local brain_search limit=1")
+        .into_inner();
+    let local_large = local
+        .inner_mut()
+        .search(BrainSearchRequest {
+            query: "fn".to_string(),
+            limit: 20,
+            response_format: None,
+            include_bodies: false,
+            prf: false,
+            rerank: false,
+            root: None,
+        })
+        .await
+        .expect("typed local brain_search limit=20")
+        .into_inner();
+    assert_eq!(local_small.total_matches_relation, "eq");
+    assert_eq!(local_large.total_matches_relation, "eq");
+    assert_eq!(local_small.total_matches, local_large.total_matches);
+    assert_eq!(local_small.returned_matches, 1);
+    assert!(local_small.truncated);
+    assert_eq!(local_large.returned_matches, local_large.total_matches);
+    assert!(!local_large.truncated);
+
     let upstream = merge_upstream(server.grpc_addr(), HYBRID_TOKEN);
     let mut hybrid = HybridClient::from_parts(local, vec![upstream]);
+
+    // A source-side display cap makes the hybrid union a conservative lower
+    // bound even when the rows returned by both sources happen to be unique.
+    let merged_small = hybrid
+        .query("brain_search", &json!({ "query": "fn", "limit": 1 }))
+        .await
+        .expect("hybrid brain_search lower-bound merge query");
+    assert_eq!(merged_small["total_matches_relation"], "gte");
+    assert_eq!(
+        merged_small["returned_matches"].as_u64(),
+        merged_small["results"]
+            .as_array()
+            .map(|rows| rows.len() as u64)
+    );
+    assert_eq!(merged_small["truncated"], true);
+    assert!(merged_small["total_matches"].as_u64().is_some());
+
+    // With both sources complete, RRF dedup has the complete union and may
+    // report an exact total without summing overlapping source totals.
+    let merged_large = hybrid
+        .query("brain_search", &json!({ "query": "fn", "limit": 20 }))
+        .await
+        .expect("hybrid brain_search exact merge query");
+    assert_eq!(merged_large["total_matches_relation"], "eq");
+    assert_eq!(
+        merged_large["total_matches"].as_u64(),
+        merged_large["results"]
+            .as_array()
+            .map(|rows| rows.len() as u64)
+    );
+    assert_eq!(
+        merged_large["returned_matches"],
+        merged_large["total_matches"]
+    );
+    assert_eq!(merged_large["truncated"], false);
 
     // `serverfn` exists ONLY on the server. If it shows up in the merged
     // response, the server query genuinely contributed.
@@ -1898,6 +1973,9 @@ async fn hybrid_merge_combines_local_and_server_sources() {
         "merged results must contain the server-only symbol 'serverfn' \
          (proof the server side contributed); got {resp}"
     );
+    assert_eq!(resp["total_matches_relation"], "eq");
+    assert_eq!(resp["returned_matches"], resp["total_matches"]);
+    assert_eq!(resp["truncated"], false);
 
     // Symmetry: a local-only symbol must also surface through the same merge,
     // with both sources still labelled.

@@ -206,6 +206,9 @@ message BrainSearchResponse {
   repeated SearchResultItem results = 4;
   // F7 PRF-mined expansion terms (empty unless prf=true on the request).
   repeated string expansion_terms = 5;
+  int32 returned_matches = 6;
+  string total_matches_relation = 7; // "eq" | "gte"
+  bool truncated = 8;
 }
 message SearchResultItem {
   string uid = 1;

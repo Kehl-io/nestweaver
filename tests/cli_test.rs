@@ -135,6 +135,116 @@ fn cli_index_and_search() {
 }
 
 #[test]
+fn brain_search_json_count_contract_is_limit_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("brain.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function cardinalityneedle() {}\n\
+         function cardinalityneedleExtra() {}\n\
+         function helper_cardinalityneedle() {}\n",
+    )
+    .unwrap();
+    for (name, title) in [
+        ("one.md", "cardinalityneedle"),
+        ("two.md", "cardinalityneedle alpha"),
+        ("three.md", "cardinalityneedle beta"),
+    ] {
+        std::fs::write(vault_dir.join(name), format!("# {title}\n\nbody\n")).unwrap();
+    }
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let search = |limit: &str| {
+        let output = nestweaver_cmd()
+            .args([
+                "brain",
+                "search",
+                "cardinalityneedle",
+                "--json",
+                "--limit",
+                limit,
+                "--db",
+            ])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "brain search --limit {limit} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "brain search --limit {limit} returned invalid JSON ({error}): {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+    };
+
+    let narrow = search("1");
+    let broad = search("20");
+
+    nestweaver_cmd()
+        .args([
+            "brain",
+            "search",
+            "cardinalityneedle",
+            "--limit",
+            "1",
+            "--db",
+        ])
+        .arg(&db_path)
+        .assert()
+        .success()
+        .stdout(contains(" of "));
+
+    assert_eq!(narrow["total_matches"], broad["total_matches"]);
+    assert_eq!(
+        narrow["total_matches_relation"],
+        broad["total_matches_relation"]
+    );
+    assert_eq!(narrow["total_matches_relation"], "eq");
+    assert_ne!(narrow["returned_matches"], broad["returned_matches"]);
+    assert_eq!(
+        narrow["returned_matches"].as_u64().unwrap(),
+        narrow["results"].as_array().unwrap().len() as u64
+    );
+    assert_eq!(narrow["truncated"], true);
+    assert_eq!(broad["truncated"], false);
+
+    let broad_rows = broad["results"].as_array().unwrap();
+    assert!(
+        broad_rows
+            .iter()
+            .any(|row| row["kind"] == "note" && row["title"] == "cardinalityneedle")
+    );
+    assert!(
+        broad_rows
+            .iter()
+            .any(|row| { row["kind"] == "Symbol/Function" && row["title"] == "cardinalityneedle" }),
+        "same-title note and symbol must remain distinct rows: {broad}"
+    );
+}
+
+#[test]
 fn cli_symbol_not_found_exit_2() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.lbug");

@@ -3580,7 +3580,7 @@ impl NestWeaverDaemon for DaemonService {
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32;
 
-        let results = value
+        let results: Vec<SearchResultItem> = value
             .get("results")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -3635,6 +3635,19 @@ impl NestWeaverDaemon for DaemonService {
                     .collect()
             })
             .unwrap_or_default();
+        let returned_matches = value
+            .get("returned_matches")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(results.len() as i64) as i32;
+        let total_matches_relation = value
+            .get("total_matches_relation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("eq")
+            .to_string();
+        let truncated = value
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(returned_matches < total_matches);
 
         Ok(Response::new(BrainSearchResponse {
             query: query_echo,
@@ -3642,6 +3655,9 @@ impl NestWeaverDaemon for DaemonService {
             total_matches,
             results,
             expansion_terms,
+            returned_matches,
+            total_matches_relation,
+            truncated,
         }))
     }
 
@@ -11932,7 +11948,7 @@ mod startup_helper_tests {
     }
 
     #[tokio::test]
-    async fn typed_search_enforces_request_repo_visibility() {
+    async fn typed_brain_search_enforces_request_repo_visibility_and_preserves_counts() {
         use nestweaver_engine::authz::{Identity, StaticConfigPermissionSource};
         use nestweaver_schema::{Symbol, SymbolKind, Visibility};
 
@@ -11978,9 +11994,9 @@ mod startup_helper_tests {
                 .collect(),
         ));
         let service = DaemonService::new(test_state_with_authz(store, source));
-        let search_request = || BrainSearchRequest {
+        let search_request = |limit| BrainSearchRequest {
             query: "searchneedle".to_string(),
-            limit: 10,
+            limit,
             response_format: None,
             include_bodies: false,
             prf: false,
@@ -11990,13 +12006,16 @@ mod startup_helper_tests {
 
         // Warm the unrestricted cache scope first. The subsequent restricted
         // request must neither reuse this response nor dispatch as `All`.
-        let mut unrestricted = Request::new(search_request());
+        let mut unrestricted = Request::new(search_request(1));
         unrestricted.extensions_mut().insert(Identity::Admin);
         let unrestricted = service.search(unrestricted).await.unwrap().into_inner();
         assert_eq!(unrestricted.total_matches, 2);
-        assert_eq!(unrestricted.results.len(), 2);
+        assert_eq!(unrestricted.results.len(), 1);
+        assert_eq!(unrestricted.returned_matches, 1);
+        assert_eq!(unrestricted.total_matches_relation, "eq");
+        assert!(unrestricted.truncated);
 
-        let mut request = Request::new(search_request());
+        let mut request = Request::new(search_request(10));
         request
             .extensions_mut()
             .insert(Identity::Token(token.to_string()));
@@ -12005,6 +12024,9 @@ mod startup_helper_tests {
 
         assert_eq!(response.total_matches, 1);
         assert_eq!(response.results.len(), 1);
+        assert_eq!(response.returned_matches, 1);
+        assert_eq!(response.total_matches_relation, "eq");
+        assert!(!response.truncated);
         assert_eq!(response.results[0].uid, "sym:visible");
         assert!(
             response.results.iter().all(|row| row.uid != "sym:hidden"),

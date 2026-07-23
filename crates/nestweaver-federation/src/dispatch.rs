@@ -133,6 +133,51 @@ fn inject_bearer_token<T>(request: &mut tonic::Request<T>, auth_token: Option<&s
     }
 }
 
+fn brain_search_response_to_json(response: &nestweaver_proto::BrainSearchResponse) -> Value {
+    let results: Vec<Value> = response
+        .results
+        .iter()
+        .map(|result| {
+            let mut item = serde_json::json!({
+                "uid": result.uid,
+                "kind": result.kind,
+                "title": result.title,
+                "score": result.score,
+            });
+            if let Some(location) = &result.location {
+                item["location"] = Value::String(location.clone());
+            }
+            if !result.matched_headings.is_empty() {
+                item["matched_headings"] = serde_json::json!(result.matched_headings);
+            }
+            if let Some(body) = &result.inline_body {
+                item["inline_body"] = Value::String(body.clone());
+            }
+            item
+        })
+        .collect();
+    let returned_matches = if response.returned_matches == 0 && !results.is_empty() {
+        results.len() as i32
+    } else {
+        response.returned_matches
+    };
+    let relation = if response.total_matches_relation.is_empty() {
+        "eq"
+    } else {
+        &response.total_matches_relation
+    };
+    serde_json::json!({
+        "query": response.query,
+        "engine": response.engine,
+        "total_matches": response.total_matches,
+        "total_matches_relation": relation,
+        "returned_matches": returned_matches,
+        "truncated": response.truncated,
+        "results": results,
+        "expansion_terms": response.expansion_terms,
+    })
+}
+
 /// Typed dispatch for `brain_search` -> `Search` RPC.
 async fn dispatch_typed_brain_search(
     client: &mut NestWeaverDaemonClient<Channel>,
@@ -171,36 +216,7 @@ async fn dispatch_typed_brain_search(
         .await
         .context("brain_search RPC failed")?
         .into_inner();
-    // Serialize the typed response back to JSON.
-    let results: Vec<Value> = resp
-        .results
-        .iter()
-        .map(|r| {
-            let mut obj = serde_json::json!({
-                "uid": r.uid,
-                "kind": r.kind,
-                "title": r.title,
-                "score": r.score,
-            });
-            if let Some(ref loc) = r.location {
-                obj["location"] = Value::String(loc.clone());
-            }
-            if !r.matched_headings.is_empty() {
-                obj["matched_headings"] = serde_json::json!(r.matched_headings);
-            }
-            if let Some(ref body) = r.inline_body {
-                obj["inline_body"] = Value::String(body.clone());
-            }
-            obj
-        })
-        .collect();
-    Ok(serde_json::json!({
-        "query": resp.query,
-        "engine": resp.engine,
-        "total_matches": resp.total_matches,
-        "results": results,
-        "expansion_terms": resp.expansion_terms,
-    }))
+    Ok(brain_search_response_to_json(&resp))
 }
 
 /// Typed dispatch for `brain_context` -> `GetContext` RPC.
@@ -454,4 +470,39 @@ fn json_str_array(params: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_brain_search_json_preserves_counts_and_old_response_defaults() {
+        let response = nestweaver_proto::BrainSearchResponse {
+            query: "needle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 3,
+            results: vec![nestweaver_proto::SearchResultItem {
+                uid: "sym:needle".to_string(),
+                kind: "Symbol/Function".to_string(),
+                title: "needle".to_string(),
+                score: 1.0,
+                location: Some("src/lib.rs:1".to_string()),
+                matched_headings: Vec::new(),
+                inline_body: None,
+            }],
+            expansion_terms: vec!["expanded".to_string()],
+            returned_matches: 0,
+            total_matches_relation: String::new(),
+            truncated: true,
+        };
+
+        let value = brain_search_response_to_json(&response);
+
+        assert_eq!(value["total_matches"], 3);
+        assert_eq!(value["total_matches_relation"], "eq");
+        assert_eq!(value["returned_matches"], 1);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["expansion_terms"], serde_json::json!(["expanded"]));
+    }
 }

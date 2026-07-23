@@ -7,6 +7,45 @@ use serde_json::Value;
 
 use crate::merge::rrf_merge;
 
+#[derive(Clone, Copy)]
+struct SearchCountMetadata {
+    total: u64,
+    returned: u64,
+    exact: bool,
+}
+
+fn search_count_metadata(value: &Value, result_count: usize) -> Option<SearchCountMetadata> {
+    let total = value.get("total_matches")?.as_u64()?;
+    let returned = value
+        .get("returned_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or(result_count as u64);
+    let exact = value
+        .get("total_matches_relation")
+        .and_then(Value::as_str)
+        .unwrap_or("eq")
+        == "eq";
+    Some(SearchCountMetadata {
+        total,
+        returned,
+        exact,
+    })
+}
+
+fn union_expansion_terms(local: &Value, server: &Value) -> Vec<String> {
+    let mut terms = Vec::new();
+    for value in [local, server] {
+        if let Some(items) = value.get("expansion_terms").and_then(Value::as_array) {
+            for term in items.iter().filter_map(Value::as_str) {
+                if !terms.iter().any(|existing| existing == term) {
+                    terms.push(term.to_string());
+                }
+            }
+        }
+    }
+    terms
+}
+
 /// Count the number of result items in a JSON response.
 ///
 /// Handles both `{ "results": [...] }` envelope and bare arrays.
@@ -66,11 +105,52 @@ pub fn extract_result_items(value: &Value) -> Vec<Value> {
 pub fn merge_json_results(local: &Value, server: &Value) -> Value {
     let local_items = extract_result_items(local);
     let server_items = extract_result_items(server);
+    let local_count = search_count_metadata(local, local_items.len());
+    let server_count = search_count_metadata(server, server_items.len());
 
     let merged = rrf_merge(local_items, server_items);
     let values: Vec<Value> = merged.into_iter().map(|mr| mr.value).collect();
+    let returned = values.len() as u64;
 
-    wrap_merged_response(values, &["local", "server"])
+    let mut response = wrap_merged_response(values, &["local", "server"]);
+    if local_count.is_some() || server_count.is_some() {
+        let local_count = local_count.unwrap_or(SearchCountMetadata {
+            total: 0,
+            returned: 0,
+            exact: true,
+        });
+        let server_count = server_count.unwrap_or(SearchCountMetadata {
+            total: 0,
+            returned: 0,
+            exact: true,
+        });
+        let complete = local_count.exact
+            && local_count.returned == local_count.total
+            && server_count.exact
+            && server_count.returned == server_count.total;
+        let (total, relation) = if complete {
+            (returned, "eq")
+        } else {
+            (
+                local_count.total.max(server_count.total).max(returned),
+                "gte",
+            )
+        };
+        response["query"] = local
+            .get("query")
+            .or_else(|| server.get("query"))
+            .cloned()
+            .unwrap_or(Value::String(String::new()));
+        response["engine"] = Value::String("hybrid".to_string());
+        response["total_matches"] = Value::from(total);
+        response["total_matches_relation"] = Value::String(relation.to_string());
+        response["returned_matches"] = Value::from(returned);
+        response["truncated"] = Value::Bool(relation != "eq" || returned < total);
+        let expansion_terms = union_expansion_terms(local, server);
+        response["expansion_terms"] = serde_json::json!(expansion_terms);
+    }
+
+    response
 }
 
 /// Merge two FanOut tool responses (regex_search, count_patterns) by CONCATENATING their row
@@ -490,6 +570,113 @@ mod tests {
         let merged = merge_json_results(&local, &server);
         let results = merged["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    fn complete_search_response(query: &str, results: Vec<Value>) -> Value {
+        let total = results.len();
+        json!({
+            "query": query,
+            "engine": "bm25",
+            "total_matches": total,
+            "total_matches_relation": "eq",
+            "returned_matches": total,
+            "truncated": false,
+            "results": results,
+            "expansion_terms": [],
+        })
+    }
+
+    #[test]
+    fn merge_json_results_reports_exact_union_for_disjoint_complete_searches() {
+        let mut local = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": "sym:repo:local:a:one",
+                "kind": "Symbol/Function",
+                "title": "local_needle",
+                "location": "src/local.rs:1"
+            })],
+        );
+        local["expansion_terms"] = json!(["local", "common"]);
+        let mut server = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": "sym:repo:server:b:two",
+                "kind": "Symbol/Function",
+                "title": "server_needle",
+                "location": "src/server.rs:1"
+            })],
+        );
+        server["expansion_terms"] = json!(["server", "common"]);
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["query"], "needle");
+        assert_eq!(merged["engine"], "hybrid");
+        assert_eq!(merged["total_matches"], 2);
+        assert_eq!(merged["total_matches_relation"], "eq");
+        assert_eq!(merged["returned_matches"], 2);
+        assert_eq!(merged["truncated"], false);
+        assert_eq!(
+            merged["expansion_terms"],
+            json!(["local", "common", "server"])
+        );
+    }
+
+    #[test]
+    fn merge_json_results_reports_exact_union_for_overlapping_complete_searches() {
+        let shared = json!({
+            "uid": "sym:repo:shared:a:one",
+            "kind": "Symbol/Function",
+            "title": "shared_needle",
+            "location": "src/shared.rs:1"
+        });
+        let local = complete_search_response("needle", vec![shared.clone()]);
+        let server = complete_search_response("needle", vec![shared]);
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 1);
+        assert_eq!(merged["total_matches"], 1);
+        assert_eq!(merged["total_matches_relation"], "eq");
+        assert_eq!(merged["returned_matches"], 1);
+        assert_eq!(merged["truncated"], false);
+    }
+
+    #[test]
+    fn merge_json_results_reports_safe_lower_bound_when_one_search_is_truncated() {
+        let local = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": "sym:repo:local:a:one",
+                "kind": "Symbol/Function",
+                "title": "local_needle",
+                "location": "src/local.rs:1"
+            })],
+        );
+        let server = json!({
+            "query": "needle",
+            "engine": "bm25",
+            "total_matches": 7,
+            "total_matches_relation": "eq",
+            "returned_matches": 1,
+            "truncated": true,
+            "results": [{
+                "uid": "sym:repo:server:b:two",
+                "kind": "Symbol/Function",
+                "title": "server_needle",
+                "location": "src/server.rs:1"
+            }],
+            "expansion_terms": ["remote", "common"],
+        });
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["total_matches"], 7);
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(merged["returned_matches"], 2);
+        assert_eq!(merged["truncated"], true);
+        assert_eq!(merged["expansion_terms"], json!(["remote", "common"]));
     }
 
     #[test]

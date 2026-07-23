@@ -405,6 +405,28 @@ Different tools have different optimal routing:
 | `brain_status`, `stale_check`, `brain_doc_stats` | combined | Preserve status/metadata shape while including both sources |
 | `detect_changes`, memory/admin tools | local-only | These depend on local working-tree or personal state |
 
+### `brain_search` count semantics
+
+Every `brain_search` JSON response reports the display-independent match count
+alongside the returned rows:
+
+- `total_matches` counts distinct logical note/tag and symbol entities, not raw
+  heading or section hits. A note and a symbol with the same title remain two
+  entities.
+- `total_matches_relation: "eq"` means `total_matches` is exact;
+  `"gte"` means it is a safe lower bound because bounded counting or an
+  incomplete source prevented an exact count.
+- `returned_matches` is the number of rows in `results` after the requested
+  display limit and any hybrid deduplication.
+- `truncated` is true whenever the total is a lower bound or fewer rows were
+  returned than the exact total.
+
+For a hybrid merge, NestWeaver reports an exact union only when both local and
+server responses are exact and complete. RRF can then deduplicate the complete
+union and use its length. If either source is incomplete, the merged total is
+`gte max(local total, server total, merged rows)`; source totals are never
+summed because local and server data can overlap.
+
 ### Staleness detection
 
 The client compares local `indexed_sha` against server `RepoStates` using `git ls-remote`. When local state is behind:

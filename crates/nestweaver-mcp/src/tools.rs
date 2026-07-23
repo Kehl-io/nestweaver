@@ -579,6 +579,37 @@ mod tool_schema_validation_tests {
         assert!(error.contains("invalid arguments for tool"), "{error}");
         assert!(error.contains("/query"), "{error}");
     }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn daemon_brain_search_json_preserves_counts_and_old_response_defaults() {
+        let response = nestweaver_proto::BrainSearchResponse {
+            query: "needle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 3,
+            results: vec![nestweaver_proto::SearchResultItem {
+                uid: "sym:needle".to_string(),
+                kind: "Symbol/Function".to_string(),
+                title: "needle".to_string(),
+                score: 1.0,
+                location: Some("src/lib.rs:1".to_string()),
+                matched_headings: Vec::new(),
+                inline_body: None,
+            }],
+            expansion_terms: vec!["expanded".to_string()],
+            returned_matches: 0,
+            total_matches_relation: String::new(),
+            truncated: true,
+        };
+
+        let value = daemon_brain_search_response_to_json(&response, false);
+
+        assert_eq!(value["total_matches"], 3);
+        assert_eq!(value["total_matches_relation"], "eq");
+        assert_eq!(value["returned_matches"], 1);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["expansion_terms"], json!(["expanded"]));
+    }
 }
 
 /// Returns structured documentation metadata for every registered tool.
@@ -7403,6 +7434,68 @@ fn reconciliation_warnings(failures: &[nestweaver_proto::ReconciliationFailure])
         .collect()
 }
 
+#[cfg(feature = "daemon")]
+fn daemon_brain_search_response_to_json(
+    response: &nestweaver_proto::BrainSearchResponse,
+    concise: bool,
+) -> Value {
+    let results: Vec<Value> = response
+        .results
+        .iter()
+        .map(|result| {
+            if concise {
+                let mut item = json!({
+                    "kind": result.kind,
+                    "title": result.title,
+                    "matched_headings": result.matched_headings,
+                });
+                if let Some(location) = &result.location {
+                    item["location"] = json!(location);
+                }
+                item
+            } else {
+                let mut item = json!({
+                    "uid": result.uid,
+                    "kind": result.kind,
+                    "title": result.title,
+                    "score": result.score,
+                    "matched_headings": result.matched_headings,
+                });
+                if let Some(location) = &result.location {
+                    item["location"] = json!(location);
+                }
+                if let Some(body) = &result.inline_body {
+                    item["inline_body"] = json!(body);
+                }
+                item
+            }
+        })
+        .collect();
+    let returned_matches = if response.returned_matches == 0 && !results.is_empty() {
+        results.len() as i32
+    } else {
+        response.returned_matches
+    };
+    let relation = if response.total_matches_relation.is_empty() {
+        "eq"
+    } else {
+        &response.total_matches_relation
+    };
+    let mut value = json!({
+        "query": response.query,
+        "engine": response.engine,
+        "total_matches": response.total_matches,
+        "total_matches_relation": relation,
+        "returned_matches": returned_matches,
+        "truncated": response.truncated,
+        "results": results,
+    });
+    if !response.expansion_terms.is_empty() {
+        value["expansion_terms"] = json!(response.expansion_terms);
+    }
+    value
+}
+
 /// Dispatch an MCP tool call through the daemon gRPC service instead of
 /// opening the DB directly. Maps each MCP tool name to the corresponding
 /// gRPC RPC on the `NestWeaverDaemon` service.
@@ -7590,46 +7683,7 @@ pub fn dispatch_via_daemon(
                     .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
                 let inner = resp.into_inner();
                 let is_concise = str_field("response_format").eq_ignore_ascii_case("concise");
-                // Serialize the typed response back to JSON, respecting
-                // concise mode (which deliberately omits uid/score/location).
-                let results: Vec<serde_json::Value> = inner
-                    .results
-                    .iter()
-                    .map(|r| {
-                        if is_concise {
-                            let mut obj = serde_json::json!({
-                                "kind": r.kind,
-                                "title": r.title,
-                                "matched_headings": r.matched_headings,
-                            });
-                            if let Some(ref loc) = r.location {
-                                obj["location"] = serde_json::json!(loc);
-                            }
-                            obj
-                        } else {
-                            let mut obj = serde_json::json!({
-                                "uid": r.uid,
-                                "kind": r.kind,
-                                "title": r.title,
-                                "score": r.score,
-                                "matched_headings": r.matched_headings,
-                            });
-                            if let Some(ref loc) = r.location {
-                                obj["location"] = serde_json::json!(loc);
-                            }
-                            if let Some(ref body) = r.inline_body {
-                                obj["inline_body"] = serde_json::json!(body);
-                            }
-                            obj
-                        }
-                    })
-                    .collect();
-                let value = serde_json::json!({
-                    "query": inner.query,
-                    "engine": inner.engine,
-                    "total_matches": inner.total_matches,
-                    "results": results,
-                });
+                let value = daemon_brain_search_response_to_json(&inner, is_concise);
                 Ok(serde_json::to_string(&value)?)
             }
             "brain_context" => {
