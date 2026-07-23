@@ -127,15 +127,17 @@ const HYBRID_TOKEN: &str = "hybrid-integration-secret-token-0123456789abcdef";
 /// Connect a local `DaemonClient` to an already-running daemon (started via
 /// `ServerGuard`) over its Unix domain socket. The socket is bound before the
 /// port file is written, so by the time `ServerGuard::start` returns it should
-/// exist — but retry briefly to absorb any accept-loop start-up jitter.
+/// exist — but retry briefly to absorb any accept-loop start-up jitter. The
+/// budget (10 s) is sized for full-workspace parallel test load, where the
+/// daemon's accept loop can be starved well past the old 10×150 ms window.
 async fn connect_local(db_path: &std::path::Path) -> DaemonClient {
     let mut last_err = None;
-    for _ in 0..10 {
+    for _ in 0..40 {
         match DaemonClient::connect_existing(db_path).await {
             Ok(client) => return client,
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
     }
@@ -147,7 +149,9 @@ async fn connect_local(db_path: &std::path::Path) -> DaemonClient {
 
 /// Build an `UpstreamHandle` in `Merge` mode pointing at a `ServerGuard`'s gRPC
 /// address with the given bearer token. Empty `repos` globs => matches every
-/// query, so the merge path always selects it.
+/// query, so the merge path always selects it. The upstream timeout is
+/// load-tolerant: 5 s was too tight when the full workspace test suite runs in
+/// parallel and the upstream server competes for CPU.
 fn merge_upstream(grpc_addr: String, token: &str) -> UpstreamHandle {
     let cfg = UpstreamConfig {
         name: Some("server".to_string()),
@@ -155,7 +159,7 @@ fn merge_upstream(grpc_addr: String, token: &str) -> UpstreamHandle {
         token: Some(token.to_string()),
         mode: RoutingMode::Merge,
         repos: vec![],
-        timeout: "5s".to_string(),
+        timeout: "15s".to_string(),
         ca_cert: None,
     };
     UpstreamHandle::from_config(&cfg).expect("build upstream handle")

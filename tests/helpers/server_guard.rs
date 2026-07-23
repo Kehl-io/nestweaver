@@ -3,10 +3,25 @@
 //! Spawns `nestweaver daemon --db <path> run --server --bind 127.0.0.1:0 --port-file <path>`
 //! as a foreground child process, waits for the port file to appear, and kills
 //! the process on drop.
+//!
+//! The child's stderr is piped and drained by a reader thread into a bounded
+//! in-memory tail buffer. Draining is load-bearing: with the pipe undrained a
+//! chatty server blocks on write once the OS pipe buffer (~64 KiB) fills, the
+//! port file never appears, and the startup deadline fires with no useful
+//! diagnostics. The captured tail is included in the timeout panic message.
+//!
+//! Startup deadline: 30 s by default (the old 10 s was too tight under
+//! full-workspace parallel test load); override with
+//! `NESTWEAVER_TEST_SERVER_TIMEOUT_SECS`.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// How much of the child's stderr to retain for failure diagnostics.
+const STDERR_TAIL_CAP: usize = 16 * 1024;
 
 /// Guard that owns a `nestweaver daemon run --server` child process.
 ///
@@ -17,6 +32,7 @@ pub struct ServerGuard {
     port_file: PathBuf,
     #[allow(dead_code)]
     db_path: PathBuf,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ServerGuard {
@@ -219,38 +235,79 @@ impl ServerGuard {
         // Run in foreground — launchd-style daemonisation doesn't work in tests.
         cmd.env("NESTWEAVER_DAEMON_FORK", "0");
 
-        let child = cmd
+        let mut child = cmd
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("failed to spawn nestweaver daemon in server mode");
 
-        let guard = Self {
+        // Drain the child's stderr from a reader thread into a bounded tail
+        // buffer. Without this the child blocks on write once the pipe buffer
+        // fills and the startup deadline fires spuriously (flake F-25).
+        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let stderr_thread = child.stderr.take().map(|mut pipe| {
+            let tail = Arc::clone(&stderr_tail);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match pipe.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let chunk = String::from_utf8_lossy(&buf[..n]);
+                            let mut guard = tail.lock().unwrap();
+                            guard.push_str(&chunk);
+                            if guard.len() > STDERR_TAIL_CAP {
+                                let mut start = guard.len() - STDERR_TAIL_CAP;
+                                while !guard.is_char_boundary(start) {
+                                    start += 1;
+                                }
+                                guard.drain(..start);
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
+        let mut guard = Self {
             child,
             port_file: port_file.clone(),
             db_path: db_path.to_path_buf(),
+            stderr_thread,
         };
 
-        // Wait for the port file to appear (up to 10 s).
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Wait for the port file to appear. The deadline scales: 30 s default
+        // (parallel full-workspace test runs starve the child of CPU; the old
+        // 10 s fired spuriously), overridable via env for even slower CI hosts.
+        let timeout_secs: u64 = std::env::var("NESTWEAVER_TEST_SERVER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(30);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         while Instant::now() < deadline {
             if port_file.exists() {
                 // Give the server a moment to finish binding after writing.
                 std::thread::sleep(Duration::from_millis(100));
                 return guard;
             }
+            // Early-exit if the child died (e.g. bad flags) instead of
+            // waiting out the full deadline.
+            if let Ok(Some(status)) = guard.child.try_wait() {
+                let tail = stderr_tail.lock().unwrap();
+                panic!(
+                    "nestweaver daemon in server mode exited early ({status}) \
+                     before writing port file {port_file:?}\n\
+                     --- captured stderr tail ---\n{tail}"
+                );
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // If we reach here in the current codebase, it means `run_server()`
-        // hasn't been implemented yet (Task 3). That's expected — tests that
-        // call `start()` will be gated behind `#[ignore]` until then.
-        //
-        // We still panic so that un-ignored tests get a clear error.
+        let tail = stderr_tail.lock().unwrap();
         panic!(
-            "port file {:?} did not appear within 10 s — \
-             is `nestweaver daemon run --server` implemented?",
-            port_file
+            "port file {port_file:?} did not appear within {timeout_secs} s \
+             (override with NESTWEAVER_TEST_SERVER_TIMEOUT_SECS)\n\
+             --- captured stderr tail ---\n{tail}"
         );
     }
 }
@@ -259,6 +316,11 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // The stderr pipe hits EOF once the child is reaped; join the reader
+        // thread so it doesn't linger across tests in the same process.
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
         let _ = std::fs::remove_file(&self.port_file);
     }
 }

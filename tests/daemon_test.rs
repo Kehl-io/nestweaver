@@ -2771,3 +2771,438 @@ fn daemon_prune_stale_drops_sidecar_slices_so_readd_reindexes() {
         .success()
         .stdout(contains("readdfn"));
 }
+
+/// Run `search <query> --json` against the DB directly and return the `uid` of
+/// the first hit. Used to obtain a real, indexed symbol UID for impact tests.
+fn first_search_uid(db_path: &Path, query: &str) -> String {
+    let output = no_daemon_cmd()
+        .args([
+            "search",
+            query,
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .expect("search failed to run");
+    assert!(
+        output.status.success(),
+        "search must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("search --json must emit valid JSON");
+    rows.as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|row| row["uid"].as_str())
+        .unwrap_or_else(|| panic!("search for '{query}' must return at least one uid: {rows}"))
+        .to_string()
+}
+
+/// Parse the `tools/call` response (id=2) out of an MCP stdio transcript and
+/// return its `structuredContent`, asserting the call did not error.
+fn mcp_structured_content(output: &str) -> serde_json::Value {
+    let response = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("id") == Some(&serde_json::json!(2)))
+        .unwrap_or_else(|| panic!("tools/call response missing from: {output}"));
+    assert_eq!(
+        response["result"]["isError"],
+        serde_json::json!(false),
+        "tool call must succeed: {response}"
+    );
+    response["result"]["structuredContent"].clone()
+}
+
+/// List repos through the daemon and return the parsed JSON array.
+fn list_repos_json_via_daemon(db_path: &Path) -> Vec<serde_json::Value> {
+    let output = daemon_cmd()
+        .args([
+            "list-repos",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .expect("list-repos failed to run");
+    assert!(
+        output.status.success(),
+        "list-repos must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim())
+        .expect("list-repos --json did not emit a valid JSON array")
+}
+
+/// nw-089: the daemon-proxy `brain_remove_source` MCP write tool must RESOLVE a
+/// path/name target to the repo uid and actually delete it — pre-fix the proxy
+/// sent the raw target string as `repo_uid`, matched nothing, and silently
+/// reported success. Driven over stdio MCP in daemon mode against a running
+/// daemon, mirroring `daemon_mcp_brain_add_source`.
+#[test]
+fn daemon_mcp_brain_remove_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("remsrc").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // Sanity: the repo is indexed before removal.
+    let before = list_repos_json_via_daemon(&db_path);
+    assert_eq!(
+        before.len(),
+        1,
+        "fixture should start with exactly one indexed repo: {before:?}"
+    );
+
+    // Remove it via the daemon-proxy MCP tool, addressing the repo by PATH
+    // (the shape that pre-fix silently no-opped).
+    let remove_output = mcp_tool_call_in_mode(
+        &db_path,
+        "brain_remove_source",
+        serde_json::json!({ "target": repo_dir.display().to_string() }),
+        McpMode::Daemon,
+    );
+    let removed = mcp_structured_content(&remove_output);
+    assert_eq!(
+        removed["kind"],
+        serde_json::json!("repo"),
+        "brain_remove_source must report removing a repo: {removed}"
+    );
+
+    // The repo must actually be gone when read back through the daemon.
+    let after = list_repos_json_via_daemon(&db_path);
+    assert!(
+        after.is_empty(),
+        "brain_remove_source must delete the repo, but list-repos still shows: {after:?}"
+    );
+}
+
+/// F-04: `impact` must fail closed on unknown/garbage UIDs — exit 2, never a
+/// false-green `[]` exit 0. DIRECT path (NESTWEAVER_NO_DAEMON=1).
+#[test]
+fn daemon_impact_fail_closed_direct() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("impact-direct").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let valid_uid = first_search_uid(&db_path, "greet");
+
+    // Garbage UID → exit 2.
+    no_daemon_cmd()
+        .args([
+            "impact",
+            "sym:totally:bogus:uid:99999",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .code(2);
+
+    // Well-formed but nonexistent UID → exit 2.
+    no_daemon_cmd()
+        .args([
+            "impact",
+            "sym:repo:default:deadbeef00:deadbeef00:deadbeef00:1",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .code(2);
+
+    // A real indexed symbol's UID still resolves → exit 0.
+    no_daemon_cmd()
+        .args(["impact", &valid_uid, "--db", &db_path.display().to_string()])
+        .assert()
+        .code(0);
+}
+
+/// F-04: same fail-closed contract through a RUNNING daemon (the
+/// `try_hybrid_json_rpc` → `brain_impact` path, which must map the tool's
+/// `status: not_found` onto exit 2).
+#[test]
+fn daemon_impact_fail_closed_via_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("impact-daemon").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    // Obtain a real UID before starting the daemon (direct read).
+    let valid_uid = first_search_uid(&db_path, "greet");
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // Garbage UID → exit 2.
+    daemon_cmd()
+        .args([
+            "impact",
+            "sym:totally:bogus:uid:99999",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .code(2);
+
+    // Well-formed but nonexistent UID → exit 2.
+    daemon_cmd()
+        .args([
+            "impact",
+            "sym:repo:default:deadbeef00:deadbeef00:deadbeef00:1",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .code(2);
+
+    // A real indexed symbol's UID still resolves → exit 0.
+    daemon_cmd()
+        .args(["impact", &valid_uid, "--db", &db_path.display().to_string()])
+        .assert()
+        .code(0);
+}
+
+/// Final-hunt regression: `daemon stop` must not declare success while a
+/// daemon is still serving. When the pidfile has been lost (the old launchd
+/// stop path removed it after booting out a dead job, leaving a detached
+/// daemon alive), `stop` must find the serving process via the socket's
+/// kernel-reported peer PID and stop THAT — and `status` must not report
+/// "not running" while the socket still answers.
+#[test]
+fn daemon_stop_without_pidfile_stops_serving_daemon_via_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    // Simulate the state the buggy launchd stop path left behind: pidfile
+    // removed while the daemon still serves the socket.
+    std::fs::remove_file(&pidfile).unwrap();
+
+    // status must not lie about the still-serving daemon.
+    daemon_action_cmd(&db_path, "status")
+        .assert()
+        .success()
+        .stdout(contains("running"));
+
+    // stop must terminate the serving daemon and only then claim success.
+    daemon_action_cmd(&db_path, "stop")
+        .assert()
+        .success()
+        .stderr(contains("Daemon stopped."));
+
+    // The process is really gone and the socket no longer answers.
+    let ps_ok = StdCommand::new("ps")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(!ps_ok, "daemon process {pid} must be gone after stop");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_err(),
+        "socket must not answer after stop"
+    );
+
+    daemon_action_cmd(&db_path, "status")
+        .assert()
+        .success()
+        .stdout(contains("not running"));
+}
+
+/// Extract the `tools/call` response (id == 2) from MCP stdio output.
+fn mcp_call_response(output: &str) -> serde_json::Value {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v.get("id") == Some(&serde_json::json!(2)))
+        .unwrap_or_else(|| panic!("expected a tools/call response; got: {output}"))
+}
+
+/// Final-hunt Z-2 (item 1): extension tool argument errors surfaced over
+/// daemon stdio must use the standard `tool <name> failed:` format — stdio
+/// MCP clients never speak gRPC, so a "gRPC error:" prefix misleads them.
+#[test]
+fn daemon_extension_arg_errors_use_tool_failed_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // MCP-visible path: query_extensions (its schema lets these through to the
+    // daemon handler).
+    for (args, needle) in [
+        (
+            serde_json::json!({}),
+            "tool query_extensions failed: provide either 'uid' or both 'key' and 'value'",
+        ),
+        (
+            serde_json::json!({ "key": "owner" }),
+            "tool query_extensions failed: 'value' is required when 'key' is given",
+        ),
+    ] {
+        let output = mcp_tool_call_in_mode(&db_path, "query_extensions", args, McpMode::Daemon);
+        let response = mcp_call_response(&output);
+        assert_eq!(
+            response["result"]["isError"],
+            serde_json::json!(true),
+            "expected a tool error; got: {response}"
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(needle), "unexpected error text: {text}");
+        assert!(
+            !text.starts_with("gRPC error:"),
+            "tool error must not be mislabeled as a transport error: {text}"
+        );
+    }
+
+    // Raw-gRPC path: set_extension (the MCP schema's required fields mask
+    // these, but direct gRPC clients still hit the daemon handler).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = nestweaver_client::DaemonClient::connect_existing(&db_path)
+            .await
+            .unwrap();
+        let status = client
+            .inner_mut()
+            .set_extension(nestweaver_proto::JsonRequest {
+                args_json: serde_json::json!({ "uid": "note:x", "key": "owner" }).to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "tool set_extension failed: 'value' is required"
+        );
+    });
+}
+
+/// Final-hunt Z-2 (item 2): a vault added via the CLI and via MCP
+/// brain_add_source must land under the SAME instance id. Before the fix the
+/// MCP daemon path sent an empty instance_id, which a config-less daemon
+/// resolved to its db-path hash — duplicating the vault under two UIDs.
+#[test]
+fn daemon_mcp_and_cli_add_source_share_default_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+    write_test_vault(&vault_dir);
+
+    // CLI add first (no daemon): stamps the vault under the CLI's resolved
+    // default instance id "default".
+    no_daemon_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .args(["--db"])
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // MCP brain_add_source over the daemon must resolve the same "default".
+    let add_output = mcp_tool_call_in_mode(
+        &db_path,
+        "brain_add_source",
+        serde_json::json!({ "path": vault_dir.display().to_string() }),
+        McpMode::Daemon,
+    );
+    let add_response = mcp_call_response(&add_output);
+    assert_eq!(
+        add_response["result"]["isError"],
+        serde_json::json!(false),
+        "brain_add_source should succeed; got: {add_response}"
+    );
+
+    // Exactly one vault row, under the CLI's "default" instance.
+    let status_output = mcp_tool_call_in_mode(
+        &db_path,
+        "brain_status",
+        serde_json::json!({}),
+        McpMode::Daemon,
+    );
+    let status = mcp_call_response(&status_output);
+    let vaults = status["result"]["structuredContent"]["vaults"]
+        .as_array()
+        .unwrap_or_else(|| panic!("brain_status should list vaults; got: {status}"));
+    assert_eq!(
+        vaults.len(),
+        1,
+        "CLI add + MCP add of the same vault must be idempotent; got: {vaults:?}"
+    );
+    assert_eq!(vaults[0]["instance_id"], "default");
+}
+
+/// Final-hunt Z-2 (item 3a): note_get over the daemon must return the same
+/// `frontmatter` and `outline` fields the local path returns.
+#[test]
+fn daemon_note_get_returns_frontmatter_and_outline() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(
+        vault_dir.join("note1.md"),
+        "---\nstatus: active\nowner: z2\n---\n# Hello\nBody text.\n## Details\nMore content.",
+    )
+    .unwrap();
+
+    no_daemon_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .args(["--db"])
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let output = mcp_tool_call_in_mode(
+        &db_path,
+        "note_get",
+        serde_json::json!({ "title": "Hello", "include_body": false }),
+        McpMode::Daemon,
+    );
+    let response = mcp_call_response(&output);
+    let note = &response["result"]["structuredContent"];
+    assert_eq!(
+        note["frontmatter"],
+        serde_json::json!({ "status": "active", "owner": "z2" }),
+        "daemon note_get must round-trip frontmatter; got: {note}"
+    );
+    let outline = note["outline"]
+        .as_array()
+        .unwrap_or_else(|| panic!("daemon note_get must include an outline; got: {note}"));
+    let texts: Vec<&str> = outline.iter().filter_map(|h| h["text"].as_str()).collect();
+    assert_eq!(texts, ["Hello", "Details"], "outline headings; got: {note}");
+}
