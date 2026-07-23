@@ -1853,21 +1853,17 @@ pub fn abort_instance_extension_migration(
              merge), or pass --force to discard the journal and reconcile manually."
         );
     }
+    // The handoff journal is a shared, multi-operation forward-recovery queue.
+    // Aborting this migration is not authorization to discard any of those
+    // authored entries, including entries for this operation after graph
+    // mutation. The migration journal is therefore the only abort commit
+    // marker and the only sidecar removed here.
     let journal_path = instance_extension_migration_journal_path(db_path);
-    let handoff_path = extension_handoff_journal_path(db_path);
     nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&journal_path).map_err(
         |error| {
             anyhow::anyhow!(
                 "durably remove migration journal {}: {error}",
                 journal_path.display()
-            )
-        },
-    )?;
-    nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&handoff_path).map_err(
-        |error| {
-            anyhow::anyhow!(
-                "durably remove handoff journal {}: {error}",
-                handoff_path.display()
             )
         },
     )?;
@@ -2205,6 +2201,40 @@ fn sidecar_path(db_path: &Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    fn test_pending_handoff(operation_id: &str, source_uid: &str) -> PendingExtensionHandoff {
+        PendingExtensionHandoff {
+            operation_id: operation_id.to_string(),
+            activation_generation: 17,
+            source_uid: source_uid.to_string(),
+            predicted_destination_uid: source_uid.replacen("file:old:", "file:new:", 1),
+            identity: JournalHandoffIdentity::File {
+                destination_repo_uid: "repo:new:aaaaaaaaaaaa".to_string(),
+                path: format!("/src/{source_uid}.rs"),
+            },
+            properties: BTreeMap::from([(
+                "owner".to_string(),
+                serde_json::json!({"operation": operation_id}),
+            )]),
+        }
+    }
+
+    fn write_test_handoffs(db_path: &Path, mut entries: Vec<PendingExtensionHandoff>) {
+        entries.sort_by(|left, right| {
+            (&left.operation_id, &left.source_uid).cmp(&(&right.operation_id, &right.source_uid))
+        });
+        write_extension_handoff_journal(&extension_handoff_journal_path(db_path), entries).unwrap();
+    }
+
+    fn handoff_snapshot(db_path: &Path) -> (Vec<u8>, Vec<PendingExtensionHandoff>) {
+        let path = extension_handoff_journal_path(db_path);
+        let bytes = std::fs::read(&path).unwrap();
+        let entries = load_extension_handoff_journal(&path)
+            .unwrap()
+            .unwrap()
+            .entries;
+        (bytes, entries)
+    }
 
     #[test]
     fn moved_symbol_extension_handoff_is_consumed_by_real_reindex_and_survives_reopen() {
@@ -3119,5 +3149,94 @@ mod tests {
             AbortMigrationOutcome::ForceDiscardedApplied
         );
         assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn prepared_abort_preserves_existing_handoffs_byte_for_byte_and_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let journal_path = instance_extension_migration_journal_path(&db_path);
+        write_test_handoffs(
+            &db_path,
+            vec![test_pending_handoff(
+                "operation-a",
+                "file:old:aaaaaaaaaaaa:111111111111",
+            )],
+        );
+        let before = handoff_snapshot(&db_path);
+
+        prepare_instance_extension_migration(
+            &db_path,
+            "old",
+            "new",
+            &[nestweaver_store::InstanceUidRemap {
+                source_uid: "proj:old:bbbbbbbbbbbb".to_string(),
+                destination_uid: "proj:new:bbbbbbbbbbbb".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            abort_instance_extension_migration(&db_path, false).unwrap(),
+            AbortMigrationOutcome::AbortedPrepared
+        );
+        assert!(!journal_path.exists());
+        assert_eq!(handoff_snapshot(&db_path), before);
+
+        assert_eq!(
+            abort_instance_extension_migration(&db_path, false).unwrap(),
+            AbortMigrationOutcome::NothingToAbort
+        );
+        assert_eq!(handoff_snapshot(&db_path), before);
+    }
+
+    #[test]
+    fn forced_applied_and_reconciled_aborts_preserve_all_handoffs_and_on_retry() {
+        for reconciled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("brain.lbug");
+            let journal_path = instance_extension_migration_journal_path(&db_path);
+            let prepared = prepare_instance_extension_migration(
+                &db_path,
+                "old",
+                "new",
+                &[nestweaver_store::InstanceUidRemap {
+                    source_uid: "proj:old:bbbbbbbbbbbb".to_string(),
+                    destination_uid: "proj:new:bbbbbbbbbbbb".to_string(),
+                }],
+            )
+            .unwrap();
+            let operation_b = prepared.journal.as_ref().unwrap().operation_id.clone();
+            let graph_applied =
+                mark_instance_extension_migration_graph_applied(&db_path, &prepared).unwrap();
+            if reconciled {
+                mark_instance_extension_migration_reconciled(&db_path, &graph_applied).unwrap();
+            }
+            write_test_handoffs(
+                &db_path,
+                vec![
+                    test_pending_handoff("operation-a", "file:old:aaaaaaaaaaaa:111111111111"),
+                    test_pending_handoff(&operation_b, "file:old:bbbbbbbbbbbb:222222222222"),
+                ],
+            );
+            let before = handoff_snapshot(&db_path);
+
+            assert!(abort_instance_extension_migration(&db_path, false).is_err());
+            assert!(journal_path.exists());
+            assert_eq!(handoff_snapshot(&db_path), before);
+
+            assert_eq!(
+                abort_instance_extension_migration(&db_path, true).unwrap(),
+                AbortMigrationOutcome::ForceDiscardedApplied
+            );
+            assert!(!journal_path.exists());
+            assert_eq!(handoff_snapshot(&db_path), before);
+
+            assert_eq!(
+                abort_instance_extension_migration(&db_path, true).unwrap(),
+                AbortMigrationOutcome::NothingToAbort
+            );
+            assert_eq!(handoff_snapshot(&db_path), before);
+        }
     }
 }
