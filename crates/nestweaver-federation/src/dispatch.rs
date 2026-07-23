@@ -152,9 +152,7 @@ fn brain_search_response_to_json(
             if let Some(location) = &result.location {
                 item["location"] = Value::String(location.clone());
             }
-            if !result.matched_headings.is_empty() {
-                item["matched_headings"] = serde_json::json!(result.matched_headings);
-            }
+            item["matched_headings"] = serde_json::json!(result.matched_headings);
             if !concise && let Some(body) = &result.inline_body {
                 item["inline_body"] = Value::String(body.clone());
             }
@@ -535,6 +533,19 @@ mod tests {
         assert!(
             concise["results"][0].get("inline_body").is_none(),
             "typed federation concise rows must omit inline bodies: {concise}"
+        );
+
+        let mut title_only_note = response;
+        title_only_note.results[0].uid = "note:needle".to_string();
+        title_only_note.results[0].kind = "note".to_string();
+        title_only_note.results[0].canonical_id = None;
+        title_only_note.results[0].matched_headings.clear();
+        let concise_note = brain_search_response_to_json(&title_only_note, true);
+        assert_eq!(
+            concise_note["results"][0]["matched_headings"],
+            serde_json::json!([]),
+            "title-only concise note rows must retain an empty matched-headings field: \
+             {concise_note}"
         );
     }
 }

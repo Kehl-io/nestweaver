@@ -2891,7 +2891,6 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
             ),
         ],
     );
-    index_repo(&visible_repo, &db_local);
 
     // Keep a second local repository in the same fronting daemon. Its symbols
     // and tests prove that repository scoping applies before each local
@@ -2911,6 +2910,12 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
         ],
     );
     index_repo(&hidden_local_repo, &db_local);
+    index_repo(&visible_repo, &db_local);
+    std::fs::write(
+        hidden_local_repo.join("hidden/secret-local-path.test.js"),
+        "export function hiddenlocaltest() { return 'hiddenbaserefcanary'; }",
+    )
+    .expect("dirty hidden local repo for base_ref scoping");
     {
         let store = nestweaver_store::GraphStore::open(&db_local).expect("open local graph");
         let target = store
@@ -3191,6 +3196,53 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
             "status": "withheld",
             "reason": "authorization-unproven"
         })
+    );
+
+    let base_ref_arguments = json!({ "base_ref": "HEAD" });
+    let admin_base_ref_response = client
+        .post(&endpoint)
+        .bearer_auth(admin_token)
+        .json(&request(67, "affected_tests", base_ref_arguments.clone()))
+        .send()
+        .await
+        .expect("admin affected_tests base_ref request");
+    assert_eq!(admin_base_ref_response.status(), 200);
+    let admin_base_ref_body: Value = admin_base_ref_response
+        .json()
+        .await
+        .expect("admin affected_tests base_ref JSON");
+    assert!(
+        admin_base_ref_body["result"]["structuredContent"]["local_impact"]["changed_files"]
+            .to_string()
+            .contains("secret-local-path.test.js"),
+        "fixture must prove unrestricted base_ref selected the first, hidden local repo: \
+         {admin_base_ref_body}"
+    );
+
+    let restricted_base_ref_response = client
+        .post(&endpoint)
+        .bearer_auth(query_token)
+        .json(&request(68, "affected_tests", base_ref_arguments))
+        .send()
+        .await
+        .expect("restricted affected_tests base_ref request");
+    assert_eq!(restricted_base_ref_response.status(), 200);
+    let restricted_base_ref_body: Value = restricted_base_ref_response
+        .json()
+        .await
+        .expect("restricted affected_tests base_ref JSON");
+    assert_eq!(
+        restricted_base_ref_body["result"]["structuredContent"]["local_impact"]["changed_files"],
+        json!([]),
+        "restricted base_ref must diff the sole visible local repository: \
+         {restricted_base_ref_body}"
+    );
+    assert!(
+        !restricted_base_ref_body
+            .to_string()
+            .contains("secret-local-path.test.js"),
+        "restricted base_ref leaked a changed path from the hidden local repository: \
+         {restricted_base_ref_body}"
     );
 }
 

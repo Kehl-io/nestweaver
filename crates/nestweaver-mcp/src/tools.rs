@@ -5132,7 +5132,16 @@ fn tool_brain_impact(
         }
     };
 
-    let mut nodes = store.impact_cancellable(&uid, depth, 0.0, cancel)?;
+    let mut nodes = if let Some(owners) = &owners {
+        let allowed: HashSet<String> = owners
+            .iter()
+            .filter(|(_, repo_uid)| repo_is_visible(repo_uid, visible))
+            .map(|(uid, _)| uid.clone())
+            .collect();
+        store.impact_cancellable_within(&uid, depth, 0.0, &allowed, cancel)?
+    } else {
+        store.impact_cancellable(&uid, depth, 0.0, cancel)?
+    };
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
 
@@ -5572,6 +5581,8 @@ fn tool_affected_tests(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    let owners = restricted_symbol_owners(store, visible)?;
+
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
     let mut changed_files: Vec<String> = bound_identifiers(
         args.get("changed_files")
@@ -5588,7 +5599,7 @@ fn tool_affected_tests(
     if changed_files.is_empty()
         && let Some(base_ref) = base_ref
     {
-        let repo_path = first_local_repo_path(store).unwrap_or_else(|| ".".to_string());
+        let repo_path = scoped_local_repo_path(store, visible)?.unwrap_or_else(|| ".".to_string());
         let files =
             nestweaver_engine::changed_files_from_git(Path::new(&repo_path), Some(base_ref))
                 .context("git diff for base_ref")?;
@@ -5612,12 +5623,21 @@ fn tool_affected_tests(
 
     // nw-037: route through the recorded wrapper so every selection feeds the
     // measured-recall loop and carries the in-band `measured` disclosure.
-    let db_path = current_db_path(store).ok();
-    let mut result =
+    let mut result = if let Some(owners) = &owners {
+        let allowed: HashSet<String> = owners
+            .iter()
+            .filter(|(_, repo_uid)| repo_is_visible(repo_uid, visible))
+            .map(|(uid, _)| uid.clone())
+            .collect();
+        nestweaver_engine::affected_tests::affected_tests_scoped(store, &changed_files, &allowed)
+            .context("affected_tests")?
+    } else {
+        let db_path = current_db_path(store).ok();
         nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
-            .context("affected_tests")?;
+            .context("affected_tests")?
+    };
 
-    if let Some(owners) = restricted_symbol_owners(store, visible)? {
+    if let Some(owners) = owners {
         let mut ownership_unproven = false;
         result.changed_symbols.retain(|symbol| {
             let repo_uid = if symbol.repo_uid.is_empty() {
@@ -5691,16 +5711,39 @@ fn tool_affected_tests(
     Ok(serde_json::to_value(&result)?)
 }
 
-/// Return the filesystem path of the first locally-indexed repo (a repo
-/// with a known local working tree — see [`nestweaver_schema::Repo::local_root`]).
-fn first_local_repo_path(store: &GraphStore) -> Option<String> {
-    // Option return can't propagate; surface a DB error in the log rather than
-    // silently reporting "no local repo".
-    let repos = store.list_repos(None).unwrap_or_else(|e| {
-        tracing::warn!("first_local_repo_path: list_repos failed: {e}");
-        Vec::new()
-    });
-    repos.iter().find_map(|r| r.local_root().map(String::from))
+/// Resolve the local working tree used for a `base_ref` diff.
+///
+/// Restricted callers must have exactly one visible local repository; choosing
+/// an arbitrary first repository would let graph ordering cross caller scope.
+fn scoped_local_repo_path(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Option<String>, anyhow::Error> {
+    let repos = store.list_repos(None).map_err(|error| {
+        anyhow!("listing repositories for affected-tests base_ref failed: {error}")
+    })?;
+    let roots: Vec<String> = repos
+        .iter()
+        .filter(|repo| repo_is_visible(&repo.uid, visible))
+        .filter_map(|repo| repo.local_root().map(String::from))
+        .collect();
+    if matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    ) {
+        match roots.as_slice() {
+            [root] => Ok(Some(root.clone())),
+            [] => Err(anyhow!(
+                "affected_tests base_ref requires one visible local repository"
+            )),
+            _ => Err(anyhow!(
+                "affected_tests base_ref is ambiguous across visible repositories; \
+                 provide changed_files explicitly"
+            )),
+        }
+    } else {
+        Ok(roots.into_iter().next())
+    }
 }
 
 // ── 12. clusters ───────────────────────────────────────────────────────────
@@ -9871,6 +9914,24 @@ mod blast_radius_visibility_tests {
         store
             .insert_symbol(&hidden_target)
             .expect("hidden same-name target");
+        let mut visible_via_hidden = hidden_target.clone();
+        visible_via_hidden.uid = "visible-via-hidden".to_string();
+        visible_via_hidden.name = "VisibleViaHidden".to_string();
+        visible_via_hidden.repo_uid = "repo:a".to_string();
+        visible_via_hidden.file_path = "src/visible_via_hidden.rs".to_string();
+        store
+            .insert_symbol(&visible_via_hidden)
+            .expect("visible transitive caller");
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: visible_via_hidden.uid.clone(),
+                target_uid: "hidden".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .expect("hidden-intermediate edge");
 
         let impact = tool_brain_impact(&store, json!({ "symbol": "Target" }), None, Some(&visible))
             .expect("scoped impact");
@@ -9882,6 +9943,7 @@ mod blast_radius_visibility_tests {
         assert!(impact_text.contains("VisibleCaller"), "{impact}");
         assert!(!impact_text.contains("HiddenCaller"), "{impact}");
         assert!(!impact_text.contains("LocalCaller"), "{impact}");
+        assert!(!impact_text.contains("VisibleViaHidden"), "{impact}");
         assert!(!impact_text.contains("hidden/target.rs"), "{impact}");
         assert_eq!(impact["total"], 1);
         assert_eq!(impact["returned"], 1);
@@ -9900,6 +9962,13 @@ mod blast_radius_visibility_tests {
         hidden_test.repo_uid = "repo:b".to_string();
         hidden_test.file_path = "hidden/tests/hidden_target_test.rs".to_string();
         store.insert_symbol(&hidden_test).expect("hidden test");
+        let mut hidden_same_path_test = hidden_test.clone();
+        hidden_same_path_test.uid = "hidden-same-path-test".to_string();
+        hidden_same_path_test.name = "hidden_same_path_test".to_string();
+        hidden_same_path_test.file_path = visible_test.file_path.clone();
+        store
+            .insert_symbol(&hidden_same_path_test)
+            .expect("hidden same-path test");
         for source_uid in ["visible-test", "hidden-test"] {
             store
                 .insert_edge(&ResolvedEdge {
@@ -9912,6 +9981,16 @@ mod blast_radius_visibility_tests {
                 })
                 .expect("test edge");
         }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: hidden_same_path_test.uid,
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.7,
+                link_type: None,
+                evidence: vec![],
+            })
+            .expect("hidden same-path test edge");
 
         let tests = tool_affected_tests(
             &store,
@@ -9922,6 +10001,7 @@ mod blast_radius_visibility_tests {
         let tests_text = tests.to_string();
         assert!(tests_text.contains("visible_target_test"), "{tests}");
         assert!(!tests_text.contains("hidden_target_test"), "{tests}");
+        assert!(!tests_text.contains("hidden_same_path_test"), "{tests}");
         assert!(!tests_text.contains("hidden/tests"), "{tests}");
         assert_eq!(
             tests["summary"],

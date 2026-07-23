@@ -145,6 +145,27 @@ pub(crate) fn derive_recommendation(status: AnalysisStatus) -> &'static str {
 ///   4. bucket by traversal depth (tier_1 = depth 1, etc.), ordering within a
 ///      tier by edge confidence.
 pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<AffectedTestsResult> {
+    affected_tests_within(store, changed_files, None)
+}
+
+/// Compute affected tests inside an induced symbol subgraph.
+///
+/// `allowed_symbols` is a positive authorization set: disallowed symbols are
+/// excluded as changed seeds, test candidates, and traversal intermediates.
+/// This prevents hidden topology from producing visible selections.
+pub fn affected_tests_scoped(
+    store: &GraphStore,
+    changed_files: &[String],
+    allowed_symbols: &HashSet<String>,
+) -> Result<AffectedTestsResult> {
+    affected_tests_within(store, changed_files, Some(allowed_symbols))
+}
+
+fn affected_tests_within(
+    store: &GraphStore,
+    changed_files: &[String],
+    allowed_symbols: Option<&HashSet<String>>,
+) -> Result<AffectedTestsResult> {
     // Trust core: a failed traversal must surface as `Degraded` so a CI
     // consumer runs the full suite instead of trusting an incomplete subset.
     let mut status = AnalysisStatus::Complete;
@@ -166,6 +187,12 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     for file_path in changed_files {
         match store.symbols_in_file(file_path) {
             Ok(syms) => {
+                let syms: Vec<_> = syms
+                    .into_iter()
+                    .filter(|symbol| {
+                        allowed_symbols.is_none_or(|allowed| allowed.contains(&symbol.uid))
+                    })
+                    .collect();
                 if syms.is_empty() {
                     files_without_symbols.push(file_path);
                 }
@@ -206,7 +233,10 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     // max-product reverse BFS (same edge set, depth cap, confidence + threshold
     // pruning), just over the in-memory adjacency.
     let symbols = match store.list_all_symbols() {
-        Ok(symbols) => symbols,
+        Ok(symbols) => symbols
+            .into_iter()
+            .filter(|symbol| allowed_symbols.is_none_or(|allowed| allowed.contains(&symbol.uid)))
+            .collect(),
         Err(e) => {
             notifications.push(Notification {
                 level: NotificationLevel::Error,
@@ -220,7 +250,7 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     let sym_by_uid: HashMap<String, &nestweaver_schema::Symbol> =
         symbols.iter().map(|s| (s.uid.clone(), s)).collect();
     let rev_adj = match store.load_typed_edges() {
-        Ok(edges) => build_rev_impact_adjacency(&edges),
+        Ok(edges) => build_rev_impact_adjacency(&edges, allowed_symbols),
         Err(e) => {
             // Do NOT silently proceed — an empty impact graph that reads as
             // "few tests" is the dangerous failure mode this tool exists to
@@ -405,6 +435,7 @@ struct Reacher {
 /// the structural impact edge types (dropping DEFINES/data/other edges).
 fn build_rev_impact_adjacency(
     typed_edges: &[(String, String, String, f64, String)],
+    allowed_symbols: Option<&HashSet<String>>,
 ) -> RevImpactAdj {
     let impact_names: HashSet<&str> = nestweaver_store::IMPACT_EDGE_TYPES
         .iter()
@@ -412,7 +443,9 @@ fn build_rev_impact_adjacency(
         .collect();
     let mut adj: RevImpactAdj = HashMap::new();
     for (src, dst, etype, conf, _evidence) in typed_edges {
-        if impact_names.contains(etype.as_str()) {
+        if impact_names.contains(etype.as_str())
+            && allowed_symbols.is_none_or(|allowed| allowed.contains(src) && allowed.contains(dst))
+        {
             // Edge src -[etype]-> dst means src is a caller of dst.
             adj.entry(dst.clone())
                 .or_default()
@@ -967,7 +1000,7 @@ mod tests {
             store.insert_edge(&edge).unwrap();
         }
 
-        let adj = build_rev_impact_adjacency(&store.load_typed_edges().unwrap());
+        let adj = build_rev_impact_adjacency(&store.load_typed_edges().unwrap(), None);
         for seed in ["sym:a", "sym:b", "sym:c"] {
             let db: HashMap<String, u32> = store
                 .impact(seed, MAX_TEST_DEPTH, MIN_CONFIDENCE)

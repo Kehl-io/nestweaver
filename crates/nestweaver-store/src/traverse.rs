@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use nestweaver_schema::{EdgeType, SymbolKind};
 
@@ -241,6 +241,32 @@ impl GraphStore {
             .nodes)
     }
 
+    /// Like [`impact_cancellable`](Self::impact_cancellable), but traverses only
+    /// the subgraph induced by `allowed_symbols`. Disallowed callers are not
+    /// returned or expanded, so an allowed node reachable only through a
+    /// disallowed intermediate cannot reveal that hidden topology.
+    pub fn impact_cancellable_within(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        allowed_symbols: &HashSet<String>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<ImpactNode>, StoreError> {
+        Ok(self
+            .impact_bfs(
+                target_uid,
+                max_depth,
+                min_confidence,
+                IMPACT_EDGE_TYPES,
+                &[],
+                0,
+                Some(allowed_symbols),
+                cancel,
+            )?
+            .nodes)
+    }
+
     /// Impact with the default edge set, returning the ImpactResult (with
     /// truncation-honesty flags). Convenience over `impact_detailed`.
     pub fn impact_with_flags(
@@ -278,7 +304,16 @@ impl GraphStore {
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
         // Structural-only walk: no data-dependence edges (empty set, cap 0).
-        self.impact_bfs(target_uid, max_depth, min_confidence, edges, &[], 0, cancel)
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            edges,
+            &[],
+            0,
+            None,
+            cancel,
+        )
     }
 
     /// Impact with the structural edge set (to `max_depth`) plus data-dependence
@@ -300,6 +335,7 @@ impl GraphStore {
             IMPACT_EDGE_TYPES,
             IMPACT_DATA_EDGE_TYPES,
             data_max_depth,
+            None,
             cancel,
         )
     }
@@ -323,6 +359,7 @@ impl GraphStore {
         structural: &[EdgeType],
         data: &[EdgeType],
         data_max_depth: u32,
+        allowed_symbols: Option<&HashSet<String>>,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
         // Whether the shallow data tier is actually in play for this walk.
@@ -399,6 +436,9 @@ impl GraphStore {
             for row in callers {
                 // Skip the seed node itself.
                 if row.uid == target_uid {
+                    continue;
+                }
+                if allowed_symbols.is_some_and(|allowed| !allowed.contains(&row.uid)) {
                     continue;
                 }
 
