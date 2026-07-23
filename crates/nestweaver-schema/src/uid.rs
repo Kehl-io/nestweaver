@@ -131,8 +131,7 @@ pub fn normalize_search_entity_uid(uid: &str) -> Option<(SearchEntityUidKind, St
             && is_lowercase_12_hex(repo_hash)
             && is_lowercase_12_hex(file_hash)
             && is_lowercase_12_hex(name_hash)
-            && line.bytes().all(|byte| byte.is_ascii_digit())
-            && line.parse::<u32>().is_ok() =>
+            && is_canonical_u32(line) =>
         {
             Some((
                 SearchEntityUidKind::Symbol,
@@ -152,6 +151,13 @@ fn is_lowercase_12_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_canonical_u32(value: &str) -> bool {
+    value.bytes().all(|byte| byte.is_ascii_digit())
+        && value
+            .parse::<u32>()
+            .is_ok_and(|parsed| value == parsed.to_string())
 }
 
 /// "proj:{instance}:{name_hash}"
@@ -463,11 +469,14 @@ mod tests {
             "sym:repo:local:0123456789ag:abcdef012345:123456789abc:42",
             "sym:repo:local:0123456789ab:ABCDEF012345:123456789abc:42",
             "sym:repo:local:0123456789ab:abcdef012345:123456789ab:42",
-            // The final component must be a decimal u32.
+            // The final component must be the canonical decimal spelling of a u32.
             "sym:repo:local:0123456789ab:abcdef012345:123456789abc:",
             "sym:repo:local:0123456789ab:abcdef012345:123456789abc:-1",
             "sym:repo:local:0123456789ab:abcdef012345:123456789abc:not-a-line",
             "sym:repo:local:0123456789ab:abcdef012345:123456789abc:4294967296",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:00",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:007",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:042",
             // Search identity supports only note, tag, and symbol domains.
             "head:vlt:local:0123456789ab:abcdef012345",
         ] {

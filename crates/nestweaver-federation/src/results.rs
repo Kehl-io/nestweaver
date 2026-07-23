@@ -1109,6 +1109,55 @@ mod tests {
     }
 
     #[test]
+    fn merge_json_results_leading_zero_symbol_line_cannot_prove_or_inflate_union() {
+        let canonical_uid = symbol_search_uid(
+            "local",
+            "https://github.com/acme/repo",
+            "src/lib.rs",
+            "needle",
+            42,
+        );
+        let server_canonical_uid = symbol_search_uid(
+            "server",
+            "https://github.com/acme/repo",
+            "src/lib.rs",
+            "needle",
+            42,
+        );
+        let malformed_uid = format!(
+            "{}:042",
+            server_canonical_uid
+                .strip_suffix(":42")
+                .expect("constructor must use canonical decimal line spelling")
+        );
+        let local = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": canonical_uid,
+                "kind": "Symbol/Function",
+                "title": "canonical"
+            })],
+        );
+        let server = complete_search_response(
+            "needle",
+            vec![json!({
+                "uid": malformed_uid,
+                "kind": "Symbol/Function",
+                "title": "malformed"
+            })],
+        );
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["returned_matches"], 2);
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(
+            merged["total_matches"], 1,
+            "malformed line spelling cannot prove a second identity or inflate the lower bound"
+        );
+    }
+
+    #[test]
     fn merge_json_results_discards_contradictory_equal_count_exact_metadata() {
         let duplicate = note_search_row("local", "/shared/vault", "notes/needle.md", "needle");
         let contradictory = json!({
