@@ -242,6 +242,21 @@ fn brain_search_json_count_contract_is_limit_independent() {
             .any(|row| { row["kind"] == "Symbol/Function" && row["title"] == "cardinalityneedle" }),
         "same-title note and symbol must remain distinct rows: {broad}"
     );
+    assert!(
+        broad_rows
+            .iter()
+            .filter(|row| {
+                row["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("Symbol/"))
+            })
+            .all(|row| {
+                row["canonical_id"]
+                    .as_str()
+                    .is_some_and(|canonical_id| !canonical_id.is_empty())
+            }),
+        "CLI JSON must preserve canonical symbol IDs: {broad}"
+    );
 }
 
 #[test]

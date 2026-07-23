@@ -142,6 +142,47 @@ pub fn normalize_search_entity_uid(uid: &str) -> Option<(SearchEntityUidKind, St
     }
 }
 
+/// Validate an edit-stable canonical ID against its line-sensitive symbol UID.
+///
+/// The symbol UID proves repository ownership plus hashed file/name identity.
+/// The canonical ID must carry the same repository hash and raw file/name
+/// components whose hashes match that UID. Every possible `#` separator is
+/// considered so valid paths and symbol names may themselves contain `#`.
+/// The returned key is explicitly domain-prefixed to remain distinct from
+/// note/tag identities.
+pub fn normalize_search_symbol_canonical_id(
+    symbol_uid: &str,
+    canonical_id: &str,
+) -> Option<String> {
+    let (kind, normalized_uid) = normalize_search_entity_uid(symbol_uid)?;
+    if kind != SearchEntityUidKind::Symbol {
+        return None;
+    }
+    let uid_parts: Vec<&str> = normalized_uid.split(':').collect();
+    let ["sym", "repo", repo_hash, file_hash, name_hash, _line] = uid_parts.as_slice() else {
+        return None;
+    };
+
+    let (canonical_repo_hash, remainder) = canonical_id.split_once(':')?;
+    let (path_and_name, scope_hash) = remainder.rsplit_once(':')?;
+    if canonical_repo_hash != *repo_hash
+        || !is_lowercase_12_hex(canonical_repo_hash)
+        || !is_lowercase_12_hex(scope_hash)
+    {
+        return None;
+    }
+
+    let has_matching_path_and_name = path_and_name.match_indices('#').any(|(separator, _)| {
+        let file_path = &path_and_name[..separator];
+        let name = &path_and_name[separator + 1..];
+        !file_path.is_empty()
+            && !name.is_empty()
+            && truncated_hash(file_path) == *file_hash
+            && truncated_hash(name) == *name_hash
+    });
+    has_matching_path_and_name.then(|| format!("sym-canonical:{canonical_id}"))
+}
+
 fn valid_uid_instance(instance: &str) -> bool {
     !instance.is_empty() && !instance.chars().any(char::is_whitespace)
 }
@@ -614,6 +655,61 @@ mod tests {
         assert_eq!(
             a, b,
             "line shifts must not change the canonical_id of a top-level symbol"
+        );
+    }
+
+    #[test]
+    fn canonical_search_symbol_identity_is_edit_stable_and_validated() {
+        let repo_url = "https://github.com/acme/api";
+        let file_path = "src/#generated:part.rs";
+        let name = "operator:#:call";
+        let repo = repo_uid("local", repo_url);
+        let line_7_uid = symbol_uid(&repo, file_path, name, 7);
+        let line_42_uid = symbol_uid(&repo, file_path, name, 42);
+        let canonical = canonical_symbol_id(repo_url, file_path, name, "module::operator:#:call");
+        let expected = format!("sym-canonical:{canonical}");
+
+        assert_eq!(
+            normalize_search_symbol_canonical_id(&line_7_uid, &canonical),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            normalize_search_symbol_canonical_id(&line_42_uid, &canonical),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn canonical_search_symbol_identity_rejects_malformed_or_mismatched_ids() {
+        let repo_url = "https://github.com/acme/api";
+        let other_repo_url = "https://github.com/acme/other";
+        let file_path = "src/lib.rs";
+        let name = "needle";
+        let uid = symbol_uid(&repo_uid("local", repo_url), file_path, name, 7);
+        let canonical = canonical_symbol_id(repo_url, file_path, name, "module::needle");
+        let other_repo_canonical =
+            canonical_symbol_id(other_repo_url, file_path, name, "module::needle");
+        let bad_scope = format!("{}ABC", &canonical[..canonical.len() - 3]);
+        let empty_path = canonical_symbol_id(repo_url, "", name, "module::needle");
+        let empty_name = canonical_symbol_id(repo_url, file_path, "", "module::needle");
+
+        for invalid in [
+            "",
+            "not-a-canonical-id",
+            other_repo_canonical.as_str(),
+            bad_scope.as_str(),
+            empty_path.as_str(),
+            empty_name.as_str(),
+        ] {
+            assert_eq!(
+                normalize_search_symbol_canonical_id(&uid, invalid),
+                None,
+                "{invalid:?} must not become a proof identity"
+            );
+        }
+        assert_eq!(
+            normalize_search_symbol_canonical_id("sym:malformed", &canonical),
+            None
         );
     }
 

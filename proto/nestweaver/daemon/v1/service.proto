@@ -218,6 +218,7 @@ message SearchResultItem {
   optional string location = 5;
   repeated string matched_headings = 6;
   optional string inline_body = 7;
+  optional string canonical_id = 8;
 }
 
 // brain_status

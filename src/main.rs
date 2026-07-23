@@ -12602,6 +12602,28 @@ fn brain_search_engine_header(engine: &str) -> &'static str {
     }
 }
 
+fn brain_search_result_item_json(item: &nestweaver_proto::SearchResultItem) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "uid": item.uid,
+        "kind": item.kind,
+        "title": item.title,
+        "score": item.score,
+    });
+    if let Some(ref canonical_id) = item.canonical_id {
+        value["canonical_id"] = serde_json::json!(canonical_id);
+    }
+    if let Some(ref location) = item.location {
+        value["location"] = serde_json::json!(location);
+    }
+    if !item.matched_headings.is_empty() {
+        value["matched_headings"] = serde_json::json!(item.matched_headings);
+    }
+    if let Some(ref body) = item.inline_body {
+        value["inline_body"] = serde_json::json!(body);
+    }
+    value
+}
+
 fn render_brain_search_response(
     resp: &nestweaver_proto::BrainSearchResponse,
     json: bool,
@@ -12611,25 +12633,11 @@ fn render_brain_search_response(
     let total_matches_relation = metadata.total_matches_relation;
     let truncated = metadata.truncated;
     if json {
-        let mut results: Vec<serde_json::Value> = Vec::with_capacity(resp.results.len());
-        for item in &resp.results {
-            let mut v = serde_json::json!({
-                "uid": item.uid,
-                "kind": item.kind,
-                "title": item.title,
-                "score": item.score,
-            });
-            if let Some(ref loc) = item.location {
-                v["location"] = serde_json::json!(loc);
-            }
-            if !item.matched_headings.is_empty() {
-                v["matched_headings"] = serde_json::json!(item.matched_headings);
-            }
-            if let Some(ref body) = item.inline_body {
-                v["inline_body"] = serde_json::json!(body);
-            }
-            results.push(v);
-        }
+        let results: Vec<serde_json::Value> = resp
+            .results
+            .iter()
+            .map(brain_search_result_item_json)
+            .collect();
         let mut payload = serde_json::json!({
             "query": resp.query,
             "engine": resp.engine,
@@ -12711,6 +12719,7 @@ mod brain_search_renderer_tests {
             total_matches: 1,
             results: vec![nestweaver_proto::SearchResultItem {
                 uid: "sym:needle".to_string(),
+                canonical_id: Some("canonical-needle".to_string()),
                 kind: "Symbol/Function".to_string(),
                 title: "needle".to_string(),
                 score: 1.0,
@@ -12729,6 +12738,10 @@ mod brain_search_renderer_tests {
         assert_eq!(metadata.returned_matches, 1);
         assert_eq!(metadata.total_matches_relation, "gte");
         assert!(metadata.truncated);
+        assert_eq!(
+            brain_search_result_item_json(&response.results[0])["canonical_id"],
+            "canonical-needle"
+        );
     }
 
     #[test]

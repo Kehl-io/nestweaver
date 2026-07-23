@@ -589,6 +589,7 @@ mod tool_schema_validation_tests {
             total_matches: 1,
             results: vec![nestweaver_proto::SearchResultItem {
                 uid: "sym:needle".to_string(),
+                canonical_id: Some("canonical-needle".to_string()),
                 kind: "Symbol/Function".to_string(),
                 title: "needle".to_string(),
                 score: 1.0,
@@ -610,10 +611,12 @@ mod tool_schema_validation_tests {
         assert_eq!(value["total_matches_relation"], "gte");
         assert_eq!(value["returned_matches"], 1);
         assert_eq!(value["truncated"], true);
+        assert_eq!(value["results"][0]["canonical_id"], "canonical-needle");
         assert_eq!(value["expansion_terms"], json!(["expanded"]));
 
         let concise = daemon_brain_search_response_to_json(&response, true);
         assert_eq!(concise["results"][0]["uid"], "sym:needle");
+        assert_eq!(concise["results"][0]["canonical_id"], "canonical-needle");
     }
 }
 
@@ -2894,22 +2897,26 @@ fn tool_brain_search(
     for sym in code_hits.iter().take(limit) {
         let location = format!("{}:{}", sym.file_path, sym.start_line);
         let kind = format!("Symbol/{}", sym.kind);
-        if concise {
-            note_results.push(json!({
+        let mut row = if concise {
+            json!({
                 "uid": sym.uid,
                 "kind": kind,
                 "title": sym.name,
                 "location": location,
-            }));
+            })
         } else {
-            note_results.push(json!({
+            json!({
                 "uid": sym.uid,
                 "kind": kind,
                 "title": sym.name,
                 "score": 0.5,
                 "location": location,
-            }));
+            })
+        };
+        if let Some(canonical_id) = &sym.canonical_id {
+            row["canonical_id"] = json!(canonical_id);
         }
+        note_results.push(row);
     }
 
     // Stable sort by score descending so notes and symbols interleave by relevance.
@@ -3268,6 +3275,7 @@ mod brain_search_total_contract_tests {
     use nestweaver_engine::authz::VisibleRepos;
     use nestweaver_schema::{
         Heading, Note, NoteKind, Section, Symbol, SymbolKind, Tag, Visibility,
+        uid::{canonical_symbol_id, repo_uid, symbol_uid},
     };
     use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
 
@@ -3579,6 +3587,41 @@ mod brain_search_total_contract_tests {
                 rows.iter().all(|row| row.get("score").is_none()),
                 "concise presentation must not gain detailed scores: {result}"
             );
+        }
+    }
+
+    #[test]
+    fn brain_search_symbol_rows_carry_canonical_id_in_both_formats() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_url = "https://github.com/acme/api";
+        let file_path = "src/search.rs";
+        let name = "CanonicalNeedle";
+        let repo = repo_uid("local", repo_url);
+        let uid = symbol_uid(&repo, file_path, name, 7);
+        let canonical = canonical_symbol_id(repo_url, file_path, name, "module::CanonicalNeedle");
+        let mut searched = symbol(&uid, &repo, name);
+        searched.file_path = file_path.to_string();
+        searched.start_line = 7;
+        searched.canonical_id = Some(canonical.clone());
+        store.insert_symbol(&searched).unwrap();
+
+        for response_format in [None, Some("concise")] {
+            let mut args = json!({ "query": "CanonicalNeedle", "limit": 10 });
+            if let Some(response_format) = response_format {
+                args["response_format"] = json!(response_format);
+            }
+            let result = dispatch(&store, None, "brain_search", args, None).unwrap();
+            let row = result["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["uid"] == uid)
+                .expect("symbol row");
+
+            assert_eq!(row["canonical_id"], canonical);
+            if response_format.is_some() {
+                assert!(row.get("score").is_none());
+            }
         }
     }
 
@@ -7492,7 +7535,7 @@ fn daemon_brain_search_response_to_json(
         .results
         .iter()
         .map(|result| {
-            if concise {
+            let mut item = if concise {
                 let mut item = json!({
                     "uid": result.uid,
                     "kind": result.kind,
@@ -7518,7 +7561,11 @@ fn daemon_brain_search_response_to_json(
                     item["inline_body"] = json!(body);
                 }
                 item
+            };
+            if let Some(canonical_id) = &result.canonical_id {
+                item["canonical_id"] = json!(canonical_id);
             }
+            item
         })
         .collect();
     let returned_matches = if response.returned_matches == 0 && !results.is_empty() {

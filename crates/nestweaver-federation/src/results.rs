@@ -5,7 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use nestweaver_schema::uid::{SearchEntityUidKind, normalize_search_entity_uid};
+use nestweaver_schema::uid::{
+    SearchEntityUidKind, normalize_search_entity_uid, normalize_search_symbol_canonical_id,
+};
 use serde_json::Value;
 
 use crate::merge::rrf_merge;
@@ -45,23 +47,29 @@ fn search_count_metadata(value: &Value, result_count: usize) -> SearchCountMetad
     }
 }
 
-/// Return the canonical logical identity carried by a `brain_search` row.
+/// Return the stable logical identity carried by a `brain_search` row.
 ///
 /// The shared schema parser enforces the exact constructor grammar before
 /// removing the instance component. This layer additionally checks that the
-/// row's presentation kind agrees with the parsed UID domain. Older concise or
-/// malformed responses remain unkeyed and cannot prove union cardinality.
+/// row's presentation kind agrees with the parsed UID domain. Symbols must also
+/// carry a validated edit-stable canonical ID; their line-sensitive UID is
+/// never used as a federation proof identity. Older or malformed responses
+/// remain visible but unkeyed and cannot prove union cardinality.
 fn brain_search_logical_uid(value: &Value) -> Option<String> {
     let uid = value.get("uid").and_then(Value::as_str)?;
     let kind = value.get("kind").and_then(Value::as_str)?;
     let (uid_kind, normalized) = normalize_search_entity_uid(uid)?;
-    let kind_matches = match uid_kind {
-        SearchEntityUidKind::Note | SearchEntityUidKind::Tag => kind == "note",
-        SearchEntityUidKind::Symbol => kind
-            .strip_prefix("Symbol/")
-            .is_some_and(|symbol_kind| !symbol_kind.is_empty()),
-    };
-    kind_matches.then_some(normalized)
+    match uid_kind {
+        SearchEntityUidKind::Note | SearchEntityUidKind::Tag => {
+            (kind == "note").then_some(normalized)
+        }
+        SearchEntityUidKind::Symbol => {
+            kind.strip_prefix("Symbol/")
+                .filter(|symbol_kind| !symbol_kind.is_empty())?;
+            let canonical_id = value.get("canonical_id").and_then(Value::as_str)?;
+            normalize_search_symbol_canonical_id(uid, canonical_id)
+        }
+    }
 }
 
 fn has_proven_unique_search_identities(items: &[Value]) -> bool {
@@ -457,7 +465,9 @@ pub fn inject_or_wrap_provenance(result: &mut Value, sources: &[&str], stale_rep
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nestweaver_schema::uid::{note_uid, repo_uid, symbol_uid, tag_uid, vault_uid};
+    use nestweaver_schema::uid::{
+        canonical_symbol_id, note_uid, repo_uid, symbol_uid, tag_uid, vault_uid,
+    };
     use serde_json::json;
 
     #[test]
@@ -713,6 +723,7 @@ mod tests {
     ) -> Value {
         json!({
             "uid": symbol_search_uid(instance, repo_url, file_path, name, line),
+            "canonical_id": canonical_symbol_id(repo_url, file_path, name, "module"),
             "kind": "Symbol/Function",
             "title": name,
             "location": format!("{file_path}:{line}")
@@ -800,6 +811,122 @@ mod tests {
         assert_eq!(merged["total_matches_relation"], "eq");
         assert_eq!(merged["returned_matches"], 1);
         assert_eq!(merged["truncated"], false);
+    }
+
+    #[test]
+    fn merge_json_results_uses_canonical_symbol_identity_across_line_shifts() {
+        let local = complete_search_response(
+            "needle",
+            vec![symbol_search_row(
+                "local-instance",
+                "https://github.com/acme/shared",
+                "src/shared.rs",
+                "shared_needle",
+                7,
+            )],
+        );
+        let server = complete_search_response(
+            "needle",
+            vec![symbol_search_row(
+                "server-instance",
+                "git@github.com:acme/shared.git",
+                "src/shared.rs",
+                "shared_needle",
+                42,
+            )],
+        );
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 1);
+        assert_eq!(merged["total_matches"], 1);
+        assert_eq!(merged["total_matches_relation"], "eq");
+        assert_eq!(merged["returned_matches"], 1);
+        assert_eq!(merged["truncated"], false);
+    }
+
+    #[test]
+    fn merge_json_results_missing_symbol_canonical_id_stays_visible_but_unproven() {
+        let mut local_row = symbol_search_row(
+            "local-instance",
+            "https://github.com/acme/shared",
+            "src/shared.rs",
+            "shared_needle",
+            7,
+        );
+        let mut server_row = symbol_search_row(
+            "server-instance",
+            "git@github.com:acme/shared.git",
+            "src/shared.rs",
+            "shared_needle",
+            7,
+        );
+        local_row.as_object_mut().unwrap().remove("canonical_id");
+        server_row.as_object_mut().unwrap().remove("canonical_id");
+        let local = complete_search_response("needle", vec![local_row]);
+        let server = complete_search_response("needle", vec![server_row]);
+
+        let merged = merge_json_results(&local, &server);
+
+        assert_eq!(merged["results"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["returned_matches"], 2);
+        assert_eq!(merged["total_matches_relation"], "gte");
+        assert_eq!(
+            merged["total_matches"], 1,
+            "rows without stable identity cannot inflate the proven lower bound"
+        );
+        assert_eq!(merged["truncated"], true);
+    }
+
+    #[test]
+    fn merge_json_results_invalid_symbol_canonical_ids_stay_visible_but_unproven() {
+        let repo_url = "https://github.com/acme/shared";
+        let invalid_ids = [
+            "not-a-canonical-id".to_string(),
+            canonical_symbol_id(
+                "https://github.com/acme/other",
+                "src/shared.rs",
+                "shared_needle",
+                "module",
+            ),
+            canonical_symbol_id(repo_url, "src/other.rs", "shared_needle", "module"),
+        ];
+
+        for invalid_id in invalid_ids {
+            let mut local_row = symbol_search_row(
+                "local-instance",
+                repo_url,
+                "src/shared.rs",
+                "shared_needle",
+                7,
+            );
+            let mut server_row = symbol_search_row(
+                "server-instance",
+                repo_url,
+                "src/shared.rs",
+                "shared_needle",
+                7,
+            );
+            local_row["canonical_id"] = json!(invalid_id);
+            server_row["canonical_id"] = json!(invalid_id);
+            let local = complete_search_response("needle", vec![local_row]);
+            let server = complete_search_response("needle", vec![server_row]);
+
+            let merged = merge_json_results(&local, &server);
+
+            assert_eq!(
+                merged["results"].as_array().unwrap().len(),
+                2,
+                "invalid canonical IDs must remain visible: {invalid_id}"
+            );
+            assert_eq!(merged["returned_matches"], 2);
+            assert_eq!(merged["total_matches_relation"], "gte");
+            assert_eq!(
+                merged["total_matches"], 1,
+                "invalid canonical IDs cannot inflate the proven lower bound: {invalid_id}"
+            );
+            assert_eq!(merged["truncated"], true);
+        }
     }
 
     #[test]

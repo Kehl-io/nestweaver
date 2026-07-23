@@ -153,6 +153,9 @@ fn brain_search_response_to_json(response: &nestweaver_proto::BrainSearchRespons
             if let Some(body) = &result.inline_body {
                 item["inline_body"] = Value::String(body.clone());
             }
+            if let Some(canonical_id) = &result.canonical_id {
+                item["canonical_id"] = Value::String(canonical_id.clone());
+            }
             item
         })
         .collect();
@@ -486,6 +489,7 @@ mod tests {
             total_matches: 1,
             results: vec![nestweaver_proto::SearchResultItem {
                 uid: "sym:needle".to_string(),
+                canonical_id: Some("canonical-needle".to_string()),
                 kind: "Symbol/Function".to_string(),
                 title: "needle".to_string(),
                 score: 1.0,
@@ -507,6 +511,7 @@ mod tests {
         assert_eq!(value["total_matches_relation"], "gte");
         assert_eq!(value["returned_matches"], 1);
         assert_eq!(value["truncated"], true);
+        assert_eq!(value["results"][0]["canonical_id"], "canonical-needle");
         assert_eq!(value["expansion_terms"], serde_json::json!(["expanded"]));
     }
 }

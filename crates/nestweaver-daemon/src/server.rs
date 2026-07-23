@@ -3591,6 +3591,11 @@ impl NestWeaverDaemon for DaemonService {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        canonical_id: item
+                            .get("canonical_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
                         kind: item
                             .get("kind")
                             .and_then(|v| v.as_str())
@@ -11985,7 +11990,7 @@ mod startup_helper_tests {
                     visibility: Visibility::Public,
                     type_info: None,
                     framework_hint: None,
-                    canonical_id: None,
+                    canonical_id: Some(format!("canonical:{uid}")),
                 })
                 .unwrap();
         }
@@ -12031,6 +12036,10 @@ mod startup_helper_tests {
         assert_eq!(response.total_matches_relation, "eq");
         assert!(!response.truncated);
         assert_eq!(response.results[0].uid, "sym:visible");
+        assert_eq!(
+            response.results[0].canonical_id.as_deref(),
+            Some("canonical:sym:visible")
+        );
         assert!(
             response.results.iter().all(|row| row.uid != "sym:hidden"),
             "typed Search must not leak hidden symbol rows"

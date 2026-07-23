@@ -97,6 +97,8 @@ pub struct SymbolDetail {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SymbolCandidate {
     pub uid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<String>,
     pub name: String,
     pub kind: String,
     pub file_path: String,
@@ -115,6 +117,7 @@ impl From<&Symbol> for SymbolCandidate {
     fn from(s: &Symbol) -> Self {
         SymbolCandidate {
             uid: s.uid.clone(),
+            canonical_id: s.canonical_id.clone(),
             name: s.name.clone(),
             kind: s.kind.to_string(),
             file_path: s.file_path.clone(),
@@ -308,7 +311,7 @@ mod counted_symbol_search_tests {
             visibility: Visibility::Inferred,
             type_info: None,
             framework_hint: None,
-            canonical_id: None,
+            canonical_id: Some(format!("canonical:{uid}")),
         }
     }
 
@@ -324,6 +327,10 @@ mod counted_symbol_search_tests {
         assert_eq!(page.results.len(), 1);
         assert_eq!(page.total.value, 2);
         assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+        assert_eq!(
+            page.results[0].canonical_id.as_deref(),
+            Some("canonical:s1")
+        );
 
         let legacy = search_symbols(&store, "payment", 1).unwrap();
         assert_eq!(page.results[0].uid, legacy[0].uid);
