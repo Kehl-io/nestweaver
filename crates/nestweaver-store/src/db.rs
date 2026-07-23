@@ -1306,6 +1306,17 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Roll back the explicit transaction opened by [`Self::begin_transaction`].
+    ///
+    /// Destructive classified mutations call this explicitly so a successful
+    /// rollback is affirmative evidence that an error happened before any
+    /// durable change. A rollback failure is never treated as proof either way.
+    pub fn rollback_transaction(&self, conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+        conn.query("ROLLBACK")
+            .map_err(|e| StoreError::Query(format!("rollback: {e}")))?;
+        Ok(())
+    }
+
     /// Merge the WAL into the main database file.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         let conn = self.conn()?;

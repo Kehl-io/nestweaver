@@ -10,11 +10,55 @@ use serde_json;
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+/// What a classified destructive store mutation can prove about durable state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationDisposition {
+    ConfirmedNoChange,
+    CommittedComplete,
+    CommittedPartial,
+    Ambiguous,
+}
+
+/// A mutation-stage error retained on a structured partial or ambiguous result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MutationFailure {
+    pub stage: String,
+    pub message: String,
+}
+
+impl MutationFailure {
+    fn new(stage: impl Into<String>, error: impl std::fmt::Display) -> Self {
+        Self {
+            stage: stage.into(),
+            message: error.to_string(),
+        }
+    }
+}
+
+/// A destructive store result that never uses `Err` to imply rollback after a
+/// possible durable mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MutationOutcome<T> {
+    pub disposition: MutationDisposition,
+    pub confirmed_changed: bool,
+    pub value: T,
+    pub primary_failure: Option<MutationFailure>,
+    pub mutation_warnings: Vec<MutationFailure>,
+}
+
 /// Confirmed graph mutation performed by a vault cascade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeleteVaultCascadeOutcome {
     pub notes_deleted: usize,
     pub changed: bool,
+}
+
+/// Snapshot-derived counts retained by a classified Repo cascade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteRepoCascadeOutcome {
+    pub repo_uid: String,
+    pub files_deleted: usize,
+    pub symbols_deleted: usize,
 }
 
 /// What the store can prove about a Project cascade after the transaction
@@ -111,10 +155,106 @@ struct ProjectCascadeFaults {
     rollback: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct VaultCascadeFaults {
+    before_delete: bool,
+    commit_before: bool,
+    commit_after: bool,
+    probe: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RepoCascadeFaults {
+    bulk_commit_after: bool,
+    after_bulk: bool,
+    before_root: bool,
+    root_ack_after: bool,
+    probe: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PurgeInstanceFaults {
+    before_repo: Option<usize>,
+    before_vault: Option<usize>,
+    orphan_commit_after: Option<usize>,
+    orphan_probe: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MergeInstanceFaults {
+    before_graph: bool,
+    after_repo: Option<usize>,
+    after_graph: bool,
+    verify: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PurgeOrphanTarget {
+    label: &'static str,
+    uid: String,
+    code: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PurgeInstancePlan {
+    repos: Vec<Repo>,
+    vaults: Vec<Vault>,
+    projects: Vec<Project>,
+    orphan_targets: Vec<PurgeOrphanTarget>,
+    code_repo_uids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct VaultDeletionSnapshot {
+    vault_uids: std::collections::BTreeSet<String>,
+    note_uids: std::collections::BTreeSet<String>,
+    tag_uids: std::collections::BTreeSet<String>,
+}
+
+impl VaultDeletionSnapshot {
+    fn is_empty(&self) -> bool {
+        self.vault_uids.is_empty() && self.note_uids.is_empty() && self.tag_uids.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactSnapshotState {
+    WhollyLive,
+    WhollyAbsent,
+    Mixed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RepoDeletionSnapshot {
+    repo_uids: std::collections::BTreeSet<String>,
+    file_uids: std::collections::BTreeSet<String>,
+    symbol_uids: std::collections::BTreeSet<String>,
+    service_uids: std::collections::BTreeSet<String>,
+    contract_uids: std::collections::BTreeSet<String>,
+}
+
+impl RepoDeletionSnapshot {
+    fn is_empty(&self) -> bool {
+        self.repo_uids.is_empty()
+            && self.file_uids.is_empty()
+            && self.symbol_uids.is_empty()
+            && self.service_uids.is_empty()
+            && self.contract_uids.is_empty()
+    }
+
+    fn is_subset_of(&self, other: &Self) -> bool {
+        self.repo_uids.is_subset(&other.repo_uids)
+            && self.file_uids.is_subset(&other.file_uids)
+            && self.symbol_uids.is_subset(&other.symbol_uids)
+            && self.service_uids.is_subset(&other.service_uids)
+            && self.contract_uids.is_subset(&other.contract_uids)
+    }
+}
+
 /// A vault whose notes were discarded during a collision in instance merge.
 /// When two instances have vaults at the same root_path, the vault with
 /// fewer notes loses and its notes are cascade-deleted.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscardedVault {
     pub root_path: String,
     pub notes_discarded: usize,
@@ -127,7 +267,7 @@ pub struct DiscardedVault {
 /// graph rows are removed before each Repo is re-minted, so the caller must
 /// force re-index every repo in this list — see
 /// [`MergeResult::repos_need_reindex`].
-#[derive(Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeResult {
     pub vaults: usize,
     pub repos: usize,
@@ -261,7 +401,7 @@ pub struct ReparentVaultResult {
 /// Heading/Section/Tag rows whose UID prefix encodes the instance but
 /// whose parent Repo or Vault no longer exists — typically left behind
 /// by a partially-applied `instance merge`).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PurgeInstanceResult {
     pub repos: usize,
     pub files: usize,
@@ -2250,10 +2390,277 @@ impl GraphStore {
         &self,
         vault_uid: &str,
     ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
+        Self::legacy_mutation_result(self.delete_vault_cascade_with_classified_outcome(vault_uid))
+    }
+
+    /// Cascade-delete a vault while retaining commit ambiguity as data.
+    ///
+    /// The preflight and every post-error liveness check use exact Vault,
+    /// Note, and Tag UIDs. The probe opens a connection distinct from the
+    /// transaction connection, so a failed transaction handle is never reused
+    /// as liveness evidence.
+    pub fn delete_vault_cascade_with_classified_outcome(
+        &self,
+        vault_uid: &str,
+    ) -> Result<MutationOutcome<DeleteVaultCascadeOutcome>, StoreError> {
+        self.delete_vault_cascade_with_classified_outcome_inner(
+            vault_uid,
+            VaultCascadeFaults::default(),
+        )
+    }
+
+    #[cfg(test)]
+    fn delete_vault_cascade_with_classified_outcome_and_faults(
+        &self,
+        vault_uid: &str,
+        faults: VaultCascadeFaults,
+    ) -> Result<MutationOutcome<DeleteVaultCascadeOutcome>, StoreError> {
+        self.delete_vault_cascade_with_classified_outcome_inner(vault_uid, faults)
+    }
+
+    fn delete_vault_cascade_with_classified_outcome_inner(
+        &self,
+        vault_uid: &str,
+        faults: VaultCascadeFaults,
+    ) -> Result<MutationOutcome<DeleteVaultCascadeOutcome>, StoreError> {
+        let before = self.vault_deletion_snapshot(vault_uid)?;
+        let value = DeleteVaultCascadeOutcome {
+            notes_deleted: before.note_uids.len(),
+            changed: !before.is_empty(),
+        };
+        if before.is_empty() {
+            return Ok(MutationOutcome {
+                disposition: MutationDisposition::ConfirmedNoChange,
+                confirmed_changed: false,
+                value,
+                primary_failure: None,
+                mutation_warnings: Vec::new(),
+            });
+        }
+
         let conn = self.begin_transaction()?;
-        let outcome = Self::delete_vault_cascade_with_outcome_on(&conn, vault_uid)?;
-        self.commit_transaction(&conn)?;
-        Ok(outcome)
+        let mutation =
+            Self::delete_vault_cascade_with_outcome_on_with_faults(&conn, vault_uid, faults);
+        if let Err(primary) = mutation {
+            return match self.rollback_transaction(&conn) {
+                Ok(()) => Err(primary),
+                Err(rollback) => self.classify_failed_vault_attempt(
+                    vault_uid,
+                    &before,
+                    value,
+                    primary,
+                    Some(rollback),
+                    faults,
+                    false,
+                ),
+            };
+        }
+
+        let commit = if faults.commit_before {
+            Err(StoreError::Query(
+                "injected commit failure before commit acknowledgement".to_string(),
+            ))
+        } else {
+            self.commit_transaction(&conn).and_then(|()| {
+                if faults.commit_after {
+                    Err(StoreError::Query(
+                        "injected commit failure after durable commit".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        match commit {
+            Ok(()) => Ok(MutationOutcome {
+                disposition: MutationDisposition::CommittedComplete,
+                confirmed_changed: true,
+                value,
+                primary_failure: None,
+                mutation_warnings: Vec::new(),
+            }),
+            Err(primary) => {
+                let rollback = self.rollback_transaction(&conn).err();
+                self.classify_failed_vault_attempt(
+                    vault_uid, &before, value, primary, rollback, faults, true,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify_failed_vault_attempt(
+        &self,
+        vault_uid: &str,
+        before: &VaultDeletionSnapshot,
+        value: DeleteVaultCascadeOutcome,
+        primary: StoreError,
+        rollback: Option<StoreError>,
+        faults: VaultCascadeFaults,
+        commit_stage: bool,
+    ) -> Result<MutationOutcome<DeleteVaultCascadeOutcome>, StoreError> {
+        let failure_stage = if commit_stage {
+            "vault-commit"
+        } else {
+            "vault-delete"
+        };
+        let probe = if faults.probe {
+            Err(StoreError::Query(
+                "injected vault liveness probe failure".to_string(),
+            ))
+        } else {
+            self.vault_deletion_snapshot(vault_uid)
+        };
+        match probe {
+            Ok(after) => match Self::exact_snapshot_state(before, &after) {
+                ExactSnapshotState::WhollyLive => {
+                    let rollback_context = rollback
+                        .map(|error| format!("; rollback failed: {error}"))
+                        .unwrap_or_default();
+                    Err(StoreError::Query(format!(
+                        "{primary}{rollback_context}; exact vault snapshot remained live"
+                    )))
+                }
+                ExactSnapshotState::WhollyAbsent => Ok(MutationOutcome {
+                    disposition: MutationDisposition::CommittedComplete,
+                    confirmed_changed: true,
+                    value,
+                    primary_failure: None,
+                    mutation_warnings: vec![MutationFailure::new(failure_stage, primary)],
+                }),
+                ExactSnapshotState::Mixed => Ok(MutationOutcome {
+                    disposition: MutationDisposition::Ambiguous,
+                    confirmed_changed: false,
+                    value,
+                    primary_failure: Some(MutationFailure::new(
+                        failure_stage,
+                        format!(
+                            "{primary}; exact atomic vault snapshot was mixed{}",
+                            rollback
+                                .map(|error| format!("; rollback failed: {error}"))
+                                .unwrap_or_default()
+                        ),
+                    )),
+                    mutation_warnings: Vec::new(),
+                }),
+            },
+            Err(probe) => Ok(MutationOutcome {
+                disposition: MutationDisposition::Ambiguous,
+                confirmed_changed: false,
+                value,
+                primary_failure: Some(MutationFailure::new(
+                    failure_stage,
+                    format!(
+                        "{primary}; vault liveness probe failed: {probe}{}",
+                        rollback
+                            .map(|error| format!("; rollback failed: {error}"))
+                            .unwrap_or_default()
+                    ),
+                )),
+                mutation_warnings: Vec::new(),
+            }),
+        }
+    }
+
+    fn vault_deletion_snapshot(
+        &self,
+        vault_uid: &str,
+    ) -> Result<VaultDeletionSnapshot, StoreError> {
+        let conn = self.conn()?;
+        Ok(VaultDeletionSnapshot {
+            vault_uids: Self::exact_uids_on(
+                &conn,
+                "MATCH (v:Vault) WHERE v.uid = $scope RETURN v.uid",
+                "scope",
+                vault_uid,
+                "Vault",
+            )?,
+            note_uids: Self::exact_uids_on(
+                &conn,
+                "MATCH (n:Note) WHERE n.vault_uid = $scope RETURN n.uid",
+                "scope",
+                vault_uid,
+                "Note",
+            )?,
+            tag_uids: Self::exact_uids_on(
+                &conn,
+                "MATCH (t:Tag) WHERE t.vault_uid = $scope RETURN t.uid",
+                "scope",
+                vault_uid,
+                "Tag",
+            )?,
+        })
+    }
+
+    fn exact_uids_on(
+        conn: &lbug::Connection<'_>,
+        query: &str,
+        parameter: &'static str,
+        scope: &str,
+        label: &str,
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        let mut statement = conn.prepare(query).map_err(|error| {
+            StoreError::Query(format!("prepare exact {label} snapshot: {error}"))
+        })?;
+        let rows = conn
+            .execute(
+                &mut statement,
+                vec![(parameter, lbug::Value::String(scope.to_string()))],
+            )
+            .map_err(|error| {
+                StoreError::Query(format!("execute exact {label} snapshot: {error}"))
+            })?;
+        let mut uids = std::collections::BTreeSet::new();
+        for row in rows {
+            let Some(lbug::Value::String(uid)) = row.first() else {
+                return Err(StoreError::Query(format!(
+                    "malformed exact {label} snapshot identity: {:?}",
+                    row.first()
+                )));
+            };
+            if !uids.insert(uid.clone()) {
+                return Err(StoreError::Query(format!(
+                    "duplicate exact {label} snapshot identity: {uid}"
+                )));
+            }
+        }
+        Ok(uids)
+    }
+
+    fn exact_snapshot_state(
+        before: &VaultDeletionSnapshot,
+        after: &VaultDeletionSnapshot,
+    ) -> ExactSnapshotState {
+        if before == after {
+            ExactSnapshotState::WhollyLive
+        } else if after.is_empty() {
+            ExactSnapshotState::WhollyAbsent
+        } else {
+            ExactSnapshotState::Mixed
+        }
+    }
+
+    fn legacy_mutation_result<T>(
+        outcome: Result<MutationOutcome<T>, StoreError>,
+    ) -> Result<T, StoreError> {
+        let outcome = outcome?;
+        match outcome.disposition {
+            MutationDisposition::ConfirmedNoChange | MutationDisposition::CommittedComplete => {
+                Ok(outcome.value)
+            }
+            MutationDisposition::CommittedPartial | MutationDisposition::Ambiguous => {
+                let failure = outcome.primary_failure.ok_or_else(|| {
+                    StoreError::Query(format!(
+                        "{:?} mutation outcome omitted its primary failure",
+                        outcome.disposition
+                    ))
+                })?;
+                Err(StoreError::Query(format!(
+                    "{}: {}",
+                    failure.stage, failure.message
+                )))
+            }
+        }
     }
 
     /// Cascade-delete a vault's data using an externally-provided transaction
@@ -2273,6 +2680,18 @@ impl GraphStore {
     fn delete_vault_cascade_with_outcome_on(
         conn: &lbug::Connection<'_>,
         vault_uid: &str,
+    ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
+        Self::delete_vault_cascade_with_outcome_on_with_faults(
+            conn,
+            vault_uid,
+            VaultCascadeFaults::default(),
+        )
+    }
+
+    fn delete_vault_cascade_with_outcome_on_with_faults(
+        conn: &lbug::Connection<'_>,
+        vault_uid: &str,
+        faults: VaultCascadeFaults,
     ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
         let count_matches = |query: &str, context: &str| -> Result<usize, StoreError> {
             let mut stmt = conn
@@ -2307,6 +2726,12 @@ impl GraphStore {
             "tag count",
         )?;
         let changed = count > 0 || vault_count > 0 || tag_count > 0;
+
+        if faults.before_delete {
+            return Err(StoreError::Query(
+                "injected vault failure before delete".to_string(),
+            ));
+        }
 
         // 1. Delete all Sections under notes in this vault.
         exec_params(
@@ -2873,6 +3298,331 @@ impl GraphStore {
     /// (FILE_HAS_SYMBOL, REPO_HAS_FILE, CALLS, IMPORTS, etc.) automatically.
     ///
     /// Returns `(file_count, symbol_count)` for logging.
+    pub fn delete_repo_cascade_with_outcome(
+        &self,
+        repo_uid: &str,
+    ) -> Result<MutationOutcome<DeleteRepoCascadeOutcome>, StoreError> {
+        self.delete_repo_cascade_with_outcome_inner(repo_uid, RepoCascadeFaults::default())
+    }
+
+    #[cfg(test)]
+    fn delete_repo_cascade_with_outcome_and_faults(
+        &self,
+        repo_uid: &str,
+        faults: RepoCascadeFaults,
+    ) -> Result<MutationOutcome<DeleteRepoCascadeOutcome>, StoreError> {
+        self.delete_repo_cascade_with_outcome_inner(repo_uid, faults)
+    }
+
+    fn delete_repo_cascade_with_outcome_inner(
+        &self,
+        repo_uid: &str,
+        faults: RepoCascadeFaults,
+    ) -> Result<MutationOutcome<DeleteRepoCascadeOutcome>, StoreError> {
+        let before = self.repo_deletion_snapshot(repo_uid)?;
+        if before.is_empty() {
+            return Ok(MutationOutcome {
+                disposition: MutationDisposition::ConfirmedNoChange,
+                confirmed_changed: false,
+                value: Self::repo_delete_value(repo_uid, &before, &before),
+                primary_failure: None,
+                mutation_warnings: Vec::new(),
+            });
+        }
+
+        let mut mutation_warnings = Vec::new();
+        let bulk = (|| {
+            let conn = self.begin_transaction()?;
+            let mutation = Self::bulk_delete_repo_files_and_symbols_on(&conn, repo_uid);
+            let counts = match mutation {
+                Ok(counts) => counts,
+                Err(error) => {
+                    let rollback = self.rollback_transaction(&conn);
+                    return Err(match rollback {
+                        Ok(()) => error,
+                        Err(rollback) => StoreError::Query(format!(
+                            "{error}; Repo bulk rollback failed: {rollback}"
+                        )),
+                    });
+                }
+            };
+            self.commit_transaction(&conn).and_then(|()| {
+                if faults.bulk_commit_after {
+                    Err(StoreError::Query(
+                        "injected Repo bulk commit acknowledgement failure".to_string(),
+                    ))
+                } else {
+                    Ok(counts)
+                }
+            })
+        })();
+
+        let bulk_confirmed_changed = !before.file_uids.is_empty() || !before.symbol_uids.is_empty();
+        if let Err(primary) = bulk {
+            let after = match self.repo_deletion_probe(repo_uid, faults) {
+                Ok(after) => after,
+                Err(probe) => {
+                    return Ok(MutationOutcome {
+                        disposition: MutationDisposition::Ambiguous,
+                        confirmed_changed: false,
+                        value: DeleteRepoCascadeOutcome {
+                            repo_uid: repo_uid.to_string(),
+                            files_deleted: 0,
+                            symbols_deleted: 0,
+                        },
+                        primary_failure: Some(MutationFailure::new(
+                            "repo-bulk-delete",
+                            format!("{primary}; exact Repo liveness probe failed: {probe}"),
+                        )),
+                        mutation_warnings,
+                    });
+                }
+            };
+            let other_unchanged = after.repo_uids == before.repo_uids
+                && after.service_uids == before.service_uids
+                && after.contract_uids == before.contract_uids;
+            let bulk_live =
+                after.file_uids == before.file_uids && after.symbol_uids == before.symbol_uids;
+            let bulk_absent = after.file_uids.is_empty() && after.symbol_uids.is_empty();
+            if other_unchanged && bulk_live {
+                return Err(StoreError::Query(format!(
+                    "{primary}; exact Repo File/Symbol snapshot remained live"
+                )));
+            }
+            if other_unchanged && bulk_absent {
+                mutation_warnings.push(MutationFailure::new("repo-bulk-delete", primary));
+            } else {
+                return Ok(MutationOutcome {
+                    disposition: MutationDisposition::Ambiguous,
+                    confirmed_changed: false,
+                    value: Self::repo_delete_value(repo_uid, &before, &after),
+                    primary_failure: Some(MutationFailure::new(
+                        "repo-bulk-delete",
+                        format!(
+                            "{primary}; exact atomic File/Symbol snapshot was mixed or other Repo rows changed"
+                        ),
+                    )),
+                    mutation_warnings,
+                });
+            }
+        }
+
+        if faults.after_bulk {
+            return self.classify_repo_attempt_error(
+                repo_uid,
+                &before,
+                StoreError::Query("injected failure after committed Repo bulk delete".to_string()),
+                bulk_confirmed_changed,
+                mutation_warnings,
+                faults,
+            );
+        }
+
+        if let Err(primary) = self.clear_repo_derived_nodes_strict(repo_uid) {
+            return self.classify_repo_attempt_error(
+                repo_uid,
+                &before,
+                primary,
+                bulk_confirmed_changed,
+                mutation_warnings,
+                faults,
+            );
+        }
+
+        let child_confirmed_changed = bulk_confirmed_changed
+            || !before.service_uids.is_empty()
+            || !before.contract_uids.is_empty();
+
+        if faults.before_root {
+            return self.classify_repo_attempt_error(
+                repo_uid,
+                &before,
+                StoreError::Query("injected failure before Repo root delete".to_string()),
+                child_confirmed_changed,
+                mutation_warnings,
+                faults,
+            );
+        }
+
+        let root_delete = self.delete_repo_node(repo_uid).and_then(|()| {
+            if faults.root_ack_after {
+                Err(StoreError::Query(
+                    "injected Repo root delete acknowledgement failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(primary) = root_delete {
+            return self.classify_repo_attempt_error(
+                repo_uid,
+                &before,
+                primary,
+                child_confirmed_changed,
+                mutation_warnings,
+                faults,
+            );
+        }
+
+        Ok(MutationOutcome {
+            disposition: MutationDisposition::CommittedComplete,
+            confirmed_changed: true,
+            value: DeleteRepoCascadeOutcome {
+                repo_uid: repo_uid.to_string(),
+                files_deleted: before.file_uids.len(),
+                symbols_deleted: before.symbol_uids.len(),
+            },
+            primary_failure: None,
+            mutation_warnings,
+        })
+    }
+
+    fn classify_repo_attempt_error(
+        &self,
+        repo_uid: &str,
+        before: &RepoDeletionSnapshot,
+        primary: StoreError,
+        known_changed: bool,
+        mutation_warnings: Vec<MutationFailure>,
+        faults: RepoCascadeFaults,
+    ) -> Result<MutationOutcome<DeleteRepoCascadeOutcome>, StoreError> {
+        let after = match self.repo_deletion_probe(repo_uid, faults) {
+            Ok(after) => after,
+            Err(probe) => {
+                return Ok(MutationOutcome {
+                    disposition: MutationDisposition::Ambiguous,
+                    confirmed_changed: known_changed,
+                    value: DeleteRepoCascadeOutcome {
+                        repo_uid: repo_uid.to_string(),
+                        files_deleted: usize::from(known_changed) * before.file_uids.len(),
+                        symbols_deleted: usize::from(known_changed) * before.symbol_uids.len(),
+                    },
+                    primary_failure: Some(MutationFailure::new(
+                        "repo-delete",
+                        format!("{primary}; exact Repo liveness probe failed: {probe}"),
+                    )),
+                    mutation_warnings,
+                });
+            }
+        };
+        if after == *before && !known_changed {
+            return Err(StoreError::Query(format!(
+                "{primary}; exact Repo snapshot remained live"
+            )));
+        }
+        if !after.is_subset_of(before) {
+            return Ok(MutationOutcome {
+                disposition: MutationDisposition::Ambiguous,
+                confirmed_changed: known_changed,
+                value: Self::repo_delete_value(repo_uid, before, &after),
+                primary_failure: Some(MutationFailure::new(
+                    "repo-delete",
+                    format!("{primary}; exact Repo probe observed unexpected rows"),
+                )),
+                mutation_warnings,
+            });
+        }
+        if after.is_empty() {
+            let mut mutation_warnings = mutation_warnings;
+            mutation_warnings.push(MutationFailure::new("repo-delete", primary));
+            return Ok(MutationOutcome {
+                disposition: MutationDisposition::CommittedComplete,
+                confirmed_changed: true,
+                value: Self::repo_delete_value(repo_uid, before, &after),
+                primary_failure: None,
+                mutation_warnings,
+            });
+        }
+        Ok(MutationOutcome {
+            disposition: MutationDisposition::CommittedPartial,
+            confirmed_changed: true,
+            value: Self::repo_delete_value(repo_uid, before, &after),
+            primary_failure: Some(MutationFailure::new("repo-delete", primary)),
+            mutation_warnings,
+        })
+    }
+
+    fn repo_deletion_probe(
+        &self,
+        repo_uid: &str,
+        faults: RepoCascadeFaults,
+    ) -> Result<RepoDeletionSnapshot, StoreError> {
+        if faults.probe {
+            Err(StoreError::Query(
+                "injected Repo liveness probe failure".to_string(),
+            ))
+        } else {
+            self.repo_deletion_snapshot(repo_uid)
+        }
+    }
+
+    fn repo_deletion_snapshot(&self, repo_uid: &str) -> Result<RepoDeletionSnapshot, StoreError> {
+        let conn = self.conn()?;
+        Ok(RepoDeletionSnapshot {
+            repo_uids: Self::exact_uids_on(
+                &conn,
+                "MATCH (r:Repo) WHERE r.uid = $scope RETURN r.uid",
+                "scope",
+                repo_uid,
+                "Repo",
+            )?,
+            file_uids: Self::exact_uids_on(
+                &conn,
+                "MATCH (f:File) WHERE f.repo_uid = $scope RETURN f.uid",
+                "scope",
+                repo_uid,
+                "File",
+            )?,
+            symbol_uids: Self::exact_uids_on(
+                &conn,
+                "MATCH (s:Symbol) WHERE s.repo_uid = $scope RETURN s.uid",
+                "scope",
+                repo_uid,
+                "Symbol",
+            )?,
+            service_uids: Self::exact_uids_on(
+                &conn,
+                "MATCH (s:Service) WHERE s.repo_uid = $scope RETURN s.uid",
+                "scope",
+                repo_uid,
+                "Service",
+            )?,
+            contract_uids: Self::exact_uids_on(
+                &conn,
+                "MATCH (c:Contract) WHERE c.repo_uid = $scope RETURN c.uid",
+                "scope",
+                repo_uid,
+                "Contract",
+            )?,
+        })
+    }
+
+    fn repo_delete_value(
+        repo_uid: &str,
+        before: &RepoDeletionSnapshot,
+        after: &RepoDeletionSnapshot,
+    ) -> DeleteRepoCascadeOutcome {
+        DeleteRepoCascadeOutcome {
+            repo_uid: repo_uid.to_string(),
+            files_deleted: before.file_uids.difference(&after.file_uids).count(),
+            symbols_deleted: before.symbol_uids.difference(&after.symbol_uids).count(),
+        }
+    }
+
+    fn clear_repo_derived_nodes_strict(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (s:Service {repo_uid: $uid}) DETACH DELETE s",
+            vec![("uid", lbug::Value::String(repo_uid.to_string()))],
+        )?;
+        exec_params(
+            &conn,
+            "MATCH (c:Contract {repo_uid: $uid}) DETACH DELETE c",
+            vec![("uid", lbug::Value::String(repo_uid.to_string()))],
+        )
+    }
+
     pub fn bulk_delete_repo_files_and_symbols(
         &self,
         repo_uid: &str,
@@ -3002,53 +3752,292 @@ impl GraphStore {
     /// DB. Useful for recovering from a misconfigured `instance merge`
     /// that left an orphan instance ID behind.
     pub fn purge_instance(&self, id: &str) -> Result<PurgeInstanceResult, StoreError> {
+        self.purge_instance_with_outcome(id)
+            .map(|outcome| outcome.value)
+    }
+
+    /// Purge one instance while retaining every confirmed count if a later
+    /// stage fails. Discovery, including exact orphan UIDs, completes before
+    /// the first destructive statement.
+    pub fn purge_instance_with_outcome(
+        &self,
+        id: &str,
+    ) -> Result<MutationOutcome<PurgeInstanceResult>, StoreError> {
+        self.purge_instance_with_outcome_inner(id, PurgeInstanceFaults::default())
+    }
+
+    #[cfg(test)]
+    fn purge_instance_with_outcome_and_faults(
+        &self,
+        id: &str,
+        faults: PurgeInstanceFaults,
+    ) -> Result<MutationOutcome<PurgeInstanceResult>, StoreError> {
+        self.purge_instance_with_outcome_inner(id, faults)
+    }
+
+    fn purge_instance_with_outcome_inner(
+        &self,
+        id: &str,
+        faults: PurgeInstanceFaults,
+    ) -> Result<MutationOutcome<PurgeInstanceResult>, StoreError> {
+        let plan = self.plan_purge_instance(id)?;
+        let planned_orphans = plan
+            .orphan_targets
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         let mut result = PurgeInstanceResult {
-            code_repo_uids: self.list_purge_code_repo_uids(id)?,
+            code_repo_uids: plan.code_repo_uids,
             ..PurgeInstanceResult::default()
         };
+        let mut confirmed_changed = false;
+        let mut mutation_warnings = Vec::new();
 
-        // Repos owned by this instance — cascade delete every File,
-        // Symbol, Service, and Contract that hangs off each one before
-        // dropping the Repo node itself.
-        let repos = self.list_repos(Some(id))?;
-        for r in &repos {
-            let (files, syms) = self.bulk_delete_repo_files_and_symbols(&r.uid)?;
-            self.clear_repo_derived_nodes(&r.uid)?;
-            self.delete_repo_node(&r.uid)?;
-            result.files += files;
-            result.symbols += syms;
-        }
-        result.repos = repos.len();
-
-        // Vaults owned by this instance — cascade Note/Heading/Section.
-        let vaults = self.list_vaults(Some(id))?;
-        for v in &vaults {
-            let notes = self.delete_vault_cascade(&v.uid)?;
-            result.notes += notes;
-        }
-        result.vaults = vaults.len();
-
-        // Projects owned by this instance — single DETACH DELETE each.
-        let projects = self.list_projects()?;
-        for p in &projects {
-            if p.instance_id == id {
-                let conn = self.conn()?;
-                exec_params(
-                    &conn,
-                    "MATCH (p:Project {uid: $uid}) DETACH DELETE p",
-                    vec![("uid", lbug::Value::String(p.uid.clone()))],
-                )?;
-                result.projects += 1;
+        for (index, repo) in plan.repos.iter().enumerate() {
+            if faults.before_repo == Some(index) {
+                return Self::purge_stage_error(
+                    result,
+                    confirmed_changed,
+                    mutation_warnings,
+                    "purge-repo",
+                    StoreError::Query(format!("injected failure before purge Repo {}", repo.uid)),
+                );
+            }
+            let child = match self.delete_repo_cascade_with_outcome(&repo.uid) {
+                Ok(child) => child,
+                Err(error) => {
+                    return Self::purge_stage_error(
+                        result,
+                        confirmed_changed,
+                        mutation_warnings,
+                        "purge-repo",
+                        error,
+                    );
+                }
+            };
+            mutation_warnings.extend(child.mutation_warnings);
+            if child.confirmed_changed {
+                confirmed_changed = true;
+                result.files += child.value.files_deleted;
+                result.symbols += child.value.symbols_deleted;
+            }
+            match child.disposition {
+                MutationDisposition::ConfirmedNoChange => {}
+                MutationDisposition::CommittedComplete => result.repos += 1,
+                MutationDisposition::CommittedPartial | MutationDisposition::Ambiguous => {
+                    return Ok(MutationOutcome {
+                        disposition: child.disposition,
+                        confirmed_changed,
+                        value: result,
+                        primary_failure: child.primary_failure,
+                        mutation_warnings,
+                    });
+                }
             }
         }
 
-        // Orphan sweep: a partial `instance merge` can drop the Repo or
-        // Vault node while leaving its child Symbol/File/Service/Note
-        // rows behind. Those children still encode the source instance
-        // in their UID prefix, so we can find and drop them even after
-        // the parent is gone. Order matters only for telemetry — every
-        // statement is `DETACH DELETE` so incident edges are cleaned.
-        for (label, prefix, is_code) in [
+        for (index, vault) in plan.vaults.iter().enumerate() {
+            if faults.before_vault == Some(index) {
+                return Self::purge_stage_error(
+                    result,
+                    confirmed_changed,
+                    mutation_warnings,
+                    "purge-vault",
+                    StoreError::Query(format!("injected failure before purge Vault {}", vault.uid)),
+                );
+            }
+            let child = match self.delete_vault_cascade_with_classified_outcome(&vault.uid) {
+                Ok(child) => child,
+                Err(error) => {
+                    return Self::purge_stage_error(
+                        result,
+                        confirmed_changed,
+                        mutation_warnings,
+                        "purge-vault",
+                        error,
+                    );
+                }
+            };
+            mutation_warnings.extend(child.mutation_warnings);
+            if child.confirmed_changed {
+                confirmed_changed = true;
+                result.notes += child.value.notes_deleted;
+            }
+            match child.disposition {
+                MutationDisposition::ConfirmedNoChange => {}
+                MutationDisposition::CommittedComplete => result.vaults += 1,
+                MutationDisposition::CommittedPartial | MutationDisposition::Ambiguous => {
+                    return Ok(MutationOutcome {
+                        disposition: child.disposition,
+                        confirmed_changed,
+                        value: result,
+                        primary_failure: child.primary_failure,
+                        mutation_warnings,
+                    });
+                }
+            }
+        }
+
+        for project in &plan.projects {
+            let child = match self.delete_project_cascade_classified(&project.uid) {
+                Ok(child) => child,
+                Err(error) => {
+                    return Self::purge_stage_error(
+                        result,
+                        confirmed_changed,
+                        mutation_warnings,
+                        "purge-project",
+                        error,
+                    );
+                }
+            };
+            mutation_warnings.extend(child.mutation_warnings);
+            if child.confirmed_changed {
+                confirmed_changed = true;
+            }
+            match child.disposition {
+                MutationDisposition::ConfirmedNoChange => {}
+                MutationDisposition::CommittedComplete => result.projects += 1,
+                MutationDisposition::CommittedPartial | MutationDisposition::Ambiguous => {
+                    return Ok(MutationOutcome {
+                        disposition: child.disposition,
+                        confirmed_changed,
+                        value: result,
+                        primary_failure: child.primary_failure,
+                        mutation_warnings,
+                    });
+                }
+            }
+        }
+
+        for (index, target) in plan.orphan_targets.iter().enumerate() {
+            let child = match self.delete_exact_purge_orphan(
+                target,
+                faults.orphan_commit_after == Some(index),
+                faults.orphan_probe,
+            ) {
+                Ok(child) => child,
+                Err(error) => {
+                    return Self::purge_stage_error(
+                        result,
+                        confirmed_changed,
+                        mutation_warnings,
+                        "purge-orphan",
+                        error,
+                    );
+                }
+            };
+            mutation_warnings.extend(child.mutation_warnings);
+            if child.confirmed_changed {
+                confirmed_changed = true;
+                result.orphans_swept += child.value;
+                if target.code {
+                    result.code_orphans_swept += child.value;
+                }
+            }
+            match child.disposition {
+                MutationDisposition::ConfirmedNoChange | MutationDisposition::CommittedComplete => {
+                }
+                MutationDisposition::CommittedPartial | MutationDisposition::Ambiguous => {
+                    return Ok(MutationOutcome {
+                        disposition: child.disposition,
+                        confirmed_changed,
+                        value: result,
+                        primary_failure: child.primary_failure,
+                        mutation_warnings,
+                    });
+                }
+            }
+        }
+
+        let final_orphans = match self.list_exact_purge_orphans(id) {
+            Ok(targets) => targets
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            Err(error) => {
+                return Ok(MutationOutcome {
+                    disposition: MutationDisposition::Ambiguous,
+                    confirmed_changed,
+                    value: result,
+                    primary_failure: Some(MutationFailure::new(
+                        "purge-final-probe",
+                        format!("exact purge final probe failed: {error}"),
+                    )),
+                    mutation_warnings,
+                });
+            }
+        };
+        if !final_orphans.is_subset(&planned_orphans) || !final_orphans.is_empty() {
+            return Ok(MutationOutcome {
+                disposition: MutationDisposition::Ambiguous,
+                confirmed_changed,
+                value: result,
+                primary_failure: Some(MutationFailure::new(
+                    "purge-final-probe",
+                    "exact purge final probe observed remaining or unexpected targets",
+                )),
+                mutation_warnings,
+            });
+        }
+
+        Ok(MutationOutcome {
+            disposition: if confirmed_changed {
+                MutationDisposition::CommittedComplete
+            } else {
+                MutationDisposition::ConfirmedNoChange
+            },
+            confirmed_changed,
+            value: result,
+            primary_failure: None,
+            mutation_warnings,
+        })
+    }
+
+    fn purge_stage_error(
+        value: PurgeInstanceResult,
+        confirmed_changed: bool,
+        mutation_warnings: Vec<MutationFailure>,
+        stage: &'static str,
+        error: StoreError,
+    ) -> Result<MutationOutcome<PurgeInstanceResult>, StoreError> {
+        if !confirmed_changed {
+            return Err(error);
+        }
+        Ok(MutationOutcome {
+            disposition: MutationDisposition::CommittedPartial,
+            confirmed_changed: true,
+            value,
+            primary_failure: Some(MutationFailure::new(stage, error)),
+            mutation_warnings,
+        })
+    }
+
+    fn plan_purge_instance(&self, id: &str) -> Result<PurgeInstancePlan, StoreError> {
+        let code_repo_uids = self.list_purge_code_repo_uids(id)?;
+        let mut repos = self.list_repos(Some(id))?;
+        let mut vaults = self.list_vaults(Some(id))?;
+        let mut projects = self
+            .list_projects()?
+            .into_iter()
+            .filter(|project| project.instance_id == id)
+            .collect::<Vec<_>>();
+        let orphan_targets = self.list_exact_purge_orphans(id)?;
+        repos.sort_by(|left, right| left.uid.cmp(&right.uid));
+        vaults.sort_by(|left, right| left.uid.cmp(&right.uid));
+        projects.sort_by(|left, right| left.uid.cmp(&right.uid));
+        Ok(PurgeInstancePlan {
+            repos,
+            vaults,
+            projects,
+            orphan_targets,
+            code_repo_uids,
+        })
+    }
+
+    fn list_exact_purge_orphans(&self, id: &str) -> Result<Vec<PurgeOrphanTarget>, StoreError> {
+        let conn = self.conn()?;
+        let mut targets = Vec::new();
+        for (label, prefix, code) in [
             ("Symbol", format!("sym:repo:{id}:"), true),
             ("File", format!("file:repo:{id}:"), true),
             ("Service", format!("svc:repo:{id}:"), true),
@@ -3056,82 +4045,187 @@ impl GraphStore {
             ("Heading", format!("head:note:vlt:{id}:"), false),
             ("Section", format!("sec:note:vlt:{id}:"), false),
             ("Tag", format!("tag:vlt:{id}:"), false),
-            // Defensive: also catch Repo/Vault/Project rows that the
-            // registry-walk above missed (e.g. stale rows whose
-            // instance_id column was scrambled but whose UID is intact).
             ("Repo", format!("repo:{id}:"), true),
             ("Vault", format!("vlt:{id}:"), false),
             ("Project", format!("proj:{id}:"), false),
         ] {
-            let swept = self.sweep_orphan_nodes(label, &prefix)?;
-            result.orphans_swept += swept;
-            if is_code {
-                result.code_orphans_swept += swept;
+            let query = format!("MATCH (n:{label}) WHERE n.uid STARTS WITH $p RETURN n.uid");
+            let mut statement = conn.prepare(&query).map_err(|error| {
+                StoreError::Query(format!("prepare exact purge {label} plan: {error}"))
+            })?;
+            let rows = conn
+                .execute(&mut statement, vec![("p", lbug::Value::String(prefix))])
+                .map_err(|error| {
+                    StoreError::Query(format!("execute exact purge {label} plan: {error}"))
+                })?;
+            for row in rows {
+                let Some(lbug::Value::String(uid)) = row.first() else {
+                    return Err(StoreError::Query(format!(
+                        "malformed exact purge {label} identity: {:?}",
+                        row.first()
+                    )));
+                };
+                targets.push(PurgeOrphanTarget {
+                    label,
+                    uid: uid.clone(),
+                    code,
+                });
             }
         }
 
-        // Contract UIDs describe API identity and do not embed the repo UID,
-        // so sweep code-orphan contracts by their repo_uid property instead.
-        let contracts = self.sweep_orphan_contracts(&format!("repo:{id}:"))?;
-        result.orphans_swept += contracts;
-        result.code_orphans_swept += contracts;
-
-        Ok(result)
+        let repo_prefix = format!("repo:{id}:");
+        if let Ok(mut statement) =
+            conn.prepare("MATCH (n:Contract) WHERE n.repo_uid STARTS WITH $p RETURN n.uid")
+        {
+            let rows = conn
+                .execute(
+                    &mut statement,
+                    vec![("p", lbug::Value::String(repo_prefix))],
+                )
+                .map_err(|error| {
+                    StoreError::Query(format!("execute exact purge Contract plan: {error}"))
+                })?;
+            for row in rows {
+                let Some(lbug::Value::String(uid)) = row.first() else {
+                    return Err(StoreError::Query(format!(
+                        "malformed exact purge Contract identity: {:?}",
+                        row.first()
+                    )));
+                };
+                targets.push(PurgeOrphanTarget {
+                    label: "Contract",
+                    uid: uid.clone(),
+                    code: true,
+                });
+            }
+        }
+        targets.sort();
+        let original_len = targets.len();
+        targets.dedup();
+        if targets.len() != original_len {
+            return Err(StoreError::Query(
+                "duplicate identity in exact purge plan".to_string(),
+            ));
+        }
+        Ok(targets)
     }
 
-    /// Count and DETACH DELETE every node of `label` whose `uid` starts
-    /// with `prefix`. Returns the number of rows removed. Idempotent.
-    /// Used by [`purge_instance`] to clean up orphans left by a
-    /// partial `instance merge` that already dropped the parent
-    /// Repo/Vault node.
-    fn sweep_orphan_nodes(&self, label: &str, prefix: &str) -> Result<usize, StoreError> {
-        let conn = self.conn()?;
-        let query =
-            format!("MATCH (n:{label}) WHERE n.uid STARTS WITH $p DETACH DELETE n RETURN count(n)");
-        let mut stmt = conn
-            .prepare(&query)
-            .map_err(|e| StoreError::Query(format!("prepare sweep {label} orphans: {e}")))?;
-        let rows = conn
-            .execute(
-                &mut stmt,
-                vec![("p", lbug::Value::String(prefix.to_string()))],
-            )
-            .map_err(|e| StoreError::Query(format!("sweep {label} orphans: {e}")))?;
-        let count = rows
-            .filter_map(|row| {
-                row.first().and_then(|v| match v {
-                    lbug::Value::Int64(n) => Some(*n as usize),
-                    _ => None,
-                })
-            })
-            .next()
-            .unwrap_or(0);
-        Ok(count)
+    fn delete_exact_purge_orphan(
+        &self,
+        target: &PurgeOrphanTarget,
+        commit_after: bool,
+        probe_fault: bool,
+    ) -> Result<MutationOutcome<usize>, StoreError> {
+        if !self.purge_orphan_target_exists(target, false)? {
+            return Ok(MutationOutcome {
+                disposition: MutationDisposition::ConfirmedNoChange,
+                confirmed_changed: false,
+                value: 0,
+                primary_failure: None,
+                mutation_warnings: Vec::new(),
+            });
+        }
+
+        let transaction = self.begin_transaction()?;
+        let query = format!("MATCH (n:{} {{uid: $uid}}) DETACH DELETE n", target.label);
+        if let Err(primary) = exec_params(
+            &transaction,
+            &query,
+            vec![("uid", lbug::Value::String(target.uid.clone()))],
+        ) {
+            return match self.rollback_transaction(&transaction) {
+                Ok(()) => Err(primary),
+                Err(rollback) => self.classify_exact_purge_orphan_error(
+                    target,
+                    primary,
+                    Some(rollback),
+                    probe_fault,
+                ),
+            };
+        }
+
+        let commit = self.commit_transaction(&transaction).and_then(|()| {
+            if commit_after {
+                Err(StoreError::Query(format!(
+                    "injected commit acknowledgement failure for purge {} {}",
+                    target.label, target.uid
+                )))
+            } else {
+                Ok(())
+            }
+        });
+        match commit {
+            Ok(()) => Ok(MutationOutcome {
+                disposition: MutationDisposition::CommittedComplete,
+                confirmed_changed: true,
+                value: 1,
+                primary_failure: None,
+                mutation_warnings: Vec::new(),
+            }),
+            Err(primary) => {
+                self.classify_exact_purge_orphan_error(target, primary, None, probe_fault)
+            }
+        }
     }
 
-    fn sweep_orphan_contracts(&self, repo_prefix: &str) -> Result<usize, StoreError> {
-        let conn = self.conn()?;
-        let Ok(mut stmt) = conn.prepare(
-            "MATCH (n:Contract) WHERE n.repo_uid STARTS WITH $p DETACH DELETE n RETURN count(n)",
-        ) else {
-            // Contract tables were introduced after the initial schema.
-            return Ok(0);
-        };
-        let rows = conn
-            .execute(
-                &mut stmt,
-                vec![("p", lbug::Value::String(repo_prefix.to_string()))],
-            )
-            .map_err(|e| StoreError::Query(format!("sweep Contract orphans: {e}")))?;
-        Ok(rows
-            .filter_map(|row| {
-                row.first().and_then(|v| match v {
-                    lbug::Value::Int64(n) => Some(*n as usize),
-                    _ => None,
-                })
-            })
-            .next()
-            .unwrap_or(0))
+    fn classify_exact_purge_orphan_error(
+        &self,
+        target: &PurgeOrphanTarget,
+        primary: StoreError,
+        rollback: Option<StoreError>,
+        probe_fault: bool,
+    ) -> Result<MutationOutcome<usize>, StoreError> {
+        match self.purge_orphan_target_exists(target, probe_fault) {
+            Ok(true) if rollback.is_none() => Err(primary),
+            Ok(true) => Ok(MutationOutcome {
+                disposition: MutationDisposition::Ambiguous,
+                confirmed_changed: false,
+                value: 0,
+                primary_failure: Some(MutationFailure::new(
+                    "purge-orphan",
+                    format!(
+                        "{primary}; rollback failed: {}",
+                        rollback.expect("checked above")
+                    ),
+                )),
+                mutation_warnings: Vec::new(),
+            }),
+            Ok(false) => Ok(MutationOutcome {
+                disposition: MutationDisposition::CommittedComplete,
+                confirmed_changed: true,
+                value: 1,
+                primary_failure: None,
+                mutation_warnings: vec![MutationFailure::new("purge-orphan", primary)],
+            }),
+            Err(probe) => Ok(MutationOutcome {
+                disposition: MutationDisposition::Ambiguous,
+                confirmed_changed: false,
+                value: 0,
+                primary_failure: Some(MutationFailure::new(
+                    "purge-orphan",
+                    format!(
+                        "{primary}; exact orphan liveness probe failed: {probe}{}",
+                        rollback
+                            .map(|error| format!("; rollback failed: {error}"))
+                            .unwrap_or_default()
+                    ),
+                )),
+                mutation_warnings: Vec::new(),
+            }),
+        }
+    }
+
+    fn purge_orphan_target_exists(
+        &self,
+        target: &PurgeOrphanTarget,
+        fault: bool,
+    ) -> Result<bool, StoreError> {
+        if fault {
+            return Err(StoreError::Query(
+                "injected exact purge orphan probe failure".to_string(),
+            ));
+        }
+        self.instance_merge_node_exists(target.label, &target.uid)
     }
 
     /// Return every repo UID whose registry row or code children would be
@@ -3377,6 +4471,127 @@ impl GraphStore {
         project_uid: &str,
     ) -> Result<DeleteProjectCascadeOutcome, DeleteProjectCascadeError> {
         self.delete_project_cascade_with_queries(project_uid, ProjectCascadeQueries::default())
+    }
+
+    /// Delete one Project and resolve every legacy transaction disposition to
+    /// the common mutation outcome contract. Ambiguous transaction failures
+    /// are probed through [`Self::project_exists`], which opens a connection
+    /// distinct from the failed transaction connection.
+    pub fn delete_project_cascade_classified(
+        &self,
+        project_uid: &str,
+    ) -> Result<MutationOutcome<DeleteProjectCascadeOutcome>, StoreError> {
+        let result = self.delete_project_cascade_with_outcome(project_uid);
+        Self::classify_project_cascade_result_with_liveness(result, || {
+            self.project_exists(project_uid)
+        })
+    }
+
+    fn classify_project_cascade_result_with_liveness<F>(
+        result: Result<DeleteProjectCascadeOutcome, DeleteProjectCascadeError>,
+        liveness: F,
+    ) -> Result<MutationOutcome<DeleteProjectCascadeOutcome>, StoreError>
+    where
+        F: FnOnce() -> Result<bool, StoreError>,
+    {
+        match result {
+            Ok(value) => match value.disposition {
+                ProjectMutationDisposition::ConfirmedUnchanged
+                | ProjectMutationDisposition::ConfirmedRolledBack => Ok(MutationOutcome {
+                    disposition: MutationDisposition::ConfirmedNoChange,
+                    confirmed_changed: false,
+                    value,
+                    primary_failure: None,
+                    mutation_warnings: Vec::new(),
+                }),
+                ProjectMutationDisposition::Changed => Ok(MutationOutcome {
+                    disposition: MutationDisposition::CommittedComplete,
+                    confirmed_changed: true,
+                    value,
+                    primary_failure: None,
+                    mutation_warnings: Vec::new(),
+                }),
+                ProjectMutationDisposition::Ambiguous => {
+                    let synthetic =
+                        "Project cascade returned an ambiguous result without an error".to_string();
+                    match liveness() {
+                        Ok(false) => Ok(MutationOutcome {
+                            disposition: MutationDisposition::CommittedComplete,
+                            confirmed_changed: true,
+                            value,
+                            primary_failure: None,
+                            mutation_warnings: vec![MutationFailure::new(
+                                "project-delete",
+                                synthetic,
+                            )],
+                        }),
+                        Ok(true) => Ok(MutationOutcome {
+                            disposition: MutationDisposition::ConfirmedNoChange,
+                            confirmed_changed: false,
+                            value,
+                            primary_failure: None,
+                            mutation_warnings: Vec::new(),
+                        }),
+                        Err(probe) => Ok(MutationOutcome {
+                            disposition: MutationDisposition::Ambiguous,
+                            confirmed_changed: false,
+                            value,
+                            primary_failure: Some(MutationFailure::new(
+                                "project-delete",
+                                format!("{synthetic}; Project liveness probe failed: {probe}"),
+                            )),
+                            mutation_warnings: Vec::new(),
+                        }),
+                    }
+                }
+            },
+            Err(error) => {
+                let value = DeleteProjectCascadeOutcome {
+                    project_uid: error.project_uid.clone(),
+                    project_name: error.project_name.clone(),
+                    disposition: error.disposition,
+                };
+                let message = error.to_string();
+                match error.disposition {
+                    ProjectMutationDisposition::ConfirmedUnchanged
+                    | ProjectMutationDisposition::ConfirmedRolledBack => {
+                        Err(StoreError::Query(message))
+                    }
+                    ProjectMutationDisposition::Changed => Ok(MutationOutcome {
+                        disposition: MutationDisposition::CommittedComplete,
+                        confirmed_changed: true,
+                        value,
+                        primary_failure: None,
+                        mutation_warnings: vec![MutationFailure::new("project-delete", message)],
+                    }),
+                    ProjectMutationDisposition::Ambiguous => match liveness() {
+                        Ok(false) => Ok(MutationOutcome {
+                            disposition: MutationDisposition::CommittedComplete,
+                            confirmed_changed: true,
+                            value,
+                            primary_failure: None,
+                            mutation_warnings: vec![MutationFailure::new(
+                                "project-delete",
+                                message,
+                            )],
+                        }),
+                        Ok(true) => Err(StoreError::Query(format!(
+                            "{message}; exact Project UID remained live"
+                        ))),
+                        Err(probe) => Ok(MutationOutcome {
+                            disposition: MutationDisposition::Ambiguous,
+                            confirmed_changed: false,
+                            value,
+                            primary_failure: Some(MutationFailure::new(
+                                "project-delete",
+                                format!("{message}; Project liveness probe failed: {probe}"),
+                            )),
+                            mutation_warnings: Vec::new(),
+                        }),
+                    },
+                }
+            }
+        }
     }
 
     fn delete_project_cascade_with_queries(
@@ -4252,114 +5467,594 @@ impl GraphStore {
     ///
     /// Uses [`reparent_vault`] to preserve notes in the winning vault.
     pub fn merge_instance_ids(&self, from: &str, to: &str) -> Result<MergeResult, StoreError> {
+        self.merge_instance_ids_with_outcome(from, to)
+            .map(|outcome| outcome.value)
+    }
+
+    /// Merge two instance IDs and classify failures against the exact remap
+    /// plan captured before the first graph mutation.
+    pub fn merge_instance_ids_with_outcome(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<MutationOutcome<MergeResult>, StoreError> {
         if from == to {
             return Err(StoreError::Query(format!(
                 "source and target instance IDs must differ (both were {from:?})"
             )));
         }
+        let plan = self.plan_instance_uid_remaps(from, to)?;
+        self.merge_instance_ids_with_plan_inner(from, to, &plan, MergeInstanceFaults::default())
+    }
 
-        let project_merges = self.plan_instance_project_merges(from, to)?;
-        let mut vault_count = 0usize;
-        let mut repo_count = 0usize;
-        let mut project_count = 0usize;
-        let mut discarded: Vec<DiscardedVault> = Vec::new();
-        let mut repos_moved: Vec<String> = Vec::new();
-        let mut repo_uids_removed: Vec<String> = Vec::new();
+    /// Classified merge using the caller's durable exact remap plan. This is
+    /// the recovery-safe entry point for journal-backed daemon operations.
+    pub fn merge_instance_ids_with_plan_outcome(
+        &self,
+        from: &str,
+        to: &str,
+        expected_plan: &[InstanceUidRemap],
+    ) -> Result<MutationOutcome<MergeResult>, StoreError> {
+        self.merge_instance_ids_with_plan_inner(
+            from,
+            to,
+            expected_plan,
+            MergeInstanceFaults::default(),
+        )
+    }
 
-        // Build a map of target-instance vaults keyed by root_path so we
-        // can detect collisions and compare child counts.
-        let target_vaults: std::collections::HashMap<String, Vault> = self
-            .list_vaults(None)?
+    #[cfg(test)]
+    fn merge_instance_ids_with_plan_and_faults(
+        &self,
+        from: &str,
+        to: &str,
+        expected_plan: &[InstanceUidRemap],
+        faults: MergeInstanceFaults,
+    ) -> Result<MutationOutcome<MergeResult>, StoreError> {
+        self.merge_instance_ids_with_plan_inner(from, to, expected_plan, faults)
+    }
+
+    fn merge_instance_ids_with_plan_inner(
+        &self,
+        from: &str,
+        to: &str,
+        expected_plan: &[InstanceUidRemap],
+        faults: MergeInstanceFaults,
+    ) -> Result<MutationOutcome<MergeResult>, StoreError> {
+        if from == to {
+            return Err(StoreError::Query(format!(
+                "source and target instance IDs must differ (both were {from:?})"
+            )));
+        }
+        if expected_plan.is_empty() {
+            if self.plan_instance_uid_remaps(from, to)?.is_empty() {
+                return Ok(MutationOutcome {
+                    disposition: MutationDisposition::ConfirmedNoChange,
+                    confirmed_changed: false,
+                    value: MergeResult::default(),
+                    primary_failure: None,
+                    mutation_warnings: Vec::new(),
+                });
+            }
+            return Err(StoreError::Query(
+                "durable instance merge plan is empty but source rows remain".to_string(),
+            ));
+        }
+
+        let initial_state = match self.verify_instance_uid_remap_plan_state(from, to, expected_plan)
+        {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(MutationOutcome {
+                    disposition: MutationDisposition::Ambiguous,
+                    confirmed_changed: false,
+                    value: MergeResult::default(),
+                    primary_failure: Some(MutationFailure::new(
+                        "merge-preflight",
+                        format!("exact merge plan verification failed: {error}"),
+                    )),
+                    mutation_warnings: Vec::new(),
+                });
+            }
+        };
+        if initial_state == InstanceUidRemapPlanState::Applied {
+            return Ok(MutationOutcome {
+                disposition: MutationDisposition::CommittedComplete,
+                confirmed_changed: true,
+                value: MergeResult::default(),
+                primary_failure: None,
+                mutation_warnings: Vec::new(),
+            });
+        }
+        let mut confirmed_changed = initial_state == InstanceUidRemapPlanState::PartiallyApplied;
+        let mut value = MergeResult::default();
+        let mut mutation_warnings = Vec::new();
+
+        // Complete all graph discovery before the first mutation.
+        let project_merges = match self.plan_instance_project_merges(from, to) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return self.classify_merge_error(
+                    from,
+                    to,
+                    expected_plan,
+                    value,
+                    confirmed_changed,
+                    mutation_warnings,
+                    "merge-preflight",
+                    error,
+                    faults.verify,
+                );
+            }
+        };
+        let all_vaults = match self.list_vaults(None) {
+            Ok(vaults) => vaults,
+            Err(error) => {
+                return self.classify_merge_error(
+                    from,
+                    to,
+                    expected_plan,
+                    value,
+                    confirmed_changed,
+                    mutation_warnings,
+                    "merge-preflight",
+                    error,
+                    faults.verify,
+                );
+            }
+        };
+        let mut source_vaults = all_vaults
+            .iter()
+            .filter(|vault| vault.instance_id == from)
+            .cloned()
+            .collect::<Vec<_>>();
+        let target_vaults = all_vaults
             .into_iter()
-            .filter(|v| v.instance_id == to)
-            .map(|v| (v.root_path.clone(), v))
-            .collect();
+            .filter(|vault| vault.instance_id == to)
+            .map(|vault| (vault.root_path.clone(), vault))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut source_repos = match self.list_repos(Some(from)) {
+            Ok(repos) => repos,
+            Err(error) => {
+                return self.classify_merge_error(
+                    from,
+                    to,
+                    expected_plan,
+                    value,
+                    confirmed_changed,
+                    mutation_warnings,
+                    "merge-preflight",
+                    error,
+                    faults.verify,
+                );
+            }
+        };
+        source_vaults.sort_by(|left, right| left.uid.cmp(&right.uid));
+        source_repos.sort_by(|left, right| left.uid.cmp(&right.uid));
 
-        for v in self.list_vaults(None)? {
-            if v.instance_id == from {
-                let root_path = v.root_path.clone();
-                let new_uid = vault_uid(to, &root_path);
+        if faults.before_graph {
+            return self.classify_merge_error(
+                from,
+                to,
+                expected_plan,
+                value,
+                confirmed_changed,
+                mutation_warnings,
+                "merge-graph",
+                StoreError::Query("injected failure before graph merge".to_string()),
+                faults.verify,
+            );
+        }
 
-                if let Some(target) = target_vaults.get(&root_path) {
-                    // Collision: two vaults with the same root_path in
-                    // different instances. Keep whichever has more notes.
-                    let source_count = self.vault_note_count(&v.uid)?;
-                    let target_count = self.vault_note_count(&target.uid)?;
-
-                    if source_count > target_count {
-                        // Source wins — delete target (intentional discard),
-                        // then reparent source to preserve its notes.
-                        let target_dropped = self.delete_vault_cascade(&target.uid)?;
-                        self.reparent_vault(&v.uid, &new_uid, to)?;
-                        if target_dropped > 0 {
-                            discarded.push(DiscardedVault {
-                                root_path,
-                                notes_discarded: target_dropped,
-                            });
-                        }
-                    } else {
-                        // Target wins — drop source (intentional discard).
-                        let source_dropped = self.delete_vault_cascade(&v.uid)?;
-                        if source_dropped > 0 {
-                            discarded.push(DiscardedVault {
-                                root_path,
-                                notes_discarded: source_dropped,
-                            });
-                        }
+        for vault in source_vaults {
+            let root_path = vault.root_path.clone();
+            let new_uid = vault_uid(to, &root_path);
+            if let Some(target) = target_vaults.get(&root_path) {
+                let source_count = match self.vault_note_count(&vault.uid) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        return self.classify_merge_error(
+                            from,
+                            to,
+                            expected_plan,
+                            value,
+                            confirmed_changed,
+                            mutation_warnings,
+                            "merge-vault",
+                            error,
+                            faults.verify,
+                        );
+                    }
+                };
+                let target_count = match self.vault_note_count(&target.uid) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        return self.classify_merge_error(
+                            from,
+                            to,
+                            expected_plan,
+                            value,
+                            confirmed_changed,
+                            mutation_warnings,
+                            "merge-vault",
+                            error,
+                            faults.verify,
+                        );
+                    }
+                };
+                if source_count > target_count {
+                    let deletion =
+                        match self.delete_vault_cascade_with_classified_outcome(&target.uid) {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                return self.classify_merge_error(
+                                    from,
+                                    to,
+                                    expected_plan,
+                                    value,
+                                    confirmed_changed,
+                                    mutation_warnings,
+                                    "merge-vault",
+                                    error,
+                                    faults.verify,
+                                );
+                            }
+                        };
+                    mutation_warnings.extend(deletion.mutation_warnings);
+                    if deletion.disposition == MutationDisposition::Ambiguous {
+                        return Ok(MutationOutcome {
+                            disposition: MutationDisposition::Ambiguous,
+                            confirmed_changed: confirmed_changed || deletion.confirmed_changed,
+                            value,
+                            primary_failure: deletion.primary_failure,
+                            mutation_warnings,
+                        });
+                    }
+                    confirmed_changed |= deletion.confirmed_changed;
+                    if let Err(error) = self.reparent_vault(&vault.uid, &new_uid, to) {
+                        return self.classify_merge_error(
+                            from,
+                            to,
+                            expected_plan,
+                            value,
+                            confirmed_changed,
+                            mutation_warnings,
+                            "merge-vault",
+                            error,
+                            faults.verify,
+                        );
+                    }
+                    confirmed_changed = true;
+                    if deletion.value.notes_deleted > 0 {
+                        value.discarded.push(DiscardedVault {
+                            root_path,
+                            notes_discarded: deletion.value.notes_deleted,
+                        });
                     }
                 } else {
-                    // No collision — reparent source to preserve its notes.
-                    self.reparent_vault(&v.uid, &new_uid, to)?;
+                    let deletion =
+                        match self.delete_vault_cascade_with_classified_outcome(&vault.uid) {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                return self.classify_merge_error(
+                                    from,
+                                    to,
+                                    expected_plan,
+                                    value,
+                                    confirmed_changed,
+                                    mutation_warnings,
+                                    "merge-vault",
+                                    error,
+                                    faults.verify,
+                                );
+                            }
+                        };
+                    mutation_warnings.extend(deletion.mutation_warnings);
+                    if deletion.disposition == MutationDisposition::Ambiguous {
+                        return Ok(MutationOutcome {
+                            disposition: MutationDisposition::Ambiguous,
+                            confirmed_changed: confirmed_changed || deletion.confirmed_changed,
+                            value,
+                            primary_failure: deletion.primary_failure,
+                            mutation_warnings,
+                        });
+                    }
+                    confirmed_changed |= deletion.confirmed_changed;
+                    if deletion.value.notes_deleted > 0 {
+                        value.discarded.push(DiscardedVault {
+                            root_path,
+                            notes_discarded: deletion.value.notes_deleted,
+                        });
+                    }
                 }
-                vault_count += 1;
+            } else if let Err(error) = self.reparent_vault(&vault.uid, &new_uid, to) {
+                return self.classify_merge_error(
+                    from,
+                    to,
+                    expected_plan,
+                    value,
+                    confirmed_changed,
+                    mutation_warnings,
+                    "merge-vault",
+                    error,
+                    faults.verify,
+                );
+            } else {
+                confirmed_changed = true;
+            }
+            value.vaults += 1;
+        }
+
+        for repo in source_repos {
+            let repo_ident = repo.name.clone().unwrap_or_else(|| repo.url.clone());
+            let source_uid = repo.uid.clone();
+            let target_uid = repo_uid(to, &repo.url);
+            let deletion = match self.delete_repo_cascade_with_outcome(&source_uid) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return self.classify_merge_error(
+                        from,
+                        to,
+                        expected_plan,
+                        value,
+                        confirmed_changed,
+                        mutation_warnings,
+                        "merge-repo",
+                        error,
+                        faults.verify,
+                    );
+                }
+            };
+            mutation_warnings.extend(deletion.mutation_warnings);
+            if matches!(
+                deletion.disposition,
+                MutationDisposition::CommittedPartial | MutationDisposition::Ambiguous
+            ) {
+                if deletion.disposition == MutationDisposition::Ambiguous {
+                    return Ok(MutationOutcome {
+                        disposition: MutationDisposition::Ambiguous,
+                        confirmed_changed: confirmed_changed || deletion.confirmed_changed,
+                        value,
+                        primary_failure: deletion.primary_failure,
+                        mutation_warnings,
+                    });
+                }
+                let failure = deletion
+                    .primary_failure
+                    .unwrap_or_else(|| MutationFailure::new("merge-repo", "partial Repo deletion"));
+                return self.classify_merge_error(
+                    from,
+                    to,
+                    expected_plan,
+                    value,
+                    confirmed_changed || deletion.confirmed_changed,
+                    mutation_warnings,
+                    &failure.stage,
+                    StoreError::Query(failure.message),
+                    faults.verify,
+                );
+            }
+            confirmed_changed |= deletion.confirmed_changed;
+            let target_exists = match self.lookup_repo(&target_uid) {
+                Ok(repo) => repo.is_some(),
+                Err(error) => {
+                    return self.classify_merge_error(
+                        from,
+                        to,
+                        expected_plan,
+                        value,
+                        confirmed_changed,
+                        mutation_warnings,
+                        "merge-repo",
+                        error,
+                        faults.verify,
+                    );
+                }
+            };
+            if !target_exists {
+                if let Err(error) = self.insert_repo(&Repo {
+                    uid: target_uid,
+                    instance_id: to.to_string(),
+                    ..repo
+                }) {
+                    return self.classify_merge_error(
+                        from,
+                        to,
+                        expected_plan,
+                        value,
+                        confirmed_changed,
+                        mutation_warnings,
+                        "merge-repo",
+                        error,
+                        faults.verify,
+                    );
+                }
+                confirmed_changed = true;
+            }
+            value.repos += 1;
+            value.repos_moved.push(repo_ident);
+            value.repo_uids_removed.push(source_uid);
+            if faults.after_repo == Some(value.repos) {
+                let repos_merged = value.repos;
+                return self.classify_merge_error(
+                    from,
+                    to,
+                    expected_plan,
+                    value,
+                    confirmed_changed,
+                    mutation_warnings,
+                    "merge-repo",
+                    StoreError::Query(format!(
+                        "injected failure after merged Repo {}",
+                        repos_merged
+                    )),
+                    faults.verify,
+                );
             }
         }
-        for r in self.list_repos(None)? {
-            if r.instance_id == from {
-                // Identify the repo for the re-index guidance before we move
-                // `r` into the reinsert. Prefer the display name, else the url.
-                let repo_ident = r.name.clone().unwrap_or_else(|| r.url.clone());
-                let source_uid = r.uid.clone();
-                let target_uid = repo_uid(to, &r.url);
 
-                self.bulk_delete_repo_files_and_symbols(&source_uid)?;
-                self.clear_repo_derived_nodes(&source_uid)?;
-                self.delete_repo_node(&source_uid)?;
-
-                if self.lookup_repo(&target_uid)?.is_none() {
-                    self.insert_repo(&Repo {
-                        uid: target_uid,
-                        instance_id: to.to_string(),
-                        ..r
-                    })?;
-                }
-
-                repo_count += 1;
-                repos_moved.push(repo_ident);
-                repo_uids_removed.push(source_uid);
-            }
-        }
         for project_merge in project_merges {
-            // Publish a newly minted winner before deleting its source. If a
-            // process stops between these statements, the durable migration
-            // journal can safely retry the source deletion; deleting first
-            // would leave both roots absent and require reconstruction.
             if !project_merge.winner_preexists {
-                self.insert_project(&project_merge.winner)?;
+                if let Err(error) = self.insert_project(&project_merge.winner) {
+                    return self.classify_merge_error(
+                        from,
+                        to,
+                        expected_plan,
+                        value,
+                        confirmed_changed,
+                        mutation_warnings,
+                        "merge-project",
+                        error,
+                        faults.verify,
+                    );
+                }
+                confirmed_changed = true;
             }
             for mapping in &project_merge.remaps {
-                self.delete_project_node(&mapping.source_uid)?;
+                let deletion = match self.delete_project_cascade_classified(&mapping.source_uid) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return self.classify_merge_error(
+                            from,
+                            to,
+                            expected_plan,
+                            value,
+                            confirmed_changed,
+                            mutation_warnings,
+                            "merge-project",
+                            error,
+                            faults.verify,
+                        );
+                    }
+                };
+                mutation_warnings.extend(deletion.mutation_warnings);
+                if deletion.disposition == MutationDisposition::Ambiguous {
+                    return Ok(MutationOutcome {
+                        disposition: MutationDisposition::Ambiguous,
+                        confirmed_changed: confirmed_changed || deletion.confirmed_changed,
+                        value,
+                        primary_failure: deletion.primary_failure,
+                        mutation_warnings,
+                    });
+                }
+                confirmed_changed |= deletion.confirmed_changed;
             }
-            project_count += project_merge.source_count;
+            value.projects += project_merge.source_count;
         }
-        Ok(MergeResult {
-            vaults: vault_count,
-            repos: repo_count,
-            projects: project_count,
-            discarded,
-            repos_moved,
-            repo_uids_removed,
-        })
+
+        if faults.after_graph {
+            return self.classify_merge_error(
+                from,
+                to,
+                expected_plan,
+                value,
+                confirmed_changed,
+                mutation_warnings,
+                "merge-graph",
+                StoreError::Query("injected failure after graph merge".to_string()),
+                faults.verify,
+            );
+        }
+        match self.verify_merge_plan(from, to, expected_plan, faults.verify) {
+            Ok(InstanceUidRemapPlanState::Applied) => Ok(MutationOutcome {
+                disposition: MutationDisposition::CommittedComplete,
+                confirmed_changed,
+                value,
+                primary_failure: None,
+                mutation_warnings,
+            }),
+            Ok(state) => self.classify_merge_error(
+                from,
+                to,
+                expected_plan,
+                value,
+                confirmed_changed,
+                mutation_warnings,
+                "merge-final-probe",
+                StoreError::Query(format!(
+                    "merge returned before exact plan reached Applied; state={state:?}"
+                )),
+                false,
+            ),
+            Err(error) => Ok(MutationOutcome {
+                disposition: MutationDisposition::Ambiguous,
+                confirmed_changed,
+                value,
+                primary_failure: Some(MutationFailure::new(
+                    "merge-final-probe",
+                    format!("exact merge plan verification failed: {error}"),
+                )),
+                mutation_warnings,
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify_merge_error(
+        &self,
+        from: &str,
+        to: &str,
+        expected_plan: &[InstanceUidRemap],
+        value: MergeResult,
+        confirmed_changed: bool,
+        mut mutation_warnings: Vec<MutationFailure>,
+        stage: &str,
+        primary: StoreError,
+        verification_fault: bool,
+    ) -> Result<MutationOutcome<MergeResult>, StoreError> {
+        let state = match self.verify_merge_plan(from, to, expected_plan, verification_fault) {
+            Ok(state) => state,
+            Err(verification) => {
+                return Ok(MutationOutcome {
+                    disposition: MutationDisposition::Ambiguous,
+                    confirmed_changed,
+                    value,
+                    primary_failure: Some(MutationFailure::new(
+                        stage,
+                        format!("{primary}; exact merge plan verification failed: {verification}"),
+                    )),
+                    mutation_warnings,
+                });
+            }
+        };
+        match state {
+            InstanceUidRemapPlanState::Prepared if !confirmed_changed => Err(primary),
+            InstanceUidRemapPlanState::Prepared | InstanceUidRemapPlanState::PartiallyApplied => {
+                Ok(MutationOutcome {
+                    disposition: MutationDisposition::CommittedPartial,
+                    confirmed_changed: true,
+                    value,
+                    primary_failure: Some(MutationFailure::new(stage, primary)),
+                    mutation_warnings,
+                })
+            }
+            InstanceUidRemapPlanState::Applied => {
+                mutation_warnings.push(MutationFailure::new(stage, primary));
+                Ok(MutationOutcome {
+                    disposition: MutationDisposition::CommittedComplete,
+                    confirmed_changed: true,
+                    value,
+                    primary_failure: None,
+                    mutation_warnings,
+                })
+            }
+        }
+    }
+
+    fn verify_merge_plan(
+        &self,
+        from: &str,
+        to: &str,
+        expected_plan: &[InstanceUidRemap],
+        fault: bool,
+    ) -> Result<InstanceUidRemapPlanState, StoreError> {
+        if fault {
+            Err(StoreError::Query(
+                "injected exact merge plan verification failure".to_string(),
+            ))
+        } else {
+            self.verify_instance_uid_remap_plan_state(from, to, expected_plan)
+        }
     }
 
     // ── DB-level metadata ───────────────────────────────────────────────────
@@ -4608,6 +6303,781 @@ mod copy_from_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed_classified_vault(store: &GraphStore, vault_uid: &str) {
+        store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "classified".to_string(),
+                root_path: format!("/{vault_uid}"),
+                instance_id: "classified".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: format!("note:{vault_uid}:one"),
+                vault_uid: vault_uid.to_string(),
+                file_path: "one.md".to_string(),
+                title: "One".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 1,
+                content_hash: "one".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_tag(&Tag {
+                uid: format!("tag:{vault_uid}:one"),
+                vault_uid: vault_uid.to_string(),
+                name: "one".to_string(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn vault_cascade_outcome_pre_delete_failure_rolls_back() {
+        let store = GraphStore::in_memory().unwrap();
+        let vault_uid = "vlt:classified:rollback";
+        seed_classified_vault(&store, vault_uid);
+
+        let error = store
+            .delete_vault_cascade_with_classified_outcome_and_faults(
+                vault_uid,
+                VaultCascadeFaults {
+                    before_delete: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("before delete"));
+        assert!(
+            store
+                .list_vaults(None)
+                .unwrap()
+                .iter()
+                .any(|v| v.uid == vault_uid)
+        );
+        assert_eq!(store.list_notes(Some(vault_uid)).unwrap().len(), 1);
+        assert_eq!(store.list_tags(Some(vault_uid)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn vault_cascade_outcome_commit_failure_wholly_live_is_proved_no_change() {
+        let store = GraphStore::in_memory().unwrap();
+        let vault_uid = "vlt:classified:commit-live";
+        seed_classified_vault(&store, vault_uid);
+
+        let error = store
+            .delete_vault_cascade_with_classified_outcome_and_faults(
+                vault_uid,
+                VaultCascadeFaults {
+                    commit_before: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("commit"));
+        assert!(
+            store
+                .list_vaults(None)
+                .unwrap()
+                .iter()
+                .any(|v| v.uid == vault_uid)
+        );
+        assert_eq!(store.list_notes(Some(vault_uid)).unwrap().len(), 1);
+        assert_eq!(store.list_tags(Some(vault_uid)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn vault_cascade_outcome_commit_failure_wholly_absent_is_complete_with_warning() {
+        let store = GraphStore::in_memory().unwrap();
+        let vault_uid = "vlt:classified:commit-absent";
+        seed_classified_vault(&store, vault_uid);
+
+        let outcome = store
+            .delete_vault_cascade_with_classified_outcome_and_faults(
+                vault_uid,
+                VaultCascadeFaults {
+                    commit_after: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedComplete);
+        assert!(outcome.confirmed_changed);
+        assert_eq!(outcome.value.notes_deleted, 1);
+        assert_eq!(outcome.primary_failure, None);
+        assert_eq!(outcome.mutation_warnings.len(), 1);
+        assert!(
+            !store
+                .list_vaults(None)
+                .unwrap()
+                .iter()
+                .any(|v| v.uid == vault_uid)
+        );
+        assert!(store.list_notes(Some(vault_uid)).unwrap().is_empty());
+        assert!(store.list_tags(Some(vault_uid)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn vault_cascade_outcome_commit_failure_with_failed_probe_is_ambiguous() {
+        let store = GraphStore::in_memory().unwrap();
+        let vault_uid = "vlt:classified:probe";
+        seed_classified_vault(&store, vault_uid);
+
+        let outcome = store
+            .delete_vault_cascade_with_classified_outcome_and_faults(
+                vault_uid,
+                VaultCascadeFaults {
+                    commit_after: true,
+                    probe: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::Ambiguous);
+        assert!(!outcome.confirmed_changed);
+        assert!(outcome.primary_failure.is_some());
+        assert!(outcome.mutation_warnings.is_empty());
+        assert!(
+            !store
+                .list_vaults(None)
+                .unwrap()
+                .iter()
+                .any(|v| v.uid == vault_uid)
+        );
+    }
+
+    #[test]
+    fn vault_cascade_outcome_missing_vault_is_confirmed_no_change() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let outcome = store
+            .delete_vault_cascade_with_classified_outcome("vlt:classified:missing")
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::ConfirmedNoChange);
+        assert!(!outcome.confirmed_changed);
+        assert_eq!(outcome.value.notes_deleted, 0);
+        assert_eq!(outcome.primary_failure, None);
+        assert!(outcome.mutation_warnings.is_empty());
+    }
+
+    fn seed_classified_repo(store: &GraphStore, repo_uid: &str) {
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.to_string(),
+                url: format!("https://example.invalid/{repo_uid}"),
+                indexed_sha: "classified".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "classified".to_string(),
+                name: Some(repo_uid.to_string()),
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_file(&File {
+                uid: format!("file:{repo_uid}:one"),
+                path: "src/one.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "one".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: format!("sym:{repo_uid}:one"),
+                name: "one".to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: repo_uid.to_string(),
+                file_path: "src/one.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn one()".to_string(),
+                summary: None,
+                content_hash: "one".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        store
+            .insert_service(&Service {
+                uid: format!("svc:{repo_uid}:one"),
+                name: "one".to_string(),
+                repo_uid: repo_uid.to_string(),
+                summary: None,
+                summary_hash: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_contract(&Contract {
+                uid: format!("contract:{repo_uid}:one"),
+                kind: "rest-endpoint".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/one".to_string()),
+                operation_id: None,
+                repo_uid: repo_uid.to_string(),
+                source_path: "openapi.yaml".to_string(),
+                confidence: 1.0,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn classified_repo_delete_empty_target_is_confirmed_no_change() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let outcome = store
+            .delete_repo_cascade_with_outcome("repo:classified:missing")
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::ConfirmedNoChange);
+        assert!(!outcome.confirmed_changed);
+        assert_eq!(outcome.value.files_deleted, 0);
+        assert_eq!(outcome.value.symbols_deleted, 0);
+        assert_eq!(outcome.primary_failure, None);
+    }
+
+    #[test]
+    fn classified_repo_delete_bulk_commit_ack_failure_continues_from_exact_absence() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_uid = "repo:classified:bulk-ack";
+        seed_classified_repo(&store, repo_uid);
+
+        let outcome = store
+            .delete_repo_cascade_with_outcome_and_faults(
+                repo_uid,
+                RepoCascadeFaults {
+                    bulk_commit_after: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedComplete);
+        assert!(outcome.confirmed_changed);
+        assert_eq!(outcome.value.files_deleted, 1);
+        assert_eq!(outcome.value.symbols_deleted, 1);
+        assert_eq!(outcome.mutation_warnings.len(), 1);
+        assert!(store.lookup_repo(repo_uid).unwrap().is_none());
+    }
+
+    #[test]
+    fn classified_repo_delete_failure_after_committed_bulk_retains_partial_counts() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_uid = "repo:classified:after-bulk";
+        seed_classified_repo(&store, repo_uid);
+
+        let outcome = store
+            .delete_repo_cascade_with_outcome_and_faults(
+                repo_uid,
+                RepoCascadeFaults {
+                    after_bulk: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedPartial);
+        assert!(outcome.confirmed_changed);
+        assert_eq!(outcome.value.files_deleted, 1);
+        assert_eq!(outcome.value.symbols_deleted, 1);
+        assert!(outcome.primary_failure.is_some());
+        assert!(store.list_files_by_repo(repo_uid).unwrap().is_empty());
+        assert!(store.lookup_symbols_by_repo(repo_uid).unwrap().is_empty());
+        assert!(store.lookup_repo(repo_uid).unwrap().is_some());
+        assert_eq!(
+            store
+                .list_services(None)
+                .unwrap()
+                .into_iter()
+                .filter(|service| service.repo_uid == repo_uid)
+                .count(),
+            1
+        );
+        assert_eq!(store.list_contracts(Some(repo_uid)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn classified_repo_delete_root_failure_reports_children_absent_root_live() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_uid = "repo:classified:root";
+        seed_classified_repo(&store, repo_uid);
+
+        let outcome = store
+            .delete_repo_cascade_with_outcome_and_faults(
+                repo_uid,
+                RepoCascadeFaults {
+                    before_root: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedPartial);
+        assert!(outcome.confirmed_changed);
+        assert!(store.lookup_repo(repo_uid).unwrap().is_some());
+        assert!(store.list_files_by_repo(repo_uid).unwrap().is_empty());
+        assert!(store.lookup_symbols_by_repo(repo_uid).unwrap().is_empty());
+        assert!(store.list_contracts(Some(repo_uid)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn classified_repo_delete_root_only_failure_is_proved_no_change_error() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_uid = "repo:classified:root-only";
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.to_string(),
+                url: "https://example.invalid/root-only".to_string(),
+                indexed_sha: "classified".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "classified".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        let error = store
+            .delete_repo_cascade_with_outcome_and_faults(
+                repo_uid,
+                RepoCascadeFaults {
+                    before_root: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("before Repo root"));
+        assert!(store.lookup_repo(repo_uid).unwrap().is_some());
+    }
+
+    #[test]
+    fn classified_repo_delete_final_ack_failure_is_complete_with_warning() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_uid = "repo:classified:root-ack";
+        seed_classified_repo(&store, repo_uid);
+
+        let outcome = store
+            .delete_repo_cascade_with_outcome_and_faults(
+                repo_uid,
+                RepoCascadeFaults {
+                    root_ack_after: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedComplete);
+        assert!(outcome.confirmed_changed);
+        assert_eq!(outcome.primary_failure, None);
+        assert_eq!(outcome.mutation_warnings.len(), 1);
+        assert!(store.lookup_repo(repo_uid).unwrap().is_none());
+    }
+
+    #[test]
+    fn classified_repo_delete_probe_failure_is_ambiguous_after_confirmed_bulk() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_uid = "repo:classified:probe";
+        seed_classified_repo(&store, repo_uid);
+
+        let outcome = store
+            .delete_repo_cascade_with_outcome_and_faults(
+                repo_uid,
+                RepoCascadeFaults {
+                    after_bulk: true,
+                    probe: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::Ambiguous);
+        assert!(outcome.confirmed_changed);
+        assert!(outcome.primary_failure.is_some());
+    }
+
+    fn seed_purge_repo(store: &GraphStore, instance_id: &str, suffix: &str) -> String {
+        let uid = format!("repo:{instance_id}:{suffix}");
+        store
+            .insert_repo(&Repo {
+                uid: uid.clone(),
+                url: format!("https://example.invalid/{instance_id}/{suffix}"),
+                indexed_sha: "purge".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: instance_id.to_string(),
+                name: Some(suffix.to_string()),
+                root_path: None,
+            })
+            .unwrap();
+        uid
+    }
+
+    #[test]
+    fn purge_instance_second_repo_failure_retains_first_repo_count() {
+        let store = GraphStore::in_memory().unwrap();
+        let first = seed_purge_repo(&store, "purge-repos", "a");
+        let second = seed_purge_repo(&store, "purge-repos", "b");
+
+        let outcome = store
+            .purge_instance_with_outcome_and_faults(
+                "purge-repos",
+                PurgeInstanceFaults {
+                    before_repo: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedPartial);
+        assert!(outcome.confirmed_changed);
+        assert_eq!(outcome.value.repos, 1);
+        assert!(store.lookup_repo(&first).unwrap().is_none());
+        assert!(store.lookup_repo(&second).unwrap().is_some());
+    }
+
+    #[test]
+    fn purge_instance_vault_failure_after_repo_retains_repo_result() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_uid = seed_purge_repo(&store, "purge-vault", "repo");
+        let vault_uid = "vlt:purge-vault:one";
+        store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "one".to_string(),
+                root_path: "/purge-vault/one".to_string(),
+                instance_id: "purge-vault".to_string(),
+            })
+            .unwrap();
+
+        let outcome = store
+            .purge_instance_with_outcome_and_faults(
+                "purge-vault",
+                PurgeInstanceFaults {
+                    before_vault: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedPartial);
+        assert_eq!(outcome.value.repos, 1);
+        assert_eq!(outcome.value.vaults, 0);
+        assert!(store.lookup_repo(&repo_uid).unwrap().is_none());
+        assert!(
+            store
+                .list_vaults(None)
+                .unwrap()
+                .iter()
+                .any(|vault| vault.uid == vault_uid)
+        );
+    }
+
+    #[test]
+    fn purge_instance_orphan_probe_failure_is_ambiguous_with_prior_exact_delta() {
+        let store = GraphStore::in_memory().unwrap();
+        let missing_repo = "repo:purge-orphans:missing";
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:repo:purge-orphans:missing:one".to_string(),
+                name: "one".to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: missing_repo.to_string(),
+                file_path: "src/one.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn one()".to_string(),
+                summary: None,
+                content_hash: "one".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        store
+            .insert_file(&File {
+                uid: "file:repo:purge-orphans:missing:one".to_string(),
+                path: "src/one.rs".to_string(),
+                repo_uid: missing_repo.to_string(),
+                content_hash: "one".to_string(),
+            })
+            .unwrap();
+
+        let outcome = store
+            .purge_instance_with_outcome_and_faults(
+                "purge-orphans",
+                PurgeInstanceFaults {
+                    orphan_commit_after: Some(1),
+                    orphan_probe: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::Ambiguous);
+        assert!(outcome.confirmed_changed);
+        assert_eq!(outcome.value.orphans_swept, 1);
+        assert!(store.lookup_symbols_by_name("one").unwrap().is_empty());
+        assert!(store.list_files_by_repo(missing_repo).unwrap().is_empty());
+    }
+
+    fn seed_merge_repo(store: &GraphStore, from: &str, suffix: &str) -> String {
+        let url = format!("https://example.invalid/merge/{suffix}");
+        let uid = repo_uid(from, &url);
+        store
+            .insert_repo(&Repo {
+                uid: uid.clone(),
+                url,
+                indexed_sha: "merge".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: from.to_string(),
+                name: Some(suffix.to_string()),
+                root_path: None,
+            })
+            .unwrap();
+        uid
+    }
+
+    #[test]
+    fn merge_instance_prepared_plan_failure_is_proved_no_change_error() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_merge_repo(&store, "merge-prepared", "one");
+        let plan = store
+            .plan_instance_uid_remaps("merge-prepared", "merge-target")
+            .unwrap();
+
+        let error = store
+            .merge_instance_ids_with_plan_and_faults(
+                "merge-prepared",
+                "merge-target",
+                &plan,
+                MergeInstanceFaults {
+                    before_graph: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("before graph"));
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("merge-prepared", "merge-target", &plan)
+                .unwrap(),
+            InstanceUidRemapPlanState::Prepared
+        );
+    }
+
+    #[test]
+    fn merge_instance_failure_after_first_repo_retains_partial_result() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_merge_repo(&store, "merge-partial", "a");
+        seed_merge_repo(&store, "merge-partial", "b");
+        let plan = store
+            .plan_instance_uid_remaps("merge-partial", "merge-target")
+            .unwrap();
+
+        let outcome = store
+            .merge_instance_ids_with_plan_and_faults(
+                "merge-partial",
+                "merge-target",
+                &plan,
+                MergeInstanceFaults {
+                    after_repo: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedPartial);
+        assert!(outcome.confirmed_changed);
+        assert_eq!(outcome.value.repos, 1);
+        assert!(outcome.primary_failure.is_some());
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("merge-partial", "merge-target", &plan)
+                .unwrap(),
+            InstanceUidRemapPlanState::PartiallyApplied
+        );
+    }
+
+    #[test]
+    fn merge_instance_failure_after_graph_completion_is_complete_with_warning() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_merge_repo(&store, "merge-applied", "a");
+        seed_merge_repo(&store, "merge-applied", "b");
+        let plan = store
+            .plan_instance_uid_remaps("merge-applied", "merge-target")
+            .unwrap();
+
+        let outcome = store
+            .merge_instance_ids_with_plan_and_faults(
+                "merge-applied",
+                "merge-target",
+                &plan,
+                MergeInstanceFaults {
+                    after_graph: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::CommittedComplete);
+        assert_eq!(outcome.value.repos, 2);
+        assert_eq!(outcome.primary_failure, None);
+        assert_eq!(outcome.mutation_warnings.len(), 1);
+        assert_eq!(
+            store
+                .verify_instance_uid_remap_plan_state("merge-applied", "merge-target", &plan)
+                .unwrap(),
+            InstanceUidRemapPlanState::Applied
+        );
+    }
+
+    #[test]
+    fn merge_instance_verification_failure_after_first_repo_is_ambiguous() {
+        let store = GraphStore::in_memory().unwrap();
+        seed_merge_repo(&store, "merge-ambiguous", "a");
+        seed_merge_repo(&store, "merge-ambiguous", "b");
+        let plan = store
+            .plan_instance_uid_remaps("merge-ambiguous", "merge-target")
+            .unwrap();
+
+        let outcome = store
+            .merge_instance_ids_with_plan_and_faults(
+                "merge-ambiguous",
+                "merge-target",
+                &plan,
+                MergeInstanceFaults {
+                    after_repo: Some(1),
+                    verify: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.disposition, MutationDisposition::Ambiguous);
+        assert!(outcome.confirmed_changed);
+        assert_eq!(outcome.value.repos, 1);
+        assert!(outcome.primary_failure.is_some());
+    }
+
+    #[test]
+    fn project_cascade_classified_maps_every_existing_disposition() {
+        let unchanged = DeleteProjectCascadeOutcome {
+            project_uid: "proj:classified:unchanged".to_string(),
+            project_name: None,
+            disposition: ProjectMutationDisposition::ConfirmedUnchanged,
+        };
+        let unchanged =
+            GraphStore::classify_project_cascade_result_with_liveness(Ok(unchanged), || Ok(true))
+                .unwrap();
+        assert_eq!(
+            unchanged.disposition,
+            MutationDisposition::ConfirmedNoChange
+        );
+        assert!(!unchanged.confirmed_changed);
+
+        let changed = DeleteProjectCascadeOutcome {
+            project_uid: "proj:classified:changed".to_string(),
+            project_name: Some("Changed".to_string()),
+            disposition: ProjectMutationDisposition::Changed,
+        };
+        let changed =
+            GraphStore::classify_project_cascade_result_with_liveness(Ok(changed), || Ok(false))
+                .unwrap();
+        assert_eq!(changed.disposition, MutationDisposition::CommittedComplete);
+        assert!(changed.confirmed_changed);
+
+        for disposition in [
+            ProjectMutationDisposition::ConfirmedUnchanged,
+            ProjectMutationDisposition::ConfirmedRolledBack,
+        ] {
+            let error = DeleteProjectCascadeError {
+                project_uid: "proj:classified:error".to_string(),
+                project_name: None,
+                disposition,
+                primary: StoreError::Query("injected project failure".to_string()),
+                rollback: None,
+            };
+            assert!(
+                GraphStore::classify_project_cascade_result_with_liveness(Err(error), || Ok(true))
+                    .is_err()
+            );
+        }
+
+        let changed_error = DeleteProjectCascadeError {
+            project_uid: "proj:classified:error-changed".to_string(),
+            project_name: Some("Changed".to_string()),
+            disposition: ProjectMutationDisposition::Changed,
+            primary: StoreError::Query("lost acknowledgement".to_string()),
+            rollback: None,
+        };
+        let changed_error =
+            GraphStore::classify_project_cascade_result_with_liveness(Err(changed_error), || {
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(
+            changed_error.disposition,
+            MutationDisposition::CommittedComplete
+        );
+        assert_eq!(changed_error.mutation_warnings.len(), 1);
+    }
+
+    #[test]
+    fn project_cascade_classified_resolves_ambiguous_by_fresh_liveness() {
+        let make_error = || DeleteProjectCascadeError {
+            project_uid: "proj:classified:ambiguous".to_string(),
+            project_name: Some("Ambiguous".to_string()),
+            disposition: ProjectMutationDisposition::Ambiguous,
+            primary: StoreError::Query("commit acknowledgement lost".to_string()),
+            rollback: Some(StoreError::Query("rollback unavailable".to_string())),
+        };
+
+        let absent =
+            GraphStore::classify_project_cascade_result_with_liveness(Err(make_error()), || {
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(absent.disposition, MutationDisposition::CommittedComplete);
+        assert!(absent.confirmed_changed);
+        assert_eq!(absent.mutation_warnings.len(), 1);
+
+        assert!(
+            GraphStore::classify_project_cascade_result_with_liveness(Err(make_error()), || {
+                Ok(true)
+            })
+            .is_err()
+        );
+
+        let failed_probe =
+            GraphStore::classify_project_cascade_result_with_liveness(Err(make_error()), || {
+                Err(StoreError::Query("probe unavailable".to_string()))
+            })
+            .unwrap();
+        assert_eq!(failed_probe.disposition, MutationDisposition::Ambiguous);
+        assert!(!failed_probe.confirmed_changed);
+        assert!(failed_probe.primary_failure.is_some());
+    }
 
     fn seed_project_component(store: &GraphStore) {
         for (uid, name) in [("proj:txn:parent", "Parent"), ("proj:txn:child", "Child")] {

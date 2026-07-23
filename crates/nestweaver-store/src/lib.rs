@@ -36,11 +36,11 @@ pub use tantivy_index::{
 };
 pub use traverse::{IMPACT_EDGE_TYPES, ImpactEdge, ImpactNode, ImpactResult};
 pub use write::{
-    DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
-    DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery, InstanceUidHandoff,
-    InstanceUidHandoffIdentity, InstanceUidMigrationPlan, InstanceUidRemap,
-    InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult, ProjectMutationDisposition,
-    PurgeInstanceResult,
+    DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteRepoCascadeOutcome,
+    DeleteVaultCascadeOutcome, DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery,
+    InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan, InstanceUidRemap,
+    InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult, MutationDisposition,
+    MutationFailure, MutationOutcome, ProjectMutationDisposition, PurgeInstanceResult,
 };
 
 #[cfg(test)]
