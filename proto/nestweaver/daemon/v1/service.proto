@@ -225,6 +225,8 @@ message SearchResultItem {
   repeated string matched_headings = 6;
   optional string inline_body = 7;
   optional string canonical_id = 8;
+  // Vault the note/section hit belongs to (notes only; absent for symbols).
+  optional string vault_uid = 9;
 }
 
 // brain_status

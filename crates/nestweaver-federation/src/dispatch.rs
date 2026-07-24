@@ -159,6 +159,10 @@ fn brain_search_response_to_json(
             if let Some(canonical_id) = &result.canonical_id {
                 item["canonical_id"] = Value::String(canonical_id.clone());
             }
+            // Parity: note rows carry their vault.
+            if let Some(vault_uid) = &result.vault_uid {
+                item["vault_uid"] = Value::String(vault_uid.clone());
+            }
             item
         })
         .collect();
@@ -522,6 +526,7 @@ mod tests {
                 location: Some("src/lib.rs:1".to_string()),
                 matched_headings: vec!["Needle heading".to_string()],
                 inline_body: Some("detailed body".to_string()),
+                vault_uid: None,
             }],
             expansion_terms: vec!["expanded".to_string()],
             returned_matches: 0,

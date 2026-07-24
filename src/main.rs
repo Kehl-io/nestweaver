@@ -2187,7 +2187,11 @@ enum BrainCommands {
         /// Approximate token cap for the output (characters / 4). When set,
         /// truncates the connected list to fit. This is the primary knob
         /// for LLM context-window-sized output.
-        #[arg(long, help = "Approximate token budget for the connected list")]
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
+            help = "Approximate token budget for the connected list (1-16000; matches the MCP brain_context schema)"
+        )]
         token_budget: Option<usize>,
         /// Hard cap on connected results. Used when --token-budget is not
         /// set; ignored when it is.
@@ -13651,6 +13655,9 @@ fn brain_search_result_item_json(item: &nestweaver_proto::SearchResultItem) -> s
     if !item.matched_headings.is_empty() {
         value["matched_headings"] = serde_json::json!(item.matched_headings);
     }
+    if let Some(ref vault_uid) = item.vault_uid {
+        value["vault_uid"] = serde_json::json!(vault_uid);
+    }
     if let Some(ref body) = item.inline_body {
         value["inline_body"] = serde_json::json!(body);
     }
@@ -13759,6 +13766,7 @@ mod brain_search_renderer_tests {
                 location: Some("src/lib.rs:1".to_string()),
                 matched_headings: Vec::new(),
                 inline_body: None,
+                vault_uid: None,
             }],
             expansion_terms: Vec::new(),
             returned_matches: 0,

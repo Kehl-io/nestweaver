@@ -3736,6 +3736,11 @@ impl NestWeaverDaemon for DaemonService {
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                             .map(String::from),
+                        vault_uid: item
+                            .get("vault_uid")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
                     })
                     .collect()
             })

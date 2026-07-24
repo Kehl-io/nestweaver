@@ -965,6 +965,7 @@ mod tool_schema_validation_tests {
                 location: Some("src/lib.rs:1".to_string()),
                 matched_headings: Vec::new(),
                 inline_body: None,
+                vault_uid: None,
             }],
             expansion_terms: vec!["expanded".to_string()],
             returned_matches: 0,
@@ -1026,6 +1027,7 @@ mod tool_schema_validation_tests {
                     location: Some("src/lib.rs:1".to_string()),
                     matched_headings: Vec::new(),
                     inline_body: None,
+                    vault_uid: None,
                 },
                 nestweaver_proto::SearchResultItem {
                     uid: "note:needle".to_string(),
@@ -1036,6 +1038,7 @@ mod tool_schema_validation_tests {
                     location: None,
                     matched_headings: vec!["Needle Heading".to_string()],
                     inline_body: None,
+                    vault_uid: Some("vlt:default:needle".to_string()),
                 },
             ],
             expansion_terms: Vec::new(),
@@ -1049,6 +1052,12 @@ mod tool_schema_validation_tests {
         assert_eq!(
             value["results"][1]["matched_headings"],
             json!(["Needle Heading"])
+        );
+        // Note rows carry their vault; symbol rows omit the key.
+        assert!(value["results"][0].get("vault_uid").is_none());
+        assert_eq!(
+            value["results"][1]["vault_uid"],
+            json!("vlt:default:needle")
         );
 
         let concise = daemon_brain_search_response_to_json(&response, true);
@@ -2459,7 +2468,9 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate cap on the connected list (chars / 4). Default 2000. Increase for broader context, decrease for focused results.",
+                    "minimum": 1,
+                    "maximum": 16000,
+                    "description": "Approximate cap on the connected list (chars / 4, 1-16000). Default 2000. Increase for broader context, decrease for focused results.",
                     "default": 2000
                 },
                 "response_format": {
@@ -8395,6 +8406,10 @@ fn daemon_brain_search_response_to_json(
             if let Some(canonical_id) = &result.canonical_id {
                 item["canonical_id"] = json!(canonical_id);
             }
+            // Parity with the local path: note rows carry their vault.
+            if let Some(vault_uid) = &result.vault_uid {
+                item["vault_uid"] = json!(vault_uid);
+            }
             item
         })
         .collect();
@@ -8933,11 +8948,19 @@ fn dispatch_add_source_via_daemon(
         .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?
         .to_string();
 
+    // Schema promises "Defaults to the directory name" — resolve it here;
+    // forwarding "" blanks the vault's stored friendly name on every
+    // nameless re-add (the daemon treats the value literally).
     let name = args
         .get("name")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(String::from)
+        .or_else(|| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
 
     let resolved = std::path::Path::new(&path);
     // nw-089: validate the path exists — the old code returned a phantom

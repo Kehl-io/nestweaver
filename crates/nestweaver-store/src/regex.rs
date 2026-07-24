@@ -244,7 +244,7 @@ impl GraphStore {
     /// `index --with-trigrams`. Returns the number of (trigram, uid) postings
     /// written.
     pub fn build_trigram_index(&self) -> Result<usize, StoreError> {
-        let conn = self.conn()?;
+        let setup_conn = self.conn()?;
         // Mark the index as mid-build BEFORE touching the postings. An
         // interrupted rebuild (crash/kill between the clear below and the
         // provenance write at the end) would otherwise leave the OLD
@@ -252,11 +252,9 @@ impl GraphStore {
         // "fresh" while the posting table is empty or partial, silently
         // dropping regex matches (P1 review). "building" is unparseable by
         // `trigram_index_meta`, so any interrupted build reads as stale and
-        // falls back to a full scan.
-        Self::write_trigram_meta(&conn, "building")?;
-        // Clear existing postings so a rebuild reflects the current graph.
-        conn.query("MATCH (t:TrigramPosting) DETACH DELETE t")
-            .map_err(|e| StoreError::Query(format!("clear trigram postings: {e}")))?;
+        // falls back to a full scan. Written on its own auto-committed
+        // connection so it survives the build transaction rolling back.
+        Self::write_trigram_meta(&setup_conn, "building")?;
 
         let candidates = self.collect_candidates(None, None)?;
 
@@ -269,31 +267,55 @@ impl GraphStore {
             }
         }
 
-        let mut stmt = conn
-            .prepare("CREATE (:TrigramPosting {uid: $puid, trigram: $tg, node_uid: $nuid})")
-            .map_err(|e| StoreError::Query(format!("prepare trigram insert: {e}")))?;
-        for (i, (tg, nuid)) in postings.iter().enumerate() {
-            // Synthetic primary key: index-stamped to stay unique.
-            let puid = format!("tg:{i}");
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("puid", Value::String(puid)),
-                    ("tg", Value::String(tg.clone())),
-                    ("nuid", Value::String(nuid.clone())),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("insert trigram: {e}")))?;
-        }
+        // Clear + rebuild + provenance in ONE explicit transaction: per-
+        // statement auto-commit made every posting its own WAL flush, which
+        // is fsync-bound and impractically slow at monorepo scale (20+
+        // minutes on a ~25 MB DB). A single transaction flushes once. It
+        // also makes interruption all-or-nothing: a crashed build rolls
+        // back, leaving the durable "building" marker above to report the
+        // index as stale.
+        let conn = self.begin_transaction()?;
+        let build = (|| -> Result<usize, StoreError> {
+            // Clear existing postings so a rebuild reflects the current graph.
+            conn.query("MATCH (t:TrigramPosting) DETACH DELETE t")
+                .map_err(|e| StoreError::Query(format!("clear trigram postings: {e}")))?;
 
-        // Record provenance so a later reader can detect that the posting
-        // table no longer reflects the graph (nodes added/edited after this
-        // build) and fall back to a full scan instead of silently missing
-        // matches (F-03). Overwrites the "building" marker written at the
-        // start of this rebuild.
-        let meta_value = format!("{}:{}", self.graph_generation(), candidates.len());
-        Self::write_trigram_meta(&conn, &meta_value)?;
-        Ok(postings.len())
+            let mut stmt = conn
+                .prepare("CREATE (:TrigramPosting {uid: $puid, trigram: $tg, node_uid: $nuid})")
+                .map_err(|e| StoreError::Query(format!("prepare trigram insert: {e}")))?;
+            for (i, (tg, nuid)) in postings.iter().enumerate() {
+                // Synthetic primary key: index-stamped to stay unique.
+                let puid = format!("tg:{i}");
+                conn.execute(
+                    &mut stmt,
+                    vec![
+                        ("puid", Value::String(puid)),
+                        ("tg", Value::String(tg.clone())),
+                        ("nuid", Value::String(nuid.clone())),
+                    ],
+                )
+                .map_err(|e| StoreError::Query(format!("insert trigram: {e}")))?;
+            }
+
+            // Record provenance so a later reader can detect that the posting
+            // table no longer reflects the graph (nodes added/edited after this
+            // build) and fall back to a full scan instead of silently missing
+            // matches (F-03). Overwrites the "building" marker written at the
+            // start of this rebuild.
+            let meta_value = format!("{}:{}", self.graph_generation(), candidates.len());
+            Self::write_trigram_meta(&conn, &meta_value)?;
+            Ok(postings.len())
+        })();
+        match build {
+            Ok(n) => {
+                self.commit_transaction(&conn)?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(e)
+            }
+        }
     }
 
     /// Upsert the trigram-index provenance singleton in the `Meta` table
@@ -731,6 +753,13 @@ mod tests {
     use super::*;
     use nestweaver_schema::{Note, NoteKind, Section, Symbol, SymbolKind, Visibility};
 
+    /// Serializes tests that touch the process-global TRIGRAM_STALE_WARNED
+    /// latch: a parallel stale observation (which sets the latch) can land
+    /// between the fresh-index re-arm and its assertion, flaking
+    /// `fresh_index_observation_rearms_stale_warning_latch` under load (seen
+    /// on CI). Every stale-observation test must hold this lock too.
+    static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn store_with_text() -> GraphStore {
         let store = GraphStore::in_memory().unwrap();
 
@@ -1126,6 +1155,7 @@ mod tests {
     /// scan that still finds the new node.
     #[test]
     fn stale_trigram_index_falls_back_to_scan_and_finds_new_nodes() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
 
@@ -1181,6 +1211,7 @@ mod tests {
     /// through the engine) must also mark the index stale.
     #[test]
     fn generation_bump_marks_trigram_index_stale() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
         store.bump_graph_generation();
@@ -1201,6 +1232,7 @@ mod tests {
     /// be trusted — treat them as stale and scan.
     #[test]
     fn trigram_index_without_provenance_is_treated_as_stale() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
         // Simulate a legacy index: drop the provenance row.
@@ -1225,6 +1257,7 @@ mod tests {
     /// built, false for a fresh index, true once the graph drifts.
     #[test]
     fn stale_index_flag_reflects_index_state() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // No index at all: fallback, but NOT stale (nothing to be stale).
         let store = store_with_text();
         let res = store
@@ -1270,6 +1303,7 @@ mod tests {
     /// after a rebuild + restale instead of staying latched forever.
     #[test]
     fn fresh_index_observation_rearms_stale_warning_latch() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
 

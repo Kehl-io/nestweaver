@@ -166,6 +166,11 @@ pub struct MeasuredRecall {
     pub change_recall: f64,
     pub n_joined: usize,
     pub window: usize,
+    /// True when part of the underlying evidence was never rerun-confirmed —
+    /// the recall figures can err in EITHER direction (they are not a
+    /// bound). Consumers must not present the numbers as exact without this
+    /// caveat (P1 review).
+    pub recall_estimate_uncertain: bool,
 }
 
 fn now_rfc3339() -> String {
@@ -184,18 +189,20 @@ fn recording_disabled() -> bool {
 /// (parallel CI steps sharing a DB) can silently lose each other's records
 /// without mutual exclusion. Pattern mirrors investigate.rs's
 /// `BundleStoreLock`: `create_new` lock file, bounded wait, stale-lock
-/// break, RAII cleanup. Recording is best-effort, so on timeout we degrade
-/// to proceeding unlocked rather than failing the record.
+/// break, RAII cleanup. Acquisition failure is an ERROR, not a silent
+/// unlocked pass — proceeding unlocked would reintroduce the very
+/// lost-update race the lock exists to close (P2 review). Recording
+/// failures surface as a non-fatal Note notification on affected-tests,
+/// so erroring here never breaks the selection itself.
 struct SidecarLock {
     path: PathBuf,
-    owned: bool,
 }
 
 impl SidecarLock {
     const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
     const STALE: std::time::Duration = std::time::Duration::from_secs(60);
 
-    fn acquire(sidecar: &Path) -> Self {
+    fn acquire(sidecar: &Path) -> Result<Self> {
         let path = sidecar.with_extension("lock");
         let start = std::time::Instant::now();
         loop {
@@ -204,7 +211,7 @@ impl SidecarLock {
                 .write(true)
                 .open(&path)
             {
-                Ok(_) => return Self { path, owned: true },
+                Ok(_) => return Ok(Self { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Break a lock abandoned by a crashed/killed holder.
                     let stale = std::fs::metadata(&path)
@@ -217,18 +224,19 @@ impl SidecarLock {
                         continue;
                     }
                     if start.elapsed() >= Self::WAIT {
-                        tracing::warn!(
-                            "rts-eval sidecar lock wait exceeded {:?} — proceeding unlocked",
+                        anyhow::bail!(
+                            "timed out acquiring rts-eval sidecar lock {} after {:?} \
+                             (another recorder is holding it)",
+                            path.display(),
                             Self::WAIT
                         );
-                        return Self { path, owned: false };
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                Err(_) => {
-                    // Lock file itself unusable (perms, missing parent) —
-                    // degrade to unlocked; recording must not fail over this.
-                    return Self { path, owned: false };
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("create rts-eval sidecar lock {}", path.display())
+                    });
                 }
             }
         }
@@ -237,9 +245,7 @@ impl SidecarLock {
 
 impl Drop for SidecarLock {
     fn drop(&mut self) {
-        if self.owned {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -249,7 +255,7 @@ fn append_jsonl(path: &Path, line: &str) -> Result<()> {
     // Hold the sidecar lock across append + rotation check: two concurrent
     // recorders interleaving here can each rotate-rewrite over the other's
     // fresh append and silently lose records (P2 review).
-    let _lock = SidecarLock::acquire(path);
+    let _lock = SidecarLock::acquire(path)?;
     {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -259,14 +265,20 @@ fn append_jsonl(path: &Path, line: &str) -> Result<()> {
         f.write_all(line.as_bytes()).context("append record")?;
         f.write_all(b"\n").context("append newline")?;
     }
-    // Rotation: cheap line count; rewrite only on overflow.
+    // Rotation: cheap line count; rewrite only on overflow. The rewrite
+    // goes through atomic_replace_file (tmp + fsync + rename) — a bare
+    // `std::fs::write` truncates in place, so a crash mid-rotation would
+    // destroy the whole history (P2 review).
     let content = std::fs::read_to_string(path).context("read for rotation check")?;
     let lines: Vec<&str> = content.lines().collect();
     if lines.len() > MAX_RECORDS {
         let keep = &lines[lines.len() - MAX_RECORDS..];
         let mut out = keep.join("\n");
         out.push('\n');
-        std::fs::write(path, out).context("rewrite rotated sidecar")?;
+        nestweaver_store::durable_sidecar::atomic_replace_file(path, |f| {
+            f.write_all(out.as_bytes())
+        })
+        .with_context(|| format!("rewrite rotated sidecar {}", path.display()))?;
     }
     Ok(())
 }
@@ -353,7 +365,7 @@ pub fn record_truth(
     let path = crate::sidecar_path(db_path, TRUTH_SUFFIX);
     // Hold the sidecar lock across the whole read → upsert → atomic replace
     // cycle so concurrent recorders don't lose each other's updates.
-    let _lock = SidecarLock::acquire(&path);
+    let _lock = SidecarLock::acquire(&path)?;
 
     // Drop any existing record for the same (repo_uid, sha) before appending.
     // Unparseable lines are preserved verbatim (one bad line must not disable
@@ -407,32 +419,46 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     let (truths, _truth_corrupt) =
         load_jsonl::<TruthRecord>(&crate::sidecar_path(db_path, TRUTH_SUFFIX));
 
-    // Join 1:1 — each truth is consumed by at most ONE selection. Letting
-    // multiple selections at the same sha share one truth (e.g. re-running
-    // the selector N times against one tested commit) manufactures sample
-    // size: one measured outcome would count as N joined pairs and dominate
-    // the recall metrics (P1 review).
+    // Join 1:1, truth-centric and temporal. Each truth pairs with the
+    // LATEST still-unmatched selection at the same sha recorded at or
+    // before the truth's own timestamp — that is the run the truth
+    // actually measures; pairing it with an arbitrary earlier selection
+    // at the same sha could score the outcome against the wrong selected
+    // set (P1 review). When timestamps don't order (clock skew, manual
+    // records) fall back to the earliest unmatched selection at that sha.
+    // Each truth is consumed at most once, so N selector re-runs against
+    // one tested commit can't manufacture sample size (P1 review).
     let mut joined: Vec<(&SelectionRecord, &TruthRecord)> = Vec::new();
+    let mut matched_sel: HashSet<usize> = HashSet::new();
     let mut matched_truth: HashSet<usize> = HashSet::new();
-    let mut unresolved = 0usize;
-    for sel in &selections {
-        if sel.sha == "unknown" || sel.sha.is_empty() {
-            unresolved += 1;
+    let sel_matches = |s: &&SelectionRecord, t: &TruthRecord| {
+        s.sha == t.sha
+            && (t.repo_uid.is_empty() || s.repo_uid.is_empty() || t.repo_uid == s.repo_uid)
+    };
+    for (t_idx, truth) in truths.iter().enumerate() {
+        if truth.sha == "unknown" || truth.sha.is_empty() {
             continue;
         }
-        let hit = truths.iter().enumerate().find(|(idx, t)| {
-            !matched_truth.contains(idx)
-                && t.sha == sel.sha
-                && (t.repo_uid.is_empty() || sel.repo_uid.is_empty() || t.repo_uid == sel.repo_uid)
-        });
-        match hit {
-            Some((idx, t)) => {
-                matched_truth.insert(idx);
-                joined.push((sel, t));
-            }
-            None => unresolved += 1,
+        // Latest unmatched selection with ts <= truth.ts (RFC3339 compares
+        // lexicographically); else earliest unmatched selection at the sha.
+        let hit = selections
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| !matched_sel.contains(i) && sel_matches(s, truth))
+            .rfind(|(_, s)| !s.ts.is_empty() && s.ts <= truth.ts)
+            .or_else(|| {
+                selections
+                    .iter()
+                    .enumerate()
+                    .find(|(i, s)| !matched_sel.contains(i) && sel_matches(s, truth))
+            });
+        if let Some((s_idx, sel)) = hit {
+            matched_sel.insert(s_idx);
+            matched_truth.insert(t_idx);
+            joined.push((sel, truth));
         }
     }
+    let unresolved = selections.len() - matched_sel.len();
     let n_unmatched_truths = truths.len() - matched_truth.len();
 
     if window > 0 && joined.len() > window {
@@ -512,8 +538,14 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
         recall_estimate_uncertain: unconfirmed_failure_runs > 0,
     };
 
-    // Cache for the in-band `measured` disclosure; best-effort.
-    if let Ok(json) = serde_json::to_string_pretty(&report) {
+    // Cache for the in-band `measured` disclosure; best-effort. Only the
+    // canonical lifetime report (window == 0) refreshes the cache — a
+    // `--window N` slice can be insufficient on its own, and caching it
+    // would strip the disclosure from subsequent affected-tests runs even
+    // though lifetime data clears the bar.
+    if window == 0
+        && let Ok(json) = serde_json::to_string_pretty(&report)
+    {
         let _ = std::fs::write(crate::sidecar_path(db_path, REPORT_SUFFIX), json);
     }
 
@@ -654,6 +686,7 @@ pub fn load_measured(db_path: &Path) -> Option<MeasuredRecall> {
         change_recall: report.change_recall?,
         n_joined: report.n_joined,
         window: report.window,
+        recall_estimate_uncertain: report.recall_estimate_uncertain,
     })
 }
 
