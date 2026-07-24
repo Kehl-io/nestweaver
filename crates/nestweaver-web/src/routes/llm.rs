@@ -29,8 +29,15 @@ pub async fn query(
     let seeds: Vec<String> = body
         .query
         .split_whitespace()
+        // Strip surrounding punctuation so natural-language questions seed
+        // resolvable names ("what is main?" -> "main", not "main?", which
+        // matches nothing). Interior characters are kept — identifiers
+        // legitimately contain `_`, `::`, etc.
+        .map(|w| {
+            w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .to_string()
+        })
         .filter(|w| w.len() > 3)
-        .map(|w| w.to_string())
         .collect();
 
     if seeds.is_empty() {

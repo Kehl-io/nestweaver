@@ -2973,6 +2973,38 @@ fn daemon_impact_fail_closed_via_daemon() {
         .code(0);
 }
 
+/// Busy-port honesty: when another process holds the UI port, the daemon's
+/// `serve_ui` returns `ok: false` and the CLI must map that (and any
+/// `ok: false` generally) to a NON-ZERO exit instead of reporting success.
+#[test]
+fn daemon_ui_busy_port_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    // Hold the port with a foreign listener so the daemon's bind probe fails.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    daemon_cmd()
+        .args([
+            "ui",
+            "--db",
+            &db_path.display().to_string(),
+            "--port",
+            &port.to_string(),
+            "--no-open",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("already in use"));
+}
+
 /// Final-hunt regression: `daemon stop` must not declare success while a
 /// daemon is still serving. When the pidfile has been lost (the old launchd
 /// stop path removed it after booting out a dead job, leaving a detached

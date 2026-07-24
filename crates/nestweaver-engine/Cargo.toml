@@ -56,3 +56,6 @@ embed = ["dep:nestweaver-embed"]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
+# Dev-only: parse generated certs to assert the extensions strict verifiers
+# (Python VERIFY_X509_STRICT) require. Same version rcgen itself uses.
+x509-parser = "0.18"

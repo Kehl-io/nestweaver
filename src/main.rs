@@ -545,7 +545,7 @@ enum Commands {
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
     /// to find all symbols that would be affected by a change.
     #[command(
-        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json"
+        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so (text note; under --json the output becomes\nan object with `nodes`, `truncated_by_threshold`, `truncated_by_depth` instead of\nthe usual bare array). Pass --min-score 0 for the full traversal."
     )]
     Impact {
         /// Symbol name or UID to analyze
@@ -563,6 +563,11 @@ enum Commands {
             help = "Minimum edge confidence [0.0-1.0]"
         )]
         confidence: f32,
+        #[arg(
+            long,
+            help = "Minimum impact score for including a dependent [0.0-1.0] (default: 0.10; pass 0 to disable score pruning and get the full traversal)"
+        )]
+        min_score: Option<f64>,
         #[arg(long, help = "Filter by instance ID")]
         instance: Option<String>,
         #[arg(long, help = "Filter to symbols in this repo")]
@@ -808,7 +813,8 @@ enum Commands {
         limit: Option<usize>,
         #[arg(
             long,
-            help = "Approximate token budget for output (takes precedence over --limit)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
+            help = "Approximate token budget for output (1-16000; takes precedence over --limit; matches the MCP brain_context schema)"
         )]
         token_budget: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -1373,6 +1379,11 @@ enum Commands {
     /// EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Symbols not reached
     /// are reported as potentially dead, with confidence scoring based
     /// on visibility.
+    ///
+    /// Known limitation: symbol visibility is not persisted (reads rebuild it
+    /// as Inferred), so confidence scoring cannot distinguish a public API
+    /// from a private helper — treat Low-confidence results as review
+    /// candidates, not proof of deadness.
     #[command(
         after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json"
     )]
@@ -2156,7 +2167,8 @@ enum BrainCommands {
         query: String,
         #[arg(
             long,
-            help = "Maximum results (default: 20, or [limits].default_result_limit from config)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+            help = "Maximum results (minimum 1; default: 20, or [limits].default_result_limit from config; matches the MCP brain_search schema)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -3913,6 +3925,28 @@ fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> 
         println!("{}", serde_json::to_string_pretty(&output)?);
     }
     Ok(())
+}
+
+/// Human-readable caveat for an incomplete `impact` traversal, mirroring the
+/// pr-impact "reported impact is a floor" phrasing. Names the concrete cause
+/// (score pruning / depth cap) and the opt-out for each.
+fn impact_truncation_note(
+    result: &nestweaver_store::ImpactResult,
+    threshold: f64,
+    depth: u32,
+) -> String {
+    let mut parts = Vec::new();
+    if result.truncated_by_threshold {
+        parts.push(format!(
+            "traversal pruned below the impact-score threshold ({threshold:.2}) — re-run with --min-score 0 for the full traversal"
+        ));
+    }
+    if result.truncated_by_depth {
+        parts.push(format!(
+            "traversal hit the depth limit ({depth}) — deeper dependents may exist; raise --depth"
+        ));
+    }
+    format!("{} — reported impact is a floor", parts.join("; "))
 }
 
 /// Pure core of [`no_daemon_allowed`], split out so the policy is unit-testable
@@ -6798,17 +6832,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "default",
                 )) {
                     Ok(resp) if !resp.ok => {
-                        // e.g. port already bound by another process — surface
-                        // the daemon's message instead of falling back (a
-                        // direct fallback would hit the same busy port).
-                        eprintln!("Error: {}", resp.message);
+                        // e.g. port already bound by another process
+                        // (error == "port_in_use") — surface the daemon's
+                        // message instead of falling back (a direct fallback
+                        // would hit the same busy port). Any ok:false maps to
+                        // a non-zero exit.
+                        if resp.error.is_empty() {
+                            eprintln!("Error: {}", resp.message);
+                        } else {
+                            eprintln!("Error [{}]: {}", resp.error, resp.message);
+                        }
                         return Ok((EXIT_ERROR, None));
                     }
                     Ok(resp) if resp.message.starts_with("UI server already running") => {
-                        // The daemon already serves the UI on this port — point
-                        // the user at it instead of pretending to start a
-                        // second server and blocking.
-                        println!("NestWeaver UI: http://127.0.0.1:{port}");
+                        // The daemon already serves the UI — point the user at
+                        // the ACTUAL running port (resp.port), not the one they
+                        // requested, instead of printing a dead URL.
+                        let actual_port = if resp.port != 0 {
+                            resp.port
+                        } else {
+                            port as u32
+                        };
+                        println!("NestWeaver UI: http://127.0.0.1:{actual_port}");
                         println!("{}", resp.message);
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -7863,6 +7908,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             name_or_uid,
             depth,
             confidence,
+            min_score,
             json,
             db,
             repo: repo_filter,
@@ -7874,7 +7920,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
             // which honors it and returns the correct Found/NotFound/Ambiguous exit code. Without
             // this guard, `impact <sym> --repo <r>` would silently resolve across ALL repos.
-            if use_daemon && repo_filter.is_none() {
+            // Likewise, --min-score has no daemon-side equivalent (the brain_impact schema is
+            // additionalProperties:false and the daemon envelope carries no truncation flags),
+            // so an explicit threshold also forces the direct path, where pruning is both
+            // honored and surfaced.
+            if use_daemon && repo_filter.is_none() && min_score.is_none() {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 if let Some(value) = try_hybrid_json_rpc(
                     true,
@@ -8013,11 +8063,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Resolve the symbol UID first (may be a name).
             match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
                 ResolveResult::Found(uid) => {
-                    let nodes = store.impact(&uid, depth, confidence)?;
+                    let threshold = min_score.unwrap_or(nestweaver_store::DEFAULT_IMPACT_THRESHOLD);
+                    let result = store.impact_with_flags_and_threshold(
+                        &uid, depth, confidence, threshold, None,
+                    )?;
+                    let nodes = &result.nodes;
                     let count = nodes.len();
+                    let truncated = result.truncated_by_threshold || result.truncated_by_depth;
 
-                    if json {
-                        // Serialize as JSON array
+                    if json && !truncated {
+                        // nw-086: bare node array (matches the daemon path's --json
+                        // shape) — but ONLY for a complete walk; see below.
                         #[derive(serde::Serialize)]
                         struct ImpactNodeJson {
                             uid: String,
@@ -8041,15 +8097,59 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             })
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&json_nodes)?);
+                    } else if json {
+                        // Truncated walk: a bare array would read as a complete
+                        // answer, so emit an honest object instead (like
+                        // blast_radius's blind_spots) — `nodes` plus the
+                        // truncation flags and a human-readable caveat.
+                        let note = impact_truncation_note(&result, threshold, depth);
+                        eprintln!("note: {note}");
+                        #[derive(serde::Serialize)]
+                        struct ImpactNodeJson<'a> {
+                            uid: &'a str,
+                            name: &'a str,
+                            file_path: &'a str,
+                            start_line: u32,
+                            edge_type: &'a str,
+                            confidence: f32,
+                            depth: u32,
+                        }
+                        let json_nodes: Vec<_> = nodes
+                            .iter()
+                            .map(|n| ImpactNodeJson {
+                                uid: &n.uid,
+                                name: &n.name,
+                                file_path: &n.file_path,
+                                start_line: n.start_line,
+                                edge_type: &n.edge_type,
+                                confidence: n.confidence,
+                                depth: n.depth,
+                            })
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "nodes": json_nodes,
+                                "truncated_by_threshold": result.truncated_by_threshold,
+                                "truncated_by_depth": result.truncated_by_depth,
+                                "note": note,
+                            }))?
+                        );
                     } else if nodes.is_empty() {
                         if !out.quiet {
                             println!("No impact found for '{name_or_uid}'.");
+                        }
+                        if truncated {
+                            println!(
+                                "  note: {}",
+                                impact_truncation_note(&result, threshold, depth)
+                            );
                         }
                     } else {
                         if !out.quiet {
                             println!("Impact of '{name_or_uid}' ({} nodes):", count);
                         }
-                        for n in &nodes {
+                        for n in nodes {
                             if out.verbose {
                                 println!(
                                     "  [depth {}] {} via {} ({:.2}) — {}:{} [{}]",
@@ -8072,6 +8172,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     n.start_line,
                                 );
                             }
+                        }
+                        if truncated {
+                            println!(
+                                "  note: {}",
+                                impact_truncation_note(&result, threshold, depth)
+                            );
                         }
                     }
                     let stats = format!(
@@ -17655,7 +17761,8 @@ mod cli_bounds_tests {
     /// CLI numeric bounds must match the MCP tool schemas (F-12 parity):
     /// impact/blast-radius --depth 1..=15, regex-search --limit 1..=10000,
     /// --max-millis 1..=600000, project-context --token-budget 1..=16000,
-    /// hubs --top 1..=1000, dead-code --limit 1..=1000.
+    /// hubs --top 1..=1000, dead-code --limit 1..=1000,
+    /// context/brain-context --token-budget 1..=16000, brain search --limit >= 1.
     #[test]
     fn numeric_flags_enforce_mcp_schema_bounds() {
         std::thread::Builder::new()
@@ -17697,6 +17804,21 @@ mod cli_bounds_tests {
                         &["nestweaver", "dead-code", "--limit"],
                         &["0", "1001"],
                         &["1", "1000"],
+                    ),
+                    (
+                        &["nestweaver", "context", "sym", "--token-budget"],
+                        &["0", "16001"],
+                        &["1", "16000"],
+                    ),
+                    (
+                        &["nestweaver", "brain", "context", "seed", "--token-budget"],
+                        &["0", "16001"],
+                        &["1", "16000"],
+                    ),
+                    (
+                        &["nestweaver", "brain", "search", "q", "--limit"],
+                        &["0"],
+                        &["1", "20"],
                     ),
                 ];
                 for (prefix, bad, good) in cases {

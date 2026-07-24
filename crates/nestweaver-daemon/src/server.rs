@@ -187,9 +187,12 @@ pub struct DaemonState {
     /// Handle to the server-mode worker-pool task. Awaited on shutdown so an
     /// in-flight index write is allowed to finish rather than being abandoned.
     pub worker_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Handle to the `serve_ui` web-server task, aborted by `stop_ui` so the
-    /// listen port is released when the CLI exits (LOW: ui port leak).
-    pub ui_server: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Handle to the `serve_ui` web-server task plus the port it is bound
+    /// to, aborted by `stop_ui` so the listen port is released when the CLI
+    /// exits (LOW: ui port leak). The port is tracked so a repeated
+    /// `serve_ui` can report the ACTUAL running port instead of echoing the
+    /// requested one (which would send the CLI to a dead URL).
+    pub ui_server: std::sync::Mutex<Option<(u16, tokio::task::JoinHandle<()>)>>,
 }
 
 impl DaemonState {
@@ -329,6 +332,15 @@ fn clear_watcher_registration(state: &DaemonState, id: u64) {
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
 pub struct DaemonService {
     state: Arc<DaemonState>,
+}
+
+/// Mutable state shared by the debounce + circuit-breaker in the watcher's
+/// embed-on-change callback (`make_embed_on_change_with`).
+#[cfg(feature = "embed")]
+struct EmbedOnChangeState {
+    last_pass: Option<std::time::Instant>,
+    all_fail_passes: u32,
+    disabled: bool,
 }
 
 impl DaemonService {
@@ -649,6 +661,26 @@ impl DaemonService {
         result
     }
 
+    /// Minimum interval between embed passes triggered by watcher batches.
+    /// A burst of file saves produces many debounced watcher batches; without
+    /// this throttle each batch synchronously embeds up to 64 nodes INLINE on
+    /// the watcher thread (local-model inference is the dominant CPU cost of
+    /// a watch session), so a 10-file burst could stall the watcher's DB
+    /// writes for minutes at 300%+ CPU. Coalescing to one pass per interval
+    /// keeps embeddings fresh without letting them starve reindexing.
+    #[cfg(feature = "embed")]
+    const EMBED_ON_CHANGE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Consecutive embed passes that attempted nodes but stored nothing
+    /// (every `embed_query` failed or every vector was rejected, e.g. a
+    /// dimension-mismatched/zero-length vector that `add_embedding`
+    /// refuses) before the callback stops retrying. Retrying a
+    /// deterministically-failing embed on every watcher batch is a hot
+    /// loop that burns CPU forever without making progress; the warn tells
+    /// the operator how to recover (`nestweaver embed --force` / restart).
+    #[cfg(feature = "embed")]
+    const EMBED_ON_CHANGE_MAX_ALL_FAIL_PASSES: u32 = 3;
+
     /// Build an `on_change` callback that embeds un-embedded nodes after every
     /// watcher batch.  Returns `None` when the `embed` feature is disabled or
     /// the model is not yet loaded.
@@ -677,7 +709,35 @@ impl DaemonService {
         embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
         store: Arc<nestweaver_store::GraphStore>,
     ) -> Option<Box<dyn Fn() + Send>> {
+        Self::make_embed_on_change_with(embed_model, store, Self::EMBED_ON_CHANGE_MIN_INTERVAL)
+    }
+
+    /// [`Self::make_embed_on_change`] with an injectable debounce interval
+    /// (tests use `Duration::ZERO` to exercise every pass).
+    #[cfg(feature = "embed")]
+    fn make_embed_on_change_with(
+        embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        store: Arc<nestweaver_store::GraphStore>,
+        min_interval: std::time::Duration,
+    ) -> Option<Box<dyn Fn() + Send>> {
+        let state = Arc::new(std::sync::Mutex::new(EmbedOnChangeState {
+            last_pass: None,
+            all_fail_passes: 0,
+            disabled: false,
+        }));
         Some(Box::new(move || {
+            {
+                let mut st = state.lock().unwrap();
+                if st.disabled {
+                    return;
+                }
+                // Debounce: coalesce a burst of watcher batches into at most
+                // one embed pass per interval.
+                if st.last_pass.is_some_and(|t| t.elapsed() < min_interval) {
+                    return;
+                }
+                st.last_pass = Some(std::time::Instant::now());
+            }
             // Peek at the model without blocking async code — we are already
             // in a blocking thread (the watcher thread, inside spawn_blocking).
             let model = {
@@ -686,6 +746,7 @@ impl DaemonService {
             };
             let Some(model) = model else { return };
 
+            let mut attempted = 0u32;
             let mut embedded = 0u32;
             let limit: usize = 64; // Max nodes per watcher cycle
 
@@ -697,6 +758,7 @@ impl DaemonService {
                         &sym.name,
                         None,
                     );
+                    attempted += 1;
                     match model.embed_query(&text) {
                         Ok(emb) => {
                             // Dimension-guard rejections must not count as
@@ -724,6 +786,7 @@ impl DaemonService {
                     .take(remaining)
                 {
                     let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                    attempted += 1;
                     match model.embed_query(&text) {
                         Ok(emb) => {
                             if store.add_embedding(&note.uid, emb) {
@@ -749,6 +812,7 @@ impl DaemonService {
                     .take(remaining)
                 {
                     let text = nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
+                    attempted += 1;
                     match model.embed_query(&text) {
                         Ok(emb) => {
                             if store.add_embedding(&heading.uid, emb) {
@@ -767,6 +831,27 @@ impl DaemonService {
                     tracing::warn!("failed to flush embedding index: {e}");
                 }
                 tracing::debug!(count = embedded, "embedded new nodes from watcher");
+            }
+
+            // Circuit breaker: a pass that attempted nodes but stored none
+            // will fail the same way on every future batch (deterministic
+            // rejection or a dead endpoint). After enough consecutive
+            // all-fail passes, stop retrying instead of hot-looping.
+            let mut st = state.lock().unwrap();
+            if attempted > 0 && embedded == 0 {
+                st.all_fail_passes += 1;
+                if st.all_fail_passes >= Self::EMBED_ON_CHANGE_MAX_ALL_FAIL_PASSES {
+                    st.disabled = true;
+                    tracing::warn!(
+                        passes = st.all_fail_passes,
+                        "watcher embed disabled after repeated all-failed passes \
+                         (every embed_query failed or every vector was rejected); \
+                         fix the embedding model/endpoint and run `nestweaver embed --force` \
+                         or restart the daemon"
+                    );
+                }
+            } else {
+                st.all_fail_passes = 0;
             }
         }))
     }
@@ -2762,12 +2847,16 @@ impl NestWeaverDaemon for DaemonService {
                 .ui_server
                 .lock()
                 .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
-            if let Some(handle) = guard.as_ref()
+            if let Some((running_port, handle)) = guard.as_ref()
                 && !handle.is_finished()
             {
+                // Report the ACTUAL running port, not the requested one —
+                // the CLI prints this port in the URL it shows the user.
                 return Ok(Response::new(ServeUiResponse {
                     ok: true,
-                    message: format!("UI server already running on port {port}"),
+                    message: format!("UI server already running on port {running_port}"),
+                    port: u32::from(*running_port),
+                    error: String::new(),
                 }));
             }
         }
@@ -2777,6 +2866,8 @@ impl NestWeaverDaemon for DaemonService {
                 message: format!(
                     "port {port} is already in use by another process — pick another --port"
                 ),
+                port: 0,
+                error: "port_in_use".to_string(),
             }));
         }
 
@@ -2807,7 +2898,7 @@ impl NestWeaverDaemon for DaemonService {
                 .ui_server
                 .lock()
                 .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
-            *guard = Some(handle);
+            *guard = Some((port, handle));
         }
 
         // If watch mode requested, spawn a CodeWatcher.
@@ -2828,6 +2919,8 @@ impl NestWeaverDaemon for DaemonService {
         Ok(Response::new(ServeUiResponse {
             ok: true,
             message: format!("UI server started on port {port}"),
+            port: u32::from(port),
+            error: String::new(),
         }))
     }
 
@@ -2849,7 +2942,7 @@ impl NestWeaverDaemon for DaemonService {
             guard.take()
         };
         match handle {
-            Some(handle) if !handle.is_finished() => {
+            Some((_port, handle)) if !handle.is_finished() => {
                 // Aborting the task drops the axum listener, releasing the port.
                 handle.abort();
                 Ok(Response::new(StopUiResponse {
@@ -12110,6 +12203,231 @@ mod startup_helper_tests {
             store.has_embedding(&sym_uid),
             "callback should have embedded the pending symbol"
         );
+    }
+
+    /// An `EmbedQueryFn` that counts calls and returns a fixed vector, for
+    /// exercising the debounce + circuit-breaker in `make_embed_on_change`.
+    #[cfg(feature = "embed")]
+    struct CountingEmbed {
+        calls: Arc<AtomicU32>,
+        vector: Vec<f32>,
+    }
+
+    #[cfg(feature = "embed")]
+    impl nestweaver_engine::EmbedQueryFn for CountingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.vector.clone())
+        }
+    }
+
+    /// Insert one un-embedded symbol so the embed callback has work to do.
+    #[cfg(feature = "embed")]
+    fn insert_unembedded_symbol(store: &GraphStore, uid: &str) {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+        store
+            .insert_symbol(&Symbol {
+                uid: uid.to_string(),
+                name: format!("name_{uid}"),
+                kind: SymbolKind::Function,
+                repo_uid: "repo-1".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn f()".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+    }
+
+    /// Invoke the callback on a blocking thread — it uses
+    /// `embed_model.blocking_read()`, which panics in an async context
+    /// (mirrors how the watcher thread calls it).
+    #[cfg(feature = "embed")]
+    async fn run_embed_cb(cb: Arc<std::sync::Mutex<Box<dyn Fn() + Send>>>) {
+        tokio::task::spawn_blocking(move || (cb.lock().unwrap())())
+            .await
+            .unwrap();
+    }
+
+    /// Regression (re-embedding stalls the watcher, #perf): back-to-back
+    /// watcher batches must NOT each pay a full inline embed pass — passes
+    /// are debounced to at most one per interval so a burst of saves can't
+    /// stall the watcher's DB writes behind local-model inference.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_embed_debounces_back_to_back_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&dir.path().join("brain.lbug")).unwrap());
+        insert_unembedded_symbol(&store, "sym-debounce");
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let probe = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1_f32, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+
+        let cb = Arc::new(std::sync::Mutex::new(
+            DaemonService::make_embed_on_change_with(
+                embed_model,
+                store,
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("embed callback should be present when a model is loaded"),
+        ));
+
+        run_embed_cb(cb.clone()).await;
+        run_embed_cb(cb.clone()).await;
+        run_embed_cb(cb).await;
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "batches within the debounce window must skip the embed pass"
+        );
+    }
+
+    /// Regression (hot retry loop): when every vector is rejected (e.g. a
+    /// dimension-mismatched/zero-length vector that `add_embedding`
+    /// refuses — the zero-vector case), retrying the same nodes on every
+    /// watcher batch burns CPU forever without progress. After enough
+    /// consecutive all-failed passes the callback must stop calling the
+    /// model.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_embed_circuit_breaks_after_repeated_all_fail_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&dir.path().join("brain.lbug")).unwrap());
+        insert_unembedded_symbol(&store, "sym-reject");
+        // Establish a dim-2 embedding index so the probe's dim-3 vector is
+        // always REJECTED by add_embedding's dimension guard.
+        assert!(store.add_embedding("seed-uid", vec![1.0_f32, 0.0]));
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let probe = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1_f32, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+
+        let cb = Arc::new(std::sync::Mutex::new(
+            DaemonService::make_embed_on_change_with(
+                embed_model,
+                store,
+                std::time::Duration::ZERO, // every pass runs
+            )
+            .expect("embed callback should be present when a model is loaded"),
+        ));
+
+        for _ in 0..DaemonService::EMBED_ON_CHANGE_MAX_ALL_FAIL_PASSES {
+            run_embed_cb(cb.clone()).await;
+        }
+        let after_failures = calls.load(Ordering::Relaxed);
+        assert_eq!(
+            after_failures,
+            DaemonService::EMBED_ON_CHANGE_MAX_ALL_FAIL_PASSES,
+            "each all-fail pass attempts the model exactly once"
+        );
+
+        // The circuit is now open: further batches must not call the model.
+        run_embed_cb(cb.clone()).await;
+        run_embed_cb(cb).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            after_failures,
+            "after repeated all-fail passes the callback must stop retrying the model"
+        );
+    }
+
+    /// Grab a free localhost port (bind :0, read the port, release).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn admin_serve_ui_request(port: u16) -> Request<ServeUiRequest> {
+        let mut request = Request::new(ServeUiRequest {
+            port: u32::from(port),
+            open_browser: false,
+            watch: false,
+            watch_repo_path: String::new(),
+            watch_instance_id: "default".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        request
+    }
+
+    /// Regression (dead URL): when the UI is already running, `serve_ui`
+    /// must report the ACTUAL running port — not the requested one —
+    /// because the CLI prints that port in the URL it shows the user.
+    #[tokio::test]
+    async fn serve_ui_already_running_reports_actual_port() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+
+        let port_a = free_port();
+        let resp = service
+            .serve_ui(admin_serve_ui_request(port_a))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "first serve_ui must start: {}", resp.message);
+        assert_eq!(resp.port, u32::from(port_a));
+        assert!(resp.error.is_empty());
+
+        // Re-ask with a DIFFERENT port: the response must carry port A.
+        let port_b = free_port();
+        let resp = service
+            .serve_ui(admin_serve_ui_request(port_b))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert_eq!(
+            resp.port,
+            u32::from(port_a),
+            "already-running response must report the ACTUAL port, not the requested one"
+        );
+        assert!(
+            resp.message.contains(&port_a.to_string()),
+            "message must name the actual port: {}",
+            resp.message
+        );
+    }
+
+    /// Regression (ambiguous failure): a port bound by a FOREIGN process
+    /// must come back as ok:false with a machine-readable `port_in_use`
+    /// error code so the CLI can map it to a non-zero exit.
+    #[tokio::test]
+    async fn serve_ui_foreign_busy_port_returns_port_in_use() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy_port = blocker.local_addr().unwrap().port();
+
+        let resp = service
+            .serve_ui(admin_serve_ui_request(busy_port))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert_eq!(resp.error, "port_in_use");
+        assert_eq!(resp.port, 0);
+        drop(blocker);
     }
 
     /// Build a minimal `DaemonState` with a writer-mode Tantivy index for

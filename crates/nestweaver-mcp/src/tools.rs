@@ -1440,6 +1440,127 @@ fn mix_visibility_cache_key(base: u64, salt: u64) -> u64 {
     hasher.finish()
 }
 
+// ── Single-flight coalescing for cache misses ────────────────────────────────
+/// Identical concurrent cacheable calls (same tool, args, visibility,
+/// generation, scope) otherwise stampede: every dispatch thread misses its
+/// thread-local response cache and runs the same expensive query — a
+/// brain_context semantic leg is a full BERT forward pass, so 30 parallel
+/// identical calls burned 30 embeds and piled into the tool timeout.
+/// Coalesce them: the first caller (leader) computes, followers wait on the
+/// shared slot and receive a clone of the leader's result. `anyhow::Error`
+/// is not `Clone`, so the slot carries the error's message and followers
+/// re-wrap it.
+struct InFlightSlot {
+    result: std::sync::Mutex<Option<Result<Value, String>>>,
+    ready: std::sync::Condvar,
+}
+
+/// In-flight key: everything that identifies one deterministic computation —
+/// db identity, the visibility-salted response-cache key, and the freshness
+/// pair (graph generation, whole-db scope digest) the response cache uses.
+type InFlightKey = (std::path::PathBuf, u64, u64, u64);
+
+static IN_FLIGHT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<InFlightKey, std::sync::Arc<InFlightSlot>>>,
+> = std::sync::OnceLock::new();
+
+/// RAII handle for the leader of a coalesced computation. Dropping it —
+/// normal return, error, or panic unwind alike — removes the flight entry
+/// and wakes every follower; if no result was stored (panic path) followers
+/// receive an error instead of waiting forever.
+struct FlightLeader {
+    key: InFlightKey,
+    slot: std::sync::Arc<InFlightSlot>,
+}
+
+impl FlightLeader {
+    /// Store the outcome for waiting followers; `drop` then unregisters the
+    /// flight and notifies them.
+    fn finish(self, result: Result<Value, String>) {
+        *self.slot.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+    }
+}
+
+impl Drop for FlightLeader {
+    fn drop(&mut self) {
+        if let Some(flights) = IN_FLIGHT.get() {
+            let mut flights = flights.lock().unwrap_or_else(|e| e.into_inner());
+            // Remove only if the entry still points at THIS slot — a later
+            // leader for the same key may already have replaced it.
+            if flights
+                .get(&self.key)
+                .is_some_and(|s| std::sync::Arc::ptr_eq(s, &self.slot))
+            {
+                flights.remove(&self.key);
+            }
+        }
+        let mut result = self.slot.result.lock().unwrap_or_else(|e| e.into_inner());
+        if result.is_none() {
+            *result = Some(Err(
+                "in-flight leader dropped before producing a result".to_string()
+            ));
+        }
+        drop(result);
+        self.slot.ready.notify_all();
+    }
+}
+
+/// Run `compute` at most once among concurrent callers sharing `key`
+/// (single-flight). The first caller computes; followers block on the shared
+/// slot's condvar and receive a clone of the leader's result. Followers
+/// inherit the leader's cancellation/failure — for an identical query that
+/// is the same outcome they would have produced themselves.
+fn coalesce_in_flight(
+    key: InFlightKey,
+    compute: impl FnOnce() -> Result<Value, anyhow::Error>,
+) -> Result<Value, anyhow::Error> {
+    let (slot, leader) = {
+        let flights =
+            IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut flights = flights.lock().unwrap_or_else(|e| e.into_inner());
+        match flights.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                (std::sync::Arc::clone(e.get()), None)
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let slot = std::sync::Arc::new(InFlightSlot {
+                    result: std::sync::Mutex::new(None),
+                    ready: std::sync::Condvar::new(),
+                });
+                e.insert(std::sync::Arc::clone(&slot));
+                let leader = FlightLeader {
+                    key,
+                    slot: std::sync::Arc::clone(&slot),
+                };
+                (slot, Some(leader))
+            }
+        }
+    };
+
+    let Some(leader) = leader else {
+        // Follower: wait for the leader to publish its result, then share it.
+        let mut result = slot.result.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(res) = &*result {
+                return match res {
+                    Ok(value) => Ok(value.clone()),
+                    Err(msg) => Err(anyhow!("{msg}")),
+                };
+            }
+            result = slot.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+        }
+    };
+
+    let result = compute();
+    leader.finish(
+        result
+            .as_ref()
+            .map(|v| v.clone())
+            .map_err(|e| format!("{e:#}")),
+    );
+    result
+}
+
 fn maybe_cached(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -1492,7 +1613,12 @@ fn maybe_cached(
     }
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)?;
+    // Single-flight: concurrent identical calls share one computation
+    // instead of stampeding it (see `coalesce_in_flight`).
+    let flight_key: InFlightKey = (db_path.clone(), key, generation, scope_digest);
+    let result = coalesce_in_flight(flight_key, || {
+        dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
+    })?;
     if store.is_index_publication_dirty() || store.graph_generation() != generation {
         return Ok(result);
     }
@@ -2518,7 +2644,7 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "weight_semantic": {
                     "type": "number",
-                    "description": "Semantic embedding weight for hybrid RRF fusion. Default 0.0 (disabled until embeddings are generated)."
+                    "description": "Semantic embedding weight for hybrid RRF fusion. Effective default is 0.0 — the semantic leg is skipped entirely (no BERT embed of the query) until embeddings are generated for the database (`nestweaver embed`); on embedded databases the default is 0.35."
                 },
                 "since": {
                     "type": "string",
@@ -5728,16 +5854,19 @@ fn tool_brain_impact(
         }
     };
 
-    let mut nodes = if let Some(owners) = &owners {
+    let result = if let Some(owners) = &owners {
         let allowed: HashSet<String> = owners
             .iter()
             .filter(|(_, repo_uid)| repo_is_visible(repo_uid, visible))
             .map(|(uid, _)| uid.clone())
             .collect();
-        store.impact_cancellable_within(&uid, depth, 0.0, &allowed, cancel)?
+        store.impact_with_flags_within(&uid, depth, 0.0, &allowed, cancel)?
     } else {
-        store.impact_cancellable(&uid, depth, 0.0, cancel)?
+        store.impact_with_flags(&uid, depth, 0.0, cancel)?
     };
+    let truncated_by_threshold = result.truncated_by_threshold;
+    let truncated_by_depth = result.truncated_by_depth;
+    let mut nodes = result.nodes;
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
 
@@ -5772,6 +5901,19 @@ fn tool_brain_impact(
         "impact_nodes": rows,
         "total": total,
         "returned": rows.len(),
+        // Honesty flags (same semantics as blast_radius): when either is set
+        // the reported impact set is a FLOOR, not the full reverse-closure.
+        "truncated_by_threshold": truncated_by_threshold,
+        "truncated_by_depth": truncated_by_depth,
+        "note": if truncated_by_threshold {
+            (truncated_by_threshold || truncated_by_depth).then_some(
+                "paths pruned below the impact-score threshold — reported impact is a floor, not the full set",
+            )
+        } else {
+            truncated_by_depth.then_some(
+                "frontier reached max depth — deeper dependents may exist beyond the returned set",
+            )
+        },
     }))
 }
 
@@ -7513,7 +7655,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private/internal), Medium (inferred visibility), Low (public/library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Public symbols flagged as Low confidence may be consumed by external code",
+        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private/internal), Medium (inferred visibility), Low (public/library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Visibility is not persisted from the parser, so every symbol is scored at inferred (Medium) confidence — the documented High/Low tiers cannot fire; treat min_confidence filters accordingly (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9967,6 +10109,11 @@ mod cache_dispatch_tests {
         store
             .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
             .unwrap();
+        // Seed one embedding so the semantic (vector KNN) leg actually runs:
+        // on an un-embedded db that leg is skipped entirely
+        // (`store_has_embeddings`) and the pre-cancelled flag would never
+        // trip inside it.
+        assert!(store.add_embedding("sym:cancel-probe", vec![1.0, 0.0, 0.0]));
 
         let embed = FixedEmbed(vec![1.0, 0.0, 0.0]);
         let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
@@ -10138,6 +10285,118 @@ mod cache_dispatch_tests {
         assert!(
             concise > detailed,
             "concise must fit more nodes in the same budget: concise={concise} detailed={detailed}"
+        );
+    }
+
+    // ── Single-flight coalescing ──────────────────────────────────────────
+
+    /// Poll the IN_FLIGHT map until the slot for `key` reaches the requested
+    /// strong-count condition (or fail after a generous deadline).
+    fn wait_for_flight_count(key: &InFlightKey, cond: impl Fn(usize) -> bool) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let count = IN_FLIGHT.get().and_then(|flights| {
+                flights
+                    .lock()
+                    .ok()
+                    .and_then(|f| f.get(key).map(std::sync::Arc::strong_count))
+            });
+            if let Some(c) = count
+                && cond(c)
+            {
+                return c;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "flight never reached the expected state"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Deterministic overlap: block the leader inside `compute` until the
+    /// follower has registered on the same flight (observed via the slot's
+    /// Arc strong count), then release it. The computation must run exactly
+    /// once and both callers must receive the same value — the stampede fix
+    /// for concurrent identical brain_context calls.
+    #[test]
+    fn single_flight_coalesces_concurrent_identical_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let key: InFlightKey = (
+            std::path::PathBuf::from("/tmp/single-flight-test.lbug"),
+            7,
+            8,
+            9,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Barrier::new(2));
+
+        let leader_key = key.clone();
+        let leader_calls = Arc::clone(&calls);
+        let leader_release = Arc::clone(&release);
+        let leader = std::thread::spawn(move || {
+            coalesce_in_flight(leader_key, move || {
+                leader_calls.fetch_add(1, Ordering::SeqCst);
+                // Hold the flight open until the main thread has watched the
+                // follower attach, then released us below.
+                leader_release.wait();
+                Ok(json!({ "answer": 42 }))
+            })
+        });
+
+        // Wait for the leader to register its flight, then attach a follower.
+        let baseline = wait_for_flight_count(&key, |c| c >= 1);
+        let follower_key = key.clone();
+        let follower = std::thread::spawn(move || {
+            coalesce_in_flight(follower_key, || {
+                panic!("follower must never run the computation")
+            })
+        });
+        wait_for_flight_count(&key, |c| c > baseline);
+
+        release.wait(); // let the leader finish
+        let leader_result = leader.join().expect("leader thread panicked");
+        let follower_result = follower.join().expect("follower thread panicked");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "identical concurrent calls must share one computation"
+        );
+        assert_eq!(leader_result.unwrap(), json!({ "answer": 42 }));
+        assert_eq!(
+            follower_result.unwrap(),
+            json!({ "answer": 42 }),
+            "follower must receive a clone of the leader's result"
+        );
+    }
+
+    /// A failed leader cleans up: followers get the error, and a later call
+    /// with the same key recomputes instead of poisoning the flight map.
+    #[test]
+    fn single_flight_error_propagates_and_cleans_up() {
+        let key: InFlightKey = (
+            std::path::PathBuf::from("/tmp/single-flight-error-test.lbug"),
+            1,
+            2,
+            3,
+        );
+
+        let err = coalesce_in_flight(key.clone(), || Err(anyhow!("boom"))).unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+
+        // The flight entry must be gone and the next call must compute fresh.
+        let ok = coalesce_in_flight(key.clone(), || Ok(json!("recovered"))).unwrap();
+        assert_eq!(ok, json!("recovered"));
+        let entry_gone = IN_FLIGHT
+            .get()
+            .map(|f| !f.lock().unwrap().contains_key(&key))
+            .unwrap_or(true);
+        assert!(
+            entry_gone,
+            "flight entry must be removed after the leader finishes"
         );
     }
 }

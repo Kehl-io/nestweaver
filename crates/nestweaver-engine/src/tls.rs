@@ -68,6 +68,9 @@ pub fn generate_tls_bundle(
     ca_params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
     ca_params.not_after = OffsetDateTime::now_utc() + Duration::days(i64::from(validity_days) * 3);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    // Self-issued AKI (= own SKI): strict verifiers (e.g. Python 3.13+
+    // VERIFY_X509_STRICT) want the extension present even on roots.
+    ca_params.use_authority_key_identifier_extension = true;
 
     let ca = CertifiedIssuer::self_signed(ca_params, ca_key).context("self-sign CA certificate")?;
 
@@ -99,6 +102,17 @@ pub fn generate_tls_bundle(
     server_params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
     server_params.not_after = OffsetDateTime::now_utc() + Duration::days(i64::from(validity_days));
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    // Extensions required by strict verifiers (Python 3.13+ VERIFY_X509_STRICT
+    // rejects the handshake with "Missing Authority Key Identifier"):
+    // - AKI naming the issuing CA,
+    // - explicit basicConstraints CA:FALSE (critical) + SKI via ExplicitNoCa,
+    // - key usage appropriate for a TLS server key.
+    server_params.use_authority_key_identifier_extension = true;
+    server_params.is_ca = IsCa::ExplicitNoCa;
+    server_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
 
     let server_cert = server_params
         .signed_by(&server_key, &*ca)
@@ -229,6 +243,86 @@ mod tests {
         ];
         let bundle = generate_tls_bundle(&names, 30, false).unwrap();
         assert!(bundle.server_cert_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    /// Strict verifiers (Python 3.13+ `VERIFY_X509_STRICT`) reject handshakes
+    /// whose certificates lack an Authority Key Identifier. Parse the
+    /// generated certs and assert the extensions they require are present.
+    #[test]
+    fn certs_carry_extensions_required_by_strict_verifiers() {
+        use x509_parser::extensions::ParsedExtension;
+        use x509_parser::prelude::*;
+
+        fn key_identifier(cert: &X509Certificate<'_>, authority: bool) -> Option<Vec<u8>> {
+            cert.extensions()
+                .iter()
+                .find_map(|ext| match (ext.parsed_extension(), authority) {
+                    (ParsedExtension::AuthorityKeyIdentifier(aki), true) => {
+                        aki.key_identifier.as_ref().map(|ki| ki.0.to_vec())
+                    }
+                    (ParsedExtension::SubjectKeyIdentifier(ki), false) => Some(ki.0.to_vec()),
+                    _ => None,
+                })
+        }
+
+        let bundle = generate_tls_bundle(&[], 365, false).unwrap();
+        let (_, ca_pem) =
+            x509_parser::pem::parse_x509_pem(bundle.ca_cert_pem.as_bytes()).expect("parse CA PEM");
+        let (_, ca) = X509Certificate::from_der(&ca_pem.contents).expect("parse CA DER");
+        let (_, server_pem) = x509_parser::pem::parse_x509_pem(bundle.server_cert_pem.as_bytes())
+            .expect("parse server PEM");
+        let (_, server) =
+            X509Certificate::from_der(&server_pem.contents).expect("parse server DER");
+
+        // CA: self-issued AKI, SKI, critical CA:TRUE basicConstraints,
+        // keyCertSign key usage.
+        let ca_ski =
+            key_identifier(&ca, false).expect("CA cert must carry a Subject Key Identifier");
+        assert_eq!(
+            key_identifier(&ca, true).as_deref(),
+            Some(ca_ski.as_slice()),
+            "CA cert must carry an Authority Key Identifier naming its own SKI"
+        );
+        let ca_bc = ca
+            .basic_constraints()
+            .unwrap()
+            .expect("CA basicConstraints");
+        assert!(ca_bc.critical && ca_bc.value.ca, "CA must be a critical CA");
+        let ca_ku = ca.key_usage().unwrap().expect("CA key usage");
+        assert!(ca_ku.value.key_cert_sign(), "CA must allow keyCertSign");
+
+        // Server: AKI naming the CA's SKI, critical CA:FALSE basicConstraints,
+        // SKI, digitalSignature key usage, serverAuth EKU.
+        assert_eq!(
+            key_identifier(&server, true).as_deref(),
+            Some(ca_ski.as_slice()),
+            "server cert must carry an Authority Key Identifier naming the issuing CA"
+        );
+        assert!(
+            key_identifier(&server, false).is_some(),
+            "server cert must carry a Subject Key Identifier"
+        );
+        let server_bc = server
+            .basic_constraints()
+            .unwrap()
+            .expect("server basicConstraints");
+        assert!(
+            server_bc.critical && !server_bc.value.ca,
+            "server cert must assert CA:FALSE"
+        );
+        let server_ku = server.key_usage().unwrap().expect("server key usage");
+        assert!(
+            server_ku.value.digital_signature(),
+            "server key usage must include digitalSignature"
+        );
+        let server_eku = server
+            .extended_key_usage()
+            .unwrap()
+            .expect("server extended key usage");
+        assert!(
+            server_eku.value.server_auth,
+            "server EKU must include serverAuth"
+        );
     }
 
     #[test]

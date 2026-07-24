@@ -633,6 +633,34 @@ async fn llm_query_extracts_keywords() {
 }
 
 #[tokio::test]
+async fn llm_query_strips_punctuation_from_seeds() {
+    // Regression: "what is main?" used to seed "main?" — which never resolves
+    // — because trailing punctuation was kept. Seeds must be punctuation-free.
+    let app = make_app();
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/llm/query",
+        json!({ "query": "what is authentication?" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let seeds: Vec<&str> = json["seeds"]
+        .as_array()
+        .expect("seeds should be an array")
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert!(
+        seeds.contains(&"authentication"),
+        "trailing '?' must be stripped from the seed, got: {seeds:?}"
+    );
+    assert!(
+        seeds.iter().all(|s| !s.ends_with('?')),
+        "no seed may keep trailing punctuation, got: {seeds:?}"
+    );
+}
+
+#[tokio::test]
 async fn llm_query_short_words_returns_400() {
     let app = make_app();
     let (status, _) = post_json(&app, "/api/v1/llm/query", json!({ "query": "a b c" })).await;

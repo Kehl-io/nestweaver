@@ -578,10 +578,15 @@ fn resolve_single_reference(
     })
 }
 
-/// Find the enclosing symbol: the symbol with the largest start_line that is <= reference line.
+/// Find the enclosing symbol: the innermost symbol whose span contains the
+/// reference line (`start_line <= ref_line <= end_line`).
 ///
 /// Requires `symbols` to be sorted by `start_line` ascending (tree-sitter LR-parser guarantee).
-/// Uses binary search (O(log n)) instead of a linear scan (O(n)).
+/// Binary search finds the last symbol starting at or before `ref_line`; if that
+/// symbol's span does not contain the line (e.g. Python module-level statements
+/// like `if __name__ == '__main__':` after the last `def`), walk back to an
+/// earlier symbol whose span does — or return `None` when the reference is
+/// module-level code that belongs to no symbol.
 fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Option<&'a RawSymbol> {
     debug_assert!(
         symbols
@@ -594,10 +599,13 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Opt
     }
     let idx = symbols.partition_point(|s| s.start_line <= ref_line);
     if idx == 0 {
-        None
-    } else {
-        Some(symbols[idx - 1])
+        return None;
     }
+    symbols[..idx]
+        .iter()
+        .rev()
+        .find(|s| ref_line <= s.end_line.max(s.start_line))
+        .copied()
 }
 
 #[cfg(test)]
@@ -611,7 +619,9 @@ mod tests {
             name: name.to_string(),
             kind: SymbolKind::Function,
             start_line: line,
-            end_line: line,
+            // Real parser spans cover the body; keep fixtures realistic so the
+            // enclosing-symbol end_line check behaves like production.
+            end_line: line + 5,
             signature: format!("function {name}()"),
             content_hash: String::new(),
             is_entry_point: false,
@@ -1061,12 +1071,12 @@ mod tests {
 
     #[test]
     fn find_enclosing_symbol_binary_search_correctness() {
-        // Helper that runs both the old linear scan and the new binary search,
-        // asserting they agree, then returns the start_line of the result.
+        // Helper that runs both an end-line-aware linear scan and the binary
+        // search, asserting they agree, then returns the start_line of the result.
         fn linear_scan(symbols: &[RawSymbol], ref_line: u32) -> Option<u32> {
             symbols
                 .iter()
-                .filter(|s| s.start_line <= ref_line)
+                .filter(|s| s.start_line <= ref_line && ref_line <= s.end_line.max(s.start_line))
                 .max_by_key(|s| s.start_line)
                 .map(|s| s.start_line)
         }
@@ -1090,6 +1100,7 @@ mod tests {
         // Empty slice → None
         assert!(check(&[], 5).is_none());
 
+        // make_symbol spans line..=line+5
         let symbols = vec![
             make_symbol("a", 10),
             make_symbol("b", 20),
@@ -1102,20 +1113,43 @@ mod tests {
         // ref_line exactly on first symbol → first symbol
         assert_eq!(check(&symbols, 10), Some(10));
 
-        // ref_line between first and second → first symbol
+        // ref_line between first and second, inside first's span → first symbol
         assert_eq!(check(&symbols, 15), Some(10));
 
         // ref_line exactly on second symbol → second symbol
         assert_eq!(check(&symbols, 20), Some(20));
 
-        // ref_line between second and third → second symbol
+        // ref_line between second and third, inside second's span → second symbol
         assert_eq!(check(&symbols, 25), Some(20));
 
         // ref_line exactly on last symbol → last symbol
         assert_eq!(check(&symbols, 30), Some(30));
 
-        // ref_line after all symbols → last symbol
-        assert_eq!(check(&symbols, 999), Some(30));
+        // ref_line inside last symbol's span → last symbol
+        assert_eq!(check(&symbols, 35), Some(30));
+
+        // ref_line past every symbol's end → None (module-level code,
+        // e.g. Python `if __name__ == '__main__':` after the last def)
+        assert!(check(&symbols, 999).is_none());
+
+        // ref_line in the gap between two symbols' spans → None
+        let gapped = vec![make_symbol("a", 10), make_symbol("b", 30)];
+        assert!(check(&gapped, 20).is_none());
+
+        // Nested spans: ref past the inner symbol's end but inside the outer
+        // one falls back to the outer symbol.
+        let mut outer = make_symbol("outer", 10);
+        outer.end_line = 100;
+        let mut inner = make_symbol("inner", 20);
+        inner.end_line = 30;
+        let nested = vec![outer, inner];
+        assert_eq!(check(&nested, 25), Some(20), "inside inner → inner");
+        assert_eq!(
+            check(&nested, 50),
+            Some(10),
+            "past inner's end but inside outer → outer"
+        );
+        assert!(check(&nested, 200).is_none(), "past outer's end → None");
 
         // Single symbol — before it → None
         let single = vec![make_symbol("only", 5)];
@@ -1124,14 +1158,302 @@ mod tests {
         // Single symbol — exactly on it → that symbol
         assert_eq!(check(&single, 5), Some(5));
 
-        // Single symbol — after it → that symbol
-        assert_eq!(check(&single, 50), Some(5));
+        // Single symbol — inside its span → that symbol
+        assert_eq!(check(&single, 8), Some(5));
+
+        // Single symbol — past its end → None
+        assert!(check(&single, 50).is_none());
 
         // Two symbols with same start_line — either is correct; just verify no panic
         // and that it agrees with linear scan.
         let dupes = vec![make_symbol("x", 10), make_symbol("y", 10)];
         let result = check(&dupes, 10);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn python_module_level_call_after_last_def_gets_no_edge() {
+        // def main(): ...        lines 1-2
+        // def dead_helper(): ... lines 4-5
+        // if __name__ == '__main__': main()   lines 7-8 — module level
+        let mut main_fn = make_symbol("main", 1);
+        main_fn.end_line = 2;
+        let mut dead_helper = make_symbol("dead_helper", 4);
+        dead_helper.end_line = 5;
+
+        let files = vec![(
+            "app/__main__.py".to_string(),
+            vec![main_fn, dead_helper],
+            vec![make_ref("main", ReferenceKind::Call, 8)],
+        )];
+
+        let edges = resolve_references(&files, Language::Python, "repo:test:abc");
+        assert!(
+            edges.is_empty(),
+            "module-level call after the last def must not be attributed to the \
+             preceding function (phantom dead_helper → main edge); got: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn python_call_inside_preceding_function_still_resolves() {
+        // Same shape as the module-level case, but the call is inside
+        // dead_helper's span — the enclosing-symbol attribution must survive.
+        let mut main_fn = make_symbol("main", 1);
+        main_fn.end_line = 2;
+        let mut dead_helper = make_symbol("dead_helper", 4);
+        dead_helper.end_line = 8;
+
+        let files = vec![(
+            "app/mod.py".to_string(),
+            vec![main_fn, dead_helper],
+            vec![make_ref("main", ReferenceKind::Call, 6)],
+        )];
+
+        let edges = resolve_references(&files, Language::Python, "repo:test:abc");
+        let call = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Calls)
+            .expect("call inside the function body should still produce an edge");
+        let expected_source = symbol_uid("repo:test:abc", "app/mod.py", "dead_helper", 4);
+        assert_eq!(call.source_uid, expected_source);
+    }
+
+    #[test]
+    fn rust_cross_crate_qualified_call_resolves() {
+        // crates/nestweaver-daemon/src/server.rs:
+        //   use nestweaver_engine::rts_eval;
+        //   fn run() { rts_eval::sidecar_path("x"); }
+        // The qualified call must produce a CALLS edge to the engine crate's
+        // sidecar_path, not "unresolved:sidecar_path".
+        let mut sidecar_path = make_symbol("sidecar_path", 10);
+        sidecar_path.end_line = 20;
+        let mut run_fn = make_symbol("run", 3);
+        run_fn.end_line = 10;
+
+        let files = vec![
+            (
+                "crates/nestweaver-daemon/src/server.rs".to_string(),
+                vec![run_fn],
+                vec![
+                    make_ref("nestweaver_engine::rts_eval", ReferenceKind::Import, 1),
+                    make_ref("sidecar_path", ReferenceKind::Call, 5),
+                ],
+            ),
+            (
+                "crates/nestweaver-daemon/src/main.rs".to_string(),
+                vec![make_symbol("main", 1)],
+                vec![],
+            ),
+            (
+                "crates/nestweaver-engine/src/lib.rs".to_string(),
+                vec![make_symbol("Engine", 1)],
+                vec![],
+            ),
+            (
+                "crates/nestweaver-engine/src/rts_eval.rs".to_string(),
+                vec![sidecar_path],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let call = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Calls)
+            .expect("cross-crate call should produce a CALLS edge; got: {edges:?}");
+        let expected_target = symbol_uid(
+            "repo:test:abc",
+            "crates/nestweaver-engine/src/rts_eval.rs",
+            "sidecar_path",
+            10,
+        );
+        assert_eq!(
+            call.target_uid, expected_target,
+            "qualified call must resolve to the sibling crate's function"
+        );
+        let expected_confidence = confidence_score(MatchType::ImportResolved, Language::Rust);
+        assert!(
+            (call.confidence - expected_confidence).abs() < f32::EPSILON,
+            "expected import-resolved confidence {expected_confidence}, got {}",
+            call.confidence
+        );
+    }
+
+    #[test]
+    fn rust_integration_test_use_crate_under_test_resolves() {
+        // tests/beta_it.rs: `use fixture_repo::beta::b;` then `b()` — the
+        // crate-under-test import must resolve so affected-tests sees the
+        // test as a dependent of src/beta.rs.
+        let mut b_fn = make_symbol("b", 3);
+        b_fn.end_line = 8;
+        let mut test_fn = make_symbol("it_works", 4);
+        test_fn.end_line = 10;
+
+        let files = vec![
+            (
+                "src/lib.rs".to_string(),
+                vec![make_symbol("fixture_repo", 1)],
+                vec![],
+            ),
+            ("src/beta.rs".to_string(), vec![b_fn], vec![]),
+            (
+                "tests/beta_it.rs".to_string(),
+                vec![test_fn],
+                vec![
+                    make_ref("fixture_repo::beta::b", ReferenceKind::Import, 1),
+                    make_ref("b", ReferenceKind::Call, 6),
+                ],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+
+        // The import itself must resolve (IMPORTS edge into src/beta.rs)…
+        let expected_target = symbol_uid("repo:test:abc", "src/beta.rs", "b", 3);
+        let import_edge = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Imports && e.target_uid == expected_target);
+        assert!(
+            import_edge.is_some(),
+            "integration-test import should create an IMPORTS edge into src/beta.rs; got: {edges:?}"
+        );
+
+        // …and the call must resolve to src/beta.rs's `b`, giving RTS a
+        // CALLS dependency from the test to the changed file.
+        let call = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Calls && e.target_uid == expected_target);
+        assert!(
+            call.is_some(),
+            "call in integration test should resolve to src/beta.rs::b; got: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn rust_external_crate_use_stays_unresolved() {
+        // `use serde::Serialize;` must not be glued onto the local crate.
+        let mut run_fn = make_symbol("run", 3);
+        run_fn.end_line = 10;
+
+        let files = vec![
+            (
+                "src/lib.rs".to_string(),
+                vec![make_symbol("root", 1)],
+                vec![],
+            ),
+            (
+                "src/main.rs".to_string(),
+                vec![run_fn],
+                vec![make_ref("serde::Serialize", ReferenceKind::Import, 1)],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        assert!(
+            edges.iter().all(|e| e.edge_type != EdgeType::Imports),
+            "external crate import must not create IMPORTS edges; got: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn no_edge_to_symbol_never_referenced_in_source_file() {
+        // Regression for the "phantom detect_entry_point → list_all_symbols
+        // CALLS edge" hunt finding: the resolver must never emit an edge whose
+        // target name does not appear as a reference in the source file, even
+        // with type environments active. (The DB-level instance of that bug
+        // was a Symbol node carrying another symbol's UID — an engine/store
+        // issue — but this guards the resolver side.)
+        use crate::type_extractors::{BindingSource, TypeBinding};
+        use crate::types::TypeEnvironment;
+
+        let mut detect_entry_point = make_symbol("detect_entry_point", 1);
+        detect_entry_point.end_line = 10;
+        let mut detect_c = make_symbol("detect_c", 12);
+        detect_c.end_line = 18;
+
+        let store_struct = RawSymbol {
+            name: "GraphStore".to_string(),
+            kind: SymbolKind::Class,
+            start_line: 1,
+            end_line: 100,
+            signature: "pub struct GraphStore".to_string(),
+            content_hash: String::new(),
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            parent_name: None,
+            scope_chain: None,
+        };
+        let mut list_all_symbols = make_symbol("list_all_symbols", 20);
+        list_all_symbols.parent_name = Some("GraphStore".to_string());
+
+        let files = vec![
+            (
+                "crates/nestweaver-parser/src/entry_points.rs".to_string(),
+                vec![detect_entry_point, detect_c],
+                // entry_points.rs calls only its own helpers; it never
+                // mentions list_all_symbols nor imports the store.
+                vec![make_ref("detect_c", ReferenceKind::Call, 5)],
+            ),
+            (
+                "crates/nestweaver-store/src/read.rs".to_string(),
+                vec![store_struct, list_all_symbols],
+                vec![],
+            ),
+        ];
+
+        // Type env with a high-confidence binding — the type-aware path must
+        // still not fabricate a cross-file edge for a name absent from the file.
+        let mut type_envs = std::collections::HashMap::new();
+        let env = TypeEnvironment::from_bindings(vec![(
+            "self".to_string(),
+            1,
+            TypeBinding {
+                type_name: "GraphStore".to_string(),
+                line: 1,
+                confidence: 0.95,
+                source: BindingSource::SelfThis,
+            },
+        )]);
+        type_envs.insert(
+            "crates/nestweaver-parser/src/entry_points.rs".to_string(),
+            env,
+        );
+
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&type_envs),
+            None,
+        );
+
+        let phantom_target = symbol_uid(
+            "repo:test:abc",
+            "crates/nestweaver-store/src/read.rs",
+            "list_all_symbols",
+            20,
+        );
+        assert!(
+            edges.iter().all(|e| e.target_uid != phantom_target),
+            "no edge may target a symbol the source file never references; got: {edges:?}"
+        );
+        // Sanity: the genuine same-file call still resolves.
+        let real_target = symbol_uid(
+            "repo:test:abc",
+            "crates/nestweaver-parser/src/entry_points.rs",
+            "detect_c",
+            12,
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.edge_type == EdgeType::Calls && e.target_uid == real_target),
+            "the genuine call must still resolve; got: {edges:?}"
+        );
     }
 
     mod snapshot_tests {

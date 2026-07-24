@@ -702,8 +702,15 @@ async fn handle_mcp(
             );
         }
 
+        // Admin tokens are never throttled by the per-session limiter either,
+        // matching the client-IP limiter above and the gRPC interceptor
+        // (auth.rs checks `if !is_admin` before rate limiting). The check
+        // still runs so `last_active`/`request_count` bookkeeping stays fresh
+        // for the session sweeper — only the rejection is skipped. Without
+        // the bypass an admin client got 429 at request RATE_LIMIT_PER_MIN+1.
         if let Some(ref sid) = session_id
             && !check_session_rate_limit(&state.sessions, sid)
+            && !admin_bypass_rate_limit
         {
             return jsonrpc_error(
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -1512,6 +1519,67 @@ mod tests {
             statuses[1],
             StatusCode::TOO_MANY_REQUESTS,
             "rotating the session id must not mint a fresh bucket — the identity stays throttled"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_token_bypasses_per_session_rate_limit() {
+        // The admin bypass must cover the per-session limiter too — previously
+        // only the client-IP limiter skipped admins, so an admin token still
+        // got 429 at request RATE_LIMIT_PER_MIN+1 on one session. The gRPC
+        // interceptor skips rate limiting for admins entirely; HTTP now
+        // matches. Client-IP bucket capacity is 1000 so only the session
+        // limiter can produce a 429 here.
+        let app = test_server_auth_app_with_limiter(1000);
+        let call = |token: &str, sid: &str, i: u64| {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": i,
+                "method": "tools/list",
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .header("mcp-session-id", sid)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+
+        // Admin: RATE_LIMIT_PER_MIN+1 requests on one session, never a 429.
+        for i in 0..=RATE_LIMIT_PER_MIN {
+            let resp = app
+                .clone()
+                .oneshot(call("admin-token", "session-a", i))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "admin request {} must bypass the session limiter",
+                i + 1
+            );
+        }
+
+        // Control: the query token IS throttled by the session limiter once it
+        // crosses RATE_LIMIT_PER_MIN requests on its session.
+        let mut last = StatusCode::OK;
+        for i in 0..=RATE_LIMIT_PER_MIN {
+            let resp = app
+                .clone()
+                .oneshot(call("shared-query-token", "session-b", i))
+                .await
+                .unwrap();
+            last = resp.status();
+            if last == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+        }
+        assert_eq!(
+            last,
+            StatusCode::TOO_MANY_REQUESTS,
+            "query token must still hit the session limiter past RATE_LIMIT_PER_MIN"
         );
     }
 

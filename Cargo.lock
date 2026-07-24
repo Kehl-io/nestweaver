@@ -4246,6 +4246,7 @@ dependencies = [
  "url",
  "walkdir",
  "wiremock",
+ "x509-parser",
  "zstd",
 ]
 

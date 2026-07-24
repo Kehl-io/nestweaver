@@ -363,6 +363,15 @@ message ServeUiRequest {
 message ServeUiResponse {
   bool ok = 1;
   string message = 2;
+  // The port the UI is actually reachable on after this call (0 when not
+  // running). Differs from the requested port when the UI was already
+  // running on an earlier port — clients must print THIS port, not the
+  // one they asked for.
+  uint32 port = 3;
+  // Machine-readable error code (empty when ok). Currently defined:
+  // "port_in_use" — the requested port is bound by a foreign process;
+  // clients should map this to a non-zero exit without retrying.
+  string error = 4;
 }
 
 message StopUiRequest {}

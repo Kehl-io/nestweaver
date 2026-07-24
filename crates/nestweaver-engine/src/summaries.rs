@@ -189,14 +189,18 @@ pub fn generate_symbol_summaries_bounded(
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("list_all_symbols: {e}"))?;
 
-    // Push the target filter down: match name/uid substring BEFORE any of the
-    // per-symbol caller/callee queries, mirroring `filter_by_target` so the two
-    // stay consistent. This turns the common single-symbol lookup into O(matches)
-    // graph queries instead of O(all symbols).
+    // Push the target filter down: match name/file-path substring or exact UID
+    // BEFORE any of the per-symbol caller/callee queries, mirroring
+    // `filter_by_target` so the two stay consistent (UIDs embed hex hashes, so
+    // a UID *substring* match would retain virtually every symbol). This turns
+    // the common single-symbol lookup into O(matches) graph queries instead of
+    // O(all symbols).
     if let Some(t) = target {
         let needle = t.to_lowercase();
         symbols.retain(|s| {
-            s.name.to_lowercase().contains(&needle) || s.uid.to_lowercase().contains(&needle)
+            s.name.to_lowercase().contains(&needle)
+                || s.file_path.to_lowercase().contains(&needle)
+                || s.uid.eq_ignore_ascii_case(t)
         });
     }
 
@@ -546,14 +550,23 @@ pub fn truncate_to_budget(summaries: &[Summary], token_budget: usize) -> Vec<&Su
     result
 }
 
-/// Filter summaries by target name or UID.
+/// Filter summaries by target name or file path (substring, case-insensitive),
+/// or by exact UID.
+///
+/// The UID is matched exactly, never as a substring: symbol UIDs embed hex
+/// hashes (`sym:repo:default:c8f000561246:6a4df1030d93:…`), so a one-character
+/// target like `b` substring-matches virtually every UID in the graph and the
+/// filter returns everything.
 pub fn filter_by_target<'a>(summaries: &'a [Summary], target: &str) -> Vec<&'a Summary> {
     let needle = target.to_lowercase();
     summaries
         .iter()
         .filter(|s| {
-            s.target_uid.to_lowercase().contains(&needle)
-                || s.target_name.to_lowercase().contains(&needle)
+            s.target_name.to_lowercase().contains(&needle)
+                || s.file_path
+                    .as_deref()
+                    .is_some_and(|fp| fp.to_lowercase().contains(&needle))
+                || s.target_uid.eq_ignore_ascii_case(target)
         })
         .collect()
 }
@@ -667,6 +680,51 @@ mod tests {
     }
 
     #[test]
+    fn filter_by_target_does_not_substring_match_uid_hash() {
+        // Regression: symbol UIDs embed hex hashes, so a 1-char target like
+        // "b" used to substring-match every UID and return the whole graph.
+        let summaries = vec![
+            Summary {
+                level: SummaryLevel::Symbol,
+                target_uid: "sym:repo:default:c8f000561246:6a4df1030d93:895572949b24:121"
+                    .to_string(),
+                target_name: "compute_score".to_string(),
+                content: "score stuff".to_string(),
+                token_estimate: 3,
+                file_path: Some("src/score.rs".to_string()),
+            },
+            Summary {
+                level: SummaryLevel::Symbol,
+                target_uid: "sym:repo:default:c8f000561246:17b788a70eec:17b788a70eec:126"
+                    .to_string(),
+                target_name: "render".to_string(),
+                content: "render stuff".to_string(),
+                token_estimate: 3,
+                file_path: Some("src/render.rs".to_string()),
+            },
+        ];
+
+        // "b" appears in both UID hashes but in neither name nor file path.
+        assert!(
+            filter_by_target(&summaries, "b").is_empty(),
+            "a hex-digit target must not match UID substrings"
+        );
+
+        // Name substring, file-path substring, and exact UID still match.
+        assert_eq!(filter_by_target(&summaries, "render").len(), 1);
+        assert_eq!(filter_by_target(&summaries, "score.rs").len(), 1);
+        assert_eq!(
+            filter_by_target(
+                &summaries,
+                "sym:repo:default:c8f000561246:6a4df1030d93:895572949b24:121"
+            )
+            .len(),
+            1,
+            "an exact UID must still target its summary"
+        );
+    }
+
+    #[test]
     fn render_text_joins_lines() {
         let summaries = vec![
             Summary {
@@ -773,6 +831,49 @@ mod tests {
         assert_eq!(all.summaries.len(), 2);
         assert_eq!(all.matched_total, 5);
         assert!(all.capped);
+    }
+
+    #[test]
+    fn symbol_summaries_pushdown_does_not_substring_match_uid() {
+        // Same regression as filter_by_target: "abc" appears in every test UID
+        // (`sym:test:abc:{i}`) but in no name/file path — a UID substring match
+        // would retain every symbol and defeat the pushdown.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: "sym:test:abc:1".to_string(),
+                name: "foo".to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:test".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn foo()".to_string(),
+                summary: None,
+                content_hash: "a".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let miss = generate_symbol_summaries_bounded(&store, Some("abc"), 10).unwrap();
+        assert_eq!(
+            miss.matched_total, 0,
+            "a UID-hash substring must not match; matched: {}",
+            miss.matched_total
+        );
+
+        // Exact UID, name substring, and file-path substring all still match.
+        let by_uid = generate_symbol_summaries_bounded(&store, Some("sym:test:abc:1"), 10).unwrap();
+        assert_eq!(by_uid.matched_total, 1, "exact UID must match");
+        let by_path = generate_symbol_summaries_bounded(&store, Some("lib.rs"), 10).unwrap();
+        assert_eq!(by_path.matched_total, 1, "file-path substring must match");
     }
 
     #[test]

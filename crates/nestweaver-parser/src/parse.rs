@@ -242,6 +242,102 @@ fn leading_rust_attributes(node: &tree_sitter::Node, source: &[u8]) -> String {
     attrs
 }
 
+/// Expand a Rust `use` declaration into one import [`RawReference`] per path.
+///
+/// The grammar nests arbitrarily (`use a::{b, c::d, e as f, g::*};`), which
+/// tree-sitter query patterns cannot flatten, so the whole `use_declaration`
+/// node is captured as `@reference.rust_use` and expanded here:
+///
+/// - `use a::b;`        → `a::b`
+/// - `use a::{b, c};`   → `a::b`, `a::c`
+/// - `use a::b as c;`   → `a::b` (the path, not the alias — resolution needs
+///   the origin; the alias itself is not yet tracked)
+/// - `use a::*;`        → `a` (the module path; wildcard members resolve
+///   through the module's import edge)
+/// - `use a::{b::{c, d}};` → `a::b::c`, `a::b::d`
+fn expand_rust_use_imports(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let context = node
+        .utf8_text(source)
+        .map(first_line)
+        .unwrap_or_default()
+        .to_string();
+    if let Some(argument) = node.child_by_field_name("argument") {
+        expand_rust_use_tree(&argument, "", source, &context, references);
+    }
+}
+
+/// Recursive worker for [`expand_rust_use_imports`]. `prefix` is the path
+/// accumulated so far (empty or ending in `::`).
+fn expand_rust_use_tree(
+    node: &tree_sitter::Node,
+    prefix: &str,
+    source: &[u8],
+    context: &str,
+    references: &mut Vec<RawReference>,
+) {
+    let text = node.utf8_text(source).unwrap_or("").trim();
+    match node.kind() {
+        "identifier" | "scoped_identifier" | "crate" => {
+            if !text.is_empty() {
+                references.push(RawReference {
+                    name: format!("{prefix}{text}"),
+                    kind: ReferenceKind::Import,
+                    start_line: node.start_position().row as u32 + 1,
+                    context: context.to_string(),
+                    receiver: None,
+                });
+            }
+        }
+        // `use a::b::{self, c};` — `self` imports the path `a::b` itself.
+        "self" if !prefix.is_empty() => {
+            references.push(RawReference {
+                name: prefix.trim_end_matches("::").to_string(),
+                kind: ReferenceKind::Import,
+                start_line: node.start_position().row as u32 + 1,
+                context: context.to_string(),
+                receiver: None,
+            });
+        }
+        "use_as_clause" => {
+            // Import the original path; the alias is a local rename.
+            if let Some(path) = node.child_by_field_name("path") {
+                expand_rust_use_tree(&path, prefix, source, context, references);
+            }
+        }
+        "use_wildcard" => {
+            // `use a::*;` — record the module path itself so imports of the
+            // module resolve and wildcard members resolve through them.
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i as u32) {
+                    expand_rust_use_tree(&child, prefix, source, context, references);
+                }
+            }
+        }
+        "use_list" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i as u32) {
+                    expand_rust_use_tree(&child, prefix, source, context, references);
+                }
+            }
+        }
+        "scoped_use_list" => {
+            let path_prefix = node
+                .child_by_field_name("path")
+                .and_then(|p| p.utf8_text(source).ok())
+                .map(|p| format!("{prefix}{}::", p.trim()))
+                .unwrap_or_else(|| prefix.to_string());
+            if let Some(list) = node.child_by_field_name("list") {
+                expand_rust_use_tree(&list, &path_prefix, source, context, references);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Infer symbol visibility from name and surrounding source text based on language conventions.
 fn infer_visibility(name: &str, node_text: &str, lang: Language, exported: bool) -> Visibility {
     match lang {
@@ -944,6 +1040,13 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     scope_chain,
                 });
             } else if let Some(kind_str) = capture_name.strip_prefix("reference.") {
+                // Rust `use` declarations are captured whole and expanded here
+                // into one import reference per path (list/wildcard/alias forms
+                // included); see expand_rust_use_imports.
+                if kind_str == "rust_use" {
+                    expand_rust_use_imports(&node, source_bytes, &mut references);
+                    continue;
+                }
                 let kind = match kind_str {
                     "call" => ReferenceKind::Call,
                     "import" => ReferenceKind::Import,
@@ -1901,6 +2004,50 @@ mod tests {
             extends.iter().any(|r| r.name == "Readable"),
             "should find impl Readable as extends; got: {:?}",
             extends.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_rust_expands_use_lists_wildcards_and_aliases() {
+        // Cross-crate/workspace imports come in list, wildcard and alias
+        // forms; every path must become an Import reference or the resolver
+        // has nothing to resolve against.
+        let source = r#"
+use nestweaver_engine::rts_eval;
+use nestweaver_engine::{alpha, beta};
+use nestweaver_engine::store::{self, GraphStore as Store};
+use nestweaver_proto::*;
+use crate::config::{Settings, load as load_config};
+"#;
+        let parsed = parse_source(Path::new("server.rs"), source).unwrap();
+        let names: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        for expected in [
+            "nestweaver_engine::rts_eval",
+            "nestweaver_engine::alpha",
+            "nestweaver_engine::beta",
+            "nestweaver_engine::store",
+            "nestweaver_engine::store::GraphStore",
+            "nestweaver_proto",
+            "crate::config::Settings",
+            "crate::config::load",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing import reference {expected}; got: {names:?}"
+            );
+        }
+        // The alias target must NOT be recorded as an import path.
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.ends_with("::Store") || n.ends_with("::load_config")),
+            "alias name must not become an import path; got: {names:?}"
         );
     }
 

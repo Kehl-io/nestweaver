@@ -34,8 +34,10 @@ impl EmbedQueryFn for nestweaver_embed::EmbedModel {
 /// - `weight_ppr = 0.40` — structural signal from Personalized PageRank.
 /// - `weight_bm25 = 0.25` — lexical relevance covers what graph
 ///   structure misses (freshly-mentioned terms, exact matches).
-/// - `weight_semantic = 0.35` — embedding-based similarity; set to 0.0
-///   if embeddings are not generated yet (`nestweaver embed`).
+/// - `weight_semantic = 0.35` — embedding-based similarity. Effectively
+///   0.0 on databases without generated embeddings (`nestweaver embed`):
+///   the semantic leg is skipped entirely when the store holds no
+///   embedding vectors, so no BERT forward pass is paid.
 /// - `bm25_limit = 500` — large enough that BM25's tail is comparable
 ///   to PPR's. 500 keeps the candidate pool symmetric.
 /// - `semantic_limit = 200` — cap on vector KNN results fed into
@@ -1207,6 +1209,37 @@ pub fn build_brain_context(
     )
 }
 
+/// Whether the store's embedding sidecar index holds any vectors.
+///
+/// The semantic leg embeds the query text with a full BERT forward pass
+/// whenever `weight_semantic > 0` — pure waste on databases where
+/// `nestweaver embed` never ran, since there are no vectors to match
+/// against. The determination is a per-store property, so it is cached
+/// keyed by db path and invalidated whenever `graph_generation` changes;
+/// embeddings added while the process is live (e.g. `nestweaver embed`
+/// against a running daemon) are then picked up on the next query.
+/// In-memory stores (no db path) probe directly — `embedding_count` is a
+/// mutex-guarded `len()`.
+fn store_has_embeddings(store: &GraphStore) -> bool {
+    let Some(db_path) = store.db_path().map(std::path::Path::to_path_buf) else {
+        return store.embedding_count() > 0;
+    };
+    let generation = store.graph_generation();
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, bool)>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    match cache.get(&db_path) {
+        Some(&(cached_generation, has)) if cached_generation == generation => has,
+        _ => {
+            let has = store.embedding_count() > 0;
+            cache.insert(db_path, (generation, has));
+            has
+        }
+    }
+}
+
 /// Hybrid PPR + BM25 retrieval.
 ///
 /// When `tantivy` is supplied, runs BM25 over the seed strings and fuses
@@ -1431,14 +1464,20 @@ pub fn build_brain_context_hybrid_with_aliases(
     seed_uids.retain(|u| seen.insert(u.clone()));
 
     // ── Semantic seed blending ────────────────────────────────────────────
-    // When an embedding model is available and the semantic weight is nonzero,
-    // run a vector KNN search over the entire graph. The top-k hits are
+    // When an embedding model is available and the semantic weight is nonzero
+    // AND the store actually holds embedding vectors (otherwise the whole leg
+    // is a wasted BERT forward pass — see `store_has_embeddings`), run a
+    // vector KNN search over the entire graph. The top-k hits are
     // injected as PPR seeds (always-blend) so the walk explores semantically
     // relevant neighborhoods even when the textual seeds miss them. The full
     // hit list is passed to weighted_score_fuse as the semantic signal.
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();
     if let Some(model) = embed_model
         && config.weight_semantic > 0.0
+        // No vectors in the store → the semantic leg can contribute
+        // nothing; skip the BERT forward pass entirely (perf: this made
+        // every brain_context pay a full embed on un-embedded DBs).
+        && store_has_embeddings(store)
     {
         let query_text = inputs.join(" ");
         if let Ok(query_emb) = model.embed_query(&query_text) {
@@ -3096,6 +3135,112 @@ mod instance_validation_tests {
         assert!(
             msg.contains("instance merge --from c37ccf01 --to kory-brain"),
             "{msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod semantic_leg_tests {
+    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
+
+    use super::{EmbedQueryFn, HybridSearchConfig, build_brain_context_hybrid_with_aliases};
+
+    /// Embed model that records how often the (expensive) BERT forward pass
+    /// ran, so tests can prove the semantic leg was skipped entirely.
+    struct CountingEmbed {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbed {
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl EmbedQueryFn for CountingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![0.0; 4])
+        }
+    }
+
+    fn store_with_symbol() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        let symbol = Symbol {
+            uid: "sym:payment".to_string(),
+            name: "Payment".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: "src/payment.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: "fn Payment()".to_string(),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&symbol).unwrap();
+        store
+    }
+
+    fn run_context(store: &GraphStore, model: &CountingEmbed) {
+        let config = HybridSearchConfig {
+            weight_semantic: 0.35,
+            ..HybridSearchConfig::default()
+        };
+        build_brain_context_hybrid_with_aliases(
+            store,
+            &["Payment".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(model),
+            None,
+        )
+        .expect("brain_context must succeed");
+    }
+
+    #[test]
+    fn semantic_leg_skipped_when_store_has_no_embeddings() {
+        // Regression: brain_context used to pay a full BERT forward pass per
+        // call even on databases with zero embedding vectors, where the
+        // semantic leg can contribute nothing (p50 24-27s in debug builds).
+        let store = store_with_symbol();
+        assert_eq!(store.embedding_count(), 0);
+        let model = CountingEmbed { calls: 0.into() };
+
+        run_context(&store, &model);
+
+        assert_eq!(
+            model.call_count(),
+            0,
+            "no embedding vectors in the DB → the semantic leg must not run the BERT embed"
+        );
+    }
+
+    #[test]
+    fn semantic_leg_runs_when_store_has_embeddings() {
+        // Control: once vectors exist, the semantic leg fires as before.
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+        let model = CountingEmbed { calls: 0.into() };
+
+        run_context(&store, &model);
+
+        assert_eq!(
+            model.call_count(),
+            1,
+            "embedding vectors present → the semantic leg must embed the query"
         );
     }
 }

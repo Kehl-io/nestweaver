@@ -118,7 +118,17 @@ pub(crate) struct SymbolNameCached {
 
 /// Minimum impact score for a node to be included in traversal results.
 /// Edges below this threshold are pruned during BFS.
-const DEFAULT_IMPACT_THRESHOLD: f64 = 0.10;
+///
+/// Deliberately aggressive: at 0.10 a depth-4 chain of 0.5-confidence edges
+/// (score 0.0625) is pruned. That default is kept — not lowered — because the
+/// multiplicative decay means genuinely-attributable impact fades fast, the
+/// prune bounds BFS fan-out on dense graphs, and the value is mirrored by the
+/// in-memory walk (`affected_tests::IMPACT_THRESHOLD`) so the two must not
+/// drift. The trade-off is surfaced, not hidden: a prune sets
+/// [`ImpactResult::truncated_by_threshold`], and callers that need the full
+/// traversal can opt out via [`GraphStore::impact_with_flags_and_threshold`]
+/// (CLI: `impact --min-score 0`).
+pub const DEFAULT_IMPACT_THRESHOLD: f64 = 0.10;
 
 /// A node returned by the impact analysis traversal.
 #[derive(Debug, Clone)]
@@ -261,10 +271,36 @@ impl GraphStore {
                 IMPACT_EDGE_TYPES,
                 &[],
                 0,
+                DEFAULT_IMPACT_THRESHOLD,
                 Some(allowed_symbols),
                 cancel,
             )?
             .nodes)
+    }
+
+    /// Scoped impact (authz allow-list) returning the full ImpactResult with
+    /// truncation-honesty flags — the flags-dropping `impact_cancellable_within`
+    /// hides threshold pruning from callers (surfaced as a silent-floor bug
+    /// in the CLI/MCP impact paths).
+    pub fn impact_with_flags_within(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        allowed_symbols: &HashSet<String>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            IMPACT_EDGE_TYPES,
+            &[],
+            0,
+            DEFAULT_IMPACT_THRESHOLD,
+            Some(allowed_symbols),
+            cancel,
+        )
     }
 
     /// Impact with the default edge set, returning the ImpactResult (with
@@ -281,6 +317,33 @@ impl GraphStore {
             max_depth,
             min_confidence,
             IMPACT_EDGE_TYPES,
+            cancel,
+        )
+    }
+
+    /// Like [`impact_with_flags`](Self::impact_with_flags), but with an explicit
+    /// score-pruning threshold instead of [`DEFAULT_IMPACT_THRESHOLD`]. Pass
+    /// `0.0` to disable score pruning entirely and get the full traversal
+    /// (bounded only by `max_depth`); the `truncated_by_threshold` flag then
+    /// never fires. Intended for the CLI `--min-score` opt-out — the default
+    /// threshold stays in place everywhere else (see its doc comment).
+    pub fn impact_with_flags_and_threshold(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        threshold: f64,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            IMPACT_EDGE_TYPES,
+            &[],
+            0,
+            threshold,
+            None,
             cancel,
         )
     }
@@ -311,6 +374,7 @@ impl GraphStore {
             edges,
             &[],
             0,
+            DEFAULT_IMPACT_THRESHOLD,
             None,
             cancel,
         )
@@ -335,6 +399,7 @@ impl GraphStore {
             IMPACT_EDGE_TYPES,
             IMPACT_DATA_EDGE_TYPES,
             data_max_depth,
+            DEFAULT_IMPACT_THRESHOLD,
             None,
             cancel,
         )
@@ -350,6 +415,10 @@ impl GraphStore {
     /// combined edge slice is precomputed once and selected per depth: combined
     /// while `d < data_max_depth`, structural-only beyond. When `data` is empty
     /// or `data_max_depth == 0` this is byte-for-byte the structural-only walk.
+    /// `min_score` is the score-pruning threshold: a path whose decayed score
+    /// falls below it is pruned (and flags `truncated_by_threshold`). All
+    /// existing entry points pass [`DEFAULT_IMPACT_THRESHOLD`]; pass `0.0` to
+    /// disable score pruning.
     #[allow(clippy::too_many_arguments)]
     fn impact_bfs(
         &self,
@@ -359,6 +428,7 @@ impl GraphStore {
         structural: &[EdgeType],
         data: &[EdgeType],
         data_max_depth: u32,
+        min_score: f64,
         allowed_symbols: Option<&HashSet<String>>,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
@@ -445,7 +515,7 @@ impl GraphStore {
                 let candidate_score = parent_score * row.confidence as f64;
 
                 // Prune paths that fall below the impact threshold.
-                if candidate_score < DEFAULT_IMPACT_THRESHOLD {
+                if candidate_score < min_score {
                     truncated_by_threshold = true;
                     continue;
                 }
@@ -1822,6 +1892,65 @@ mod tests {
             result.nodes.len(),
             1,
             "only a survives; b is pruned below threshold"
+        );
+    }
+
+    /// The opt-out: `impact_with_flags_and_threshold` with `0.0` must return the
+    /// full traversal — a depth-4 chain of 0.5-confidence edges (score 0.0625)
+    /// that the default threshold prunes — and must not set
+    /// `truncated_by_threshold`.
+    #[test]
+    fn impact_with_flags_and_threshold_zero_disables_pruning() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["target", "a", "b", "c", "d"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // d → c → b → a → target, every edge at 0.5 confidence:
+        // d's decayed score is 0.5^4 = 0.0625 < DEFAULT_IMPACT_THRESHOLD (0.10).
+        for (src, tgt) in [("a", "target"), ("b", "a"), ("c", "b"), ("d", "c")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.5,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        // Default threshold: d is pruned and the honesty flag fires.
+        let pruned = store.impact_with_flags("target", 10, 0.0, None).unwrap();
+        assert!(
+            pruned.truncated_by_threshold,
+            "the default threshold must prune the 0.0625-score depth-4 caller"
+        );
+        assert!(
+            !pruned.nodes.iter().any(|n| n.uid == "d"),
+            "d must be pruned under the default threshold"
+        );
+
+        // Opt-out: threshold 0.0 returns the full traversal with no prune flag.
+        let full = store
+            .impact_with_flags_and_threshold("target", 10, 0.0, 0.0, None)
+            .unwrap();
+        assert!(
+            !full.truncated_by_threshold,
+            "threshold 0.0 disables score pruning, so nothing is pruned"
+        );
+        let d = full
+            .nodes
+            .iter()
+            .find(|n| n.uid == "d")
+            .expect("the real depth-4 caller must be included when pruning is off");
+        assert_eq!(d.depth, 4);
+        assert!(
+            (d.impact_score - 0.0625).abs() < 1e-9,
+            "d keeps its true decayed score, got {}",
+            d.impact_score
         );
     }
 
