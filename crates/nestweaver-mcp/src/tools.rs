@@ -7,26 +7,28 @@
 //! Tool descriptions are written in the "when to use" style — Claude reads
 //! these to pick the right tool. Lead with the trigger, not the mechanism.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use nestweaver_engine::config::DEFAULT_RESULT_LIMIT;
+use nestweaver_engine::query::search_symbols_page;
 use nestweaver_engine::{
     BlastRadiusOptions, BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig,
-    SummaryLevel, ToolDocEntry, affected_tests, analyze_blast_radius, attach_cluster_ids,
-    attach_communities, broken_links, build_brain_context_hybrid_with_aliases, compute_clusters,
-    detect_changes_impact, detect_dead_code_cancellable, doc_stats, expand_query_with_aliases,
-    filter_by_target, find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
+    SummaryLevel, ToolDocEntry, analyze_blast_radius, attach_cluster_ids, attach_communities,
+    broken_links, build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
+    detect_dead_code_cancellable, doc_stats, expand_query_with_aliases, filter_by_target,
+    find_bridge_nodes, find_hub_nodes, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
     load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, search_symbols,
-    tag_graph, tag_graph_all, topic_clusters, truncate_to_budget,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, tag_graph,
+    tag_graph_all, topic_clusters, truncate_to_budget,
 };
 use nestweaver_schema::SymbolKind;
-use nestweaver_store::{GraphStore, TantivyIndex};
+use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
+use nestweaver_store::{GraphStore, SearchLogicalIdentity, TantivyIndex};
 use serde_json::{Value, json};
 // In non-daemon builds, brain_add_source and set_extension write directly using
 // these primitives; in daemon builds those writes route through the daemon.
@@ -100,6 +102,39 @@ fn build_vault_name_map(store: &GraphStore) -> std::collections::HashMap<String,
         .collect()
 }
 
+/// Resolve authoritative symbol ownership only when repository scoping is
+/// active. Restricted impact/test-selection responses fail closed if this
+/// global ownership view cannot be loaded; emitting unowned rows would leak.
+fn restricted_symbol_owners(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Option<HashMap<String, String>>, anyhow::Error> {
+    let Some(nestweaver_engine::authz::VisibleRepos::Only(_)) = visible else {
+        return Ok(None);
+    };
+    let symbols = store
+        .list_all_symbols()
+        .context("loading symbol ownership for repository-scoped response")?;
+    Ok(Some(
+        symbols
+            .into_iter()
+            .map(|symbol| (symbol.uid, symbol.repo_uid))
+            .collect(),
+    ))
+}
+
+fn repo_is_visible(
+    repo_uid: &str,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> bool {
+    match visible {
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_)) => {
+            !repo_uid.is_empty() && visible.is_some_and(|scope| scope.allows(repo_uid))
+        }
+        _ => true,
+    }
+}
+
 // ── Tool catalogue ──────────────────────────────────────────────────────────
 
 const LITE_TOOLS: &[&str] = &[
@@ -114,8 +149,8 @@ const LITE_TOOLS: &[&str] = &[
 /// Returns the `tools/list` payload — schemas + descriptions for every tool
 /// the brain exposes. When `lite` is true only the 6 core tools are included.
 /// When `--tools` was specified, only those named tools are included.
-pub fn tool_list(lite: bool) -> Value {
-    let mut tools = vec![
+fn all_tool_schemas() -> Vec<Value> {
+    vec![
         tool_schema_brain_context(),
         tool_schema_brain_search(),
         tool_schema_note_get(),
@@ -156,7 +191,152 @@ pub fn tool_list(lite: bool) -> Value {
         tool_schema_brain_memory_lint(),
         tool_schema_brain_memory_consolidate(),
         tool_schema_brain_memory_related(),
-    ];
+    ]
+}
+
+static TOOL_VALIDATORS: std::sync::OnceLock<
+    std::collections::HashMap<String, jsonschema::Validator>,
+> = std::sync::OnceLock::new();
+
+fn tool_validators() -> &'static std::collections::HashMap<String, jsonschema::Validator> {
+    TOOL_VALIDATORS.get_or_init(|| {
+        all_tool_schemas()
+            .into_iter()
+            .map(|tool| {
+                let name = tool["name"]
+                    .as_str()
+                    .expect("registered tool has a string name")
+                    .to_string();
+                let validator = jsonschema::options()
+                    .with_draft(jsonschema::Draft::Draft202012)
+                    .build(&tool["inputSchema"])
+                    .unwrap_or_else(|error| panic!("invalid input schema for {name}: {error}"));
+                (name, validator)
+            })
+            .collect()
+    })
+}
+
+const MAX_VALIDATION_ITEM_BYTES: usize = 192;
+const MAX_VALIDATION_ERROR_BYTES: usize = 1024;
+const MAX_TOOL_NAME_IN_ERROR_BYTES: usize = 96;
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    const ELLIPSIS: &str = "…";
+    let suffix = if max_bytes >= ELLIPSIS.len() {
+        ELLIPSIS
+    } else {
+        ""
+    };
+    let mut end = max_bytes - suffix.len();
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut bounded = String::with_capacity(max_bytes);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(suffix);
+    bounded
+}
+
+fn missing_alias_requirement(name: &str, args: &Value) -> Option<&'static str> {
+    if !args.is_object() {
+        return None;
+    }
+
+    let (first, second, message) = match name {
+        "read_symbols" => (
+            "targets",
+            "uids_or_fqns",
+            "missing required argument: expected 'targets' or 'uids_or_fqns'",
+        ),
+        "regex_search" => (
+            "pattern",
+            "query",
+            "missing required argument: expected 'pattern' or 'query'",
+        ),
+        "detect_changes" => (
+            "changed_files",
+            "files",
+            "missing required argument: expected 'changed_files' or 'files'",
+        ),
+        _ => return None,
+    };
+
+    (args.get(first).is_none() && args.get(second).is_none()).then_some(message)
+}
+
+/// Reject alias pairs that are BOTH present — `regex_search` called with both
+/// `pattern` and `query` is ambiguous about which one drives the search and
+/// previously picked one silently.
+fn conflicting_alias_error(name: &str, args: &Value) -> Option<&'static str> {
+    if !args.is_object() {
+        return None;
+    }
+    match name {
+        "regex_search" if args.get("pattern").is_some() && args.get("query").is_some() => {
+            Some("conflicting arguments: pass only one of 'pattern' or 'query'")
+        }
+        _ => None,
+    }
+}
+
+fn render_validation_error(error: &jsonschema::ValidationError<'_>) -> String {
+    let instance_path = error.instance_path().to_string();
+    let instance_path = if instance_path.is_empty() {
+        "/".to_string()
+    } else {
+        truncate_utf8_bytes(&instance_path, MAX_VALIDATION_ITEM_BYTES / 2)
+    };
+    truncate_utf8_bytes(
+        &format!(
+            "{instance_path}: schema keyword '{}' failed",
+            error.kind().keyword()
+        ),
+        MAX_VALIDATION_ITEM_BYTES,
+    )
+}
+
+pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::Error> {
+    let Some(validator) = tool_validators().get(name) else {
+        let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);
+        let message =
+            truncate_utf8_bytes(&format!("unknown tool: {name}"), MAX_VALIDATION_ERROR_BYTES);
+        return Err(anyhow!(message));
+    };
+
+    let errors: Vec<String> = if let Some(message) = missing_alias_requirement(name, args) {
+        vec![truncate_utf8_bytes(message, MAX_VALIDATION_ITEM_BYTES)]
+    } else if let Some(message) = conflicting_alias_error(name, args) {
+        vec![truncate_utf8_bytes(message, MAX_VALIDATION_ITEM_BYTES)]
+    } else {
+        validator
+            .iter_errors(args)
+            .take(3)
+            .map(|error| render_validation_error(&error))
+            .collect()
+    };
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);
+        let message = format!("invalid arguments for tool '{name}': {}", errors.join("; "));
+        Err(anyhow!(truncate_utf8_bytes(
+            &message,
+            MAX_VALIDATION_ERROR_BYTES
+        )))
+    }
+}
+
+pub fn tool_list(lite: bool) -> Value {
+    let mut tools = all_tool_schemas();
     if lite {
         tools.retain(|t| LITE_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
     }
@@ -170,6 +350,739 @@ pub fn tool_list(lite: bool) -> Value {
         });
     }
     json!({ "tools": tools })
+}
+
+#[cfg(test)]
+mod tool_schema_validation_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn assert_valid(name: &str, args: Value) {
+        validate_tool_arguments(name, &args)
+            .unwrap_or_else(|error| panic!("expected valid arguments for {name}: {error}"));
+    }
+
+    fn assert_invalid(name: &str, args: Value) -> String {
+        validate_tool_arguments(name, &args)
+            .expect_err("arguments should fail schema validation")
+            .to_string()
+    }
+
+    #[test]
+    fn registry_contains_exactly_the_40_advertised_unique_names() {
+        let expected: BTreeSet<&str> = [
+            "affected_tests",
+            "backlinks",
+            "blast_radius",
+            "brain_add_source",
+            "brain_broken_links",
+            "brain_context",
+            "brain_diff",
+            "brain_doc_stats",
+            "brain_guide",
+            "brain_impact",
+            "brain_memory_consolidate",
+            "brain_memory_lint",
+            "brain_memory_related",
+            "brain_orphan_documents",
+            "brain_remove_source",
+            "brain_search",
+            "brain_status",
+            "brain_tag_graph",
+            "brain_topic_clusters",
+            "bridge_nodes",
+            "clusters",
+            "contract_drift",
+            "count_patterns",
+            "cross_repo_contracts",
+            "dead_code",
+            "detect_changes",
+            "flow_trace",
+            "get_summary",
+            "hub_nodes",
+            "investigate",
+            "investigate_expand",
+            "investigate_hydrate",
+            "note_get",
+            "project_context",
+            "prune_stale",
+            "query_extensions",
+            "read_symbols",
+            "regex_search",
+            "set_extension",
+            "stale_check",
+        ]
+        .into_iter()
+        .collect();
+
+        let schemas = all_tool_schemas();
+        assert_eq!(
+            schemas.len(),
+            40,
+            "registry must contain exactly 40 schemas"
+        );
+        let names: BTreeSet<&str> = schemas
+            .iter()
+            .map(|schema| {
+                schema["name"]
+                    .as_str()
+                    .expect("registered tool has a string name")
+            })
+            .collect();
+        assert_eq!(names.len(), schemas.len(), "tool names must be unique");
+        assert_eq!(names, expected, "registry must match the advertised tools");
+    }
+
+    #[test]
+    fn every_registered_input_schema_compiles_as_draft_2020_12() {
+        for tool in all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap();
+            jsonschema::options()
+                .with_draft(jsonschema::Draft::Draft202012)
+                .build(&tool["inputSchema"])
+                .unwrap_or_else(|error| panic!("invalid input schema for {name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn required_arguments_reject_empty_objects() {
+        for name in [
+            "brain_search",
+            "blast_radius",
+            "read_symbols",
+            "regex_search",
+            "detect_changes",
+        ] {
+            assert!(
+                assert_invalid(name, json!({})).contains("invalid arguments"),
+                "{name} should reject an empty object"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_errors_include_actionable_instance_paths() {
+        let error = assert_invalid("brain_search", json!({ "query": 7 }));
+        assert!(
+            error.contains("/query"),
+            "error should identify /query: {error}"
+        );
+    }
+
+    #[test]
+    fn property_and_array_member_types_are_enforced() {
+        assert_invalid("brain_search", json!({ "query": "x", "limit": "many" }));
+        assert_invalid("brain_search", json!({ "query": "x", "include_bodies": 1 }));
+        assert_invalid("read_symbols", json!({ "targets": ["sym:x", 7] }));
+    }
+
+    #[test]
+    fn validation_reports_at_most_three_errors() {
+        let error = assert_invalid(
+            "brain_search",
+            json!({
+                "query": 7,
+                "limit": "many",
+                "include_bodies": 1,
+                "prf": "yes"
+            }),
+        );
+        assert_eq!(
+            error.matches("; ").count(),
+            2,
+            "validation should report exactly three of the four errors: {error}"
+        );
+    }
+
+    #[test]
+    fn hostile_validation_values_produce_a_small_bounded_utf8_error() {
+        let huge = "界".repeat(700_000);
+        let error = assert_invalid(
+            "brain_search",
+            json!({
+                "query": 7,
+                "limit": huge,
+                "include_bodies": "🔥".repeat(600_000),
+                "prf": "é".repeat(1_000_000),
+            }),
+        );
+
+        assert!(
+            error.len() <= 1024,
+            "validation errors must stay within 1024 UTF-8 bytes, got {}",
+            error.len()
+        );
+        assert!(
+            error.contains("/limit") || error.contains("/include_bodies"),
+            "bounded error should retain an actionable instance path: {error}"
+        );
+    }
+
+    #[test]
+    fn oversized_unknown_tool_name_produces_a_small_bounded_utf8_error() {
+        let name = "工具".repeat(500_000);
+        let error = assert_invalid(&name, json!({}));
+
+        assert!(
+            error.len() <= 128,
+            "unknown-tool errors must stay within 128 UTF-8 bytes, got {}",
+            error.len()
+        );
+        assert!(error.starts_with("unknown tool: "));
+    }
+
+    #[test]
+    fn missing_alias_pairs_name_every_accepted_field() {
+        for (name, accepted) in [
+            ("read_symbols", ["targets", "uids_or_fqns"]),
+            ("regex_search", ["pattern", "query"]),
+            ("detect_changes", ["changed_files", "files"]),
+        ] {
+            let error = assert_invalid(name, json!({}));
+            for field in accepted {
+                assert!(
+                    error.contains(field),
+                    "{name} missing-argument error must name '{field}': {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_aliases_and_canonical_spellings_validate() {
+        assert_valid("read_symbols", json!({ "uids_or_fqns": ["sym:x"] }));
+        assert_valid("regex_search", json!({ "query": "fn\\s+x" }));
+        assert_valid("detect_changes", json!({ "files": ["src/a.rs"] }));
+
+        assert_valid("read_symbols", json!({ "targets": ["sym:x"] }));
+        assert_valid("regex_search", json!({ "pattern": "fn\\s+x" }));
+        assert_valid("detect_changes", json!({ "changed_files": ["src/a.rs"] }));
+
+        assert_valid("hub_nodes", json!({ "top_n": 5 }));
+        assert_valid("bridge_nodes", json!({ "top_n": 5 }));
+        assert_valid("get_summary", json!({ "name": "x" }));
+    }
+
+    #[test]
+    fn aliases_require_non_empty_string_arrays() {
+        for (name, args) in [
+            ("read_symbols", json!({ "uids_or_fqns": [] })),
+            ("detect_changes", json!({ "files": [] })),
+        ] {
+            assert_invalid(name, args);
+        }
+    }
+
+    #[test]
+    fn numeric_ranges_are_enforced_not_silently_coerced() {
+        // Negatives/floats/over-cap values used to vanish through
+        // `as_u64()` coercion and fall back to defaults. The compiled schemas
+        // now reject them on every transport.
+        let invalid = [
+            ("regex_search", json!({ "pattern": "x", "limit": 0 })),
+            ("regex_search", json!({ "pattern": "x", "limit": 10_001 })),
+            ("regex_search", json!({ "pattern": "x", "limit": -1 })),
+            ("regex_search", json!({ "pattern": "x", "limit": 2.5 })),
+            ("regex_search", json!({ "pattern": "x", "max_millis": 0 })),
+            (
+                "regex_search",
+                json!({ "pattern": "x", "max_millis": 600_001 }),
+            ),
+            (
+                "project_context",
+                json!({ "project": "p", "token_budget": 0 }),
+            ),
+            (
+                "project_context",
+                json!({ "project": "p", "token_budget": 16_001 }),
+            ),
+            ("investigate", json!({ "query": "q", "token_budget": -3 })),
+            (
+                "investigate",
+                json!({ "query": "q", "token_budget": 16_001 }),
+            ),
+            (
+                "investigate_hydrate",
+                json!({ "bundle_id": "b", "token_budget": 0 }),
+            ),
+            ("brain_impact", json!({ "symbol": "s", "depth": 0 })),
+            ("brain_impact", json!({ "symbol": "s", "depth": 16 })),
+            ("brain_impact", json!({ "symbol": "s", "limit": -2 })),
+            (
+                "blast_radius",
+                json!({ "changed_files": ["a.rs"], "max_depth": 0 }),
+            ),
+            (
+                "blast_radius",
+                json!({ "changed_files": ["a.rs"], "max_depth": 16 }),
+            ),
+            ("hub_nodes", json!({ "limit": 0 })),
+            ("hub_nodes", json!({ "top_n": 1001 })),
+            ("dead_code", json!({ "limit": 1.5 })),
+            (
+                "read_symbols",
+                json!({ "targets": ["sym:x"], "include_neighbors": 256 }),
+            ),
+            (
+                "read_symbols",
+                json!({ "targets": ["sym:x"], "include_neighbors": -1 }),
+            ),
+        ];
+        for (name, args) in invalid {
+            assert_invalid(name, args);
+        }
+
+        // Boundary values stay valid.
+        let valid = [
+            (
+                "regex_search",
+                json!({ "pattern": "x", "limit": 10_000, "max_millis": 600_000 }),
+            ),
+            (
+                "project_context",
+                json!({ "project": "p", "token_budget": 16_000 }),
+            ),
+            ("investigate", json!({ "query": "q", "token_budget": 1 })),
+            (
+                "investigate_hydrate",
+                json!({ "bundle_id": "b", "token_budget": 16_000 }),
+            ),
+            (
+                "brain_impact",
+                json!({ "symbol": "s", "depth": 15, "limit": 1000 }),
+            ),
+            (
+                "blast_radius",
+                json!({ "changed_files": ["a.rs"], "max_depth": 15 }),
+            ),
+            ("hub_nodes", json!({ "limit": 1000 })),
+            ("dead_code", json!({ "limit": 1 })),
+            (
+                "read_symbols",
+                json!({ "targets": ["sym:x"], "include_neighbors": 255 }),
+            ),
+        ];
+        for (name, args) in valid {
+            assert_valid(name, args);
+        }
+    }
+
+    #[test]
+    fn bounded_tools_reject_unknown_arguments() {
+        // Mistyped arg names must fail loudly instead of being
+        // silently ignored (e.g. `neighbors` for `include_neighbors`).
+        for (name, args) in [
+            (
+                "read_symbols",
+                json!({ "targets": ["sym:x"], "neighbors": 2 }),
+            ),
+            ("regex_search", json!({ "pattern": "x", "patterns": ["y"] })),
+            ("hub_nodes", json!({ "top": 5 })),
+            (
+                "brain_impact",
+                json!({ "symbol": "s", "min_confidence": "low" }),
+            ),
+            ("dead_code", json!({ "max_results": 5 })),
+            ("project_context", json!({ "project": "p", "budget": 100 })),
+            ("investigate", json!({ "query": "q", "seeds": ["s"] })),
+            (
+                "blast_radius",
+                json!({ "changed_files": ["a"], "files": ["b"] }),
+            ),
+        ] {
+            assert_invalid(name, args);
+        }
+
+        // Documented aliases remain accepted.
+        assert_valid("read_symbols", json!({ "uids_or_fqns": ["sym:x"] }));
+        assert_valid("regex_search", json!({ "query": "x" }));
+        assert_valid("hub_nodes", json!({ "top_n": 5 }));
+    }
+
+    #[test]
+    fn regex_search_rejects_conflicting_pattern_and_query() {
+        let error = assert_invalid("regex_search", json!({ "pattern": "a", "query": "b" }));
+        assert!(
+            error.contains("only one of 'pattern' or 'query'"),
+            "conflicting aliases must be named: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_tool_is_reported() {
+        let error = assert_invalid("not_a_tool", json!({}));
+        assert_eq!(error, "unknown tool: not_a_tool");
+    }
+
+    #[test]
+    fn direct_dispatch_validates_arguments_and_preserves_aliases() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let error = dispatch(&store, None, "brain_search", json!({ "query": 42 }), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid arguments"), "{error}");
+        assert!(error.contains("/query"), "{error}");
+
+        dispatch(
+            &store,
+            None,
+            "brain_search",
+            json!({ "query": "needle" }),
+            None,
+        )
+        .expect("valid canonical arguments should reach the handler");
+        dispatch(
+            &store,
+            None,
+            "read_symbols",
+            json!({ "uids_or_fqns": ["sym:missing"] }),
+            None,
+        )
+        .expect("valid legacy aliases should reach the handler");
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn daemon_proxy_rejects_invalid_arguments_before_rpc() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let channel = {
+            let _guard = runtime.enter();
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy()
+        };
+        let mut client = DaemonGrpcClient::new(channel);
+
+        let error = dispatch_via_daemon(
+            &mut client,
+            &runtime,
+            "brain_search",
+            json!({ "query": 42 }),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("invalid arguments for tool"), "{error}");
+        assert!(error.contains("/query"), "{error}");
+    }
+
+    #[test]
+    fn local_dispatch_enforces_tools_allowlist_and_lite_mode() {
+        // The gate must reject with the same error text on the local
+        // path (the daemon-proxy test below asserts parity).
+        let store = GraphStore::in_memory().unwrap();
+
+        set_allowed_tools(vec!["brain_search".to_string()]);
+        let error = dispatch(&store, None, "brain_status", json!({}), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "tool 'brain_status' is not in the allowed tools list; allowed: brain_search"
+            ),
+            "{error}"
+        );
+        ALLOWED_TOOLS.with(|c| *c.borrow_mut() = None);
+
+        set_lite_mode(true);
+        let error = dispatch(&store, None, "set_extension", json!({}), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("tool 'set_extension' is not available in lite mode"),
+            "{error}"
+        );
+        // A lite tool is not blocked by lite mode.
+        dispatch(&store, None, "brain_status", json!({}), None)
+            .expect("lite tools must dispatch in lite mode");
+        set_lite_mode(false);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn daemon_proxy_enforces_tools_allowlist_and_lite_mode() {
+        // The daemon-proxy path used to skip the --tools/--lite gate
+        // entirely. The lazy channel never connects, so any call that PASSES
+        // the gate fails with a transport error — proving the rejection below
+        // happened at the gate, not the wire.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let channel = {
+            let _guard = runtime.enter();
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy()
+        };
+        let mut client = DaemonGrpcClient::new(channel);
+
+        set_allowed_tools(vec!["brain_search".to_string()]);
+        let error = dispatch_via_daemon(&mut client, &runtime, "brain_status", json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "tool 'brain_status' is not in the allowed tools list; allowed: brain_search"
+            ),
+            "daemon path must reject with the same text as the local path: {error}"
+        );
+        ALLOWED_TOOLS.with(|c| *c.borrow_mut() = None);
+
+        set_lite_mode(true);
+        let error = dispatch_via_daemon(&mut client, &runtime, "set_extension", json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("tool 'set_extension' is not available in lite mode"),
+            "{error}"
+        );
+        set_lite_mode(false);
+    }
+
+    #[test]
+    fn brain_guide_rejects_config_arg_with_explicit_error() {
+        // The daemon/MCP handler cannot honor an instance config;
+        // silently ignoring it would return a guide for the wrong instance.
+        let store = GraphStore::in_memory().unwrap();
+        let error = tool_brain_guide(&store, json!({ "config": "/tmp/instance.toml" }))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot honor the 'config' argument"),
+            "{error}"
+        );
+        // No config arg -> no error.
+        tool_brain_guide(&store, json!({})).expect("guide without config must succeed");
+        // Blank config strings are treated as absent.
+        tool_brain_guide(&store, json!({ "config": "  " }))
+            .expect("blank config must be treated as absent");
+    }
+
+    #[test]
+    fn dead_code_count_contract_is_consistent() {
+        use nestweaver_schema::{Symbol, Visibility};
+
+        // unreachable_count must be the UNFILTERED total (like total_symbols /
+        // reachable_symbols / dead_percentage); the post-min_confidence count
+        // is reported separately as matching_count.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:orphan".to_string(),
+                name: "orphan_fn".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:a".to_string(),
+                file_path: "src/a.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn orphan_fn()".to_string(),
+                summary: None,
+                content_hash: "h1".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let all = tool_dead_code(&store, json!({}), None).expect("dead_code low");
+        assert_eq!(all["unreachable_count"], 1);
+        assert_eq!(all["matching_count"], 1);
+        assert_eq!(all["returned"], 1);
+
+        // Inferred visibility maps to Medium confidence, so a High filter
+        // drops it from the results but NOT from the unfiltered total.
+        let high = tool_dead_code(&store, json!({ "min_confidence": "high" }), None)
+            .expect("dead_code high");
+        assert_eq!(
+            high["unreachable_count"], 1,
+            "unreachable_count must be unfiltered: {high}"
+        );
+        assert_eq!(high["matching_count"], 0);
+        assert_eq!(high["returned"], 0);
+        assert_eq!(high["truncated"], false);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn forwarded_bool_preserves_default_true_when_arg_absent() {
+        // Proto3 bools have no presence — an absent arg must forward as
+        // the tool's default (true for these two), not as explicit false.
+        assert!(forwarded_bool(&json!({}), "include_components", true));
+        assert!(forwarded_bool(&json!({}), "include_body", true));
+        // Explicit values still honored, including explicit false.
+        assert!(!forwarded_bool(
+            &json!({ "include_components": false }),
+            "include_components",
+            true
+        ));
+        assert!(forwarded_bool(
+            &json!({ "include_body": true }),
+            "include_body",
+            true
+        ));
+        // Default-false bools are unaffected.
+        assert!(!forwarded_bool(&json!({}), "prf", false));
+        assert!(forwarded_bool(&json!({ "prf": true }), "prf", false));
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn tool_errors_are_not_mislabeled_as_grpc_transport_errors() {
+        // A tool-execution failure forwarded by the daemon is not a gRPC
+        // transport error; the prefix must not claim it is.
+        let tool_err = grpc_status_err(tonic::Status::internal(
+            "tool note_get failed: provide either 'uid' or 'title'",
+        ));
+        assert_eq!(
+            tool_err.to_string(),
+            "tool note_get failed: provide either 'uid' or 'title'"
+        );
+        let cancelled = grpc_status_err(tonic::Status::deadline_exceeded(
+            "brain_impact query cancelled: timeout",
+        ));
+        assert!(
+            !cancelled.to_string().starts_with("gRPC error:"),
+            "{cancelled}"
+        );
+        // Genuine transport failures keep the prefix.
+        let transport = grpc_status_err(tonic::Status::unavailable("transport error"));
+        assert_eq!(transport.to_string(), "gRPC error: transport error");
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn daemon_brain_search_json_preserves_counts_and_old_response_defaults() {
+        let response = nestweaver_proto::BrainSearchResponse {
+            query: "needle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 1,
+            results: vec![nestweaver_proto::SearchResultItem {
+                uid: "sym:needle".to_string(),
+                canonical_id: Some("canonical-needle".to_string()),
+                kind: "Symbol/Function".to_string(),
+                title: "needle".to_string(),
+                score: 1.0,
+                location: Some("src/lib.rs:1".to_string()),
+                matched_headings: Vec::new(),
+                inline_body: None,
+                vault_uid: None,
+            }],
+            expansion_terms: vec!["expanded".to_string()],
+            returned_matches: 0,
+            total_matches_relation: String::new(),
+            // Proto3 defaults from a pre-Task-7 daemon: the new scalar fields
+            // decode as zero/empty/false because they were absent on the wire.
+            truncated: false,
+        };
+
+        let value = daemon_brain_search_response_to_json(&response, false);
+
+        assert_eq!(value["total_matches"], 1);
+        assert_eq!(value["total_matches_relation"], "gte");
+        assert_eq!(value["returned_matches"], 1);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["results"][0]["canonical_id"], "canonical-needle");
+        assert_eq!(value["expansion_terms"], json!(["expanded"]));
+
+        let concise = daemon_brain_search_response_to_json(&response, true);
+        assert_eq!(concise["results"][0]["uid"], "sym:needle");
+        assert_eq!(concise["results"][0]["canonical_id"], "canonical-needle");
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn extension_tool_arg_errors_are_not_mislabeled_as_grpc_errors() {
+        // The daemon wraps set_extension/query_extensions argument errors in
+        // the standard `tool <name> failed:` format, so stdio MCP clients must
+        // not see a misleading "gRPC error:" prefix (they never speak gRPC).
+        let err = grpc_status_err(tonic::Status::invalid_argument(
+            "tool query_extensions failed: provide either 'uid' or both 'key' and 'value'",
+        ));
+        assert_eq!(
+            err.to_string(),
+            "tool query_extensions failed: provide either 'uid' or both 'key' and 'value'"
+        );
+        let err = grpc_status_err(tonic::Status::invalid_argument(
+            "tool set_extension failed: 'value' is required",
+        ));
+        assert!(!err.to_string().starts_with("gRPC error:"), "{err}");
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn daemon_brain_search_json_omits_empty_matched_headings() {
+        // Parity with the local path: symbol rows carry no `matched_headings`
+        // key at all — the daemon conversion used to emit a spurious `[]`.
+        let response = nestweaver_proto::BrainSearchResponse {
+            query: "needle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 2,
+            results: vec![
+                nestweaver_proto::SearchResultItem {
+                    uid: "sym:needle".to_string(),
+                    canonical_id: None,
+                    kind: "Symbol/Function".to_string(),
+                    title: "needle".to_string(),
+                    score: 1.0,
+                    location: Some("src/lib.rs:1".to_string()),
+                    matched_headings: Vec::new(),
+                    inline_body: None,
+                    vault_uid: None,
+                },
+                nestweaver_proto::SearchResultItem {
+                    uid: "note:needle".to_string(),
+                    canonical_id: None,
+                    kind: "note".to_string(),
+                    title: "Needle Note".to_string(),
+                    score: 0.9,
+                    location: None,
+                    matched_headings: vec!["Needle Heading".to_string()],
+                    inline_body: None,
+                    vault_uid: Some("vlt:default:needle".to_string()),
+                },
+            ],
+            expansion_terms: Vec::new(),
+            returned_matches: 2,
+            total_matches_relation: "eq".to_string(),
+            truncated: false,
+        };
+
+        let value = daemon_brain_search_response_to_json(&response, false);
+        assert!(value["results"][0].get("matched_headings").is_none());
+        assert_eq!(
+            value["results"][1]["matched_headings"],
+            json!(["Needle Heading"])
+        );
+        // Note rows carry their vault; symbol rows omit the key.
+        assert!(value["results"][0].get("vault_uid").is_none());
+        assert_eq!(
+            value["results"][1]["vault_uid"],
+            json!("vlt:default:needle")
+        );
+
+        let concise = daemon_brain_search_response_to_json(&response, true);
+        assert!(concise["results"][0].get("matched_headings").is_none());
+        assert_eq!(
+            concise["results"][1]["matched_headings"],
+            json!(["Needle Heading"])
+        );
+    }
+
+    #[test]
+    fn brain_search_rejects_undocumented_arguments() {
+        // Bogus args used to be silently accepted; the hardened schema
+        // (additionalProperties: false, like regex_search) rejects them.
+        let err = assert_invalid("brain_search", json!({ "query": "x", "bogus": true }));
+        assert!(err.contains("additionalProperties"), "{err}");
+    }
+
+    #[test]
+    fn brain_search_accepts_cache_bypass_arguments() {
+        // brain_search is cacheable, so the documented cache-bypass args must
+        // keep validating under additionalProperties: false.
+        assert_valid("brain_search", json!({ "query": "x", "cache": "bypass" }));
+        assert_valid("brain_search", json!({ "query": "x", "no_cache": true }));
+    }
 }
 
 /// Returns structured documentation metadata for every registered tool.
@@ -248,6 +1161,30 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
         .collect()
 }
 
+/// Enforce the `--tools` allowlist and `--lite` mode for a dispatch. Called by
+/// EVERY dispatch entry point (local store, daemon proxy, hybrid routing) so a
+/// restricted server cannot be reached by routing around the local path
+/// The allowlist error text is part of the CLI/MCP contract — keep it
+/// in sync with the `tools/list` filtering in [`tool_list`].
+pub fn enforce_tool_allowed(name: &str) -> Result<(), anyhow::Error> {
+    if is_lite_mode() && !LITE_TOOLS.contains(&name) {
+        return Err(anyhow!(
+            "tool '{name}' is not available in lite mode; allowed: {}",
+            LITE_TOOLS.join(", ")
+        ));
+    }
+    let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
+    if let Some(ref names) = allowed
+        && !names.iter().any(|a| a == name)
+    {
+        return Err(anyhow!(
+            "tool '{name}' is not in the allowed tools list; allowed: {}",
+            names.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Dispatch a `tools/call` to the named tool. The optional `tantivy`
 /// index, when present, drives hybrid retrieval in `brain_context` and
 /// upgrades `brain_search` from substring to BM25.
@@ -269,11 +1206,12 @@ pub fn dispatch(
 /// query timeout or client disconnect can stop the work. `cancel = None` is the
 /// original behavior.
 ///
-/// `visible` carries the caller's per-repo visibility (R9/R9b), resolved by the
+/// `visible` carries the caller's per-repo visibility, resolved by the
 /// HTTP boundary from the bearer identity. `None` (and `Some(VisibleRepos::All)`)
 /// means no scoping — the backward-compatible single-trust-domain default, in
-/// which blast-radius redaction is a no-op. Only `blast_radius` reads it; every
-/// other tool ignores it, exactly like `cancel`.
+/// which repo-scoped authorization is a no-op. `brain_search`, `brain_impact`,
+/// `blast_radius`, and `affected_tests` enforce it; tools whose data is not
+/// repo-scoped ignore it.
 pub fn dispatch_cancellable(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -283,16 +1221,10 @@ pub fn dispatch_cancellable(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    // Enforce tool allowlist when configured.
-    let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
-    if let Some(ref names) = allowed
-        && !names.iter().any(|a| a == name)
-    {
-        return Err(anyhow!(
-            "tool '{name}' is not in the allowed tools list; allowed: {}",
-            names.join(", ")
-        ));
-    }
+    // Enforce --tools allowlist and --lite mode.
+    enforce_tool_allowed(name)?;
+
+    validate_tool_arguments(name, &args)?;
 
     // F16: serve cacheable read tools from (or populate) the response cache.
     // Correctness rests on the cache KEY — see `maybe_cached`.
@@ -315,7 +1247,7 @@ fn dispatch_uncached(
 ) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel),
-        "brain_search" => tool_brain_search(store, tantivy, args),
+        "brain_search" => tool_brain_search(store, tantivy, args, visible),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
         "brain_status" => tool_brain_status(store, tantivy),
@@ -323,7 +1255,7 @@ fn dispatch_uncached(
         "brain_remove_source" => tool_brain_remove_source(store, args),
         "prune_stale" => tool_prune_stale(store),
         "cross_repo_contracts" => tool_cross_repo_contracts(store, args),
-        "brain_impact" => tool_brain_impact(store, args, cancel),
+        "brain_impact" => tool_brain_impact(store, args, cancel, visible),
         "brain_guide" => tool_brain_guide(store, args),
         "flow_trace" => tool_flow_trace(store, args, cancel),
         "detect_changes" => tool_detect_changes(store, args),
@@ -346,7 +1278,7 @@ fn dispatch_uncached(
         "brain_topic_clusters" => tool_brain_topic_clusters(store, args),
         "brain_tag_graph" => tool_brain_tag_graph(store, args),
         "brain_doc_stats" => tool_brain_doc_stats(store, args),
-        "affected_tests" => tool_affected_tests(store, args),
+        "affected_tests" => tool_affected_tests(store, args, visible),
         "investigate" => tool_investigate(store, tantivy, args, embed_model),
         "investigate_expand" => tool_investigate_expand(store, args),
         "investigate_hydrate" => tool_investigate_hydrate(store, args),
@@ -370,7 +1302,16 @@ fn dispatch_uncached(
 /// - stateful bundle tools (`investigate`, `investigate_expand`,
 ///   `investigate_hydrate`) — they accumulate per-session state;
 /// - `brain_status` / `stale_check` — they report live process/lock state and
-///   the cache's own stats, which must not be frozen.
+///   the cache's own stats, which must not be frozen;
+/// - `read_symbols` — its body text is read from the FILESYSTEM (resolved from
+///   cwd/`root`, or empty under a bare-clone/server), so the response is NOT a
+///   pure function of the graph generation + scope digest that keys this cache.
+///   A single call made from a wrong cwd (or a bare clone) would cache an EMPTY
+///   body and then serve it for the correct args forever — a silent-wrong result
+///   on a core retrieval tool. It's a cheap disk-span read, so leave it uncached.
+/// - `query_extensions` — reads the extensions sidecar, which `set_extension`
+///   mutates WITHOUT bumping the graph generation, so a cached result would serve
+///   stale values after a write (nw-089). Cheap sidecar read; leave it uncached.
 const CACHEABLE_TOOLS: &[&str] = &[
     "brain_context",
     "brain_search",
@@ -380,7 +1321,6 @@ const CACHEABLE_TOOLS: &[&str] = &[
     "brain_impact",
     "flow_trace",
     "clusters",
-    "query_extensions",
     "brain_diff",
     "project_context",
     "dead_code",
@@ -388,7 +1328,6 @@ const CACHEABLE_TOOLS: &[&str] = &[
     "bridge_nodes",
     "blast_radius",
     "get_summary",
-    "read_symbols",
     "regex_search",
     "count_patterns",
     "brain_broken_links",
@@ -501,6 +1440,127 @@ fn mix_visibility_cache_key(base: u64, salt: u64) -> u64 {
     hasher.finish()
 }
 
+// ── Single-flight coalescing for cache misses ────────────────────────────────
+/// Identical concurrent cacheable calls (same tool, args, visibility,
+/// generation, scope) otherwise stampede: every dispatch thread misses its
+/// thread-local response cache and runs the same expensive query — a
+/// brain_context semantic leg is a full BERT forward pass, so 30 parallel
+/// identical calls burned 30 embeds and piled into the tool timeout.
+/// Coalesce them: the first caller (leader) computes, followers wait on the
+/// shared slot and receive a clone of the leader's result. `anyhow::Error`
+/// is not `Clone`, so the slot carries the error's message and followers
+/// re-wrap it.
+struct InFlightSlot {
+    result: std::sync::Mutex<Option<Result<Value, String>>>,
+    ready: std::sync::Condvar,
+}
+
+/// In-flight key: everything that identifies one deterministic computation —
+/// db identity, the visibility-salted response-cache key, and the freshness
+/// pair (graph generation, whole-db scope digest) the response cache uses.
+type InFlightKey = (std::path::PathBuf, u64, u64, u64);
+
+static IN_FLIGHT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<InFlightKey, std::sync::Arc<InFlightSlot>>>,
+> = std::sync::OnceLock::new();
+
+/// RAII handle for the leader of a coalesced computation. Dropping it —
+/// normal return, error, or panic unwind alike — removes the flight entry
+/// and wakes every follower; if no result was stored (panic path) followers
+/// receive an error instead of waiting forever.
+struct FlightLeader {
+    key: InFlightKey,
+    slot: std::sync::Arc<InFlightSlot>,
+}
+
+impl FlightLeader {
+    /// Store the outcome for waiting followers; `drop` then unregisters the
+    /// flight and notifies them.
+    fn finish(self, result: Result<Value, String>) {
+        *self.slot.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+    }
+}
+
+impl Drop for FlightLeader {
+    fn drop(&mut self) {
+        if let Some(flights) = IN_FLIGHT.get() {
+            let mut flights = flights.lock().unwrap_or_else(|e| e.into_inner());
+            // Remove only if the entry still points at THIS slot — a later
+            // leader for the same key may already have replaced it.
+            if flights
+                .get(&self.key)
+                .is_some_and(|s| std::sync::Arc::ptr_eq(s, &self.slot))
+            {
+                flights.remove(&self.key);
+            }
+        }
+        let mut result = self.slot.result.lock().unwrap_or_else(|e| e.into_inner());
+        if result.is_none() {
+            *result = Some(Err(
+                "in-flight leader dropped before producing a result".to_string()
+            ));
+        }
+        drop(result);
+        self.slot.ready.notify_all();
+    }
+}
+
+/// Run `compute` at most once among concurrent callers sharing `key`
+/// (single-flight). The first caller computes; followers block on the shared
+/// slot's condvar and receive a clone of the leader's result. Followers
+/// inherit the leader's cancellation/failure — for an identical query that
+/// is the same outcome they would have produced themselves.
+fn coalesce_in_flight(
+    key: InFlightKey,
+    compute: impl FnOnce() -> Result<Value, anyhow::Error>,
+) -> Result<Value, anyhow::Error> {
+    let (slot, leader) = {
+        let flights =
+            IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut flights = flights.lock().unwrap_or_else(|e| e.into_inner());
+        match flights.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                (std::sync::Arc::clone(e.get()), None)
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let slot = std::sync::Arc::new(InFlightSlot {
+                    result: std::sync::Mutex::new(None),
+                    ready: std::sync::Condvar::new(),
+                });
+                e.insert(std::sync::Arc::clone(&slot));
+                let leader = FlightLeader {
+                    key,
+                    slot: std::sync::Arc::clone(&slot),
+                };
+                (slot, Some(leader))
+            }
+        }
+    };
+
+    let Some(leader) = leader else {
+        // Follower: wait for the leader to publish its result, then share it.
+        let mut result = slot.result.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(res) = &*result {
+                return match res {
+                    Ok(value) => Ok(value.clone()),
+                    Err(msg) => Err(anyhow!("{msg}")),
+                };
+            }
+            result = slot.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+        }
+    };
+
+    let result = compute();
+    leader.finish(
+        result
+            .as_ref()
+            .map(|v| v.clone())
+            .map_err(|e| format!("{e:#}")),
+    );
+    result
+}
+
 fn maybe_cached(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -553,7 +1613,12 @@ fn maybe_cached(
     }
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)?;
+    // Single-flight: concurrent identical calls share one computation
+    // instead of stampeding it (see `coalesce_in_flight`).
+    let flight_key: InFlightKey = (db_path.clone(), key, generation, scope_digest);
+    let result = coalesce_in_flight(flight_key, || {
+        dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
+    })?;
     if store.is_index_publication_dirty() || store.graph_generation() != generation {
         return Ok(result);
     }
@@ -739,6 +1804,30 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         }
     }
 
+    // Non-server mode: if any returned symbol's source span could not be read
+    // (file not found from the working directory), the body is an empty string
+    // that looks identical to a genuinely empty symbol. Surface an honest note so
+    // an agent in the wrong cwd knows to pass `root` instead of trusting "".
+    if !is_server_mode() {
+        let unreadable = value
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|s| s.get("body_available").and_then(|b| b.as_bool()) == Some(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        if unreadable > 0 {
+            value["note"] = serde_json::json!(format!(
+                "{unreadable} symbol(s) returned an empty body because their source file could \
+                 not be read from the working directory ({}). Pass `root` (the repo path) or run \
+                 from the repo root to get source spans.",
+                root.display()
+            ));
+        }
+    }
+
     Ok(value)
 }
 
@@ -911,22 +2000,35 @@ fn tool_schema_read_symbols() -> Value {
                 "targets": {
                     "type": "array",
                     "items": { "type": "string" },
+                    "minItems": 1,
                     "description": "Symbol UIDs (sym:...), names, or FQNs to read."
+                },
+                "uids_or_fqns": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Backward-compatible alias for targets."
                 },
                 "include_neighbors": {
                     "type": "integer",
-                    "description": "Include N adjacent symbols in the same file (default 0)."
+                    "minimum": 0,
+                    "maximum": 255,
+                    "description": "Include N adjacent symbols in the same file (default 0, max 255)."
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate token cap for the combined output."
+                    "description": "Approximate token cap for the combined output. The first requested symbol is always returned in full; subsequent symbols are dropped once the budget is exceeded. Omit for no cap; a budget of 0 therefore returns just the first symbol."
                 },
                 "root": {
                     "type": "string",
                     "description": "Repository root for resolving file paths (default: server working directory)."
                 }
             },
-            "required": ["targets"]
+            "anyOf": [
+                { "required": ["targets"] },
+                { "required": ["uids_or_fqns"] }
+            ],
+            "additionalProperties": false
         }
     })
 }
@@ -934,18 +2036,47 @@ fn tool_schema_read_symbols() -> Value {
 /// F3: trigram-accelerated regex search over indexed text. Lets agents run a
 /// real regex against Section bodies, Note titles, and Symbol signatures
 /// without shelling out to rg/grep.
+///
+/// The node kinds `regex_search`/`count_patterns` can filter on, as advertised
+/// in their schemas. Anything else used to silently match no candidates and
+/// return empty results — fail loudly instead.
+const REGEX_SEARCH_KINDS: &[&str] = &["Section", "Note", "Symbol"];
+
+fn validate_regex_kinds(kinds: Option<&[String]>) -> Result<(), anyhow::Error> {
+    if let Some(kinds) = kinds {
+        for kind in kinds {
+            if !REGEX_SEARCH_KINDS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(kind))
+            {
+                return Err(anyhow!(
+                    "unknown kind '{kind}'; expected one of: {}",
+                    REGEX_SEARCH_KINDS.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let pattern = args
         .get("pattern")
         .or_else(|| args.get("query"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("'pattern' must be a string"))?;
+    if pattern.trim().is_empty() {
+        // Same policy as count_patterns: an empty pattern matches everything,
+        // which is a scan-cost/response-amplification lever, not a query.
+        return Err(anyhow!("empty pattern strings are not allowed"));
+    }
 
     // Note: regex_search works in server mode — GraphStore::regex_search
     // searches over indexed symbol text, not raw source files on disk.
 
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let kinds = parse_string_array(&args, "kinds");
+    validate_regex_kinds(kinds.as_deref())?;
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -975,21 +2106,28 @@ fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_regex_search() -> Value {
     json!({
         "name": "regex_search",
-        "description": "Run a Rust regex against indexed text (section bodies, note titles, symbol signatures) with trigram-accelerated pre-filtering.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output includes {results:[{uid, kind, title, location, line, snippet}], truncated, scanned_fallback}\n- scanned_fallback is set when no trigram index exists or the pattern has no usable literals\n\nLimitations:\n- Candidate cap of 5000 or time budget (default 2000ms) may truncate results\n- Does not search binary files or unindexed content",
+        "description": "Run a Rust regex against indexed text (section bodies, note titles, symbol signatures) with trigram-accelerated pre-filtering.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output includes {results:[{uid, kind, title, location, line, snippet}], truncated, scanned_fallback, stale_index}\n- scanned_fallback is set when no trigram index exists or the pattern has no usable literals\n- stale_index is set when a trigram index EXISTS but was bypassed as stale (graph changed since it was built) — results are still correct (full scan), but reindex to restore the pre-filter\n\nLimitations:\n- Candidate cap of 200000 or time budget (default 2000ms) may truncate results\n- Does not search binary files or unindexed content",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\"." },
+                "query": { "type": "string", "description": "Backward-compatible alias for pattern." },
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Restrict to these node kinds: Section, Note, Symbol (case-insensitive)."
                 },
-                "limit": { "type": "integer", "description": "Maximum results to return. Default: unlimited (capped by the candidate budget)." },
-                "max_millis": { "type": "integer", "description": "Wall-clock time budget in milliseconds. Default 2000." }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Maximum results to return (1-10000; the candidate cap is 200000). Default: unlimited (capped by the candidate budget)." },
+                "max_millis": { "type": "integer", "minimum": 1, "maximum": 600000, "description": "Wall-clock time budget in milliseconds (1-600000). Default 2000." },
+                "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
+                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
-            "required": ["pattern"]
+            "anyOf": [
+                { "required": ["pattern"] },
+                { "required": ["query"] }
+            ],
+            "additionalProperties": false
         }
     })
 }
@@ -1014,6 +2152,7 @@ fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     }
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let kinds = parse_string_array(&args, "kinds");
+    validate_regex_kinds(kinds.as_deref())?;
 
     let counts = store
         .count_patterns(&patterns, path_prefix, kinds.as_deref())
@@ -1024,7 +2163,7 @@ fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_count_patterns() -> Value {
     json!({
         "name": "count_patterns",
-        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}]}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts one match per node, not per occurrence within a node\n- Same trigram/fallback behavior as regex_search",
+        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts one match per node, not per occurrence within a node\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1150,13 +2289,13 @@ fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, a
 fn tool_schema_brain_topic_clusters() -> Value {
     json!({
         "name": "brain_topic_clusters",
-        "description": "Discover thematic structure of a vault by running Leiden community detection over the note-to-note wikilink graph.\n\nGuidelines:\n- Each cluster is labelled by its most central member (highest PageRank)\n- Adjust resolution parameter: higher yields more, smaller clusters\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only considers wikilink edges between notes, not tags or code references\n- Label quality depends on the most-central note having a descriptive title",
+        "description": "Discover thematic structure of a vault by running Louvain-style local moving community detection over the note-to-note wikilink graph.\n\nGuidelines:\n- Each cluster is labelled by its most central member (highest PageRank)\n- Adjust resolution parameter: higher yields more, smaller clusters\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only considers wikilink edges between notes, not tags or code references\n- Label quality depends on the most-central note having a descriptive title",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "resolution": {
                     "type": "number",
-                    "description": "Leiden resolution — higher yields more, smaller clusters (default 0.5).",
+                    "description": "Community-detection resolution — higher yields more, smaller clusters (default 0.5).",
                     "default": 0.5
                 },
                 "limit": {
@@ -1413,6 +2552,32 @@ fn is_concise(args: &Value) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("concise"))
 }
 
+/// The node kinds `brain_context` can filter on, as advertised in its schema.
+/// Anything else silently matched no nodes and returned an empty context —
+/// fail loudly instead (same policy as `validate_regex_kinds`). `Symbol`
+/// sub-kinds (e.g. "Symbol/Function") stay valid because the filter is a
+/// case-insensitive kind-PREFIX match.
+const BRAIN_CONTEXT_KINDS: &[&str] = &["Symbol", "Note", "Section", "Tag", "Heading"];
+
+fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
+    for kind in kinds {
+        let is_base = BRAIN_CONTEXT_KINDS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(kind));
+        let is_symbol_subkind = kind
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("symbol/"))
+            && kind.len() > "symbol/".len();
+        if !is_base && !is_symbol_subkind {
+            return Err(anyhow!(
+                "unknown kind '{kind}'; expected one of: {} (or a 'Symbol/<sub-kind>' prefix)",
+                BRAIN_CONTEXT_KINDS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── 1. brain_context ────────────────────────────────────────────────────────
 
 fn tool_schema_brain_context() -> Value {
@@ -1429,7 +2594,9 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate cap on the connected list (chars / 4). Default 2000. Increase for broader context, decrease for focused results.",
+                    "minimum": 1,
+                    "maximum": 16000,
+                    "description": "Approximate cap on the connected list (chars / 4, 1-16000). Default 2000. Increase for broader context, decrease for focused results.",
                     "default": 2000
                 },
                 "response_format": {
@@ -1477,7 +2644,7 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "weight_semantic": {
                     "type": "number",
-                    "description": "Semantic embedding weight for hybrid RRF fusion. Default 0.0 (disabled until embeddings are generated)."
+                    "description": "Semantic embedding weight for hybrid RRF fusion. Effective default is 0.0 — the semantic leg is skipped entirely (no BERT embed of the query) until embeddings are generated for the database (`nestweaver embed`); on embedded databases the default is 0.35."
                 },
                 "since": {
                     "type": "string",
@@ -1558,6 +2725,9 @@ fn tool_brain_context(
                 .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
                 .collect()
         });
+    if let Some(ref kinds) = filter_kinds {
+        validate_brain_context_kinds(kinds)?;
+    }
     let filter_repos: Option<Vec<String>> =
         args.get("repos").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
@@ -2073,10 +3243,47 @@ fn render_cost(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
 
 // ── 2. brain_search ─────────────────────────────────────────────────────────
 
+const BRAIN_SEARCH_MAX_PER_KIND: usize = 1_000;
+const BRAIN_SEARCH_COUNT_CANDIDATES: usize = 10_000;
+
+fn combine_search_totals(notes: SearchTotal, symbols: SearchTotal) -> SearchTotal {
+    let value = notes.value.saturating_add(symbols.value);
+    if notes.relation == SearchTotalRelation::Exact
+        && symbols.relation == SearchTotalRelation::Exact
+    {
+        SearchTotal::exact(value)
+    } else {
+        SearchTotal::lower_bound(value)
+    }
+}
+
+fn search_results_are_truncated(total: SearchTotal, returned: usize) -> bool {
+    total.relation == SearchTotalRelation::LowerBound || returned < total.value
+}
+
+fn search_total_relation_label(relation: SearchTotalRelation) -> &'static str {
+    match relation {
+        SearchTotalRelation::Exact => "eq",
+        SearchTotalRelation::LowerBound => "gte",
+    }
+}
+
+fn authorized_symbol_total(
+    global: SearchTotal,
+    fetched_candidates: usize,
+    authorized_entities: usize,
+) -> SearchTotal {
+    if global.relation == SearchTotalRelation::Exact && global.value == fetched_candidates {
+        SearchTotal::exact(authorized_entities)
+    } else {
+        SearchTotal::lower_bound(authorized_entities)
+    }
+}
+
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
+        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries; note rows also carry vault_uid and matched_headings (matched_headings is omitted when empty)\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2087,13 +3294,15 @@ fn tool_schema_brain_search() -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum results to return. Default 20. Set lower for focused lookups, higher for broad discovery.",
-                    "default": 20
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 1000
                 },
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns note titles and kinds only; \"detailed\" (default) adds section text excerpts, BM25 scores, and vault UIDs."
+                    "description": "\"concise\" returns stable entity UIDs, titles, and kinds; \"detailed\" (default) adds section text excerpts, BM25 scores, and location metadata."
                 },
                 "include_bodies": {
                     "type": "boolean",
@@ -2113,9 +3322,12 @@ fn tool_schema_brain_search() -> Value {
                     "type": "boolean",
                     "default": false,
                     "description": "When true (detailed mode only), rerank the top-N hits before truncation (Feature F17). OFF by default; output is byte-identical when off. The default scorer is a transparent MONOTONIC heuristic — an UNVALIDATED reordering, NOT a proven nDCG win. An optional learned-weights file `<db>.rerank.json` is used instead if present and version-matched, but a learned model should only be trusted after the eval harness + accumulated interaction labels gate it at >= 5% nDCG@10. Reranking only reorders an already-retrieved set; recall is unchanged. Default false."
-                }
+                },
+                "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
+                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
-            "required": ["query"]
+            "required": ["query"],
+            "additionalProperties": false
         }
     })
 }
@@ -2124,6 +3336,7 @@ fn tool_brain_search(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
     args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let raw_query = args
         .get("query")
@@ -2135,10 +3348,9 @@ fn tool_brain_search(
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(20)
-        // Clamp to >=1: `limit:0` flows into `limit * 5` → `TopDocs::with_limit(0)`,
-        // which Tantivy asserts against ("Limit must be greater than 0") — a panic
-        // on a plausible client input.
-        .max(1);
+        // Schema validation rejects out-of-range MCP calls; keep a defensive
+        // clamp for direct unit/internal calls that bypass dispatch validation.
+        .clamp(1, BRAIN_SEARCH_MAX_PER_KIND);
     let concise = is_concise(&args);
 
     // Expand the query with taxonomy aliases for better recall.
@@ -2153,29 +3365,29 @@ fn tool_brain_search(
     // ── Vault note results ──────────────────────────────────────────────
 
     let mut expansion_terms: Vec<String> = Vec::new();
-    let (mut note_results, engine) = if let Some(idx) = tantivy {
+    let (grouped_notes, engine) = if let Some(idx) = tantivy {
         // Tantivy BM25 path (preferred).
-        let raw_limit = limit * 5;
-        let hits = if prf {
-            let (hits, terms) = idx
-                .search_prf(
+        let (hits, total) = if prf {
+            let page = idx
+                .search_prf_page(
                     &query,
-                    raw_limit,
+                    BRAIN_SEARCH_COUNT_CANDIDATES,
                     nestweaver_engine::query::nestweaver_store_stoplist(),
                 )
                 .map_err(|e| anyhow!("tantivy prf search: {e}"))?;
-            expansion_terms = terms;
-            hits
+            expansion_terms = page.expansion_terms;
+            (page.hits, page.total)
         } else {
-            idx.search(&query, raw_limit)
-                .map_err(|e| anyhow!("tantivy search: {e}"))?
+            let page = idx
+                .search_page(&query, BRAIN_SEARCH_COUNT_CANDIDATES)
+                .map_err(|e| anyhow!("tantivy search: {e}"))?;
+            (page.hits, page.total)
         };
-        let results = group_search_hits_by_note(store, &hits, limit, concise);
+        let results = group_search_hits_by_note(store, &hits, total, limit, concise)?;
         (results, "bm25")
     } else {
         // Substring fallback: search note titles, heading text, and section bodies.
         let needle = query.to_lowercase();
-        let raw_limit = limit * 5;
 
         struct RawHit {
             kind: String,
@@ -2189,7 +3401,7 @@ fn tool_brain_search(
         // Note title matches.
         let notes = store.list_notes(None).context("list_notes")?;
         for n in &notes {
-            if n.title.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
+            if n.title.to_lowercase().contains(&needle) {
                 raw_hits.push(RawHit {
                     kind: "note".to_string(),
                     title: n.title.clone(),
@@ -2200,38 +3412,34 @@ fn tool_brain_search(
         }
 
         // Heading text matches.
-        if raw_hits.len() < raw_limit {
-            let headings = store.list_all_headings().context("list_all_headings")?;
-            for h in &headings {
-                if h.text.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
-                    raw_hits.push(RawHit {
-                        kind: "heading".to_string(),
-                        title: h.text.clone(),
-                        note_uid: h.note_uid.clone(),
-                        score: 0.8,
-                    });
-                }
+        let headings = store.list_all_headings().context("list_all_headings")?;
+        for h in &headings {
+            if h.text.to_lowercase().contains(&needle) {
+                raw_hits.push(RawHit {
+                    kind: "heading".to_string(),
+                    title: h.text.clone(),
+                    note_uid: h.note_uid.clone(),
+                    score: 0.8,
+                });
             }
         }
 
         // Section body matches.
-        if raw_hits.len() < raw_limit {
-            let sections = store.list_all_sections().context("list_all_sections")?;
-            for s in &sections {
-                if s.text_content.to_lowercase().contains(&needle) && raw_hits.len() < raw_limit {
-                    let title = s
-                        .heading_uid
-                        .as_deref()
-                        .and_then(|h_uid| store.lookup_heading(h_uid).ok())
-                        .map(|h| h.text)
-                        .unwrap_or_else(|| "(untitled section)".to_string());
-                    raw_hits.push(RawHit {
-                        kind: "section".to_string(),
-                        title,
-                        note_uid: s.note_uid.clone(),
-                        score: 0.6,
-                    });
-                }
+        let sections = store.list_all_sections().context("list_all_sections")?;
+        for s in &sections {
+            if s.text_content.to_lowercase().contains(&needle) {
+                let title = s
+                    .heading_uid
+                    .as_deref()
+                    .and_then(|h_uid| store.lookup_heading(h_uid).ok())
+                    .map(|h| h.text)
+                    .unwrap_or_else(|| "(untitled section)".to_string());
+                raw_hits.push(RawHit {
+                    kind: "section".to_string(),
+                    title,
+                    note_uid: s.note_uid.clone(),
+                    score: 0.6,
+                });
             }
         }
 
@@ -2262,7 +3470,10 @@ fn tool_brain_search(
             if hit.kind == "note" {
                 group.best_title = hit.title.clone();
             }
-            if hit.kind == "heading" || hit.kind == "section" {
+            if (hit.kind == "heading" || hit.kind == "section")
+                && !group.matched_headings.contains(&hit.title)
+            {
+                // A heading and its section share a title — report it once.
                 group.matched_headings.push(hit.title.clone());
             }
         }
@@ -2291,13 +3502,21 @@ fn tool_brain_search(
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let results: Vec<Value> = note_order
+        let matched_entities = groups.len();
+        // Parity with the Tantivy path: detailed note rows carry their vault
+        // (resolved from the note list already fetched above).
+        let note_vaults: HashMap<&str, &str> = notes
+            .iter()
+            .map(|n| (n.uid.as_str(), n.vault_uid.as_str()))
+            .collect();
+        let rows: Vec<Value> = note_order
             .iter()
             .take(limit)
             .filter_map(|nuid| groups.get(nuid))
             .map(|g| {
                 if concise {
                     json!({
+                        "uid": g.note_uid,
                         "kind": "note",
                         "title": g.best_title,
                         "matched_headings": g.matched_headings,
@@ -2308,48 +3527,84 @@ fn tool_brain_search(
                         "kind": "note",
                         "title": g.best_title,
                         "score": g.best_score,
+                        "vault_uid": note_vaults.get(g.note_uid.as_str()).copied().unwrap_or_default(),
                         "matched_headings": g.matched_headings,
                     })
                 }
             })
             .collect();
 
-        (results, "substring")
+        (
+            GroupedNoteResults {
+                rows,
+                total: SearchTotal::exact(matched_entities),
+            },
+            "substring",
+        )
     };
+    let note_total = grouped_notes.total;
+    let mut note_results = grouped_notes.rows;
 
     // ── Code symbol results ─────────────────────────────────────────────
 
-    // Collect note titles (lowercased) for dedup against code symbols.
-    let seen_titles: HashSet<String> = note_results
-        .iter()
-        .filter_map(|v| v.get("title").and_then(|t| t.as_str()))
-        .map(|t| t.to_lowercase())
-        .collect();
+    let restricted_repos = match visible {
+        Some(nestweaver_engine::authz::VisibleRepos::Only(repos)) => Some(repos),
+        None | Some(nestweaver_engine::authz::VisibleRepos::All) => None,
+    };
+    let symbol_fetch_limit = if restricted_repos.is_some() {
+        BRAIN_SEARCH_COUNT_CANDIDATES
+    } else {
+        limit
+    };
+    let symbol_page =
+        search_symbols_page(store, &query, symbol_fetch_limit).context("search code symbols")?;
+    let fetched_symbol_candidates = symbol_page.results.len();
+    let mut code_hits = symbol_page.results;
+    if let Some(repos) = restricted_repos {
+        code_hits.retain(|candidate| {
+            store
+                .lookup_symbol(&candidate.uid)
+                .ok()
+                .is_some_and(|symbol| {
+                    !symbol.repo_uid.trim().is_empty() && repos.contains(&symbol.repo_uid)
+                })
+        });
+    }
+    let symbol_total = if restricted_repos.is_some() {
+        authorized_symbol_total(
+            symbol_page.total,
+            fetched_symbol_candidates,
+            code_hits.len(),
+        )
+    } else {
+        symbol_page.total
+    };
 
-    // Search code symbols and merge into results, skipping duplicates.
-    if let Ok(code_hits) = search_symbols(store, &query, limit) {
-        for sym in &code_hits {
-            if seen_titles.contains(&sym.name.to_lowercase()) {
-                continue;
-            }
-            let location = format!("{}:{}", sym.file_path, sym.start_line);
-            let kind = format!("Symbol/{}", sym.kind);
-            if concise {
-                note_results.push(json!({
-                    "kind": kind,
-                    "title": sym.name,
-                    "location": location,
-                }));
-            } else {
-                note_results.push(json!({
-                    "uid": sym.uid,
-                    "kind": kind,
-                    "title": sym.name,
-                    "score": 0.5,
-                    "location": location,
-                }));
-            }
+    // Titles never define identity. A note and a code symbol with the same
+    // display title remain distinct entities and distinct rows.
+    for sym in code_hits.iter().take(limit) {
+        let location = format!("{}:{}", sym.file_path, sym.start_line);
+        let kind = format!("Symbol/{}", sym.kind);
+        let mut row = if concise {
+            json!({
+                "uid": sym.uid,
+                "kind": kind,
+                "title": sym.name,
+                "location": location,
+            })
+        } else {
+            json!({
+                "uid": sym.uid,
+                "kind": kind,
+                "title": sym.name,
+                "score": 0.5,
+                "location": location,
+            })
+        };
+        if let Some(canonical_id) = &sym.canonical_id {
+            row["canonical_id"] = json!(canonical_id);
         }
+        note_results.push(row);
     }
 
     // Stable sort by score descending so notes and symbols interleave by relevance.
@@ -2360,8 +3615,8 @@ fn tool_brain_search(
     });
 
     // Feature F17: rerank the top-N before truncation. OFF by default →
-    // byte-identical output. Detailed mode only (concise rows carry no UID to
-    // key the reorder on). The default scorer is a transparent monotonic
+    // byte-identical output. Detailed mode only (concise rows intentionally
+    // omit scores used by the reranker). The default scorer is a transparent monotonic
     // heuristic, NOT a validated nDCG win; an optional `<db>.rerank.json`
     // learned-weights file is used if present and version-matched. Reranking
     // only reorders an already-retrieved set; recall is unchanged.
@@ -2423,7 +3678,8 @@ fn tool_brain_search(
     // multiplicative priors keyed by file-path glob, then fold the adjusted
     // relevance back into the row's `score`. No config → no-op (byte-identical
     // output to the pre-F6 path).
-    if let Some(cfg) = current_instance_config()
+    if !concise
+        && let Some(cfg) = current_instance_config()
         && !cfg.ranking.is_empty()
     {
         let mut probe: Vec<nestweaver_engine::BrainNode> = Vec::new();
@@ -2482,14 +3738,14 @@ fn tool_brain_search(
 
     // Bug C / symbol-parity fix: `limit` is interpreted per-kind. Notes
     // (capped at `limit` in `group_search_hits_by_note` / substring `.take`)
-    // and symbols (capped at `limit` in `search_symbols`) are each bounded
+    // and symbols (capped at `limit` from `search_symbols_page`) are each bounded
     // upstream, so we deliberately skip a cross-kind truncate here. A merged
     // cap would evict every symbol whenever ≥ `limit` notes match because
     // symbols carry a fixed 0.5 score while BM25 notes score 15+. Callers
     // that need a hard total cap should pass a smaller `limit`.
 
     // Feature F8: embed high-relevance bodies inline when opted in. Off by
-    // default. Concise mode carries no UID/score, so inline bodies are skipped
+    // default. Concise mode carries no score, so inline bodies are skipped
     // there. Bodies are computed via the shared engine helper for parity with
     // brain_context (normalized-relevance threshold + per-body truncation).
     let include_bodies = args
@@ -2548,12 +3804,17 @@ fn tool_brain_search(
         }
     }
 
-    let total = note_results.len();
+    let total = combine_search_totals(note_total, symbol_total);
+    let returned_matches = note_results.len();
+    let truncated = search_results_are_truncated(total, returned_matches);
     let mut response = json!({
         "query": query,
         "engine": engine,
         "results": note_results,
-        "total_matches": total,
+        "total_matches": total.value,
+        "total_matches_relation": search_total_relation_label(total.relation),
+        "returned_matches": returned_matches,
+        "truncated": truncated,
     });
     if engine == "substring" {
         response["engine_warning"] = json!(
@@ -2572,12 +3833,18 @@ fn tool_brain_search(
 /// For each note, picks the highest-scoring hit and collects matched
 /// heading/section titles. Returns at most `limit` note-level results
 /// sorted by best score.
+struct GroupedNoteResults {
+    rows: Vec<Value>,
+    total: SearchTotal,
+}
+
 fn group_search_hits_by_note(
     store: &GraphStore,
     hits: &[nestweaver_store::SearchHit],
+    total: SearchTotal,
     limit: usize,
     concise: bool,
-) -> Vec<Value> {
+) -> Result<GroupedNoteResults, anyhow::Error> {
     use std::collections::HashMap;
 
     struct NoteGroup {
@@ -2589,32 +3856,30 @@ fn group_search_hits_by_note(
         matched_headings: Vec<String>,
     }
 
-    let mut groups: HashMap<String, NoteGroup> = HashMap::new();
-    let mut note_order: Vec<String> = Vec::new();
+    let mut groups: HashMap<SearchLogicalIdentity, NoteGroup> = HashMap::new();
+    let mut note_order: Vec<SearchLogicalIdentity> = Vec::new();
 
     for h in hits {
-        // Determine the parent note UID based on the hit kind.
-        let parent_note_uid = match h.kind.as_str() {
-            "note" => h.uid.clone(),
-            "heading" => store
-                .lookup_heading(&h.uid)
-                .map(|hd| hd.note_uid)
-                .unwrap_or_else(|_| h.uid.clone()),
-            "section" => store
-                .lookup_section(&h.uid)
-                .map(|s| s.note_uid)
-                .unwrap_or_else(|_| h.uid.clone()),
-            _ => h.uid.clone(),
+        // Use the exact validated indexed identity used by Task 5's logical
+        // count collector. Graph lookups can drift independently and must not
+        // split one indexed note into fragment-UID presentation groups.
+        let identity = h
+            .logical_identity()
+            .map_err(|error| anyhow!("invalid counted search hit identity: {error}"))?;
+        let entity_uid = match &identity {
+            SearchLogicalIdentity::Note(uid) | SearchLogicalIdentity::Standalone { uid, .. } => {
+                uid.clone()
+            }
         };
 
-        let group = groups.entry(parent_note_uid.clone()).or_insert_with(|| {
-            note_order.push(parent_note_uid.clone());
+        let group = groups.entry(identity.clone()).or_insert_with(|| {
+            note_order.push(identity);
             let file_path = store
-                .lookup_note(&parent_note_uid)
+                .lookup_note(&entity_uid)
                 .map(|n| n.file_path)
                 .unwrap_or_default();
             NoteGroup {
-                note_uid: parent_note_uid.clone(),
+                note_uid: entity_uid,
                 best_score: 0.0,
                 best_title: String::new(),
                 vault_uid: h.vault_uid.clone(),
@@ -2629,7 +3894,10 @@ fn group_search_hits_by_note(
         if h.kind == "note" {
             group.best_title = h.title.clone();
         }
-        if h.kind == "heading" || h.kind == "section" {
+        if (h.kind == "heading" || h.kind == "section")
+            && !group.matched_headings.contains(&h.title)
+        {
+            // A heading and its section share a title — report it once.
             group.matched_headings.push(h.title.clone());
         }
     }
@@ -2662,13 +3930,14 @@ fn group_search_hits_by_note(
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    note_order
+    let rows = note_order
         .iter()
         .take(limit)
         .filter_map(|nuid| groups.get(nuid))
         .map(|g| {
             if concise {
                 json!({
+                    "uid": g.note_uid,
                     "kind": "note",
                     "title": g.best_title,
                     "matched_headings": g.matched_headings,
@@ -2685,10 +3954,640 @@ fn group_search_hits_by_note(
                 })
             }
         })
-        .collect()
+        .collect();
+    Ok(GroupedNoteResults { rows, total })
 }
 
 // ── 3. note_get ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod brain_search_total_contract_tests {
+    use super::*;
+    use nestweaver_engine::authz::VisibleRepos;
+    use nestweaver_schema::{
+        Heading, Note, NoteKind, Section, Symbol, SymbolKind, Tag, Visibility,
+        uid::{canonical_symbol_id, repo_uid, symbol_uid},
+    };
+    use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
+
+    const QUERY: &str = "searchneedle";
+
+    fn note(uid: &str, title: &str) -> Note {
+        Note {
+            uid: uid.to_string(),
+            vault_uid: "vlt:search".to_string(),
+            file_path: format!("{uid}.md"),
+            title: title.to_string(),
+            note_kind: NoteKind::General,
+            word_count: 20,
+            content_hash: format!("hash-{uid}"),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        }
+    }
+
+    fn heading(uid: &str, note_uid: &str, text: &str) -> Heading {
+        Heading {
+            uid: uid.to_string(),
+            note_uid: note_uid.to_string(),
+            level: 2,
+            text: text.to_string(),
+            slug: uid.to_string(),
+            start_line: 2,
+            end_line: 4,
+            content_hash: format!("hash-{uid}"),
+            embedding: None,
+        }
+    }
+
+    fn section(uid: &str, note_uid: &str, heading_uid: &str, text: &str) -> Section {
+        Section {
+            uid: uid.to_string(),
+            note_uid: note_uid.to_string(),
+            heading_uid: Some(heading_uid.to_string()),
+            start_line: 3,
+            end_line: 4,
+            text_hash: format!("hash-{uid}"),
+            text_content: text.to_string(),
+            word_count: 5,
+            pagerank_score: None,
+        }
+    }
+
+    fn symbol(uid: &str, repo_uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: format!("src/{uid}.rs"),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash-{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn search_fixture() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for n in [
+            note("note:fragment-rich", "SearchneedleShared"),
+            note("note:second", "Second Searchneedle Note"),
+        ] {
+            store.insert_note(&n).unwrap();
+        }
+        for h in [
+            heading(
+                "heading:first",
+                "note:fragment-rich",
+                "Searchneedle First Heading",
+            ),
+            heading(
+                "heading:second",
+                "note:fragment-rich",
+                "Searchneedle Second Heading",
+            ),
+        ] {
+            store.insert_heading(&h).unwrap();
+        }
+        for s in [
+            section(
+                "section:first",
+                "note:fragment-rich",
+                "heading:first",
+                "searchneedle orchid migration details",
+            ),
+            section(
+                "section:second",
+                "note:fragment-rich",
+                "heading:second",
+                "searchneedle quartz rollout details",
+            ),
+        ] {
+            store.insert_section(&s).unwrap();
+        }
+        for s in [
+            symbol("sym:shared-title", "repo:visible", "SearchneedleShared"),
+            symbol("sym:second", "repo:visible", "SearchneedleBeta"),
+            symbol("sym:hidden", "repo:hidden", "SearchneedleGamma"),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        store
+    }
+
+    fn index_fixture(index: &TantivyIndex) {
+        index
+            .update_note(
+                "note:fragment-rich",
+                "SearchneedleShared",
+                "vlt:search",
+                &["searchneedle orchid quartz migration rollout".to_string()],
+                &[
+                    (
+                        "heading:first".to_string(),
+                        "Searchneedle First Heading".to_string(),
+                    ),
+                    (
+                        "heading:second".to_string(),
+                        "Searchneedle Second Heading".to_string(),
+                    ),
+                ],
+                &[
+                    (
+                        "section:first".to_string(),
+                        "searchneedle orchid migration details".to_string(),
+                        "Searchneedle First Heading".to_string(),
+                    ),
+                    (
+                        "section:second".to_string(),
+                        "searchneedle quartz rollout details".to_string(),
+                        "Searchneedle Second Heading".to_string(),
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+        index
+            .update_note(
+                "note:second",
+                "Second Searchneedle Note",
+                "vlt:search",
+                &["searchneedle cedar deployment guide".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn brain_search_combines_exact_and_lower_bound_domain_totals() {
+        let cases = [
+            (
+                SearchTotal::exact(4),
+                SearchTotal::exact(3),
+                7,
+                SearchTotalRelation::Exact,
+            ),
+            (
+                SearchTotal::lower_bound(4),
+                SearchTotal::exact(3),
+                7,
+                SearchTotalRelation::LowerBound,
+            ),
+            (
+                SearchTotal::exact(4),
+                SearchTotal::lower_bound(3),
+                7,
+                SearchTotalRelation::LowerBound,
+            ),
+            (
+                SearchTotal::lower_bound(4),
+                SearchTotal::lower_bound(3),
+                7,
+                SearchTotalRelation::LowerBound,
+            ),
+        ];
+
+        for (notes, symbols, expected_value, expected_relation) in cases {
+            let combined = combine_search_totals(notes, symbols);
+            assert_eq!(combined.value, expected_value);
+            assert_eq!(combined.relation, expected_relation);
+        }
+
+        assert_eq!(
+            combine_search_totals(SearchTotal::exact(usize::MAX), SearchTotal::exact(1)).value,
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn brain_search_truncation_respects_relation_and_returned_count() {
+        assert!(!search_results_are_truncated(SearchTotal::exact(4), 4));
+        assert!(search_results_are_truncated(SearchTotal::exact(4), 3));
+        assert!(search_results_are_truncated(SearchTotal::lower_bound(4), 4));
+        assert_eq!(
+            search_total_relation_label(SearchTotalRelation::Exact),
+            "eq"
+        );
+        assert_eq!(
+            search_total_relation_label(SearchTotalRelation::LowerBound),
+            "gte"
+        );
+    }
+
+    #[test]
+    fn brain_search_total_is_limit_independent_and_collapses_note_fragments() {
+        let store = search_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_fixture(&index);
+
+        let small = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 1 }),
+            None,
+        )
+        .unwrap();
+        let large = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10 }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(small["total_matches"], large["total_matches"]);
+        assert_eq!(small["total_matches"], json!(5));
+        assert_eq!(small["total_matches_relation"], "eq");
+        assert_eq!(large["total_matches_relation"], "eq");
+        assert!(
+            small["returned_matches"].as_u64().unwrap()
+                < large["returned_matches"].as_u64().unwrap()
+        );
+        assert_eq!(small["returned_matches"], json!(2));
+        assert_eq!(large["returned_matches"], json!(5));
+        assert_eq!(small["truncated"], json!(true));
+        assert_eq!(large["truncated"], json!(false));
+
+        let rows = large["results"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["uid"] == "note:fragment-rich")
+                .count(),
+            1,
+            "one note row must represent every matching heading/section fragment"
+        );
+        let shared_title: Vec<&Value> = rows
+            .iter()
+            .filter(|row| row["title"] == "SearchneedleShared")
+            .collect();
+        assert_eq!(shared_title.len(), 2);
+        assert!(shared_title.iter().any(|row| row["kind"] == "note"));
+        assert!(
+            shared_title
+                .iter()
+                .any(|row| row["kind"].as_str().unwrap().starts_with("Symbol/"))
+        );
+    }
+
+    #[test]
+    fn brain_search_concise_rows_keep_stable_uids_without_detailed_scores() {
+        let store = search_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_fixture(&index);
+
+        for tantivy in [None, Some(&index)] {
+            let result = dispatch(
+                &store,
+                tantivy,
+                "brain_search",
+                json!({
+                    "query": QUERY,
+                    "limit": 10,
+                    "response_format": "concise"
+                }),
+                None,
+            )
+            .unwrap();
+            let rows = result["results"].as_array().unwrap();
+            assert!(!rows.is_empty());
+            assert!(
+                rows.iter()
+                    .all(|row| row["uid"].as_str().is_some_and(|uid| !uid.is_empty())),
+                "every concise row must preserve its canonical entity UID: {result}"
+            );
+            assert!(
+                rows.iter().all(|row| row.get("score").is_none()),
+                "concise presentation must not gain detailed scores: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn brain_search_symbol_rows_carry_canonical_id_in_both_formats() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_url = "https://github.com/acme/api";
+        let file_path = "src/search.rs";
+        let name = "CanonicalNeedle";
+        let repo = repo_uid("local", repo_url);
+        let uid = symbol_uid(&repo, file_path, name, 7);
+        let canonical = canonical_symbol_id(repo_url, file_path, name, "module::CanonicalNeedle");
+        let mut searched = symbol(&uid, &repo, name);
+        searched.file_path = file_path.to_string();
+        searched.start_line = 7;
+        searched.canonical_id = Some(canonical.clone());
+        store.insert_symbol(&searched).unwrap();
+
+        for response_format in [None, Some("concise")] {
+            let mut args = json!({ "query": "CanonicalNeedle", "limit": 10 });
+            if let Some(response_format) = response_format {
+                args["response_format"] = json!(response_format);
+            }
+            let result = dispatch(&store, None, "brain_search", args, None).unwrap();
+            let row = result["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["uid"] == uid)
+                .expect("symbol row");
+
+            assert_eq!(row["canonical_id"], canonical);
+            if response_format.is_some() {
+                assert!(row.get("score").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn brain_search_groups_missing_fragments_by_indexed_owner_and_keeps_tag_distinct() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&note("note:index-owner", "Indexed Owner"))
+            .unwrap();
+        store
+            .insert_tag(&Tag {
+                uid: "tag:searchneedle".to_string(),
+                vault_uid: "vlt:search".to_string(),
+                name: "searchneedle".to_string(),
+            })
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index.reindex_from_store(&store).unwrap();
+        index
+            .update_note(
+                "note:index-owner",
+                "Indexed Owner",
+                "vlt:search",
+                &["unrelated body".to_string()],
+                &[(
+                    "heading:missing".to_string(),
+                    "searchneedle heading".to_string(),
+                )],
+                &[(
+                    "section:missing".to_string(),
+                    "searchneedle section".to_string(),
+                    "Missing heading".to_string(),
+                )],
+                &[],
+            )
+            .unwrap();
+
+        let result = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10 }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["total_matches"], json!(2));
+        assert_eq!(result["total_matches_relation"], "eq");
+        assert_eq!(result["returned_matches"], json!(2));
+        assert_eq!(result["truncated"], json!(false));
+        let uids: HashSet<&str> = result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["uid"].as_str())
+            .collect();
+        assert_eq!(
+            uids,
+            HashSet::from(["note:index-owner", "tag:searchneedle"])
+        );
+    }
+
+    #[test]
+    fn brain_search_substring_fallback_counts_full_note_groups() {
+        let store = search_fixture();
+        let small = dispatch(
+            &store,
+            None,
+            "brain_search",
+            json!({ "query": QUERY, "limit": 1 }),
+            None,
+        )
+        .unwrap();
+        let large = dispatch(
+            &store,
+            None,
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10 }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(small["engine"], "substring");
+        assert_eq!(small["total_matches"], json!(5));
+        assert_eq!(small["total_matches"], large["total_matches"]);
+        assert_eq!(small["total_matches_relation"], "eq");
+        assert_eq!(large["returned_matches"], json!(5));
+    }
+
+    #[test]
+    fn brain_search_prf_uses_counted_final_query_totals() {
+        let store = search_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_fixture(&index);
+
+        let small = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 1, "prf": true }),
+            None,
+        )
+        .unwrap();
+        let large = dispatch(
+            &store,
+            Some(&index),
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10, "prf": true }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(small["engine"], "bm25");
+        assert_eq!(small["total_matches"], large["total_matches"]);
+        assert_eq!(small["total_matches_relation"], "eq");
+        assert!(small["truncated"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn brain_search_zero_matches_are_exact_and_not_truncated() {
+        let store = search_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index_fixture(&index);
+        for tantivy in [None, Some(&index)] {
+            let result = dispatch(
+                &store,
+                tantivy,
+                "brain_search",
+                json!({ "query": "absentneedle", "limit": 1 }),
+                None,
+            )
+            .unwrap();
+            assert_eq!(result["total_matches"], json!(0));
+            assert_eq!(result["total_matches_relation"], "eq");
+            assert_eq!(result["returned_matches"], json!(0));
+            assert_eq!(result["truncated"], json!(false));
+        }
+    }
+
+    #[test]
+    fn brain_search_visibility_never_counts_hidden_symbols() {
+        let store = search_fixture();
+        store
+            .insert_symbol(&symbol("sym:unknown-owner", "", "SearchneedleUnknown"))
+            .unwrap();
+        let visible = VisibleRepos::Only(
+            ["repo:visible".to_string(), String::new()]
+                .into_iter()
+                .collect(),
+        );
+        let result = dispatch_cancellable(
+            &store,
+            None,
+            "brain_search",
+            json!({ "query": QUERY, "limit": 10 }),
+            None,
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+
+        assert_eq!(result["total_matches"], json!(4));
+        assert_eq!(result["total_matches_relation"], "eq");
+        assert_eq!(result["returned_matches"], json!(4));
+        assert!(
+            result["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["uid"] != "sym:hidden" && row["uid"] != "sym:unknown-owner")
+        );
+
+        assert_eq!(
+            authorized_symbol_total(SearchTotal::exact(4), 4, 1),
+            SearchTotal::exact(1)
+        );
+        assert_eq!(
+            authorized_symbol_total(SearchTotal::exact(10_001), 10_000, 1),
+            SearchTotal::lower_bound(1),
+            "a bounded authorized scan must not reveal the global hidden total"
+        );
+    }
+
+    #[test]
+    fn brain_search_schema_bounds_limit_and_documents_total_contract() {
+        let schema = tool_schema_brain_search();
+        assert_eq!(schema["inputSchema"]["properties"]["limit"]["minimum"], 1);
+        assert_eq!(
+            schema["inputSchema"]["properties"]["limit"]["maximum"],
+            1000
+        );
+        let description = schema["description"].as_str().unwrap();
+        assert!(description.contains("total_matches_relation"));
+        assert!(description.contains("returned_matches"));
+        assert!(
+            schema["inputSchema"]["properties"]["response_format"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("stable entity UIDs")
+        );
+        assert!(
+            validate_tool_arguments("brain_search", &json!({ "query": QUERY, "limit": 0 }))
+                .is_err()
+        );
+        assert!(
+            validate_tool_arguments("brain_search", &json!({ "query": QUERY, "limit": 1001 }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn group_search_hits_dedups_shared_heading_section_titles() {
+        // A heading hit and its section hit share a title; matched_headings
+        // must report it once, not twice.
+        let store = GraphStore::in_memory().unwrap();
+        let hit = |uid: &str, kind: &str, title: &str, score: f32| nestweaver_store::SearchHit {
+            uid: uid.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            vault_uid: "vlt:v".to_string(),
+            note_uid: "note:n1".to_string(),
+            score,
+        };
+        let hits = vec![
+            hit("head:1", "heading", "Shared", 1.0),
+            hit("sec:1", "section", "Shared", 0.9),
+            hit("head:2", "heading", "Other", 0.8),
+        ];
+        let grouped =
+            group_search_hits_by_note(&store, &hits, SearchTotal::exact(1), 10, false).unwrap();
+        assert_eq!(grouped.rows.len(), 1);
+        assert_eq!(
+            grouped.rows[0]["matched_headings"],
+            json!(["Shared", "Other"])
+        );
+    }
+
+    #[test]
+    fn substring_search_dedups_shared_heading_section_titles() {
+        // Same dedup on the no-tantivy substring fallback path: the heading
+        // and its section both match the query and share the heading title.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&note("note:dup", "Unrelated Title"))
+            .unwrap();
+        store
+            .insert_heading(&heading("heading:dup", "note:dup", "Dedupneedle Alpha"))
+            .unwrap();
+        store
+            .insert_section(&section(
+                "section:dup",
+                "note:dup",
+                "heading:dup",
+                "dedupneedle body text",
+            ))
+            .unwrap();
+        let value = tool_brain_search(
+            &store,
+            None,
+            json!({ "query": "dedupneedle", "response_format": "detailed" }),
+            None,
+        )
+        .unwrap();
+        let rows = value["results"].as_array().unwrap();
+        let note_row = rows
+            .iter()
+            .find(|r| r["uid"] == "note:dup")
+            .expect("note row present");
+        assert_eq!(note_row["matched_headings"], json!(["Dedupneedle Alpha"]));
+    }
+}
 
 fn tool_schema_note_get() -> Value {
     json!({
@@ -3389,14 +5288,16 @@ fn tool_schema_brain_remove_source() -> Value {
     })
 }
 
-fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let target = args
-        .get("target")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'target' is required"))?
-        .to_string();
-
-    // Inline tilde expansion (the cfg-gated expand_tilde is not available in daemon builds).
+/// Match a user-supplied `target` (repo UID, name, filesystem path, `file://`
+/// URL, or git-origin URL) against the indexed repos. Shared by the daemon-side
+/// `tool_brain_remove_source` and the client-proxy `dispatch_via_daemon` path so
+/// both resolve a target to a repo IDENTICALLY — the client proxy used to send
+/// the raw target as a `repo_uid`, which never matched a path/name and silently
+/// removed nothing (nw-089).
+fn match_repo_target<'a>(
+    repos: &'a [nestweaver_schema::Repo],
+    target: &str,
+) -> Vec<&'a nestweaver_schema::Repo> {
     let expand = |input: &str| -> String {
         if let Some(stripped) = input.strip_prefix("~/")
             && let Ok(home) = std::env::var("HOME")
@@ -3405,28 +5306,25 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         }
         input.to_string()
     };
-
-    // Try to resolve as a repo first, then as a vault.
-    let repos = store.list_repos(None)?;
-
-    let canonical_target = std::fs::canonicalize(&target)
+    let target_trimmed = target.trim_end_matches('/');
+    let canonical_target = std::fs::canonicalize(expand(target_trimmed))
         .map(|p| format!("file://{}", p.display()))
         .unwrap_or_default();
-    let url_target = if target.starts_with("file://") {
-        target.clone()
-    } else if std::path::Path::new(&target).is_absolute() || target.starts_with("~/") {
-        let expanded = expand(&target);
+    let url_target = if target_trimmed.starts_with("file://") {
+        target_trimmed.to_string()
+    } else if std::path::Path::new(target_trimmed).is_absolute() || target_trimmed.starts_with("~/")
+    {
+        let expanded = expand(target_trimmed);
         std::fs::canonicalize(&expanded)
             .map(|p| format!("file://{}", p.display()))
-            .unwrap_or_else(|_| format!("file://{}", expanded))
+            .unwrap_or_else(|_| format!("file://{expanded}"))
     } else {
         String::new()
     };
-
-    // When the target is a filesystem path, the repo it refers to may be
-    // identified by its git origin remote rather than a file:// URL — try
-    // that identity too (read from git config; never fetched).
-    let origin_target = std::fs::canonicalize(expand(&target))
+    // A path target may refer to a repo identified by its git origin remote
+    // rather than a file:// URL — try that identity too (read from git config,
+    // never fetched).
+    let origin_target = std::fs::canonicalize(expand(target_trimmed))
         .ok()
         .filter(|p| p.join(".git").exists())
         .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
@@ -3436,8 +5334,7 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         .unwrap_or_default()
         .to_string();
 
-    let target_trimmed = target.trim_end_matches('/');
-    let matched_repo: Vec<&nestweaver_schema::Repo> = repos
+    repos
         .iter()
         .filter(|r| {
             let r_url = r.url.trim_end_matches('/');
@@ -3451,7 +5348,22 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
                         == Some(canonical_path.trim_end_matches('/')))
                 || r_url.ends_with(&format!("/{target_trimmed}"))
         })
-        .collect();
+        .collect()
+}
+
+fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("'target' is required"))?
+        .to_string();
+
+    // Try to resolve as a repo first, then as a vault.
+    let repos = store.list_repos(None)?;
+    let canonical_target = std::fs::canonicalize(&target)
+        .map(|p| format!("file://{}", p.display()))
+        .unwrap_or_default();
+    let matched_repo = match_repo_target(&repos, &target);
 
     if matched_repo.len() == 1 {
         #[cfg(feature = "daemon")]
@@ -3842,9 +5754,11 @@ fn tool_schema_brain_impact() -> Value {
             "type": "object",
             "properties": {
                 "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). Names are resolved via first-match lookup." },
-                "depth": { "type": "integer", "description": "Max traversal depth. Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
+                "depth": { "type": "integer", "minimum": 1, "maximum": 15, "description": "Max traversal depth (1-15). Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
                     "description": "Max impact nodes to return (default 50). The total count is always reported.",
                     "default": DEFAULT_RESULT_LIMIT
                 },
@@ -3853,9 +5767,12 @@ fn tool_schema_brain_impact() -> Value {
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
                     "description": "\"concise\" returns affected symbol names only; \"detailed\" (default) adds file paths, edge types, confidence scores, and depth levels."
-                }
+                },
+                "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
+                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
-            "required": ["symbol"]
+            "required": ["symbol"],
+            "additionalProperties": false
         }
     })
 }
@@ -3864,6 +5781,7 @@ fn tool_brain_impact(
     store: &GraphStore,
     args: Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let symbol = args
         .get("symbol")
@@ -3876,16 +5794,41 @@ fn tool_brain_impact(
         .map(|n| n as usize)
         .unwrap_or_else(configured_result_limit);
     let concise = is_concise(&args);
+    let owners = restricted_symbol_owners(store, visible)?;
+    let uid_is_visible = |uid: &str| {
+        owners.as_ref().is_none_or(|owners| {
+            owners
+                .get(uid)
+                .is_some_and(|repo_uid| repo_is_visible(repo_uid, visible))
+        })
+    };
 
     // Resolve with an explicit status so the CLI can honor the not-found/ambiguous exit-code
     // contract in daemon mode, instead of the daemon path silently returning the best of
     // several matches (which diverged from the direct path).
     let uid = if symbol.contains(':') {
-        symbol.to_string()
+        // Fail closed on unknown/garbage/cross-DB UIDs — verify the UID
+        // actually resolves in this store instead of trusting its shape. Keeps
+        // the same not_found contract as the name path; a legit zero-dependent
+        // symbol still resolves and returns status ok with an empty list.
+        match store.lookup_symbol(symbol) {
+            Ok(sym) if uid_is_visible(&sym.uid) => sym.uid,
+            Ok(_) | Err(nestweaver_store::StoreError::NotFound) => {
+                return Ok(json!({
+                    "status": "not_found",
+                    "symbol": symbol,
+                    "impact_nodes": [],
+                    "total": 0,
+                    "returned": 0,
+                }));
+            }
+            Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
+        }
     } else {
-        let matches = store
+        let mut matches = store
             .lookup_symbols_by_name(symbol)
             .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+        matches.retain(|candidate| repo_is_visible(&candidate.repo_uid, visible));
         match matches.len() {
             0 => {
                 return Ok(json!({
@@ -3918,7 +5861,20 @@ fn tool_brain_impact(
         }
     };
 
-    let nodes = store.impact_cancellable(&uid, depth, 0.0, cancel)?;
+    let result = if let Some(owners) = &owners {
+        let allowed: HashSet<String> = owners
+            .iter()
+            .filter(|(_, repo_uid)| repo_is_visible(repo_uid, visible))
+            .map(|(uid, _)| uid.clone())
+            .collect();
+        store.impact_with_flags_within(&uid, depth, 0.0, &allowed, cancel)?
+    } else {
+        store.impact_with_flags(&uid, depth, 0.0, cancel)?
+    };
+    let truncated_by_threshold = result.truncated_by_threshold;
+    let truncated_by_depth = result.truncated_by_depth;
+    let mut nodes = result.nodes;
+    nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
 
     let rows: Vec<Value> = nodes
@@ -3952,6 +5908,19 @@ fn tool_brain_impact(
         "impact_nodes": rows,
         "total": total,
         "returned": rows.len(),
+        // Honesty flags (same semantics as blast_radius): when either is set
+        // the reported impact set is a FLOOR, not the full reverse-closure.
+        "truncated_by_threshold": truncated_by_threshold,
+        "truncated_by_depth": truncated_by_depth,
+        "note": if truncated_by_threshold {
+            (truncated_by_threshold || truncated_by_depth).then_some(
+                "paths pruned below the impact-score threshold — reported impact is a floor, not the full set",
+            )
+        } else {
+            truncated_by_depth.then_some(
+                "frontier reached max depth — deeper dependents may exist beyond the returned set",
+            )
+        },
     }))
 }
 
@@ -3969,6 +5938,10 @@ fn tool_schema_brain_guide() -> Value {
                     "enum": ["markdown", "skill", "cursor-rule", "agents-md", "claude-md"],
                     "default": "markdown",
                     "description": "Output format. \"markdown\" (default) is the full orientation guide; \"skill\" emits a Claude skill; the others emit the matching agent-instruction file. All formats render the tool list from the live registry."
+                },
+                "config": {
+                    "type": "string",
+                    "description": "Path to an instance config TOML. NOT supported by this handler (it generates from the graph only and cannot honor per-instance settings); passing it returns an explicit error. Use the CLI 'nestweaver generate-guide --config <path>' local path instead."
                 }
             }
         }
@@ -3976,6 +5949,20 @@ fn tool_schema_brain_guide() -> Value {
 }
 
 fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    // This handler generates from the graph only and has no
+    // InstanceConfig to honor. Silently ignoring a caller-supplied `config`
+    // would return a guide shaped by the wrong instance — fail loudly instead
+    // (the CLI already falls back to the local path when --config is given).
+    if args
+        .get("config")
+        .and_then(|v| v.as_str())
+        .is_some_and(|c| !c.trim().is_empty())
+    {
+        return Err(anyhow!(
+            "brain_guide cannot honor the 'config' argument in this context; \
+             use the CLI local path instead: nestweaver generate-guide --config <path>"
+        ));
+    }
     let format = args
         .get("format")
         .and_then(|v| v.as_str())
@@ -4243,17 +6230,27 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Treat `risk` as usable only when `status == complete`; `degraded-unknown` requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "changed_files": {
                     "type": "array",
                     "items": { "type": "string" },
+                    "minItems": 1,
                     "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
+                },
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Backward-compatible alias for changed_files."
                 }
             },
-            "required": ["changed_files"]
+            "anyOf": [
+                { "required": ["changed_files"] },
+                { "required": ["files"] }
+            ]
         }
     })
 }
@@ -4308,6 +6305,9 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     Ok(json!({
         "files": files,
         "risk": risk_str,
+        "status": serde_json::to_value(impact.status)?,
+        "gate_state": serde_json::to_value(impact.gate_state)?,
+        "notifications": serde_json::to_value(&impact.notifications)?,
         "blast_radius": impact.blast_radius,
         "affected_symbols": affected_symbols,
         "affected_symbol_count": impact.affected_symbols.len(),
@@ -4321,7 +6321,7 @@ fn tool_detect_changes(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'run-full-suite' on any non-complete run (fail-safe widening), 'selection-usable' otherwise\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4339,7 +6339,13 @@ fn tool_schema_affected_tests() -> Value {
     })
 }
 
-fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_affected_tests(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
+    let owners = restricted_symbol_owners(store, visible)?;
+
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
     let mut changed_files: Vec<String> = bound_identifiers(
         args.get("changed_files")
@@ -4352,10 +6358,11 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
             .unwrap_or_default(),
     );
 
+    let base_ref = args.get("base_ref").and_then(|v| v.as_str());
     if changed_files.is_empty()
-        && let Some(base_ref) = args.get("base_ref").and_then(|v| v.as_str())
+        && let Some(base_ref) = base_ref
     {
-        let repo_path = first_local_repo_path(store).unwrap_or_else(|| ".".to_string());
+        let repo_path = scoped_local_repo_path(store, visible)?.unwrap_or_else(|| ".".to_string());
         let files =
             nestweaver_engine::changed_files_from_git(Path::new(&repo_path), Some(base_ref))
                 .context("git diff for base_ref")?;
@@ -4365,26 +6372,141 @@ fn tool_affected_tests(store: &GraphStore, args: Value) -> Result<Value, anyhow:
             .collect();
     }
 
-    if changed_files.is_empty() {
+    // Only a genuine "no input" (neither changed_files nor base_ref) is an error.
+    // A `base_ref` that resolves to ZERO changed files (e.g. HEAD vs HEAD) is a
+    // valid empty diff — run the analysis so the caller still gets the full trust
+    // contract (empty tiers + status/recommendation/disclaimer), matching the
+    // changed_files-with-no-symbols path, instead of an error that drops it
+    // (nw-088).
+    if changed_files.is_empty() && base_ref.is_none() {
         return Err(anyhow!(
             "provide either 'changed_files' (non-empty) or 'base_ref'"
         ));
     }
 
-    let result = affected_tests(store, &changed_files).context("affected_tests")?;
+    // nw-037: route through the recorded wrapper so every selection feeds the
+    // measured-recall loop and carries the in-band `measured` disclosure.
+    let mut result = if let Some(owners) = &owners {
+        let allowed: HashSet<String> = owners
+            .iter()
+            .filter(|(_, repo_uid)| repo_is_visible(repo_uid, visible))
+            .map(|(uid, _)| uid.clone())
+            .collect();
+        nestweaver_engine::affected_tests::affected_tests_scoped(store, &changed_files, &allowed)
+            .context("affected_tests")?
+    } else {
+        let db_path = current_db_path(store).ok();
+        nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
+            .context("affected_tests")?
+    };
+
+    if let Some(owners) = owners {
+        let mut ownership_unproven = false;
+        result.changed_symbols.retain(|symbol| {
+            let repo_uid = if symbol.repo_uid.is_empty() {
+                owners.get(&symbol.uid).map(String::as_str)
+            } else {
+                Some(symbol.repo_uid.as_str())
+            };
+            match repo_uid {
+                Some(repo_uid) => repo_is_visible(repo_uid, visible),
+                None => {
+                    ownership_unproven = true;
+                    false
+                }
+            }
+        });
+        for tier in [&mut result.tier_1, &mut result.tier_2, &mut result.tier_3] {
+            tier.retain(|file| match owners.get(&file.symbol_uid) {
+                Some(repo_uid) => repo_is_visible(repo_uid, visible),
+                None => {
+                    ownership_unproven = true;
+                    false
+                }
+            });
+        }
+
+        // This aggregate is learned across recorded selections and is not
+        // caller-scope keyed, so it cannot be disclosed under repo scoping.
+        result.measured = None;
+        if ownership_unproven {
+            result.status = result
+                .status
+                .max(nestweaver_engine::blast_radius::AnalysisStatus::Degraded);
+            result
+                .notifications
+                .push(nestweaver_engine::blast_radius::Notification {
+                    level: nestweaver_engine::blast_radius::NotificationLevel::Error,
+                    message: "affected-test ownership could not be proven".to_string(),
+                    descriptor: "authorization.symbol-ownership-unproven".to_string(),
+                });
+        }
+
+        for notification in &mut result.notifications {
+            tracing::debug!(
+                descriptor = %notification.descriptor,
+                detail = %notification.message,
+                "redacting affected-test notification detail for a restricted response"
+            );
+            notification.message =
+                "affected-test analysis details withheld by repository visibility policy"
+                    .to_string();
+        }
+        let count_tests = |tier: &[nestweaver_engine::affected_tests::AffectedTestFile]| {
+            tier.iter().map(|file| file.tests.len()).sum::<usize>()
+        };
+        result.summary = format!(
+            "{} tier-1, {} tier-2, {} tier-3 tests affected",
+            count_tests(&result.tier_1),
+            count_tests(&result.tier_2),
+            count_tests(&result.tier_3),
+        );
+        result.recommendation = if matches!(
+            result.status,
+            nestweaver_engine::blast_radius::AnalysisStatus::Complete
+        ) {
+            "selection-usable"
+        } else {
+            "run-full-suite"
+        }
+        .to_string();
+    }
     Ok(serde_json::to_value(&result)?)
 }
 
-/// Return the filesystem path of the first locally-indexed repo (a repo
-/// with a known local working tree — see [`nestweaver_schema::Repo::local_root`]).
-fn first_local_repo_path(store: &GraphStore) -> Option<String> {
-    // Option return can't propagate; surface a DB error in the log rather than
-    // silently reporting "no local repo".
-    let repos = store.list_repos(None).unwrap_or_else(|e| {
-        tracing::warn!("first_local_repo_path: list_repos failed: {e}");
-        Vec::new()
-    });
-    repos.iter().find_map(|r| r.local_root().map(String::from))
+/// Resolve the local working tree used for a `base_ref` diff.
+///
+/// Restricted callers must have exactly one visible local repository; choosing
+/// an arbitrary first repository would let graph ordering cross caller scope.
+fn scoped_local_repo_path(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Option<String>, anyhow::Error> {
+    let repos = store.list_repos(None).map_err(|error| {
+        anyhow!("listing repositories for affected-tests base_ref failed: {error}")
+    })?;
+    let roots: Vec<String> = repos
+        .iter()
+        .filter(|repo| repo_is_visible(&repo.uid, visible))
+        .filter_map(|repo| repo.local_root().map(String::from))
+        .collect();
+    if matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    ) {
+        match roots.as_slice() {
+            [root] => Ok(Some(root.clone())),
+            [] => Err(anyhow!(
+                "affected_tests base_ref requires one visible local repository"
+            )),
+            _ => Err(anyhow!(
+                "affected_tests base_ref is ambiguous across visible repositories; \
+                 provide changed_files explicitly"
+            )),
+        }
+    } else {
+        Ok(roots.into_iter().next())
+    }
 }
 
 // ── 12. clusters ───────────────────────────────────────────────────────────
@@ -4392,14 +6514,18 @@ fn first_local_repo_path(store: &GraphStore) -> Option<String> {
 fn tool_schema_clusters() -> Value {
     json!({
         "name": "clusters",
-        "description": "View the codebase's high-level architecture via Leiden community detection. Groups tightly-connected symbols into named functional clusters.\n\nGuidelines:\n- Adjust resolution: higher = more smaller clusters, lower = fewer larger clusters (default 0.5)\n- Returns cluster name, cohesion score, key files, and up to 20 member symbols per cluster\n- For specific symbol lookup use brain_search; for dependency analysis use brain_impact\n\nLimitations:\n- Clustering is computed on demand, not cached\n- Quality depends on the density and accuracy of indexed call/import edges",
+        "description": "View the codebase's high-level architecture via Louvain-style local moving community detection. Groups tightly-connected symbols into named functional clusters.\n\nGuidelines:\n- Adjust resolution: higher = more smaller clusters, lower = fewer larger clusters (default 0.5)\n- Returns cluster name, cohesion score, key files, and a 20-member preview per cluster (full `size` reported)\n- Pass cluster_id to get ONE cluster's full member list (paging deep clusters); `members_truncated` flags when even that is capped\n- For specific symbol lookup use brain_search; for dependency analysis use brain_impact\n\nLimitations:\n- Clustering is recomputed on each call (the result is persisted to a sidecar cache that the CLI `cluster` command reads)\n- Quality depends on the density and accuracy of indexed call/import edges",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "resolution": {
                     "type": "number",
-                    "description": "Leiden resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. Default 0.5 (0.3 for large graphs >10K symbols). Try 2.0 for fine-grained modules.",
+                    "description": "Community-detection resolution parameter. Higher = more, smaller clusters; lower = fewer, larger clusters. Default 0.5 (0.3 for large graphs >10K symbols). Try 2.0 for fine-grained modules.",
                     "default": 0.5
+                },
+                "cluster_id": {
+                    "type": "integer",
+                    "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the 20-member preview. Use the same resolution as the call that produced the id."
                 }
             }
         }
@@ -4426,19 +6552,36 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         tracing::warn!("failed to persist clusters sidecar: {e}");
     }
 
+    // nw-090: `cluster_id` pages the FULL membership of a single cluster. Without
+    // it, every cluster returns a 20-member preview (`size` still reports the true
+    // count), which made large clusters' membership unretrievable from the tool.
+    let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
+    // Full membership when a specific cluster is requested (bounded so a giant
+    // cluster can't blow the context window), a small preview otherwise.
+    const FULL_MEMBER_CAP: usize = 2000;
+    const PREVIEW_MEMBER_CAP: usize = 20;
     let clusters_json: Vec<Value> = output
         .communities
         .iter()
+        .filter(|c| requested_id.is_none_or(|id| c.id as i64 == id))
         .map(|c| {
+            let member_cap = if requested_id.is_some() {
+                FULL_MEMBER_CAP
+            } else {
+                PREVIEW_MEMBER_CAP
+            };
             let members: Vec<Value> = c
                 .members
                 .iter()
-                .take(20)
+                .take(member_cap)
                 .map(|m| {
                     json!({
                         "uid": m.uid,
                         "name": m.name,
                         "file_path": m.file_path,
+                        // Include kind so the daemon path renders the same
+                        // member shape as the CLI direct path (ClusterMember).
+                        "kind": m.kind,
                     })
                 })
                 .collect();
@@ -4449,6 +6592,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 "cohesion": c.cohesion,
                 "key_files": c.key_files,
                 "members": members,
+                "members_truncated": c.members.len() > member_cap,
             })
         })
         .collect();
@@ -4486,8 +6630,18 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
     let mut any_stale = false;
 
     for repo in &repos {
+        // A local working tree that no longer exists on disk is
+        // unverifiable — flag it `[missing]` and count it as stale instead of
+        // silently reporting `[ok]`.
+        let local_missing = repo
+            .local_root()
+            .map(|p| !std::path::Path::new(p).exists())
+            .unwrap_or(false);
+
         // Local working tree → read HEAD from disk; otherwise ask the remote.
-        let current_head = if let Some(path) = repo.local_root() {
+        let current_head = if local_missing {
+            None
+        } else if let Some(path) = repo.local_root() {
             get_git_head(path)
         } else {
             get_remote_head(&repo.url)
@@ -4503,9 +6657,13 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             _ => repo.staleness_commits_behind as u64,
         };
 
-        let is_stale = match &current_head {
-            Some(head) => head != &repo.indexed_sha,
-            None => commits_behind > 0,
+        let is_stale = if local_missing {
+            true
+        } else {
+            match &current_head {
+                Some(head) => head != &repo.indexed_sha,
+                None => commits_behind > 0,
+            }
         };
 
         if is_stale {
@@ -4518,6 +6676,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "current_head": current_head,
             "is_stale": is_stale,
             "staleness_commits_behind": commits_behind,
+            "status": if local_missing { "missing" } else if is_stale { "stale" } else { "ok" },
         }));
     }
 
@@ -4917,8 +7076,10 @@ fn tool_schema_project_context() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 16000,
                     "default": 3000,
-                    "description": "Approximate token cap for the result (chars / 4). Increase for comprehensive context, decrease for quick overview."
+                    "description": "Approximate token cap for the result (chars / 4, 1-16000). Increase for comprehensive context, decrease for quick overview."
                 },
                 "kinds": {
                     "type": "array",
@@ -4977,9 +7138,12 @@ fn tool_schema_project_context() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Drop note/section nodes tagged with any of these tags."
-                }
+                },
+                "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
+                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
-            "required": ["project"]
+            "required": ["project"],
+            "additionalProperties": false
         }
     })
 }
@@ -5498,7 +7662,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private/internal), Medium (inferred visibility), Low (public/library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Public symbols flagged as Low confidence may be consumed by external code",
+        "description": "Find potentially unreachable symbols by walking forward from all entry points (main, HTTP handlers, event listeners, test runners).\n\nGuidelines:\n- Confidence scoring: High (private/internal), Medium (inferred visibility), Low (public/library API)\n- Use min_confidence to filter; 'low' shows all, 'high' shows only strong candidates\n- unreachable_count is the unfiltered total (consistent with total_symbols/reachable_symbols/dead_percentage); matching_count is the post-min_confidence count; returned/truncated disclose the limit cap\n- For understanding what depends on a specific symbol use brain_impact instead\n\nLimitations:\n- Static reachability analysis — misses runtime reflection, DI, and dynamic dispatch\n- Visibility is not persisted from the parser, so every symbol is scored at inferred (Medium) confidence — the documented High/Low tiers cannot fire; treat min_confidence filters accordingly (known limitation)\n- Public symbols flagged as Low confidence may be consumed by external code",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5516,9 +7680,14 @@ fn tool_schema_dead_code() -> Value {
                 },
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
                     "description": "Max unreachable symbols to return (defaults to the configured result limit). The response reports the true total in 'unreachable_count' and sets 'truncated' when the cap applied."
-                }
-            }
+                },
+                "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
+                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
+            },
+            "additionalProperties": false
         }
     })
 }
@@ -5537,8 +7706,11 @@ fn tool_dead_code(
     let concise = is_concise(&args);
     // Cap the returned symbols so a large codebase can't return a multi-MB
     // payload that blows an agent's context window (the HTTP boundary caps via
-    // add_limit_metadata, but the stdio path had no bound). `unreachable_count`
-    // still reports the true total; `returned`/`truncated` disclose the cap.
+    // add_limit_metadata, but the stdio path had no bound).
+    // Count contract: `unreachable_count` is the UNFILTERED total (consistent
+    // with `total_symbols`/`reachable_symbols`/`dead_percentage`, which are
+    // also unfiltered); `matching_count` is the post-`min_confidence` count;
+    // `returned`/`truncated` disclose the cap.
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -5547,12 +7719,13 @@ fn tool_dead_code(
 
     let result = detect_dead_code_cancellable(store, cancel).context("detect_dead_code")?;
 
+    let total_unreachable = result.unreachable_symbols.len();
     let all_matching: Vec<_> = result
         .unreachable_symbols
         .iter()
         .filter(|s| s.confidence >= min_conf)
         .collect();
-    let total_unreachable = all_matching.len();
+    let matching_count = all_matching.len();
     let filtered: Vec<Value> = all_matching
         .into_iter()
         .take(limit)
@@ -5579,8 +7752,9 @@ fn tool_dead_code(
         "total_symbols": result.total_symbols,
         "reachable_symbols": result.reachable_symbols,
         "unreachable_count": total_unreachable,
+        "matching_count": matching_count,
         "returned": filtered.len(),
-        "truncated": total_unreachable > filtered.len(),
+        "truncated": matching_count > filtered.len(),
         "excluded_count": result.excluded_count,
         "dead_percentage": result.dead_percentage,
         "min_confidence": min_conf_str,
@@ -5599,16 +7773,27 @@ fn tool_schema_hub_nodes() -> Value {
             "properties": {
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
                     "description": "Number of top hubs to return. Default 10.",
                     "default": 10
+                },
+                "top_n": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Backward-compatible alias for limit."
                 },
                 "response_format": {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
                     "description": "\"concise\" returns name + total degree only; \"detailed\" (default) adds UIDs, file paths, PageRank scores, and cluster IDs."
-                }
-            }
+                },
+                "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
+                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
+            },
+            "additionalProperties": false
         }
     })
 }
@@ -5745,7 +7930,7 @@ fn tool_bridge_nodes(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, results are redacted to the caller's visible repos.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged): a run that did NOT complete is degraded-unknown, NEVER risk-flagged — treat it as 'unknown, review manually', not 'safe'\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, results are redacted to the caller's visible repos.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5756,7 +7941,9 @@ fn tool_schema_blast_radius() -> Value {
                 },
                 "max_depth": {
                     "type": "integer",
-                    "description": "Maximum transitive traversal depth. Default 3. Higher values find more distant dependents.",
+                    "minimum": 1,
+                    "maximum": 15,
+                    "description": "Maximum transitive traversal depth (1-15). Default 3. Higher values find more distant dependents.",
                     "default": 3
                 },
                 "repo": {
@@ -5778,9 +7965,12 @@ fn tool_schema_blast_radius() -> Value {
                     "enum": ["json", "sarif"],
                     "description": "Output format. 'json' (default) is the native result; 'sarif' emits SARIF v2.1.0 for GitHub code scanning / Azure DevOps / the VS Code SARIF viewer.",
                     "default": "json"
-                }
+                },
+                "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
+                "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
-            "required": ["changed_files"]
+            "required": ["changed_files"],
+            "additionalProperties": false
         }
     })
 }
@@ -5819,16 +8009,26 @@ fn tool_blast_radius(
         .unwrap_or(false);
 
     // Optional cap on returned affected_symbols (most-impactful first).
-    let limit = args
+    let requested_limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
+    let visibility_restricted = matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    );
 
     let options = BlastRadiusOptions {
         target_repo: target_repo.map(str::to_string),
         max_depth,
         include_data_edges,
-        limit,
+        // Restricted callers must be redacted against the complete result so
+        // their total is exact and contains no pre-authz cardinality.
+        limit: if visibility_restricted {
+            None
+        } else {
+            requested_limit
+        },
     };
 
     let db_path = current_db_path(store).ok();
@@ -5851,6 +8051,7 @@ fn tool_blast_radius(
             anyhow!("authz repo listing unavailable")
         })?;
         nestweaver_engine::authz::redact_blast_radius_for_visibility(&mut result, v, &repos);
+        nestweaver_engine::blast_radius::apply_affected_symbol_limit(&mut result, requested_limit);
     }
 
     // SARIF output: emit a standard SARIF v2.1.0 run (with namespaced
@@ -5944,7 +8145,9 @@ fn tool_blast_radius(
         "changed_symbols": changed_json,
         "changed_symbol_count": changed_json.len(),
         "affected_symbols": affected_json,
-        "affected_symbol_count": affected_json.len(),
+        "affected_symbol_count": result.affected_symbol_count,
+        "returned_affected_symbol_count": affected_json.len(),
+        "affected_symbols_truncated": affected_json.len() < result.affected_symbol_count,
         "affected_clusters": clusters_json,
         "affected_cluster_count": clusters_json.len(),
         // Always present so consumers can distinguish "no cross-repo impact"
@@ -5953,6 +8156,8 @@ fn tool_blast_radius(
         "org_wide": serde_json::to_value(&result.org_wide).unwrap_or(Value::Null),
         "coverage": coverage_json,
         "blind_spots": blind_spots_json,
+        "cochanged_files": serde_json::to_value(&result.cochanged_files)
+            .unwrap_or(serde_json::Value::Array(Vec::new())),
         "analysis_direction": result.analysis_direction,
     }))
 }
@@ -5990,11 +8195,71 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
 
     let level_str = args.get("level").and_then(|v| v.as_str()).unwrap_or("file");
     let level: SummaryLevel = level_str.parse().map_err(|e: String| anyhow!("{e}"))?;
-    let target = args.get("target").and_then(|v| v.as_str());
+    // Accept `name` as an alias for `target` — agents naturally pass a symbol as
+    // `name`, and silently dropping it used to force a full-store regeneration.
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .or_else(|| args.get("name").and_then(|v| v.as_str()));
     let token_budget = args
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
+
+    // ── Symbol level: bounded, target-pushed-down path (nw-079) ───────────────
+    // Symbol summaries are O(symbols × per-symbol caller/callee queries). An
+    // untargeted call over a large graph used to hang for tens of seconds and
+    // never cache (so every call re-hung). Route symbol level through the bounded
+    // engine API instead: a `target` filters BEFORE the expensive queries (fast),
+    // and an untargeted call is hard-capped and reports the truncation honestly.
+    // We deliberately do NOT touch the sidecar cache here — a targeted or capped
+    // result is a partial set and must never be persisted as "the" summaries.
+    if level == SummaryLevel::Symbol {
+        let out = nestweaver_engine::generate_symbol_summaries_bounded(
+            store,
+            target,
+            nestweaver_engine::DEFAULT_SYMBOL_SUMMARY_CAP,
+        )?;
+        let matched_total = out.matched_total;
+        let capped = out.capped;
+        let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
+            truncate_to_budget(&out.summaries, budget)
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            out.summaries
+        };
+        let total_tokens: usize = display.iter().map(|s| s.token_estimate).sum();
+        let truncated_by_budget = display.len() < matched_total;
+        let note = if capped {
+            Some(format!(
+                "symbol-level summary is capped at {} symbols of {matched_total}; pass `target` \
+                 (a symbol name or file substring) to summarize a specific area",
+                nestweaver_engine::DEFAULT_SYMBOL_SUMMARY_CAP
+            ))
+        } else if target.is_some() && display.is_empty() {
+            Some(format!(
+                "no symbol matched target {:?}",
+                target.unwrap_or_default()
+            ))
+        } else {
+            None
+        };
+        return Ok(json!({
+            "level": level_str,
+            "target": target,
+            "count": display.len(),
+            "total_available": matched_total,
+            "tokens_used": total_tokens,
+            "token_budget": token_budget,
+            "truncated": truncated_by_budget || capped,
+            "partial": capped,
+            "cached": false,
+            "note": note,
+            "summaries": render_text(&display),
+        }));
+    }
 
     // Try loading cached summaries from the sidecar first; only use the
     // cache when it contains entries at the requested level.
@@ -6005,7 +8270,12 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             None
         }
     };
+    // `no_cache` / `cache: "bypass"` must skip the summary sidecar too, not just
+    // the F16 response cache — otherwise a caller asking for fresh data got
+    // `cached: true` served from the sidecar, which reads as contradictory.
+    let bypass = cache_bypassed(&args);
     let (summaries, from_cache) = if let Some(ref db) = db_path
+        && !bypass
         && let Ok(Some(cached)) = load_summaries(db, store.graph_generation())
     {
         let level_filtered: Vec<nestweaver_engine::Summary> =
@@ -6226,6 +8496,131 @@ pub fn is_server_mode() -> bool {
 pub type DaemonGrpcClient =
     nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient<tonic::transport::Channel>;
 
+/// Render post-commit reconciliation failures as human-readable warning strings
+/// for an MCP `reconciliation_warnings` field (nw-091 / Bug 2).
+#[cfg(feature = "daemon")]
+fn reconciliation_warnings(failures: &[nestweaver_proto::ReconciliationFailure]) -> Vec<String> {
+    failures
+        .iter()
+        .map(|f| {
+            if f.repo_uid.is_empty() {
+                format!("{}: {}", f.stage, f.message)
+            } else {
+                format!("{} ({}): {}", f.stage, f.repo_uid, f.message)
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "daemon")]
+fn daemon_brain_search_response_to_json(
+    response: &nestweaver_proto::BrainSearchResponse,
+    concise: bool,
+) -> Value {
+    let results: Vec<Value> = response
+        .results
+        .iter()
+        .map(|result| {
+            let mut item = if concise {
+                let mut item = json!({
+                    "uid": result.uid,
+                    "kind": result.kind,
+                    "title": result.title,
+                });
+                if let Some(location) = &result.location {
+                    item["location"] = json!(location);
+                }
+                item
+            } else {
+                let mut item = json!({
+                    "uid": result.uid,
+                    "kind": result.kind,
+                    "title": result.title,
+                    "score": result.score,
+                });
+                if let Some(location) = &result.location {
+                    item["location"] = json!(location);
+                }
+                if let Some(body) = &result.inline_body {
+                    item["inline_body"] = json!(body);
+                }
+                item
+            };
+            // Parity with the local path: symbol rows carry no
+            // `matched_headings` key at all — omit it when empty instead of
+            // emitting a spurious `[]`.
+            if !result.matched_headings.is_empty() {
+                item["matched_headings"] = json!(result.matched_headings);
+            }
+            if let Some(canonical_id) = &result.canonical_id {
+                item["canonical_id"] = json!(canonical_id);
+            }
+            // Parity with the local path: note rows carry their vault.
+            if let Some(vault_uid) = &result.vault_uid {
+                item["vault_uid"] = json!(vault_uid);
+            }
+            item
+        })
+        .collect();
+    let returned_matches = if response.returned_matches == 0 && !results.is_empty() {
+        results.len() as i32
+    } else {
+        response.returned_matches
+    };
+    let relation = if response.total_matches_relation.is_empty() {
+        "gte"
+    } else {
+        &response.total_matches_relation
+    };
+    let truncated =
+        response.truncated || relation != "eq" || returned_matches < response.total_matches;
+    let mut value = json!({
+        "query": response.query,
+        "engine": response.engine,
+        "total_matches": response.total_matches,
+        "total_matches_relation": relation,
+        "returned_matches": returned_matches,
+        "truncated": truncated,
+        "results": results,
+    });
+    if !response.expansion_terms.is_empty() {
+        value["expansion_terms"] = json!(response.expansion_terms);
+    }
+    value
+}
+
+/// Map a tonic Status from a daemon tool RPC into an anyhow error. The
+/// daemon's dispatch layer reports tool-EXECUTION failures as
+/// `Status::internal("tool <name> failed: ...")` and cancellations as
+/// `"<name> query cancelled: ..."` — those are tool errors, not transport
+/// failures, so surfacing them under a "gRPC error:" prefix misleads clients
+/// (stdio MCP clients never speak gRPC). Only genuine transport/RPC failures
+/// keep the prefix.
+#[cfg(feature = "daemon")]
+fn grpc_status_err(status: tonic::Status) -> anyhow::Error {
+    let message = status.message();
+    if message.starts_with("tool ") || message.contains(" query cancelled:") {
+        anyhow::anyhow!("{message}")
+    } else {
+        anyhow::anyhow!("gRPC error: {message}")
+    }
+}
+
+/// Proto3 scalar bools carry no presence. An MCP arg the caller left
+/// unset would forward as explicit `false`, and the daemon's typed handlers
+/// write that `false` back into the tool args — overriding tool defaults that
+/// are TRUE (`project_context.include_components`, `note_get.include_body`).
+/// Forward the tool's own default when the caller did not specify the flag;
+/// an explicit `false` is still honored.
+///
+/// (The alternative — proto `optional` fields — is blocked because
+/// `nestweaver-federation` constructs these request messages with exhaustive
+/// struct literals; any proto field change would break that crate.)
+#[cfg(feature = "daemon")]
+fn forwarded_bool(args: &serde_json::Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
 /// Dispatch an MCP tool call through the daemon gRPC service instead of
 /// opening the DB directly. Maps each MCP tool name to the corresponding
 /// gRPC RPC on the `NestWeaverDaemon` service.
@@ -6240,6 +8635,12 @@ pub fn dispatch_via_daemon(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
     use nestweaver_proto::JsonRequest;
+
+    // The daemon-proxy path must enforce the same --tools/--lite gate
+    // as the local path, before any RPC is proxied.
+    enforce_tool_allowed(name)?;
+
+    validate_tool_arguments(name, &args)?;
 
     let args_json = serde_json::to_string(&args)?;
 
@@ -6257,33 +8658,93 @@ pub fn dispatch_via_daemon(
             .ok_or_else(|| anyhow::anyhow!("'target' is required"))?
             .to_string();
 
-        // Try repo first — ask the daemon for matching repo by name/uid.
-        // We send the target as repo_uid; the daemon resolves it.
-        // However, the proto only accepts a uid. We need to resolve locally
-        // or just try the RPC and fall back. For simplicity, try as repo_uid
-        // first (covers uid and name for well-known targets), then vault_uid.
-        let repo_result = rt.block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
-            repo_uid: target.clone(),
-        }));
-        if let Ok(resp) = repo_result {
+        // nw-089: RESOLVE the target (path / name / url / uid) to the actual repo
+        // (or vault) UID before deleting. The RPC's repo_uid is an exact uid, so
+        // the previous code that sent the raw `target` never matched a path/name
+        // and silently deleted nothing (a no-op reported as success). Fetch the
+        // repo list from the daemon and match with the same logic the CLI uses.
+        let repos: Vec<nestweaver_schema::Repo> = {
+            let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+                args_json: "{}".to_string(),
+            });
+            let resp = rt
+                .block_on(client.list_repos_json(req))
+                .map_err(|s| anyhow::anyhow!("list_repos RPC failed: {}", s.message()))?;
+            serde_json::from_str(&resp.into_inner().result_json).unwrap_or_default()
+        };
+        let matched_repo = match_repo_target(&repos, &target);
+        if matched_repo.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "'{target}' matches multiple repos — pass a full UID to disambiguate."
+            ));
+        }
+        if let Some(repo) = matched_repo.first() {
+            let resp = rt
+                .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                    repo_uid: repo.uid.clone(),
+                }))
+                .map_err(|s| anyhow::anyhow!("remove_repo RPC failed: {}", s.message()))?;
             let inner = resp.into_inner();
             return Ok(json!({
                 "kind": "repo",
-                "uid": target,
+                "name": repo.name.clone().unwrap_or_else(|| repo.url.clone()),
+                "uid": repo.uid,
                 "files_deleted": inner.files_deleted,
-                "symbols_deleted": inner.symbols_deleted
+                "symbols_deleted": inner.symbols_deleted,
+                // nw-091 / Bug 2: committed=true means the delete HAPPENED even if
+                // some post-commit reconciliation step failed — surfaced as warnings,
+                // never as an RPC error that reads as "nothing happened".
+                "committed": inner.committed,
+                "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
             }));
         }
 
-        let vault_result = rt.block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
-            vault_uid: target.clone(),
-        }));
-        if let Ok(resp) = vault_result {
+        // Not a repo — resolve as a vault (by uid, name, or root path).
+        let vaults: Vec<nestweaver_schema::Vault> = {
+            let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+                args_json: "{}".to_string(),
+            });
+            match rt.block_on(client.list_vaults_json(req)) {
+                Ok(resp) => {
+                    serde_json::from_str(&resp.into_inner().result_json).unwrap_or_default()
+                }
+                Err(_) => Vec::new(),
+            }
+        };
+        let canonical_target = std::fs::canonicalize(&target)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let target_trimmed = target.trim_end_matches('/');
+        let matched_vault: Vec<&nestweaver_schema::Vault> = vaults
+            .iter()
+            .filter(|v| {
+                v.uid == target
+                    || v.name == target_trimmed
+                    || v.root_path.trim_end_matches('/') == target_trimmed
+                    || (!canonical_target.is_empty()
+                        && v.root_path.trim_end_matches('/')
+                            == canonical_target.trim_end_matches('/'))
+            })
+            .collect();
+        if matched_vault.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "'{target}' matches multiple vaults — pass a full UID to disambiguate."
+            ));
+        }
+        if let Some(vault) = matched_vault.first() {
+            let resp = rt
+                .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                    vault_uid: vault.uid.clone(),
+                }))
+                .map_err(|s| anyhow::anyhow!("remove_vault RPC failed: {}", s.message()))?;
             let inner = resp.into_inner();
             return Ok(json!({
                 "kind": "vault",
-                "uid": target,
-                "notes_deleted": inner.notes_deleted
+                "name": vault.name.clone(),
+                "uid": vault.uid,
+                "notes_deleted": inner.notes_deleted,
+                "committed": inner.committed,
+                "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
             }));
         }
 
@@ -6345,52 +8806,10 @@ pub fn dispatch_via_daemon(
                     rerank: bool_field("rerank"),
                     root: opt_str_field("root"),
                 });
-                let resp = client
-                    .search(req)
-                    .await
-                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                let resp = client.search(req).await.map_err(grpc_status_err)?;
                 let inner = resp.into_inner();
                 let is_concise = str_field("response_format").eq_ignore_ascii_case("concise");
-                // Serialize the typed response back to JSON, respecting
-                // concise mode (which deliberately omits uid/score/location).
-                let results: Vec<serde_json::Value> = inner
-                    .results
-                    .iter()
-                    .map(|r| {
-                        if is_concise {
-                            let mut obj = serde_json::json!({
-                                "kind": r.kind,
-                                "title": r.title,
-                                "matched_headings": r.matched_headings,
-                            });
-                            if let Some(ref loc) = r.location {
-                                obj["location"] = serde_json::json!(loc);
-                            }
-                            obj
-                        } else {
-                            let mut obj = serde_json::json!({
-                                "uid": r.uid,
-                                "kind": r.kind,
-                                "title": r.title,
-                                "score": r.score,
-                                "matched_headings": r.matched_headings,
-                            });
-                            if let Some(ref loc) = r.location {
-                                obj["location"] = serde_json::json!(loc);
-                            }
-                            if let Some(ref body) = r.inline_body {
-                                obj["inline_body"] = serde_json::json!(body);
-                            }
-                            obj
-                        }
-                    })
-                    .collect();
-                let value = serde_json::json!({
-                    "query": inner.query,
-                    "engine": inner.engine,
-                    "total_matches": inner.total_matches,
-                    "results": results,
-                });
+                let value = daemon_brain_search_response_to_json(&inner, is_concise);
                 Ok(serde_json::to_string(&value)?)
             }
             "brain_context" => {
@@ -6418,10 +8837,7 @@ pub fn dispatch_via_daemon(
                     recency_weight: f64_field("recency_weight"),
                     recency_half_life_days: f64_field("recency_half_life_days"),
                 });
-                let resp = client
-                    .get_context(req)
-                    .await
-                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                let resp = client.get_context(req).await.map_err(grpc_status_err)?;
                 Ok(resp.into_inner().result_json)
             }
             "project_context" => {
@@ -6430,7 +8846,7 @@ pub fn dispatch_via_daemon(
                     project: str_field("project"),
                     token_budget: i32_field("token_budget"),
                     kinds: str_array("kinds"),
-                    include_components: bool_field("include_components"),
+                    include_components: forwarded_bool(&args, "include_components", true),
                     intent: str_field("intent"),
                     include_seeds: bool_field("include_seeds"),
                     since: str_field("since"),
@@ -6445,7 +8861,7 @@ pub fn dispatch_via_daemon(
                 let resp = client
                     .get_project_context(req)
                     .await
-                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                    .map_err(grpc_status_err)?;
                 Ok(resp.into_inner().result_json)
             }
             "note_get" => {
@@ -6453,13 +8869,10 @@ pub fn dispatch_via_daemon(
                 let req = tonic::Request::new(NoteGetRequest {
                     uid: opt_str_field("uid"),
                     title: opt_str_field("title"),
-                    include_body: bool_field("include_body"),
+                    include_body: forwarded_bool(&args, "include_body", true),
                     sections: str_array("sections"),
                 });
-                let resp = client
-                    .get_note(req)
-                    .await
-                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                let resp = client.get_note(req).await.map_err(grpc_status_err)?;
                 let inner = resp.into_inner();
                 let mut value = serde_json::json!({
                     "uid": inner.uid,
@@ -6468,6 +8881,25 @@ pub fn dispatch_via_daemon(
                     "note_kind": inner.note_kind,
                     "word_count": inner.word_count,
                     "section_count": inner.section_count,
+                    // Parity with the local path: frontmatter and outline are
+                    // always present (local defaults to {} / []).
+                    "frontmatter": serde_json::from_str::<serde_json::Value>(
+                        &inner.frontmatter_json
+                    )
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                    "outline": inner
+                        .outline
+                        .iter()
+                        .map(|h| {
+                            serde_json::json!({
+                                "uid": h.uid,
+                                "level": h.level,
+                                "text": h.text,
+                                "slug": h.slug,
+                                "line": h.line,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
                 });
                 if let Some(ref body) = inner.body {
                     value["body"] = serde_json::json!(body);
@@ -6485,7 +8917,7 @@ pub fn dispatch_via_daemon(
                 let resp = client
                     .brain_status_json(req)
                     .await
-                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                    .map_err(grpc_status_err)?;
                 Ok(resp.into_inner().result_json)
             }
             "hub_nodes" => {
@@ -6500,10 +8932,7 @@ pub fn dispatch_via_daemon(
                         .unwrap_or(0) as i32,
                     response_format: str_field("response_format"),
                 });
-                let resp = client
-                    .hub_nodes(req)
-                    .await
-                    .map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                let resp = client.hub_nodes(req).await.map_err(grpc_status_err)?;
                 Ok(resp.into_inner().result_json)
             }
             // ── JSON pass-through RPCs ───────────────────────────────
@@ -6549,7 +8978,7 @@ pub fn dispatch_via_daemon(
                         ));
                     }
                 };
-                let resp = resp.map_err(|s| anyhow::anyhow!("gRPC error: {}", s.message()))?;
+                let resp = resp.map_err(grpc_status_err)?;
                 Ok(resp.into_inner().result_json)
             }
         }
@@ -6592,6 +9021,70 @@ where
         .map_err(|error| anyhow::anyhow!("{} index failed: {error}", source.label()))
 }
 
+/// Heuristic vault detector for `brain_add_source`: true when markdown files are
+/// the majority of the "content" files in a bounded shallow scan of `dir`. Used
+/// to distinguish a notes vault from a code directory so a code dir without a
+/// `.git` isn't misclassified as a vault (nw-089). Bounded (depth ≤ 3, ≤ 4000
+/// files, skips VCS/dependency dirs) so it stays cheap on large trees.
+#[cfg(feature = "daemon")]
+fn dir_is_markdown_dominant(dir: &std::path::Path) -> bool {
+    const CODE_EXTS: &[&str] = &[
+        "rs", "js", "ts", "jsx", "tsx", "py", "go", "java", "c", "h", "cpp", "hpp", "cc", "cs",
+        "rb", "php", "swift", "kt", "scala", "lua", "sh", "sql", "hcl", "dart", "ex", "exs", "zig",
+        "m", "mm",
+    ];
+    let mut md = 0usize;
+    let mut code = 0usize;
+    let mut seen = 0usize;
+    let mut stack = vec![(dir.to_path_buf(), 0u32)];
+    while let Some((d, depth)) = stack.pop() {
+        if depth > 3 || seen > 4000 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            seen += 1;
+            if seen > 4000 {
+                break;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if name.starts_with('.')
+                    || matches!(
+                        name,
+                        "node_modules" | "target" | "vendor" | "dist" | "build"
+                    )
+                {
+                    continue;
+                }
+                stack.push((p, depth + 1));
+            } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                if ext == "md" || ext == "markdown" {
+                    md += 1;
+                } else if CODE_EXTS.contains(&ext) {
+                    code += 1;
+                }
+            }
+        }
+    }
+    md > 0 && md >= code
+}
+
+/// Instance id `brain_add_source` stamps vaults under when routing through the
+/// daemon, mirroring the CLI's nw-019 precedence (`resolve_instance_id`):
+/// config's `instance_id` > `"default"`. An empty id would defer to the daemon,
+/// whose config-less fallback is the db-path hash — a different identity than
+/// the CLI's `"default"`, duplicating any vault added via both paths.
+#[cfg(feature = "daemon")]
+fn resolve_add_source_instance_id() -> String {
+    current_instance_config()
+        .map(|c| c.instance_id.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
 #[cfg(feature = "daemon")]
 fn dispatch_add_source_via_daemon(
     client: &mut DaemonGrpcClient,
@@ -6604,33 +9097,50 @@ fn dispatch_add_source_via_daemon(
         .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?
         .to_string();
 
-    let name = args
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // Vault schema promises "Defaults to the directory name" — resolve it
+    // here, but ONLY for vaults: forwarding "" blanks a vault's stored
+    // friendly name on every nameless re-add (the daemon treats the value
+    // literally), while for code repos an empty name is meaningful — the
+    // daemon derives the repo name (package/remote) and a directory-name
+    // default would override that derivation.
+    let name_arg = args.get("name").and_then(|v| v.as_str()).map(String::from);
 
     let resolved = std::path::Path::new(&path);
-    let is_repo = resolved.join(".git").exists();
-    let is_vault = !is_repo
-        && (resolved.join(".obsidian").exists()
-            || std::fs::read_dir(resolved)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .any(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-                })
-                .unwrap_or(false));
+    // nw-089: validate the path exists — the old code returned a phantom
+    // `status:"indexed"` vault for a nonexistent path (no validation).
+    if !resolved.exists() {
+        return Err(anyhow::anyhow!("path does not exist: {path}"));
+    }
+    if !resolved.is_dir() {
+        return Err(anyhow::anyhow!(
+            "path is not a directory (index a source directory, not a file): {path}"
+        ));
+    }
+    // nw-089: classify by a POSITIVE vault signal, then default to CODE. The old
+    // `if is_vault || !is_repo` indexed any non-git directory as a vault, so a
+    // plain code dir without a `.git` was indexed as a vault and its source was
+    // never picked up (vault indexing only ingests markdown). A directory is a
+    // vault only when it is an Obsidian vault or is markdown-dominant; everything
+    // else — including a code dir with no `.git` — indexes as code.
+    let is_vault = resolved.join(".obsidian").exists() || dir_is_markdown_dominant(resolved);
 
-    let instance_id = current_instance_config()
-        .map(|c| c.instance_id.clone())
-        .unwrap_or_default();
+    // Match the CLI's nw-019 precedence (`resolve_instance_id`): config's
+    // `instance_id` > "default". The old `unwrap_or_default` sent an empty id,
+    // which a config-less daemon resolves to its db-path hash — so the same
+    // vault added once via `brain add` ("default") and once via MCP (hash) was
+    // duplicated under two vault UIDs.
+    let instance_id = resolve_add_source_instance_id();
 
     rt.block_on(async {
-        if is_vault || !is_repo {
+        if is_vault {
+            let vault_name = name_arg.clone().or_else(|| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            });
             let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
                 vault_path: path.clone(),
-                vault_name: name,
+                vault_name: vault_name.unwrap_or_default(),
                 extra_ignore_patterns: vec![],
                 instance_id: instance_id.clone(),
             });
@@ -6649,7 +9159,10 @@ fn dispatch_add_source_via_daemon(
         } else {
             let req = tonic::Request::new(nestweaver_proto::IndexRepoRequest {
                 repo_path: path.clone(),
-                name,
+                // Empty when omitted: the daemon derives the repo name
+                // (package/remote) — a directory-name default would override
+                // that derivation.
+                name: name_arg.clone().unwrap_or_default(),
                 force: false,
                 with_trigrams: false,
                 with_git_activity: false,
@@ -6693,6 +9206,29 @@ mod daemon_index_progress_tests {
         events: Vec<Result<IndexProgress, tonic::Status>>,
     ) -> Result<String, anyhow::Error> {
         consume_daemon_index_progress(source, tokio_stream::iter(events)).await
+    }
+
+    #[test]
+    fn add_source_instance_id_matches_cli_precedence() {
+        // The MCP daemon path must stamp vaults under the SAME instance id the
+        // CLI resolves (`--instance` > config > "default"): an empty id defers
+        // to a config-less daemon's db-path hash, duplicating any vault added
+        // via both paths under two vault UIDs.
+        set_current_instance_config(None);
+        assert_eq!(resolve_add_source_instance_id(), "default");
+
+        let cfg: nestweaver_engine::InstanceConfig = serde_json::from_value(serde_json::json!({
+            "instance_id": "cfg-instance",
+            "repos": [],
+            "snapshot_storage": { "backend": "local", "path": "/tmp" },
+            "workspace": { "backend": "local", "path": "/tmp" },
+            "inference": { "endpoint": "", "embedding_model": "", "summary_model": "" },
+            "git": { "credential_method": "ssh" }
+        }))
+        .expect("valid test config");
+        set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+        assert_eq!(resolve_add_source_instance_id(), "cfg-instance");
+        set_current_instance_config(None);
     }
 
     #[tokio::test]
@@ -6824,16 +9360,17 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- more_available counts entries dropped by token budget — raise token_budget to see them\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- more_available counts entries dropped by token budget — raise token_budget to see them\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "The topic/feature/subsystem to orient on (e.g. \"device pairing\", \"how indexing works\")." },
                 "scope": { "type": "string", "description": "Optional scope: \"project:<slug>\", \"repo:<name>\", or \"vault\"/\"all\" (default = no restriction)." },
-                "token_budget": { "type": "integer", "default": 4000, "description": "Approximate token cap for the map (chars/4). Hard-capped at 16000." },
+                "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the map (chars/4). Hard-capped at 16000." },
                 "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. Defaults to the server's working directory." }
             },
-            "required": ["query"]
+            "required": ["query"],
+            "additionalProperties": false
         }
     })
 }
@@ -6918,7 +9455,7 @@ fn tool_schema_investigate_hydrate() -> Value {
             "type": "object",
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
-                "token_budget": { "type": "integer", "default": 4000, "description": "Approximate token cap for the hydrated bodies (chars/4). Hard-capped at 16000." },
+                "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the hydrated bodies (chars/4). Hard-capped at 16000." },
                 "root": { "type": "string", "description": "Filesystem root for reading source bodies. Defaults to the server's working directory." }
             },
             "required": ["bundle_id"]
@@ -6927,6 +9464,19 @@ fn tool_schema_investigate_hydrate() -> Value {
 }
 
 fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    // hydrate is the BULK operation — it hydrates every un-hydrated entry in the
+    // bundle and takes no per-entry selector. A caller passing `targets`/`target`/
+    // `uid`/`uids` has confused it with investigate_expand; those keys were silently
+    // ignored (a no-op that reads as "nothing to hydrate"), so reject them with a
+    // pointer instead, matching investigate_expand's own strictness.
+    for key in ["targets", "target", "uid", "uids"] {
+        if args.get(key).is_some() {
+            return Err(anyhow!(
+                "investigate_hydrate takes no '{key}' — it hydrates the whole bundle. \
+                 Use investigate_expand with 'targets' to hydrate specific entries."
+            ));
+        }
+    }
     let bundle_id = args
         .get("bundle_id")
         .and_then(|v| v.as_str())
@@ -7521,6 +10071,13 @@ mod cache_dispatch_tests {
         assert!(!is_cacheable_tool("investigate_hydrate"));
         assert!(!is_cacheable_tool("brain_status"));
         assert!(!is_cacheable_tool("stale_check"));
+        // nw-077: read_symbols reads bodies from the filesystem (cwd/root-
+        // dependent), so it must NOT be cached — a call from a wrong cwd would
+        // otherwise poison the cache with an empty body served forever.
+        assert!(!is_cacheable_tool("read_symbols"));
+        // nw-089: query_extensions reads a sidecar that set_extension mutates
+        // without bumping the generation, so a cached result would go stale.
+        assert!(!is_cacheable_tool("query_extensions"));
         // And a representative read tool IS cacheable.
         assert!(is_cacheable_tool("hub_nodes"));
 
@@ -7561,6 +10118,11 @@ mod cache_dispatch_tests {
         store
             .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
             .unwrap();
+        // Seed one embedding so the semantic (vector KNN) leg actually runs:
+        // on an un-embedded db that leg is skipped entirely
+        // (`store_has_embeddings`) and the pre-cancelled flag would never
+        // trip inside it.
+        assert!(store.add_embedding("sym:cancel-probe", vec![1.0, 0.0, 0.0]));
 
         let embed = FixedEmbed(vec![1.0, 0.0, 0.0]);
         let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
@@ -7734,6 +10296,118 @@ mod cache_dispatch_tests {
             "concise must fit more nodes in the same budget: concise={concise} detailed={detailed}"
         );
     }
+
+    // ── Single-flight coalescing ──────────────────────────────────────────
+
+    /// Poll the IN_FLIGHT map until the slot for `key` reaches the requested
+    /// strong-count condition (or fail after a generous deadline).
+    fn wait_for_flight_count(key: &InFlightKey, cond: impl Fn(usize) -> bool) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let count = IN_FLIGHT.get().and_then(|flights| {
+                flights
+                    .lock()
+                    .ok()
+                    .and_then(|f| f.get(key).map(std::sync::Arc::strong_count))
+            });
+            if let Some(c) = count
+                && cond(c)
+            {
+                return c;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "flight never reached the expected state"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Deterministic overlap: block the leader inside `compute` until the
+    /// follower has registered on the same flight (observed via the slot's
+    /// Arc strong count), then release it. The computation must run exactly
+    /// once and both callers must receive the same value — the stampede fix
+    /// for concurrent identical brain_context calls.
+    #[test]
+    fn single_flight_coalesces_concurrent_identical_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let key: InFlightKey = (
+            std::path::PathBuf::from("/tmp/single-flight-test.lbug"),
+            7,
+            8,
+            9,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Barrier::new(2));
+
+        let leader_key = key.clone();
+        let leader_calls = Arc::clone(&calls);
+        let leader_release = Arc::clone(&release);
+        let leader = std::thread::spawn(move || {
+            coalesce_in_flight(leader_key, move || {
+                leader_calls.fetch_add(1, Ordering::SeqCst);
+                // Hold the flight open until the main thread has watched the
+                // follower attach, then released us below.
+                leader_release.wait();
+                Ok(json!({ "answer": 42 }))
+            })
+        });
+
+        // Wait for the leader to register its flight, then attach a follower.
+        let baseline = wait_for_flight_count(&key, |c| c >= 1);
+        let follower_key = key.clone();
+        let follower = std::thread::spawn(move || {
+            coalesce_in_flight(follower_key, || {
+                panic!("follower must never run the computation")
+            })
+        });
+        wait_for_flight_count(&key, |c| c > baseline);
+
+        release.wait(); // let the leader finish
+        let leader_result = leader.join().expect("leader thread panicked");
+        let follower_result = follower.join().expect("follower thread panicked");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "identical concurrent calls must share one computation"
+        );
+        assert_eq!(leader_result.unwrap(), json!({ "answer": 42 }));
+        assert_eq!(
+            follower_result.unwrap(),
+            json!({ "answer": 42 }),
+            "follower must receive a clone of the leader's result"
+        );
+    }
+
+    /// A failed leader cleans up: followers get the error, and a later call
+    /// with the same key recomputes instead of poisoning the flight map.
+    #[test]
+    fn single_flight_error_propagates_and_cleans_up() {
+        let key: InFlightKey = (
+            std::path::PathBuf::from("/tmp/single-flight-error-test.lbug"),
+            1,
+            2,
+            3,
+        );
+
+        let err = coalesce_in_flight(key.clone(), || Err(anyhow!("boom"))).unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+
+        // The flight entry must be gone and the next call must compute fresh.
+        let ok = coalesce_in_flight(key.clone(), || Ok(json!("recovered"))).unwrap();
+        assert_eq!(ok, json!("recovered"));
+        let entry_gone = IN_FLIGHT
+            .get()
+            .map(|f| !f.lock().unwrap().contains_key(&key))
+            .unwrap_or(true);
+        assert!(
+            entry_gone,
+            "flight entry must be removed after the leader finishes"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7845,6 +10519,184 @@ mod arg_alias_tests {
         assert_eq!(via_alias["files"], json!(["src/b.rs"]));
         assert!(tool_detect_changes(&store, json!({})).is_err());
     }
+
+    #[test]
+    fn detect_changes_surfaces_unknown_source_trust_fields() {
+        let store = GraphStore::in_memory().unwrap();
+        let result = dispatch(
+            &store,
+            None,
+            "detect_changes",
+            json!({ "changed_files": ["src/new.rs"] }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["status"], json!("partial"));
+        assert_eq!(result["gate_state"], json!("degraded-unknown"));
+        assert!(
+            result["notifications"]
+                .as_array()
+                .expect("serialized notifications")
+                .iter()
+                .any(|n| n["descriptor"] == json!("changed-file-no-symbols"))
+        );
+    }
+
+    #[test]
+    fn get_summary_symbol_honors_name_alias_and_target() {
+        // nw-079: `name` is accepted as an alias for `target`, and a targeted
+        // symbol-level summary returns only the match (not a full-store scan).
+        let store = GraphStore::in_memory().unwrap();
+        for name in ["greet", "hello"] {
+            let sym = nestweaver_schema::Symbol {
+                uid: format!("sym:test:abc:{name}"),
+                name: name.to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:test".to_string(),
+                file_path: "src/main.js".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("function {name}()"),
+                summary: None,
+                content_hash: name.to_string(),
+                embedding: None,
+                pagerank_score: Some(0.5),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            };
+            store.insert_symbol(&sym).unwrap();
+        }
+        // `name` alias is honored (not silently dropped) and filters to one match.
+        let via_name =
+            tool_get_summary(&store, json!({ "level": "symbol", "name": "greet" })).unwrap();
+        assert_eq!(via_name["count"], json!(1));
+        assert_eq!(via_name["total_available"], json!(1));
+        assert_eq!(via_name["partial"], json!(false));
+        assert!(
+            via_name["summaries"].as_str().unwrap().contains("greet"),
+            "summary should describe the targeted symbol"
+        );
+        // `target` works identically.
+        let via_target =
+            tool_get_summary(&store, json!({ "level": "symbol", "target": "hello" })).unwrap();
+        assert_eq!(via_target["count"], json!(1));
+    }
+
+    #[test]
+    fn investigate_hydrate_rejects_targeting_keys() {
+        // nw-084: hydrate is bulk (no per-entry selector). Passing targets/target/
+        // uid/uids was silently ignored (looked like "nothing hydrated"); now it's a
+        // clear error pointing to investigate_expand, matching expand's strictness.
+        let store = GraphStore::in_memory().unwrap();
+        for key in ["targets", "target", "uid", "uids"] {
+            let err = tool_investigate_hydrate(
+                &store,
+                json!({ "bundle_id": "bndl_x", key: ["sym:whatever"] }),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("investigate_hydrate takes no") && err.contains("investigate_expand"),
+                "expected a pointer to investigate_expand for key {key}, got: {err}"
+            );
+        }
+        // A well-formed call (no targeting keys) gets PAST the new validation —
+        // it fails later on db-path/bundle resolution, not on a targeting-key
+        // rejection.
+        let err = tool_investigate_hydrate(&store, json!({ "bundle_id": "bndl_missing" }))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("investigate_hydrate takes no"),
+            "a well-formed call must pass targeting-key validation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn regex_search_and_count_patterns_reject_unknown_kinds() {
+        // A bogus kind used to filter out every candidate and return empty
+        // results; now it is an error naming the advertised kinds.
+        let store = GraphStore::in_memory().unwrap();
+        let err = tool_regex_search(&store, json!({ "pattern": "x", "kinds": ["Function"] }))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown kind 'Function'") && err.contains("Section, Note, Symbol"),
+            "{err}"
+        );
+        let err = tool_count_patterns(&store, json!({ "patterns": ["x"], "kinds": ["Heading"] }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown kind 'Heading'"), "{err}");
+        // Case-insensitive valid kinds pass validation (empty results are fine
+        // on an empty store).
+        tool_regex_search(
+            &store,
+            json!({ "pattern": "x", "kinds": ["section", "NOTE"] }),
+        )
+        .expect("case-insensitive advertised kinds must be accepted");
+    }
+
+    #[test]
+    fn brain_context_rejects_unknown_kinds() {
+        // A bogus kind used to silently match no nodes and return an empty
+        // context; now it is an error naming the advertised kinds (same
+        // policy as regex_search/count_patterns).
+        let store = GraphStore::in_memory().unwrap();
+        let err = tool_brain_context(
+            &store,
+            None,
+            json!({ "seeds": ["x"], "kinds": ["Banana"] }),
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown kind 'banana'"), "{err}");
+        // Case-insensitive advertised kinds and Symbol sub-kind prefixes pass
+        // (the seed must resolve, so index a note named after it first).
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: "note:seed".to_string(),
+                vault_uid: "vlt:v".to_string(),
+                file_path: "seed.md".to_string(),
+                title: "x".to_string(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 1,
+                content_hash: "hash-seed".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        tool_brain_context(
+            &store,
+            None,
+            json!({ "seeds": ["x"], "kinds": ["note", "SYMBOL", "Symbol/Function"] }),
+            None,
+            None,
+        )
+        .expect("advertised kinds and symbol sub-kinds must be accepted");
+    }
+
+    #[test]
+    fn regex_search_rejects_empty_pattern() {
+        // Parity with count_patterns: an empty pattern matches everything and
+        // is a scan-cost lever, not a query.
+        let store = GraphStore::in_memory().unwrap();
+        for args in [json!({ "pattern": "" }), json!({ "pattern": "   " })] {
+            let err = tool_regex_search(&store, args).unwrap_err().to_string();
+            assert!(err.contains("empty pattern"), "{err}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7857,9 +10709,9 @@ mod blast_radius_visibility_tests {
 
     /// Build a two-repo (repo:api → repo:client) cross-repo store, mirroring the
     /// engine's `org_wide_populated_for_cross_repo_impact` fixture. Changing the
-    /// api symbol surfaces repo:client as an org-wide impact. Repo records are
-    /// inserted (with `url == uid`) so `redact_blast_radius_for_visibility` can
-    /// resolve an org item's `affected_repo` display label back to a repo_uid.
+    /// api symbol surfaces repo:client as an org-wide impact. Repo records use
+    /// `url == uid` only to keep the expected presentation labels concise;
+    /// authorization uses the org item's stable source and destination UIDs.
     fn cross_repo_store() -> GraphStore {
         let store = GraphStore::in_memory().expect("in_memory store");
 
@@ -7915,6 +10767,203 @@ mod blast_radius_visibility_tests {
         store
     }
 
+    fn mixed_visibility_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, repo: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let mk_repo = |uid: &str| Repo {
+            uid: uid.to_string(),
+            url: uid.to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+
+        for repo in ["repo:api", "repo:a", "repo:b"] {
+            store.insert_repo(&mk_repo(repo)).unwrap();
+        }
+        store
+            .insert_symbol(&mk("target", "Target", "repo:api", "src/target.rs"))
+            .unwrap();
+        for (uid, name, repo, confidence) in [
+            ("hidden", "HiddenCaller", "repo:b", 0.95_f32),
+            ("visible", "VisibleCaller", "repo:a", 0.9_f32),
+            ("local", "LocalCaller", "", 0.8_f32),
+        ] {
+            store
+                .insert_symbol(&mk(uid, name, repo, &format!("src/{uid}.rs")))
+                .unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid.to_string(),
+                    target_uid: "target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    fn duplicate_url_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let repo = |uid: &str, url: &str| Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+        let symbol = |uid: &str, name: &str, repo_uid: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        store
+            .insert_repo(&repo("repo:hidden", "https://example.test/shared"))
+            .unwrap();
+        store
+            .insert_repo(&repo("repo:alias", "https://example.test/shared"))
+            .unwrap();
+        store
+            .insert_repo(&repo("repo:source", "https://example.test/source"))
+            .unwrap();
+        store
+            .insert_symbol(&symbol(
+                "source",
+                "VisibleSource",
+                "repo:source",
+                "src/source.rs",
+            ))
+            .unwrap();
+        store
+            .insert_symbol(&symbol(
+                "hidden-duplicate",
+                "HiddenDuplicateCaller",
+                "repo:hidden",
+                "hidden/duplicate.rs",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "hidden-duplicate".to_string(),
+                target_uid: "source".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: vec![],
+            })
+            .unwrap();
+        store
+    }
+
+    fn unresolved_affected_owner_store() -> GraphStore {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let repo = |uid: &str| Repo {
+            uid: uid.to_string(),
+            url: format!("https://example.test/{uid}"),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "inst".to_string(),
+            name: None,
+            root_path: None,
+        };
+        let symbol = |uid: &str, name: &str, repo_uid: &str, file: &str, signature: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: signature.to_string(),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        store.insert_repo(&repo("repo:visible")).unwrap();
+        store.insert_repo(&repo("repo:hidden")).unwrap();
+        store
+            .insert_symbol(&symbol(
+                "visible-target",
+                "VisibleTarget",
+                "repo:visible",
+                "src/target.rs",
+                "fn VisibleTarget()",
+            ))
+            .unwrap();
+        // The edge scan reads uid/name/path, but the authoritative symbol-row
+        // lookup rejects this corruption canary while decoding `signature`.
+        store
+            .insert_symbol(&symbol(
+                "hidden-lookup-miss",
+                "HiddenLookupMiss",
+                "repo:hidden",
+                "hidden/lookup-miss.rs",
+                "fn HiddenLookupMiss()\0",
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "hidden-lookup-miss".to_string(),
+                target_uid: "visible-target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        store
+    }
+
     /// Redaction must strip the cross-repo (repo:client) org item and affected
     /// symbol when the caller may only see repo:api, while `None` (the
     /// backward-compatible default) leaves the full result intact.
@@ -7955,5 +11004,611 @@ mod blast_radius_visibility_tests {
             scoped["org_wide"].is_null(),
             "org_wide collapses to null once its only item (repo:client) is hidden"
         );
+    }
+
+    #[test]
+    fn two_tier_local_tools_redact_hidden_repo_symbols_and_counts() {
+        let store = mixed_visibility_store();
+        let visible = VisibleRepos::Only(
+            ["repo:api".to_string(), "repo:a".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let mut hidden_target = store
+            .lookup_symbols_by_name("HiddenCaller")
+            .expect("hidden template")
+            .remove(0);
+        hidden_target.uid = "hidden-target".to_string();
+        hidden_target.name = "Target".to_string();
+        hidden_target.file_path = "hidden/target.rs".to_string();
+        store
+            .insert_symbol(&hidden_target)
+            .expect("hidden same-name target");
+        let mut visible_via_hidden = hidden_target.clone();
+        visible_via_hidden.uid = "visible-via-hidden".to_string();
+        visible_via_hidden.name = "VisibleViaHidden".to_string();
+        visible_via_hidden.repo_uid = "repo:a".to_string();
+        visible_via_hidden.file_path = "src/visible_via_hidden.rs".to_string();
+        store
+            .insert_symbol(&visible_via_hidden)
+            .expect("visible transitive caller");
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: visible_via_hidden.uid.clone(),
+                target_uid: "hidden".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .expect("hidden-intermediate edge");
+
+        let impact = tool_brain_impact(&store, json!({ "symbol": "Target" }), None, Some(&visible))
+            .expect("scoped impact");
+        let impact_text = impact.to_string();
+        assert_eq!(
+            impact["status"], "ok",
+            "a hidden same-name symbol must not make the visible target ambiguous"
+        );
+        assert!(impact_text.contains("VisibleCaller"), "{impact}");
+        assert!(!impact_text.contains("HiddenCaller"), "{impact}");
+        assert!(!impact_text.contains("LocalCaller"), "{impact}");
+        assert!(!impact_text.contains("VisibleViaHidden"), "{impact}");
+        assert!(!impact_text.contains("hidden/target.rs"), "{impact}");
+        assert_eq!(impact["total"], 1);
+        assert_eq!(impact["returned"], 1);
+
+        let mut visible_test = store
+            .lookup_symbols_by_name("VisibleCaller")
+            .expect("visible template")
+            .remove(0);
+        visible_test.uid = "visible-test".to_string();
+        visible_test.name = "visible_target_test".to_string();
+        visible_test.file_path = "tests/visible_target_test.rs".to_string();
+        store.insert_symbol(&visible_test).expect("visible test");
+        let mut hidden_test = visible_test.clone();
+        hidden_test.uid = "hidden-test".to_string();
+        hidden_test.name = "hidden_target_test".to_string();
+        hidden_test.repo_uid = "repo:b".to_string();
+        hidden_test.file_path = "hidden/tests/hidden_target_test.rs".to_string();
+        store.insert_symbol(&hidden_test).expect("hidden test");
+        let mut hidden_same_path_test = hidden_test.clone();
+        hidden_same_path_test.uid = "hidden-same-path-test".to_string();
+        hidden_same_path_test.name = "hidden_same_path_test".to_string();
+        hidden_same_path_test.file_path = visible_test.file_path.clone();
+        store
+            .insert_symbol(&hidden_same_path_test)
+            .expect("hidden same-path test");
+        for source_uid in ["visible-test", "hidden-test"] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source_uid.to_string(),
+                    target_uid: "target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .expect("test edge");
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: hidden_same_path_test.uid,
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.7,
+                link_type: None,
+                evidence: vec![],
+            })
+            .expect("hidden same-path test edge");
+
+        let tests = tool_affected_tests(
+            &store,
+            json!({ "changed_files": ["src/target.rs"] }),
+            Some(&visible),
+        )
+        .expect("scoped affected tests");
+        let tests_text = tests.to_string();
+        assert!(tests_text.contains("visible_target_test"), "{tests}");
+        assert!(!tests_text.contains("hidden_target_test"), "{tests}");
+        assert!(!tests_text.contains("hidden_same_path_test"), "{tests}");
+        assert!(!tests_text.contains("hidden/tests"), "{tests}");
+        assert_eq!(
+            tests["summary"],
+            "1 tier-1, 0 tier-2, 0 tier-3 tests affected"
+        );
+    }
+
+    #[test]
+    fn blast_radius_count_is_independent_of_limit() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:api".to_string(),
+            file_path: file.to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+
+        store
+            .insert_symbol(&mk("target", "fn_target", "src/target.rs"))
+            .unwrap();
+        for i in 0..60 {
+            let uid = format!("caller:{i}");
+            store
+                .insert_symbol(&mk(
+                    &uid,
+                    &format!("fn_caller_{i}"),
+                    &format!("src/caller_{i}.rs"),
+                ))
+                .unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid,
+                    target_uid: "target".to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+
+        let result = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/target.rs"], "limit": 5 }),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["affected_symbol_count"], json!(60));
+        assert_eq!(result["returned_affected_symbol_count"], json!(5));
+        assert_eq!(result["affected_symbols_truncated"], json!(true));
+        assert_eq!(result["affected_symbols"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn blast_radius_authz_precedes_limit_and_sarif_count_exposure() {
+        let store = mixed_visibility_store();
+        let visible = VisibleRepos::Only(["repo:a".to_string()].into_iter().collect());
+        let args = json!({ "changed_files": ["src/target.rs"], "limit": 1 });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert_eq!(result["affected_symbol_count"], json!(2));
+        assert_eq!(result["returned_affected_symbol_count"], json!(1));
+        assert_eq!(result["affected_symbols_truncated"], json!(true));
+        assert_eq!(result["affected_symbols"].as_array().unwrap().len(), 1);
+        assert!(
+            result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("2 transitively affected")
+        );
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("repo:b"));
+        assert!(!serialized.contains("HiddenCaller"));
+        assert!(!serialized.contains("src/hidden.rs"));
+        assert!(!serialized.contains("repo:api"));
+        assert!(!serialized.contains("Target"));
+        assert!(result["org_wide"].is_null());
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({
+                "changed_files": ["src/target.rs"],
+                "limit": 1,
+                "format": "sarif"
+            }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let props = &sarif["runs"][0]["properties"];
+        assert_eq!(props["nestweaver/affectedSymbolCount"], json!(2));
+        assert_eq!(props["nestweaver/returnedAffectedSymbolCount"], json!(1));
+        assert_eq!(props["nestweaver/affectedSymbolsTruncated"], json!(true));
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("repo:b"));
+        assert!(!serialized.contains("HiddenCaller"));
+        assert!(!serialized.contains("src/hidden.rs"));
+        assert!(!serialized.contains("repo:api"));
+        assert!(!serialized.contains("Target"));
+        assert!(
+            sarif["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| result["ruleId"] != "nw/org-impact")
+        );
+    }
+
+    #[test]
+    fn blast_radius_authz_ignores_duplicate_repo_display_urls() {
+        let store = duplicate_url_store();
+        let visible = VisibleRepos::Only(
+            ["repo:source".to_string(), "repo:alias".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let args = json!({ "changed_files": ["src/source.rs"] });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert!(result["org_wide"].is_null());
+        assert_eq!(result["affected_symbol_count"], 0);
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("repo:hidden"));
+        assert!(!serialized.contains("HiddenDuplicateCaller"));
+        assert!(!serialized.contains("hidden/duplicate.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/source.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        assert!(sarif["runs"][0]["results"].as_array().unwrap().is_empty());
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("repo:hidden"));
+        assert!(!serialized.contains("HiddenDuplicateCaller"));
+        assert!(!serialized.contains("hidden/duplicate.rs"));
+    }
+
+    #[test]
+    fn blast_radius_authz_hides_unqualified_cochange_data_from_json_and_sarif() {
+        use nestweaver_engine::cochange::{CoChangeEdge, save_cochange_sidecar};
+
+        let store = cross_repo_store();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cochange-authz.lbug");
+        std::fs::write(&db_path, b"").unwrap();
+        save_cochange_sidecar(
+            &[CoChangeEdge {
+                file_a: "src/api.rs".to_string(),
+                file_b: "hidden/private.sql".to_string(),
+                cochange_count: 8675309,
+                total_commits_a: 8675310,
+                total_commits_b: 8675311,
+                confidence: 0.99,
+            }],
+            &nestweaver_engine::sidecar_path(&db_path, ".cochange.json"),
+        )
+        .unwrap();
+        set_current_db_path(db_path);
+        let visible = VisibleRepos::Only(["repo:api".to_string()].into_iter().collect());
+        let args = json!({ "changed_files": ["src/api.rs"] });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert!(result["cochanged_files"].as_array().unwrap().is_empty());
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("hidden/private.sql"));
+        assert!(!serialized.contains("8675309"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/api.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("hidden/private.sql"));
+        assert!(!serialized.contains("8675309"));
+    }
+
+    #[test]
+    fn blast_radius_authz_sanitizes_degraded_notifications_in_json_and_sarif() {
+        let store = GraphStore::in_memory().unwrap();
+        let visible = VisibleRepos::Only(HashSet::new());
+        let args = json!({ "changed_files": ["hidden/private.rs"] });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert_eq!(result["status"], "degraded");
+        assert_eq!(result["gate_state"], "degraded-unknown");
+        let notifications = result["notifications"].as_array().unwrap();
+        let changed_file_note = notifications
+            .iter()
+            .find(|note| note["descriptor"] == "changed-file-no-symbols")
+            .expect("changed-file-no-symbols notification");
+        assert_eq!(changed_file_note["level"], "warning");
+        assert_eq!(
+            changed_file_note["message"],
+            "blast-radius analysis details withheld by repository visibility policy"
+        );
+        let notifications_json = serde_json::to_string(notifications).unwrap();
+        assert!(!notifications_json.contains("hidden/private.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["hidden/private.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        assert_eq!(
+            sarif["runs"][0]["properties"]["nestweaver/status"],
+            "degraded"
+        );
+        assert_eq!(
+            sarif["runs"][0]["properties"]["nestweaver/gateState"],
+            "degraded-unknown"
+        );
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("hidden/private.rs"));
+    }
+
+    #[test]
+    fn blast_radius_authz_drops_unknown_affected_ownership_from_json_and_sarif() {
+        let store = unresolved_affected_owner_store();
+        let visible = VisibleRepos::Only(["repo:visible".to_string()].into_iter().collect());
+        let args = json!({ "changed_files": ["src/target.rs"] });
+
+        let result = tool_blast_radius(&store, args.clone(), None, Some(&visible)).unwrap();
+        assert_eq!(result["affected_symbol_count"], 0);
+        assert_eq!(result["returned_affected_symbol_count"], 0);
+        assert!(result["affected_symbols"].as_array().unwrap().is_empty());
+        assert!(
+            result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("0 transitively affected")
+        );
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("hidden-lookup-miss"));
+        assert!(!serialized.contains("HiddenLookupMiss"));
+        assert!(!serialized.contains("hidden/lookup-miss.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/target.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let props = &sarif["runs"][0]["properties"];
+        assert_eq!(props["nestweaver/affectedSymbolCount"], 0);
+        assert_eq!(props["nestweaver/returnedAffectedSymbolCount"], 0);
+        assert!(sarif["runs"][0]["results"].as_array().unwrap().is_empty());
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(!serialized.contains("hidden-lookup-miss"));
+        assert!(!serialized.contains("HiddenLookupMiss"));
+        assert!(!serialized.contains("hidden/lookup-miss.rs"));
+    }
+
+    #[test]
+    fn blast_radius_authz_keeps_resolved_local_affected_symbol_in_json_and_sarif() {
+        let store = mixed_visibility_store();
+        let visible = VisibleRepos::Only(["repo:a".to_string()].into_iter().collect());
+
+        let result = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/target.rs"] }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(serialized.contains("LocalCaller"));
+        assert!(serialized.contains("src/local.rs"));
+
+        let sarif = tool_blast_radius(
+            &store,
+            json!({ "changed_files": ["src/target.rs"], "format": "sarif" }),
+            None,
+            Some(&visible),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&sarif).unwrap();
+        assert!(serialized.contains("LocalCaller"));
+        assert!(serialized.contains("src/local.rs"));
+    }
+}
+
+#[cfg(test)]
+mod source_management_tests {
+    use super::*;
+
+    fn repo(
+        uid: &str,
+        url: &str,
+        name: Option<&str>,
+        root: Option<&str>,
+    ) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: "sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: name.map(String::from),
+            root_path: root.map(String::from),
+        }
+    }
+
+    #[test]
+    fn match_repo_target_resolves_by_uid_name_and_path() {
+        // nw-089: brain_remove_source must resolve a path/name/url/uid to the
+        // repo, not send the raw string as a uid (which matched nothing).
+        let repos = vec![
+            repo(
+                "repo:aa:bb",
+                "file:///tmp/nw_match_test_xyz",
+                Some("my-repo"),
+                Some("/tmp/nw_match_test_xyz"),
+            ),
+            repo("repo:cc:dd", "file:///other/place", None, None),
+        ];
+        // by uid
+        assert_eq!(match_repo_target(&repos, "repo:aa:bb").len(), 1);
+        // by name
+        assert_eq!(match_repo_target(&repos, "my-repo").len(), 1);
+        // by file:// URL
+        assert_eq!(
+            match_repo_target(&repos, "file:///tmp/nw_match_test_xyz").len(),
+            1
+        );
+        // by absolute path (canonicalize fails on a nonexistent path → falls back
+        // to file://<path>, which matches the repo url)
+        let m = match_repo_target(&repos, "/tmp/nw_match_test_xyz");
+        assert_eq!(m.len(), 1, "a path target must resolve to its repo");
+        assert_eq!(m[0].uid, "repo:aa:bb");
+        // trailing slash tolerated
+        assert_eq!(
+            match_repo_target(&repos, "/tmp/nw_match_test_xyz/").len(),
+            1
+        );
+        // no match
+        assert!(match_repo_target(&repos, "/nope/nope").is_empty());
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn dir_is_markdown_dominant_classifies_code_vs_notes() {
+        use std::fs;
+        // nw-089: a code dir (no .git, no markdown) must NOT be seen as a vault.
+        let code = tempfile::tempdir().unwrap();
+        fs::write(code.path().join("lib.rs"), "pub fn a() {}").unwrap();
+        fs::write(code.path().join("app.ts"), "export const x = 1;").unwrap();
+        assert!(
+            !dir_is_markdown_dominant(code.path()),
+            "a code directory is not markdown-dominant"
+        );
+
+        // A notes dir (all markdown) IS a vault.
+        let notes = tempfile::tempdir().unwrap();
+        fs::write(notes.path().join("a.md"), "# a").unwrap();
+        fs::write(notes.path().join("b.md"), "# b").unwrap();
+        assert!(dir_is_markdown_dominant(notes.path()));
+
+        // A code dir with a single README.md is still code (md not the majority).
+        let mixed = tempfile::tempdir().unwrap();
+        fs::write(mixed.path().join("README.md"), "# readme").unwrap();
+        fs::write(mixed.path().join("a.rs"), "fn a() {}").unwrap();
+        fs::write(mixed.path().join("b.rs"), "fn b() {}").unwrap();
+        assert!(
+            !dir_is_markdown_dominant(mixed.path()),
+            "a code dir with a README is not a vault"
+        );
+    }
+}
+
+#[cfg(test)]
+mod brain_impact_uid_resolution_tests {
+    use super::*;
+    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+    fn mk_symbol(uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:api".to_string(),
+            file_path: "src/target.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// A UID-shaped input that does not resolve in this store (garbage,
+    /// typo'd, or from another DB) must fail closed with the same `not_found`
+    /// contract as the name path — not return status ok with an empty list.
+    #[test]
+    fn brain_impact_unknown_uid_fails_closed() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_symbol(&mk_symbol("sym:repo:api:target:1", "Target"))
+            .unwrap();
+
+        for bogus in [
+            "sym:repo:api:nonexistent:99",
+            "garbage:uid:from:nowhere",
+            "sym:repo:otherdb:target:1",
+        ] {
+            let result = tool_brain_impact(&store, json!({ "symbol": bogus }), None, None)
+                .expect("impact call");
+            assert_eq!(
+                result["status"], "not_found",
+                "unknown UID '{bogus}' must fail closed, got: {result}"
+            );
+        }
+    }
+
+    /// A legit symbol with zero dependents still resolves by UID and
+    /// returns status ok with an empty impact list (exit 0 at the CLI).
+    #[test]
+    fn brain_impact_zero_dependent_uid_still_ok() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        store
+            .insert_symbol(&mk_symbol("sym:repo:api:lonely:1", "Lonely"))
+            .unwrap();
+
+        let result = tool_brain_impact(
+            &store,
+            json!({ "symbol": "sym:repo:api:lonely:1" }),
+            None,
+            None,
+        )
+        .expect("impact call");
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["total"], 0);
+        assert!(result["impact_nodes"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod stale_check_tool_tests {
+    use super::*;
+
+    /// A repo whose local working tree was deleted must be flagged
+    /// `status: "missing"` and counted as stale — never silently `[ok]`.
+    #[test]
+    fn stale_check_flags_deleted_working_tree_as_missing() {
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let gone = tempfile::tempdir().unwrap();
+        let gone_path = gone.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:gone".to_string(),
+                url: format!("file://{gone_path}"),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(gone_path.clone()),
+            })
+            .expect("insert repo");
+        // Delete the working tree after indexing.
+        std::fs::remove_dir_all(gone.path()).unwrap();
+
+        let result = tool_stale_check(&store).expect("stale check");
+        assert_eq!(result["any_stale"], true, "{result}");
+        let repo = &result["repos"][0];
+        assert_eq!(repo["status"], "missing", "{result}");
+        assert_eq!(repo["is_stale"], true, "{result}");
     }
 }

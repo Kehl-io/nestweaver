@@ -79,6 +79,128 @@ pub fn tag_uid(vault_uid: &str, name: &str) -> String {
     format!("tag:{}:{}", vault_uid, truncated_hash(&name.to_lowercase()))
 }
 
+/// Canonical UID domains that can identify a top-level `brain_search` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchEntityUidKind {
+    Note,
+    Tag,
+    Symbol,
+}
+
+/// Parse a canonical search-entity UID and remove only its instance component.
+///
+/// Accepted constructor grammars are:
+///
+/// - `note|tag:vlt:<instance>:<12-lower-hex-vault>:<12-lower-hex-entity>`;
+/// - `sym:repo:<instance>:<12-lower-hex-repo>:<12-lower-hex-file>:<12-lower-hex-name>:<u32-line>`.
+///
+/// Instances follow the graph UID rule: nonempty, with no whitespace. A colon
+/// necessarily changes the exact component count and is therefore rejected.
+/// The normalized value retains the domain plus all ownership/content
+/// components so unrelated repositories, vaults, notes, tags, and symbols
+/// remain distinct.
+pub fn normalize_search_entity_uid(uid: &str) -> Option<(SearchEntityUidKind, String)> {
+    let parts: Vec<&str> = uid.split(':').collect();
+    match parts.as_slice() {
+        [
+            domain @ ("note" | "tag"),
+            "vlt",
+            instance,
+            vault_hash,
+            entity_hash,
+        ] if valid_uid_instance(instance)
+            && is_lowercase_12_hex(vault_hash)
+            && is_lowercase_12_hex(entity_hash) =>
+        {
+            let kind = if *domain == "note" {
+                SearchEntityUidKind::Note
+            } else {
+                SearchEntityUidKind::Tag
+            };
+            Some((kind, format!("{domain}:vlt:{vault_hash}:{entity_hash}")))
+        }
+        [
+            "sym",
+            "repo",
+            instance,
+            repo_hash,
+            file_hash,
+            name_hash,
+            line,
+        ] if valid_uid_instance(instance)
+            && is_lowercase_12_hex(repo_hash)
+            && is_lowercase_12_hex(file_hash)
+            && is_lowercase_12_hex(name_hash)
+            && is_canonical_u32(line) =>
+        {
+            Some((
+                SearchEntityUidKind::Symbol,
+                format!("sym:repo:{repo_hash}:{file_hash}:{name_hash}:{line}"),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Validate an edit-stable canonical ID against its line-sensitive symbol UID.
+///
+/// The symbol UID proves repository ownership plus hashed file/name identity.
+/// The canonical ID must carry the same repository hash and raw file/name
+/// components whose hashes match that UID. Every possible `#` separator is
+/// considered so valid paths and symbol names may themselves contain `#`.
+/// The returned key is explicitly domain-prefixed to remain distinct from
+/// note/tag identities.
+pub fn normalize_search_symbol_canonical_id(
+    symbol_uid: &str,
+    canonical_id: &str,
+) -> Option<String> {
+    let (kind, normalized_uid) = normalize_search_entity_uid(symbol_uid)?;
+    if kind != SearchEntityUidKind::Symbol {
+        return None;
+    }
+    let uid_parts: Vec<&str> = normalized_uid.split(':').collect();
+    let ["sym", "repo", repo_hash, file_hash, name_hash, _line] = uid_parts.as_slice() else {
+        return None;
+    };
+
+    let (canonical_repo_hash, remainder) = canonical_id.split_once(':')?;
+    let (path_and_name, scope_hash) = remainder.rsplit_once(':')?;
+    if canonical_repo_hash != *repo_hash
+        || !is_lowercase_12_hex(canonical_repo_hash)
+        || !is_lowercase_12_hex(scope_hash)
+    {
+        return None;
+    }
+
+    let has_matching_path_and_name = path_and_name.match_indices('#').any(|(separator, _)| {
+        let file_path = &path_and_name[..separator];
+        let name = &path_and_name[separator + 1..];
+        !file_path.is_empty()
+            && !name.is_empty()
+            && truncated_hash(file_path) == *file_hash
+            && truncated_hash(name) == *name_hash
+    });
+    has_matching_path_and_name.then(|| format!("sym-canonical:{canonical_id}"))
+}
+
+fn valid_uid_instance(instance: &str) -> bool {
+    !instance.is_empty() && !instance.chars().any(char::is_whitespace)
+}
+
+fn is_lowercase_12_hex(value: &str) -> bool {
+    value.len() == 12
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_canonical_u32(value: &str) -> bool {
+    value.bytes().all(|byte| byte.is_ascii_digit())
+        && value
+            .parse::<u32>()
+            .is_ok_and(|parsed| value == parsed.to_string())
+}
+
 /// "proj:{instance}:{name_hash}"
 pub fn project_uid(instance: &str, name: &str) -> String {
     format!("proj:{}:{}", instance, truncated_hash(name))
@@ -326,6 +448,88 @@ mod tests {
     }
 
     #[test]
+    fn search_entity_uid_normalization_accepts_constructor_output_across_instances() {
+        let local_repo = repo_uid("local", "git@github.com:acme/api.git");
+        let server_repo = repo_uid("server", "https://github.com/acme/api");
+        let local_symbol = symbol_uid(&local_repo, "src/lib.rs", "needle", 42);
+        let server_symbol = symbol_uid(&server_repo, "src/lib.rs", "needle", 42);
+        let (local_kind, local_normalized) =
+            normalize_search_entity_uid(&local_symbol).expect("constructor output must parse");
+        let (server_kind, server_normalized) =
+            normalize_search_entity_uid(&server_symbol).expect("constructor output must parse");
+        assert_eq!(local_kind, SearchEntityUidKind::Symbol);
+        assert_eq!(server_kind, SearchEntityUidKind::Symbol);
+        assert_eq!(local_normalized, server_normalized);
+        assert!(!local_normalized.contains("local"));
+        assert!(!server_normalized.contains("server"));
+
+        let local_vault = vault_uid("local", "/same/vault");
+        let server_vault = vault_uid("server", "/same/vault");
+        for (local, server, expected_kind) in [
+            (
+                note_uid(&local_vault, "notes/needle.md"),
+                note_uid(&server_vault, "notes/needle.md"),
+                SearchEntityUidKind::Note,
+            ),
+            (
+                tag_uid(&local_vault, "Needle"),
+                tag_uid(&server_vault, "Needle"),
+                SearchEntityUidKind::Tag,
+            ),
+        ] {
+            let (local_kind, local_normalized) =
+                normalize_search_entity_uid(&local).expect("constructor output must parse");
+            let (server_kind, server_normalized) =
+                normalize_search_entity_uid(&server).expect("constructor output must parse");
+            assert_eq!(local_kind, expected_kind);
+            assert_eq!(server_kind, expected_kind);
+            assert_eq!(local_normalized, server_normalized);
+        }
+    }
+
+    #[test]
+    fn search_entity_uid_normalization_rejects_noncanonical_shapes() {
+        for invalid in [
+            // Note/tag IDs require exactly five components.
+            "note:vlt:local:0123456789ab",
+            "note:vlt:local:0123456789ab:abcdef012345:extra",
+            "tag:vlt:local:0123456789ab",
+            // Instances are nonempty and cannot contain whitespace.
+            "note:vlt::0123456789ab:abcdef012345",
+            "note:vlt:local box:0123456789ab:abcdef012345",
+            // Every ownership/content hash is lowercase 12-hex.
+            "note:vlt:local:0123456789AB:abcdef012345",
+            "note:vlt:local:0123456789ag:abcdef012345",
+            "note:vlt:local:0123456789a:abcdef012345",
+            "tag:vlt:local:0123456789ab:ABCDEF012345",
+            // Symbol IDs require exactly seven components and three hashes.
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:42:extra",
+            "sym:repo::0123456789ab:abcdef012345:123456789abc:42",
+            "sym:repo:local box:0123456789ab:abcdef012345:123456789abc:42",
+            "sym:repo:local:0123456789ag:abcdef012345:123456789abc:42",
+            "sym:repo:local:0123456789ab:ABCDEF012345:123456789abc:42",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789ab:42",
+            // The final component must be the canonical decimal spelling of a u32.
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:-1",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:not-a-line",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:4294967296",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:00",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:007",
+            "sym:repo:local:0123456789ab:abcdef012345:123456789abc:042",
+            // Search identity supports only note, tag, and symbol domains.
+            "head:vlt:local:0123456789ab:abcdef012345",
+        ] {
+            assert_eq!(
+                normalize_search_entity_uid(invalid),
+                None,
+                "invalid UID must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn normalize_http_path_collapses_param_syntaxes() {
         // All four slot syntaxes collapse to the same canonical shape,
         // ignoring slot names.
@@ -451,6 +655,61 @@ mod tests {
         assert_eq!(
             a, b,
             "line shifts must not change the canonical_id of a top-level symbol"
+        );
+    }
+
+    #[test]
+    fn canonical_search_symbol_identity_is_edit_stable_and_validated() {
+        let repo_url = "https://github.com/acme/api";
+        let file_path = "src/#generated:part.rs";
+        let name = "operator:#:call";
+        let repo = repo_uid("local", repo_url);
+        let line_7_uid = symbol_uid(&repo, file_path, name, 7);
+        let line_42_uid = symbol_uid(&repo, file_path, name, 42);
+        let canonical = canonical_symbol_id(repo_url, file_path, name, "module::operator:#:call");
+        let expected = format!("sym-canonical:{canonical}");
+
+        assert_eq!(
+            normalize_search_symbol_canonical_id(&line_7_uid, &canonical),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            normalize_search_symbol_canonical_id(&line_42_uid, &canonical),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn canonical_search_symbol_identity_rejects_malformed_or_mismatched_ids() {
+        let repo_url = "https://github.com/acme/api";
+        let other_repo_url = "https://github.com/acme/other";
+        let file_path = "src/lib.rs";
+        let name = "needle";
+        let uid = symbol_uid(&repo_uid("local", repo_url), file_path, name, 7);
+        let canonical = canonical_symbol_id(repo_url, file_path, name, "module::needle");
+        let other_repo_canonical =
+            canonical_symbol_id(other_repo_url, file_path, name, "module::needle");
+        let bad_scope = format!("{}ABC", &canonical[..canonical.len() - 3]);
+        let empty_path = canonical_symbol_id(repo_url, "", name, "module::needle");
+        let empty_name = canonical_symbol_id(repo_url, file_path, "", "module::needle");
+
+        for invalid in [
+            "",
+            "not-a-canonical-id",
+            other_repo_canonical.as_str(),
+            bad_scope.as_str(),
+            empty_path.as_str(),
+            empty_name.as_str(),
+        ] {
+            assert_eq!(
+                normalize_search_symbol_canonical_id(&uid, invalid),
+                None,
+                "{invalid:?} must not become a proof identity"
+            );
+        }
+        assert_eq!(
+            normalize_search_symbol_canonical_id("sym:malformed", &canonical),
+            None
         );
     }
 

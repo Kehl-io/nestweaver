@@ -1631,9 +1631,14 @@ fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSy
         .filter(|s| s.start_line <= line && line <= s.end_line)
         .max_by_key(|s| s.start_line)
         .or_else(|| {
+            // Fallback for symbols with a degenerate/unknown span (end_line
+            // never advanced past start_line). A symbol with a REAL span that
+            // ends before `line` must NOT claim module-level code that comes
+            // after it (same misattribution class as the resolver's
+            // find_enclosing_symbol fix).
             symbols
                 .iter()
-                .filter(|s| s.start_line <= line)
+                .filter(|s| s.start_line <= line && s.end_line <= s.start_line)
                 .max_by_key(|s| s.start_line)
         })
 }
@@ -3613,7 +3618,11 @@ fn partition_changed_removed(
 /// **CRITICAL ORDERING:** this must run BEFORE `begin_transaction`; the
 /// per-file `DETACH DELETE` in the mutation loop destroys the very edges this
 /// query reads.
-fn collect_reverse_dep_files(
+///
+/// `pub(crate)` so the live code watcher (`watch_code.rs`) can run the same
+/// nw-008 Phase 0 — without it a watcher reindex loses every cross-file edge
+/// incident to the re-indexed file.
+pub(crate) fn collect_reverse_dep_files(
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
     changed: &std::collections::HashSet<String>,
@@ -3675,19 +3684,6 @@ fn collect_reverse_dep_files(
         .collect()
 }
 
-/// Phase 2 of transitive re-resolution (nw-008). Re-parse `S = changed ∪ rdeps`
-/// from `reader`, resolve cross-file references with the full symbol map across
-/// `S`, and surgically re-insert ONLY the edges the per-file `DETACH DELETE`
-/// removed: those whose TARGET lives in a changed file and whose SOURCE lives
-/// in a different file. Intra-file edges and edges into unchanged files were
-/// never deleted (or were re-created by single-file resolution in the mutation
-/// loop), so re-inserting them would duplicate (edge insert is `CREATE`, not
-/// `MERGE`) — the `source_file != target_file` and `target ∈ changed` filters
-/// keep the insert duplicate-free without a `delete_resolved_edges_for_file`
-/// pass.
-///
-/// Runs inside the same transaction as the mutation loop. Returns the number of
-/// edges inserted.
 fn reresolve_affected_dependents(
     reader: &dyn crate::content_reader::ContentReader,
     conn: &nestweaver_store::DbConnection<'_>,
@@ -3699,6 +3695,68 @@ fn reresolve_affected_dependents(
         return Ok(0);
     }
 
+    let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
+        .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
+    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols)?;
+
+    // Runs inside the same transaction as the mutation loop.
+    let count = insertable.len();
+    if count > 0 {
+        nestweaver_store::GraphStore::batch_insert_edges_on(conn, &insertable)
+            .with_context(|| "batch_insert_edges (transitive re-resolution)")?;
+    }
+    Ok(count)
+}
+
+/// Non-transactional variant of [`reresolve_affected_dependents`] for the
+/// live code watcher (`watch_code.rs`), which interleaves its mutations with
+/// store-level (non-txn) calls. Same nw-008 Phase 2 semantics: re-insert ONLY
+/// the cross-file edges the per-file `DETACH DELETE` destroyed.
+pub(crate) fn reresolve_affected_dependents_on_store(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &nestweaver_store::GraphStore,
+    r_uid: &str,
+    changed: &std::collections::HashSet<String>,
+    rdeps: &std::collections::HashSet<String>,
+) -> Result<usize, anyhow::Error> {
+    if changed.is_empty() {
+        return Ok(0);
+    }
+
+    let db_symbols = store
+        .lookup_symbols_by_repo(r_uid)
+        .with_context(|| "lookup_symbols_by_repo for forward edge resolution")?;
+    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols)?;
+
+    let count = insertable.len();
+    if count > 0 {
+        store
+            .batch_insert_edges(&insertable)
+            .with_context(|| "batch_insert_edges (transitive re-resolution)")?;
+    }
+    Ok(count)
+}
+
+/// Shared core of nw-008 Phase 2. Re-parse `S = changed ∪ rdeps` from
+/// `reader`, resolve cross-file references with the full symbol map across
+/// `S`, and return ONLY the edges the per-file `DETACH DELETE` removed: those
+/// whose SOURCE or TARGET lives in a changed file, with both endpoints in
+/// different files. Intra-file edges and edges between files that were both
+/// untouched were never deleted (or were re-created by single-file resolution
+/// in the mutation loop), so re-inserting them would duplicate (edge insert
+/// is `CREATE`, not `MERGE`) — the `source_file != target_file` and
+/// `source ∈ changed OR target ∈ changed` filters keep the insert
+/// duplicate-free without a `delete_resolved_edges_for_file` pass.
+///
+/// `db_symbols` must be the repo's live symbol set (post-mutation), used to
+/// give the resolver visibility into unchanged files' symbols as targets.
+fn build_reresolve_edges(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    changed: &std::collections::HashSet<String>,
+    rdeps: &std::collections::HashSet<String>,
+    db_symbols: &[nestweaver_schema::Symbol],
+) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     // S = changed ∪ rdeps — files whose references need re-resolution.
     let mut scope: std::collections::HashSet<String> = changed.clone();
     scope.extend(rdeps.iter().cloned());
@@ -3729,7 +3787,7 @@ fn reresolve_affected_dependents(
     }
 
     if file_data.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // ── Include unchanged files' symbols as resolution targets ──────────
@@ -3743,12 +3801,10 @@ fn reresolve_affected_dependents(
     // targets.  We add them to `file_data` with empty references (we
     // don't need to resolve their references — those edges were never
     // deleted) and populate `uid_to_file` so the edge filter can look up
-    // their file paths.
-    let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
-        .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
-
+    // their file paths.  `db_symbols` is the repo's live (post-mutation)
+    // symbol set, fetched by the caller.
     let mut unchanged_by_file: HashMap<String, Vec<RawSymbol>> = HashMap::new();
-    for sym in &db_symbols {
+    for sym in db_symbols {
         if scope.contains(&sym.file_path) {
             // Already in file_data from re-parsing above; just ensure
             // uid_to_file has the DB uid (the re-parsed uid should match,
@@ -3846,12 +3902,7 @@ fn reresolve_affected_dependents(
         })
         .collect();
 
-    let count = insertable.len();
-    if count > 0 {
-        nestweaver_store::GraphStore::batch_insert_edges_on(conn, &insertable)
-            .with_context(|| "batch_insert_edges (transitive re-resolution)")?;
-    }
-    Ok(count)
+    Ok(insertable)
 }
 
 /// Delete all File nodes (and their symbols) that belong to a repo,

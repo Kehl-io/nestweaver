@@ -106,6 +106,13 @@ fn get_or_compile_query(
 pub enum ReferenceKind {
     Call,
     Import,
+    /// The local rename of an aliased import: `use a::b as c;` emits the
+    /// usual [`ReferenceKind::Import`] reference for `a::b` plus one
+    /// `ImportAlias` reference whose `name` is the alias (`c`) and whose
+    /// `context` is the full original import path (`a::b`). The resolver
+    /// turns these into named bindings so calls to the alias resolve to the
+    /// original item.
+    ImportAlias,
     Extends,
     Implements,
     Includes,
@@ -197,8 +204,169 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
 }
 
+/// Whether a captured declaration node sits inside an `export_statement`.
+///
+/// Tree-sitter's JS/TS grammars wrap exported declarations (`export function`,
+/// `export const`, `export default ...`) in a PARENT `export_statement` node,
+/// so the `export` keyword is not part of the declaration node's own text. A
+/// short ancestor walk (declaration → lexical_declaration → export_statement
+/// is the deepest common shape) recovers it. Cheap: at most 3 parent hops.
+fn has_export_ancestor(node: &tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    for _ in 0..3 {
+        match current {
+            Some(n) if n.kind() == "export_statement" => return true,
+            Some(n) => current = n.parent(),
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Collect the text of `attribute_item` siblings immediately preceding `node`.
+///
+/// In tree-sitter-rust an outer attribute like `#[test]` is a *preceding sibling*
+/// of the `function_item` it decorates, not part of it — so the function's
+/// signature (its first line, starting at `fn`) never contains the attribute.
+/// Entry-point detection needs the attribute to recognize `#[test]` /
+/// `#[tokio::test]` functions, so gather the leading attributes here and prepend
+/// them to the signature passed to detection (only — the stored signature is
+/// unchanged). Returns an empty string when there are no leading attributes.
+fn leading_rust_attributes(node: &tree_sitter::Node, source: &[u8]) -> String {
+    let mut attrs = String::new();
+    let mut sib = node.prev_sibling();
+    while let Some(s) = sib {
+        if s.kind() == "attribute_item" {
+            if let Ok(text) = s.utf8_text(source) {
+                attrs.push_str(text);
+                attrs.push('\n');
+            }
+            sib = s.prev_sibling();
+        } else {
+            break;
+        }
+    }
+    attrs
+}
+
+/// Expand a Rust `use` declaration into one import [`RawReference`] per path.
+///
+/// The grammar nests arbitrarily (`use a::{b, c::d, e as f, g::*};`), which
+/// tree-sitter query patterns cannot flatten, so the whole `use_declaration`
+/// node is captured as `@reference.rust_use` and expanded here:
+///
+/// - `use a::b;`        → `a::b`
+/// - `use a::{b, c};`   → `a::b`, `a::c`
+/// - `use a::b as c;`   → `a::b` (the path — resolution needs the origin),
+///   plus an `ImportAlias` reference binding the local name `c` to the path
+/// - `use a::*;`        → `a` (the module path; wildcard members resolve
+///   through the module's import edge)
+/// - `use a::{b::{c, d}};` → `a::b::c`, `a::b::d`
+fn expand_rust_use_imports(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let context = node
+        .utf8_text(source)
+        .map(first_line)
+        .unwrap_or_default()
+        .to_string();
+    if let Some(argument) = node.child_by_field_name("argument") {
+        expand_rust_use_tree(&argument, "", source, &context, references);
+    }
+}
+
+/// Recursive worker for [`expand_rust_use_imports`]. `prefix` is the path
+/// accumulated so far (empty or ending in `::`).
+fn expand_rust_use_tree(
+    node: &tree_sitter::Node,
+    prefix: &str,
+    source: &[u8],
+    context: &str,
+    references: &mut Vec<RawReference>,
+) {
+    let text = node.utf8_text(source).unwrap_or("").trim();
+    match node.kind() {
+        "identifier" | "scoped_identifier" | "crate" => {
+            if !text.is_empty() {
+                references.push(RawReference {
+                    name: format!("{prefix}{text}"),
+                    kind: ReferenceKind::Import,
+                    start_line: node.start_position().row as u32 + 1,
+                    context: context.to_string(),
+                    receiver: None,
+                });
+            }
+        }
+        // `use a::b::{self, c};` — `self` imports the path `a::b` itself.
+        "self" if !prefix.is_empty() => {
+            references.push(RawReference {
+                name: prefix.trim_end_matches("::").to_string(),
+                kind: ReferenceKind::Import,
+                start_line: node.start_position().row as u32 + 1,
+                context: context.to_string(),
+                receiver: None,
+            });
+        }
+        "use_as_clause" => {
+            // Import the original path; the alias is a local rename, recorded
+            // as an ImportAlias reference so the resolver can bind it.
+            if let Some(path) = node.child_by_field_name("path") {
+                let before = references.len();
+                expand_rust_use_tree(&path, prefix, source, context, references);
+                // Only bind the alias when the path actually produced an
+                // import reference (e.g. bare `self` with no prefix does not).
+                if references.len() > before
+                    && let Some(alias) = node.child_by_field_name("alias")
+                    && let Ok(alias_text) = alias.utf8_text(source)
+                {
+                    let alias_text = alias_text.trim();
+                    if !alias_text.is_empty() {
+                        let specifier = references[before].name.clone();
+                        references.push(RawReference {
+                            name: alias_text.to_string(),
+                            kind: ReferenceKind::ImportAlias,
+                            start_line: node.start_position().row as u32 + 1,
+                            context: specifier,
+                            receiver: None,
+                        });
+                    }
+                }
+            }
+        }
+        "use_wildcard" => {
+            // `use a::*;` — record the module path itself so imports of the
+            // module resolve and wildcard members resolve through them.
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i as u32) {
+                    expand_rust_use_tree(&child, prefix, source, context, references);
+                }
+            }
+        }
+        "use_list" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i as u32) {
+                    expand_rust_use_tree(&child, prefix, source, context, references);
+                }
+            }
+        }
+        "scoped_use_list" => {
+            let path_prefix = node
+                .child_by_field_name("path")
+                .and_then(|p| p.utf8_text(source).ok())
+                .map(|p| format!("{prefix}{}::", p.trim()))
+                .unwrap_or_else(|| prefix.to_string());
+            if let Some(list) = node.child_by_field_name("list") {
+                expand_rust_use_tree(&list, &path_prefix, source, context, references);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Infer symbol visibility from name and surrounding source text based on language conventions.
-fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
+fn infer_visibility(name: &str, node_text: &str, lang: Language, exported: bool) -> Visibility {
     match lang {
         // Go: capitalized = public, lowercase = private
         Language::Go => {
@@ -240,7 +408,7 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language) -> Visibility {
         | Language::Svelte
         | Language::Astro => {
             let sig = first_line(node_text);
-            if sig.contains("export ") {
+            if exported || sig.contains("export ") {
                 Visibility::Public
             } else {
                 Visibility::Private
@@ -852,16 +1020,31 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let ep_kind = if node.kind() == "call_expression" {
                     Some(EntryPointKind::TestEntry)
                 } else {
+                    // Rust `#[test]`/`#[tokio::test]` attributes are preceding
+                    // siblings, not part of the signature — prepend them (for
+                    // detection only) so inline `#[cfg(test)]`-module tests are
+                    // flagged TestEntry instead of being invisible to RTS.
+                    let detect_sig: std::borrow::Cow<str> = if lang_str == "rust" {
+                        let attrs = leading_rust_attributes(&node, source_bytes);
+                        if attrs.is_empty() {
+                            std::borrow::Cow::Borrowed(signature.as_str())
+                        } else {
+                            std::borrow::Cow::Owned(format!("{attrs}{signature}"))
+                        }
+                    } else {
+                        std::borrow::Cow::Borrowed(signature.as_str())
+                    };
                     detect_entry_point(
                         &name,
                         &file_path_str,
                         kind_label,
-                        Some(&signature),
+                        Some(&detect_sig),
                         lang_str,
                     )
                 };
 
-                let visibility = infer_visibility(&name, node_text, lang);
+                let visibility =
+                    infer_visibility(&name, node_text, lang, has_export_ancestor(&node));
                 let type_info = extract_type_info(&signature, lang);
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
                     find_parent_name(&node, source_bytes)
@@ -884,6 +1067,13 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     scope_chain,
                 });
             } else if let Some(kind_str) = capture_name.strip_prefix("reference.") {
+                // Rust `use` declarations are captured whole and expanded here
+                // into one import reference per path (list/wildcard/alias forms
+                // included); see expand_rust_use_imports.
+                if kind_str == "rust_use" {
+                    expand_rust_use_imports(&node, source_bytes, &mut references);
+                    continue;
+                }
                 let kind = match kind_str {
                     "call" => ReferenceKind::Call,
                     "import" => ReferenceKind::Import,
@@ -1237,6 +1427,50 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to read fixture {rel}: {e}"))
     }
 
+    // ── visibility tests (nw-063) ───────────────────────────────────────────
+
+    /// `export`ed TS/JS declarations are the module's public API. Tree-sitter
+    /// wraps them in a parent `export_statement`, so the export keyword is NOT
+    /// in the declaration node's own text — visibility must consult ancestors.
+    #[test]
+    fn ts_exported_symbols_are_public() {
+        let src = "export function charge(id: string, amount: number): boolean {\n  return true;\n}\nfunction helper(): void {}\nexport const rate = (x: number): number => x * 2;\nexport default function main(): void {}\n";
+        let parsed = parse_source(Path::new("api.ts"), src).unwrap();
+        let vis = |name: &str| {
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} not extracted: {:?}",
+                        parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    )
+                })
+                .visibility
+        };
+        assert_eq!(
+            vis("charge"),
+            Visibility::Public,
+            "export function must be Public"
+        );
+        assert_eq!(
+            vis("helper"),
+            Visibility::Private,
+            "non-exported stays Private"
+        );
+        assert_eq!(
+            vis("rate"),
+            Visibility::Public,
+            "export const arrow must be Public"
+        );
+        assert_eq!(
+            vis("main"),
+            Visibility::Public,
+            "export default must be Public"
+        );
+    }
+
     // ── query cache tests ───────────────────────────────────────────────────
 
     /// Parsing two distinct files with the same language should both succeed,
@@ -1406,6 +1640,46 @@ mod tests {
             test_sym.start_line,
             test_sym.end_line
         );
+    }
+
+    #[test]
+    fn parse_rust_flags_inline_cfg_test_functions_as_test_entries() {
+        // nw-085: Rust unit tests live in an inline `#[cfg(test)] mod tests`
+        // inside a non-test src file, decorated with `#[test]` — a preceding
+        // sibling attribute the signature never captured. They must be flagged
+        // TestEntry so regression-test selection can reach them.
+        let source = "pub fn util() -> u32 { 1 }\n\
+                      #[cfg(test)]\n\
+                      mod tests {\n\
+                          use super::*;\n\
+                          #[test]\n\
+                          fn test_util_returns_one() { assert_eq!(util(), 1); }\n\
+                          #[tokio::test]\n\
+                          async fn test_util_async() { let _ = util(); }\n\
+                      }\n";
+        let parsed = parse_source(Path::new("src/util.rs"), source).unwrap();
+
+        for name in ["test_util_returns_one", "test_util_async"] {
+            let sym = parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "should find '{name}'; got: {:?}",
+                        parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                sym.entry_point_kind,
+                Some(EntryPointKind::TestEntry),
+                "'{name}' should be a TestEntry (has a #[test]/#[tokio::test] attribute)"
+            );
+        }
+
+        // A plain non-test function must NOT be flagged.
+        let util = parsed.symbols.iter().find(|s| s.name == "util").unwrap();
+        assert_eq!(util.entry_point_kind, None, "util() is not a test entry");
     }
 
     #[test]
@@ -1757,6 +2031,67 @@ mod tests {
             extends.iter().any(|r| r.name == "Readable"),
             "should find impl Readable as extends; got: {:?}",
             extends.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_rust_expands_use_lists_wildcards_and_aliases() {
+        // Cross-crate/workspace imports come in list, wildcard and alias
+        // forms; every path must become an Import reference or the resolver
+        // has nothing to resolve against.
+        let source = r#"
+use nestweaver_engine::rts_eval;
+use nestweaver_engine::{alpha, beta};
+use nestweaver_engine::store::{self, GraphStore as Store};
+use nestweaver_proto::*;
+use crate::config::{Settings, load as load_config};
+"#;
+        let parsed = parse_source(Path::new("server.rs"), source).unwrap();
+        let names: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        for expected in [
+            "nestweaver_engine::rts_eval",
+            "nestweaver_engine::alpha",
+            "nestweaver_engine::beta",
+            "nestweaver_engine::store",
+            "nestweaver_engine::store::GraphStore",
+            "nestweaver_proto",
+            "crate::config::Settings",
+            "crate::config::load",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing import reference {expected}; got: {names:?}"
+            );
+        }
+        // The alias target must NOT be recorded as an import path.
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.ends_with("::Store") || n.ends_with("::load_config")),
+            "alias name must not become an import path; got: {names:?}"
+        );
+
+        // Aliased imports also emit ImportAlias references binding the local
+        // rename to the full original path.
+        let aliases: Vec<(&str, &str)> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::ImportAlias)
+            .map(|r| (r.name.as_str(), r.context.as_str()))
+            .collect();
+        assert_eq!(
+            aliases,
+            [
+                ("Store", "nestweaver_engine::store::GraphStore"),
+                ("load_config", "crate::config::load"),
+            ],
+            "aliased imports should produce ImportAlias bindings"
         );
     }
 

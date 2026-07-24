@@ -18,11 +18,3 @@ expression: "sorted_edges(files, Language::JavaScript)"
   evidence:
     - kind: structural
       weight: 0.9
-- source_uid: "sym:repo:test:snapshot:27653c212e1c:0d6e4079e367:5"
-  target_uid: "unresolved:missingFn"
-  edge_type: Calls
-  confidence: 0
-  link_type: ~
-  evidence:
-    - kind: unresolved
-      weight: 0

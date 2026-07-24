@@ -6,7 +6,8 @@ use std::process::Command as StdCommand;
 
 fn nestweaver_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
-    cmd.env("NESTWEAVER_NO_DAEMON", "1");
+    cmd.env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
     cmd
 }
 
@@ -131,6 +132,131 @@ fn cli_index_and_search() {
         .assert()
         .success()
         .stdout(contains("greet"));
+}
+
+#[test]
+fn brain_search_json_count_contract_is_limit_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("brain.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function cardinalityneedle() {}\n\
+         function cardinalityneedleExtra() {}\n\
+         function helper_cardinalityneedle() {}\n",
+    )
+    .unwrap();
+    for (name, title) in [
+        ("one.md", "cardinalityneedle"),
+        ("two.md", "cardinalityneedle alpha"),
+        ("three.md", "cardinalityneedle beta"),
+    ] {
+        std::fs::write(vault_dir.join(name), format!("# {title}\n\nbody\n")).unwrap();
+    }
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let search = |limit: &str| {
+        let output = nestweaver_cmd()
+            .args([
+                "brain",
+                "search",
+                "cardinalityneedle",
+                "--json",
+                "--limit",
+                limit,
+                "--db",
+            ])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "brain search --limit {limit} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "brain search --limit {limit} returned invalid JSON ({error}): {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+    };
+
+    let narrow = search("1");
+    let broad = search("20");
+
+    nestweaver_cmd()
+        .args([
+            "brain",
+            "search",
+            "cardinalityneedle",
+            "--limit",
+            "1",
+            "--db",
+        ])
+        .arg(&db_path)
+        .assert()
+        .success()
+        .stdout(contains(" of "));
+
+    assert_eq!(narrow["total_matches"], broad["total_matches"]);
+    assert_eq!(
+        narrow["total_matches_relation"],
+        broad["total_matches_relation"]
+    );
+    assert_eq!(narrow["total_matches_relation"], "eq");
+    assert_ne!(narrow["returned_matches"], broad["returned_matches"]);
+    assert_eq!(
+        narrow["returned_matches"].as_u64().unwrap(),
+        narrow["results"].as_array().unwrap().len() as u64
+    );
+    assert_eq!(narrow["truncated"], true);
+    assert_eq!(broad["truncated"], false);
+
+    let broad_rows = broad["results"].as_array().unwrap();
+    assert!(
+        broad_rows
+            .iter()
+            .any(|row| row["kind"] == "note" && row["title"] == "cardinalityneedle")
+    );
+    assert!(
+        broad_rows
+            .iter()
+            .any(|row| { row["kind"] == "Symbol/Function" && row["title"] == "cardinalityneedle" }),
+        "same-title note and symbol must remain distinct rows: {broad}"
+    );
+    assert!(
+        broad_rows
+            .iter()
+            .filter(|row| {
+                row["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("Symbol/"))
+            })
+            .all(|row| {
+                row["canonical_id"]
+                    .as_str()
+                    .is_some_and(|canonical_id| !canonical_id.is_empty())
+            }),
+        "CLI JSON must preserve canonical symbol IDs: {broad}"
+    );
 }
 
 #[test]
@@ -733,6 +859,96 @@ fn cli_impact_on_empty_db_exits_not_found() {
 }
 
 #[test]
+fn cli_impact_json_is_array_and_notfound_is_object() {
+    // nw-086: `impact --json` must emit a bare node ARRAY on success and a JSON
+    // error OBJECT on not-found (never a plain-text-only stderr line), so a
+    // --json consumer can always parse the output.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.lbug");
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("m.js"),
+        "function a(){ return b(); }\nfunction b(){ return 1; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // Found → bare array (a calls b, so impact(b) is non-empty).
+    let out = nestweaver_cmd()
+        .args([
+            "impact",
+            "b",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("impact --json (found) must be valid JSON");
+    assert!(
+        v.is_array(),
+        "impact --json (found) must be a bare array, got: {v}"
+    );
+
+    // Not-found → JSON object with an `error` field, exit 2.
+    let out = nestweaver_cmd()
+        .args([
+            "impact",
+            "zzz_no_symbol",
+            "--db",
+            &db_path.display().to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "not-found exits 2");
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("impact --json (not-found) must be valid JSON");
+    assert!(
+        v.get("error").is_some(),
+        "not-found --json must carry an error field, got: {v}"
+    );
+}
+
+#[test]
+fn cli_read_on_missing_db_daemon_path_does_not_create_it() {
+    // nw-087: a query against a NONEXISTENT db (parent dir exists) on the DAEMON
+    // path must fail loudly — not autostart a daemon that materializes an empty
+    // store, which would read as a false-green "0 results / complete" success.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("typo_never_created.lbug");
+    // Raw command WITHOUT the allow-hatch and WITHOUT any CI marker → routes
+    // through the daemon path (the one that used to create the store).
+    let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    cmd.env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .args([
+            "impact",
+            "anySymbol",
+            "--db",
+            &db_path.display().to_string(),
+        ]);
+    cmd.assert().failure();
+    assert!(
+        !db_path.exists(),
+        "a read against a missing db must not create it (nw-087)"
+    );
+}
+
+#[test]
 fn cli_incremental_index_picks_up_new_symbol() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
@@ -819,6 +1035,7 @@ fn setup_does_not_overwrite_existing_skill_file() {
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -856,6 +1073,7 @@ fn setup_force_overwrites_existing_skill_file() {
         ])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -881,6 +1099,7 @@ fn setup_does_not_overwrite_existing_cursor_rule() {
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -916,6 +1135,7 @@ fn setup_strips_deprecated_args_from_existing_config() {
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -947,6 +1167,7 @@ fn daemon_status_accepts_db_after_subcommand() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["daemon", "status", "--db", db_path.to_str().unwrap()])
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -1449,6 +1670,7 @@ fn nw047_repo_instances(db_path: &std::path::Path) -> Vec<String> {
         .args(["list-repos", "--json", "--db"])
         .arg(db_path)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1478,6 +1700,7 @@ fn no_daemon_index_uses_config_instance_id() {
         .arg("--config")
         .arg(&config_path)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
@@ -1513,6 +1736,7 @@ fn no_daemon_index_empty_instance_flag_falls_back_to_config() {
         .arg("--instance")
         .arg("")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
@@ -1548,6 +1772,7 @@ fn no_daemon_index_rejects_colon_in_instance_flag() {
         .arg("--instance")
         .arg("a:b")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .failure()
         .stderr(contains("colon"));
@@ -1680,6 +1905,7 @@ fn index_does_not_write_setup_files_into_unrelated_cwd() {
         ])
         .current_dir(&cwd)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1740,6 +1966,7 @@ fn index_setup_prints_banner_at_most_once_with_multiple_tools() {
         ])
         .current_dir(&repo)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1779,6 +2006,7 @@ fn index_setup_quiet_suppresses_setup_banner() {
         ])
         .current_dir(&repo)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1822,6 +2050,7 @@ fn index_setup_flag_forces_setup_anchored_to_repo_root() {
         ])
         .current_dir(&cwd)
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1856,6 +2085,7 @@ fn index_setup_failure_does_not_write_done_marker() {
         .arg(&db)
         .arg("--setup")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
@@ -1880,6 +2110,7 @@ fn index_setup_retries_secondary_before_writing_done_marker() {
         .arg(&db)
         .arg("--setup")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
@@ -1895,9 +2126,358 @@ fn index_setup_retries_secondary_before_writing_done_marker() {
         .arg(&db)
         .arg("--setup")
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .assert()
         .success();
 
     assert!(rules_path.join("nestweaver.mdc").exists());
     assert!(marker.exists());
+}
+
+// ── nw-087: missing-DB guard matrix ───────────────────────────────────
+//
+// A command run against a NONEXISTENT --db must fail loudly with the
+// `db_not_found` diagnostic (exit 1) — never CREATE an empty DB, exit 0 on a
+// typo'd path, or autostart a daemon that materializes an empty store. Each
+// command is exercised twice: on the no-daemon path (NESTWEAVER_NO_DAEMON=1)
+// and on the daemon-autostart path (both env vars removed), proving the guard
+// fires before any daemon autostart.
+
+/// Run `args` plus `--db <missing>` in a fresh tempdir, in both daemon-env
+/// modes, and assert the full guard contract.
+fn assert_missing_db_guard(args: &[&str]) {
+    for no_daemon_env in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nope.lbug");
+        let db_arg = db_path.display().to_string();
+
+        let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+        if no_daemon_env {
+            cmd.env("NESTWEAVER_NO_DAEMON", "1")
+                .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
+        } else {
+            // Same pattern as cli_read_on_missing_db_daemon_path_does_not_create_it:
+            // no allow-hatch and no CI marker → the daemon-autostart path.
+            cmd.env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+                .env_remove("NESTWEAVER_NO_DAEMON")
+                .env_remove("CI")
+                .env_remove("GITHUB_ACTIONS");
+        }
+        let output = cmd
+            .env_remove("NESTWEAVER_DB")
+            .args(args)
+            .arg("--db")
+            .arg(&db_arg)
+            .output()
+            .unwrap();
+
+        let mode = if no_daemon_env {
+            "no-daemon"
+        } else {
+            "daemon-autostart"
+        };
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?} against a missing db must exit 1 ({mode} path); stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        assert!(
+            combined.contains("db_not_found"),
+            "{args:?} against a missing db must render the db_not_found diagnostic ({mode} path), got:\n{combined}"
+        );
+        assert!(
+            !db_path.exists(),
+            "{args:?} must not CREATE the missing db ({mode} path)"
+        );
+        // No sidecar files (`nope.lbug.*`) may appear either.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with("nope.lbug"),
+                "{args:?} left sidecar {name:?} behind ({mode} path)"
+            );
+        }
+        // No daemon may be left running for this db.
+        let status = Command::cargo_bin("nestweaver")
+            .unwrap()
+            .env_remove("NESTWEAVER_DB")
+            .args(["daemon", "--db", &db_arg, "status"])
+            .output()
+            .unwrap();
+        let status_out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(
+            status_out.contains("not running"),
+            "{args:?} must not leave a daemon running for the missing db ({mode} path); `daemon status` says:\n{status_out}"
+        );
+    }
+}
+
+#[test]
+fn cli_missing_db_prune_stale() {
+    assert_missing_db_guard(&["prune-stale"]);
+}
+
+#[test]
+fn cli_missing_db_remove_repo() {
+    assert_missing_db_guard(&["remove-repo", "anything"]);
+}
+
+#[test]
+fn cli_missing_db_export() {
+    assert_missing_db_guard(&["export", "--format", "mermaid"]);
+}
+
+#[test]
+fn cli_missing_db_hubs() {
+    assert_missing_db_guard(&["hubs"]);
+}
+
+#[test]
+fn cli_missing_db_brain_search() {
+    assert_missing_db_guard(&["brain", "search", "anything"]);
+}
+
+#[test]
+fn cli_missing_db_instance_merge() {
+    assert_missing_db_guard(&["instance", "merge", "--from", "a", "--to", "b"]);
+}
+
+#[test]
+fn cli_missing_db_stale_check() {
+    assert_missing_db_guard(&["stale-check"]);
+}
+
+#[test]
+fn cli_missing_db_list_repos() {
+    assert_missing_db_guard(&["list-repos"]);
+}
+
+#[test]
+fn cli_missing_db_brain_orphans() {
+    assert_missing_db_guard(&["brain", "orphans"]);
+}
+
+#[test]
+fn cli_missing_db_brain_topic_clusters() {
+    assert_missing_db_guard(&["brain", "topic-clusters"]);
+}
+
+#[test]
+fn cli_missing_db_brain_tag_graph() {
+    assert_missing_db_guard(&["brain", "tag-graph"]);
+}
+
+#[test]
+fn cli_missing_db_brain_doc_stats() {
+    assert_missing_db_guard(&["brain", "doc-stats"]);
+}
+
+#[test]
+fn cli_missing_db_memory_lint() {
+    assert_missing_db_guard(&["memory", "lint"]);
+}
+
+#[test]
+fn cli_missing_db_memory_consolidate() {
+    assert_missing_db_guard(&["memory", "consolidate"]);
+}
+
+#[test]
+fn cli_missing_db_memory_related() {
+    assert_missing_db_guard(&["memory", "related", "note:x"]);
+}
+
+// ── create-operations create missing --db parent dirs ──────────────────────
+//
+// `index` / `brain add` MATERIALIZE the database, so a --db pointing into a
+// not-yet-existing directory must be created — never fail with the circular
+// db_not_found diagnostic ("Run `nestweaver index` to create a database")
+// while running index.
+
+#[test]
+fn cli_index_creates_missing_db_parent_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(name) { return name; }",
+    )
+    .unwrap();
+    let db_path = dir.path().join("missing").join("parent").join("test.lbug");
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    assert!(
+        db_path.exists(),
+        "index must create the db in a previously missing parent dir"
+    );
+}
+
+#[test]
+fn cli_brain_add_creates_missing_db_parent_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Hello\n\nworld\n").unwrap();
+    let db_path = dir.path().join("missing").join("parent").join("brain.lbug");
+
+    nestweaver_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    assert!(
+        db_path.exists(),
+        "brain add must create the db in a previously missing parent dir"
+    );
+}
+
+// ── --stats is honored by list-repos and search ────────────────────────────
+
+#[test]
+fn cli_list_repos_and_search_honor_stats_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greet(name) { return name; }",
+    )
+    .unwrap();
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    // Both commands must print a "stats:" line (stderr) under --stats,
+    // matching the hubs/brain-search pattern.
+    nestweaver_cmd()
+        .args(["list-repos", "--stats", "--db"])
+        .arg(&db_path)
+        .assert()
+        .success()
+        .stderr(contains("stats:"));
+
+    nestweaver_cmd()
+        .args(["search", "greet", "--stats", "--db"])
+        .arg(&db_path)
+        .assert()
+        .success()
+        .stderr(contains("stats:"));
+}
+
+// ── `instance abort-migration` journal recovery ────────────────────────
+
+/// The instance-migration journal lives at `<db>.extensions.migration.json`
+/// (see `instance_extension_migration_journal_path` in
+/// crates/nestweaver-engine/src/extensions.rs).
+fn migration_journal_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".extensions.migration.json");
+    std::path::PathBuf::from(path)
+}
+
+/// Create a scratch DB and leave a syntactically VALID, parseable journal in
+/// the `graph_applied` phase — produced by the real engine writer so the
+/// version, fingerprint, and operation-id invariants all hold.
+fn scratch_db_with_graph_applied_journal(dir: &std::path::Path) -> std::path::PathBuf {
+    let db_path = dir.join("test.lbug");
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    drop(store);
+    let mappings = vec![nestweaver_store::InstanceUidRemap {
+        source_uid: nestweaver_schema::vault_uid("from", "/tmp/nw-abort-migration-test/vault"),
+        destination_uid: nestweaver_schema::vault_uid("to", "/tmp/nw-abort-migration-test/vault"),
+    }];
+    let migration =
+        nestweaver_engine::prepare_instance_extension_migration(&db_path, "from", "to", &mappings)
+            .unwrap();
+    nestweaver_engine::mark_instance_extension_migration_graph_applied(&db_path, &migration)
+        .unwrap();
+    db_path
+}
+
+#[test]
+fn cli_abort_migration_wedged_valid_journal_requires_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = scratch_db_with_graph_applied_journal(dir.path());
+    let db_arg = db_path.display().to_string();
+    let journal_path = migration_journal_path(&db_path);
+    assert!(journal_path.exists(), "precondition: journal was written");
+
+    // A graph-applied journal is REFUSED without --force: the graph was
+    // already mutated, so aborting would leave it half-migrated.
+    nestweaver_cmd()
+        .args(["instance", "abort-migration", "--db", &db_arg])
+        .assert()
+        .code(1)
+        .stderr(contains("graph"));
+    assert!(
+        journal_path.exists(),
+        "a refused abort must leave the journal in place"
+    );
+
+    // With --force the journal is discarded and the command succeeds.
+    nestweaver_cmd()
+        .args(["instance", "abort-migration", "--db", &db_arg, "--force"])
+        .assert()
+        .code(0);
+    assert!(
+        !journal_path.exists(),
+        "--force must remove the wedged journal"
+    );
+}
+
+#[test]
+fn cli_abort_migration_corrupt_journal_force_discards() {
+    // A journal that fails to parse carries no trustworthy phase
+    // information. Without --force the abort refuses; with --force the corrupt
+    // journal is discarded (phase reported as unknown) so the daemon can boot.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+    drop(store);
+    let db_arg = db_path.display().to_string();
+    let journal_path = migration_journal_path(&db_path);
+    std::fs::write(&journal_path, b"\x00\xff not json at all {{{").unwrap();
+
+    nestweaver_cmd()
+        .args(["instance", "abort-migration", "--db", &db_arg])
+        .assert()
+        .code(1)
+        .stderr(contains("--force"));
+    assert!(
+        journal_path.exists(),
+        "a refused abort must leave the corrupt journal in place"
+    );
+
+    nestweaver_cmd()
+        .args(["instance", "abort-migration", "--db", &db_arg, "--force"])
+        .assert()
+        .code(0)
+        .stderr(contains("Force-discarded an unreadable migration journal"));
+    assert!(
+        !journal_path.exists(),
+        "--force must remove the corrupt journal"
+    );
 }

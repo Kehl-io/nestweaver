@@ -31,10 +31,19 @@ pub enum StoreError {
     Query(String),
     #[error("not found")]
     NotFound,
+    #[error("presentation limit {limit} exceeds maximum {max}")]
+    PresentationLimitExceeded { limit: usize, max: usize },
     /// The computation was cancelled cooperatively before it could finish.
     /// Distinct from an empty result so callers never cache a truncated answer.
     #[error("query cancelled: {0}")]
     Cancelled(CancelReason),
+    /// A returned string value failed a corruption check (an embedded NUL —
+    /// never valid in any column we store). The underlying storage engine can
+    /// return garbled non-primary-key strings from partial scans after
+    /// delete+checkpoint cycles (LadybugDB #678); surfacing this as a distinct
+    /// LOUD error is what stops a corrupted value being returned silently.
+    #[error("corrupt value at column {column}: {reason}")]
+    CorruptValue { column: usize, reason: String },
 }
 
 impl StoreError {
@@ -47,7 +56,10 @@ impl StoreError {
                     || lower.contains("unique")
                     || lower.contains("constraint")
             }
-            StoreError::NotFound | StoreError::Cancelled(_) => false,
+            StoreError::NotFound
+            | StoreError::PresentationLimitExceeded { .. }
+            | StoreError::Cancelled(_)
+            | StoreError::CorruptValue { .. } => false,
         }
     }
 

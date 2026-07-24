@@ -165,6 +165,76 @@ impl DaemonClient {
         &mut self.inner
     }
 
+    /// Health-check the daemon, returning its version, instance, uptime —
+    /// and its own OS PID. Bounded so an unresponsive daemon can't
+    /// hang the caller.
+    pub async fn health_check(&mut self) -> Result<nestweaver_proto::HealthCheckResponse> {
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.inner
+                .health_check(nestweaver_proto::HealthCheckRequest {}),
+        )
+        .await
+        .context("health check timed out — daemon connected but unresponsive")?
+        .context("health check failed")?;
+        Ok(resp.into_inner())
+    }
+
+    /// The running daemon's own PID, as reported over its socket.
+    ///
+    /// Cross-check this against a pidfile PID before signaling that PID: a
+    /// foreign PID written into the pidfile of a LIVE daemon fails this
+    /// check (the socket still reports the real daemon's PID), while a plain
+    /// flock check would have trusted the file.
+    pub async fn socket_reported_pid(&mut self) -> Result<u32> {
+        Ok(self.health_check().await?.pid)
+    }
+
+    /// Poll until the daemon for `db_path` answers a health check or
+    /// `timeout` elapses. Does NOT auto-start anything — use after
+    /// triggering a start (launchd kickstart / fork) to detect an
+    /// eventually-healthy daemon whose boot outlives a short fixed wait.
+    pub async fn wait_healthy(
+        db_path: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<nestweaver_proto::HealthCheckResponse> {
+        let start = std::time::Instant::now();
+        let mut delay = std::time::Duration::from_millis(100);
+        let max_delay = std::time::Duration::from_secs(1);
+        loop {
+            // health_check has its own 10s timeout, and the deadline below is
+            // only checked BETWEEN attempts — cap each attempt at the
+            // remaining budget so the loop never overshoots `timeout` by up
+            // to 10s.
+            let remaining = timeout.saturating_sub(start.elapsed());
+            match Self::connect_existing(db_path).await {
+                Ok(mut client) => {
+                    match tokio::time::timeout(remaining, client.health_check()).await {
+                        Ok(Ok(resp)) => return Ok(resp),
+                        Ok(Err(e)) => {
+                            tracing::debug!("wait_healthy: health check not yet passing: {e:#}")
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "wait_healthy: health check exceeded the remaining budget"
+                            )
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("wait_healthy: daemon not yet connectable: {e:#}"),
+            }
+            if start.elapsed() >= timeout {
+                anyhow::bail!(
+                    "daemon for {} did not become healthy within {:.1}s",
+                    db_path.display(),
+                    timeout.as_secs_f64()
+                );
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(max_delay);
+        }
+    }
+
     /// Returns a reference to the underlying gRPC client.
     pub fn inner(&self) -> &NestWeaverDaemonClient<Channel> {
         &self.inner
@@ -284,20 +354,58 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    /// Ask the daemon to stop serving the web UI (releases the listen port).
+    pub async fn stop_ui(&mut self) -> Result<nestweaver_proto::StopUiResponse> {
+        let resp = self
+            .inner
+            .stop_ui(nestweaver_proto::StopUiRequest {})
+            .await
+            .context("stop_ui RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
     /// Tell the daemon to start a code watcher for a repository.
     pub async fn watch_code(
         &mut self,
         repo_path: &str,
         instance_id: &str,
     ) -> Result<nestweaver_proto::WatchCodeResponse> {
+        self.watch_code_with_force(repo_path, instance_id, false)
+            .await
+    }
+
+    /// Like [`DaemonClient::watch_code`], with explicit control over
+    /// replacing an already-running watcher.
+    ///
+    /// A `watch` CLI that is kill -9'd leaves its daemon-side watcher
+    /// running, and every new watch session then fails with "already
+    /// running". `force: true` stops the orphaned incumbent and adopts the
+    /// new session instead.
+    pub async fn watch_code_with_force(
+        &mut self,
+        repo_path: &str,
+        instance_id: &str,
+        force: bool,
+    ) -> Result<nestweaver_proto::WatchCodeResponse> {
         let resp = self
             .inner
             .watch_code(nestweaver_proto::WatchCodeRequest {
                 repo_path: repo_path.to_string(),
                 instance_id: instance_id.to_string(),
+                force,
             })
             .await
             .context("watch_code RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
+    /// Ask the daemon to stop its active file watcher (if any).
+    pub async fn stop_watch(&mut self) -> Result<nestweaver_proto::StopWatchResponse> {
+        let resp = self
+            .inner
+            .stop_watch(nestweaver_proto::StopWatchRequest {})
+            .await
+            .context("stop_watch RPC failed")?;
         Ok(resp.into_inner())
     }
 
@@ -333,5 +441,31 @@ impl DaemonClient {
             .await
             .context("purge_instance RPC failed")?;
         Ok(resp.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `wait_healthy` must keep polling until the timeout and then
+    /// report not-healthy (rather than declaring failure after a short fixed
+    /// wait while the daemon is still booting, e.g. under launchd).
+    #[tokio::test]
+    async fn wait_healthy_times_out_when_no_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-such-daemon.lbug");
+        let start = std::time::Instant::now();
+        let err = DaemonClient::wait_healthy(&db_path, std::time::Duration::from_millis(400))
+            .await
+            .expect_err("no daemon running — must time out");
+        assert!(
+            err.to_string().contains("did not become healthy"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(400),
+            "must poll for the full timeout, not fail on the first attempt"
+        );
     }
 }

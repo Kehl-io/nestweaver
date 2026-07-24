@@ -95,6 +95,17 @@ pub struct AffectedTestsResult {
     /// Machine-readable reasons the selection was incomplete or degraded.
     #[serde(default)]
     pub notifications: Vec<Notification>,
+    /// Machine-readable CI directive derived from `status` (TIA-style
+    /// fail-safe widening): any non-Complete run says "run-full-suite" so a
+    /// pipeline can act on degradation without parsing notifications.
+    /// Values: "selection-usable" | "run-full-suite".
+    #[serde(default)]
+    pub recommendation: String,
+    /// In-band measured-recall disclosure (nw-037): present only when the
+    /// rts-eval loop has >= 10 joined (selection, truth) pairs. Absence means
+    /// "no measured claim", never "perfect".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<crate::rts_eval::MeasuredRecall>,
 }
 
 /// A changed source symbol reference.
@@ -103,11 +114,27 @@ pub struct ChangedSymbolRef {
     pub uid: String,
     pub name: String,
     pub file_path: String,
+    /// Owning repo of the changed symbol (feeds selection recording and
+    /// multi-repo consumers). Empty on records serialized before this field.
+    #[serde(default)]
+    pub repo_uid: String,
 }
 
 const DISCLAIMER: &str = "Static call-graph regression test selection: a prioritized signal, NOT a \
 provably-safe subset. Misses reflection, DI, codegen, and data-driven/integration tests. \
-\"No tests found\" does not mean safe-to-skip — keep a periodic full test run.";
+\"No tests found\" does not mean safe-to-skip — keep a periodic full test run. \
+Published prior: static symbol-level selection violated safety on ~10.6% of revisions \
+versus dynamic coverage-based selection (FSE 2016), reflection being the dominant cause — \
+measure your own recall with `nestweaver rts-eval report` rather than assuming.";
+
+/// Fail-safe widening (Microsoft TIA precedent): an incomplete selection is
+/// only safe to act on by running the FULL suite; never narrow on degradation.
+pub(crate) fn derive_recommendation(status: AnalysisStatus) -> &'static str {
+    match status {
+        AnalysisStatus::Complete => "selection-usable",
+        _ => "run-full-suite",
+    }
+}
 
 /// Compute the affected tests for a set of changed files.
 ///
@@ -118,6 +145,27 @@ provably-safe subset. Misses reflection, DI, codegen, and data-driven/integratio
 ///   4. bucket by traversal depth (tier_1 = depth 1, etc.), ordering within a
 ///      tier by edge confidence.
 pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<AffectedTestsResult> {
+    affected_tests_within(store, changed_files, None)
+}
+
+/// Compute affected tests inside an induced symbol subgraph.
+///
+/// `allowed_symbols` is a positive authorization set: disallowed symbols are
+/// excluded as changed seeds, test candidates, and traversal intermediates.
+/// This prevents hidden topology from producing visible selections.
+pub fn affected_tests_scoped(
+    store: &GraphStore,
+    changed_files: &[String],
+    allowed_symbols: &HashSet<String>,
+) -> Result<AffectedTestsResult> {
+    affected_tests_within(store, changed_files, Some(allowed_symbols))
+}
+
+fn affected_tests_within(
+    store: &GraphStore,
+    changed_files: &[String],
+    allowed_symbols: Option<&HashSet<String>>,
+) -> Result<AffectedTestsResult> {
     // Trust core: a failed traversal must surface as `Degraded` so a CI
     // consumer runs the full suite instead of trusting an incomplete subset.
     let mut status = AnalysisStatus::Complete;
@@ -132,15 +180,29 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     // layer (the 2.5.10 affected_tests daemon-crash/segfault report).
     let mut changed_symbols: Vec<ChangedSymbolRef> = Vec::new();
     let mut changed_uids: HashSet<String> = HashSet::new();
+    // Changed files that resolved to zero indexed symbols (new file or stale
+    // index) — non-test source files are disclosed as unassessed; test files
+    // are ALWAYS included in tier 1 below (TIA/Develocity always-include rule).
+    let mut files_without_symbols: Vec<&String> = Vec::new();
     for file_path in changed_files {
         match store.symbols_in_file(file_path) {
             Ok(syms) => {
+                let syms: Vec<_> = syms
+                    .into_iter()
+                    .filter(|symbol| {
+                        allowed_symbols.is_none_or(|allowed| allowed.contains(&symbol.uid))
+                    })
+                    .collect();
+                if syms.is_empty() {
+                    files_without_symbols.push(file_path);
+                }
                 for s in syms {
                     if changed_uids.insert(s.uid.clone()) {
                         changed_symbols.push(ChangedSymbolRef {
                             uid: s.uid,
                             name: s.name,
                             file_path: s.file_path,
+                            repo_uid: s.repo_uid,
                         });
                     }
                 }
@@ -163,10 +225,62 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     // and among equal depths the highest-confidence edge.
     let mut best: HashMap<String, AffectedTestSymbol> = HashMap::new();
 
-    // A changed symbol may itself live in a test file (a test was edited).
-    // Such tests are directly affected — treat them as tier 1 (depth 1).
+    // Load the reverse-impact graph ONCE (a handful of bulk queries) and walk it
+    // in memory, instead of the old path that issued a DB round-trip per visited
+    // node for EVERY changed symbol — that re-walked heavily-overlapping reverse
+    // cones and cost ~21ms/changed-symbol, dominating wall time on hot files
+    // (nw-085). The per-symbol walk below is the identical confidence-weighted
+    // max-product reverse BFS (same edge set, depth cap, confidence + threshold
+    // pruning), just over the in-memory adjacency.
+    let symbols = match store.list_all_symbols() {
+        Ok(symbols) => symbols
+            .into_iter()
+            .filter(|symbol| allowed_symbols.is_none_or(|allowed| allowed.contains(&symbol.uid)))
+            .collect(),
+        Err(e) => {
+            notifications.push(Notification {
+                level: NotificationLevel::Error,
+                message: format!("listing symbols for affected-test resolution failed: {e}"),
+                descriptor: "store.list-symbols-failed".to_string(),
+            });
+            status = status.max(AnalysisStatus::Degraded);
+            Vec::new()
+        }
+    };
+    let sym_by_uid: HashMap<String, &nestweaver_schema::Symbol> =
+        symbols.iter().map(|s| (s.uid.clone(), s)).collect();
+    let rev_adj = match store.load_typed_edges() {
+        Ok(edges) => build_rev_impact_adjacency(&edges, allowed_symbols),
+        Err(e) => {
+            // Do NOT silently proceed — an empty impact graph that reads as
+            // "few tests" is the dangerous failure mode this tool exists to
+            // avoid. Degrade loudly.
+            notifications.push(Notification {
+                level: NotificationLevel::Error,
+                message: format!("loading the reverse-impact graph failed: {e}"),
+                descriptor: "store.load-edges-failed".to_string(),
+            });
+            status = status.max(AnalysisStatus::Degraded);
+            RevImpactAdj::default()
+        }
+    };
+
+    // A test symbol is any symbol whose file is a test file, OR any symbol the
+    // parser flagged as a test entry point (e.g. a Rust `#[test]` fn living in an
+    // inline `#[cfg(test)]` module inside a non-test `src/*.rs` file — nw-085).
+    let is_test_symbol = |sym: &nestweaver_schema::Symbol| -> bool {
+        is_test_file(&sym.file_path)
+            || sym.entry_point_kind == Some(nestweaver_schema::EntryPointKind::TestEntry)
+    };
+
+    // A changed symbol may itself be a test (a test was edited). Such tests are
+    // directly affected — treat them as tier 1 (depth 1).
     for cs in &changed_symbols {
-        if is_test_file(&cs.file_path) {
+        let is_test = sym_by_uid
+            .get(&cs.uid)
+            .map(|s| is_test_symbol(s))
+            .unwrap_or_else(|| is_test_file(&cs.file_path));
+        if is_test {
             consider(
                 &mut best,
                 AffectedTestSymbol {
@@ -182,30 +296,19 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     }
 
     for cs in &changed_symbols {
-        let callers = match store.impact(&cs.uid, MAX_TEST_DEPTH, MIN_CONFIDENCE) {
-            Ok(callers) => callers,
-            Err(e) => {
-                // Do NOT propagate/drop silently — an incomplete affected-tests
-                // set that reads as "few tests" is the dangerous failure mode.
-                notifications.push(Notification {
-                    level: NotificationLevel::Error,
-                    message: format!("reverse traversal for {} failed: {e}", cs.uid),
-                    descriptor: "store.impact-failed".to_string(),
-                });
-                status = status.max(AnalysisStatus::Degraded);
+        for node in impact_reachers_in_memory(&cs.uid, &rev_adj, MAX_TEST_DEPTH, MIN_CONFIDENCE) {
+            let Some(sym) = sym_by_uid.get(&node.uid) else {
                 continue;
-            }
-        };
-        for node in callers {
-            if !is_test_file(&node.file_path) {
+            };
+            if !is_test_symbol(sym) {
                 continue;
             }
             consider(
                 &mut best,
                 AffectedTestSymbol {
                     symbol_uid: node.uid,
-                    name: node.name,
-                    test_file: node.file_path,
+                    name: sym.name.clone(),
+                    test_file: sym.file_path.clone(),
                     depth: node.depth,
                     edge_type: node.edge_type,
                     confidence: node.confidence,
@@ -226,9 +329,75 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
         }
     }
 
-    let tier_1 = group_by_file(tier_1_syms);
+    let mut tier_1 = group_by_file(tier_1_syms);
     let tier_2 = group_by_file(tier_2_syms);
     let tier_3 = group_by_file(tier_3_syms);
+
+    // nw-064: always-include + disclosure for changed files the index doesn't
+    // know (new file or stale index). A changed TEST file goes straight into
+    // tier 1 — TIA includes newly added tests, Develocity always selects
+    // "recently new/changed" tests; missing them during the stale-index window
+    // was a silent under-selection. A changed non-test SOURCE file is
+    // disclosed as unassessed (mirrors blast_radius's changed-file-no-symbols
+    // honesty) and forces fail-safe widening to the full suite.
+    let selected_files: HashSet<&str> = tier_1
+        .iter()
+        .chain(&tier_2)
+        .chain(&tier_3)
+        .map(|f| f.test_file.as_str())
+        .collect();
+    let mut always_included: Vec<String> = Vec::new();
+    let mut unassessed: Vec<&str> = Vec::new();
+    for file_path in files_without_symbols {
+        if selected_files.contains(file_path.as_str()) {
+            continue;
+        }
+        if is_test_file(file_path) {
+            always_included.push(file_path.clone());
+        } else if nestweaver_parser::is_markdown(std::path::Path::new(file_path)) {
+            // Docs-only changes cannot break tests — keep the selection
+            // usable (deliberate nw-064 behavior).
+        } else {
+            // A recognized source file with no indexed symbols is
+            // "new file or stale index"; an UNRECOGNIZED extension (Makefile,
+            // ci.yml, …) means we cannot even tell what the file is — the
+            // parser may simply not cover a real source language. Both must
+            // fail safe (partial + notification) instead of silently claiming
+            // a complete selection.
+            unassessed.push(file_path);
+        }
+    }
+    for file_path in always_included.iter() {
+        tier_1.push(AffectedTestFile {
+            test_file: file_path.clone(),
+            tests: Vec::new(),
+            symbol_uid: String::new(),
+            confidence: 1.0,
+        });
+    }
+    if !always_included.is_empty() {
+        notifications.push(Notification {
+            level: NotificationLevel::Note,
+            message: format!(
+                "always-included {} changed test file(s) not yet in the index (new test or stale index): {}",
+                always_included.len(),
+                always_included.join(", ")
+            ),
+            descriptor: "always-include-changed-test".to_string(),
+        });
+    }
+    if !unassessed.is_empty() {
+        status = status.max(AnalysisStatus::Partial);
+        notifications.push(Notification {
+            level: NotificationLevel::Warning,
+            message: format!(
+                "changed file(s) with no indexed symbols (new file, unrecognized file type, or \
+                 stale index) — their impact was not assessed: {}",
+                unassessed.join(", ")
+            ),
+            descriptor: "changed-file-no-symbols".to_string(),
+        });
+    }
 
     let summary = format!(
         "{} tier-1, {} tier-2, {} tier-3 tests affected",
@@ -245,9 +414,113 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
         tier_3,
         summary,
         disclaimer: DISCLAIMER.to_string(),
+        recommendation: derive_recommendation(status).to_string(),
         status,
         notifications,
+        measured: None,
     })
+}
+
+/// Impact threshold: prune reverse paths whose cumulative confidence product
+/// falls below this. Mirrors the store's `DEFAULT_IMPACT_THRESHOLD` so the
+/// in-memory walk matches the DB `impact_bfs`.
+const IMPACT_THRESHOLD: f64 = 0.10;
+
+/// Reverse adjacency over [`nestweaver_store::IMPACT_EDGE_TYPES`]: for each
+/// symbol uid, the direct callers reaching it as `(caller_uid, edge_type_name,
+/// confidence)`.
+type RevImpactAdj = HashMap<String, Vec<(String, String, f32)>>;
+
+/// A caller reached by the in-memory reverse-impact walk (the fields
+/// affected-tests needs from the store's `ImpactNode`).
+struct Reacher {
+    uid: String,
+    edge_type: String,
+    confidence: f32,
+    depth: u32,
+}
+
+/// Build the reverse-impact adjacency from a bulk typed-edge load, keeping only
+/// the structural impact edge types (dropping DEFINES/data/other edges).
+fn build_rev_impact_adjacency(
+    typed_edges: &[(String, String, String, f64, String)],
+    allowed_symbols: Option<&HashSet<String>>,
+) -> RevImpactAdj {
+    let impact_names: HashSet<&str> = nestweaver_store::IMPACT_EDGE_TYPES
+        .iter()
+        .map(|e| e.rel_table_name())
+        .collect();
+    let mut adj: RevImpactAdj = HashMap::new();
+    for (src, dst, etype, conf, _evidence) in typed_edges {
+        if impact_names.contains(etype.as_str())
+            && allowed_symbols.is_none_or(|allowed| allowed.contains(src) && allowed.contains(dst))
+        {
+            // Edge src -[etype]-> dst means src is a caller of dst.
+            adj.entry(dst.clone())
+                .or_default()
+                .push((src.clone(), etype.clone(), *conf as f32));
+        }
+    }
+    adj
+}
+
+/// In-memory equivalent of `store.impact(seed, max_depth, min_confidence)` — the
+/// confidence-weighted reverse BFS: score starts at 1.0 at the seed and decays
+/// multiplicatively through each edge's confidence; a node's score is the max
+/// over all paths (re-enqueued when improved, Dijkstra-with-max); edges below
+/// `min_confidence` and cumulative scores below [`IMPACT_THRESHOLD`] are pruned;
+/// depth is capped at `max_depth`. Byte-equivalent to the store's structural
+/// `impact_bfs`, but over the prebuilt adjacency so it costs nothing per node.
+fn impact_reachers_in_memory(
+    seed: &str,
+    adj: &RevImpactAdj,
+    max_depth: u32,
+    min_confidence: f32,
+) -> Vec<Reacher> {
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    scores.insert(seed.to_string(), 1.0);
+    let mut queue: std::collections::VecDeque<(String, u32)> = std::collections::VecDeque::new();
+    queue.push_back((seed.to_string(), 0));
+    let mut result: HashMap<String, Reacher> = HashMap::new();
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let parent_score = scores.get(&current).copied().unwrap_or(0.0);
+        let Some(callers) = adj.get(&current) else {
+            continue;
+        };
+        for (caller_uid, edge_type, confidence) in callers {
+            // The DB query filters callers by min_confidence; mirror it.
+            if *confidence < min_confidence {
+                continue;
+            }
+            // Skip the seed appearing as its own (transitive) caller.
+            if caller_uid == seed {
+                continue;
+            }
+            let candidate_score = parent_score * *confidence as f64;
+            if candidate_score < IMPACT_THRESHOLD {
+                continue;
+            }
+            let prev_score = scores.get(caller_uid).copied().unwrap_or(0.0);
+            if candidate_score > prev_score {
+                scores.insert(caller_uid.clone(), candidate_score);
+                result.insert(
+                    caller_uid.clone(),
+                    Reacher {
+                        uid: caller_uid.clone(),
+                        edge_type: edge_type.clone(),
+                        confidence: *confidence,
+                        depth: depth + 1,
+                    },
+                );
+                queue.push_back((caller_uid.clone(), depth + 1));
+            }
+        }
+    }
+    result.into_values().collect()
 }
 
 /// Record `candidate` as the best-known selection for its symbol UID, keeping
@@ -347,6 +620,75 @@ mod tests {
             link_type: None,
             evidence: vec![],
         }
+    }
+
+    #[test]
+    fn rust_inline_test_in_src_file_is_selected() {
+        // nw-085 Part B: a Rust `#[test]` fn flagged TestEntry that lives in a
+        // NON-test src file (inline `#[cfg(test)] mod tests`) must still be
+        // selected — path-based is_test_file misses it, the entry_point_kind
+        // flag catches it.
+        let store = GraphStore::in_memory().expect("store");
+        let changed = sym("sym:util", "util", "src/util.rs");
+        // The test lives in a plain src file (NOT a *.test.* / tests/ path).
+        let mut inline_test = sym("sym:test_util", "test_util", "src/other.rs");
+        inline_test.entry_point_kind = Some(nestweaver_schema::EntryPointKind::TestEntry);
+        store.insert_symbol(&changed).unwrap();
+        store.insert_symbol(&inline_test).unwrap();
+        store
+            .insert_edge(&edge("sym:test_util", "sym:util"))
+            .unwrap();
+
+        let result = affected_tests(&store, &["src/util.rs".to_string()]).expect("ok");
+        // Without the flag this would be empty (the old path-only bug). Now the
+        // inline test is tier-1.
+        let tier1_names: Vec<&str> = result
+            .tier_1
+            .iter()
+            .flat_map(|f| f.tests.iter().map(|t| t.as_str()))
+            .collect();
+        assert!(
+            tier1_names.contains(&"test_util"),
+            "the TestEntry-flagged inline test must be selected as tier-1; got {tier1_names:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_unrelated_symbol_forces_full_suite_fallback() {
+        let store = GraphStore::in_memory().expect("store");
+        let changed = sym("sym:changed", "changed", "src/changed.rs");
+        let test = sym("sym:test", "changed_is_covered", "tests/changed_test.rs");
+        store.insert_symbol(&changed).expect("changed symbol");
+        store.insert_symbol(&test).expect("test symbol");
+        store
+            .insert_edge(&edge("sym:test", "sym:changed"))
+            .expect("test edge");
+
+        let mut corrupt = sym("sym:corrupt", "unrelated", "src/unrelated.rs");
+        corrupt.name = "unrelated\0corrupt".to_string();
+        store.insert_symbol(&corrupt).expect("corrupt canary");
+
+        assert_eq!(
+            store
+                .symbols_in_file("src/changed.rs")
+                .expect("changed-file lookup remains usable")
+                .len(),
+            1
+        );
+        assert!(
+            store.list_all_symbols().is_err(),
+            "global enumeration must encounter the unrelated corruption canary"
+        );
+
+        let result =
+            affected_tests(&store, &["src/changed.rs".to_string()]).expect("partial result");
+
+        assert_eq!(result.status, AnalysisStatus::Degraded);
+        assert_eq!(result.recommendation, "run-full-suite");
+        assert!(result.notifications.iter().any(|notification| {
+            notification.level == NotificationLevel::Error
+                && notification.descriptor == "store.list-symbols-failed"
+        }));
     }
 
     #[test]
@@ -522,5 +864,196 @@ mod tests {
         assert_eq!(result.tier_1.len(), 1);
         assert_eq!(result.tier_1[0].test_file, "src/auth.test.ts");
         assert!(result.tier_1[0].tests.contains(&"checks_login".to_string()));
+    }
+
+    /// nw-064: TIA/Develocity always-include rule — a changed TEST file from
+    /// the diff itself is selected even when the index doesn't know it yet
+    /// (new test + stale index was a silent miss).
+    #[test]
+    fn unindexed_changed_test_file_is_always_included() {
+        let store = GraphStore::in_memory().expect("store");
+        let result = affected_tests(
+            &store,
+            &["src/new.test.ts".to_string(), "src/also_new.rs".to_string()],
+        )
+        .expect("ok");
+        let t1: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
+        assert!(
+            t1.contains(&"src/new.test.ts"),
+            "changed test file must be tier-1 even when unindexed: {t1:?}"
+        );
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "always-include-changed-test"),
+            "inclusion must be disclosed: {:?}",
+            result.notifications
+        );
+        // The non-test source file is disclosed as unassessed, not silent.
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols"
+                    && n.message.contains("src/also_new.rs")),
+            "unindexed changed source must be disclosed: {:?}",
+            result.notifications
+        );
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.recommendation, "run-full-suite");
+        let notice = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "changed-file-no-symbols")
+            .expect("unknown source must be disclosed");
+        assert_eq!(notice.level, NotificationLevel::Warning);
+        assert!(notice.message.contains("src/also_new.rs"));
+    }
+
+    #[test]
+    fn unindexed_docs_only_change_keeps_selection_usable() {
+        let store = GraphStore::in_memory().expect("store");
+        let result = affected_tests(&store, &["README.md".to_string()]).expect("ok");
+
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.recommendation, "selection-usable");
+        assert!(
+            !result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "changed-file-no-symbols")
+        );
+    }
+
+    /// Changed files whose extension we don't recognize (Makefile,
+    /// ci.yml, …) must NOT yield a silent "complete" — the parser may simply
+    /// not cover a real source language, so fail safe like an unindexed
+    /// source file.
+    #[test]
+    fn unknown_extension_files_fail_safe_to_partial() {
+        let store = GraphStore::in_memory().expect("store");
+        let result = affected_tests(
+            &store,
+            &[
+                "Makefile".to_string(),
+                ".github/workflows/ci.yml".to_string(),
+            ],
+        )
+        .expect("ok");
+
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.recommendation, "run-full-suite");
+        let notice = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "changed-file-no-symbols")
+            .expect("unrecognized file types must be disclosed");
+        assert_eq!(notice.level, NotificationLevel::Warning);
+        assert!(notice.message.contains("Makefile"));
+        assert!(notice.message.contains("ci.yml"));
+    }
+
+    /// The always-include rule must not duplicate a test file the graph
+    /// already selected via the edited-test tier-1 rule.
+    #[test]
+    fn always_include_does_not_duplicate_indexed_selection() {
+        let store = GraphStore::in_memory().expect("store");
+        let t = sym("sym:t", "checks_login", "src/auth.test.ts");
+        store.insert_symbol(&t).expect("insert");
+        let result = affected_tests(&store, &["src/auth.test.ts".to_string()]).expect("ok");
+        let count = result
+            .tier_1
+            .iter()
+            .filter(|f| f.test_file == "src/auth.test.ts")
+            .count();
+        assert_eq!(
+            count, 1,
+            "one entry, not graph + always-include: {:?}",
+            result.tier_1
+        );
+        assert!(
+            result.tier_1[0].tests.contains(&"checks_login".to_string()),
+            "the indexed entry (with test names) must win"
+        );
+    }
+
+    #[test]
+    fn degraded_run_recommends_full_suite() {
+        // Complete run: selection usable end-to-end.
+        let store = GraphStore::in_memory().expect("store");
+        let ok = affected_tests(&store, &["README.md".to_string()]).expect("ok");
+        assert_eq!(ok.status, AnalysisStatus::Complete);
+        assert_eq!(ok.recommendation, "selection-usable");
+        // Fail-safe widening (TIA precedent): ANY non-complete status must
+        // recommend the full suite.
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Complete),
+            "selection-usable"
+        );
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Partial),
+            "run-full-suite"
+        );
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Degraded),
+            "run-full-suite"
+        );
+        assert_eq!(
+            derive_recommendation(AnalysisStatus::Failed),
+            "run-full-suite"
+        );
+    }
+
+    #[test]
+    fn in_memory_impact_matches_store_impact() {
+        // nw-085 Part A: the in-memory reverse walk must reproduce the store's
+        // confidence-weighted `impact` exactly. Build a DAG with overlapping
+        // reverse cones and DISTINCT confidences (no score ties, where the DB
+        // and in-memory tie-break order could legitimately differ), then compare
+        // the reached uid->depth map for each seed.
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+        let store = GraphStore::in_memory().expect("store");
+        for name in ["a", "b", "c", "d", "e"] {
+            store
+                .insert_symbol(&sym(&format!("sym:{name}"), name, "src/lib.rs"))
+                .unwrap();
+        }
+        let e = |src: &str, dst: &str, conf: f32, et: EdgeType| ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: dst.to_string(),
+            edge_type: et,
+            confidence: conf,
+            link_type: None,
+            evidence: vec![],
+        };
+        // b -> a, c -> b, d -> a (shallower), e -> c ; mixed edge types + confs.
+        for edge in [
+            e("sym:b", "sym:a", 0.9, EdgeType::Calls),
+            e("sym:c", "sym:b", 0.8, EdgeType::Imports),
+            e("sym:d", "sym:a", 0.7, EdgeType::Calls),
+            e("sym:e", "sym:c", 0.95, EdgeType::Extends),
+        ] {
+            store.insert_edge(&edge).unwrap();
+        }
+
+        let adj = build_rev_impact_adjacency(&store.load_typed_edges().unwrap(), None);
+        for seed in ["sym:a", "sym:b", "sym:c"] {
+            let db: HashMap<String, u32> = store
+                .impact(seed, MAX_TEST_DEPTH, MIN_CONFIDENCE)
+                .unwrap()
+                .into_iter()
+                .map(|n| (n.uid, n.depth))
+                .collect();
+            let mem: HashMap<String, u32> =
+                impact_reachers_in_memory(seed, &adj, MAX_TEST_DEPTH, MIN_CONFIDENCE)
+                    .into_iter()
+                    .map(|r| (r.uid, r.depth))
+                    .collect();
+            assert_eq!(
+                db, mem,
+                "in-memory impact must match store.impact for {seed}"
+            );
+        }
     }
 }

@@ -194,11 +194,12 @@ pub struct TopicCluster {
     pub label: String,
 }
 
-/// Run Leiden community detection over the Note↔Note wikilink subgraph and
-/// return one cluster per detected community. The label is the title of the
-/// highest-PageRank member (falling back to highest wikilink-degree, then the
-/// first member). Reuses the SAME [`clustering::leiden`] algorithm the code
-/// graph uses — only the loader differs. Empty DB → empty vec.
+/// Run Louvain-style local-moving community detection over the Note↔Note
+/// wikilink subgraph and return one cluster per detected community. The label
+/// is the title of the highest-PageRank member (falling back to highest
+/// wikilink-degree, then the first member). Reuses the SAME
+/// [`clustering::leiden`] algorithm the code graph uses (single-level local
+/// moving, not full Leiden) — only the loader differs. Empty DB → empty vec.
 pub fn topic_clusters(store: &GraphStore, resolution: f64) -> Result<Vec<TopicCluster>> {
     let notes = store
         .list_notes_lite(None)

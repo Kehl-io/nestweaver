@@ -702,8 +702,15 @@ async fn handle_mcp(
             );
         }
 
+        // Admin tokens are never throttled by the per-session limiter either,
+        // matching the client-IP limiter above and the gRPC interceptor
+        // (auth.rs checks `if !is_admin` before rate limiting). The check
+        // still runs so `last_active`/`request_count` bookkeeping stays fresh
+        // for the session sweeper — only the rejection is skipped. Without
+        // the bypass an admin client got 429 at request RATE_LIMIT_PER_MIN+1.
         if let Some(ref sid) = session_id
             && !check_session_rate_limit(&state.sessions, sid)
+            && !admin_bypass_rate_limit
         {
             return jsonrpc_error(
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -797,6 +804,18 @@ async fn handle_mcp(
                     "tools/call: 'name' is required",
                 );
             };
+
+            if let Err(error) = tools::validate_tool_arguments(&name, &arguments) {
+                return (
+                    axum::http::StatusCode::OK,
+                    HeaderMap::new(),
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": tools::wrap_tool_error(&error.to_string()),
+                    })),
+                );
+            }
 
             // Read-only snapshot replica: reject EVERY mutating tool before
             // dispatch, regardless of auth/admin. A replica opens its store
@@ -904,12 +923,15 @@ async fn handle_mcp(
             // the upstream with the SAME (post-safeguard) arguments the local
             // tier saw. Capture them now, before `arguments` is moved into the
             // blocking dispatch closure — but only when an upstream is actually
-            // configured, so the common single-node daemon pays no clone. The
-            // tool name is not captured here: `name` outlives the closure (only
-            // its `tool_name` clone is moved in), so the federation call borrows
-            // `&name` directly rather than cloning it a second time.
+            // configured, so the common single-node daemon pays no clone. Keep
+            // the caller's resolved visibility with those arguments: the local
+            // dispatch consumes its copy on the blocking thread, while the
+            // post-local federation gate must make its decision from the same
+            // authorization verdict before any upstream I/O.
             #[cfg(feature = "daemon")]
-            let fed_capture = federation.as_ref().map(|_| arguments.clone());
+            let fed_capture = federation
+                .as_ref()
+                .map(|_| (arguments.clone(), visible.clone()));
 
             // Run tool dispatch on a blocking thread — graph queries are
             // CPU-bound and must not starve the tokio runtime.
@@ -957,11 +979,25 @@ async fn handle_mcp(
                     // stamped on every result (empty without an upstream).
                     #[cfg(feature = "daemon")]
                     let (value, upstream_source, stale_repos) = match (&federation, fed_capture) {
-                        (Some(fed), Some(fed_args)) => {
-                            let (v, src) =
-                                crate::federation::federate_two_tier(fed, &name, &fed_args, value)
-                                    .await;
-                            (v, src, fed.stale_repos())
+                        (Some(fed), Some((fed_args, fed_visible))) => {
+                            let expose_staleness =
+                                matches!(fed_visible, nestweaver_engine::authz::VisibleRepos::All);
+                            let (v, src) = crate::federation::federate_two_tier(
+                                fed,
+                                &name,
+                                &fed_args,
+                                value,
+                                &fed_visible,
+                            )
+                            .await;
+                            let stale_repos = if expose_staleness {
+                                fed.stale_repos()
+                            } else {
+                                // The cached verdict contains org-wide repo
+                                // URLs and is not keyed by caller scope.
+                                Vec::new()
+                            };
+                            (v, src, stale_repos)
                         }
                         _ => (value, None, Vec::new()),
                     };
@@ -1110,6 +1146,34 @@ mod tests {
             false,
         ));
         router(state)
+    }
+
+    fn test_server_app() -> Router {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let state = Arc::new(McpHttpState::new(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            true,
+        ));
+        router(state)
+    }
+
+    fn valid_mutating_arguments(tool: &str) -> Value {
+        match tool {
+            "brain_add_source" => json!({ "path": "/tmp/not-dispatched" }),
+            "brain_remove_source" => json!({ "target": "repo:not-dispatched" }),
+            "brain_memory_consolidate" => json!({}),
+            "set_extension" => json!({
+                "uid": "sym:not-dispatched",
+                "key": "reviewed",
+                "value": true,
+            }),
+            "prune_stale" => json!({}),
+            other => panic!("missing schema-valid mutating fixture for {other}"),
+        }
     }
 
     fn test_auth_app() -> Router {
@@ -1458,6 +1522,180 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn admin_token_bypasses_per_session_rate_limit() {
+        // The admin bypass must cover the per-session limiter too — previously
+        // only the client-IP limiter skipped admins, so an admin token still
+        // got 429 at request RATE_LIMIT_PER_MIN+1 on one session. The gRPC
+        // interceptor skips rate limiting for admins entirely; HTTP now
+        // matches. Client-IP bucket capacity is 1000 so only the session
+        // limiter can produce a 429 here.
+        let app = test_server_auth_app_with_limiter(1000);
+        let call = |token: &str, sid: &str, i: u64| {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": i,
+                "method": "tools/list",
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .header("mcp-session-id", sid)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+
+        // Admin: RATE_LIMIT_PER_MIN+1 requests on one session, never a 429.
+        for i in 0..=RATE_LIMIT_PER_MIN {
+            let resp = app
+                .clone()
+                .oneshot(call("admin-token", "session-a", i))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "admin request {} must bypass the session limiter",
+                i + 1
+            );
+        }
+
+        // Control: the query token IS throttled by the session limiter once it
+        // crosses RATE_LIMIT_PER_MIN requests on its session.
+        let mut last = StatusCode::OK;
+        for i in 0..=RATE_LIMIT_PER_MIN {
+            let resp = app
+                .clone()
+                .oneshot(call("shared-query-token", "session-b", i))
+                .await
+                .unwrap();
+            last = resp.status();
+            if last == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+        }
+        assert_eq!(
+            last,
+            StatusCode::TOO_MANY_REQUESTS,
+            "query token must still hit the session limiter past RATE_LIMIT_PER_MIN"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_brain_search_returns_in_band_schema_error_before_safeguards() {
+        let app = test_server_app();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "tools/call",
+            "params": {
+                "name": "brain_search",
+                "arguments": { "query": 17, "depth": MAX_DEPTH + 1 },
+            },
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(json.get("error").is_none(), "{json}");
+        assert_eq!(json["result"]["isError"], serde_json::json!(true));
+        let result = json["result"].to_string();
+        assert!(result.contains("invalid arguments for tool"), "{result}");
+        assert!(result.contains("/query"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn malformed_mutating_tools_return_in_band_schema_errors_before_authorization() {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let mut state = McpHttpState::with_auth(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            true,
+            "query-token".to_string(),
+            Some("admin-token".to_string()),
+        );
+        state.read_only = true;
+        let gate_cases = [
+            (router(Arc::new(state)), "admin-token", "read-only"),
+            (test_auth_app(), "query-token", "admin"),
+        ];
+
+        let malformed_calls = [
+            ("brain_add_source", json!({ "path": 17 }), "/path"),
+            ("brain_remove_source", json!({ "target": 17 }), "/target"),
+            (
+                "brain_memory_consolidate",
+                json!({ "apply": "yes" }),
+                "/apply",
+            ),
+            (
+                "set_extension",
+                json!({ "uid": 17, "key": "reviewed", "value": true }),
+                "/uid",
+            ),
+            ("prune_stale", json!([]), "/"),
+        ];
+
+        for (tool, arguments, instance_path) in malformed_calls {
+            for (app, token, gate) in &gate_cases {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": tool,
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments },
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{tool} before {gate} gate");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+                assert!(
+                    json.get("error").is_none(),
+                    "{tool} before {gate} gate: {json}"
+                );
+                assert_eq!(
+                    json["result"]["isError"],
+                    serde_json::json!(true),
+                    "{tool} before {gate} gate: {json}"
+                );
+                let result = json["result"].to_string();
+                assert!(
+                    result.contains("invalid arguments for tool"),
+                    "{tool} before {gate} gate: {result}"
+                );
+                assert!(
+                    result.contains(instance_path),
+                    "{tool} before {gate} gate must identify {instance_path}: {result}"
+                );
+            }
+        }
+    }
+
     /// A read-only snapshot replica must reject every mutating MCP tool over
     /// `tools/call` BEFORE dispatch — even when the caller presents the admin
     /// token — so the mutation never reaches the read-only store. This is the
@@ -1480,11 +1718,14 @@ mod tests {
 
         // Every mutating tool must be rejected, even with the admin token.
         for tool in MUTATING_TOOLS {
+            let arguments = valid_mutating_arguments(tool);
+            tools::validate_tool_arguments(tool, &arguments)
+                .unwrap_or_else(|error| panic!("invalid test fixture for {tool}: {error}"));
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": tool,
                 "method": "tools/call",
-                "params": { "name": tool, "arguments": {} },
+                "params": { "name": tool, "arguments": arguments },
             });
             let req = Request::builder()
                 .method("POST")

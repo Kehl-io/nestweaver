@@ -51,9 +51,9 @@ pub enum VisibleRepos {
 impl VisibleRepos {
     /// Whether a symbol/edge in `repo_uid` is visible.
     ///
-    /// An empty `repo_uid` (unresolved / the local repo under review) is always
-    /// kept — dropping it would break the primary result, and it reveals
-    /// nothing cross-repo.
+    /// An empty `repo_uid` (the local repo under review) is allowed. Callers
+    /// whose data source can also use empty for unresolved ownership must first
+    /// require separate positive provenance; blast-radius affected rows do so.
     pub fn allows(&self, repo_uid: &str) -> bool {
         match self {
             VisibleRepos::All => true,
@@ -157,13 +157,13 @@ impl PermissionSource for StaticConfigPermissionSource {
 /// `visible` is [`VisibleRepos::All`] (the disabled-policy / single-trust-domain
 /// path), which is what preserves zero behavior change for existing callers.
 ///
-/// `repos` is required to resolve an [`OrgImpactItem`]'s `affected_repo` — a
-/// *display label* (a repo's `url` or `uid`), not a `repo_uid` — back to a
-/// concrete `repo_uid` before the visibility check.
+/// `repos` is retained in the signature for caller compatibility. Authorization
+/// deliberately does not consult display labels: org items carry stable source
+/// and destination repo UIDs and legacy/unattributed rows fail closed.
 pub fn redact_blast_radius_for_visibility(
     result: &mut BlastRadiusResult,
     visible: &VisibleRepos,
-    repos: &[Repo],
+    _repos: &[Repo],
 ) {
     // All ⇒ nothing is hidden; leave the result byte-for-byte unchanged.
     let visible_only = match visible {
@@ -171,40 +171,36 @@ pub fn redact_blast_radius_for_visibility(
         VisibleRepos::Only(_) => visible,
     };
 
-    // Symbols carry their owning repo_uid directly.
+    // Affected traversal rows need positive ownership provenance in addition
+    // to a repo UID. An empty UID can mean a genuinely local symbol or a failed
+    // enrichment; only a successful authoritative lookup distinguishes them.
     result
         .affected_symbols
-        .retain(|s| visible_only.allows(&s.repo_uid));
+        .retain(|s| s.ownership_resolved && visible_only.allows(&s.repo_uid));
+
+    // Changed symbols come directly from a successful `symbols_in_file[_in_repo]`
+    // lookup and have no scan-data fallback/enrichment path. Their empty UID is
+    // therefore positively resolved local ownership rather than unknown.
     result
         .changed_symbols
         .retain(|s| visible_only.allows(&s.repo_uid));
+    result.affected_symbol_count = result.affected_symbols.len();
 
-    // Map every display label (url and uid) to its repo_uid so an
-    // OrgImpactItem's `affected_repo` label can be resolved before the check.
-    let label_to_uid: HashMap<&str, &str> = repos
-        .iter()
-        .flat_map(|r| {
-            [
-                (r.url.as_str(), r.uid.as_str()),
-                (r.uid.as_str(), r.uid.as_str()),
-            ]
-        })
-        .collect();
-
-    // An org item is visible when its resolved repo_uid is allowed. A label we
-    // cannot resolve to a known repo is dropped — under an enabled policy we
-    // cannot prove it is visible, so we fail closed rather than leak it.
-    let item_visible = |affected_repo: &str| -> bool {
-        match label_to_uid.get(affected_repo) {
-            Some(uid) => visible_only.allows(uid),
-            None => false,
-        }
+    // Org items reference both a source/change repo and a destination/affected
+    // repo. Authorize exclusively by their stable UIDs: display URLs/names may
+    // collide and are presentation-only. Legacy items lack one or both UIDs and
+    // therefore fail closed under an enabled policy.
+    let item_visible = |item: &crate::blast_radius::OrgImpactItem| -> bool {
+        !item.change_repo_uid.is_empty()
+            && !item.affected_repo_uid.is_empty()
+            && visible_only.allows(&item.change_repo_uid)
+            && visible_only.allows(&item.affected_repo_uid)
     };
 
     if let Some(org) = result.org_wide.as_mut() {
-        org.breaking.retain(|i| item_visible(&i.affected_repo));
-        org.warnings.retain(|i| item_visible(&i.affected_repo));
-        org.info.retain(|i| item_visible(&i.affected_repo));
+        org.breaking.retain(&item_visible);
+        org.warnings.retain(&item_visible);
+        org.info.retain(&item_visible);
 
         // Recompute impacted_repos to the surviving visible display labels,
         // de-duplicated and order-preserving.
@@ -253,6 +249,24 @@ pub fn redact_blast_radius_for_visibility(
     // rather than emit numbers/names that encode hidden-repo membership.
     result.affected_clusters.clear();
 
+    // Co-change rows currently carry paths and cardinalities but no repo UID.
+    // Until the sidecar format can prove ownership, fail closed under scoping.
+    result.cochanged_files.clear();
+
+    // Notification detail may contain symbol names, paths, or raw store errors.
+    // Preserve the stable descriptor and severity for machine handling, retain
+    // the detail in server-side logs, and expose only a fixed generic message.
+    for notification in &mut result.notifications {
+        tracing::debug!(
+            descriptor = %notification.descriptor,
+            level = ?notification.level,
+            detail = %notification.message,
+            "redacting blast-radius notification detail for a restricted response"
+        );
+        notification.message =
+            "blast-radius analysis details withheld by repository visibility policy".to_string();
+    }
+
     // Regenerate the human summary from the REDACTED vecs. The baked-in string
     // embedded pre-redaction counts (transitively-affected + clusters), which
     // both disagreed with the redacted `affected_symbols` and leaked the
@@ -267,14 +281,14 @@ pub fn redact_blast_radius_for_visibility(
     result.summary = crate::blast_radius::render_blast_summary(
         result.changed_symbols.len(),
         changed_files,
-        result.affected_symbols.len(),
+        result.affected_symbol_count,
         result.affected_clusters.len(),
         result.risk_level,
         result.status,
     );
 
-    // risk_level, gate_state, status, blind_spots, analysis_direction,
-    // notifications, coverage.traversal_truncated: intentionally NOT redacted.
+    // risk_level, gate_state, status, blind_spots, analysis_direction, and
+    // coverage.traversal_truncated are intentionally NOT redacted.
     //
     // The gate verdict must reflect the TRUE risk of the change. Recomputing it
     // from only the visible subset could report "safe" while real impact lives in
@@ -336,10 +350,13 @@ pub fn classify_repo_listing(
 mod tests {
     use super::*;
     use crate::blast_radius::{
-        AffectedCluster, AffectedSymbol, ChangedSymbol, Coverage, OrgImpactItem, OrgWideImpact,
-        StaleRepo,
+        AffectedCluster, AffectedSymbol, AnalysisStatus, BlastRadiusOptions, ChangedSymbol,
+        CoChangedFile, Coverage, Notification, NotificationLevel, OrgImpactItem, OrgWideImpact,
+        StaleRepo, analyze_blast_radius,
     };
     use crate::process::RiskLevel;
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
 
     fn repo(uid: &str, url: &str) -> Repo {
         Repo {
@@ -372,7 +389,8 @@ mod tests {
         let v = only(&["repo:a"]);
         assert!(v.allows("repo:a"));
         assert!(!v.allows("repo:b"));
-        // Empty repo_uid (unresolved / local repo under review) is always kept.
+        // Empty repo_uid represents the local repo at this primitive layer.
+        // Ambiguous affected rows require provenance in the redactor itself.
         assert!(v.allows(""));
     }
 
@@ -527,20 +545,39 @@ mod tests {
             start_line: 1,
             impact_score: 1.0,
             repo_uid: repo_uid.to_string(),
+            ownership_resolved: true,
         }
     }
 
     fn org_item(affected_repo: &str) -> OrgImpactItem {
+        let affected_repo_uid = match affected_repo {
+            "github.com/acme/a" => "repo:a",
+            "github.com/acme/b" => "repo:b",
+            _ => "",
+        };
         OrgImpactItem {
             change_name: "c".to_string(),
             change_kind: "function".to_string(),
+            change_repo_uid: "repo:a".to_string(),
             affected_name: "a".to_string(),
+            affected_repo_uid: affected_repo_uid.to_string(),
             affected_repo: affected_repo.to_string(),
             affected_file: "f.rs".to_string(),
             affected_line: 1,
             severity: "warning".to_string(),
             reason: "r".to_string(),
         }
+    }
+
+    fn org_item_with_uids(
+        affected_repo: &str,
+        change_repo_uid: &str,
+        affected_repo_uid: &str,
+    ) -> OrgImpactItem {
+        let mut item = org_item(affected_repo);
+        item.change_repo_uid = change_repo_uid.to_string();
+        item.affected_repo_uid = affected_repo_uid.to_string();
+        item
     }
 
     fn sample_result() -> BlastRadiusResult {
@@ -555,6 +592,7 @@ mod tests {
                 affected("s:b", "repo:b"),
                 affected("s:local", ""),
             ],
+            affected_symbol_count: 3,
             affected_clusters: vec![],
             risk_level: RiskLevel::Medium,
             summary: "s".to_string(),
@@ -580,9 +618,87 @@ mod tests {
                 }],
                 traversal_truncated: false,
             },
+            cochanged_files: Vec::new(),
             blind_spots: vec![],
             analysis_direction: String::new(),
         }
+    }
+
+    fn ownership_store(
+        caller_name: &str,
+        caller_repo_uid: &str,
+        corrupt_lookup: bool,
+    ) -> GraphStore {
+        let store = GraphStore::in_memory().expect("in-memory store");
+        let symbol =
+            |uid: &str, name: &str, repo_uid: &str, file_path: &str, signature: &str| Symbol {
+                uid: uid.to_string(),
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: repo_uid.to_string(),
+                file_path: file_path.to_string(),
+                start_line: 1,
+                end_line: 2,
+                signature: signature.to_string(),
+                summary: None,
+                content_hash: format!("hash:{uid}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            };
+
+        store
+            .insert_repo(&repo("repo:visible", "https://example.test/visible"))
+            .unwrap();
+        if !caller_repo_uid.is_empty() {
+            store
+                .insert_repo(&repo(caller_repo_uid, "https://example.test/hidden"))
+                .unwrap();
+        }
+        store
+            .insert_symbol(&symbol(
+                "target",
+                "VisibleTarget",
+                "repo:visible",
+                "src/target.rs",
+                "fn VisibleTarget()",
+            ))
+            .unwrap();
+        let caller_file = if corrupt_lookup {
+            "hidden/lookup-miss.rs"
+        } else {
+            "src/local.rs"
+        };
+        let caller_signature = if corrupt_lookup {
+            "fn HiddenLookupMiss()\0"
+        } else {
+            "fn LocalResolved()"
+        };
+        store
+            .insert_symbol(&symbol(
+                "caller",
+                caller_name,
+                caller_repo_uid,
+                caller_file,
+                caller_signature,
+            ))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        store
     }
 
     fn sample_repos() -> Vec<Repo> {
@@ -685,6 +801,7 @@ mod tests {
             "summary must not leak pre-redaction counts, got: {}",
             result.summary
         );
+        assert_eq!(result.affected_symbol_count, 2);
     }
 
     #[test]
@@ -710,5 +827,209 @@ mod tests {
         result.org_wide.as_mut().unwrap().breaking.clear();
         redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
         assert!(result.org_wide.is_none());
+    }
+
+    #[test]
+    fn redact_only_requires_visible_source_and_destination_uids() {
+        let mut result = sample_result();
+        let org = result.org_wide.as_mut().unwrap();
+        org.breaking.clear();
+        org.warnings = vec![org_item_with_uids("github.com/acme/a", "repo:b", "repo:a")];
+        org.info.clear();
+        org.impacted_repos = vec!["github.com/acme/a".to_string()];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        assert!(
+            result.org_wide.is_none(),
+            "a visible destination must not expose a hidden source"
+        );
+    }
+
+    #[test]
+    fn redact_only_uses_destination_uid_when_repo_urls_collide() {
+        let repos = vec![
+            repo("repo:hidden", "github.com/acme/shared"),
+            repo("repo:visible", "github.com/acme/shared"),
+        ];
+        let mut result = sample_result();
+        let org = result.org_wide.as_mut().unwrap();
+        org.breaking.clear();
+        org.warnings = vec![org_item_with_uids(
+            "github.com/acme/shared",
+            "repo:visible",
+            "repo:hidden",
+        )];
+        org.info.clear();
+        org.impacted_repos = vec!["github.com/acme/shared".to_string()];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:visible"]), &repos);
+
+        assert!(
+            result.org_wide.is_none(),
+            "a duplicate display URL must not authorize the hidden destination"
+        );
+    }
+
+    #[test]
+    fn redact_only_drops_legacy_unattributed_org_items() {
+        let mut result = sample_result();
+        let mut legacy_value = serde_json::to_value(org_item("github.com/acme/a")).unwrap();
+        let legacy_object = legacy_value.as_object_mut().unwrap();
+        legacy_object.remove("change_repo_uid");
+        legacy_object.remove("affected_repo_uid");
+        let legacy_item = serde_json::from_value(legacy_value).unwrap();
+        let org = result.org_wide.as_mut().unwrap();
+        org.breaking.clear();
+        org.warnings = vec![legacy_item];
+        org.info.clear();
+        org.impacted_repos = vec!["github.com/acme/a".to_string()];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        assert!(result.org_wide.is_none());
+    }
+
+    #[test]
+    fn redact_only_clears_unqualified_cochange_rows() {
+        let mut result = sample_result();
+        result.cochanged_files = vec![CoChangedFile {
+            file: "hidden/private.sql".to_string(),
+            coupled_to: "hidden/source.rs".to_string(),
+            cochange_count: 8675309,
+            confidence: 0.99,
+            note: "hidden/private.sql changed with hidden/source.rs 8675309 times".to_string(),
+        }];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        assert!(result.cochanged_files.is_empty());
+    }
+
+    #[test]
+    fn redact_only_sanitizes_notification_messages_for_json_and_sarif() {
+        let mut result = sample_result();
+        result.status = AnalysisStatus::Degraded;
+        result.notifications = vec![Notification {
+            level: NotificationLevel::Error,
+            message: "impact failed for HiddenTarget at hidden/private.rs: raw-store-secret"
+                .to_string(),
+            descriptor: "store.impact-failed".to_string(),
+        }];
+
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+
+        let notification = &result.notifications[0];
+        assert_eq!(notification.level, NotificationLevel::Error);
+        assert_eq!(notification.descriptor, "store.impact-failed");
+        assert_eq!(
+            notification.message,
+            "blast-radius analysis details withheld by repository visibility policy"
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("HiddenTarget"));
+        assert!(!json.contains("hidden/private.rs"));
+        assert!(!json.contains("raw-store-secret"));
+
+        let sarif = crate::blast_radius_sarif::blast_radius_to_sarif(&result, "test");
+        let sarif_json = serde_json::to_string(&sarif).unwrap();
+        assert!(!sarif_json.contains("HiddenTarget"));
+        assert!(!sarif_json.contains("hidden/private.rs"));
+        assert!(!sarif_json.contains("raw-store-secret"));
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["descriptor"]["id"],
+            "store.impact-failed"
+        );
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["level"],
+            "error"
+        );
+    }
+
+    #[test]
+    fn redact_only_drops_affected_symbol_when_ownership_lookup_fails() {
+        let store = ownership_store("HiddenLookupMiss", "repo:hidden", true);
+        let mut result = analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from("src/target.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.affected_symbol_count, 1);
+        assert_eq!(result.affected_symbols[0].name, "HiddenLookupMiss");
+        assert_eq!(result.affected_symbols[0].repo_uid, "");
+
+        let repos = store.list_repos(None).unwrap();
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:visible"]), &repos);
+
+        assert!(result.affected_symbols.is_empty());
+        assert_eq!(result.affected_symbol_count, 0);
+        assert!(result.summary.contains("0 transitively affected"));
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("HiddenLookupMiss"));
+        assert!(!serialized.contains("hidden/lookup-miss.rs"));
+    }
+
+    #[test]
+    fn redact_only_keeps_affected_symbol_with_resolved_local_ownership() {
+        let store = ownership_store("LocalResolved", "", false);
+        let mut result = analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from("src/target.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let repos = store.list_repos(None).unwrap();
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:visible"]), &repos);
+
+        assert_eq!(result.affected_symbol_count, 1);
+        assert_eq!(result.affected_symbols[0].name, "LocalResolved");
+        assert_eq!(result.affected_symbols[0].repo_uid, "");
+    }
+
+    #[test]
+    fn redact_only_drops_deserialized_affected_symbol_without_provenance() {
+        let mut original = sample_result();
+        original.affected_symbols = vec![affected("legacy-visible", "repo:a")];
+        original.affected_symbol_count = 1;
+        let serialized = serde_json::to_value(original).unwrap();
+        assert!(
+            serialized["affected_symbols"][0]
+                .get("ownership_resolved")
+                .is_none()
+        );
+        let mut deserialized: BlastRadiusResult = serde_json::from_value(serialized).unwrap();
+        assert!(!deserialized.affected_symbols[0].ownership_resolved);
+
+        redact_blast_radius_for_visibility(&mut deserialized, &only(&["repo:a"]), &sample_repos());
+
+        assert!(deserialized.affected_symbols.is_empty());
+        assert_eq!(deserialized.affected_symbol_count, 0);
+    }
+
+    #[test]
+    fn redact_only_keeps_local_changed_symbol_from_successful_file_lookup() {
+        let store = ownership_store("LocalChanged", "", false);
+        let mut result = analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from("src/local.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.changed_symbols.len(), 1);
+
+        let repos = store.list_repos(None).unwrap();
+        redact_blast_radius_for_visibility(&mut result, &only(&[]), &repos);
+
+        assert_eq!(result.changed_symbols.len(), 1);
+        assert_eq!(result.changed_symbols[0].name, "LocalChanged");
+        assert_eq!(result.changed_symbols[0].repo_uid, "");
     }
 }

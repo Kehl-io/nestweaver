@@ -93,6 +93,7 @@ pub mod recency;
 pub mod registry;
 pub mod rerank;
 pub mod resolution_cache;
+pub mod rts_eval;
 pub mod scheduler;
 pub mod signature_diff;
 pub mod snapshot;
@@ -175,7 +176,8 @@ pub use eval::{
 pub use export::{export_cypher, export_graphml, export_mermaid};
 pub use export_graph::export_in_memory_graph;
 pub use extensions::{
-    ExtensionStore, InstanceExtensionMigration, InstanceMigrationFinalizerPlan,
+    AbortMigrationOutcome, ExtensionStore, InstanceExtensionMigration,
+    InstanceMigrationFinalizerPlan, abort_instance_extension_migration,
     finalize_instance_extension_migration, get_all_properties, get_last_indexed_at, get_property,
     load_extensions, load_live_extensions, mark_instance_extension_migration_graph_applied,
     mark_instance_extension_migration_reconciled, pending_instance_extension_migration,
@@ -251,7 +253,8 @@ pub use suggest::{
     materialize_declared_links, persist_cross_repo_links, suggest_links,
 };
 pub use summaries::{
-    Summary, SummaryLevel, SummaryStore, filter_by_target, generate_summaries, load_summaries,
+    DEFAULT_SYMBOL_SUMMARY_CAP, Summary, SummaryLevel, SummaryStore, SymbolSummaries,
+    filter_by_target, generate_summaries, generate_symbol_summaries_bounded, load_summaries,
     merge_and_save_summaries, render_text, save_summaries, truncate_to_budget,
 };
 pub use watch_code::CodeWatcher;

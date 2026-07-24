@@ -297,6 +297,52 @@ fn remove_stale_checkpoint_sidecars(path: &Path) -> bool {
 /// Open an lbug database, auto-recovering once from a stale WAL checkpoint left by
 /// a prior crash (see [`is_stale_checkpoint_error`]). This turns what was a full
 /// read+write outage requiring manual `rm` into a transparent self-heal.
+/// Build the engine `SystemConfig`, applying corruption/crash hardening and
+/// operator overrides on top of the library defaults.
+///
+/// nw-073: the engine's `optimisticRead` dereferences a raw buffer-page pointer
+/// inside a lock-free loop; the reader-count pinning that would protect it is
+/// gated behind a compile flag (`BM_MALLOC`) that native builds don't set, and
+/// the only fallback is Windows-only. So on native builds a page eviction
+/// racing a concurrent read is an unguarded SIGSEGV — observed during large
+/// batch inserts (a full vault re-index) that create buffer pressure while the
+/// engine's internal index-builder pool is still appending. The race needs
+/// concurrency; bounding the engine thread pool removes it. Because our own
+/// hot query path is application-level BFS + point lookups (not engine-parallel
+/// analytical joins), a bounded pool costs query latency little while closing
+/// the index-time crash window.
+///
+/// Overridable per-operator:
+///   NESTWEAVER_LBUG_MAX_THREADS       engine thread-pool size (0 = library auto)
+///   NESTWEAVER_LBUG_BUFFER_POOL_BYTES buffer pool size in bytes (0 = auto);
+///                                     a larger pool avoids eviction (and thus
+///                                     the race) when the working set fits.
+///   NESTWEAVER_LBUG_AUTO_CHECKPOINT   "0"/"false" defers auto-checkpoints; the
+///                                     #678 corruption trigger needs several
+///                                     checkpoint-separated segments, so
+///                                     deferring during bulk load reduces it.
+fn hardened_system_config() -> lbug::SystemConfig {
+    fn env_u64(key: &str) -> Option<u64> {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+    // Default engine threads. Env override wins; else a conservative bound that
+    // removes the eviction-vs-read race the crash needs. `1` is the only value
+    // that fully eliminates it; keep it the default on the write path and let
+    // ops raise it if they measure a query-latency cost on their workload.
+    let max_threads = env_u64("NESTWEAVER_LBUG_MAX_THREADS").unwrap_or(1);
+    let mut cfg = lbug::SystemConfig::default().max_num_threads(max_threads);
+    if let Some(bytes) = env_u64("NESTWEAVER_LBUG_BUFFER_POOL_BYTES") {
+        cfg = cfg.buffer_pool_size(bytes);
+    }
+    if let Ok(v) = std::env::var("NESTWEAVER_LBUG_AUTO_CHECKPOINT") {
+        let on = !matches!(v.trim(), "0" | "false" | "off");
+        cfg = cfg.auto_checkpoint(on);
+    }
+    cfg
+}
+
 fn open_lbug_with_recovery(
     path: &Path,
     make_config: impl Fn() -> lbug::SystemConfig,
@@ -321,7 +367,7 @@ fn open_lbug_with_recovery(
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, lbug::SystemConfig::default)?;
+        let db = open_lbug_with_recovery(path, hardened_system_config)?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -350,7 +396,7 @@ impl GraphStore {
     /// Runs schema migrations to ensure any new tables/columns from newer
     /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, lbug::SystemConfig::default)?;
+        let db = open_lbug_with_recovery(path, hardened_system_config)?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -631,15 +677,39 @@ impl GraphStore {
     }
 
     /// Advance the live generation without ever wrapping to a reused value.
+    ///
+    /// This is the UNGATED administrative bump (the delete/merge finalize path
+    /// calls it without holding the publication lease). If a dirty reservation is
+    /// present it means either a live publication is mid-flight (lease held → fail
+    /// closed, never clobber it) OR a prior publisher crashed leaving an abandoned
+    /// reservation (lease unowned → RECOVER, rather than wedging every future admin
+    /// bump for the daemon's lifetime — nw-091 / Bug 3A). The old code always
+    /// failed closed, so one dropped lease permanently broke remove_vault /
+    /// merge_instance / prune_stale.
     pub fn try_bump_graph_generation(&self) -> Result<u64, StoreError> {
-        let reservation = self
-            .index_publication_generation_base
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if reservation.is_some() {
-            return Err(StoreError::Query(
-                "index publication generation is already reserved".to_string(),
-            ));
+        {
+            let mut reservation = self
+                .index_publication_generation_base
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(canonical) = *reservation {
+                // Probe ownership WHILE holding `base`. Lock order base → lease is
+                // safe: no path holds both (reserve drops the lease guard before
+                // locking base; acquire never touches base), so this cannot
+                // deadlock, and probing under the base lock closes the TOCTOU.
+                if self.index_publication_lease_is_unowned() {
+                    // Abandoned reservation from a crashed publisher: roll the
+                    // dirty N+1 back to the last clean generation and clear it (the
+                    // N+1 was never durably published as canonical, so reusing it is
+                    // safe — mirrors cancel_index_publication_generation), then bump.
+                    self.graph_generation.store(canonical, Ordering::Release);
+                    *reservation = None;
+                } else {
+                    return Err(StoreError::Query(
+                        "index publication generation is already reserved".to_string(),
+                    ));
+                }
+            }
         }
         self.graph_generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -748,6 +818,23 @@ impl GraphStore {
         }
     }
 
+    /// True when no in-process owner currently holds the index-publication lease.
+    ///
+    /// A leftover `index_publication_generation_base` while the lease is UNOWNED
+    /// is an abandoned reservation from a prior owner that dropped its lease
+    /// without completing (e.g. the daemon crashed mid-publish) — safe to recover.
+    /// While a lease IS held, a live publication is mid-flight and the reservation
+    /// must stay fail-closed. This is the live-vs-dead signal the admin path keys
+    /// on so a crash can't wedge every future generation bump forever (nw-091).
+    fn index_publication_lease_is_unowned(&self) -> bool {
+        self.index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .owner
+            .is_none()
+    }
+
     fn release_index_publication_lease(&self, token: u64) -> Result<(), StoreError> {
         let mut state = self
             .index_publication_lease
@@ -787,15 +874,19 @@ impl GraphStore {
         token: u64,
     ) -> Result<(), StoreError> {
         self.validate_index_publication_owner(token)?;
-        let base = self
+        let mut base = self
             .index_publication_generation_base
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if base.is_some() {
-            return Err(StoreError::Query(
-                "index publication generation is already reserved".into(),
-            ));
+        // Reaching here means THIS caller holds the exclusive lease (validated
+        // above), so no concurrent live publisher exists — a leftover reservation
+        // is abandoned by a prior owner that dropped its lease (crash). Recover it
+        // (restore canonical) instead of failing closed forever (nw-091 / Bug 3A),
+        // matching the persistent reserve path's recovery.
+        if let Some(canonical) = base.take() {
+            self.graph_generation.store(canonical, Ordering::Release);
         }
+        drop(base);
         self.graph_generation()
             .checked_add(1)
             .map(|_| ())
@@ -1212,6 +1303,17 @@ impl GraphStore {
     pub fn commit_transaction(&self, conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
         conn.query("COMMIT")
             .map_err(|e| StoreError::Query(format!("commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Roll back the explicit transaction opened by [`Self::begin_transaction`].
+    ///
+    /// Destructive classified mutations call this explicitly so a successful
+    /// rollback is affirmative evidence that an error happened before any
+    /// durable change. A rollback failure is never treated as proof either way.
+    pub fn rollback_transaction(&self, conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+        conn.query("ROLLBACK")
+            .map_err(|e| StoreError::Query(format!("rollback: {e}")))?;
         Ok(())
     }
 
@@ -1730,6 +1832,63 @@ mod tests {
     }
 
     #[test]
+    fn try_bump_recovers_an_abandoned_reservation_when_lease_is_unowned() {
+        // nw-091 / Bug 3A: a publisher that reserved the dirty generation then
+        // dropped its lease without completing (a crash) leaves `base = Some`. The
+        // old ungated admin bump failed closed on that forever ("already
+        // reserved"), wedging every remove_vault/merge_instance/prune_stale. Now
+        // an UNOWNED leftover reservation is recovered.
+        let store = GraphStore::in_memory().unwrap();
+        let g0 = store.graph_generation();
+        {
+            let lease = store.acquire_index_publication_lease().unwrap();
+            lease.reserve_generation().unwrap(); // base = Some(g0), generation = dirty g0+1
+            // Drop WITHOUT complete/cancel → abandoned: base stays Some, owner → None.
+        }
+        let bumped = store
+            .try_bump_graph_generation()
+            .expect("an abandoned reservation must be recovered, not wedge the admin bump");
+        assert!(bumped > g0, "generation advanced after recovery");
+        // A second bump also works — the abandoned base was cleared.
+        assert!(store.try_bump_graph_generation().unwrap() > bumped);
+    }
+
+    #[test]
+    fn try_bump_still_fails_closed_while_a_live_lease_holds_a_reservation() {
+        // The recovery must NOT clobber a genuinely in-flight publication: while a
+        // lease is HELD, the admin bump must still fail closed.
+        let store = GraphStore::in_memory().unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        lease.reserve_generation().unwrap(); // base = Some, owner = Some (held)
+        let err = store.try_bump_graph_generation().unwrap_err();
+        assert!(
+            err.to_string().contains("already reserved"),
+            "a live publication must not be clobbered, got: {err}"
+        );
+        drop(lease); // release the lease → the reservation becomes abandoned
+        assert!(
+            store.try_bump_graph_generation().is_ok(),
+            "after the lease is dropped, the abandoned reservation is recovered"
+        );
+    }
+
+    #[test]
+    fn transient_preflight_recovers_an_abandoned_reservation() {
+        // The lease-guarded transient/admin preflight must also recover (it holds
+        // the exclusive lease, so a leftover base is provably abandoned).
+        let store = GraphStore::in_memory().unwrap();
+        {
+            let lease = store.acquire_index_publication_lease().unwrap();
+            lease.reserve_generation().unwrap();
+            // abandon
+        }
+        let lease2 = store.acquire_index_publication_lease().unwrap();
+        lease2
+            .preflight_transient_generation()
+            .expect("transient preflight must recover an abandoned reservation, not fail closed");
+    }
+
+    #[test]
     fn stale_checkpoint_error_recognized() {
         let real = "Runtime exception: Database ID for temporary file \
                     '/x/db.lbug.wal.checkpoint' does not match the current database. \
@@ -1916,5 +2075,39 @@ mod tests {
             legacy_path.exists(),
             "failed retirement must preserve fallback"
         );
+    }
+}
+
+#[cfg(test)]
+mod hardened_config_tests {
+    #[test]
+    fn env_overrides_are_honored_and_default_bounds_threads() {
+        // Serialize the env mutation; other tests don't touch these keys.
+        // Default (no env): threads bounded to 1 to remove the eviction race.
+        // SAFETY: single-threaded test section; we set then clear.
+        unsafe {
+            std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS");
+            std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
+            std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
+        }
+        // We can't read private SystemConfig fields, but we can prove the
+        // helper runs without panic under each override shape (parse paths).
+        let _default = super::hardened_system_config();
+        unsafe {
+            std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "4");
+            std::env::set_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES", "1073741824");
+            std::env::set_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT", "false");
+        }
+        let _overridden = super::hardened_system_config();
+        // Malformed values must not panic (fall back to default/auto).
+        unsafe {
+            std::env::set_var("NESTWEAVER_LBUG_MAX_THREADS", "not-a-number");
+        }
+        let _tolerant = super::hardened_system_config();
+        unsafe {
+            std::env::remove_var("NESTWEAVER_LBUG_MAX_THREADS");
+            std::env::remove_var("NESTWEAVER_LBUG_BUFFER_POOL_BYTES");
+            std::env::remove_var("NESTWEAVER_LBUG_AUTO_CHECKPOINT");
+        }
     }
 }

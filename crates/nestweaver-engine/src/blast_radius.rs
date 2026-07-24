@@ -48,6 +48,11 @@ pub struct AffectedSymbol {
     /// The repo_uid that owns this symbol (from the graph store).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub repo_uid: String,
+    /// Whether `repo_uid` came from an authoritative symbol lookup. Kept out
+    /// of serialized output so deserialized/legacy rows default to unknown and
+    /// cannot assert their own authorization provenance.
+    #[serde(skip)]
+    pub ownership_resolved: bool,
 }
 
 /// A cluster (community) that contains affected symbols.
@@ -80,7 +85,15 @@ pub struct OrgWideImpact {
 pub struct OrgImpactItem {
     pub change_name: String,
     pub change_kind: String,
+    /// Stable repo identity for the changed/source symbol. Authorization must
+    /// use this field rather than a display label.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub change_repo_uid: String,
     pub affected_name: String,
+    /// Stable repo identity for the affected/destination symbol. The
+    /// `affected_repo` field below is presentation-only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub affected_repo_uid: String,
     pub affected_repo: String,
     pub affected_file: String,
     pub affected_line: i32,
@@ -194,6 +207,10 @@ pub enum BlindSpot {
 pub struct BlastRadiusResult {
     pub changed_symbols: Vec<ChangedSymbol>,
     pub affected_symbols: Vec<AffectedSymbol>,
+    /// Total affected symbols before presentation limits, within the result's
+    /// current visibility scope.
+    #[serde(default)]
+    pub affected_symbol_count: usize,
     pub affected_clusters: Vec<AffectedCluster>,
     pub risk_level: RiskLevel,
     pub summary: String,
@@ -221,6 +238,11 @@ pub struct BlastRadiusResult {
     /// Categories of impact this static analysis cannot see.
     #[serde(default)]
     pub blind_spots: Vec<BlindSpot>,
+    /// Historically co-changing files for the changed set (advisory tier —
+    /// not part of risk scoring; empty when the cochange sidecar is absent,
+    /// disclosed via a `cochange-unavailable` note).
+    #[serde(default)]
+    pub cochanged_files: Vec<CoChangedFile>,
     /// How to read the result: static impact analysis over-approximates edges
     /// (it may report reachable-but-not-actually-affected symbols) while
     /// under-approximating the blind spots above.
@@ -228,12 +250,30 @@ pub struct BlastRadiusResult {
     pub analysis_direction: String,
 }
 
+/// A file historically coupled to a changed file via git co-change mining
+/// (Jaccard confidence), with no requirement of a static edge. Advisory:
+/// closes the logical-coupling blind spot (serializer/config/cross-language
+/// pairs) that the static graph cannot see.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoChangedFile {
+    /// The coupled file (the one NOT in the changed set).
+    pub file: String,
+    /// The changed file it historically ships with.
+    pub coupled_to: String,
+    /// Commits in which both changed together.
+    pub cochange_count: u32,
+    /// Jaccard coefficient of the pairing.
+    pub confidence: f32,
+    /// Human-readable framing.
+    pub note: String,
+}
+
 /// Derive the gate verdict from the run status and computed risk.
 ///
 /// NON-NEGOTIABLE rule: a run that did not complete is never `RiskFlagged`
 /// (we cannot trust an incomplete traversal to have found the risk), it is
 /// `DegradedUnknown`.
-fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState {
+pub(crate) fn derive_gate_state(status: AnalysisStatus, risk_level: RiskLevel) -> GateState {
     if status != AnalysisStatus::Complete {
         GateState::DegradedUnknown
     } else if matches!(risk_level, RiskLevel::High) {
@@ -264,6 +304,24 @@ pub(crate) fn render_blast_summary(
         summary.push_str(&format!(" [status: {}]", status.label()));
     }
     summary
+}
+
+/// Apply the presentation-only cap after analysis and any authorization
+/// redaction have established the result's visible total.
+pub fn apply_affected_symbol_limit(result: &mut BlastRadiusResult, limit: Option<usize>) {
+    if let Some(n) = limit
+        && result.affected_symbols.len() > n
+    {
+        let total = result.affected_symbol_count;
+        result.affected_symbols.truncate(n);
+        result.notifications.push(Notification {
+            level: NotificationLevel::Note,
+            message: format!(
+                "affected symbols truncated to {n} of {total} (raise `limit` for the full set)"
+            ),
+            descriptor: "results-truncated".to_string(),
+        });
+    }
 }
 
 /// Depth to which data-dependence edges (type references and field access)
@@ -396,43 +454,20 @@ pub fn analyze_blast_radius(
             }
         };
 
-        // A successful lookup that resolves 0 symbols is suspicious *only* when
-        // (a) we scoped to a repo the graph actually knows, and (b) the file is
-        // a recognized source file we would expect to have indexed. That points
-        // at path drift or a not-yet-reindexed source file. We deliberately stay
-        // silent for non-source files (docs, config, assets, lockfiles) — which
-        // most PRs touch — and when there is no target repo to judge against, so
-        // a healthy change never gates as degraded on benign files.
+        // A successful lookup that resolves 0 symbols is suspicious for any
+        // recognized source file: it may be new, the index may be stale, or the
+        // path may have drifted. Non-source files legitimately have no symbols.
         if syms.is_empty() {
-            let is_source = nestweaver_parser::detect_language(file).is_some();
-            if let Some(repo) = target_repo
-                && known_repo_uids.contains(repo)
-                && is_source
-            {
-                // Scoped to a known repo: a source file with no symbols is a real
-                // drift/stale signal — warn and degrade the run.
+            if nestweaver_parser::detect_language(file).is_some() {
                 notifications.push(Notification {
                     level: NotificationLevel::Warning,
                     message: format!(
-                        "changed file {file_str} mapped to 0 symbols (possible path-format \
-                         drift or unindexed file)"
+                        "changed source file {file_str} has no indexed symbols (new file, stale \
+                         index, or path drift) — its impact was not assessed"
                     ),
                     descriptor: "changed-file-no-symbols".to_string(),
                 });
                 status = status.max(AnalysisStatus::Partial);
-            } else if target_repo.is_none() && !known_repo_uids.is_empty() && is_source {
-                // Unscoped (e.g. pre-push CLI) against a non-empty index: a source
-                // file with no symbols is likely new or the index is stale. Inform
-                // without gating — new files are common and shouldn't degrade the
-                // verdict, but the reviewer should know its impact isn't assessed.
-                notifications.push(Notification {
-                    level: NotificationLevel::Note,
-                    message: format!(
-                        "changed source file {file_str} has no indexed symbols (new file or \
-                         stale index) — its impact was not assessed"
-                    ),
-                    descriptor: "changed-file-no-symbols".to_string(),
-                });
             }
             continue;
         }
@@ -448,6 +483,25 @@ pub fn analyze_blast_radius(
                     pagerank_score: sym.pagerank_score,
                     repo_uid: sym.repo_uid.clone(),
                 });
+            }
+        }
+    }
+
+    // nw-059: symbol rows never carry PageRank (it lives in the ranking
+    // cache/sidecar), so hydrate changed-symbol scores from the cache — else
+    // the centrality risk boost can never fire on a production DB. `ranks_len`
+    // (the graph size the scores normalize over) feeds the relative
+    // high-centrality threshold in Step 4; 0 means no cache was available.
+    let mut ranks_len: usize = 0;
+    if !changed_symbols.is_empty() {
+        store.ensure_pagerank_loaded();
+        let ranks = store.pagerank_scores();
+        if !ranks.is_empty() {
+            ranks_len = ranks.len();
+            for cs in &mut changed_symbols {
+                if let Some(r) = ranks.get(&cs.uid) {
+                    cs.pagerank_score = Some(*r);
+                }
             }
         }
     }
@@ -519,7 +573,7 @@ pub fn analyze_blast_radius(
     // kind/owning-repo lookup into ONE store query afterwards instead of N.
     // Buffering in first-seen order (the same order the old per-node path pushed
     // into `affected_symbols`) keeps the pre-sort ordering byte-identical.
-    let mut buffered: Vec<(ImpactNode, String, String)> = Vec::new();
+    let mut buffered: Vec<(ImpactNode, String, String, String)> = Vec::new();
 
     for cs in &changed_symbols {
         // Check the deadline before starting another symbol's traversal so a
@@ -573,7 +627,7 @@ pub fn analyze_blast_radius(
             // node plus its surfacing changed symbol; the kind/repo lookup is
             // deferred to a single batched query below.
             if affected_uids.insert(node.uid.clone()) {
-                buffered.push((node, cs.name.clone(), cs.kind.clone()));
+                buffered.push((node, cs.name.clone(), cs.kind.clone(), cs.repo_uid.clone()));
             }
         }
     }
@@ -582,7 +636,7 @@ pub fn analyze_blast_radius(
     // replacing the former N per-affected-node `lookup_symbol` round-trips.
     let uid_refs: Vec<&str> = buffered
         .iter()
-        .map(|(node, _, _)| node.uid.as_str())
+        .map(|(node, _, _, _)| node.uid.as_str())
         .collect();
     let lookup_map = match store.batch_lookup_symbols(&uid_refs) {
         Ok(map) => map,
@@ -604,7 +658,7 @@ pub fn analyze_blast_radius(
     // Second pass: rebuild affected_symbols (and the org-wide items) from the
     // buffered nodes + the batch lookup map, in the same first-seen order, so the
     // pre-sort output is identical to the old per-node path.
-    for (node, change_name, change_kind) in buffered {
+    for (node, change_name, change_kind, change_repo_uid) in buffered {
         let affected_sym = lookup_map.get(&node.uid);
         if affected_sym.is_none() {
             lookup_failures += 1;
@@ -623,7 +677,9 @@ pub fn analyze_blast_radius(
             let item = OrgImpactItem {
                 change_name,
                 change_kind,
+                change_repo_uid,
                 affected_name: node.name.clone(),
+                affected_repo_uid: affected_repo.clone(),
                 affected_repo: repo_label,
                 affected_file: node.file_path.clone(),
                 affected_line: node.start_line as i32,
@@ -652,6 +708,7 @@ pub fn analyze_blast_radius(
             start_line: node.start_line,
             impact_score: node.impact_score,
             repo_uid: affected_repo.clone(),
+            ownership_resolved: affected_sym.is_some(),
         });
     }
 
@@ -676,23 +733,10 @@ pub fn analyze_blast_radius(
             .then_with(|| a.uid.cmp(&b.uid))
     });
 
-    // R7: cap the returned set to the caller's `limit`, keeping the most-
-    // impactful symbols (already sorted). A display cap is a user request, not
-    // a failure, so it never escalates status — but the note carries the true
-    // total so a consumer knows the set was trimmed.
-    if let Some(n) = options.limit
-        && affected_symbols.len() > n
-    {
-        let total = affected_symbols.len();
-        affected_symbols.truncate(n);
-        notifications.push(Notification {
-            level: NotificationLevel::Note,
-            message: format!(
-                "affected symbols truncated to {n} of {total} (raise `limit` for the full set)"
-            ),
-            descriptor: "results-truncated".to_string(),
-        });
-    }
+    // The verdict inputs are snapshotted BEFORE any display cap: a `limit` is
+    // presentation, and a risk/gate verdict computed from a truncated set is
+    // non-safe by definition (Rothermel-Harrold; audit nw-058).
+    let total_affected = affected_symbols.len();
 
     // Step 3: Group by clusters if cluster data is available.
     let mut affected_clusters: Vec<AffectedCluster> = Vec::new();
@@ -725,13 +769,11 @@ pub fn analyze_blast_radius(
         }
     }
 
-    // Step 4: Score risk.
-    let total_affected = affected_symbols.len();
+    // Step 4: Score risk (from the pre-truncation `total_affected`).
     let clusters_touched = affected_clusters.len();
 
     // Factor in PageRank centrality: if high-centrality symbols are changed,
-    // bump the risk. Average PageRank of changed symbols; a score > 0.01
-    // is considered "high centrality" in a typical graph.
+    // bump the risk. Average PageRank of changed symbols.
     let avg_pagerank = if changed_symbols.is_empty() {
         0.0
     } else {
@@ -746,12 +788,27 @@ pub fn analyze_blast_radius(
         if count > 0 { sum / count as f64 } else { 0.0 }
     };
 
-    let risk_level = compute_risk_level(total_affected, clusters_touched, avg_pagerank);
+    // High centrality: the average changed-symbol PageRank clears 10x the
+    // graph mean (normalized scores sum to ~1 over ranks_len symbols, so the
+    // mean is 1/N and any absolute threshold is meaningless across graph
+    // sizes). Falls back to the legacy absolute 0.01 when no ranking cache
+    // exists. The boost is deliberately modest — the centrality-as-risk
+    // literature is positive but contested (Zimmermann 2008 vs TSE 2021).
+    // Capped at 0.5: on tiny graphs 10/N exceeds any possible score (they sum
+    // to ~1), but an avg holding >50% of the total rank mass is unambiguously
+    // central at any size.
+    let high_centrality = if ranks_len > 0 {
+        avg_pagerank > (10.0 / ranks_len as f64).min(0.5)
+    } else {
+        avg_pagerank > 0.01
+    };
+
+    let risk_level = compute_risk_level(total_affected, clusters_touched, high_centrality);
 
     let summary = render_blast_summary(
         changed_symbols.len(),
         changed_files.len(),
-        affected_symbols.len(),
+        total_affected,
         clusters_touched,
         risk_level,
         status,
@@ -862,9 +919,68 @@ pub fn analyze_blast_radius(
 
     let analysis_direction = "over-approximate".to_string();
 
-    Ok(BlastRadiusResult {
+    // Advisory co-change tier (nw-034): surface historically-coupled files
+    // the static graph can't see. Absence of the sidecar is disclosed but
+    // never degrades the run — this tier is a recall supplement, not a gate
+    // input (risk integration waits on the nw-037 measurement loop).
+    let mut cochanged_files: Vec<CoChangedFile> = Vec::new();
+    if let Some(db) = db_path {
+        let path = crate::sidecar_path(db, ".cochange.json");
+        match crate::cochange::load_cochange_sidecar(&path) {
+            Some(edges) => {
+                let changed_set: HashSet<&str> =
+                    changed_files.iter().filter_map(|p| p.to_str()).collect();
+                let mut seen: HashSet<(String, String)> = HashSet::new();
+                for e in &edges {
+                    let (coupled, changed) = if changed_set.contains(e.file_a.as_str())
+                        && !changed_set.contains(e.file_b.as_str())
+                    {
+                        (e.file_b.clone(), e.file_a.clone())
+                    } else if changed_set.contains(e.file_b.as_str())
+                        && !changed_set.contains(e.file_a.as_str())
+                    {
+                        (e.file_a.clone(), e.file_b.clone())
+                    } else {
+                        continue;
+                    };
+                    if seen.insert((coupled.clone(), changed.clone())) {
+                        cochanged_files.push(CoChangedFile {
+                            note: format!(
+                                "historically co-changes with {changed} ({} shared commits, \
+                                 Jaccard {:.2}) — no static edge required; verify it ships \
+                                 with this change",
+                                e.cochange_count, e.confidence
+                            ),
+                            file: coupled,
+                            coupled_to: changed,
+                            cochange_count: e.cochange_count,
+                            confidence: e.confidence,
+                        });
+                    }
+                }
+                cochanged_files.sort_by(|a, b| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.file.cmp(&b.file))
+                });
+            }
+            None => {
+                notifications.push(Notification {
+                    level: NotificationLevel::Note,
+                    message: "co-change history unavailable (no .cochange.json sidecar) — \
+                              historically-coupled files are not represented"
+                        .to_string(),
+                    descriptor: "cochange-unavailable".to_string(),
+                });
+            }
+        }
+    }
+
+    let mut result = BlastRadiusResult {
         changed_symbols,
         affected_symbols,
+        affected_symbol_count: total_affected,
         affected_clusters,
         risk_level,
         summary,
@@ -874,8 +990,11 @@ pub fn analyze_blast_radius(
         gate_state,
         coverage,
         blind_spots,
+        cochanged_files,
         analysis_direction,
-    })
+    };
+    apply_affected_symbol_limit(&mut result, options.limit);
+    Ok(result)
 }
 
 /// Classify a cross-repo impact by its decayed impact score.
@@ -892,10 +1011,12 @@ fn classify_org_severity(impact_score: f64) -> &'static str {
 }
 
 /// Compute risk level based on affected count, clusters, and centrality.
+/// `high_centrality` is decided at the call site (relative to the graph-mean
+/// PageRank when a ranking cache exists) so this stays a pure bucketing fn.
 fn compute_risk_level(
     affected_count: usize,
     clusters_touched: usize,
-    avg_pagerank: f64,
+    high_centrality: bool,
 ) -> RiskLevel {
     // Base risk from affected symbol count:
     //   <10 = Low (0), 10-50 = Medium (1), 50-200 = High (2), >200 = High (3)
@@ -906,8 +1027,8 @@ fn compute_risk_level(
         _ => 3,
     };
 
-    // Boost for high-centrality symbols (avg PageRank > 0.01).
-    let centrality_boost = if avg_pagerank > 0.01 { 1 } else { 0 };
+    // Boost for changes touching high-centrality symbols.
+    let centrality_boost = if high_centrality { 1 } else { 0 };
 
     // Boost for touching many clusters (>3 clusters).
     let cluster_boost = if clusters_touched > 3 { 1 } else { 0 };
@@ -1002,34 +1123,34 @@ mod tests {
 
     #[test]
     fn compute_risk_level_low() {
-        assert_eq!(compute_risk_level(5, 1, 0.001), RiskLevel::Low);
+        assert_eq!(compute_risk_level(5, 1, false), RiskLevel::Low);
     }
 
     #[test]
     fn compute_risk_level_medium_by_count() {
-        assert_eq!(compute_risk_level(25, 1, 0.001), RiskLevel::Medium);
+        assert_eq!(compute_risk_level(25, 1, false), RiskLevel::Medium);
     }
 
     #[test]
     fn compute_risk_level_high_by_count() {
-        assert_eq!(compute_risk_level(100, 1, 0.001), RiskLevel::High);
+        assert_eq!(compute_risk_level(100, 1, false), RiskLevel::High);
     }
 
     #[test]
     fn compute_risk_level_critical_by_count() {
-        assert_eq!(compute_risk_level(300, 1, 0.001), RiskLevel::High);
+        assert_eq!(compute_risk_level(300, 1, false), RiskLevel::High);
     }
 
     #[test]
     fn compute_risk_level_boosted_by_centrality() {
         // 25 affected would be Medium, but high centrality bumps it to High
-        assert_eq!(compute_risk_level(25, 1, 0.05), RiskLevel::High);
+        assert_eq!(compute_risk_level(25, 1, true), RiskLevel::High);
     }
 
     #[test]
     fn compute_risk_level_boosted_by_clusters() {
         // 25 affected would be Medium, but >3 clusters bumps it to High
-        assert_eq!(compute_risk_level(25, 5, 0.001), RiskLevel::High);
+        assert_eq!(compute_risk_level(25, 5, false), RiskLevel::High);
     }
 
     #[test]
@@ -1110,6 +1231,11 @@ mod tests {
             "empty index must surface an index-empty notification: {:?}",
             result.notifications
         );
+        assert!(result.notifications.iter().any(|n| {
+            n.level == NotificationLevel::Warning
+                && n.descriptor == "changed-file-no-symbols"
+                && n.message.contains("nonexistent.rs")
+        }));
     }
 
     #[test]
@@ -1197,9 +1323,11 @@ mod tests {
         assert_eq!(result.changed_symbols[0].name, "fn_a");
         assert_eq!(result.affected_symbols.len(), 1);
         assert_eq!(result.affected_symbols[0].name, "fn_b");
-        // fn_a has pagerank_score=0.5 (high centrality), which boosts
-        // the risk from Low to Medium even with only 1 affected symbol.
-        assert_eq!(result.risk_level, RiskLevel::Medium);
+        // With a live ranking cache, centrality is judged RELATIVE to the
+        // graph mean (nw-059). This 2-node in-memory graph computes uniform
+        // ranks, so the changed symbol is exactly average — no boost, and the
+        // hand-set row score (0.5) is superseded by the cache hydration.
+        assert_eq!(result.risk_level, RiskLevel::Low);
 
         // Verify impact_score is populated: sym_b calls sym_a with confidence 0.9,
         // so impact_score should be 1.0 * 0.9 = 0.9.
@@ -1286,6 +1414,15 @@ mod tests {
                 .any(|i| i.affected_name == "Caller" && i.affected_repo == "repo:client"),
             "org-wide item should describe the cross-repo consumer"
         );
+        let item = org
+            .breaking
+            .iter()
+            .chain(&org.warnings)
+            .chain(&org.info)
+            .find(|i| i.affected_name == "Caller")
+            .expect("cross-repo item");
+        assert_eq!(item.change_repo_uid, "repo:api");
+        assert_eq!(item.affected_repo_uid, "repo:client");
     }
 
     #[test]
@@ -1884,6 +2021,41 @@ mod tests {
     }
 
     #[test]
+    fn unscoped_changed_source_without_symbols_is_unknown() {
+        use nestweaver_schema::Repo;
+
+        let store = GraphStore::in_memory().expect("store");
+        store
+            .insert_repo(&Repo {
+                uid: "repo:1".to_string(),
+                url: "https://example.com/repo".to_string(),
+                indexed_sha: "abc123".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst-1".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .expect("insert repo");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/new_module.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .expect("analysis");
+
+        assert_eq!(result.status, AnalysisStatus::Partial);
+        assert_eq!(result.gate_state, GateState::DegradedUnknown);
+        assert!(result.notifications.iter().any(|n| {
+            n.level == NotificationLevel::Warning
+                && n.descriptor == "changed-file-no-symbols"
+                && n.message.contains("src/new_module.rs")
+        }));
+    }
+
+    #[test]
     fn coverage_reports_repos_in_scope_and_direction() {
         use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
 
@@ -2278,6 +2450,254 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn insert_minimal_symbol(store: &GraphStore, uid: &str, name: &str, file: &str) {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+        store
+            .insert_symbol(&Symbol {
+                uid: uid.into(),
+                name: name.into(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:1".into(),
+                file_path: file.into(),
+                start_line: 1,
+                end_line: 1,
+                signature: format!("fn {name}()"),
+                summary: None,
+                content_hash: format!("h_{uid}"),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .expect("insert symbol");
+    }
+
+    #[test]
+    fn cochange_sidecar_surfaces_coupled_files() {
+        use crate::cochange::{CoChangeEdge, save_cochange_sidecar};
+        let store = GraphStore::in_memory().expect("store");
+        insert_minimal_symbol(&store, "sym:bill", "compute_total", "src/billing.rs");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("scratch.lbug");
+        std::fs::write(&db, b"").expect("touch db");
+        let edges = vec![CoChangeEdge {
+            file_a: "src/billing.rs".into(),
+            file_b: "src/invoice_templates.sql".into(),
+            cochange_count: 9,
+            total_commits_a: 12,
+            total_commits_b: 10,
+            confidence: 0.69,
+        }];
+        save_cochange_sidecar(&edges, &crate::sidecar_path(&db, ".cochange.json"))
+            .expect("save sidecar");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/billing.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            Some(&db),
+        )
+        .expect("analyze");
+
+        assert_eq!(result.cochanged_files.len(), 1);
+        let c = &result.cochanged_files[0];
+        assert_eq!(c.file, "src/invoice_templates.sql");
+        assert_eq!(c.coupled_to, "src/billing.rs");
+        assert_eq!(c.cochange_count, 9);
+        assert!((c.confidence - 0.69).abs() < 1e-6);
+        assert!(c.note.contains("no static edge"));
+    }
+
+    #[test]
+    fn missing_cochange_sidecar_emits_honesty_note_not_error() {
+        let store = GraphStore::in_memory().expect("store");
+        insert_minimal_symbol(&store, "sym:bill", "compute_total", "src/billing.rs");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("scratch.lbug");
+        std::fs::write(&db, b"").expect("touch db");
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/billing.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            Some(&db),
+        )
+        .expect("analyze");
+        assert!(result.cochanged_files.is_empty());
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "cochange-unavailable"),
+            "absent sidecar must be disclosed, not silent: {:?}",
+            result.notifications
+        );
+        // Advisory tier: absence never degrades the run.
+        assert_eq!(result.status, AnalysisStatus::Complete);
+    }
+
+    #[test]
+    fn limit_does_not_deflate_risk_or_gate() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let store = GraphStore::in_memory().expect("store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.into(),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".into(),
+            file_path: file.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_symbol(&mk("target", "fn_target", "src/target.rs"))
+            .unwrap();
+        for i in 0..60 {
+            let uid = format!("c{i}");
+            store
+                .insert_symbol(&mk(&uid, &format!("fn_c{i}"), &format!("src/c{i}.rs")))
+                .unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid,
+                    target_uid: "target".into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        let files = [PathBuf::from("src/target.rs")];
+        let no_limit = analyze_blast_radius(
+            &store,
+            &files,
+            &BlastRadiusOptions {
+                limit: None,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let with_limit = analyze_blast_radius(
+            &store,
+            &files,
+            &BlastRadiusOptions {
+                limit: Some(5),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(no_limit.risk_level, RiskLevel::High);
+        assert_eq!(no_limit.gate_state, GateState::RiskFlagged);
+        // A display cap must never change the verdict (safe-RTS: verdicts from
+        // truncated sets are non-safe by definition).
+        assert_eq!(with_limit.risk_level, no_limit.risk_level);
+        assert_eq!(with_limit.gate_state, no_limit.gate_state);
+        assert_eq!(with_limit.summary, no_limit.summary);
+        assert_eq!(with_limit.affected_symbol_count, 60);
+        assert_eq!(
+            with_limit.affected_symbols.len(),
+            5,
+            "display cap still applies"
+        );
+        // The human summary must report the TRUE total, not the capped count.
+        assert!(
+            with_limit.summary.contains("60 transitively affected"),
+            "summary must carry the pre-cap total, got: {}",
+            with_limit.summary
+        );
+    }
+
+    #[test]
+    fn changed_symbol_pagerank_hydrates_from_cache() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let store = GraphStore::in_memory().expect("store");
+        let mk = |uid: &str, name: &str, file: &str| Symbol {
+            uid: uid.into(),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".into(),
+            file_path: file.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            // Rows carry no score — the production shape (scores live only in
+            // the ranking cache/sidecar).
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store
+            .insert_symbol(&mk("hub", "hub_fn", "src/hub.rs"))
+            .unwrap();
+        for i in 0..5 {
+            let uid = format!("caller{i}");
+            store
+                .insert_symbol(&mk(
+                    &uid,
+                    &format!("caller_fn{i}"),
+                    &format!("src/caller{i}.rs"),
+                ))
+                .unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid,
+                    target_uid: "hub".into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store.ensure_pagerank_loaded();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/hub.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let hub = result
+            .changed_symbols
+            .iter()
+            .find(|s| s.uid == "hub")
+            .expect("hub in changed set");
+        assert!(
+            hub.pagerank_score.unwrap_or(0.0) > 0.0,
+            "changed-symbol pagerank must hydrate from the cache (row value is None): {:?}",
+            hub.pagerank_score
         );
     }
 

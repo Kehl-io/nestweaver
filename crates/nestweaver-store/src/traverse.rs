@@ -1,10 +1,61 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use nestweaver_schema::{EdgeType, SymbolKind};
 
 use crate::db::GraphStore;
 use crate::error::StoreError;
 use crate::ranking::{PathDeboostRule, SeedResolutionConfig};
+use crate::tantivy_index::SearchTotal;
+
+/// Maximum precision of symbol-match totals. Ranking still scans the cached
+/// symbol snapshot so late high-quality hits are not missed, but only the
+/// caller-requested top results are retained. Reaching this cap reports a
+/// lower bound instead of an unbounded exact-match collection.
+pub const SYMBOL_SEARCH_COUNT_CAP: usize = 100_000;
+
+/// A ranked symbol page with an independently bounded match total.
+#[derive(Debug, Clone)]
+pub struct SymbolSearchPage {
+    pub symbols: Vec<nestweaver_schema::Symbol>,
+    pub total: SearchTotal,
+}
+
+struct RankedSymbol<'a> {
+    adjusted_score: f64,
+    kind_rank: usize,
+    file_path: &'a str,
+    ordinal: usize,
+    symbol: &'a nestweaver_schema::Symbol,
+}
+
+impl PartialEq for RankedSymbol<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for RankedSymbol<'_> {}
+
+impl PartialOrd for RankedSymbol<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedSymbol<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // "Less" means better-ranked. BinaryHeap therefore keeps the worst
+        // retained candidate at peek(), making bounded top-K replacement O(log K).
+        other
+            .adjusted_score
+            .partial_cmp(&self.adjusted_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.kind_rank.cmp(&other.kind_rank))
+            .then_with(|| self.file_path.cmp(other.file_path))
+            // Preserve stable DB/cache order for otherwise identical keys.
+            .then_with(|| self.ordinal.cmp(&other.ordinal))
+    }
+}
 
 /// Compute the multiplicative path-factor for a symbol's `file_path` against
 /// a list of [`PathDeboostRule`]s. Matching rules multiply; factor=1.0 when
@@ -67,7 +118,17 @@ pub(crate) struct SymbolNameCached {
 
 /// Minimum impact score for a node to be included in traversal results.
 /// Edges below this threshold are pruned during BFS.
-const DEFAULT_IMPACT_THRESHOLD: f64 = 0.10;
+///
+/// Deliberately aggressive: at 0.10 a depth-4 chain of 0.5-confidence edges
+/// (score 0.0625) is pruned. That default is kept — not lowered — because the
+/// multiplicative decay means genuinely-attributable impact fades fast, the
+/// prune bounds BFS fan-out on dense graphs, and the value is mirrored by the
+/// in-memory walk (`affected_tests::IMPACT_THRESHOLD`) so the two must not
+/// drift. The trade-off is surfaced, not hidden: a prune sets
+/// [`ImpactResult::truncated_by_threshold`], and callers that need the full
+/// traversal can opt out via [`GraphStore::impact_with_flags_and_threshold`]
+/// (CLI: `impact --min-score 0`).
+pub const DEFAULT_IMPACT_THRESHOLD: f64 = 0.10;
 
 /// A node returned by the impact analysis traversal.
 #[derive(Debug, Clone)]
@@ -126,7 +187,11 @@ struct CallerRow {
     confidence: f32,
 }
 
-const IMPACT_EDGE_TYPES: &[EdgeType] = &[
+/// Structural reverse-impact edge set. The confidence-weighted reverse BFS
+/// (`impact_bfs`) and any in-memory equivalent (e.g. `affected_tests`) must use
+/// exactly this set, so it is public to keep the two implementations from
+/// drifting.
+pub const IMPACT_EDGE_TYPES: &[EdgeType] = &[
     EdgeType::Calls,
     EdgeType::Imports,
     EdgeType::Extends,
@@ -186,6 +251,63 @@ impl GraphStore {
             .nodes)
     }
 
+    /// Like [`impact_cancellable`](Self::impact_cancellable), but traverses only
+    /// the subgraph induced by `allowed_symbols`. Disallowed callers are not
+    /// returned or expanded, so an allowed node reachable only through a
+    /// disallowed intermediate cannot reveal that hidden topology.
+    #[deprecated(
+        note = "drops the truncation-honesty flags (threshold/depth pruning) from the \
+                underlying ImpactResult; use `impact_with_flags_within` instead so callers \
+                can see when the walk was pruned"
+    )]
+    pub fn impact_cancellable_within(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        allowed_symbols: &HashSet<String>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<ImpactNode>, StoreError> {
+        Ok(self
+            .impact_bfs(
+                target_uid,
+                max_depth,
+                min_confidence,
+                IMPACT_EDGE_TYPES,
+                &[],
+                0,
+                DEFAULT_IMPACT_THRESHOLD,
+                Some(allowed_symbols),
+                cancel,
+            )?
+            .nodes)
+    }
+
+    /// Scoped impact (authz allow-list) returning the full ImpactResult with
+    /// truncation-honesty flags — the flags-dropping `impact_cancellable_within`
+    /// hides threshold pruning from callers (surfaced as a silent-floor bug
+    /// in the CLI/MCP impact paths).
+    pub fn impact_with_flags_within(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        allowed_symbols: &HashSet<String>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            IMPACT_EDGE_TYPES,
+            &[],
+            0,
+            DEFAULT_IMPACT_THRESHOLD,
+            Some(allowed_symbols),
+            cancel,
+        )
+    }
+
     /// Impact with the default edge set, returning the ImpactResult (with
     /// truncation-honesty flags). Convenience over `impact_detailed`.
     pub fn impact_with_flags(
@@ -200,6 +322,33 @@ impl GraphStore {
             max_depth,
             min_confidence,
             IMPACT_EDGE_TYPES,
+            cancel,
+        )
+    }
+
+    /// Like [`impact_with_flags`](Self::impact_with_flags), but with an explicit
+    /// score-pruning threshold instead of [`DEFAULT_IMPACT_THRESHOLD`]. Pass
+    /// `0.0` to disable score pruning entirely and get the full traversal
+    /// (bounded only by `max_depth`); the `truncated_by_threshold` flag then
+    /// never fires. Intended for the CLI `--min-score` opt-out — the default
+    /// threshold stays in place everywhere else (see its doc comment).
+    pub fn impact_with_flags_and_threshold(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        threshold: f64,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            IMPACT_EDGE_TYPES,
+            &[],
+            0,
+            threshold,
+            None,
             cancel,
         )
     }
@@ -223,7 +372,17 @@ impl GraphStore {
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
         // Structural-only walk: no data-dependence edges (empty set, cap 0).
-        self.impact_bfs(target_uid, max_depth, min_confidence, edges, &[], 0, cancel)
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            edges,
+            &[],
+            0,
+            DEFAULT_IMPACT_THRESHOLD,
+            None,
+            cancel,
+        )
     }
 
     /// Impact with the structural edge set (to `max_depth`) plus data-dependence
@@ -245,6 +404,8 @@ impl GraphStore {
             IMPACT_EDGE_TYPES,
             IMPACT_DATA_EDGE_TYPES,
             data_max_depth,
+            DEFAULT_IMPACT_THRESHOLD,
+            None,
             cancel,
         )
     }
@@ -259,6 +420,10 @@ impl GraphStore {
     /// combined edge slice is precomputed once and selected per depth: combined
     /// while `d < data_max_depth`, structural-only beyond. When `data` is empty
     /// or `data_max_depth == 0` this is byte-for-byte the structural-only walk.
+    /// `min_score` is the score-pruning threshold: a path whose decayed score
+    /// falls below it is pruned (and flags `truncated_by_threshold`). All
+    /// existing entry points pass [`DEFAULT_IMPACT_THRESHOLD`]; pass `0.0` to
+    /// disable score pruning.
     #[allow(clippy::too_many_arguments)]
     fn impact_bfs(
         &self,
@@ -268,6 +433,8 @@ impl GraphStore {
         structural: &[EdgeType],
         data: &[EdgeType],
         data_max_depth: u32,
+        min_score: f64,
+        allowed_symbols: Option<&HashSet<String>>,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
         // Whether the shallow data tier is actually in play for this walk.
@@ -301,6 +468,15 @@ impl GraphStore {
         let mut truncated_by_threshold = false;
         let mut truncated_by_depth = false;
 
+        // nw-065: one connection and one prepared statement per edge type for
+        // the WHOLE traversal. Previously each visited node created a
+        // connection and re-prepared every statement, which dominated
+        // traversal cost. Prepare the union of structural+data edges; the
+        // per-depth edge slice still selects which are actually followed.
+        let prepare_set: &[EdgeType] = if data_active { &combined } else { structural };
+        let conn = self.conn()?;
+        let mut stmts = Self::prepare_caller_stmts(&conn, prepare_set);
+
         while let Some((current_uid, depth)) = queue.pop_front() {
             if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                 // The shared cancel flag is a bare bool and can't carry a
@@ -324,18 +500,27 @@ impl GraphStore {
             } else {
                 structural
             };
-            let callers = self.direct_callers_of(&current_uid, min_confidence, edges)?;
+            let callers = Self::direct_callers_prepared(
+                &conn,
+                &mut stmts,
+                &current_uid,
+                min_confidence,
+                edges,
+            );
 
             for row in callers {
                 // Skip the seed node itself.
                 if row.uid == target_uid {
                     continue;
                 }
+                if allowed_symbols.is_some_and(|allowed| !allowed.contains(&row.uid)) {
+                    continue;
+                }
 
                 let candidate_score = parent_score * row.confidence as f64;
 
                 // Prune paths that fall below the impact threshold.
-                if candidate_score < DEFAULT_IMPACT_THRESHOLD {
+                if candidate_score < min_score {
                     truncated_by_threshold = true;
                     continue;
                 }
@@ -366,6 +551,37 @@ impl GraphStore {
         }
 
         let mut results: Vec<ImpactNode> = result_map.into_values().collect();
+
+        // Repair display fields from PRIMARY-KEY point lookups.
+        //
+        // The traversal reads caller rows through a pattern scan, and the
+        // storage engine can return garbled non-PK string values from partial
+        // string scans after delete+checkpoint cycles (which re-indexing
+        // performs routinely) — while PK point lookups return the correct
+        // values for the very same rows. `uid` is the primary key and is
+        // therefore trustworthy; `name`/`file_path` are not. Re-resolve them
+        // through the PK-driven batch lookup so no consumer of impact results
+        // (blast radius, affected tests, flow trace) can surface corrupted
+        // symbol names. One batched query per traversal.
+        if !results.is_empty() {
+            let uids: Vec<&str> = results.iter().map(|n| n.uid.as_str()).collect();
+            match self.batch_lookup_symbols(&uids) {
+                Ok(map) => {
+                    for node in results.iter_mut() {
+                        if let Some(sym) = map.get(&node.uid) {
+                            node.name = sym.name.clone();
+                            node.file_path = sym.file_path.clone();
+                            node.start_line = sym.start_line;
+                        }
+                    }
+                }
+                // Non-fatal: the traversal result is still valid, display
+                // fields just keep their scan-provided values.
+                Err(e) => {
+                    tracing::warn!("impact: display-field repair lookup failed: {e}");
+                }
+            }
+        }
         // Sort by impact_score descending; break ties by uid for determinism.
         results.sort_by(|a, b| {
             b.impact_score
@@ -392,35 +608,31 @@ impl GraphStore {
 
     /// Internal: fetch all direct callers of `uid` across
     /// CALLS/IMPORTS/EXTENDS_SYM/IMPLEMENTS_SYM/INCLUDES_SYM/CROSS_REPO_LINK.
-    fn direct_callers_of(
-        &self,
+    /// Like [`direct_callers_of`], but reuses a caller-supplied connection and
+    /// prepared statements instead of creating a connection and re-preparing
+    /// one statement per edge type on EVERY call.
+    ///
+    /// `impact_bfs` calls this once per visited node, so this setup is paid
+    /// once per traversal instead of once per node (nw-065).
+    fn direct_callers_prepared(
+        conn: &lbug::Connection<'_>,
+        stmts: &mut [(String, lbug::PreparedStatement)],
         uid: &str,
         min_confidence: f32,
         edges: &[EdgeType],
-    ) -> Result<Vec<CallerRow>, StoreError> {
-        let conn = self.conn()?;
+    ) -> Vec<CallerRow> {
         let min_conf = min_confidence as f64;
         let mut rows: Vec<CallerRow> = Vec::new();
-
-        for edge_type in edges.iter().map(|edge_type| edge_type.rel_table_name()) {
-            let q = format!(
-                "MATCH (s:Symbol)-[r:{et}]->(t:Symbol {{uid: $uid}}) \
-                 WHERE r.confidence >= $min_conf \
-                 RETURN s.uid, s.name, s.file_path, s.start_line, r.confidence",
-                et = edge_type,
-            );
-
-            let mut stmt = match conn.prepare(&q) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::trace!(
-                        "impact: edge type {edge_type} skipped (table may not exist): {e}"
-                    );
-                    continue;
-                }
-            };
+        for (edge_label, stmt) in stmts.iter_mut() {
+            // Only follow the edge types active at this depth.
+            if !edges
+                .iter()
+                .any(|e| e.rel_table_name() == edge_label.as_str())
+            {
+                continue;
+            }
             let result = match conn.execute(
-                &mut stmt,
+                stmt,
                 vec![
                     ("uid", lbug::Value::String(uid.to_string())),
                     ("min_conf", lbug::Value::Double(min_conf)),
@@ -428,14 +640,20 @@ impl GraphStore {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::trace!("impact: edge type {edge_type} query failed: {e}");
+                    tracing::trace!("impact: edge type {edge_label} query failed: {e}");
                     continue;
                 }
             };
-
             for row in result {
                 use lbug::Value;
                 let caller_uid = match &row[0] {
+                    // caller_uid is a scan-projected string and can be garbled
+                    // by the engine's partial-scan corruption (#678). It is the
+                    // NAVIGATIONAL key — following a garbled uid would add a
+                    // phantom node the PK repair can never resolve — so skip a
+                    // corrupt row rather than walk into garbage. name/file_path
+                    // are re-resolved from PK lookups after the walk regardless.
+                    Value::String(s) if crate::read::string_is_corrupt(s) => continue,
                     Value::String(s) => s.clone(),
                     _ => continue,
                 };
@@ -457,23 +675,46 @@ impl GraphStore {
                     Value::Double(f) => *f as f32,
                     _ => 0.0,
                 };
-
                 rows.push(CallerRow {
                     uid: caller_uid,
                     name,
                     file_path,
                     start_line,
-                    edge_type: edge_type.to_string(),
+                    edge_type: edge_label.clone(),
                     confidence,
                 });
             }
         }
-
-        Ok(rows)
+        rows
     }
 
-    /// Return outgoing edges that use the same relationship types as impact
-    /// traversal.
+    /// Prepare one caller-lookup statement per edge type, for reuse across a
+    /// whole traversal. Edge types whose relationship table does not exist are
+    /// skipped (same tolerance as the per-call path).
+    fn prepare_caller_stmts(
+        conn: &lbug::Connection<'_>,
+        edges: &[EdgeType],
+    ) -> Vec<(String, lbug::PreparedStatement)> {
+        let mut out = Vec::new();
+        for edge_type in edges.iter().map(|e| e.rel_table_name()) {
+            let q = format!(
+                "MATCH (s:Symbol)-[r:{et}]->(t:Symbol {{uid: $uid}}) \
+                 WHERE r.confidence >= $min_conf \
+                 RETURN s.uid, s.name, s.file_path, s.start_line, r.confidence",
+                et = edge_type,
+            );
+            match conn.prepare(&q) {
+                Ok(stmt) => out.push((edge_type.to_string(), stmt)),
+                Err(e) => {
+                    tracing::trace!(
+                        "impact: edge type {edge_type} skipped (table may not exist): {e}"
+                    );
+                }
+            }
+        }
+        out
+    }
+
     pub fn outgoing_impact_edges(
         &self,
         source_uid: &str,
@@ -634,7 +875,27 @@ impl GraphStore {
         limit: usize,
         seed_resolution: &SeedResolutionConfig,
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
-        self.search_symbols_by_name_impl(query, limit, seed_resolution, || {}, || {})
+        Ok(self
+            .search_symbols_by_name_page(query, limit, seed_resolution)?
+            .symbols)
+    }
+
+    /// Counted symbol-name search. Result retention is bounded by `limit`, and
+    /// total precision is bounded by [`SYMBOL_SEARCH_COUNT_CAP`].
+    pub fn search_symbols_by_name_page(
+        &self,
+        query: &str,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+    ) -> Result<SymbolSearchPage, StoreError> {
+        self.search_symbols_by_name_page_impl(
+            query,
+            limit,
+            seed_resolution,
+            SYMBOL_SEARCH_COUNT_CAP,
+            || {},
+            || {},
+        )
     }
 
     /// Test-only entry to the exact public-search implementation with
@@ -648,23 +909,53 @@ impl GraphStore {
         after_db_scan: impl FnOnce(),
         inside_publication_barrier: impl FnOnce(),
     ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
-        self.search_symbols_by_name_impl(
+        Ok(self
+            .search_symbols_by_name_page_impl(
+                query,
+                limit,
+                seed_resolution,
+                SYMBOL_SEARCH_COUNT_CAP,
+                after_db_scan,
+                inside_publication_barrier,
+            )?
+            .symbols)
+    }
+
+    #[cfg(test)]
+    fn search_symbols_by_name_page_with_hooks(
+        &self,
+        query: &str,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+        count_cap: usize,
+        after_db_scan: impl FnOnce(),
+        inside_publication_barrier: impl FnOnce(),
+    ) -> Result<SymbolSearchPage, StoreError> {
+        self.search_symbols_by_name_page_impl(
             query,
             limit,
             seed_resolution,
+            count_cap,
             after_db_scan,
             inside_publication_barrier,
         )
     }
 
-    fn search_symbols_by_name_impl(
+    fn search_symbols_by_name_page_impl(
         &self,
         query: &str,
         limit: usize,
         seed_resolution: &SeedResolutionConfig,
+        count_cap: usize,
         after_db_scan: impl FnOnce(),
         inside_publication_barrier: impl FnOnce(),
-    ) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
+    ) -> Result<SymbolSearchPage, StoreError> {
+        if limit > crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX {
+            return Err(StoreError::PresentationLimitExceeded {
+                limit,
+                max: crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX,
+            });
+        }
         let needle = query.to_lowercase();
         // --- Step 1: coherently snapshot publication state + cache ----------
         // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
@@ -707,10 +998,20 @@ impl GraphStore {
         // kind-priority + file-path tiebreaks. This prevents test/playwright
         // files from dominating when a PascalCase name also appears in
         // production code, and gives a deterministic order across calls.
-        let mut candidates: Vec<(f64, &nestweaver_schema::Symbol)> = Vec::new();
-        for (lower, sym) in &entry.symbols {
+        let mut candidates = BinaryHeap::new();
+        let mut counted = 0usize;
+        let mut count_saturated = false;
+        for (ordinal, (lower, sym)) in entry.symbols.iter().enumerate() {
             if !lower.contains(&needle) {
                 continue;
+            }
+            if counted < count_cap {
+                counted += 1;
+                if counted == count_cap {
+                    count_saturated = true;
+                }
+            } else {
+                count_saturated = true;
             }
             let base_score = if *lower == needle {
                 4.0_f64 // exact
@@ -721,26 +1022,35 @@ impl GraphStore {
             };
             let path_factor = compute_path_factor(&sym.file_path, &seed_resolution.path_deboost);
             let adjusted = base_score * path_factor;
-            candidates.push((adjusted, sym));
+            if limit == 0 {
+                continue;
+            }
+            let ranked = RankedSymbol {
+                adjusted_score: adjusted,
+                kind_rank: kind_rank(sym.kind, &seed_resolution.kind_priority),
+                file_path: &sym.file_path,
+                ordinal,
+                symbol: sym,
+            };
+            if candidates.len() < limit {
+                candidates.push(ranked);
+            } else if candidates.peek().is_some_and(|worst| ranked < *worst) {
+                candidates.pop();
+                candidates.push(ranked);
+            }
         }
-        candidates.sort_by(|(a_score, a_sym), (b_score, b_sym)| {
-            // 1) adjusted DESC
-            b_score
-                .partial_cmp(a_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                // 2) kind_priority ASC (lower index = higher priority)
-                .then_with(|| {
-                    kind_rank(a_sym.kind, &seed_resolution.kind_priority)
-                        .cmp(&kind_rank(b_sym.kind, &seed_resolution.kind_priority))
-                })
-                // 3) file_path lexicographic ASC for deterministic stability
-                .then_with(|| a_sym.file_path.cmp(&b_sym.file_path))
-        });
-        Ok(candidates
+        let mut candidates = candidates.into_vec();
+        candidates.sort();
+        let symbols = candidates
             .into_iter()
-            .take(limit)
-            .map(|(_, sym)| sym.clone())
-            .collect())
+            .map(|candidate| candidate.symbol.clone())
+            .collect();
+        let total = if count_saturated {
+            SearchTotal::lower_bound(counted)
+        } else {
+            SearchTotal::exact(counted)
+        };
+        Ok(SymbolSearchPage { symbols, total })
     }
 }
 
@@ -753,6 +1063,7 @@ mod tests {
     use super::{compute_path_factor, kind_rank};
     use crate::db::GraphStore;
     use crate::ranking::{PathDeboostRule, SeedResolutionConfig, default_kind_priority};
+    use crate::tantivy_index::SearchTotalRelation;
 
     fn make_symbol(uid: &str, name: &str) -> Symbol {
         Symbol {
@@ -883,6 +1194,100 @@ mod tests {
         SeedResolutionConfig {
             path_deboost: Vec::new(),
             kind_priority: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn search_symbols_by_name_page_counts_before_the_presentation_limit() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [
+            ("s1", "Payment"),
+            ("s2", "PaymentGateway"),
+            ("s3", "RetryPayment"),
+        ] {
+            store.insert_symbol(&make_symbol(uid, name)).unwrap();
+        }
+
+        let page = store
+            .search_symbols_by_name_page("payment", 1, &no_rules())
+            .unwrap();
+        assert_eq!(page.symbols.len(), 1);
+        assert_eq!(page.total.value, 3);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+
+        let legacy = store
+            .search_symbols_by_name("payment", 1, &no_rules())
+            .unwrap();
+        assert_eq!(page.symbols[0].uid, legacy[0].uid);
+    }
+
+    #[test]
+    fn search_symbols_by_name_page_reports_lower_bound_without_changing_top_hits() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [
+            ("s1", "Payment"),
+            ("s2", "PaymentGateway"),
+            ("s3", "RetryPayment"),
+        ] {
+            store.insert_symbol(&make_symbol(uid, name)).unwrap();
+        }
+
+        let page = store
+            .search_symbols_by_name_page_with_hooks("payment", 1, &no_rules(), 2, || {}, || {})
+            .unwrap();
+        assert_eq!(page.symbols.len(), 1);
+        assert_eq!(page.symbols[0].uid, "s1");
+        assert_eq!(page.total.value, 2);
+        assert_eq!(page.total.relation, SearchTotalRelation::LowerBound);
+    }
+
+    #[test]
+    fn search_symbols_by_name_page_zero_limit_does_not_materialize_results() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&make_symbol("s1", "Payment")).unwrap();
+
+        let page = store
+            .search_symbols_by_name_page("payment", 0, &no_rules())
+            .unwrap();
+        assert!(page.symbols.is_empty());
+        assert_eq!(page.total.value, 1);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+    }
+
+    #[test]
+    fn symbol_search_entry_points_reject_extreme_presentation_limits() {
+        use crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX;
+
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&make_symbol("s1", "Payment")).unwrap();
+
+        assert!(
+            store
+                .search_symbols_by_name("payment", 0, &no_rules())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_symbols_by_name("payment", SEARCH_PRESENTATION_LIMIT_MAX, &no_rules())
+                .is_ok()
+        );
+        assert!(
+            store
+                .search_symbols_by_name_page("payment", SEARCH_PRESENTATION_LIMIT_MAX, &no_rules(),)
+                .is_ok()
+        );
+
+        for over_limit in [SEARCH_PRESENTATION_LIMIT_MAX + 1, usize::MAX] {
+            assert!(matches!(
+                store.search_symbols_by_name("payment", over_limit, &no_rules()),
+                Err(crate::StoreError::PresentationLimitExceeded { .. })
+            ));
+            assert!(
+                store
+                    .search_symbols_by_name_page("payment", over_limit, &no_rules())
+                    .is_err()
+            );
         }
     }
 
@@ -1492,6 +1897,65 @@ mod tests {
             result.nodes.len(),
             1,
             "only a survives; b is pruned below threshold"
+        );
+    }
+
+    /// The opt-out: `impact_with_flags_and_threshold` with `0.0` must return the
+    /// full traversal — a depth-4 chain of 0.5-confidence edges (score 0.0625)
+    /// that the default threshold prunes — and must not set
+    /// `truncated_by_threshold`.
+    #[test]
+    fn impact_with_flags_and_threshold_zero_disables_pruning() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["target", "a", "b", "c", "d"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        // d → c → b → a → target, every edge at 0.5 confidence:
+        // d's decayed score is 0.5^4 = 0.0625 < DEFAULT_IMPACT_THRESHOLD (0.10).
+        for (src, tgt) in [("a", "target"), ("b", "a"), ("c", "b"), ("d", "c")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: tgt.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.5,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        // Default threshold: d is pruned and the honesty flag fires.
+        let pruned = store.impact_with_flags("target", 10, 0.0, None).unwrap();
+        assert!(
+            pruned.truncated_by_threshold,
+            "the default threshold must prune the 0.0625-score depth-4 caller"
+        );
+        assert!(
+            !pruned.nodes.iter().any(|n| n.uid == "d"),
+            "d must be pruned under the default threshold"
+        );
+
+        // Opt-out: threshold 0.0 returns the full traversal with no prune flag.
+        let full = store
+            .impact_with_flags_and_threshold("target", 10, 0.0, 0.0, None)
+            .unwrap();
+        assert!(
+            !full.truncated_by_threshold,
+            "threshold 0.0 disables score pruning, so nothing is pruned"
+        );
+        let d = full
+            .nodes
+            .iter()
+            .find(|n| n.uid == "d")
+            .expect("the real depth-4 caller must be included when pruning is off");
+        assert_eq!(d.depth, 4);
+        assert!(
+            (d.impact_score - 0.0625).abs() < 1e-9,
+            "d keeps its true decayed score, got {}",
+            d.impact_score
         );
     }
 

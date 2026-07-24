@@ -195,6 +195,13 @@ enum ScanOutcome {
 /// Flush a batch of scanned notes inside a single write transaction:
 /// delete each note's existing cross-domain edges, then bulk-insert the
 /// fresh ones. One fsync per batch, not per note × section.
+///
+/// Store errors are folded INTO the message (`{op}: {cause}`) rather than
+/// attached via `anyhow::Context`: callers log discovery failures with `{e}`
+/// (Display of the outermost error only), so a plain context would reduce the
+/// warning to a bare function name and hide the underlying cause — e.g.
+/// `Cannot execute write operations in a read-only database!`, which is what
+/// `brain add` hits because its discovery store is opened read-only.
 fn flush_scanned_notes(
     store: &GraphStore,
     batch: &[ScannedNote],
@@ -202,14 +209,14 @@ fn flush_scanned_notes(
 ) -> Result<(), anyhow::Error> {
     let conn = store
         .begin_transaction()
-        .context("begin_transaction for cross-domain flush")?;
+        .map_err(|e| anyhow::anyhow!("begin_transaction for cross-domain flush: {e}"))?;
 
     for scanned in batch {
         nestweaver_store::GraphStore::delete_cross_domain_edges_for_note_on(
             &conn,
             &scanned.note_uid,
         )
-        .context("delete_cross_domain_edges_for_note_on")?;
+        .map_err(|e| anyhow::anyhow!("delete_cross_domain_edges_for_note_on: {e}"))?;
 
         if !scanned.note_edges.is_empty() {
             let refs: Vec<(&str, &str, f32, &str)> = scanned
@@ -218,7 +225,7 @@ fn flush_scanned_notes(
                 .map(|(n, s, c, src)| (n.as_str(), s.as_str(), *c, *src))
                 .collect();
             nestweaver_store::GraphStore::batch_insert_note_to_symbol_edges_on(&conn, &refs)
-                .context("batch_insert_note_to_symbol_edges_on")?;
+                .map_err(|e| anyhow::anyhow!("batch_insert_note_to_symbol_edges_on: {e}"))?;
         }
 
         if !scanned.section_edges.is_empty() {
@@ -228,7 +235,7 @@ fn flush_scanned_notes(
                 .map(|(s, sym, c, src)| (s.as_str(), sym.as_str(), *c, *src))
                 .collect();
             nestweaver_store::GraphStore::batch_insert_section_to_symbol_edges_on(&conn, &refs)
-                .context("batch_insert_section_to_symbol_edges_on")?;
+                .map_err(|e| anyhow::anyhow!("batch_insert_section_to_symbol_edges_on: {e}"))?;
         }
 
         result.notes_scanned += 1;
@@ -238,7 +245,7 @@ fn flush_scanned_notes(
 
     store
         .commit_transaction(&conn)
-        .context("commit_transaction for cross-domain flush")?;
+        .map_err(|e| anyhow::anyhow!("commit_transaction for cross-domain flush: {e}"))?;
     Ok(())
 }
 
@@ -608,7 +615,6 @@ mod tests {
 
         // Build the store with a Vault + Note + Symbol that should match.
         let store = GraphStore::in_memory().unwrap();
-
         let v_uid = vault_uid("default", &vault_root.to_string_lossy());
         store
             .insert_vault(&Vault {
@@ -682,6 +688,176 @@ mod tests {
             result.note_to_symbol_edges
         );
 
+        let count = store.count_references_code_edges().unwrap();
+        assert!(count >= 1, "edges should be persisted");
+    }
+
+    #[test]
+    fn discovery_on_read_only_store_fails_with_actionable_error() {
+        // `index --repo` then `brain add` on the same DB
+        // warned `cross-domain discovery failed:
+        // delete_cross_domain_edges_for_note_on` and produced zero
+        // REFERENCES_CODE edges. Root cause: `brain add` opens the discovery
+        // store READ-ONLY (main.rs `open_store`), so every flush write fails
+        // with "Cannot execute write operations in a read-only database!" —
+        // but the WARN logged only the outermost context (a bare function
+        // name), hiding that cause in the source chain. The flush path now
+        // folds the store error into the top-level message so `{e}` logging
+        // stays actionable.
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        std::fs::write(
+            vault_root.join("refunds.md"),
+            "# Refund Design\n\nThe processRefund function calls applyCredit.\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("test.lbug");
+
+        crate::index_md::index_markdown_directory(&vault_root, &db_path, "default", "vault")
+            .unwrap();
+
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let r_uid = repo_uid("default", "https://example.com/r");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: r_uid.clone(),
+                url: "https://example.com/r".to_string(),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: symbol_uid(&r_uid, "src/refund.js", "processRefund", 1),
+                name: "processRefund".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: r_uid,
+                file_path: "src/refund.js".to_string(),
+                start_line: 1,
+                end_line: 3,
+                signature: "function processRefund()".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        drop(store);
+
+        // Reopen READ-ONLY, as `brain add`'s open_store does before discovery.
+        let read_only = GraphStore::open_read_only(&db_path).unwrap();
+        let err = discover_cross_domain_links(&read_only)
+            .expect_err("discovery against a read-only store must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("delete_cross_domain_edges_for_note_on"),
+            "the failing operation must be named, got: {msg}"
+        );
+        assert!(
+            msg.contains("read-only"),
+            "the underlying cause must be visible in the Display output \
+             (callers log with `{{e}}`, not `{{e:#}}`), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_discovers_link_with_file_backed_store() {
+        // Companion coverage: the batched-transaction flush path
+        // must work against an on-disk (file-backed) database, not just the
+        // in-memory store the tests above use. (The `brain add` failure that
+        // prompted this turned out to be a read-only store — see
+        // discovery_on_read_only_store_fails_with_actionable_error — but the
+        // file-backed happy path had no coverage either.)
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        std::fs::write(
+            vault_root.join("design.md"),
+            "# Auth Design\n\nThe AuthService.authenticate flow handles login.\n",
+        )
+        .unwrap();
+
+        let store = GraphStore::open_or_create(&dir.path().join("test.lbug")).unwrap();
+
+        let v_uid = vault_uid("default", &vault_root.to_string_lossy());
+        store
+            .insert_vault(&Vault {
+                uid: v_uid.clone(),
+                name: "v".to_string(),
+                root_path: vault_root.to_string_lossy().into_owned(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+
+        store
+            .insert_note(&Note {
+                uid: format!("note:{v_uid}:abc"),
+                vault_uid: v_uid,
+                file_path: "design.md".to_string(),
+                title: "Auth Design".to_string(),
+                note_kind: NoteKind::Design,
+                word_count: 10,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+
+        let r_uid = repo_uid("default", "https://example.com/r");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: r_uid.clone(),
+                url: "https://example.com/r".to_string(),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: symbol_uid(&r_uid, "src/auth.ts", "AuthService", 1),
+                name: "AuthService".to_string(),
+                kind: SymbolKind::Class,
+                repo_uid: r_uid,
+                file_path: "src/auth.ts".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "class AuthService".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let result = discover_cross_domain_links(&store)
+            .expect("cross-domain discovery must succeed on a file-backed store");
+        assert!(
+            result.note_to_symbol_edges >= 1,
+            "expected at least one note→symbol edge, got {}",
+            result.note_to_symbol_edges
+        );
         let count = store.count_references_code_edges().unwrap();
         assert!(count >= 1, "edges should be persisted");
     }

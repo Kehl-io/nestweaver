@@ -86,8 +86,15 @@ pub fn export_cypher(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Resu
     let symbols = store
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The `pagerank_score` column is never populated; the real scores
+    // live in the store's PageRank cache (same source `hubs` reads).
+    let pagerank = store.pagerank_scores();
     for sym in &symbols {
-        let pr = sym.pagerank_score.unwrap_or(0.0);
+        let pr = pagerank
+            .get(&sym.uid)
+            .copied()
+            .or(sym.pagerank_score)
+            .unwrap_or(0.0);
         writeln!(
             writer,
             "CREATE (:Symbol {{uid: {}, name: {}, kind: {}, file: {}, line: {}, pagerank: {:.6}}});",
@@ -233,8 +240,15 @@ pub fn export_graphml(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Res
     let symbols = store
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The `pagerank_score` column is never populated; the real scores
+    // live in the store's PageRank cache (same source `hubs` reads).
+    let pagerank = store.pagerank_scores();
     for sym in &symbols {
-        let pr = sym.pagerank_score.unwrap_or(0.0);
+        let pr = pagerank
+            .get(&sym.uid)
+            .copied()
+            .or(sym.pagerank_score)
+            .unwrap_or(0.0);
         writeln!(
             writer,
             r#"    <node id="{}">
@@ -318,11 +332,23 @@ pub fn export_mermaid(
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Sort by PageRank descending, take top N.
+    // Sort by PageRank descending, take top N. The `pagerank_score`
+    // column is never populated; rank by the store's PageRank cache (the same
+    // source `hubs` reads), falling back to the column for stores without a
+    // computed cache.
+    let pagerank = store.pagerank_scores();
     let mut ranked = symbols;
     ranked.sort_by(|a, b| {
-        let pa = a.pagerank_score.unwrap_or(0.0);
-        let pb = b.pagerank_score.unwrap_or(0.0);
+        let pa = pagerank
+            .get(&a.uid)
+            .copied()
+            .or(a.pagerank_score)
+            .unwrap_or(0.0);
+        let pb = pagerank
+            .get(&b.uid)
+            .copied()
+            .or(b.pagerank_score)
+            .unwrap_or(0.0);
         pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
     });
     ranked.truncate(top_n);
@@ -545,6 +571,81 @@ mod tests {
         assert!(output.contains("fn_0"));
         assert!(output.contains("fn_1"));
         assert!(!output.contains("fn_4"));
+    }
+
+    /// populated_store plus a second caller of sym-b: two callers make the
+    /// callee's computed PageRank strictly higher than each caller's (with a
+    /// single caller the store's reverse-edge weighting ties them at 0.5).
+    /// Every symbol carries the same 0.5 column score, so any difference in
+    /// the exported values must come from the cache — a real regression.
+    fn ranked_store() -> GraphStore {
+        let store = populated_store();
+        store
+            .insert_symbol(&make_symbol("sym-c", "fn_gamma", "src/gamma.rs"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "sym-c".to_string(),
+                target_uid: "sym-b".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn export_uses_computed_pagerank_not_zero_column() {
+        // The `pagerank_score` column is never populated in production;
+        // export must carry the store's computed PageRank cache values.
+        let store = ranked_store();
+        let scores = store.pagerank_scores();
+        assert!(
+            scores.contains_key("sym-b"),
+            "cache should compute scores on demand"
+        );
+        assert!(
+            (scores["sym-b"] - 0.5).abs() > 1e-9,
+            "cache score must differ from the 0.5 column value to prove the source: {scores:?}"
+        );
+
+        let mut buf = Vec::new();
+        export_cypher(&store, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let expected = format!("pagerank: {:.6}", scores["sym-b"]);
+        assert!(
+            output.contains(&expected),
+            "cypher export must carry the cache score {expected}"
+        );
+
+        let mut buf = Vec::new();
+        export_graphml(&store, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let expected = format!("<data key=\"pagerank\">{:.6}</data>", scores["sym-b"]);
+        assert!(
+            output.contains(&expected),
+            "graphml export must carry the cache score {expected}"
+        );
+    }
+
+    #[test]
+    fn mermaid_top_n_ranks_by_computed_pagerank() {
+        // Note: make_symbol gives every symbol the same column score (0.5),
+        // but sym-b has two inbound CALLS edges, so the computed PageRank
+        // must rank it first.
+        let store = ranked_store();
+        let scores = store.pagerank_scores();
+        assert!(
+            scores["sym-b"] > scores["sym-a"],
+            "callee must outrank caller: {scores:?}"
+        );
+        let mut buf = Vec::new();
+        export_mermaid(&store, 1, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("fn_beta"), "top-1 must be the callee");
+        assert!(!output.contains("fn_alpha"), "top-1 must not be the caller");
     }
 
     #[test]

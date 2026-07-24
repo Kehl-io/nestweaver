@@ -307,8 +307,35 @@ pub fn run_eval(
     let mut per_query = Vec::with_capacity(queries.len());
 
     for jq in queries {
+        // LOW: a query whose seeds don't resolve must not abort the whole
+        // run — catch the resolution error per query, warn, score it 0, and
+        // continue with the remaining queries.
         let ranked =
-            ranked_uids_for_query(store, tantivy, config, aliases, db_path, do_rerank, jq)?;
+            match ranked_uids_for_query(store, tantivy, config, aliases, db_path, do_rerank, jq) {
+                Ok(ranked) => ranked,
+                Err(e) => {
+                    tracing::warn!(
+                        query = %jq.query,
+                        error = %e,
+                        "eval query failed to resolve — scoring it 0 and continuing"
+                    );
+                    per_query.push(PerQueryRow {
+                        query: jq.query.clone(),
+                        ndcg10: 0.0,
+                        mrr: 0.0,
+                        p_at_5: 0.0,
+                    });
+                    continue;
+                }
+            };
+        // LOW: an unresolvable query scores 0 and the run continues — but say
+        // so, otherwise a typo'd seed silently drags the mean down.
+        if ranked.is_empty() {
+            tracing::warn!(
+                query = %jq.query,
+                "eval query resolved to zero results — scoring it 0 and continuing"
+            );
+        }
         per_query.push(PerQueryRow {
             query: jq.query.clone(),
             ndcg10: ndcg_at_k(&ranked, &jq.relevance, 10),
@@ -670,5 +697,47 @@ function hello(name) { return "Hello " + name; }
         assert!(report.mean_p5 > 0.0, "p5={}", report.mean_p5);
         // Means equal the single row.
         assert!((report.mean_ndcg10 - report.per_query[0].ndcg10).abs() < 1e-12);
+    }
+
+    /// LOW: a query whose seeds don't resolve must not abort the whole eval
+    /// run — it is scored 0 (with a warning) and the remaining queries are
+    /// still evaluated. Regression test: `run_eval` used to propagate the
+    /// seed-resolution error via `?`, failing the entire report.
+    #[test]
+    fn run_eval_scores_unresolvable_query_zero_and_continues() {
+        use crate::index::index_directory_in_memory;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function greet(name) { return name; }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let mk = |q: &str| JudgedQuery {
+            query: q.to_string(),
+            intent: None,
+            relevance: HashMap::new(),
+        };
+        let bad = mk("definitely-not-a-real-seed-zzz");
+        let good = mk("greet");
+
+        let cfg = HybridSearchConfig::default();
+        let aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let report = run_eval(&store, None, &[bad, good], &cfg, &aliases, None, false)
+            .expect("an unresolvable query must not abort the whole eval run");
+
+        assert_eq!(report.n, 2, "both queries must be scored");
+        assert_eq!(report.per_query[0].query, "definitely-not-a-real-seed-zzz");
+        assert_eq!(report.per_query[0].ndcg10, 0.0);
+        assert_eq!(report.per_query[0].mrr, 0.0);
+        assert_eq!(report.per_query[0].p_at_5, 0.0);
+        assert_eq!(report.per_query[1].query, "greet");
     }
 }

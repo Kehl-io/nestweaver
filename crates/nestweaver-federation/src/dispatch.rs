@@ -133,6 +133,68 @@ fn inject_bearer_token<T>(request: &mut tonic::Request<T>, auth_token: Option<&s
     }
 }
 
+fn brain_search_response_to_json(
+    response: &nestweaver_proto::BrainSearchResponse,
+    concise: bool,
+) -> Value {
+    let results: Vec<Value> = response
+        .results
+        .iter()
+        .map(|result| {
+            let mut item = serde_json::json!({
+                "uid": result.uid,
+                "kind": result.kind,
+                "title": result.title,
+            });
+            if !concise {
+                item["score"] = Value::from(result.score);
+            }
+            if let Some(location) = &result.location {
+                item["location"] = Value::String(location.clone());
+            }
+            // Parity with the local path: symbol rows carry no
+            // `matched_headings` key at all — omit it when empty instead of
+            // emitting a spurious `[]`.
+            if !result.matched_headings.is_empty() {
+                item["matched_headings"] = serde_json::json!(result.matched_headings);
+            }
+            if !concise && let Some(body) = &result.inline_body {
+                item["inline_body"] = Value::String(body.clone());
+            }
+            if let Some(canonical_id) = &result.canonical_id {
+                item["canonical_id"] = Value::String(canonical_id.clone());
+            }
+            // Parity: note rows carry their vault.
+            if let Some(vault_uid) = &result.vault_uid {
+                item["vault_uid"] = Value::String(vault_uid.clone());
+            }
+            item
+        })
+        .collect();
+    let returned_matches = if response.returned_matches == 0 && !results.is_empty() {
+        results.len() as i32
+    } else {
+        response.returned_matches
+    };
+    let relation = if response.total_matches_relation.is_empty() {
+        "gte"
+    } else {
+        &response.total_matches_relation
+    };
+    let truncated =
+        response.truncated || relation != "eq" || returned_matches < response.total_matches;
+    serde_json::json!({
+        "query": response.query,
+        "engine": response.engine,
+        "total_matches": response.total_matches,
+        "total_matches_relation": relation,
+        "returned_matches": returned_matches,
+        "truncated": truncated,
+        "results": results,
+        "expansion_terms": response.expansion_terms,
+    })
+}
+
 /// Typed dispatch for `brain_search` -> `Search` RPC.
 async fn dispatch_typed_brain_search(
     client: &mut NestWeaverDaemonClient<Channel>,
@@ -171,36 +233,8 @@ async fn dispatch_typed_brain_search(
         .await
         .context("brain_search RPC failed")?
         .into_inner();
-    // Serialize the typed response back to JSON.
-    let results: Vec<Value> = resp
-        .results
-        .iter()
-        .map(|r| {
-            let mut obj = serde_json::json!({
-                "uid": r.uid,
-                "kind": r.kind,
-                "title": r.title,
-                "score": r.score,
-            });
-            if let Some(ref loc) = r.location {
-                obj["location"] = Value::String(loc.clone());
-            }
-            if !r.matched_headings.is_empty() {
-                obj["matched_headings"] = serde_json::json!(r.matched_headings);
-            }
-            if let Some(ref body) = r.inline_body {
-                obj["inline_body"] = Value::String(body.clone());
-            }
-            obj
-        })
-        .collect();
-    Ok(serde_json::json!({
-        "query": resp.query,
-        "engine": resp.engine,
-        "total_matches": resp.total_matches,
-        "results": results,
-        "expansion_terms": resp.expansion_terms,
-    }))
+    let concise = params.get("response_format").and_then(Value::as_str) == Some("concise");
+    Ok(brain_search_response_to_json(&resp, concise))
 }
 
 /// Typed dispatch for `brain_context` -> `GetContext` RPC.
@@ -319,10 +353,7 @@ async fn dispatch_typed_project_context(
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32,
         kinds: json_str_array(params, "kinds"),
-        include_components: params
-            .get("include_components")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        include_components: bool_or(params, "include_components", true),
         intent: params
             .get("intent")
             .and_then(|v| v.as_str())
@@ -383,10 +414,7 @@ async fn dispatch_typed_note_get(
             .get("title")
             .and_then(|v| v.as_str())
             .map(String::from),
-        include_body: params
-            .get("include_body")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        include_body: bool_or(params, "include_body", true),
         sections: json_str_array(params, "sections"),
     };
     let mut request = tonic::Request::new(req);
@@ -403,6 +431,23 @@ async fn dispatch_typed_note_get(
         "note_kind": resp.note_kind,
         "word_count": resp.word_count,
         "section_count": resp.section_count,
+        // Match the daemon-proxy note_get shape (tools.rs): frontmatter and
+        // outline are always present (local defaults to {} / []).
+        "frontmatter": serde_json::from_str::<Value>(&resp.frontmatter_json)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        "outline": resp
+            .outline
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "uid": h.uid,
+                    "level": h.level,
+                    "text": h.text,
+                    "slug": h.slug,
+                    "line": h.line,
+                })
+            })
+            .collect::<Vec<_>>(),
     });
     if let Some(body) = resp.body {
         result["body"] = Value::String(body);
@@ -454,4 +499,102 @@ fn json_str_array(params: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Presence-aware bool extraction: proto3 scalar bools carry no
+/// presence, so an arg the caller left unset would forward as explicit
+/// `false`, and the daemon's typed handlers write that `false` back into the
+/// tool args — overriding tool defaults that are TRUE
+/// (`project_context.include_components`, `note_get.include_body`). Forward
+/// the tool's own default when the caller did not specify the flag; an
+/// explicit `false` is still honored.
+fn bool_or(params: &Value, key: &str, default: bool) -> bool {
+    params.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_brain_search_json_preserves_counts_and_old_response_defaults() {
+        let response = nestweaver_proto::BrainSearchResponse {
+            query: "needle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 1,
+            results: vec![nestweaver_proto::SearchResultItem {
+                uid: "sym:needle".to_string(),
+                canonical_id: Some("canonical-needle".to_string()),
+                kind: "Symbol/Function".to_string(),
+                title: "needle".to_string(),
+                score: 1.0,
+                location: Some("src/lib.rs:1".to_string()),
+                matched_headings: vec!["Needle heading".to_string()],
+                inline_body: Some("detailed body".to_string()),
+                vault_uid: None,
+            }],
+            expansion_terms: vec!["expanded".to_string()],
+            returned_matches: 0,
+            total_matches_relation: String::new(),
+            // Proto3 defaults from a pre-Task-7 daemon: the new scalar fields
+            // decode as zero/empty/false because they were absent on the wire.
+            truncated: false,
+        };
+
+        let value = brain_search_response_to_json(&response, false);
+
+        assert_eq!(value["total_matches"], 1);
+        assert_eq!(value["total_matches_relation"], "gte");
+        assert_eq!(value["returned_matches"], 1);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["results"][0]["canonical_id"], "canonical-needle");
+        assert_eq!(value["expansion_terms"], serde_json::json!(["expanded"]));
+
+        let concise = brain_search_response_to_json(&response, true);
+        assert_eq!(concise["results"][0]["uid"], "sym:needle");
+        assert_eq!(concise["results"][0]["canonical_id"], "canonical-needle");
+        assert!(
+            concise["results"][0].get("score").is_none(),
+            "typed federation concise rows must stay score-free: {concise}"
+        );
+        assert_eq!(
+            concise["results"][0]["matched_headings"],
+            serde_json::json!(["Needle heading"]),
+            "typed federation concise note rows must retain matched headings: {concise}"
+        );
+        assert!(
+            concise["results"][0].get("inline_body").is_none(),
+            "typed federation concise rows must omit inline bodies: {concise}"
+        );
+
+        let mut title_only_note = response;
+        title_only_note.results[0].uid = "note:needle".to_string();
+        title_only_note.results[0].kind = "note".to_string();
+        title_only_note.results[0].canonical_id = None;
+        title_only_note.results[0].matched_headings.clear();
+        let concise_note = brain_search_response_to_json(&title_only_note, true);
+        assert!(
+            concise_note["results"][0].get("matched_headings").is_none(),
+            "rows with no matched headings must omit the field (parity with the \
+             daemon-proxy mapper): {concise_note}"
+        );
+    }
+
+    #[test]
+    fn bool_or_forwards_default_true_when_arg_absent() {
+        // Absent include_components/include_body must NOT collapse to
+        // false (proto3 has no presence); the tool default is true.
+        let empty = serde_json::json!({});
+        assert!(bool_or(&empty, "include_components", true));
+        assert!(bool_or(&empty, "include_body", true));
+
+        // Explicit values are honored in both directions.
+        let explicit_false = serde_json::json!({ "include_components": false });
+        assert!(!bool_or(&explicit_false, "include_components", true));
+        let explicit_true = serde_json::json!({ "include_body": true });
+        assert!(bool_or(&explicit_true, "include_body", true));
+
+        // Default-false bools keep their old behavior.
+        assert!(!bool_or(&empty, "prf", false));
+    }
 }

@@ -14,6 +14,9 @@ message HealthCheckResponse {
   uint32 active_connections = 5;
   reserved 6;
   reserved "db_opened_at";
+  // The daemon's own OS PID. Lets the CLI cross-check a pidfile PID against
+  // the socket-reported PID before signaling it (B-1: pidfile PID hole).
+  uint32 pid = 7;
 }
 
 message ShutdownRequest {}
@@ -65,6 +68,9 @@ message WatchVaultResponse {
 message WatchCodeRequest {
   string repo_path = 1;
   string instance_id = 2;
+  // Replace an already-running watcher (e.g. one orphaned when its owning
+  // `watch` CLI was kill -9'd) instead of failing with "already running".
+  bool force = 3;
 }
 
 message WatchCodeResponse {
@@ -107,8 +113,22 @@ message RemoveVaultRequest {
   string vault_uid = 1;
 }
 
+// One post-commit reconciliation stage that failed AFTER a mutation durably
+// committed. Its presence on a response NEVER means the mutation was rolled back.
+message ReconciliationFailure {
+  string stage = 1;
+  string repo_uid = 2;  // empty when not repo-scoped
+  string message = 3;
+}
+
 message RemoveVaultResponse {
   uint64 notes_deleted = 1;
+  // True once the destructive mutation durably committed — even if post-commit
+  // reconciliation failed. When true, the delete HAPPENED.
+  bool committed = 2;
+  // Non-empty => the delete SUCCEEDED but N post-commit reconciliation steps
+  // failed (retry by re-running the op). NOT a rollback signal.
+  repeated ReconciliationFailure reconciliation_failures = 3;
 }
 
 message RemoveRepoRequest {
@@ -118,6 +138,8 @@ message RemoveRepoRequest {
 message RemoveRepoResponse {
   uint64 files_deleted = 1;
   uint64 symbols_deleted = 2;
+  bool committed = 3;
+  repeated ReconciliationFailure reconciliation_failures = 4;
 }
 
 message RemoveProjectRequest {
@@ -126,6 +148,8 @@ message RemoveProjectRequest {
 
 message RemoveProjectResponse {
   string project_name = 1;
+  bool committed = 2;
+  repeated ReconciliationFailure reconciliation_failures = 3;
 }
 
 message PruneStaleRequest {}
@@ -133,6 +157,8 @@ message PruneStaleRequest {}
 message PruneStaleResponse {
   repeated string removed_repos = 1;
   repeated string removed_vaults = 2;
+  bool committed = 3;
+  repeated ReconciliationFailure reconciliation_failures = 4;
 }
 
 message MergeInstanceRequest {
@@ -149,6 +175,8 @@ message MergeInstanceResponse {
   // removed during migration. Force re-index recreates those rows under the
   // target instance. Non-empty means the caller should warn the user.
   repeated string repos_needing_reindex = 5;
+  bool committed = 6;
+  repeated ReconciliationFailure reconciliation_failures = 7;
 }
 
 message PurgeInstanceRequest {
@@ -184,6 +212,9 @@ message BrainSearchResponse {
   repeated SearchResultItem results = 4;
   // F7 PRF-mined expansion terms (empty unless prf=true on the request).
   repeated string expansion_terms = 5;
+  int32 returned_matches = 6;
+  string total_matches_relation = 7; // "eq" | "gte"
+  bool truncated = 8;
 }
 message SearchResultItem {
   string uid = 1;
@@ -193,6 +224,9 @@ message SearchResultItem {
   optional string location = 5;
   repeated string matched_headings = 6;
   optional string inline_body = 7;
+  optional string canonical_id = 8;
+  // Vault the note/section hit belongs to (notes only; absent for symbols).
+  optional string vault_uid = 9;
 }
 
 // brain_status
@@ -240,6 +274,18 @@ message NoteGetResponse {
   int32 word_count = 5;
   optional string body = 6;
   int32 section_count = 7;
+  // Parsed frontmatter serialized as a JSON object string ("" when absent),
+  // matching the local note_get 'frontmatter' field.
+  string frontmatter_json = 8;
+  // Heading outline, matching the local note_get 'outline' field.
+  repeated NoteHeading outline = 9;
+}
+message NoteHeading {
+  string uid = 1;
+  int32 level = 2;
+  string text = 3;
+  string slug = 4;
+  int32 line = 5;
 }
 
 // brain_context (typed request, JSON response)
@@ -315,6 +361,22 @@ message ServeUiRequest {
 }
 
 message ServeUiResponse {
+  bool ok = 1;
+  string message = 2;
+  // The port the UI is actually reachable on after this call (0 when not
+  // running). Differs from the requested port when the UI was already
+  // running on an earlier port — clients must print THIS port, not the
+  // one they asked for.
+  uint32 port = 3;
+  // Machine-readable error code (empty when ok). Currently defined:
+  // "port_in_use" — the requested port is bound by a foreign process;
+  // clients should map this to a non-zero exit without retrying.
+  string error = 4;
+}
+
+message StopUiRequest {}
+
+message StopUiResponse {
   bool ok = 1;
   string message = 2;
 }
@@ -488,6 +550,7 @@ service NestWeaverDaemon {
 
   // UI
   rpc ServeUi(ServeUiRequest) returns (ServeUiResponse);
+  rpc StopUi(StopUiRequest) returns (StopUiResponse);
 
   // Phase 4 — typed RPCs
   rpc FlowTraceContinue(FlowTraceContinueRequest) returns (FlowTraceContinueResponse);

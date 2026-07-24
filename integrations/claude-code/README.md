@@ -63,7 +63,7 @@ When configured as an MCP server, NestWeaver exposes 40 tools across these categ
 
 **Graph Structure:**
 - **hub_nodes** / **bridge_nodes** — Centrality analysis (PageRank, betweenness)
-- **clusters** — Community detection (Leiden algorithm)
+- **clusters** — Community detection (Louvain-style local moving, single-level)
 - **cross_repo_contracts** — Cross-repository symbol relationships
 
 **Investigation:**

@@ -1,6 +1,5 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 3849
 expression: "parsed_references(\"simple.rs\", &source)"
 ---
 - name: "std::collections::HashMap"
@@ -11,7 +10,7 @@ expression: "parsed_references(\"simple.rs\", &source)"
 - name: "crate::config::Settings"
   kind: Import
   start_line: 2
-  context: "use std::collections::HashMap;"
+  context: "use crate::config::Settings;"
   receiver: ~
 - name: HashMap
   kind: TypeRef

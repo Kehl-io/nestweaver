@@ -85,7 +85,9 @@ The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web
 
 `daemon run --server` starts the gRPC (:9378) and MCP HTTP (:9379) listeners. The web UI (default :3000, :9377 in the macOS .app) is started separately via `nestweaver ui` and is not part of the server container default.
 
-The MCP HTTP listener is always **gRPC port + 1** and inherits the `--bind` IP. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker.
+The MCP HTTP listener inherits the `--bind` IP and is **gRPC port + 1** for fixed binds. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker. Exception: with an ephemeral `--bind 127.0.0.1:0` the gRPC port is OS-assigned at runtime, so the MCP listener binds its own ephemeral port (`:0`) instead of gRPC + 1; read both actual ports from the daemon's port file or startup log.
+
+Tool exposure and validation are identical on every MCP transport — local stdio, daemon proxy, hybrid, and MCP-over-HTTP all enforce the `--tools`/`--lite` allowlists, and tool schemas reject unknown argument names and out-of-range numeric values (e.g. `token_budget` outside 1–16000, `depth` outside 1–15) instead of silently ignoring them.
 
 | Port | Protocol | Auth | Purpose |
 |------|----------|------|---------|
@@ -136,6 +138,9 @@ curl -H "Authorization: Bearer $NESTWEAVER_ADMIN_TOKEN" \
 # Generate a self-signed certificate (development/internal use)
 nestweaver server init-tls --output-dir ./tls
 
+# Custom validity (1-36500 days; default 365)
+nestweaver server init-tls --output-dir ./tls --validity-days 90
+
 # Start with TLS
 nestweaver daemon --db ./brain.lbug run \
   --server \
@@ -144,6 +149,9 @@ nestweaver daemon --db ./brain.lbug run \
   --tls-key ./tls/server-key.pem \
   --auth-token "$NESTWEAVER_AUTH_TOKEN"
 ```
+
+Re-running `init-tls` over an existing CA warns that the new CA invalidates
+certificates signed by the old one — re-issue client/server certs afterwards.
 
 ### Manual certificate setup
 
@@ -405,6 +413,34 @@ Different tools have different optimal routing:
 | `brain_status`, `stale_check`, `brain_doc_stats` | combined | Preserve status/metadata shape while including both sources |
 | `detect_changes`, memory/admin tools | local-only | These depend on local working-tree or personal state |
 
+### `brain_search` count semantics
+
+Every `brain_search` JSON response reports the display-independent match count
+alongside the returned rows:
+
+- `total_matches` counts distinct logical note/tag and symbol entities, not raw
+  heading or section hits. A note and a symbol with the same title remain two
+  entities.
+- `total_matches_relation: "eq"` means `total_matches` is exact;
+  `"gte"` means it is a safe lower bound because bounded counting or an
+  incomplete source prevented an exact count.
+- `returned_matches` is the number of rows in `results` after the requested
+  display limit and any hybrid deduplication.
+- `truncated` is true whenever the total is a lower bound or fewer rows were
+  returned than the exact total.
+- Every row, including `response_format: "concise"`, carries its canonical
+  domain-qualified `uid`. Hybrid deduplication uses that identity rather than
+  presentation fields such as title or location.
+
+For a hybrid merge, NestWeaver reports an exact union only when both local and
+server responses have valid, internally consistent exact-count metadata and
+every returned row has a unique canonical identity within its source. RRF can
+then deduplicate the complete logical union by UID. If either source is
+incomplete or any row is unkeyed, the merged total is a conservative lower
+bound derived from trustworthy source totals and proven distinct UIDs, never
+from the raw merged-row length. Source totals are not summed because local and
+server data can overlap.
+
 ### Staleness detection
 
 The client compares local `indexed_sha` against server `RepoStates` using `git ls-remote`. When local state is behind:
@@ -597,7 +633,7 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 | `/admin/api/dead-letter` | GET | View failed jobs |
 | `/admin/api/dead-letter/{id}/retry` | POST | Retry a failed job |
 | `/admin/api/dead-letter/{id}` | DELETE | Dismiss a failed job |
-| `/metrics` | GET | Prometheus metrics (served by the daemon on the MCP HTTP port `:9379`; no admin token required) |
+| `/metrics` | GET | Prometheus metrics (served by the daemon on the MCP HTTP port `:9379`; requires a valid bearer token when `auth_token` is configured — the query token or the admin token both work, it is not admin-only; open only on unauthenticated loopback dev binds) |
 
 ```bash
 # List repos

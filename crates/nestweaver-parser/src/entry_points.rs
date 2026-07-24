@@ -681,7 +681,17 @@ fn detect_rust(
         return Some(EntryPointKind::Main);
     }
     if let Some(sig) = signature {
-        if sig.contains("#[test]") || sig.contains("#[tokio::test]") {
+        // Test attributes (the signature has any leading `#[...]` attributes
+        // prepended by the parser). `#[test]` / `#[tokio::test]` /
+        // `#[tokio::test(...)]` / `#[actix_web::test]` / `#[async_std::test]` /
+        // `#[rstest]` / `#[test_case(...)]` are the common runners.
+        if sig.contains("#[test]")
+            || sig.contains("#[tokio::test")
+            || sig.contains("#[actix_web::test")
+            || sig.contains("#[async_std::test")
+            || sig.contains("#[rstest")
+            || sig.contains("#[test_case")
+        {
             return Some(EntryPointKind::TestEntry);
         }
         if sig.contains("#[tokio::main]") || sig.contains("#[actix_web::main]") {

@@ -157,10 +157,28 @@ fn missing_bundled_source_directory_is_reported() {
 
 #[test]
 fn crate_manifest_pins_lbug_to_the_exact_abi_version() {
+    // Derive the expected pin from build.rs's LBUG_ABI_VERSION rather than
+    // hardcoding it, so the manifest and the build-script guard cannot drift
+    // apart on an upgrade (they previously had to be edited in lockstep, and
+    // a mismatch only surfaces as a confusing build-script panic).
+    let build_rs =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs")).unwrap();
+    let abi = build_rs
+        .lines()
+        .find_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix("const LBUG_ABI_VERSION: &str = \"")?;
+            rest.split('"').next()
+        })
+        .expect("build.rs must declare LBUG_ABI_VERSION");
+
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
-
-    assert!(manifest.contains("lbug = \"=0.18.2\""), "{manifest}");
+    let expected = format!("lbug = \"={abi}\"");
+    assert!(
+        manifest.contains(&expected),
+        "Cargo.toml must pin lbug to the build-script ABI version ({expected}):\n{manifest}"
+    );
 }
 
 #[test]

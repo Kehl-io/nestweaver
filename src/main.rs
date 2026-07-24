@@ -11,19 +11,19 @@ use nestweaver_engine::{
     BlastRadiusResult, BrainContextResult, BrainWatcher, BreakTier, BreakingChange, CodeWatcher,
     ContextResult, DeadCodeConfidence, FeatureContextResult, GateState, HubNode,
     HybridSearchConfig, LookupResult, NotificationLevel, RiskLevel, Summary, SummaryLevel,
-    affected_tests, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    breaking_changes_from_git, build_brain_context_hybrid_with_aliases, build_context_with_intent,
-    build_feature_context, changed_files_from_git, compute_clusters, compute_cochanges,
-    detect_implicit_projects, discover_cross_domain_links, embedding::generate_embeddings_batch,
-    expand_query_with_aliases, export_cypher, export_graphml, export_in_memory_graph,
-    export_mermaid, filter_by_target, find_bridge_nodes, find_hub_nodes,
-    generate_agents_md_with_rules, generate_claude_md_with_rules, generate_cursor_rule_with_rules,
-    generate_guide_with_tools, generate_repo_map, generate_summaries, get_last_indexed_at,
-    incremental_index_with_name, index_directory_with_options,
-    index_markdown_directory_since_with_ignore, index_markdown_directory_with_ignore, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_extensions, lookup_symbol,
-    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
-    search_symbols, suggest_links, truncate_to_budget,
+    analyze_blast_radius, attach_cluster_ids, attach_communities, breaking_changes_from_git,
+    build_brain_context_hybrid_with_aliases, build_context_with_intent, build_feature_context,
+    changed_files_from_git, compute_clusters, compute_cochanges, detect_implicit_projects,
+    discover_cross_domain_links, embedding::generate_embeddings_batch, export_cypher,
+    export_graphml, export_in_memory_graph, export_mermaid, filter_by_target, find_bridge_nodes,
+    find_hub_nodes, generate_agents_md_with_rules, generate_claude_md_with_rules,
+    generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
+    generate_summaries, get_last_indexed_at, incremental_index_with_name,
+    index_directory_with_options, index_markdown_directory_since_with_ignore,
+    index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
+    load_clusters, load_extensions, lookup_symbol, record_last_indexed_at, render_text,
+    save_clusters, save_cochange_sidecar, save_summaries, search_symbols, suggest_links,
+    truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -69,6 +69,13 @@ enum CliDiagnostic {
     )]
     RepoPathNotFound { path: String },
 
+    #[error("Repository path is not a directory: {path}")]
+    #[diagnostic(
+        code(nestweaver::repo_not_a_directory),
+        help("Pass a repository directory, not a file: {path}")
+    )]
+    RepoPathNotADirectory { path: String },
+
     #[error("No symbols found in the database")]
     #[diagnostic(
         code(nestweaver::empty_graph),
@@ -95,8 +102,13 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     let message = format!("{err:#}");
     let lower = message.to_lowercase();
 
-    if (lower.contains("no such file") || lower.contains("not found"))
-        && (lower.contains("database") || lower.contains(".lbug"))
+    // Only genuine "the DB file is absent" failures map here. A create-path
+    // error (`index` / `brain add`) like "open/create store at <path>.lbug:
+    // ... No such file or directory" mentions a .lbug path and a missing
+    // file, but mapping it to db_not_found produces the circular help text
+    // "Run `nestweaver index` to create a database" — while running index.
+    if lower.contains("database not found")
+        || (lower.contains("failed to open database") && lower.contains("no such file"))
     {
         // Extract the path from common anyhow context patterns like
         // "failed to open database at ./foo.lbug: No such file ..."
@@ -114,12 +126,31 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
         || lower.contains("not a directory")
         || (lower.contains("no such file") && lower.contains("repo"))
     {
-        let path = message
-            .split(": ")
-            .last()
-            .unwrap_or(&message)
-            .trim()
-            .to_string();
+        // Prefer the offending path embedded in our canonical messages
+        // ("... does not exist: <path> — ..." / "... is not a directory: <path> — ...")
+        // so the diagnostic names it instead of the trailing OS error.
+        let path = ["does not exist: ", "not a directory: "]
+            .iter()
+            .find_map(|marker| {
+                message
+                    .split(marker)
+                    .nth(1)
+                    .map(|s| s.split(" —").next().unwrap_or(s).trim().to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                message
+                    .split(": ")
+                    .last()
+                    .unwrap_or(&message)
+                    .trim()
+                    .to_string()
+            });
+        // A file passed as --repo must be diagnosed as "not a directory",
+        // not folded into the "does not exist" title.
+        if lower.contains("not a directory") {
+            return CliDiagnostic::RepoPathNotADirectory { path }.into();
+        }
         return CliDiagnostic::RepoPathNotFound { path }.into();
     }
 
@@ -319,6 +350,8 @@ enum Commands {
     },
     /// Check if the indexed graph is stale by comparing each repo's
     /// indexed SHA against git HEAD. (Same as `brain stale-check`.)
+    /// Exits 1 when any repo is stale or its working tree is missing —
+    /// usable as a CI freshness gate.
     StaleCheck {
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -327,6 +360,12 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+    },
+    /// Measure affected-tests selection quality against full-suite outcomes
+    /// (nw-037): record ground truth from CI, report rolling recall.
+    RtsEval {
+        #[command(subcommand)]
+        command: RtsEvalCommands,
     },
     /// List all services/modules in the graph
     ListServices {
@@ -450,9 +489,17 @@ enum Commands {
             help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
         )]
         kinds: Option<Vec<String>>,
-        #[arg(long, help = "Maximum number of results")]
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10000),
+            help = "Maximum number of results (1-10000; matches the MCP regex_search schema)"
+        )]
         limit: Option<usize>,
-        #[arg(long = "max-millis", help = "Wall-clock time budget in milliseconds")]
+        #[arg(
+            long = "max-millis",
+            value_parser = clap::value_parser!(u64).range(1..=600000),
+            help = "Wall-clock time budget in milliseconds (1-600000; matches the MCP regex_search schema)"
+        )]
         max_millis: Option<u64>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -498,12 +545,17 @@ enum Commands {
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
     /// to find all symbols that would be affected by a change.
     #[command(
-        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json"
+        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so (text note; under --json the output becomes\nan object with `nodes`, `truncated_by_threshold`, `truncated_by_depth` instead of\nthe usual bare array). Pass --min-score 0 for the full traversal."
     )]
     Impact {
         /// Symbol name or UID to analyze
         name_or_uid: String,
-        #[arg(long, default_value = "3", help = "Maximum traversal depth")]
+        #[arg(
+            long,
+            default_value = "3",
+            value_parser = clap::value_parser!(u32).range(1..=15),
+            help = "Maximum traversal depth (1-15; matches the MCP brain_impact schema)"
+        )]
         depth: u32,
         #[arg(
             long,
@@ -511,6 +563,11 @@ enum Commands {
             help = "Minimum edge confidence [0.0-1.0]"
         )]
         confidence: f32,
+        #[arg(
+            long,
+            help = "Minimum impact score for including a dependent [0.0-1.0] (default: 0.10; pass 0 to disable score pruning and get the full traversal)"
+        )]
+        min_score: Option<f64>,
         #[arg(long, help = "Filter by instance ID")]
         instance: Option<String>,
         #[arg(long, help = "Filter to symbols in this repo")]
@@ -756,7 +813,8 @@ enum Commands {
         limit: Option<usize>,
         #[arg(
             long,
-            help = "Approximate token budget for output (takes precedence over --limit)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
+            help = "Approximate token budget for output (1-16000; takes precedence over --limit; matches the MCP brain_context schema)"
         )]
         token_budget: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -929,6 +987,7 @@ enum Commands {
         #[arg(
             long,
             default_value = "markdown",
+            value_parser = ["markdown", "skill", "cursor-rule", "agents-md", "claude-md"],
             help = "Output format: markdown (default), skill, cursor-rule, agents-md, claude-md"
         )]
         format: String,
@@ -965,7 +1024,12 @@ enum Commands {
     /// codebase depend on. Useful for understanding the architectural core.
     #[command(after_help = "Examples:\n  nestweaver hubs\n  nestweaver hubs --top 20 --json")]
     Hubs {
-        #[arg(long, default_value = "10", help = "Number of top hubs to show")]
+        #[arg(
+            long,
+            default_value = "10",
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Number of top hubs to show (1-1000; matches the MCP hub_nodes schema)"
+        )]
         top: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -996,7 +1060,7 @@ enum Commands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
     },
-    /// List detected code communities (Leiden clustering)
+    /// List detected code communities (Louvain-style local moving)
     ///
     /// Runs community detection on the code graph and prints a summary of
     /// each cluster. Results are cached in a sidecar file alongside the
@@ -1047,6 +1111,7 @@ enum Commands {
         token_budget: Option<usize>,
         #[arg(
             long,
+            visible_alias = "name",
             help = "Filter to a specific target (file path, symbol name, or cluster name)"
         )]
         target: Option<String>,
@@ -1109,7 +1174,8 @@ enum Commands {
         name: String,
         #[arg(
             long,
-            help = "Approximate token budget for the output [default: 1000 concise / 3000 detailed]"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
+            help = "Approximate token budget for the output (1-16000; matches the MCP project_context schema) [default: 1000 concise / 3000 detailed]"
         )]
         token_budget: Option<usize>,
         #[arg(
@@ -1170,7 +1236,8 @@ enum Commands {
         #[arg(
             long,
             default_value = "4000",
-            help = "Approximate token budget (chars/4)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
+            help = "Approximate token budget (chars/4; 1-16000, matches the MCP investigate schema)"
         )]
         token_budget: usize,
         #[arg(long, help = "Filesystem root for inline bodies (default: repo root)")]
@@ -1216,7 +1283,8 @@ enum Commands {
         #[arg(
             long,
             default_value = "4000",
-            help = "Approximate token budget (chars/4)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
+            help = "Approximate token budget (chars/4; 1-16000, matches the MCP investigate_hydrate schema)"
         )]
         token_budget: usize,
         #[arg(long, help = "Filesystem root for source bodies (default: repo root)")]
@@ -1311,6 +1379,11 @@ enum Commands {
     /// EXTENDS, IMPLEMENTS, and MEMBER_OF edges. Symbols not reached
     /// are reported as potentially dead, with confidence scoring based
     /// on visibility.
+    ///
+    /// Known limitation: symbol visibility is not persisted (reads rebuild it
+    /// as Inferred), so confidence scoring cannot distinguish a public API
+    /// from a private helper — treat Low-confidence results as review
+    /// candidates, not proof of deadness.
     #[command(
         after_help = "Examples:\n  nestweaver dead-code\n  nestweaver dead-code --min-confidence medium --json"
     )]
@@ -1325,7 +1398,8 @@ enum Commands {
         json: bool,
         #[arg(
             long,
-            help = "Max unreachable symbols to report (default: all). Large codebases can produce very large output; cap it here or via a pipe."
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Max unreachable symbols to report (1-1000, default: all; matches the MCP dead_code schema). Large codebases can produce very large output; cap it here or via a pipe."
         )]
         limit: Option<usize>,
         #[arg(
@@ -1337,8 +1411,11 @@ enum Commands {
 
     /// Export the code graph to an external format
     ///
-    /// Supports Cypher (Neo4j), GraphML (Gephi/yEd), and Mermaid flowchart
-    /// formats. Writes to stdout by default; use --output to write to a file.
+    /// Supports Cypher (Neo4j), GraphML (Gephi/yEd), Mermaid flowchart, and
+    /// MessagePack (binary) formats. Text formats write to stdout by default;
+    /// use --output to write to a file. msgpack never writes to stdout: it
+    /// writes to --output, or to `<db-name>.graph.msgpack` next to the
+    /// database when --output is omitted.
     #[command(
         after_help = "Examples:\n  nestweaver export --format cypher\n  nestweaver export --format graphml --output graph.xml\n  nestweaver export --format mermaid --top 30\n  nestweaver export --format msgpack --output graph.msgpack"
     )]
@@ -1403,7 +1480,12 @@ enum Commands {
                     tune via [pr_impact] in nestweaver-instance.toml)"
         )]
         strict: bool,
-        #[arg(long, default_value = "3", help = "Maximum traversal depth")]
+        #[arg(
+            long,
+            default_value = "3",
+            value_parser = clap::value_parser!(u32).range(1..=15),
+            help = "Maximum traversal depth (1-15; matches the MCP blast_radius schema)"
+        )]
         depth: u32,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -1472,6 +1554,11 @@ enum Commands {
         instance: Option<String>,
         #[arg(long, help = "Re-fetch wiki sources every N hours (requires --config)")]
         refresh_wiki_hours: Option<u64>,
+        #[arg(
+            long,
+            help = "Replace an already-running daemon-side watcher (e.g. one orphaned by a kill -9'd watch CLI) instead of failing"
+        )]
+        force: bool,
         #[arg(
             long,
             help = "Path to instance config (TOML) — required for --refresh-wiki-hours"
@@ -1586,8 +1673,8 @@ enum ServerAction {
         /// Subject Alternative Names (hostnames and IPs)
         #[arg(long = "san")]
         sans: Vec<String>,
-        /// Certificate validity in days
-        #[arg(long, default_value = "365")]
+        /// Certificate validity in days (1-36500)
+        #[arg(long, default_value = "365", value_parser = clap::value_parser!(u32).range(1..=36500))]
         validity_days: u32,
         /// Generate client certificate for mTLS
         #[arg(long)]
@@ -1880,6 +1967,58 @@ enum RankingCommands {
 }
 
 #[derive(Subcommand)]
+enum RtsEvalCommands {
+    /// Record a full-suite run's outcome (ground truth) for a commit sha.
+    /// Call from CI after the periodic full test run.
+    RecordTruth {
+        /// Commit sha the full suite ran against (same sha the selection used).
+        #[arg(long)]
+        sha: String,
+        /// Repo uid the outcome belongs to (optional in single-repo DBs).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Test files that failed (repo-relative). Omit with --none-failed for a green run.
+        #[arg(long = "failed-test-files", num_args = 0..)]
+        failed_test_files: Vec<String>,
+        /// Explicitly record a green run (no failures).
+        #[arg(long, conflicts_with = "failed_test_files")]
+        none_failed: bool,
+        /// Total test files the full run executed (feeds the time-saved proxy).
+        #[arg(long)]
+        total_test_files: Option<usize>,
+        /// Failures identified as FLAKY (e.g. passed on rerun). Excluded from
+        /// recall entirely and never pinned into future selections.
+        #[arg(long = "flaky", num_args = 0..)]
+        flaky_test_files: Vec<String>,
+        /// How many times failures were re-run before reporting. Without this,
+        /// failures are UNCONFIRMED and the report marks the recall estimate
+        /// as uncertain (it can err in either direction — it is not a bound).
+        #[arg(long)]
+        reruns: Option<u32>,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+    /// Join recorded selections with ground truth and report rolling
+    /// file-recall / change-recall / selection-breadth. Refuses to print
+    /// percentages below 10 joined pairs.
+    Report {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        /// Compute over the last N joined pairs (0 = lifetime).
+        #[arg(long, default_value_t = 50)]
+        window: usize,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum BrainCommands {
     /// Index a markdown vault into the brain. Auto-detects Obsidian vault
@@ -1928,6 +2067,8 @@ enum BrainCommands {
     },
     /// Check if the indexed graph is stale by comparing each repo's
     /// indexed SHA against git HEAD.
+    /// Exits 1 when any repo is stale or its working tree is missing —
+    /// usable as a CI freshness gate.
     StaleCheck {
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -2027,7 +2168,8 @@ enum BrainCommands {
         query: String,
         #[arg(
             long,
-            help = "Maximum results (default: 20, or [limits].default_result_limit from config)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum results (1-1000; default: 20, or [limits].default_result_limit from config; matches the MCP brain_search schema)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -2058,7 +2200,11 @@ enum BrainCommands {
         /// Approximate token cap for the output (characters / 4). When set,
         /// truncates the connected list to fit. This is the primary knob
         /// for LLM context-window-sized output.
-        #[arg(long, help = "Approximate token budget for the connected list")]
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16000),
+            help = "Approximate token budget for the connected list (1-16000; matches the MCP brain_context schema)"
+        )]
         token_budget: Option<usize>,
         /// Hard cap on connected results. Used when --token-budget is not
         /// set; ignored when it is.
@@ -2274,11 +2420,11 @@ enum BrainCommands {
         #[arg(long, help = "Path to instance config (TOML)")]
         config: Option<PathBuf>,
     },
-    /// Detect topic clusters by running Leiden community detection over the
+    /// Detect topic clusters by running Louvain-style local moving over the
     /// note-to-note wikilink graph. Each cluster is labelled by its most
     /// central member.
     TopicClusters {
-        #[arg(long, default_value = "0.5", help = "Leiden resolution")]
+        #[arg(long, default_value = "0.5", help = "Community-detection resolution")]
         resolution: f64,
         #[arg(
             long,
@@ -2440,6 +2586,24 @@ enum InstanceCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+    },
+    /// Clear a wedged instance-migration journal so the daemon can boot.
+    ///
+    /// A `Prepared` journal (no graph mutation happened) is removed cleanly. A
+    /// `graph-applied` journal is refused unless `--force`, because the graph was
+    /// already mutated — restart the daemon instead (boot self-heals a re-runnable
+    /// merge), or `--force` to discard the journal and reconcile manually. Run
+    /// while the daemon is stopped.
+    #[command(name = "abort-migration")]
+    AbortMigration {
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        /// Discard a graph-applied journal too (the graph mutation stays).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -2980,6 +3144,25 @@ fn git_hooks_dir(cwd: &Path) -> anyhow::Result<PathBuf> {
     })
 }
 
+/// Repo worktree root via `git rev-parse --show-toplevel`; None when git
+/// can't answer (already validated by the caller, so a failure is ignored).
+fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
+}
+
 /// Build the pre-push hook script. Advisory (default) always `exit 0` so it can
 /// never block a push; strict drops the fail-open shim so `pr-impact`'s configured
 /// block policy (default: a contract-verified breaking change) can exit 2 and
@@ -3034,6 +3217,24 @@ fn make_executable(path: &Path) -> anyhow::Result<()> {
 /// git repo. Backs up any pre-existing non-nestweaver hook.
 fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
+    // A custom core.hooksPath can point OUTSIDE the repo — installing a
+    // hook there affects other repos, so say so loudly. Only checked when the
+    // hooks dir already exists and canonicalizes (a not-yet-created custom
+    // path can't be resolved reliably).
+    if let Some(root) = git_repo_root(cwd)
+        && let Ok(hooks_canon) = hooks_dir.canonicalize()
+    {
+        let root_canon = root.canonicalize().unwrap_or(root);
+        if hooks_dir_outside_repo(&hooks_canon, &root_canon) {
+            eprintln!(
+                "warning: git hooks path {} resolves OUTSIDE the repository {} \
+                 (core.hooksPath is set) — the hook will be installed there and \
+                 may affect other repos",
+                hooks_canon.display(),
+                root_canon.display()
+            );
+        }
+    }
     std::fs::create_dir_all(&hooks_dir)
         .with_context(|| format!("creating hooks dir {}", hooks_dir.display()))?;
     let hook_path = hooks_dir.join("pre-push");
@@ -3348,6 +3549,321 @@ fn abs_for_daemon(p: &std::path::Path) -> std::path::PathBuf {
     })
 }
 
+/// Is a daemon process for this DB currently running (per its pidfile)?
+///
+/// Used to decide whether falling back to a direct store open is safe: while a
+/// daemon holds the DB write lock, a direct open would deadlock/conflict.
+fn daemon_process_running_for_db(db_path: &std::path::Path) -> bool {
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+    nestweaver_client::autostart::read_pid(&pidfile)
+        .map(nestweaver_client::autostart::is_process_alive)
+        .unwrap_or(false)
+}
+
+/// Pure predicate: does this process cmdline look like a nestweaver
+/// daemon serving `db_path`? The daemon is always started as
+/// `nestweaver daemon --db <path> ...`, so require both markers. The DB path
+/// may be spelled differently at start vs. stop time, so accept the raw or
+/// canonical spelling.
+fn cmdline_is_our_daemon(cmdline: &str, db_path: &std::path::Path) -> bool {
+    if cmdline.is_empty() || !cmdline.contains("nestweaver") {
+        return false;
+    }
+    let raw = db_path.to_string_lossy();
+    if !raw.is_empty() && cmdline.contains(raw.as_ref()) {
+        return true;
+    }
+    if let Ok(canonical) = std::fs::canonicalize(db_path) {
+        let canonical = canonical.to_string_lossy();
+        if !canonical.is_empty() && cmdline.contains(canonical.as_ref()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the cmdline of `pid` when it is verifiably a nestweaver daemon
+/// serving `db_path`, else `None`. A stale pidfile PID may have been recycled
+/// by an unrelated process — callers must NOT signal the PID when this returns
+/// `None`.
+fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    cmdline_is_our_daemon(&cmdline, db_path).then_some(cmdline)
+}
+
+/// Is the pidfile's flock currently held? daemonize2 holds LOCK_EX on the
+/// pidfile for the daemon's whole lifetime (see autostart.rs), so a held flock
+/// proves a live daemon owns THIS pidfile — regardless of how its `--db` path
+/// was spelled at start time (which a cmdline match can't always prove).
+fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pidfile)
+    else {
+        return false;
+    };
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return false;
+    }
+    std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// PID of the process on the other end of a connected unix socket, as
+/// reported by the kernel. Unlike the pidfile (whose contents can be
+/// overwritten while the daemon still holds its flock), this cannot be faked
+/// by another process. Integration point: a future daemon self-reported-PID RPC
+/// can supersede this once it lands.
+#[cfg(target_os = "linux")]
+fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    #[repr(C)]
+    struct UCred {
+        pid: libc::pid_t,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+    let mut cred = UCred {
+        pid: -1,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<UCred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut UCred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid)
+}
+
+/// macOS equivalent of Linux `SO_PEERCRED` — XNU's `LOCAL_PEERPID`.
+#[cfg(target_os = "macos")]
+fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    const SOL_LOCAL: libc::c_int = 0;
+    const LOCAL_PEERPID: libc::c_int = 0x002;
+    let mut pid: libc::pid_t = -1;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && pid > 0).then_some(pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unix_socket_peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    None
+}
+
+/// The PID of the daemon serving `socket`, reported by the kernel at
+/// connect time. `None` when the socket is missing or refuses the connection
+/// — i.e. the daemon cannot confirm its identity and callers must refuse to
+/// signal the pidfile PID.
+fn daemon_socket_reported_pid(socket: &std::path::Path) -> Option<i32> {
+    let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    unix_socket_peer_pid(&stream)
+}
+
+/// Is the pidfile's PID verifiably our daemon? True when the process
+/// cmdline matches a nestweaver daemon for this DB. When only the pidfile
+/// flock is held, the flock proves *a* live daemon owns THIS pidfile but not
+/// that its contents still name that daemon (the file can be rewritten while
+/// the lock is held) — so cross-check the pidfile PID against the
+/// kernel-reported PID of the process serving the daemon socket. A
+/// daemon that cannot confirm its identity is NOT signaled.
+fn daemon_identity_verified(
+    pid: i32,
+    db_path: &std::path::Path,
+    pidfile: &std::path::Path,
+    socket: &std::path::Path,
+) -> bool {
+    if daemon_cmdline_if_ours(pid, db_path).is_some() {
+        return true;
+    }
+    if !pidfile_flock_held(pidfile) {
+        return false;
+    }
+    daemon_socket_reported_pid(socket) == Some(pid)
+}
+
+/// nw-087: commands that operate on an existing database must fail
+/// `db_not_found` when the file is absent — never autostart a daemon that
+/// CREATES an empty DB (a typo'd `--db` must not false-green). The message is
+/// phrased so `into_diagnostic` maps it to `CliDiagnostic::DatabaseNotFound`.
+fn require_existing_db(db_path: &std::path::Path) -> anyhow::Result<()> {
+    if !db_path.exists() {
+        anyhow::bail!("database not found at {}", db_path.display());
+    }
+    Ok(())
+}
+
+/// Create-operations (`index`, `brain add`) materialize the DB file, so a
+/// `--db` pointing into a not-yet-existing directory must have that
+/// directory created up front — otherwise the store open fails with a bare
+/// OS "No such file or directory" (and the daemon, when auto-spawned, fails
+/// the same way). Less surprising than rejecting the path: the user asked
+/// us to create a database there.
+fn ensure_db_parent_dir(db_path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create database directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// When a direct watcher fails to acquire the DB write lock, the raw
+/// lbug message ("Could not set lock on file ...") doesn't say WHO holds it —
+/// usually a live daemon. Return the actionable remedy to append.
+fn watch_lock_hint(err_msg: &str, db_path: &std::path::Path) -> Option<String> {
+    err_msg.contains("Could not set lock").then(|| {
+        format!(
+            "the database is locked by another process — if a daemon is running \
+             for this DB, stop it with `nestweaver daemon --db {} stop` and retry",
+            db_path.display()
+        )
+    })
+}
+
+/// Canonicalize a `--repo` path and require it to name a directory.
+/// A file path canonicalizes fine but can never be indexed — reject it up
+/// front, naming the offending path in both error messages.
+fn canonical_repo_dir(repo_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(repo_path).with_context(|| {
+        format!(
+            "repository path does not exist: {} — pass an existing path \
+             (absolute, or run from within the repo)",
+            repo_path.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        anyhow::bail!(
+            "repository path is not a directory: {} — pass a repository directory",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
+/// Poll until the daemon's unix socket accepts a connection (proving
+/// run_server survived boot) or `timeout` elapses.
+fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+/// Wait up to `grace` for `pid` to exit (after a SIGTERM). Returns true
+/// when the process is gone, false when it is still alive at the deadline —
+/// the caller must NOT proceed with an install/start in the false case, or
+/// the old and new daemons would overlap on one DB.
+///
+/// Only called from the launchd start path, which is macOS-only.
+#[cfg(target_os = "macos")]
+fn pid_exited_within_grace(pid: i32, grace: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        if start.elapsed() >= grace {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// `search` had no truncation signal. When the result count equals
+/// the requested limit there may be more matches — say so, like the MCP
+/// `total`/`returned` fields do.
+fn search_truncation_note(returned: usize, limit: usize) -> Option<String> {
+    if limit > 0 && returned >= limit {
+        Some(format!(
+            "(limit {limit} reached — there may be more matches; raise --limit)"
+        ))
+    } else {
+        None
+    }
+}
+
+fn print_search_truncation_note(returned: usize, limit: usize) {
+    if let Some(note) = search_truncation_note(returned, limit) {
+        println!("{note}");
+    }
+}
+
+/// Is the resolved git hooks dir outside the repo worktree (a custom
+/// `core.hooksPath`)? Both paths must be canonicalized by the caller.
+fn hooks_dir_outside_repo(hooks_dir: &std::path::Path, repo_root: &std::path::Path) -> bool {
+    !hooks_dir.starts_with(repo_root)
+}
+
+// ── RPC arg builders ─────────────────────────────────────────────────
+// The CLI must send the arg names the MCP tools actually read. Keep the
+// builders in one tested place so a rename on either side fails a unit test
+// instead of silently falling back to tool defaults.
+
+/// `bridge_nodes` reads `limit`/`top_n` — never `top`.
+fn bridge_nodes_rpc_args(top: usize) -> serde_json::Value {
+    serde_json::json!({ "top_n": top })
+}
+
+/// `affected_tests` reads `changed_files` (an array) — never a raw string
+/// under `files`.
+fn affected_tests_rpc_args(changed_files: &[String]) -> serde_json::Value {
+    serde_json::json!({ "changed_files": changed_files })
+}
+
+/// `read_symbols` reads `include_neighbors` (never `neighbors`, nw-088) and an
+/// optional integer `token_budget`. The budget key is OMITTED when unset — the
+/// tool's integer schema rejects an explicit null, which used to fail schema
+/// validation on every budget-less call and silently fall back to the direct
+/// path.
+fn read_symbols_rpc_args(
+    targets: &[String],
+    neighbors: u8,
+    token_budget: Option<usize>,
+    root: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let mut args = serde_json::json!({
+        "targets": targets,
+        "include_neighbors": neighbors,
+    });
+    if let Some(tb) = token_budget {
+        args["token_budget"] = serde_json::json!(tb);
+    }
+    if let Some(r) = root {
+        args["root"] = serde_json::json!(r.to_string_lossy());
+    }
+    args
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -3412,24 +3928,102 @@ fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Human-readable caveat for an incomplete `impact` traversal, mirroring the
+/// pr-impact "reported impact is a floor" phrasing. Names the concrete cause
+/// (score pruning / depth cap) and the opt-out for each.
+fn impact_truncation_note(
+    result: &nestweaver_store::ImpactResult,
+    threshold: f64,
+    depth: u32,
+) -> String {
+    let mut parts = Vec::new();
+    if result.truncated_by_threshold {
+        parts.push(format!(
+            "traversal pruned below the impact-score threshold ({threshold:.2}) — re-run with --min-score 0 for the full traversal"
+        ));
+    }
+    if result.truncated_by_depth {
+        parts.push(format!(
+            "traversal hit the depth limit ({depth}) — deeper dependents may exist; raise --depth"
+        ));
+    }
+    format!("{} — reported impact is a floor", parts.join("; "))
+}
+
+/// Pure core of [`no_daemon_allowed`], split out so the policy is unit-testable
+/// without mutating process-global environment variables (which race under
+/// parallel `cargo test`). The daemon bypass is permitted when an explicit
+/// local opt-in is set, or when we are running under a CI system.
+fn no_daemon_allowed_from(allow_optin: bool, github_actions: bool, ci: Option<&str>) -> bool {
+    if allow_optin || github_actions {
+        return true;
+    }
+    // `CI` is set to a truthy value by virtually every CI provider. Treat the
+    // conventional falsey spellings as "not CI" so `CI=0`/`CI=false` don't count.
+    match ci {
+        Some(v) => {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    }
+}
+
+/// Whether the daemon-bypass escape hatch (`--no-daemon` / `NESTWEAVER_NO_DAEMON`)
+/// is permitted in the current environment.
+///
+/// Bypassing the daemon writes to the store directly, which risks WAL corruption
+/// and is strictly a CI/test convenience — yet the env var kept getting set in
+/// interactive and agent contexts, silently engaging the unsafe path. So outside
+/// a CI context we now *refuse* it and route through the daemon instead. It is
+/// honored only when one of these is present:
+///   - `NESTWEAVER_ALLOW_NO_DAEMON` — explicit local-test opt-in, or
+///   - `GITHUB_ACTIONS` — set by GitHub Actions, or
+///   - `CI` set to a truthy value — set by virtually every CI system.
+fn no_daemon_allowed() -> bool {
+    no_daemon_allowed_from(
+        std::env::var_os("NESTWEAVER_ALLOW_NO_DAEMON").is_some(),
+        std::env::var_os("GITHUB_ACTIONS").is_some(),
+        std::env::var("CI").ok().as_deref(),
+    )
+}
+
+/// Resolve whether to route through the daemon, given the `--no-daemon` flag.
+///
+/// A daemon bypass is *requested* by the flag or by `NESTWEAVER_NO_DAEMON`, but
+/// only *honored* when [`no_daemon_allowed`] is true. When a bypass is requested
+/// but refused, warn once (if `warn`) and fall back to the daemon. Returns `true`
+/// to use the daemon, `false` to bypass it.
+///
+/// `warn` is suppressed for the `daemon` subcommand: an autostarted daemon child
+/// inherits `NESTWEAVER_NO_DAEMON` from its parent, but it never bypasses (it *is*
+/// the server), so warning there just double-prints the parent's message.
+fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
+    let requested = no_daemon_flag || std::env::var_os("NESTWEAVER_NO_DAEMON").is_some();
+    if !requested {
+        return true;
+    }
+    if no_daemon_allowed() {
+        return false; // genuine CI/test context — honor the bypass
+    }
+    if warn {
+        eprintln!(
+            "Warning: --no-daemon / NESTWEAVER_NO_DAEMON is a CI/test-only escape hatch that \
+             bypasses the daemon and risks WAL corruption. Ignoring it and routing through the \
+             daemon. Set NESTWEAVER_ALLOW_NO_DAEMON=1 (or run in CI) to force the bypass."
+        );
+    }
+    true
+}
+
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
     let no_embed = cli.no_embed;
-    let use_daemon = if cli.no_daemon {
-        if std::env::var("NESTWEAVER_NO_DAEMON").is_ok() {
-            false
-        } else {
-            eprintln!(
-                "Warning: --no-daemon bypasses the daemon and risks WAL corruption. \
-                 It is only for CI/testing. Set NESTWEAVER_NO_DAEMON=1 to confirm. \
-                 Ignoring flag and routing through daemon."
-            );
-            true
-        }
-    } else {
-        std::env::var("NESTWEAVER_NO_DAEMON").is_err()
-    };
+    let use_daemon = resolve_use_daemon(
+        cli.no_daemon,
+        !matches!(cli.command, Commands::Daemon { .. }),
+    );
     match cli.command {
         Commands::ListRepos {
             instance,
@@ -3437,9 +4031,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config: config_opt,
         } => {
+            // nw-087: read-only command — fail `db_not_found` on a
+            // missing --db before any daemon/store connect could create one.
+            let db_path = db.clone().unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
                 let mut args = serde_json::json!({});
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
@@ -3448,6 +4045,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "list_repos", args)
                 {
                     let value = unwrap_hybrid_payload(value);
+                    let repo_count = value.as_array().map(|a| a.len()).unwrap_or(0);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -3465,7 +4063,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             }
                         }
                     }
-                    return Ok((EXIT_SUCCESS, None));
+                    let stats = format!(
+                        "{} repos in {} (via hybrid)",
+                        repo_count,
+                        format_elapsed(t0.elapsed())
+                    );
+                    return Ok((EXIT_SUCCESS, Some(stats)));
                 }
             }
 
@@ -3485,11 +4088,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     println!();
                 }
             }
-            Ok((EXIT_SUCCESS, None))
+            let stats = format!("{} repos in {}", repos.len(), format_elapsed(t0.elapsed()));
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         Commands::RemoveRepo { target, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
 
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt
@@ -3589,6 +4194,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::RemoveProject { target, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
 
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt
@@ -3645,6 +4251,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::PruneStale { db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt
                 .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
@@ -3772,7 +4379,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let store = open_store(db.as_deref())?;
             let services = list_services(&store, instance.as_deref())?;
-            let service = services.iter().find(|s| s.name == name || s.uid == name);
+            let matches: Vec<&nestweaver_schema::Service> = services
+                .iter()
+                .filter(|s| s.name == name || s.uid == name)
+                .collect();
+            // An ambiguous name silently picked the first match — at
+            // least warn so the user knows to disambiguate by UID.
+            if matches.len() > 1 {
+                eprintln!(
+                    "warning: '{name}' matches {} services; showing the first — \
+                     pass the full UID to disambiguate:",
+                    matches.len()
+                );
+                for s in &matches {
+                    eprintln!("  {} ({})", s.uid, s.name);
+                }
+            }
+            let service = matches.first().copied();
             match service {
                 Some(s) => {
                     if json {
@@ -3947,10 +4570,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
 
-            let workspace_root = dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("nestweaver")
-                .join("workspace");
+            // An ephemeral pull must never reuse — and especially never
+            // DELETE — a pre-existing persistent checkout. Give it a unique
+            // temp workspace root that is cleaned up on both success and
+            // failure.
+            let workspace_root = if ephemeral {
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                std::env::temp_dir()
+                    .join(format!("nestweaver-pull-{}-{unique}", std::process::id()))
+            } else {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("nestweaver")
+                    .join("workspace")
+            };
 
             let mode = if full {
                 nestweaver_engine::PullMode::Full
@@ -4019,12 +4655,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         eprintln!("Warning: index is {} commits behind HEAD", drift);
                     }
                     if ephemeral {
-                        nestweaver_engine::cleanup_repo(&workspace_root, &repo)?;
+                        // Remove the unique temp workspace root we
+                        // created — never the persistent checkout path.
+                        std::fs::remove_dir_all(&workspace_root)?;
                         println!("Ephemeral: cleaned up");
                     }
                     Ok((EXIT_SUCCESS, None))
                 }
                 Err(e) => {
+                    if ephemeral {
+                        // A failed ephemeral pull must not leak the temp
+                        // workspace dir it created.
+                        let _ = std::fs::remove_dir_all(&workspace_root);
+                    }
                     eprintln!("Pull failed: {e}");
                     Ok((e.exit_code(), None))
                 }
@@ -4473,7 +5116,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // the DB directly. When --output is set we write the result
             // to the file locally; --rules-from is applied CLI-side only
             // so we skip the daemon when that flag is present.
-            if rules_from.is_none() && use_daemon {
+            // The daemon's brain_guide handler ignores the `config`
+            // arg, so when --config is given fall back to the local read
+            // path, which actually honors it.
+            if rules_from.is_none() && config.is_none() && use_daemon {
                 let mut args = serde_json::json!({ "format": format });
                 if let Some(ref c) = config {
                     args["config"] = serde_json::json!(c.to_string_lossy());
@@ -4628,6 +5274,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            require_existing_db(&db_path)?;
 
             // ── hybrid guard (routes through local + upstream) ────
             if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
@@ -4647,32 +5294,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     ));
                     match rpc {
                         Ok(value) => {
+                            // Deserialize into the direct path's type so
+                            // both output modes match direct output byte-for-byte
+                            // (the daemon envelope carries _meta/count the direct
+                            // path never prints).
+                            let hubs: Vec<HubNode> = value
+                                .get("hubs")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                .unwrap_or_default();
                             if json {
-                                println!("{}", serde_json::to_string_pretty(&value)?);
+                                println!("{}", serde_json::to_string_pretty(&hubs)?);
+                            } else if hubs.is_empty() {
+                                println!("No hub nodes found (graph may be empty).");
                             } else {
-                                let hubs: Vec<HubNode> = value
-                                    .get("hubs")
-                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                                    .unwrap_or_default();
-                                if hubs.is_empty() {
-                                    println!("No hub nodes found (graph may be empty).");
-                                } else {
-                                    println!("Top {} hub nodes (by total degree):\n", hubs.len());
-                                    for h in &hubs {
-                                        let cluster = h
-                                            .cluster_id
-                                            .map(|id| format!(" cluster={id}"))
-                                            .unwrap_or_default();
-                                        println!(
-                                            "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
-                                            h.name,
-                                            h.file_path,
-                                            h.in_degree,
-                                            h.out_degree,
-                                            h.total_degree,
-                                            h.pagerank_score,
-                                        );
-                                    }
+                                println!("Top {} hub nodes (by total degree):\n", hubs.len());
+                                for h in &hubs {
+                                    let cluster = h
+                                        .cluster_id
+                                        .map(|id| format!(" cluster={id}"))
+                                        .unwrap_or_default();
+                                    println!(
+                                        "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
+                                        h.name,
+                                        h.file_path,
+                                        h.in_degree,
+                                        h.out_degree,
+                                        h.total_degree,
+                                        h.pagerank_score,
+                                    );
                                 }
                             }
                             let stats = format!(
@@ -4737,12 +5386,53 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let args = serde_json::json!({ "top": top });
+                let args = bridge_nodes_rpc_args(top);
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "bridge_nodes", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    return Ok((EXIT_SUCCESS, None));
+                    // Deserialize the tool's `bridges` array into the
+                    // direct path's type so both modes render identically.
+                    let bridges: Vec<nestweaver_engine::BridgeNode> = serde_json::from_value(
+                        strip_hybrid_meta(value)
+                            .get("bridges")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    )
+                    .unwrap_or_default();
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&bridges)?);
+                    } else if bridges.is_empty() {
+                        println!("No bridge nodes found (graph may be empty).");
+                    } else {
+                        println!(
+                            "Top {} bridge nodes (by betweenness centrality):\n",
+                            bridges.len()
+                        );
+                        for b in &bridges {
+                            let communities = if b.communities_connected.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " connects=[{}]",
+                                    b.communities_connected
+                                        .iter()
+                                        .map(|c| c.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                )
+                            };
+                            println!(
+                                "  {} ({}) betweenness={:.2}{communities}",
+                                b.name, b.file_path, b.betweenness_score,
+                            );
+                        }
+                    }
+                    let stats = format!(
+                        "{} bridges in {} (via daemon)",
+                        bridges.len(),
+                        format_elapsed(t0.elapsed())
+                    );
+                    return Ok((EXIT_SUCCESS, Some(stats)));
                 }
             }
 
@@ -4804,7 +5494,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            // The daemon tool returns the rendered text under
+            // "summaries" (not structured data), so it can only serve human
+            // mode — for --json fall through to the direct path, whose bare
+            // Vec<Summary> output the daemon shape cannot reproduce.
+            if use_daemon && !json {
                 let mut args = serde_json::json!({ "level": level });
                 if let Some(tb) = token_budget {
                     args["token_budget"] = serde_json::json!(tb);
@@ -4813,28 +5507,57 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["target"] = serde_json::json!(t);
                 }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)
+                    && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    return Ok((EXIT_SUCCESS, None));
+                    if text.is_empty() {
+                        println!("No summaries generated (graph may be empty).");
+                    } else {
+                        print!("{text}");
+                        if !text.ends_with('\n') {
+                            println!();
+                        }
+                    }
+                    let count = value.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let tokens = value
+                        .get("tokens_used")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let stats = format!(
+                        "{count} summaries ({tokens} tokens) in {} (via daemon)",
+                        format_elapsed(t0.elapsed()),
+                    );
+                    return Ok((EXIT_SUCCESS, Some(stats)));
                 }
             }
 
             let store = open_store(Some(&db_path))?;
 
             out.status(&format!("Generating {} summaries...", parsed_level));
-            let summaries = generate_summaries(&store, parsed_level)?;
 
-            // Save to sidecar for later use.
-            save_summaries(&db_path, store.graph_generation(), &summaries)?;
-
-            // Optional target filter, then token budget truncation.
-            let after_filter: Vec<Summary> = if let Some(ref t) = target {
-                filter_by_target(&summaries, t)
-                    .into_iter()
-                    .cloned()
-                    .collect()
+            // Symbol level is bounded + target-pushed-down (nw-079): an untargeted
+            // full-store scan would hang, so cap it and push any `target` filter
+            // ahead of the per-symbol queries. A targeted or capped set is partial,
+            // so it must NOT be persisted to the sidecar as the canonical summaries.
+            let after_filter: Vec<Summary> = if parsed_level == SummaryLevel::Symbol {
+                let out = nestweaver_engine::generate_symbol_summaries_bounded(
+                    &store,
+                    target.as_deref(),
+                    nestweaver_engine::DEFAULT_SYMBOL_SUMMARY_CAP,
+                )?;
+                out.summaries
             } else {
-                summaries
+                let summaries = generate_summaries(&store, parsed_level)?;
+                // Save to sidecar for later use.
+                save_summaries(&db_path, store.graph_generation(), &summaries)?;
+                // Optional target filter.
+                if let Some(ref t) = target {
+                    filter_by_target(&summaries, t)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                } else {
+                    summaries
+                }
             };
 
             let display: Vec<Summary> = if let Some(budget) = token_budget {
@@ -4877,7 +5600,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
+            // The daemon `clusters` tool truncates each community's
+            // member list at a 20-member preview, while the direct path
+            // serializes full membership — so for --json (where that
+            // difference is visible) fall through to the direct read path,
+            // same pattern as `summary --json`. Text mode prints only
+            // id/name/member_count/key_files, which the preview preserves.
+            if use_daemon && !json {
                 let mut args = serde_json::json!({});
                 if let Some(r) = resolution {
                     args["resolution"] = serde_json::json!(r);
@@ -4885,7 +5614,56 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "clusters", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    // The tool returns {clusters: [...]} with `size` where
+                    // the direct path's ClusteringOutput uses `communities` and
+                    // `member_count`. Rebuild the real structs so both modes
+                    // match direct output byte-for-byte.
+                    let value = strip_hybrid_meta(value);
+                    let communities: Vec<nestweaver_engine::CommunityInfo> = value
+                        .get("clusters")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(community_info_from_tool_json)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if json {
+                        let output = nestweaver_engine::ClusteringOutput {
+                            resolution: value
+                                .get("resolution")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0),
+                            modularity: value
+                                .get("modularity")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0),
+                            communities,
+                        };
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else if communities.is_empty() {
+                        println!(
+                            "No communities detected (graph may be empty or fully disconnected)."
+                        );
+                    } else {
+                        println!(
+                            "Clusters ({}, modularity={:.4}):\n",
+                            communities.len(),
+                            value
+                                .get("modularity")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0)
+                        );
+                        for c in &communities {
+                            println!(
+                                "  [{:>3}] {} ({} members, cohesion={:.2})",
+                                c.id, c.name, c.member_count, c.cohesion
+                            );
+                            for f in &c.key_files {
+                                println!("        {f}");
+                            }
+                        }
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -4954,49 +5732,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let args = serde_json::json!({ "id_or_name": id_or_name });
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "clusters", args) {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else if let Some(c) = value.as_object() {
-                        println!(
-                            "Cluster [{}]: {}",
-                            c.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
-                            c.get("name").and_then(|v| v.as_str()).unwrap_or("?")
-                        );
-                        println!(
-                            "  Members: {}  Cohesion: {:.4}",
-                            c.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                            c.get("cohesion").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                        );
-                        println!();
-                        println!("  Key files:");
-                        if let Some(files) = c.get("key_files").and_then(|v| v.as_array()) {
-                            for f in files {
-                                println!("    {}", f.as_str().unwrap_or("?"));
-                            }
-                        }
-                        println!();
-                        println!("  Members:");
-                        if let Some(members) = c.get("members").and_then(|v| v.as_array()) {
-                            for m in members {
-                                println!(
-                                    "    {} ({}) {}",
-                                    m["name"].as_str().unwrap_or("?"),
-                                    m["kind"].as_str().unwrap_or("?"),
-                                    m["file_path"].as_str().unwrap_or("?")
-                                );
-                            }
-                        }
-                    } else {
-                        // Unexpected shape — dump as JSON
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
-                    return Ok((EXIT_SUCCESS, None));
-                }
-            }
+            // No daemon path here. The daemon `clusters` tool recomputes
+            // at its default resolution and truncates members at a 20-member
+            // preview, while the direct path reads the cached sidecar (the
+            // resolution the user last computed at) with full membership.
+            // Always take the direct read path — same pattern as
+            // `summary --json` — so output is identical with or without a
+            // daemon. A live daemon does not block this: the sidecar read
+            // needs no store, and the fallback store open is read-only.
 
             // Load cached clusters from sidecar. If none exist, compute them.
             let output = match load_clusters(&db_path)? {
@@ -5178,6 +5921,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
+        Commands::RtsEval { command } => run_rts_eval(command),
         Commands::StaleCheck { json, db } => run_brain(
             BrainCommands::StaleCheck { json, db },
             out,
@@ -5269,6 +6013,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     total_symbols: usize,
                     reachable_symbols: usize,
                     unreachable_count: usize,
+                    matching_count: usize,
                     returned: usize,
                     truncated: bool,
                     excluded_count: usize,
@@ -5276,12 +6021,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     min_confidence: String,
                     unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
                 }
+                // Count contract (same as the dead_code MCP tool):
+                // `unreachable_count` is the UNFILTERED total, consistent with
+                // total_symbols/reachable_symbols/dead_percentage;
+                // `matching_count` is the post-min-confidence count.
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&DeadCodeJson {
                         total_symbols: result.total_symbols,
                         reachable_symbols: result.reachable_symbols,
-                        unreachable_count: filtered_count,
+                        unreachable_count: result.unreachable_symbols.len(),
+                        matching_count: filtered_count,
                         returned: shown.len(),
                         truncated,
                         excluded_count: result.excluded_count,
@@ -5367,6 +6117,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
+            require_existing_db(db_path)?;
 
             // Route through daemon when available.
             if use_daemon {
@@ -5680,26 +6431,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let mut args = serde_json::json!({});
-                if let Some(ref f) = files {
-                    args["files"] = serde_json::json!(f);
-                }
-                if let Some(ref br) = base_ref {
-                    args["base_ref"] = serde_json::json!(br);
-                }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args)
-                {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    return Ok((EXIT_SUCCESS, None));
-                }
-            }
-
-            let store = open_store(Some(&db_path))?;
-
             // Resolve changed files: explicit --files, else git diff against --base-ref.
+            // Computed up front so the daemon path can send a proper
+            // `changed_files` array (the tool never accepted the raw --files
+            // string under the legacy `files` key).
             let changed_files: Vec<String> = if let Some(files_str) = files {
                 files_str
                     .split(',')
@@ -5738,7 +6473,33 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
 
-            let result = affected_tests(&store, &changed_files)?;
+            // ── daemon guard ──────────────────────────────────────
+            // Deserialize the daemon result into the same type the direct
+            // path produces so human/JSON output is identical either way.
+            let daemon_result: Option<nestweaver_engine::AffectedTestsResult> = if use_daemon {
+                let args = affected_tests_rpc_args(&changed_files);
+                match try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args) {
+                    Some(value) => Some(
+                        serde_json::from_value(value)
+                            .context("decoding daemon affected_tests result")?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            let result = match daemon_result {
+                Some(r) => r,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_engine::rts_eval::run_recorded(
+                        &store,
+                        &changed_files,
+                        Some(&db_path),
+                    )?
+                }
+            };
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -5782,6 +6543,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             instance,
             refresh_wiki_hours,
+            force,
             config,
         } => {
             if refresh_wiki_hours.is_some() && config.is_none() {
@@ -5813,47 +6575,75 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
             }
 
-            // Route through daemon when available.
-            if use_daemon
-                && let Ok(rt) = tokio::runtime::Runtime::new()
-                && let Ok(mut client) = rt.block_on(nestweaver_client::DaemonClient::connect(
-                    &db_path,
-                    config.as_deref(),
-                ))
-                && let Ok(resp) = rt.block_on(
-                    client.watch_code(
-                        // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
-                        &std::fs::canonicalize(&repo_path)
-                            .unwrap_or_else(|_| repo_path.clone())
-                            .to_string_lossy(),
-                        &instance_id,
-                    ),
-                )
-            {
-                if !resp.ok {
-                    eprintln!("Error: {}", resp.message);
-                    return Ok((EXIT_ERROR, None));
+            // Route through the daemon when enabled. Choose ONE path up front
+            // Once a daemon holds this DB's write lock, a direct
+            // watcher deadlocks against it, so the direct path below is only
+            // reachable when NO daemon for this DB is running.
+            if use_daemon {
+                let daemon_attempt = (|| {
+                    let rt =
+                        tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+                    let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                        &db_path,
+                        config.as_deref(),
+                    ))?;
+                    let resp = rt.block_on(
+                        client.watch_code_with_force(
+                            // Absolute path: the daemon runs with CWD=/ (would watch the wrong dir).
+                            &std::fs::canonicalize(&repo_path)
+                                .unwrap_or_else(|_| repo_path.clone())
+                                .to_string_lossy(),
+                            &instance_id,
+                            force,
+                        ),
+                    )?;
+                    Ok::<_, anyhow::Error>((rt, client, resp))
+                })();
+                match daemon_attempt {
+                    Ok((rt, mut client, resp)) => {
+                        if !resp.ok {
+                            eprintln!("Error: {}", resp.message);
+                            return Ok((EXIT_ERROR, None));
+                        }
+
+                        eprintln!(
+                            "Watching {} via daemon (Ctrl-C to stop)",
+                            repo_path.display(),
+                        );
+
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let _ = ctrlc_handler(move || {
+                            let _ = tx.send(());
+                        });
+                        let _ = rx.recv();
+
+                        let _ = rt.block_on(async {
+                            client
+                                .inner_mut()
+                                .stop_watch(nestweaver_proto::StopWatchRequest {})
+                                .await
+                        });
+                        eprintln!("Watcher stopped.");
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    Err(e) if daemon_process_running_for_db(&db_path) => {
+                        // A daemon (possibly one we just auto-started) holds the
+                        // DB write lock — falling back to a direct watcher would
+                        // deadlock. Fail loudly instead.
+                        eprintln!(
+                            "Error: watch via daemon failed ({e:#}); a daemon for this DB is \
+                             running and holds the write lock, so a direct watcher cannot be \
+                             started. Stop it with `nestweaver daemon --db {} stop` and retry, \
+                             or fix the underlying error.",
+                            db_path.display()
+                        );
+                        return Ok((EXIT_ERROR, None));
+                    }
+                    Err(e) => {
+                        // No daemon running for this DB — safe to watch directly.
+                        eprintln!("warning: daemon unavailable ({e:#}); running watcher directly");
+                    }
                 }
-
-                eprintln!(
-                    "Watching {} via daemon (Ctrl-C to stop)",
-                    repo_path.display(),
-                );
-
-                let (tx, rx) = std::sync::mpsc::channel();
-                let _ = ctrlc_handler(move || {
-                    let _ = tx.send(());
-                });
-                let _ = rx.recv();
-
-                let _ = rt.block_on(async {
-                    client
-                        .inner_mut()
-                        .stop_watch(nestweaver_proto::StopWatchRequest {})
-                        .await
-                });
-                eprintln!("Watcher stopped.");
-                return Ok((EXIT_SUCCESS, None));
             }
 
             // Fallback: run watcher directly.
@@ -5928,7 +6718,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 repo_path.display(),
                 db_path.display()
             );
-            watcher.run().context("code watcher")?;
+            if let Err(e) = watcher.run() {
+                // A lock failure here means another process (usually a
+                // live daemon) holds the DB — name the remedy.
+                let msg = format!("{e:#}");
+                if let Some(hint) = watch_lock_hint(&msg, &db_path) {
+                    let _ = std::fs::remove_file(&lock_path);
+                    eprintln!("Error: code watcher: {msg}\nhint: {hint}");
+                    return Ok((EXIT_ERROR, None));
+                }
+                return Err(e).context("code watcher");
+            }
 
             let _ = std::fs::remove_file(&lock_path);
             eprintln!("Watcher stopped.");
@@ -5957,19 +6757,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
-            let use_daemon_mcp = if no_daemon {
-                if std::env::var("NESTWEAVER_NO_DAEMON").is_ok() {
-                    false
-                } else {
-                    eprintln!(
-                        "Warning: --no-daemon is only supported for testing \
-                         (set NESTWEAVER_NO_DAEMON=1). Ignoring flag."
-                    );
-                    true
-                }
-            } else {
-                std::env::var("NESTWEAVER_NO_DAEMON").is_err()
-            };
+            // warn=false: run() already emitted the escape-hatch warning once
+            // for this invocation — warning again here double-prints it.
+            let use_daemon_mcp = resolve_use_daemon(no_daemon, false);
             if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
@@ -6042,6 +6832,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     &watch_repo_path,
                     "default",
                 )) {
+                    Ok(resp) if !resp.ok => {
+                        // e.g. port already bound by another process
+                        // (error == "port_in_use") — surface the daemon's
+                        // message instead of falling back (a direct fallback
+                        // would hit the same busy port). Any ok:false maps to
+                        // a non-zero exit.
+                        if resp.error.is_empty() {
+                            eprintln!("Error: {}", resp.message);
+                        } else {
+                            eprintln!("Error [{}]: {}", resp.error, resp.message);
+                        }
+                        return Ok((EXIT_ERROR, None));
+                    }
+                    Ok(resp) if resp.message.starts_with("UI server already running") => {
+                        // The daemon already serves the UI — point the user at
+                        // the ACTUAL running port (resp.port), not the one they
+                        // requested, instead of printing a dead URL.
+                        let actual_port = if resp.port != 0 {
+                            resp.port
+                        } else {
+                            port as u32
+                        };
+                        println!("NestWeaver UI: http://127.0.0.1:{actual_port}");
+                        println!("{}", resp.message);
+                        return Ok((EXIT_SUCCESS, None));
+                    }
                     Ok(_resp) => {
                         daemon_ok = true;
                         println!("NestWeaver UI: http://127.0.0.1:{port}");
@@ -6054,6 +6870,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let _ = tx.send(());
                         });
                         let _ = rx.recv();
+                        // Tell the daemon to stop serving so
+                        // the listen port is released when the CLI exits.
+                        match rt.block_on(client.stop_ui()) {
+                            Ok(resp) if resp.ok => eprintln!("UI server stopped."),
+                            Ok(resp) => eprintln!("note: {}", resp.message),
+                            Err(e) => {
+                                eprintln!("warning: failed to stop UI server cleanly: {e:#}")
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("ServeUi RPC failed, falling back to direct: {e}");
@@ -6117,25 +6942,31 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // Normalize to the same bare-array shape the direct path emits (below):
                         // unwrap the {results, _meta} hybrid envelope so `search --json` yields
                         // the same JSON whether or not the daemon is up.
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&unwrap_hybrid_payload(value))?
+                        let payload = unwrap_hybrid_payload(value);
+                        let count = payload.as_array().map(|a| a.len()).unwrap_or(0);
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        let stats = format!(
+                            "{count} symbols in {} (via hybrid)",
+                            format_elapsed(t0.elapsed())
                         );
-                    } else {
-                        let candidates = hybrid_search_candidates_from_value(value);
-                        if candidates.is_empty() {
-                            println!("No symbols found matching '{query}'.");
-                        } else {
-                            println!("Found {} symbol(s) matching '{query}':", candidates.len());
-                            for c in &candidates {
-                                println!(
-                                    "  {} ({}) {}:{}",
-                                    c.name, c.kind, c.file_path, c.start_line
-                                );
-                            }
-                        }
+                        return Ok((EXIT_SUCCESS, Some(stats)));
                     }
-                    return Ok((EXIT_SUCCESS, None));
+                    let candidates = hybrid_search_candidates_from_value(value);
+                    if candidates.is_empty() {
+                        println!("No symbols found matching '{query}'.");
+                    } else {
+                        println!("Found {} symbol(s) matching '{query}':", candidates.len());
+                        for c in &candidates {
+                            println!("  {} ({}) {}:{}", c.name, c.kind, c.file_path, c.start_line);
+                        }
+                        print_search_truncation_note(candidates.len(), limit);
+                    }
+                    let stats = format!(
+                        "{} symbols in {} (via hybrid)",
+                        candidates.len(),
+                        format_elapsed(t0.elapsed())
+                    );
+                    return Ok((EXIT_SUCCESS, Some(stats)));
                 }
             }
 
@@ -6151,8 +6982,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 for c in &candidates {
                     println!("  {} ({}) {}:{}", c.name, c.kind, c.file_path, c.start_line);
                 }
+                print_search_truncation_note(candidates.len(), limit);
             }
-            Ok((EXIT_SUCCESS, None))
+            let stats = format!(
+                "{} symbols in {}",
+                candidates.len(),
+                format_elapsed(t0.elapsed())
+            );
+            Ok((EXIT_SUCCESS, Some(stats)))
         }
 
         Commands::RegexSearch {
@@ -6184,35 +7021,35 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config.as_deref(), "regex_search", args)
                 {
+                    // Strip the hybrid `_meta` provenance so both output
+                    // modes match the direct path byte-for-byte.
+                    let res: nestweaver_store::regex::RegexSearchResult =
+                        serde_json::from_value(strip_hybrid_meta(value)).unwrap_or_else(|_| {
+                            nestweaver_store::regex::RegexSearchResult {
+                                results: vec![],
+                                truncated: false,
+                                scanned_fallback: false,
+                                stale_index: false,
+                            }
+                        });
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        println!("{}", serde_json::to_string_pretty(&res)?);
+                    } else if res.results.is_empty() {
+                        println!("No matches for '{pattern}'.");
                     } else {
-                        let res: nestweaver_store::regex::RegexSearchResult =
-                            serde_json::from_value(value).unwrap_or_else(|_| {
-                                nestweaver_store::regex::RegexSearchResult {
-                                    results: vec![],
-                                    truncated: false,
-                                    scanned_fallback: false,
-                                }
-                            });
-                        if res.results.is_empty() {
-                            println!("No matches for '{pattern}'.");
-                        } else {
-                            println!("Found {} match(es) for '{pattern}':", res.results.len());
-                            for m in &res.results {
-                                println!(
-                                    "  [{}] {} {} — {}",
-                                    m.kind, m.title, m.location, m.snippet
-                                );
-                            }
-                            if res.truncated {
-                                println!("(results truncated — hit candidate cap or time budget)");
-                            }
-                            if res.scanned_fallback {
-                                println!(
-                                    "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
-                                );
-                            }
+                        println!("Found {} match(es) for '{pattern}':", res.results.len());
+                        for m in &res.results {
+                            println!("  [{}] {} {} — {}", m.kind, m.title, m.location, m.snippet);
+                        }
+                        if res.truncated {
+                            println!("(results truncated — hit candidate cap or time budget)");
+                        }
+                        if res.stale_index {
+                            print_stale_index_note();
+                        } else if res.scanned_fallback {
+                            println!(
+                                "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
+                            );
                         }
                     }
                     return Ok((EXIT_SUCCESS, None));
@@ -6241,7 +7078,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if res.truncated {
                     println!("(results truncated — hit candidate cap or time budget)");
                 }
-                if res.scanned_fallback {
+                if res.stale_index {
+                    print_stale_index_note();
+                } else if res.scanned_fallback {
                     println!(
                         "(no trigram pre-filter used — run `index --with-trigrams` for speed)"
                     );
@@ -6271,7 +7110,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config.as_deref(), "count_patterns", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    // The tool wraps counts in {"patterns": [...]}
+                    // (plus a hybrid `_meta`); rebuild the real PatternCount
+                    // structs so daemon output is byte-identical to the direct
+                    // path (struct field order, not map order).
+                    let counts: Vec<nestweaver_store::regex::PatternCount> =
+                        strip_hybrid_meta(value)
+                            .get("patterns")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(pattern_count_from_tool_json)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&counts)?);
+                    } else {
+                        for c in &counts {
+                            println!(
+                                "'{}': {} match(es) across {} file(s)",
+                                c.pattern, c.total_matches, c.files_matched
+                            );
+                            for f in &c.top_files {
+                                println!("    {} ({})", f.path, f.count);
+                            }
+                        }
+                        // Surface in-band staleness the daemon's stderr
+                        // warning can't reach us with.
+                        if counts.iter().any(|c| c.stale_index) {
+                            print_stale_index_note();
+                        }
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -6292,6 +7162,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("    {} ({})", f.path, f.count);
                     }
                 }
+                // Surface in-band staleness (the direct path's own
+                // stderr warning is a once-per-process latch that may already
+                // have fired inside the store).
+                if counts.iter().any(|c| c.stale_index) {
+                    print_stale_index_note();
+                }
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -6308,14 +7184,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
-                let mut args = serde_json::json!({
-                    "targets": targets,
-                    "neighbors": neighbors,
-                    "token_budget": token_budget,
-                });
-                if let Some(ref r) = root {
-                    args["root"] = serde_json::json!(r);
-                }
+                let args =
+                    read_symbols_rpc_args(&targets, neighbors, token_budget, root.as_deref());
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config.as_deref(), "read_symbols", args)
                 {
@@ -6364,9 +7234,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
             // Exit 2 when targets were requested but none resolved to a symbol
-            // (consistent with `symbol`/`impact`). When at least one target
-            // resolves, succeed even if others were not-found/ambiguous.
+            // (consistent with `symbol`/`impact`) — or 3 when the failure was
+            // ambiguity, matching `symbol`'s exit-code contract. When at
+            // least one target resolves, succeed even if others were
+            // not-found/ambiguous.
             if !targets.is_empty() && res.symbols.is_empty() {
+                if !res.ambiguous.is_empty() {
+                    return Ok((EXIT_AMBIGUOUS, None));
+                }
                 return Ok((EXIT_NOT_FOUND, None));
             }
             Ok((EXIT_SUCCESS, None))
@@ -6917,6 +7792,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 render_codequality_json, render_impact_report_markdown,
             };
 
+            // A missing input file must fail as a clean not-found (exit 2),
+            // not a generic IO error.
+            if !input.exists() {
+                eprintln!("Error: impact report not found: {}", input.display());
+                return Ok((EXIT_NOT_FOUND, None));
+            }
             let report = read_impact_report(&input)
                 .map_err(|e| anyhow::anyhow!("failed to read impact report: {}", e))?;
 
@@ -7028,6 +7909,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             name_or_uid,
             depth,
             confidence,
+            min_score,
             json,
             db,
             repo: repo_filter,
@@ -7039,17 +7921,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // scopes to a repo we fall through to the direct path (resolve_uid_with_repo_filter),
             // which honors it and returns the correct Found/NotFound/Ambiguous exit code. Without
             // this guard, `impact <sym> --repo <r>` would silently resolve across ALL repos.
-            if use_daemon && repo_filter.is_none() {
+            // Likewise, --min-score has no daemon-side equivalent (the brain_impact schema is
+            // additionalProperties:false and the daemon envelope carries no truncation flags),
+            // so an explicit threshold also forces the direct path, where pruning is both
+            // honored and surfaced. Same for a non-default --confidence: the daemon tool
+            // hardcodes 0.0, so an explicit filter must take the direct path or it would be
+            // silently ignored.
+            if use_daemon && repo_filter.is_none() && min_score.is_none() && confidence <= 0.0 {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 if let Some(value) = try_hybrid_json_rpc(
                     true,
                     &db_path,
                     config_opt.as_deref(),
                     "brain_impact",
+                    // NOTE: do NOT send `min_confidence` here — that is a
+                    // `dead_code` arg, and the `brain_impact` schema is
+                    // additionalProperties:false, so the daemon path would
+                    // reject the call outright.
                     serde_json::json!({
                         "symbol": name_or_uid,
                         "depth": depth,
-                        "min_confidence": confidence,
                     }),
                 ) {
                     // Honor the daemon tool's status so daemon mode matches the direct path's
@@ -7057,7 +7948,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     match value.get("status").and_then(|v| v.as_str()) {
                         Some("not_found") => {
                             if json {
-                                println!("{}", serde_json::to_string_pretty(&value)?);
+                                // nw-086: identical --json shape as the direct path.
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "error": "not found",
+                                        "name": name_or_uid,
+                                    }))?
+                                );
                             } else if !out.quiet {
                                 println!("No symbol found: '{name_or_uid}'.");
                             }
@@ -7065,7 +7963,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         Some("ambiguous") => {
                             if json {
-                                println!("{}", serde_json::to_string_pretty(&value)?);
+                                // nw-086: bare candidates array, matching the direct path.
+                                let cands = value
+                                    .get("candidates")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!([]));
+                                println!("{}", serde_json::to_string_pretty(&cands)?);
                             } else if !out.quiet {
                                 println!("Ambiguous symbol '{name_or_uid}' — multiple matches:");
                                 if let Some(cands) =
@@ -7092,7 +7995,36 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         _ => {}
                     }
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        // nw-086: complete walks emit the bare node array (the direct
+                        // path's shape), NOT the daemon's {_meta, impact_nodes, ...}
+                        // envelope. When the daemon reports traversal pruning, mirror
+                        // the direct path's honest object form instead — a bare array
+                        // would hide that the impact set is a floor.
+                        let truncated_by_threshold = value
+                            .get("truncated_by_threshold")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let truncated_by_depth = value
+                            .get("truncated_by_depth")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let payload = value
+                            .get("impact_nodes")
+                            .cloned()
+                            .unwrap_or_else(|| value.clone());
+                        if truncated_by_threshold || truncated_by_depth {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "nodes": payload,
+                                    "truncated_by_threshold": truncated_by_threshold,
+                                    "truncated_by_depth": truncated_by_depth,
+                                    "note": value.get("note").cloned().unwrap_or(serde_json::Value::Null),
+                                }))?
+                            );
+                        } else {
+                            println!("{}", serde_json::to_string_pretty(&payload)?);
+                        }
                     } else if let Some(arr) = value.get("impact_nodes") {
                         #[derive(serde::Deserialize)]
                         struct DaemonImpactNode {
@@ -7145,6 +8077,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             count,
                             format_elapsed(t0.elapsed())
                         );
+                        // Surface the daemon's truncation honesty in text mode too —
+                        // the reported impact set may be a floor.
+                        if let Some(note) = value.get("note").and_then(|v| v.as_str())
+                            && !out.quiet
+                        {
+                            println!("note: {note} — reported impact is a floor");
+                        }
                         return Ok((EXIT_SUCCESS, Some(stats)));
                     }
                     return Ok((EXIT_SUCCESS, None));
@@ -7156,11 +8095,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Resolve the symbol UID first (may be a name).
             match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
                 ResolveResult::Found(uid) => {
-                    let nodes = store.impact(&uid, depth, confidence)?;
+                    let threshold = min_score.unwrap_or(nestweaver_store::DEFAULT_IMPACT_THRESHOLD);
+                    let result = store.impact_with_flags_and_threshold(
+                        &uid, depth, confidence, threshold, None,
+                    )?;
+                    let nodes = &result.nodes;
                     let count = nodes.len();
+                    let truncated = result.truncated_by_threshold || result.truncated_by_depth;
 
-                    if json {
-                        // Serialize as JSON array
+                    if json && !truncated {
+                        // nw-086: bare node array (matches the daemon path's --json
+                        // shape) — but ONLY for a complete walk; see below.
                         #[derive(serde::Serialize)]
                         struct ImpactNodeJson {
                             uid: String,
@@ -7184,15 +8129,59 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             })
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&json_nodes)?);
+                    } else if json {
+                        // Truncated walk: a bare array would read as a complete
+                        // answer, so emit an honest object instead (like
+                        // blast_radius's blind_spots) — `nodes` plus the
+                        // truncation flags and a human-readable caveat.
+                        let note = impact_truncation_note(&result, threshold, depth);
+                        eprintln!("note: {note}");
+                        #[derive(serde::Serialize)]
+                        struct ImpactNodeJson<'a> {
+                            uid: &'a str,
+                            name: &'a str,
+                            file_path: &'a str,
+                            start_line: u32,
+                            edge_type: &'a str,
+                            confidence: f32,
+                            depth: u32,
+                        }
+                        let json_nodes: Vec<_> = nodes
+                            .iter()
+                            .map(|n| ImpactNodeJson {
+                                uid: &n.uid,
+                                name: &n.name,
+                                file_path: &n.file_path,
+                                start_line: n.start_line,
+                                edge_type: &n.edge_type,
+                                confidence: n.confidence,
+                                depth: n.depth,
+                            })
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "nodes": json_nodes,
+                                "truncated_by_threshold": result.truncated_by_threshold,
+                                "truncated_by_depth": result.truncated_by_depth,
+                                "note": note,
+                            }))?
+                        );
                     } else if nodes.is_empty() {
                         if !out.quiet {
                             println!("No impact found for '{name_or_uid}'.");
+                        }
+                        if truncated {
+                            println!(
+                                "  note: {}",
+                                impact_truncation_note(&result, threshold, depth)
+                            );
                         }
                     } else {
                         if !out.quiet {
                             println!("Impact of '{name_or_uid}' ({} nodes):", count);
                         }
-                        for n in &nodes {
+                        for n in nodes {
                             if out.verbose {
                                 println!(
                                     "  [depth {}] {} via {} ({:.2}) — {}:{} [{}]",
@@ -7216,6 +8205,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 );
                             }
                         }
+                        if truncated {
+                            println!(
+                                "  note: {}",
+                                impact_truncation_note(&result, threshold, depth)
+                            );
+                        }
                     }
                     let stats = format!(
                         "{} affected symbols in {}",
@@ -7225,7 +8220,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
                 ResolveResult::NotFound => {
-                    eprintln!("Symbol '{name_or_uid}' not found.");
+                    // nw-086: under --json, emit a JSON error object (matching the
+                    // `symbol` command and the daemon path) instead of only a
+                    // plain-text stderr line a --json consumer can't parse.
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "error": "not found",
+                                "name": name_or_uid,
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Symbol '{name_or_uid}' not found.");
+                    }
                     Ok((EXIT_NOT_FOUND, None))
                 }
                 ResolveResult::Ambiguous(candidates) => {
@@ -7785,6 +8793,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 eprintln!("Error: --targets must list at least one asset_id or uid");
                 return Ok((EXIT_ERROR, None));
             }
+            // R-B: dedupe repeated targets (order-preserving) so a doubled
+            // asset_id isn't echoed twice in the UNRESOLVED list.
+            let mut seen = std::collections::HashSet::new();
+            let targets: Vec<String> = targets
+                .into_iter()
+                .filter(|t| seen.insert(t.clone()))
+                .collect();
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
@@ -8011,14 +9026,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // path would resolve against the wrong directory and silently index 0 files.
             // Failing fast here also turns a typo'd/nonexistent path into a clear error
             // instead of a confusing no-op.
-            let repo_path = std::fs::canonicalize(&repo_path).with_context(|| {
-                format!(
-                    "repository path does not exist: {} — pass an existing path \
-                     (absolute, or run from within the repo)",
-                    repo_path.display()
-                )
-            })?;
+            let repo_path = canonical_repo_dir(&repo_path)?;
             let db_path = resolve_index_db_path(db, &repo_path);
+            // Create-operation: a --db in a not-yet-existing directory must
+            // not fail with a bare OS error on either the daemon or the
+            // direct path — create the parent directories up front.
+            ensure_db_parent_dir(&db_path)?;
 
             // nw-052 (P2a): validate the `--instance` flag value BEFORE the
             // daemon/no-daemon split so both paths reject a colon/whitespace.
@@ -8324,10 +9337,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let binary_path =
                                 std::env::current_exe().context("cannot determine binary path")?;
 
+                            // The launchd child boots with CWD=`/`, so a
+                            // relative --db would resolve against the wrong
+                            // directory and the daemon would die trying to
+                            // create the store at a root-relative path
+                            // ("Read-only file system"). Pin the absolute
+                            // path in the plist.
+                            let db_path_abs = abs_for_daemon(&db_path);
                             let plist = nestweaver_daemon::launchd::generate_plist(
                                 &instance_id,
                                 &binary_path,
-                                &db_path,
+                                &db_path_abs,
                                 &log_file,
                             );
 
@@ -8339,14 +9359,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 && let Ok(pid) = pid_str.trim().parse::<i32>()
                                 && unsafe { libc::kill(pid, 0) } == 0
                             {
-                                eprintln!("Stopping existing daemon (PID {pid})...");
-                                unsafe {
-                                    libc::kill(pid, libc::SIGTERM);
-                                }
-                                for _ in 0..50 {
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
-                                    if unsafe { libc::kill(pid, 0) } != 0 {
-                                        break;
+                                // Only signal the pidfile PID when it is
+                                // verifiably our daemon — a recycled PID must
+                                // never be killed.
+                                if !daemon_identity_verified(pid, &db_path, &pidfile, &socket) {
+                                    eprintln!(
+                                        "warning: pidfile PID {pid} is not a nestweaver daemon \
+                                         for this DB — leaving it alone"
+                                    );
+                                } else {
+                                    eprintln!("Stopping existing daemon (PID {pid})...");
+                                    unsafe {
+                                        libc::kill(pid, libc::SIGTERM);
+                                    }
+                                    // If the old daemon is STILL alive
+                                    // after its SIGTERM grace, installing the
+                                    // new agent would overlap two daemons on
+                                    // one DB — abort the start instead.
+                                    if !pid_exited_within_grace(
+                                        pid,
+                                        std::time::Duration::from_secs(5),
+                                    ) {
+                                        anyhow::bail!(
+                                            "existing daemon (PID {pid}) did not exit within its \
+                                             SIGTERM grace; refusing to install a new agent over a \
+                                             live daemon — stop it with `nestweaver daemon --db {} \
+                                             stop` and retry",
+                                            db_path.display()
+                                        );
                                     }
                                 }
                             }
@@ -8370,15 +9410,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             eprintln!("  Socket: {}", socket.display());
                             eprintln!("  Log:    {}", log_file.display());
 
-                            // Wait for socket to appear (daemon is starting in background via launchd)
-                            for _ in 0..100 {
-                                if socket.exists() {
+                            // Poll connect_existing + health_check
+                            // (wait_healthy never auto-starts) instead of the
+                            // old fixed 10s socket.exists() wait — a slow boot
+                            // blew straight past 10s and false-failed even
+                            // though launchd (KeepAlive.Crashed) kept bringing
+                            // the daemon up, leaving the boot racing the user's
+                            // next command.
+                            let rt = tokio::runtime::Runtime::new()
+                                .context("failed to create tokio runtime")?;
+                            match rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
+                                &db_path,
+                                std::time::Duration::from_secs(60),
+                            )) {
+                                Ok(_) => return Ok((EXIT_SUCCESS, None)),
+                                Err(_) => {
+                                    // Deliberately NOT reaping the half-booted
+                                    // agent: launchd owns its lifecycle and a
+                                    // bootout here would race launchd's next
+                                    // KeepAlive spawn. Report success-with-
+                                    // caveat (exit 0) and point at status+log
+                                    // instead of claiming a failure launchd may
+                                    // still turn into a healthy daemon.
+                                    eprintln!(
+                                        "Daemon is still booting under launchd; check \
+                                         `nestweaver daemon --db {} status` and the log at {}",
+                                        db_path.display(),
+                                        log_file.display()
+                                    );
                                     return Ok((EXIT_SUCCESS, None));
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(100));
                             }
-
-                            anyhow::bail!("Daemon did not start within 10 seconds");
                         }
 
                         #[cfg(not(target_os = "macos"))]
@@ -8465,12 +9527,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         unsafe { libc::flock(pid_lock_fd, libc::LOCK_UN) };
                         drop(pid_lock);
 
-                        match unsafe { daemonize.start() } {
-                            Ok(()) => {
+                        match unsafe { daemonize.execute() } {
+                            daemonize2::Outcome::Child(Ok(_)) => {
                                 // We are now the daemon process.
                                 // daemonize2's pidfile flock was acquired before
                                 // the fork and is inherited by this child. Mark
-                                // that ownership only after `start()` returns in
+                                // that ownership only after `execute()` returns in
                                 // the child so run_server does not self-conflict
                                 // by opening and flocking the same pidfile again.
                                 unsafe {
@@ -8498,8 +9560,41 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     }
                                 });
                             }
-                            Err(e) => {
+                            daemonize2::Outcome::Parent(Ok(parent)) => {
+                                // The double-fork only proves fork()
+                                // worked — run_server may still die during boot
+                                // (corrupt migration journal, DB lock, ...).
+                                // Health-check that the child actually bound the
+                                // socket and fail loudly, pointing at the log.
+                                if !parent.first_child_exit_status.success() {
+                                    eprintln!(
+                                        "Error: daemon failed to start (boot exit status {}). \
+                                         Check the log: {}",
+                                        parent.first_child_exit_status,
+                                        log_file.display()
+                                    );
+                                    std::process::exit(EXIT_ERROR);
+                                }
+                                if wait_for_daemon_boot(&socket, std::time::Duration::from_secs(10))
+                                {
+                                    eprintln!("Daemon started.");
+                                    std::process::exit(EXIT_SUCCESS);
+                                }
+                                eprintln!(
+                                    "Error: daemon did not start accepting connections within \
+                                     10s — it may have died during boot. Check the log: {}",
+                                    log_file.display()
+                                );
+                                std::process::exit(EXIT_ERROR);
+                            }
+                            daemonize2::Outcome::Parent(Err(e)) => {
                                 anyhow::bail!("Failed to daemonize: {e}");
+                            }
+                            daemonize2::Outcome::Child(Err(e)) => {
+                                // The daemon process itself failed before
+                                // dropping privileges — nothing more to do.
+                                eprintln!("Daemon boot error: {e}");
+                                std::process::exit(EXIT_ERROR);
                             }
                         }
                         Ok((EXIT_SUCCESS, None))
@@ -8585,9 +9680,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
 
                 DaemonAction::Stop => {
-                    // Try launchd first on macOS (unless it's not managing this instance)
+                    // Try launchd first on macOS — but do NOT declare success
+                    // yet: a detached auto-spawned daemon may still be serving
+                    // this DB outside launchd's control (e.g. a stale launchd
+                    // job next to a forked daemon). Fall through to the
+                    // pidfile/socket check so `stop` only reports success when
+                    // nothing is left serving.
                     #[cfg(target_os = "macos")]
-                    if nestweaver_daemon::launchd::is_running(&instance_id) {
+                    let launchd_stopped = if nestweaver_daemon::launchd::is_running(&instance_id) {
                         eprintln!("Stopping daemon via launchd...");
                         nestweaver_daemon::launchd::stop_and_uninstall(&instance_id)?;
                         for _ in 0..50 {
@@ -8596,19 +9696,57 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 break;
                             }
                         }
-                        eprintln!("Daemon stopped.");
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let launchd_stopped = false;
+
+                    // SIGTERM-based stop for Linux + legacy macOS fork-based
+                    // daemons — and for a detached daemon that survived the
+                    // launchd bootout above.
+                    let socket_pid = daemon_socket_reported_pid(&socket);
+                    let pidfile_pid: Option<i32> = std::fs::read_to_string(&pidfile)
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok());
+                    // A stale pidfile can name a DEAD pid while a daemon still
+                    // serves the socket — retarget the stop at the live
+                    // socket-peer pid instead of declaring "not running" and
+                    // deleting a live daemon's socket (the same state the
+                    // identity cross-check exists for).
+                    let pid = match pidfile_pid {
+                        Some(p) if unsafe { libc::kill(p, 0) } == 0 => Some(p),
+                        _ => socket_pid.filter(|p| unsafe { libc::kill(*p, 0) } == 0),
+                    };
+                    let Some(pid) = pid else {
+                        // Nothing alive on either the pidfile or the socket.
+                        if launchd_stopped {
+                            eprintln!("Daemon stopped.");
+                        } else {
+                            println!("Daemon is not running.");
+                        }
                         let _ = std::fs::remove_file(&pidfile);
                         let _ = std::fs::remove_file(&socket);
                         return Ok((EXIT_SUCCESS, None));
-                    }
+                    };
 
-                    // SIGTERM-based stop for Linux + legacy macOS fork-based daemons
-                    let pid_str = std::fs::read_to_string(&pidfile)
-                        .with_context(|| format!("read pidfile: {}", pidfile.display()))?;
-                    let pid: i32 = pid_str
-                        .trim()
-                        .parse()
-                        .with_context(|| "parse PID from pidfile")?;
+                    // The pidfile PID may have been recycled by an
+                    // unrelated process. Verify identity before signaling. A
+                    // kernel-reported socket peer PID is self-verifying — it
+                    // IS the process serving this daemon's socket.
+                    if socket_pid != Some(pid)
+                        && !daemon_identity_verified(pid, &db_path, &pidfile, &socket)
+                    {
+                        eprintln!(
+                            "Error: pidfile {} names PID {pid}, but that process is not a \
+                             nestweaver daemon for {} — refusing to signal it. If no daemon is \
+                             running, remove the stale pidfile and socket manually.",
+                            pidfile.display(),
+                            db_path.display()
+                        );
+                        return Ok((EXIT_ERROR, None));
+                    }
 
                     eprintln!("Stopping daemon (PID {pid})...");
                     unsafe {
@@ -8673,7 +9811,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         && let Ok(pid) = pid_str.trim().parse::<i32>()
                         && unsafe { libc::kill(pid, 0) } == 0
                     {
-                        println!("Daemon is running (PID {pid})");
+                        // A live PID is not proof — it may be recycled.
+                        if daemon_identity_verified(pid, &db_path, &pidfile, &socket) {
+                            println!("Daemon is running (PID {pid})");
+                            println!("  DB:     {}", db_path.display());
+                            println!("  Socket: {}", socket.display());
+                            println!("  Log:    {}", log_file.display());
+                        } else {
+                            println!(
+                                "Daemon is not running (pidfile PID {pid} belongs to another process)."
+                            );
+                        }
+                        return Ok((EXIT_SUCCESS, None));
+                    }
+                    // The pidfile may be gone/stale while a detached daemon
+                    // still serves the socket — ask the kernel before
+                    // declaring "not running".
+                    if let Some(pid) = daemon_socket_reported_pid(&socket)
+                        && unsafe { libc::kill(pid, 0) } == 0
+                    {
+                        println!("Daemon is running (PID {pid}, serving socket)");
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
                         println!("  Log:    {}", log_file.display());
@@ -8837,6 +9994,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 client,
             } => {
                 use nestweaver_engine::tls;
+
+                // Re-running init-tls silently replaces the CA, which
+                // invalidates every cert it signed — warn before doing so.
+                if output_dir.join("ca.pem").exists() {
+                    eprintln!(
+                        "warning: {} already contains a CA (ca.pem) — overwriting it \
+                         invalidates every certificate it signed",
+                        output_dir.display()
+                    );
+                }
 
                 let bundle = tls::generate_tls_bundle(&sans, validity_days, client)?;
 
@@ -9513,6 +10680,9 @@ fn run_memory(
     match command {
         MemoryCommands::Lint { json, db, config } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-087: read-only command — fail `db_not_found` on a
+            // missing --db, matching the other read commands.
+            require_existing_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({});
@@ -9575,6 +10745,9 @@ fn run_memory(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-087: fail `db_not_found` on a missing --db, matching
+            // the other read commands.
+            require_existing_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "apply": apply });
@@ -9627,6 +10800,9 @@ fn run_memory(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-087: read-only command — fail `db_not_found` on a
+            // missing --db, matching the other read commands.
+            require_existing_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({
@@ -9688,6 +10864,20 @@ fn try_hybrid_json_rpc(
     }
     let rt = tokio::runtime::Runtime::new().ok()?;
     let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // nw-087: a read/query against a NONEXISTENT local db must not autostart a
+    // daemon that CREATES an empty store — that turns a typo'd `--db` path into a
+    // silent "0 results / status: complete" success (false-green in CI). Skip the
+    // local connect when the db file is absent; still try configured upstreams
+    // (federated read), else return None so the caller's direct path reports
+    // `db_not_found` and a non-zero exit. `index` creates dbs and does NOT route
+    // through here, so it is unaffected.
+    if !db_path.exists() {
+        return rt
+            .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+                config, &start_dir, rpc_name, &args,
+            ))
+            .ok();
+    }
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {
@@ -9709,10 +10899,167 @@ fn unwrap_hybrid_payload(value: serde_json::Value) -> serde_json::Value {
     value.get("results").cloned().unwrap_or(value)
 }
 
+/// Drop the hybrid provenance `_meta` key from a daemon/hybrid object
+/// response so the CLI can deserialize/print the same shape the direct path
+/// produces (the direct store result has no `_meta`).
+fn strip_hybrid_meta(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("_meta");
+    }
+    value
+}
+
+/// Rebuild the direct path's `CommunityInfo` from a `clusters` tool
+/// response entry, which uses `size` where the CLI/sidecar schema uses
+/// `member_count`. Serializing the real struct keeps daemon --json output
+/// byte-identical to the direct path (struct field order, not map order).
+fn community_info_from_tool_json(
+    c: &serde_json::Value,
+) -> Option<nestweaver_engine::CommunityInfo> {
+    Some(nestweaver_engine::CommunityInfo {
+        id: c.get("id")?.as_u64()? as u32,
+        name: c.get("name")?.as_str()?.to_string(),
+        cohesion: c.get("cohesion")?.as_f64()?,
+        member_count: c.get("size")?.as_u64()? as usize,
+        members: serde_json::from_value(c.get("members")?.clone()).ok()?,
+        key_files: serde_json::from_value(c.get("key_files")?.clone()).ok()?,
+    })
+}
+
+/// Rebuild the direct path's `PatternCount` from a `count_patterns`
+/// tool payload entry (`PatternCount` is Serialize-only, so this is manual —
+/// same approach as [`community_info_from_tool_json`]). Serializing the real
+/// struct keeps daemon --json output byte-identical to the direct path
+/// (struct field order, not map order). `stale_index` defaults to false for
+/// daemons that predate the field.
+fn pattern_count_from_tool_json(
+    c: &serde_json::Value,
+) -> Option<nestweaver_store::regex::PatternCount> {
+    Some(nestweaver_store::regex::PatternCount {
+        pattern: c.get("pattern")?.as_str()?.to_string(),
+        total_matches: c.get("total_matches")?.as_u64()?,
+        files_matched: c.get("files_matched")?.as_u64()?,
+        top_files: c
+            .get("top_files")?
+            .as_array()?
+            .iter()
+            .map(|f| {
+                Some(nestweaver_store::regex::FileCount {
+                    path: f.get("path")?.as_str()?.to_string(),
+                    count: f.get("count")?.as_u64()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+        stale_index: c
+            .get("stale_index")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+/// One-line staleness note rendered (text mode only) when a search
+/// reports that it bypassed a stale trigram posting table. JSON mode carries
+/// the signal in-band via the `stale_index` field instead.
+fn print_stale_index_note() {
+    println!(
+        "(trigram index is stale — results came from a full scan; reindex with `index --with-trigrams`)"
+    );
+}
+
 fn hybrid_search_candidates_from_value(
     value: serde_json::Value,
 ) -> Vec<nestweaver_engine::SymbolCandidate> {
     serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default()
+}
+
+fn run_rts_eval(command: RtsEvalCommands) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        RtsEvalCommands::RecordTruth {
+            sha,
+            repo,
+            failed_test_files,
+            none_failed,
+            total_test_files,
+            flaky_test_files,
+            reruns,
+            db,
+        } => {
+            if failed_test_files.is_empty() && !none_failed {
+                anyhow::bail!(
+                    "provide --failed-test-files <paths...> or --none-failed for a green run"
+                );
+            }
+            let db_path = db.unwrap_or_else(default_db_path);
+            nestweaver_engine::rts_eval::record_truth(
+                &db_path,
+                repo.as_deref().unwrap_or(""),
+                &sha,
+                &failed_test_files,
+                total_test_files,
+                &flaky_test_files,
+                reruns,
+            )?;
+            println!(
+                "Recorded full-suite outcome for {} ({} failed test file(s)).",
+                sha.chars().take(8).collect::<String>(),
+                failed_test_files.len()
+            );
+            Ok((EXIT_SUCCESS, None))
+        }
+        RtsEvalCommands::Report { json, window, db } => {
+            let db_path = db.unwrap_or_else(default_db_path);
+            let report = nestweaver_engine::rts_eval::compute_report(&db_path, window)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.insufficient_data {
+                println!(
+                    "Insufficient data: {} joined selection/truth pair(s) (need {}).",
+                    report.n_joined,
+                    nestweaver_engine::rts_eval::MIN_JOINED_FOR_METRICS
+                );
+                println!(
+                    "  unresolved selections: {}  unmatched truths: {}",
+                    report.n_unresolved_selections, report.n_unmatched_truths
+                );
+                println!("No recall percentages are reported below that bar — keep feeding");
+                println!("full-suite outcomes via `nestweaver rts-eval record-truth`.");
+            } else {
+                let pct = |v: Option<f64>| {
+                    v.map(|x| format!("{:.1}%", x * 100.0))
+                        .unwrap_or_else(|| "n/a".to_string())
+                };
+                println!(
+                    "RTS eval over last {} joined pair(s) ({} failing):",
+                    report.n_joined, report.n_failing_pairs
+                );
+                println!("  file recall:        {}", pct(report.file_recall));
+                println!("  change recall:      {}", pct(report.change_recall));
+                println!("  selection breadth:  {}", pct(report.selection_breadth));
+                println!("  time saved (proxy): {}", pct(report.time_saved_proxy));
+                println!(
+                    "  unresolved selections: {}  unmatched truths: {}",
+                    report.n_unresolved_selections, report.n_unmatched_truths
+                );
+                if report.excluded_flaky_failures > 0 {
+                    println!(
+                        "  excluded {} failure(s) reported as flaky",
+                        report.excluded_flaky_failures
+                    );
+                }
+                if report.recall_estimate_uncertain {
+                    println!();
+                    println!(
+                        "  NOTE: {} run(s) reported failures that were never re-run, so these",
+                        report.unconfirmed_failure_runs
+                    );
+                    println!("  recall figures are UNCERTAIN in either direction (not a bound).");
+                    println!("  Pass --reruns (and --flaky) to rts-eval record-truth to report");
+                    println!("  confirmed failures.");
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+    }
 }
 
 fn run_brain(
@@ -9732,6 +11079,10 @@ fn run_brain(
             ignore,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // Create-operation (like `index`): create a missing parent
+            // directory for --db up front instead of failing deep inside
+            // the store open with a bare OS error.
+            ensure_db_parent_dir(&db_path)?;
             // nw-019: --instance flag > config's instance_id > "default".
             let instance_id_owned = resolve_instance_id(instance, config.as_deref())?;
             let instance_id = instance_id_owned.as_str();
@@ -9843,17 +11194,26 @@ fn run_brain(
 
             // Auto-discover cross-domain (notes ↔ code) bridges if any
             // code symbols are indexed. Cheap no-op when there's no code.
+            // Needs a read-write store to persist the REFERENCES_CODE edges;
+            // if the DB is locked (e.g. a daemon holds it) skip with a warning
+            // rather than failing the whole `brain add`.
             {
-                let store_for_discovery = open_store(Some(&db_path))?;
-                match discover_cross_domain_links(&store_for_discovery) {
-                    Ok(cd) if cd.note_to_symbol_edges + cd.section_to_symbol_edges > 0 => {
-                        println!(
-                            "Cross-domain: {} note→symbol, {} section→symbol edge(s) created.",
-                            cd.note_to_symbol_edges, cd.section_to_symbol_edges
-                        );
+                match GraphStore::open(&db_path) {
+                    Ok(store_for_discovery) => {
+                        match discover_cross_domain_links(&store_for_discovery) {
+                            Ok(cd) if cd.note_to_symbol_edges + cd.section_to_symbol_edges > 0 => {
+                                println!(
+                                    "Cross-domain: {} note→symbol, {} section→symbol edge(s) created.",
+                                    cd.note_to_symbol_edges, cd.section_to_symbol_edges
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("cross-domain discovery failed: {e:#}"),
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("cross-domain discovery failed: {e}"),
+                    Err(e) => tracing::warn!(
+                        "cross-domain discovery skipped — cannot open DB for writing: {e:#}"
+                    ),
                 }
             }
 
@@ -10381,6 +11741,9 @@ fn run_brain(
 
         BrainCommands::StaleCheck { json, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            // nw-087: read-only command — fail `db_not_found` on a
+            // missing --db before any daemon/store connect could create one.
+            require_existing_db(&db_path)?;
 
             // ── daemon guard ──────────────────────────────────────
             if let Some(value) = try_hybrid_json_rpc(
@@ -10390,17 +11753,40 @@ fn run_brain(
                 "stale_check",
                 serde_json::json!({}),
             ) {
+                // Emit the exact JSON shape the direct path
+                // produces (the hybrid `_meta` envelope — whose background
+                // `stale_repos` verdict could contradict the tool's fresh
+                // `any_stale` — is replaced by a top-level `stale_repos`
+                // computed from the actual stale list).
+                let stale_urls: Vec<serde_json::Value> = value
+                    .get("repos")
+                    .and_then(|v| v.as_array())
+                    .map(|repos| {
+                        repos
+                            .iter()
+                            .filter(|r| r["is_stale"].as_bool().unwrap_or(false))
+                            .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let any_stale = value
+                    .get("any_stale")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    let normalized = serde_json::json!({
+                        "repo_count": value.get("repo_count").cloned().unwrap_or(serde_json::json!(0)),
+                        "any_stale": any_stale,
+                        "stale_repos": stale_urls,
+                        "repos": value.get("repos").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&normalized)?);
                 } else {
                     let repo_count = value
                         .get("repo_count")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    let any_stale = value
-                        .get("any_stale")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
                     let repos = value
                         .get("repos")
                         .and_then(|v| v.as_array())
@@ -10429,7 +11815,11 @@ fn run_brain(
                                 .map(|h| &h[..8.min(h.len())])
                                 .unwrap_or("unknown");
                             let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
-                            let marker = if stale { "STALE" } else { "ok" };
+                            let marker = match r["status"].as_str() {
+                                Some("missing") => "missing",
+                                _ if stale => "STALE",
+                                _ => "ok",
+                            };
                             if stale && behind > 0 {
                                 println!(
                                     "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
@@ -10440,7 +11830,8 @@ fn run_brain(
                         }
                     }
                 }
-                return Ok((EXIT_SUCCESS, None));
+                // Stale-check is a freshness gate — exit non-zero when stale.
+                return Ok((if any_stale { EXIT_ERROR } else { EXIT_SUCCESS }, None));
             }
 
             let store = open_store(Some(&db_path))?;
@@ -10450,7 +11841,17 @@ fn run_brain(
             let mut results: Vec<serde_json::Value> = Vec::new();
 
             for repo in &repos {
-                let current_head = if let Some(path) = repo.local_root() {
+                // A local working tree that no longer exists on disk is
+                // unverifiable — flag it `[missing]` and count it as stale
+                // instead of silently reporting `[ok]`.
+                let local_missing = repo
+                    .local_root()
+                    .map(|p| !std::path::Path::new(p).exists())
+                    .unwrap_or(false);
+
+                let current_head = if local_missing {
+                    None
+                } else if let Some(path) = repo.local_root() {
                     std::process::Command::new("git")
                         .args(["-C", path, "rev-parse", "HEAD"])
                         .output()
@@ -10486,9 +11887,13 @@ fn run_brain(
                     }
                     _ => repo.staleness_commits_behind as u64,
                 };
-                let is_stale = match &current_head {
-                    Some(head) => head != &repo.indexed_sha,
-                    None => commits_behind > 0,
+                let is_stale = if local_missing {
+                    true
+                } else {
+                    match &current_head {
+                        Some(head) => head != &repo.indexed_sha,
+                        None => commits_behind > 0,
+                    }
                 };
                 if is_stale {
                     any_stale = true;
@@ -10500,15 +11905,24 @@ fn run_brain(
                     "current_head": current_head,
                     "is_stale": is_stale,
                     "staleness_commits_behind": commits_behind,
+                    "status": if local_missing { "missing" } else if is_stale { "stale" } else { "ok" },
                 }));
             }
 
             if json {
+                // Include the actual stale list so `any_stale: true`
+                // never sits next to an empty stale set.
+                let stale_urls: Vec<serde_json::Value> = results
+                    .iter()
+                    .filter(|r| r["is_stale"].as_bool().unwrap_or(false))
+                    .filter_map(|r| r["url"].as_str().map(serde_json::Value::from))
+                    .collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "repo_count": repos.len(),
                         "any_stale": any_stale,
+                        "stale_repos": stale_urls,
                         "repos": results,
                     }))?
                 );
@@ -10534,7 +11948,11 @@ fn run_brain(
                         .map(|h| &h[..8.min(h.len())])
                         .unwrap_or("unknown");
                     let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
-                    let marker = if stale { "STALE" } else { "ok" };
+                    let marker = match r["status"].as_str() {
+                        Some("missing") => "missing",
+                        _ if stale => "STALE",
+                        _ => "ok",
+                    };
                     if stale && behind > 0 {
                         println!(
                             "  [{marker}] {url}  indexed={indexed}  HEAD={head}  ({behind} commits behind)"
@@ -10544,7 +11962,8 @@ fn run_brain(
                     }
                 }
             }
-            Ok((EXIT_SUCCESS, None))
+            // Stale-check is a freshness gate — exit non-zero when stale.
+            Ok((if any_stale { EXIT_ERROR } else { EXIT_SUCCESS }, None))
         }
 
         BrainCommands::Watch {
@@ -10762,7 +12181,17 @@ fn run_brain(
                 path.display(),
                 db_path.display()
             ));
-            watcher.run().context("watcher")?;
+            if let Err(e) = watcher.run() {
+                // A lock failure here means another process (usually a
+                // live daemon) holds the DB — name the remedy.
+                let msg = format!("{e:#}");
+                if let Some(hint) = watch_lock_hint(&msg, &db_path) {
+                    let _ = std::fs::remove_file(&lock_path);
+                    eprintln!("Error: watcher: {msg}\nhint: {hint}");
+                    return Ok((EXIT_ERROR, None));
+                }
+                return Err(e).context("watcher");
+            }
 
             // BrainWatcher::run() drops its GraphStore when it returns,
             // which triggers lbug's internal cleanup. However, `launchctl
@@ -11134,6 +12563,7 @@ fn run_brain(
             prf,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 20);
 
@@ -11228,212 +12658,43 @@ fn run_brain(
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
 
-            // Parse the instance config once and reuse for ranking priors and
-            // the Feature F7 `[ranking] enable_prf` default.
-            let instance_cfg = load_instance_config_opt(config.as_deref());
-            // Feature F6: per-path ranking priors from `[ranking]`. None → no-op.
-            let ranking_config = instance_cfg
-                .as_ref()
-                .map(|c| c.ranking.clone())
-                .filter(|r| !r.is_empty());
             // Feature F7: PRF is enabled by the --prf flag OR `[ranking] enable_prf`.
-            let prf_enabled = prf
-                || instance_cfg
-                    .as_ref()
-                    .map(|c| c.ranking.enable_prf)
-                    .unwrap_or(false);
+            let prf_enabled = prf || cfg.as_ref().map(|c| c.ranking.enable_prf).unwrap_or(false);
 
-            // Expand the query with taxonomy aliases for better recall.
-            let aliases = load_alias_sidecar(&db_path);
-            let query = expand_query_with_aliases(&raw_query, &aliases);
-
-            // ── Vault note results ──────────────────────────────────────
-            let mut expansion_terms: Vec<String> = Vec::new();
-            let (note_results, engine) = if let Some(ref idx) = tantivy {
-                let raw_limit = limit * 5;
-                let hits = if prf_enabled {
-                    let (hits, terms) = idx
-                        .search_prf(
-                            &query,
-                            raw_limit,
-                            nestweaver_engine::query::nestweaver_store_stoplist(),
-                        )
-                        .with_context(|| "tantivy prf search")?;
-                    expansion_terms = terms;
-                    hits
-                } else {
-                    idx.search(&query, raw_limit)
-                        .with_context(|| "tantivy search")?
-                };
-                let grouped = group_bm25_hits_by_note(&store, &hits, limit);
-                (grouped, "bm25")
-            } else {
-                let needle = query.to_lowercase();
-                let notes = store.list_notes(None).context("list_notes")?;
-                let matches: Vec<NoteSearchResult> = notes
-                    .iter()
-                    .filter(|n| n.title.to_lowercase().contains(&needle))
-                    .take(limit)
-                    .map(|n| NoteSearchResult {
-                        note_uid: n.uid.clone(),
-                        title: n.title.clone(),
-                        best_score: 1.0,
-                        matched_headings: Vec::new(),
-                    })
-                    .collect();
-                (matches, "substring")
-            };
-
-            // ── Code symbol results ─────────────────────────────────────
-            let seen_titles: std::collections::HashSet<String> = note_results
-                .iter()
-                .map(|r| r.title.to_lowercase())
-                .collect();
-
-            let code_results = search_symbols(&store, &query, limit).unwrap_or_default();
-            let code_results: Vec<_> = code_results
-                .into_iter()
-                .filter(|sym| !seen_titles.contains(&sym.name.to_lowercase()))
-                .collect();
-
-            // Feature F6: apply per-path ranking priors as a multiplier on each
-            // result's relevance, keyed by file-path glob. Reuse the engine
-            // helper by projecting results into BrainNodes, then map the
-            // adjusted relevance back by UID. No config → empty map (no-op).
-            let mut note_results = note_results;
-            let prior_scores: std::collections::HashMap<String, f64> =
-                if let Some(ref ranking) = ranking_config {
-                    let mut probe: Vec<nestweaver_engine::BrainNode> = Vec::new();
-                    for n in &note_results {
-                        let location = store
-                            .lookup_note(&n.note_uid)
-                            .map(|note| note.file_path)
-                            .unwrap_or_default();
-                        probe.push(nestweaver_engine::BrainNode {
-                            uid: n.note_uid.clone(),
-                            kind: "Note".to_string(),
-                            title: n.title.clone(),
-                            location,
-                            relevance: n.best_score as f64,
-                            inline_body: None,
-                            body_complete: true,
-                        });
-                    }
-                    for sym in &code_results {
-                        probe.push(nestweaver_engine::BrainNode {
-                            uid: sym.uid.clone(),
-                            kind: format!("Symbol/{}", sym.kind),
-                            title: sym.name.clone(),
-                            location: format!("{}:{}", sym.file_path, sym.start_line),
-                            relevance: 0.5,
-                            inline_body: None,
-                            body_complete: true,
-                        });
-                    }
-                    nestweaver_engine::apply_ranking_priors(&mut probe, ranking);
-                    probe.into_iter().map(|n| (n.uid, n.relevance)).collect()
-                } else {
-                    std::collections::HashMap::new()
-                };
-            // Fold adjusted note scores back in.
-            for n in &mut note_results {
-                if let Some(&adj) = prior_scores.get(&n.note_uid) {
-                    n.best_score = adj as f32;
-                }
-            }
-            // Symbol display score: prior-adjusted when present, else 0.5.
-            let code_score = |uid: &str| prior_scores.get(uid).copied().unwrap_or(0.5);
-
-            let result_count = note_results.len() + code_results.len();
+            // Reuse the canonical MCP search implementation in-process so the
+            // direct CLI, daemon, and MCP share counted search pages, logical
+            // grouping, identity rules, and ranking behavior. This performs no
+            // network I/O and uses the already-open direct-disk store/index.
+            nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+            nestweaver_mcp::tools::set_current_instance_config(cfg.map(std::sync::Arc::new));
+            let response = nestweaver_mcp::tools::dispatch(
+                &store,
+                tantivy.as_ref(),
+                "brain_search",
+                serde_json::json!({
+                    "query": raw_query,
+                    "limit": limit,
+                    "prf": prf_enabled,
+                }),
+                None,
+            );
+            nestweaver_mcp::tools::set_current_instance_config(None);
+            let response = response?;
 
             if json {
-                let mut results: Vec<serde_json::Value> = note_results
-                    .iter()
-                    .map(|g| {
-                        let mut v = serde_json::json!({
-                            "uid": g.note_uid,
-                            "kind": "note",
-                            "title": g.title,
-                            "score": g.best_score,
-                        });
-                        if !g.matched_headings.is_empty() {
-                            v["matched_headings"] = serde_json::json!(g.matched_headings);
-                        }
-                        v
-                    })
-                    .collect();
-                for sym in &code_results {
-                    results.push(serde_json::json!({
-                        "uid": sym.uid,
-                        "kind": format!("Symbol/{}", sym.kind),
-                        "title": sym.name,
-                        "score": code_score(&sym.uid),
-                        "location": format!("{}:{}", sym.file_path, sym.start_line),
-                    }));
-                }
-                // Sort by score descending. `limit` is interpreted per-kind
-                // (each of notes/symbols is already capped upstream); a
-                // cross-kind truncate here would evict every symbol whenever
-                // ≥ `limit` notes match because symbols carry a fixed 0.5
-                // score while BM25 notes score 15+. Mirrors the daemon-side
-                // `tool_brain_search` semantics.
-                results.sort_by(|a, b| {
-                    let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut payload = serde_json::json!({
-                    "query": query,
-                    "engine": engine,
-                    "results": results,
-                    "total_matches": results.len(),
-                });
-                // Feature F7: surface PRF-mined expansion terms for auditing.
-                if !expansion_terms.is_empty() {
-                    payload["expansion_terms"] = serde_json::json!(expansion_terms);
-                }
-                println!("{}", serde_json::to_string_pretty(&payload)?);
-            } else if note_results.is_empty() && code_results.is_empty() {
-                println!("No results for '{query}'.");
+                println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
-                let header = if engine == "bm25" {
-                    "Brain search (BM25)"
-                } else {
-                    "Brain search (substring fallback)"
-                };
-                println!(
-                    "{}: {} result(s)",
-                    header,
-                    note_results.len() + code_results.len()
-                );
-                // Feature F7: show PRF-mined expansion terms for auditing.
-                if !expansion_terms.is_empty() {
-                    println!("  PRF expansion terms: {}", expansion_terms.join(", "));
-                }
-                println!();
-                for g in &note_results {
-                    if g.matched_headings.is_empty() {
-                        println!("  [{:.2}] {}", g.best_score, g.title);
-                    } else {
-                        println!(
-                            "  [{:.2}] {} (matched: {})",
-                            g.best_score,
-                            g.title,
-                            g.matched_headings.join(", "),
-                        );
-                    }
-                }
-                for sym in &code_results {
-                    println!(
-                        "  [{:.2}] {} [{}] @ {}:{}",
-                        code_score(&sym.uid),
-                        sym.name,
-                        sym.kind,
-                        sym.file_path,
-                        sym.start_line,
-                    );
-                }
+                render_brain_search_json(&response)?;
             }
+            let result_count = response
+                .get("returned_matches")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(|| {
+                    response
+                        .get("results")
+                        .and_then(|value| value.as_array())
+                        .map_or(0, |results| results.len() as u64)
+                });
             let stats = format!(
                 "{} results in {}",
                 result_count,
@@ -11955,6 +13216,9 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-087: read-only command — fail `db_not_found` on a
+            // missing --db, matching the other read commands.
+            require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
@@ -12037,6 +13301,9 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-087: read-only command — fail `db_not_found` on a
+            // missing --db, matching the other read commands.
+            require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
@@ -12111,6 +13378,9 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-087: read-only command — fail `db_not_found` on a
+            // missing --db, matching the other read commands.
+            require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
@@ -12224,6 +13494,9 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-087: read-only command — fail `db_not_found` on a
+            // missing --db, matching the other read commands.
+            require_existing_db(&db_path)?;
 
             if let Some(value) = try_hybrid_json_rpc(
                 use_daemon,
@@ -12330,99 +13603,6 @@ fn context_token_budgeted_truncate(
         taken += 1;
     }
     taken
-}
-
-/// A note-level search result after grouping BM25 hits by parent note.
-struct NoteSearchResult {
-    note_uid: String,
-    title: String,
-    best_score: f32,
-    matched_headings: Vec<String>,
-}
-
-/// Group BM25 search hits by their parent Note, picking the highest-scoring
-/// hit per note and collecting matched heading/section titles.
-fn group_bm25_hits_by_note(
-    store: &nestweaver_store::GraphStore,
-    hits: &[nestweaver_store::SearchHit],
-    limit: usize,
-) -> Vec<NoteSearchResult> {
-    use std::collections::HashMap;
-
-    struct Group {
-        note_uid: String,
-        best_score: f32,
-        title: String,
-        matched_headings: Vec<String>,
-    }
-
-    let mut groups: HashMap<String, Group> = HashMap::new();
-    let mut note_order: Vec<String> = Vec::new();
-
-    for h in hits {
-        let parent_note_uid = match h.kind.as_str() {
-            "note" => h.uid.clone(),
-            "heading" => store
-                .lookup_heading(&h.uid)
-                .map(|hd| hd.note_uid)
-                .unwrap_or_else(|_| h.uid.clone()),
-            "section" => store
-                .lookup_section(&h.uid)
-                .map(|s| s.note_uid)
-                .unwrap_or_else(|_| h.uid.clone()),
-            _ => h.uid.clone(),
-        };
-
-        let group = groups.entry(parent_note_uid.clone()).or_insert_with(|| {
-            note_order.push(parent_note_uid.clone());
-            Group {
-                note_uid: parent_note_uid.clone(),
-                best_score: 0.0,
-                title: String::new(),
-                matched_headings: Vec::new(),
-            }
-        });
-
-        if h.score > group.best_score {
-            group.best_score = h.score;
-        }
-        if h.kind == "note" {
-            group.title = h.title.clone();
-        }
-        if h.kind == "heading" || h.kind == "section" {
-            group.matched_headings.push(h.title.clone());
-        }
-    }
-
-    // Look up note titles for groups that had no direct note-title match.
-    for group in groups.values_mut() {
-        if group.title.is_empty() {
-            group.title = store
-                .lookup_note(&group.note_uid)
-                .map(|n| n.title)
-                .unwrap_or_else(|_| group.note_uid.clone());
-        }
-    }
-
-    // Sort by best_score descending.
-    note_order.sort_by(|a, b| {
-        let sa = groups.get(a).map(|g| g.best_score).unwrap_or(0.0);
-        let sb = groups.get(b).map(|g| g.best_score).unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    note_order
-        .into_iter()
-        .take(limit)
-        .filter_map(|nuid| {
-            groups.remove(&nuid).map(|g| NoteSearchResult {
-                note_uid: g.note_uid,
-                title: g.title,
-                best_score: g.best_score,
-                matched_headings: g.matched_headings,
-            })
-        })
-        .collect()
 }
 
 /// Apply age-decay score boost to non-Symbol nodes (CLI variant).
@@ -12554,35 +13734,91 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
 /// results into a single `results` array, distinguished by `kind`
 /// (`"note"` vs `"Symbol/<Kind>"`); text mode splits them back out so the
 /// per-row format matches the legacy output.
+struct BrainSearchDisplayMetadata<'a> {
+    returned_matches: i32,
+    total_matches_relation: &'a str,
+    truncated: bool,
+}
+
+fn brain_search_display_metadata(
+    response: &nestweaver_proto::BrainSearchResponse,
+) -> BrainSearchDisplayMetadata<'_> {
+    let returned_matches = if response.returned_matches == 0 && !response.results.is_empty() {
+        response.results.len() as i32
+    } else {
+        response.returned_matches
+    };
+    let total_matches_relation = if response.total_matches_relation.is_empty() {
+        "gte"
+    } else {
+        &response.total_matches_relation
+    };
+    let truncated = response.truncated
+        || total_matches_relation != "eq"
+        || returned_matches < response.total_matches;
+    BrainSearchDisplayMetadata {
+        returned_matches,
+        total_matches_relation,
+        truncated,
+    }
+}
+
+fn brain_search_engine_header(engine: &str) -> &'static str {
+    match engine {
+        "bm25" => "Brain search (BM25)",
+        "hybrid" => "Brain search (hybrid)",
+        "substring" => "Brain search (substring fallback)",
+        _ => "Brain search",
+    }
+}
+
+fn brain_search_result_item_json(item: &nestweaver_proto::SearchResultItem) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "uid": item.uid,
+        "kind": item.kind,
+        "title": item.title,
+        "score": item.score,
+    });
+    if let Some(ref canonical_id) = item.canonical_id {
+        value["canonical_id"] = serde_json::json!(canonical_id);
+    }
+    if let Some(ref location) = item.location {
+        value["location"] = serde_json::json!(location);
+    }
+    if !item.matched_headings.is_empty() {
+        value["matched_headings"] = serde_json::json!(item.matched_headings);
+    }
+    if let Some(ref vault_uid) = item.vault_uid {
+        value["vault_uid"] = serde_json::json!(vault_uid);
+    }
+    if let Some(ref body) = item.inline_body {
+        value["inline_body"] = serde_json::json!(body);
+    }
+    value
+}
+
 fn render_brain_search_response(
     resp: &nestweaver_proto::BrainSearchResponse,
     json: bool,
 ) -> anyhow::Result<()> {
+    let metadata = brain_search_display_metadata(resp);
+    let returned_matches = metadata.returned_matches;
+    let total_matches_relation = metadata.total_matches_relation;
+    let truncated = metadata.truncated;
     if json {
-        let mut results: Vec<serde_json::Value> = Vec::with_capacity(resp.results.len());
-        for item in &resp.results {
-            let mut v = serde_json::json!({
-                "uid": item.uid,
-                "kind": item.kind,
-                "title": item.title,
-                "score": item.score,
-            });
-            if let Some(ref loc) = item.location {
-                v["location"] = serde_json::json!(loc);
-            }
-            if !item.matched_headings.is_empty() {
-                v["matched_headings"] = serde_json::json!(item.matched_headings);
-            }
-            if let Some(ref body) = item.inline_body {
-                v["inline_body"] = serde_json::json!(body);
-            }
-            results.push(v);
-        }
+        let results: Vec<serde_json::Value> = resp
+            .results
+            .iter()
+            .map(brain_search_result_item_json)
+            .collect();
         let mut payload = serde_json::json!({
             "query": resp.query,
             "engine": resp.engine,
             "results": results,
             "total_matches": resp.total_matches,
+            "total_matches_relation": total_matches_relation,
+            "returned_matches": returned_matches,
+            "truncated": truncated,
         });
         if !resp.expansion_terms.is_empty() {
             payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
@@ -12596,12 +13832,22 @@ fn render_brain_search_response(
         return Ok(());
     }
 
-    let header = if resp.engine == "bm25" {
-        "Brain search (BM25)"
+    let header = brain_search_engine_header(&resp.engine);
+    if truncated {
+        if total_matches_relation == "gte" {
+            println!(
+                "{}: {} of at least {} result(s)",
+                header, returned_matches, resp.total_matches
+            );
+        } else {
+            println!(
+                "{}: {} of {} result(s)",
+                header, returned_matches, resp.total_matches
+            );
+        }
     } else {
-        "Brain search (substring fallback)"
-    };
-    println!("{}: {} result(s)", header, resp.results.len());
+        println!("{}: {} result(s)", header, returned_matches);
+    }
     if !resp.expansion_terms.is_empty() {
         println!("  PRF expansion terms: {}", resp.expansion_terms.join(", "));
     }
@@ -12634,6 +13880,53 @@ fn render_brain_search_response(
     Ok(())
 }
 
+#[cfg(test)]
+mod brain_search_renderer_tests {
+    use super::*;
+
+    #[test]
+    fn typed_old_wire_defaults_are_rendered_as_truncated() {
+        let response = nestweaver_proto::BrainSearchResponse {
+            query: "needle".to_string(),
+            engine: "bm25".to_string(),
+            total_matches: 1,
+            results: vec![nestweaver_proto::SearchResultItem {
+                uid: "sym:needle".to_string(),
+                canonical_id: Some("canonical-needle".to_string()),
+                kind: "Symbol/Function".to_string(),
+                title: "needle".to_string(),
+                score: 1.0,
+                location: Some("src/lib.rs:1".to_string()),
+                matched_headings: Vec::new(),
+                inline_body: None,
+                vault_uid: None,
+            }],
+            expansion_terms: Vec::new(),
+            returned_matches: 0,
+            total_matches_relation: String::new(),
+            truncated: false,
+        };
+
+        let metadata = brain_search_display_metadata(&response);
+
+        assert_eq!(metadata.returned_matches, 1);
+        assert_eq!(metadata.total_matches_relation, "gte");
+        assert!(metadata.truncated);
+        assert_eq!(
+            brain_search_result_item_json(&response.results[0])["canonical_id"],
+            "canonical-needle"
+        );
+    }
+
+    #[test]
+    fn hybrid_engine_has_an_honest_text_label() {
+        assert_eq!(
+            brain_search_engine_header("hybrid"),
+            "Brain search (hybrid)"
+        );
+    }
+}
+
 /// Render a brain search response from a JSON `Value` (hybrid path).
 ///
 /// The JSON shape matches the proto `BrainSearchResponse` serialized by
@@ -12658,24 +13951,52 @@ fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    let returned_matches = result
+        .get("returned_matches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(results.len() as u64);
+    let total_matches = result
+        .get("total_matches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(returned_matches);
+    let total_matches_relation = result
+        .get("total_matches_relation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gte");
+    let explicit_truncated = result
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let truncated =
+        explicit_truncated || total_matches_relation != "eq" || returned_matches < total_matches;
 
     if results.is_empty() {
         println!("No results for '{}'.", query);
         return Ok(());
     }
 
-    let header = if engine == "bm25" {
-        "Brain search (BM25)"
-    } else {
-        "Brain search (substring fallback)"
-    };
+    let header = brain_search_engine_header(engine);
     // Include provenance scope if present (hybrid/local/server).
     let scope = result
         .get("_meta")
         .and_then(|m| m.get("scope"))
         .and_then(|v| v.as_str())
         .unwrap_or("local");
-    println!("{}: {} result(s) [{}]", header, results.len(), scope);
+    if truncated {
+        if total_matches_relation == "gte" {
+            println!(
+                "{}: {} of at least {} result(s) [{}]",
+                header, returned_matches, total_matches, scope
+            );
+        } else {
+            println!(
+                "{}: {} of {} result(s) [{}]",
+                header, returned_matches, total_matches, scope
+            );
+        }
+    } else {
+        println!("{}: {} result(s) [{}]", header, returned_matches, scope);
+    }
     if !expansion_terms.is_empty() {
         println!("  PRF expansion terms: {}", expansion_terms.join(", "));
     }
@@ -12855,6 +14176,9 @@ fn run_embed(
     if local && endpoint.is_some() {
         anyhow::bail!("--local and --endpoint are mutually exclusive");
     }
+    if batch_size == 0 {
+        anyhow::bail!("--batch-size must be at least 1");
+    }
 
     let t0 = std::time::Instant::now();
     let default = default_db_path();
@@ -12950,6 +14274,19 @@ fn run_embed(
         anyhow::bail!(
             "daemon is not running. Start it with 'nestweaver daemon --db {} start' \
              or use --no-daemon (requires NESTWEAVER_NO_DAEMON=1)",
+            path.display()
+        );
+    }
+
+    // Lock trap: the direct write open below fails against a running
+    // daemon's write lock with a raw store error. Detect it up front and say
+    // exactly what to do instead.
+    if daemon_process_running_for_db(path) {
+        anyhow::bail!(
+            "a nestweaver daemon is running for {} and holds the write lock. \
+             Stop it first with `nestweaver daemon --db {} stop` (or embed \
+             through the daemon by dropping --endpoint/--local).",
+            path.display(),
             path.display()
         );
     }
@@ -13598,9 +14935,15 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
     match command {
         InstanceCommands::Register { config_path } => {
             let config = nestweaver_engine::InstanceConfig::from_file(Path::new(&config_path))?;
+            // Store the canonical path so the registry entry is immune to
+            // CWD differences between `register` and later lookups. The file
+            // was just read successfully, so canonicalization cannot fail.
+            let canonical = std::fs::canonicalize(&config_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(config_path);
             let registry_path = default_registry_path();
             let mut registry = nestweaver_engine::Registry::load_or_create(&registry_path)?;
-            registry.register(&config.instance_id, &config_path)?;
+            registry.register(&config.instance_id, &canonical)?;
             println!("Registered instance '{}'", config.instance_id);
             Ok(EXIT_SUCCESS)
         }
@@ -13620,6 +14963,15 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             purge_graph,
             db,
         } => {
+            // Validate the DB BEFORE mutating the registry — a typo'd
+            // --db must fail without the instance already being removed.
+            let db_path = if purge_graph {
+                let db_path = db.unwrap_or_else(default_db_path);
+                require_existing_db(&db_path)?;
+                Some(db_path)
+            } else {
+                None
+            };
             let mut registry =
                 nestweaver_engine::Registry::load_or_create(&default_registry_path())?;
             let registry_removed = match registry.remove(&id) {
@@ -13639,8 +14991,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             if registry_removed {
                 println!("Removed instance '{id}' from registry");
             }
-            if purge_graph {
-                let db_path = db.unwrap_or_else(default_db_path);
+            if let Some(db_path) = db_path {
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client = rt
                     .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
@@ -13695,6 +15046,10 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
         }
         InstanceCommands::Merge { from, to, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            // Merging against a typo'd --db must fail db_not_found, not
+            // autostart a daemon that creates an empty DB and false-greens
+            // ("No rows found").
+            require_existing_db(&db_path)?;
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt
                 .block_on(nestweaver_client::DaemonClient::connect(&db_path, None))
@@ -13717,6 +15072,36 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                 }
                 if !result.repos_needing_reindex.is_empty() {
                     eprintln!("{}", merge_reindex_guidance(&result.repos_needing_reindex));
+                }
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        InstanceCommands::AbortMigration { db, force } => {
+            // Offline recovery: operate on the sidecar journals directly (the
+            // daemon is wedged and won't boot). nw-091 / Bug 3B.
+            let db_path = db.unwrap_or_else(default_db_path);
+            match nestweaver_engine::abort_instance_extension_migration(&db_path, force)? {
+                nestweaver_engine::AbortMigrationOutcome::NothingToAbort => {
+                    println!("No pending instance-migration journal — nothing to abort.");
+                }
+                nestweaver_engine::AbortMigrationOutcome::AbortedPrepared => {
+                    println!(
+                        "Aborted a prepared instance-migration journal (no graph mutation had \
+                         happened). The daemon can boot now."
+                    );
+                }
+                nestweaver_engine::AbortMigrationOutcome::ForceDiscardedApplied => {
+                    eprintln!(
+                        "Force-discarded a graph-applied migration journal. The graph mutation \
+                         itself remains — verify the merge result and reconcile if needed."
+                    );
+                }
+                nestweaver_engine::AbortMigrationOutcome::ForceDiscardedUnknownPhase => {
+                    eprintln!(
+                        "Force-discarded an unreadable migration journal (phase unknown). The \
+                         graph may or may not have been mutated — verify the merge result and \
+                         reconcile if needed."
+                    );
                 }
             }
             Ok(EXIT_SUCCESS)
@@ -14264,6 +15649,23 @@ fn run_mcp_hybrid(
                         "jsonrpc": "2.0",
                         "id": id,
                         "error": { "code": -32602, "message": "tools/call: 'name' is required" }
+                    })
+                } else if let Err(error) = nestweaver_mcp::tools::enforce_tool_allowed(name) {
+                    // The HybridClient read path dispatches queries itself
+                    // and would otherwise bypass the --tools/--lite gate. Same
+                    // error text as the local and daemon-proxy paths.
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                    })
+                } else if let Err(error) =
+                    nestweaver_mcp::tools::validate_tool_arguments(name, &arguments)
+                {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
                     })
                 } else if write_tools.contains(name) {
                     // Write operations go through standard gRPC dispatch.
@@ -14823,6 +16225,177 @@ mod abs_for_daemon_tests {
         let out = abs_for_daemon(&dir);
         assert!(out.is_absolute());
     }
+
+    /// With no pidfile for the derived instance, no daemon is reported
+    /// running — the direct-watcher fallback stays reachable.
+    #[test]
+    fn daemon_process_running_false_for_unknown_db() {
+        let bogus = std::path::Path::new("/definitely/not/a/real/db-xyz-123/brain.lbug");
+        assert!(!daemon_process_running_for_db(bogus));
+    }
+
+    /// The pidfile-PID identity predicate must match only nestweaver
+    /// daemon cmdlines serving the same DB (raw or canonical spelling).
+    #[test]
+    fn cmdline_is_our_daemon_matches_only_our_daemon() {
+        let db = std::path::Path::new("/tmp/nw-f06/brain.lbug");
+
+        assert!(cmdline_is_our_daemon(
+            "/usr/local/bin/nestweaver daemon --db /tmp/nw-f06/brain.lbug start",
+            db
+        ));
+        assert!(cmdline_is_our_daemon(
+            "nestweaver daemon --db /tmp/nw-f06/brain.lbug run",
+            db
+        ));
+        // Foreign process reusing the PID: no nestweaver marker.
+        assert!(!cmdline_is_our_daemon("/usr/sbin/cron -s", db));
+        // A nestweaver daemon for a DIFFERENT DB must not match.
+        assert!(!cmdline_is_our_daemon(
+            "nestweaver daemon --db /tmp/other/brain.lbug start",
+            db
+        ));
+        // A nestweaver CLI invocation that is not serving this DB must not match.
+        assert!(!cmdline_is_our_daemon("nestweaver search foo", db));
+        assert!(!cmdline_is_our_daemon("", db));
+    }
+
+    /// `daemon_cmdline_if_ours` returns None for a live process that is
+    /// not a nestweaver daemon for the given DB (PID-reuse protection).
+    #[test]
+    fn daemon_cmdline_if_ours_rejects_foreign_process() {
+        let bogus_db = std::path::Path::new("/definitely/not/a/real/db-xyz-123/brain.lbug");
+        // Our own test process is alive but is not a daemon for that DB.
+        assert!(daemon_cmdline_if_ours(std::process::id() as i32, bogus_db).is_none());
+        // PID 1 (launchd/init) is alive and foreign.
+        assert!(daemon_cmdline_if_ours(1, bogus_db).is_none());
+    }
+
+    /// The pidfile flock is a spelling-independent identity proof —
+    /// held means a live daemon owns the pidfile, free means it does not.
+    #[test]
+    fn pidfile_flock_held_detects_lock_owner() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        std::fs::write(&pidfile, "123").unwrap();
+
+        // Not held by anyone.
+        assert!(!pidfile_flock_held(&pidfile));
+
+        // Hold the flock in this process → detected as held.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pidfile)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert!(pidfile_flock_held(&pidfile));
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        drop(file);
+
+        // Missing pidfile → not held.
+        assert!(!pidfile_flock_held(&dir.path().join("nope.pid")));
+    }
+
+    /// The kernel reports the listener's PID for a connected unix socket;
+    /// a missing socket yields None (daemon can't confirm identity).
+    #[test]
+    fn daemon_socket_reported_pid_matches_listener_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(
+            daemon_socket_reported_pid(&socket),
+            Some(std::process::id() as i32)
+        );
+        // Socket never existed → None.
+        assert_eq!(
+            daemon_socket_reported_pid(&dir.path().join("nope.sock")),
+            None
+        );
+    }
+
+    /// With the pidfile flock held but no cmdline match, identity is
+    /// confirmed ONLY when the socket-serving PID equals the pidfile PID — a
+    /// rewritten pidfile can no longer redirect a signal at a foreign PID.
+    #[test]
+    fn daemon_identity_cross_checks_socket_pid_when_flock_held() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let socket = dir.path().join("daemon.sock");
+        let bogus_db = std::path::Path::new("/definitely/not/a/real/db-xyz-123/brain.lbug");
+        let our_pid = std::process::id() as i32;
+
+        std::fs::write(&pidfile, our_pid.to_string()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // Hold the flock (as a real daemon would).
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pidfile)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        // Pidfile PID == socket-serving PID → verified.
+        assert!(daemon_identity_verified(
+            our_pid, bogus_db, &pidfile, &socket
+        ));
+
+        // Pidfile rewritten to a foreign PID while the flock is still held →
+        // the socket cross-check disagrees → refused (the earlier code would
+        // have signaled it on flock evidence alone).
+        assert!(!daemon_identity_verified(
+            i32::MAX - 1,
+            bogus_db,
+            &pidfile,
+            &socket
+        ));
+
+        // Socket gone → the daemon can't confirm identity → refused.
+        let missing_socket = dir.path().join("nope.sock");
+        assert!(!daemon_identity_verified(
+            our_pid,
+            bogus_db,
+            &pidfile,
+            &missing_socket
+        ));
+
+        // Flock NOT held and no cmdline match → refused regardless of socket.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        assert!(!daemon_identity_verified(
+            our_pid, bogus_db, &pidfile, &socket
+        ));
+    }
+}
+
+#[cfg(test)]
+mod no_daemon_gate_tests {
+    use super::*;
+
+    #[test]
+    fn bypass_refused_outside_ci() {
+        // No opt-in, not GitHub Actions, and CI unset/falsey → refuse the bypass.
+        assert!(!no_daemon_allowed_from(false, false, None));
+        assert!(!no_daemon_allowed_from(false, false, Some("")));
+        assert!(!no_daemon_allowed_from(false, false, Some("0")));
+        assert!(!no_daemon_allowed_from(false, false, Some("false")));
+        assert!(!no_daemon_allowed_from(false, false, Some("False")));
+        assert!(!no_daemon_allowed_from(false, false, Some("  ")));
+    }
+
+    #[test]
+    fn bypass_allowed_in_ci_or_with_optin() {
+        // Explicit local opt-in.
+        assert!(no_daemon_allowed_from(true, false, None));
+        // GitHub Actions.
+        assert!(no_daemon_allowed_from(false, true, None));
+        // Generic CI truthy spellings.
+        assert!(no_daemon_allowed_from(false, false, Some("1")));
+        assert!(no_daemon_allowed_from(false, false, Some("true")));
+        assert!(no_daemon_allowed_from(false, false, Some("yes")));
+    }
 }
 
 /// Serializes tests that mutate the process-global `XDG_RUNTIME_DIR`. The
@@ -15072,6 +16645,292 @@ mod snapshot_build_guard_tests {
 mod hybrid_cli_tests {
     use super::*;
 
+    /// The CLI must send the exact arg names the MCP tools read —
+    /// `top_n` for bridge_nodes, `changed_files` (array) for affected_tests.
+    #[test]
+    fn rpc_args_use_tool_expected_names() {
+        let bridges = bridge_nodes_rpc_args(3);
+        assert_eq!(bridges, serde_json::json!({ "top_n": 3 }));
+        assert!(bridges.get("top").is_none());
+
+        let affected = affected_tests_rpc_args(&["src/a.rs".to_string(), "src/b.rs".to_string()]);
+        assert_eq!(
+            affected,
+            serde_json::json!({ "changed_files": ["src/a.rs", "src/b.rs"] })
+        );
+        assert!(affected["changed_files"].is_array());
+        assert!(affected.get("files").is_none());
+    }
+
+    /// `read_symbols` sends `include_neighbors` (nw-088) and OMITS
+    /// `token_budget` when unset — the tool's integer schema rejects an
+    /// explicit null, which used to fail validation on every budget-less
+    /// daemon call and silently fall back to the direct path.
+    #[test]
+    fn read_symbols_rpc_args_omit_null_token_budget() {
+        let args = read_symbols_rpc_args(&["main".to_string()], 0, None, None);
+        assert_eq!(
+            args,
+            serde_json::json!({ "targets": ["main"], "include_neighbors": 0 })
+        );
+        assert!(args.get("token_budget").is_none());
+        assert!(args.get("root").is_none());
+        assert!(args.get("neighbors").is_none());
+
+        let args = read_symbols_rpc_args(
+            &["main".to_string()],
+            2,
+            Some(4000),
+            Some(std::path::Path::new("/repo")),
+        );
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "targets": ["main"],
+                "include_neighbors": 2,
+                "token_budget": 4000,
+                "root": "/repo",
+            })
+        );
+    }
+
+    /// nw-087: a nonexistent --db must fail with the db_not_found
+    /// diagnostic (exit 1), not silently create/spawn anything.
+    #[test]
+    fn require_existing_db_fails_db_not_found_on_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.lbug");
+        let err = require_existing_db(&missing).expect_err("missing db must error");
+        let report = into_diagnostic(err);
+        let rendered = format!("{report:?}");
+        assert!(
+            rendered.contains("db_not_found"),
+            "expected db_not_found diagnostic, got: {rendered}"
+        );
+        // Nothing was created as a side effect.
+        assert!(!missing.exists());
+
+        // An existing DB passes the guard.
+        let present = dir.path().join("present.lbug");
+        std::fs::write(&present, b"").unwrap();
+        assert!(require_existing_db(&present).is_ok());
+    }
+
+    /// A create-path store error ("open/create store at
+    /// <path>.lbug: ... No such file or directory") must NOT misfire into
+    /// the circular db_not_found diagnostic ("Run `nestweaver index` to
+    /// create a database") — the user IS running index.
+    #[test]
+    fn into_diagnostic_does_not_map_create_path_errors_to_db_not_found() {
+        let err = anyhow::anyhow!(
+            "incremental_index: open/create store at tmp/x/sub/db.lbug: database error: \
+             IO exception: No such file or directory (os error 2)"
+        );
+        let rendered = format!("{:?}", into_diagnostic(err));
+        assert!(
+            !rendered.contains("db_not_found"),
+            "create-path errors must not misfire into db_not_found: {rendered}"
+        );
+
+        // The genuine missing-db message still maps.
+        let err = anyhow::anyhow!("database not found at ./nope.lbug");
+        let rendered = format!("{:?}", into_diagnostic(err));
+        assert!(rendered.contains("db_not_found"), "{rendered}");
+    }
+
+    /// Create-operations (`index`, `brain add`) create missing --db parent
+    /// directories up front instead of failing deep in the store open.
+    #[test]
+    fn ensure_db_parent_dir_creates_missing_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("a").join("b").join("db.lbug");
+        ensure_db_parent_dir(&db).unwrap();
+        assert!(db.parent().unwrap().is_dir());
+
+        // A bare filename (no parent component) is a no-op.
+        ensure_db_parent_dir(std::path::Path::new("db.lbug")).unwrap();
+    }
+
+    /// A direct-watcher lock failure must suggest `nestweaver daemon
+    /// stop`; unrelated errors get no hint.
+    #[test]
+    fn watch_lock_hint_only_for_lock_errors() {
+        let db = std::path::Path::new("/tmp/nw-b8/brain.lbug");
+        let hint = watch_lock_hint(
+            "code watcher: open GraphStore at /tmp/nw-b8/brain.lbug: Could not set lock on file",
+            db,
+        )
+        .expect("lock errors must produce a hint");
+        assert!(
+            hint.contains("nestweaver daemon --db /tmp/nw-b8/brain.lbug stop"),
+            "{hint}"
+        );
+        assert!(watch_lock_hint("some other error", db).is_none());
+    }
+
+    /// A `count_patterns` tool payload entry rebuilds into the direct
+    /// path's `PatternCount` — field order byte-identical, `stale_index`
+    /// defaulted for pre-field daemons.
+    #[test]
+    fn pattern_count_from_tool_json_rebuilds_direct_struct() {
+        // Daemon payload (map order alphabetical, as a serde_json::Value).
+        let entry = serde_json::json!({
+            "files_matched": 2,
+            "pattern": "foo",
+            "stale_index": true,
+            "top_files": [{"count": 3, "path": "src/a.rs"}, {"count": 1, "path": "src/b.rs"}],
+            "total_matches": 4,
+        });
+        let c = pattern_count_from_tool_json(&entry).expect("valid entry must rebuild");
+        assert_eq!(c.pattern, "foo");
+        assert_eq!(c.total_matches, 4);
+        assert_eq!(c.files_matched, 2);
+        assert!(c.stale_index);
+        assert_eq!(c.top_files.len(), 2);
+        assert_eq!(c.top_files[0].path, "src/a.rs");
+        assert_eq!(c.top_files[0].count, 3);
+
+        // Serializing the rebuilt struct matches the direct path's key order.
+        let serialized = serde_json::to_string(&c).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true}"#
+        );
+
+        // A pre-`stale_index` daemon payload still rebuilds (default false).
+        let old = serde_json::json!({
+            "pattern": "bar",
+            "total_matches": 0,
+            "files_matched": 0,
+            "top_files": [],
+        });
+        let c = pattern_count_from_tool_json(&old).expect("old payload must rebuild");
+        assert!(!c.stale_index);
+
+        // Malformed entries are skipped (None), not panicked on.
+        assert!(pattern_count_from_tool_json(&serde_json::json!({"pattern": 1})).is_none());
+    }
+
+    /// Hybrid `_meta` provenance is stripped so daemon responses render
+    /// identically to the direct path; other keys are untouched and
+    /// non-object values pass through.
+    #[test]
+    fn strip_hybrid_meta_removes_only_meta() {
+        let value = serde_json::json!({
+            "results": [1, 2],
+            "_meta": { "sources": ["local"], "stale_repos": [] }
+        });
+        assert_eq!(
+            strip_hybrid_meta(value),
+            serde_json::json!({ "results": [1, 2] })
+        );
+        // No _meta → unchanged; non-object → unchanged.
+        let plain = serde_json::json!({ "a": 1 });
+        assert_eq!(strip_hybrid_meta(plain.clone()), plain);
+        assert_eq!(
+            strip_hybrid_meta(serde_json::json!([1, 2])),
+            serde_json::json!([1, 2])
+        );
+    }
+
+    /// `index --repo <file>` is rejected naming the path; a missing
+    /// path is also rejected naming the path; a directory passes.
+    #[test]
+    fn canonical_repo_dir_rejects_files_and_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A file path → "not a directory", naming the path.
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let err = canonical_repo_dir(&file).expect_err("a file must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a directory"), "{msg}");
+        assert!(msg.contains("file.txt"), "{msg}");
+
+        // A missing path → "does not exist", naming the path.
+        let missing = dir.path().join("no-such-dir");
+        let err = canonical_repo_dir(&missing).expect_err("missing path must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(msg.contains("no-such-dir"), "{msg}");
+
+        // A directory passes.
+        assert!(canonical_repo_dir(dir.path()).is_ok());
+    }
+
+    /// The miette diagnostic for `--repo <file>` must be titled "not a
+    /// directory", not folded into the "does not exist" diagnostic.
+    #[test]
+    fn into_diagnostic_distinguishes_not_a_directory_from_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let err = canonical_repo_dir(&file).expect_err("a file must be rejected");
+        let rendered = format!("{:?}", into_diagnostic(err));
+        assert!(
+            rendered.contains("repo_not_a_directory"),
+            "expected repo_not_a_directory diagnostic, got: {rendered}"
+        );
+        assert!(rendered.contains("not a directory"), "{rendered}");
+        assert!(rendered.contains("file.txt"), "{rendered}");
+
+        let missing = dir.path().join("no-such-dir");
+        let err = canonical_repo_dir(&missing).expect_err("missing path must be rejected");
+        let rendered = format!("{:?}", into_diagnostic(err));
+        assert!(
+            rendered.contains("repo_not_found"),
+            "expected repo_not_found diagnostic, got: {rendered}"
+        );
+        assert!(!rendered.contains("repo_not_a_directory"), "{rendered}");
+    }
+
+    /// The boot health-check must report a dead/absent daemon as not
+    /// booted (false) and a listening socket as booted (true).
+    #[test]
+    fn wait_for_daemon_boot_detects_listening_socket() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nothing listening → false well within the timeout.
+        let absent = dir.path().join("absent.sock");
+        assert!(!wait_for_daemon_boot(
+            &absent,
+            std::time::Duration::from_millis(300)
+        ));
+
+        // A listening unix socket → true.
+        let sock = dir.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(wait_for_daemon_boot(
+            &sock,
+            std::time::Duration::from_millis(300)
+        ));
+    }
+
+    /// A full page of search results carries a truncation note;
+    /// a partial page does not.
+    #[test]
+    fn search_truncation_note_only_at_limit() {
+        assert!(search_truncation_note(10, 10).is_some());
+        assert!(search_truncation_note(9, 10).is_none());
+        assert!(search_truncation_note(0, 10).is_none());
+    }
+
+    /// Hooks dir inside the repo is fine; a custom core.hooksPath
+    /// pointing elsewhere is flagged.
+    #[test]
+    fn hooks_dir_outside_repo_detection() {
+        let root = std::path::Path::new("/repo");
+        assert!(!hooks_dir_outside_repo(
+            std::path::Path::new("/repo/.git/hooks"),
+            root
+        ));
+        assert!(hooks_dir_outside_repo(
+            std::path::Path::new("/shared/hooks"),
+            root
+        ));
+    }
+
     #[test]
     fn hybrid_search_candidates_reads_wrapped_results() {
         let value = serde_json::json!({
@@ -15276,6 +17135,52 @@ mod stop_grace_tests {
             resolve_stop_grace_secs(Some("notanumber"), Some("also-bad")),
             DEFAULT_DRAIN_CEILING_SECS + STOP_GRACE_BUFFER_SECS
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod start_grace_tests {
+    use super::*;
+
+    /// A pid that is already gone is detected immediately — the
+    /// launchd pre-install stop step proceeds only in this case.
+    #[test]
+    fn exited_pid_is_detected() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        assert!(pid_exited_within_grace(
+            child.id() as i32,
+            std::time::Duration::from_millis(500)
+        ));
+    }
+
+    /// A pid that stays alive through the grace reports false — the
+    /// launchd start path must abort rather than overlap two daemons on one
+    /// DB. Uses our own pid: guaranteed alive, guaranteed signalable.
+    #[test]
+    fn live_pid_survives_grace() {
+        assert!(!pid_exited_within_grace(
+            std::process::id() as i32,
+            std::time::Duration::from_millis(200)
+        ));
+    }
+
+    /// A pid that exits DURING the grace is still detected (the loop
+    /// does not require the process to be gone at entry).
+    #[test]
+    fn pid_exiting_mid_grace_is_detected() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        assert!(pid_exited_within_grace(
+            pid,
+            std::time::Duration::from_secs(5)
+        ));
     }
 }
 
@@ -15791,6 +17696,40 @@ mod stale_check_cli_tests {
     use super::*;
 
     #[test]
+    fn rts_eval_subcommands_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "rts-eval",
+                    "record-truth",
+                    "--sha",
+                    "abc123",
+                    "--failed-test-files",
+                    "tests/a.test.ts",
+                    "--total-test-files",
+                    "10",
+                ])
+                .expect("record-truth must parse");
+                assert!(matches!(cli.command, Commands::RtsEval { .. }));
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "rts-eval",
+                    "report",
+                    "--json",
+                    "--window",
+                    "25",
+                ])
+                .expect("report must parse");
+                assert!(matches!(cli.command, Commands::RtsEval { .. }));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
     fn top_level_stale_check_parses() {
         // Parsing the full Cli overflows the default 2 MiB test-thread stack
         // in debug builds (the Commands enum is large); use a bigger stack.
@@ -15804,6 +17743,126 @@ mod stale_check_cli_tests {
                     cli.command,
                     Commands::StaleCheck { json: true, .. }
                 ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// --validity-days is range-checked at the clap layer (1..=36500) —
+    /// 0 and absurd values are rejected before any cert generation (which used
+    /// to panic on overflow).
+    #[test]
+    fn init_tls_validity_days_range_enforced() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let base = ["nestweaver", "server", "init-tls", "--output-dir", "/tmp/x"];
+                for bad in ["0", "36501", "999999999"] {
+                    let mut argv = base.to_vec();
+                    argv.extend(["--validity-days", bad]);
+                    assert!(
+                        Cli::try_parse_from(&argv).is_err(),
+                        "--validity-days {bad} must be rejected"
+                    );
+                }
+                for good in ["1", "365", "36500"] {
+                    let mut argv = base.to_vec();
+                    argv.extend(["--validity-days", good]);
+                    assert!(
+                        Cli::try_parse_from(&argv).is_ok(),
+                        "--validity-days {good} must parse"
+                    );
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+}
+
+#[cfg(test)]
+mod cli_bounds_tests {
+    use super::*;
+
+    /// CLI numeric bounds must match the MCP tool schemas (MCP parity):
+    /// impact/blast-radius --depth 1..=15, regex-search --limit 1..=10000,
+    /// --max-millis 1..=600000, project-context --token-budget 1..=16000,
+    /// hubs --top 1..=1000, dead-code --limit 1..=1000,
+    /// context/brain-context --token-budget 1..=16000, brain search --limit 1..=1000.
+    #[test]
+    fn numeric_flags_enforce_mcp_schema_bounds() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cases: &[(&[&str], &[&str], &[&str])] = &[
+                    // (argv prefix, rejected values, accepted values)
+                    (
+                        &["nestweaver", "impact", "sym", "--depth"],
+                        &["0", "16"],
+                        &["1", "3", "15"],
+                    ),
+                    (
+                        &["nestweaver", "pr-impact", "--files", "a.rs", "--depth"],
+                        &["0", "16"],
+                        &["1", "3", "15"],
+                    ),
+                    (
+                        &["nestweaver", "regex-search", "foo", "--limit"],
+                        &["0", "10001"],
+                        &["1", "10000"],
+                    ),
+                    (
+                        &["nestweaver", "regex-search", "foo", "--max-millis"],
+                        &["0", "600001"],
+                        &["1", "600000"],
+                    ),
+                    (
+                        &["nestweaver", "project-context", "proj", "--token-budget"],
+                        &["0", "16001"],
+                        &["1", "16000"],
+                    ),
+                    (
+                        &["nestweaver", "hubs", "--top"],
+                        &["0", "1001"],
+                        &["1", "1000"],
+                    ),
+                    (
+                        &["nestweaver", "dead-code", "--limit"],
+                        &["0", "1001"],
+                        &["1", "1000"],
+                    ),
+                    (
+                        &["nestweaver", "context", "sym", "--token-budget"],
+                        &["0", "16001"],
+                        &["1", "16000"],
+                    ),
+                    (
+                        &["nestweaver", "brain", "context", "seed", "--token-budget"],
+                        &["0", "16001"],
+                        &["1", "16000"],
+                    ),
+                    (
+                        &["nestweaver", "brain", "search", "q", "--limit"],
+                        &["0"],
+                        &["1", "20"],
+                    ),
+                ];
+                for (prefix, bad, good) in cases {
+                    for v in *bad {
+                        let mut argv = prefix.to_vec();
+                        argv.push(v);
+                        assert!(
+                            Cli::try_parse_from(&argv).is_err(),
+                            "{argv:?} must be rejected"
+                        );
+                    }
+                    for v in *good {
+                        let mut argv = prefix.to_vec();
+                        argv.push(v);
+                        assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
+                    }
+                }
             })
             .expect("spawn")
             .join()

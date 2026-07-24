@@ -436,6 +436,15 @@ pub fn index_markdown_directory_since_with_ignore(
         notes_updated += 1;
     }
 
+    // Advance + persist the graph generation when any note was mutated.
+    // An in-place edit deletes and recreates the note's sections, leaving the
+    // candidate-node count unchanged — the generation bump is the only signal
+    // that stales the trigram posting table (mirrors `index.rs` and the full
+    // vault index above).
+    if notes_updated > 0 || notes_deleted > 0 {
+        store.bump_and_persist_generation();
+    }
+
     Ok(MarkdownSinceResult {
         vault_name: vault_name.to_string(),
         files_checked,
@@ -1359,6 +1368,16 @@ where
     if let Some(sha) = record_repo_sha {
         record_repo_indexed_sha(store, instance_id, vault_name, sha)?;
     }
+
+    // Advance + persist the graph generation for this vault mutation,
+    // mirroring the code path (`index.rs`). Without it the trigram posting
+    // table's staleness check is blind to an in-place vault edit: a section
+    // delete+recreate keeps the candidate-node count identical, so
+    // `regex_search` would trust stale postings and silently drop new/edited
+    // note content. `bump_and_persist_generation` persists to the
+    // `<db>.generation` sidecar for persistent stores and just bumps for
+    // in-memory ones.
+    store.bump_and_persist_generation();
 
     // ── Summary ───────────────────────────────────────────────────────────
     let elapsed = started.elapsed();
@@ -2660,6 +2679,96 @@ sub b body
         assert!(
             store.lookup_repo(&r_uid).unwrap().is_none(),
             "no Repo SHA recorded when the gate fails"
+        );
+    }
+
+    /// A full vault index must advance the graph generation, mirroring
+    /// the code path (`index.rs`). Without the bump the trigram posting
+    /// table's staleness check is blind to vault mutations.
+    #[test]
+    fn full_vault_index_advances_graph_generation() {
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha body\n")]);
+        let (_result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert!(
+            store.graph_generation() > 0,
+            "vault indexing must advance the graph generation"
+        );
+    }
+
+    /// An in-place vault edit (delete + recreate of the same sections)
+    /// keeps the candidate-node count identical, so the generation bump is the
+    /// ONLY signal that stales the trigram posting table. Re-indexing into the
+    /// same store after such an edit must advance the generation while the
+    /// node counts stay put.
+    #[test]
+    fn vault_reindex_after_in_place_edit_advances_generation_with_unchanged_counts() {
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha body\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]).unwrap();
+        let g1 = store.graph_generation();
+        let counts1 = (
+            store.count_notes().unwrap(),
+            store.count_sections().unwrap(),
+        );
+
+        // In-place edit: same heading structure, different body text — the
+        // section is deleted and recreated, so node counts are unchanged.
+        fs::write(root.join("a.md"), "# A\n\nbeta body rewritten\n").unwrap();
+        index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[]).unwrap();
+
+        assert_eq!(
+            (
+                store.count_notes().unwrap(),
+                store.count_sections().unwrap()
+            ),
+            counts1,
+            "an in-place edit must not change the candidate-node count"
+        );
+        assert!(
+            store.graph_generation() > g1,
+            "an in-place vault edit must still advance the graph generation"
+        );
+    }
+
+    /// The incremental (`--since`) refresh path must advance AND persist
+    /// the graph generation, so a later process (or the daemon) observes the
+    /// bump and distrusts the stale trigram postings.
+    #[test]
+    fn since_refresh_advances_and_persists_generation_on_in_place_edit() {
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha body\n")]);
+        let db_path = root.join("brain.lbug");
+
+        index_markdown_directory(&root, &db_path, "default", "v").unwrap();
+        let g1 = {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            store.graph_generation()
+        };
+        assert!(
+            g1 > 0,
+            "the full index must persist a non-zero generation to the sidecar"
+        );
+
+        // In-place edit; since=UNIX_EPOCH processes every file regardless of
+        // mtime granularity.
+        fs::write(root.join("a.md"), "# A\n\nbeta body rewritten\n").unwrap();
+        let res = index_markdown_directory_since(
+            &root,
+            &db_path,
+            "default",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(res.notes_updated, 1, "the edited note must be reindexed");
+
+        let g2 = {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            store.graph_generation()
+        };
+        assert!(
+            g2 > g1,
+            "the since refresh must advance and persist the graph generation ({g1} -> {g2})"
         );
     }
 

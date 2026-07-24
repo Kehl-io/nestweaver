@@ -249,91 +249,22 @@ impl CodeWatcher {
             )?;
 
             let start = Instant::now();
-            let mut files_processed = 0usize;
-            let mut batch_failures = Vec::new();
-
-            for path in &relevant {
-                let rel_path = match path.strip_prefix(&self.repo_root) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        tracing::debug!(
-                            path = %path.display(),
-                            "path outside repo root; skipping"
-                        );
-                        continue;
-                    }
-                };
-                let rel_str = rel_path.to_string_lossy();
-
-                if path.exists() {
-                    // File was created or modified: delete old data, re-parse, re-insert.
-                    let removed = match store.delete_symbols_in_file(&r_uid, &rel_str) {
-                        Ok(removed) => removed,
-                        Err(error) => {
-                            batch_failures
-                                .push(format!("delete stale symbols for {}: {error}", rel_str));
-                            0
-                        }
-                    };
-                    if removed > 0 {
-                        tracing::debug!(
-                            path = %rel_str,
-                            removed,
-                            "removed stale symbols before re-index"
-                        );
-                    }
-
-                    match reindex_file(&self.repo_root, rel_path, &r_uid, &store) {
-                        Ok(syms) => {
-                            tracing::debug!(
-                                path = %rel_str,
-                                symbols = syms,
-                                "re-indexed file"
-                            );
-                            files_processed += 1;
-                        }
-                        Err(e) => {
-                            batch_failures.push(format!("re-index {}: {e:#}", rel_str));
-                            tracing::warn!(
-                                path = %rel_str,
-                                error = %e,
-                                "failed to re-index file"
-                            );
-                        }
-                    }
-                } else {
-                    // File was deleted: remove its symbols and File node.
-                    let removed = match store.delete_symbols_in_file(&r_uid, &rel_str) {
-                        Ok(removed) => removed,
-                        Err(error) => {
-                            batch_failures.push(format!(
-                                "delete symbols for removed file {}: {error}",
-                                rel_str
-                            ));
-                            0
-                        }
-                    };
-                    let f_uid = nestweaver_schema::file_uid(&r_uid, &rel_str);
-                    if let Err(error) = store.delete_file_node(&f_uid) {
-                        batch_failures
-                            .push(format!("delete removed File node {}: {error}", rel_str));
-                    }
-                    if removed > 0 {
-                        tracing::debug!(
-                            path = %rel_str,
-                            removed,
-                            "deleted symbols for removed file"
-                        );
-                    }
-                    files_processed += 1;
-                }
-            }
+            // Per-file PRE-mutation failures are logged and skipped inside
+            // `reindex_paths`: a single unreadable file must not kill the
+            // watch session (the next edit batch retries), and because the
+            // reindex re-parses BEFORE deleting, a failed file keeps its
+            // previous graph data instead of vanishing from the graph while
+            // still on disk. A POST-mutation failure (delete landed, later
+            // insert failed) is different: the graph holds partial data, so
+            // the batch is reported as failed after publication finalizes —
+            // it must not look cleanly successful.
+            let (files_processed, batch_error) = self.reindex_paths(&store, &r_uid, &relevant);
 
             let finalization = self.finalize_graph_publication_with_io(
                 publication,
                 &crate::index::FileSystemIndexEpilogueIo,
             );
-            if finalization.is_ok() {
+            if finalization.is_ok() && batch_error.is_none() {
                 let duration = start.elapsed();
                 tracing::info!(
                     files_processed,
@@ -348,15 +279,162 @@ impl CodeWatcher {
                 }
             }
             if let Err(error) = finalization {
-                batch_failures.push(format!("mandatory graph publication: {error}"));
+                anyhow::bail!("code watcher batch failed mandatory graph publication: {error}");
             }
-            if !batch_failures.is_empty() {
+            if let Some(error) = batch_error {
                 anyhow::bail!(
-                    "code watcher batch failed after committed graph work: {}",
-                    batch_failures.join("; ")
+                    "code watcher batch partially failed mid-mutation (partial index data; \
+                     the next edit retries, or repair with `nestweaver index --force`): {error}"
                 );
             }
         }
+    }
+
+    /// Re-index one batch of changed paths against the live graph. Returns
+    /// the number of files processed plus the FIRST post-mutation failure,
+    /// if any — a post-mutation failure means the graph holds partial data
+    /// for that file and the batch must not be reported as cleanly
+    /// successful. Mirrors the engine's incremental index
+    /// (`index.rs::incremental_index_with_name_and_io`): nw-008 Phase 0
+    /// collects reverse-dependents from the live graph BEFORE any mutation,
+    /// and Phase 2 re-resolves them afterwards so the cross-file edges the
+    /// per-file `DETACH DELETE` destroys are restored — without this, a
+    /// watcher reindex leaves the file's symbols in place but strips ALL
+    /// their incoming and outgoing cross-file CALLS/IMPORTS edges.
+    fn reindex_paths(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        relevant: &[PathBuf],
+    ) -> (usize, Option<anyhow::Error>) {
+        // Partition into changed (still on disk) / removed (deleted), keeping
+        // the absolute path alongside for the mutation loop.
+        let mut changed: HashSet<String> = HashSet::new();
+        let mut removed: HashSet<String> = HashSet::new();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for path in relevant {
+            let rel_path = match path.strip_prefix(&self.repo_root) {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "path outside repo root; skipping"
+                    );
+                    continue;
+                }
+            };
+            let rel_str = rel_path.to_string_lossy().into_owned();
+            if path.exists() {
+                changed.insert(rel_str);
+            } else {
+                removed.insert(rel_str);
+            }
+            paths.push(path.clone());
+        }
+
+        // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph,
+        // BEFORE any mutation (the per-file `DETACH DELETE` destroys the
+        // edges this query walks).
+        let rdeps = crate::index::collect_reverse_dep_files(store, r_uid, &changed, &removed);
+
+        let mut files_processed = 0usize;
+        let mut first_post_mutation_error: Option<anyhow::Error> = None;
+        for path in &paths {
+            let rel_path = match path.strip_prefix(&self.repo_root) {
+                Ok(r) => r,
+                Err(_) => continue, // already logged above
+            };
+            let rel_str = rel_path.to_string_lossy();
+
+            if path.exists() {
+                // File was created or modified: re-parse, then replace.
+                match reindex_file(&self.repo_root, rel_path, r_uid, store) {
+                    Ok(Some(syms)) => {
+                        tracing::debug!(
+                            path = %rel_str,
+                            symbols = syms,
+                            "re-indexed file"
+                        );
+                        files_processed += 1;
+                    }
+                    Ok(None) => {
+                        // Parse failure — old graph data preserved
+                        // (reindex_file deletes only after a successful
+                        // read+parse). Do NOT re-resolve edges for this
+                        // file below: its edges were never deleted, and
+                        // edge insert is CREATE (duplicates).
+                        changed.remove(rel_str.as_ref());
+                    }
+                    Err(ReindexError::PreMutation(e)) => {
+                        // Same keep-old-data treatment for pre-mutation
+                        // read/store errors (delete never landed).
+                        changed.remove(rel_str.as_ref());
+                        tracing::warn!(
+                            path = %rel_str,
+                            error = %e,
+                            "failed to re-index file; keeping previous index data"
+                        );
+                    }
+                    Err(ReindexError::PostMutation(e)) => {
+                        // The delete already landed: the graph holds PARTIAL
+                        // data for this file, not the old data. Keep the file
+                        // in `changed` so Phase 2 re-resolves whatever edges
+                        // it can, and report the batch as failed instead of
+                        // publishing it as cleanly successful.
+                        if first_post_mutation_error.is_none() {
+                            first_post_mutation_error = Some(anyhow::anyhow!("{rel_str}: {e}"));
+                        }
+                        tracing::error!(
+                            path = %rel_str,
+                            error = %e,
+                            "re-index failed mid-mutation; graph holds partial data for this file"
+                        );
+                    }
+                }
+            } else {
+                // File was deleted: remove its symbols and File node.
+                let removed_count = match store.delete_symbols_in_file(r_uid, &rel_str) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        tracing::warn!("delete symbols for removed file {rel_str}: {error}");
+                        0
+                    }
+                };
+                let f_uid = nestweaver_schema::file_uid(r_uid, &rel_str);
+                if let Err(error) = store.delete_file_node(&f_uid) {
+                    tracing::warn!("delete removed File node {rel_str}: {error}");
+                }
+                if removed_count > 0 {
+                    tracing::debug!(
+                        path = %rel_str,
+                        removed = removed_count,
+                        "deleted symbols for removed file"
+                    );
+                }
+                files_processed += 1;
+            }
+        }
+
+        // nw-008 Phase 2 — re-resolve reverse-dependents and surgically
+        // restore the cross-file edges the per-file `DETACH DELETE` removed.
+        let reader = crate::content_reader::FilesystemReader::new(&self.repo_root);
+        match crate::index::reresolve_affected_dependents_on_store(
+            &reader, store, r_uid, &changed, &rdeps,
+        ) {
+            Ok(reresolved) if reresolved > 0 => {
+                tracing::info!(
+                    edges = reresolved,
+                    rdeps = rdeps.len(),
+                    "restored cross-file edges via transitive re-resolution"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("transitive re-resolution failed: {e:#}");
+            }
+        }
+
+        (files_processed, first_post_mutation_error)
     }
 }
 
@@ -418,14 +496,22 @@ fn is_supported_source(path: &Path) -> bool {
 }
 
 /// Parse a single source file and insert its File node, Symbol nodes, and
-/// edges. Returns the number of symbols inserted. Mirrors the logic in
+/// edges. Returns `Ok(Some(n))` when the file was re-indexed (n symbols
+/// inserted), or `Ok(None)` when the reindex was SKIPPED and the file's
+/// previous graph data was kept. Mirrors the logic in
 /// `index.rs::process_added_or_modified_file`.
+///
+/// The file is read and parsed BEFORE any graph mutation: on a read or
+/// parse failure the file's previous symbols stay in the graph. The old
+/// code deleted the file's symbols first, so a transient read error (or a
+/// mid-save partial write) left the file's symbols deleted from the graph
+/// while the file was still on disk.
 fn reindex_file(
     repo_root: &Path,
     rel_path: &Path,
     r_uid: &str,
     store: &GraphStore,
-) -> Result<usize, anyhow::Error> {
+) -> Result<Option<usize>, ReindexError> {
     use nestweaver_parser::{RawReference, RawSymbol, parse_source};
     use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
@@ -433,16 +519,31 @@ fn reindex_file(
     let abs_path = repo_root.join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
 
-    let source = std::fs::read_to_string(&abs_path)
-        .with_context(|| format!("read {}", abs_path.display()))?;
+    let source = std::fs::read_to_string(&abs_path).map_err(|e| {
+        ReindexError::PreMutation(anyhow::anyhow!("read {}: {e}", abs_path.display()))
+    })?;
 
     let parsed = match parse_source(&abs_path, &source) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(path = %abs_path.display(), "parse error: {e}; skipping");
-            return Ok(0);
+            tracing::warn!(path = %abs_path.display(), "parse error: {e}; keeping previous index data");
+            return Ok(None);
         }
     };
+
+    // Only now that the fresh parse is in hand: drop the stale symbols.
+    // From this point on the file's graph data is being MUTATED — a failure
+    // here is not "kept previous data".
+    let removed = store.delete_symbols_in_file(r_uid, &rel_str).map_err(|e| {
+        ReindexError::PostMutation(anyhow::anyhow!("delete_symbols_in_file {rel_str}: {e}"))
+    })?;
+    if removed > 0 {
+        tracing::debug!(
+            path = %rel_str,
+            removed,
+            "removed stale symbols before re-index"
+        );
+    }
 
     let content_hash = crate::hash::blake3_hex(&source);
     let f_uid = file_uid(r_uid, &rel_str);
@@ -456,10 +557,10 @@ fn reindex_file(
     };
     store
         .insert_file(&file)
-        .with_context(|| format!("insert_file {}", rel_str))?;
-    store
-        .insert_repo_file_edge(r_uid, &f_uid)
-        .with_context(|| format!("insert_repo_file_edge {}", rel_str))?;
+        .map_err(|e| ReindexError::PostMutation(anyhow::anyhow!("insert_file {rel_str}: {e}")))?;
+    store.insert_repo_file_edge(r_uid, &f_uid).map_err(|e| {
+        ReindexError::PostMutation(anyhow::anyhow!("insert_repo_file_edge {rel_str}: {e}"))
+    })?;
 
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut file_sym_pairs: Vec<(String, String)> = Vec::new();
@@ -530,9 +631,9 @@ fn reindex_file(
 
     let sym_count = symbols.len();
 
-    store
-        .batch_insert_symbols(&symbols)
-        .with_context(|| format!("batch_insert_symbols {}", rel_str))?;
+    store.batch_insert_symbols(&symbols).map_err(|e| {
+        ReindexError::PostMutation(anyhow::anyhow!("batch_insert_symbols {rel_str}: {e}"))
+    })?;
 
     let file_sym_refs: Vec<(&str, &str)> = file_sym_pairs
         .iter()
@@ -540,7 +641,11 @@ fn reindex_file(
         .collect();
     store
         .batch_insert_file_symbol_edges(&file_sym_refs)
-        .with_context(|| format!("batch_insert_file_symbol_edges {}", rel_str))?;
+        .map_err(|e| {
+            ReindexError::PostMutation(anyhow::anyhow!(
+                "batch_insert_file_symbol_edges {rel_str}: {e}"
+            ))
+        })?;
 
     // Resolve cross-file edges within this file.
     let lang = detect_language(&abs_path).unwrap_or(nestweaver_schema::Language::JavaScript);
@@ -571,12 +676,32 @@ fn reindex_file(
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
         .collect();
     if !insertable_edges.is_empty() {
-        store
-            .batch_insert_edges(&insertable_edges)
-            .with_context(|| format!("batch_insert_edges {}", rel_str))?;
+        store.batch_insert_edges(&insertable_edges).map_err(|e| {
+            ReindexError::PostMutation(anyhow::anyhow!("batch_insert_edges {rel_str}: {e}"))
+        })?;
     }
 
-    Ok(sym_count)
+    Ok(Some(sym_count))
+}
+
+/// Why a watcher re-index of one file failed, split by whether the file's
+/// graph data had already been mutated. Callers must NOT treat a
+/// `PostMutation` failure as "previous data preserved": the
+/// delete already landed, so the graph holds partial data for the file and
+/// the batch must not publish as cleanly successful.
+enum ReindexError {
+    /// Failed before any mutation (read/parse/delete) — old graph data intact.
+    PreMutation(anyhow::Error),
+    /// Failed after the file's symbols were deleted — partial data.
+    PostMutation(anyhow::Error),
+}
+
+impl std::fmt::Display for ReindexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreMutation(e) | Self::PostMutation(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +803,208 @@ mod tests {
         assert!(path_in_skip_dir(p));
         let p = Path::new("/repo/src/main.rs");
         assert!(!path_in_skip_dir(p));
+    }
+
+    /// Index a small JS fixture repo (a.js ← b.js ← c.js) into an in-memory
+    /// store under its `file://` identity, returning the store, repo uid,
+    /// and canonical repo root.
+    fn index_fixture_repo(dir: &tempfile::TempDir) -> (GraphStore, String, PathBuf) {
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::write(
+            repo_root.join("src/a.js"),
+            "export function helper() { return 7; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_root.join("src/b.js"),
+            "import { helper } from './a.js';\nexport function alpha() { return helper() + 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_root.join("src/c.js"),
+            "import { alpha } from './b.js';\nexport function gamma() { return alpha() * 2; }\n",
+        )
+        .unwrap();
+
+        let canonical_root = std::fs::canonicalize(&repo_root).unwrap();
+        let file_url = format!("file://{}", canonical_root.display());
+        let r_uid = nestweaver_schema::repo_uid("test", &file_url);
+        let (_result, store) =
+            crate::index::index_directory_in_memory(&repo_root, "test", &file_url, "sha1").unwrap();
+        (store, r_uid, canonical_root)
+    }
+
+    fn uid_of(store: &GraphStore, r_uid: &str, name: &str) -> String {
+        store
+            .lookup_symbols_by_repo(r_uid)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("symbol {name} should be indexed"))
+            .uid
+    }
+
+    /// Regression (CRITICAL — edge loss across watch reindex): a watcher
+    /// reindex of a modified file must restore the SAME cross-file edges a
+    /// manual incremental index produces — both the file's outgoing edges
+    /// and the incoming edges from its dependents. Before this fix the
+    /// watcher ran single-file resolution only, so every cross-file
+    /// CALLS/IMPORTS edge incident to the re-indexed file was destroyed by
+    /// the per-file `DETACH DELETE` and never rebuilt (symbols present,
+    /// all edges gone; only `--force` repaired).
+    #[test]
+    fn watch_reindex_preserves_cross_file_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, canonical_root) = index_fixture_repo(&dir);
+
+        // Sanity: the full index produced both cross-file CALLS edges.
+        let alpha_uid = uid_of(&store, &r_uid, "alpha");
+        assert!(
+            store
+                .callees_of(&alpha_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "helper"),
+            "fixture must start with alpha→helper"
+        );
+        assert!(
+            store
+                .callers_of(&alpha_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "gamma"),
+            "fixture must start with gamma→alpha"
+        );
+
+        // Modify b.js on disk and run one watcher batch over it.
+        std::fs::write(
+            canonical_root.join("src/b.js"),
+            "import { helper } from './a.js';\nexport function alpha() { return helper() + 2; }\n",
+        )
+        .unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
+        let (processed, batch_error) =
+            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        assert!(batch_error.is_none(), "{batch_error:?}");
+        assert_eq!(processed, 1);
+
+        // THE critical assertions: outgoing (alpha→helper) and incoming
+        // (gamma→alpha) cross-file edges survive a watcher reindex —
+        // exactly once each (edge insert is CREATE, not MERGE).
+        let alpha_uid = uid_of(&store, &r_uid, "alpha");
+        let callees = store.callees_of(&alpha_uid).unwrap();
+        assert_eq!(
+            callees.iter().filter(|s| s.name == "helper").count(),
+            1,
+            "outgoing cross-file edge alpha→helper must be restored exactly once, got {callees:?}"
+        );
+        let callers = store.callers_of(&alpha_uid).unwrap();
+        assert_eq!(
+            callers.iter().filter(|s| s.name == "gamma").count(),
+            1,
+            "incoming cross-file edge gamma→alpha must be restored exactly once, got {callers:?}"
+        );
+    }
+
+    /// Regression (symbol deletion on failed reindex): when a watched file
+    /// becomes unreadable, its previous symbols must STAY in the graph and
+    /// the watch batch must survive. The old code deleted the file's
+    /// symbols BEFORE reading it, so a transient read error left the
+    /// file's symbols deleted while the file was still on disk — and the
+    /// batch failure then killed the whole watcher, so subsequent edits
+    /// were never indexed.
+    #[test]
+    fn watch_reindex_keeps_previous_symbols_when_file_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, canonical_root) = index_fixture_repo(&dir);
+
+        // Corrupt b.js with invalid UTF-8 so `read_to_string` fails.
+        std::fs::write(
+            canonical_root.join("src/b.js"),
+            b"export function alpha() { return \xff\xfe; }\n",
+        )
+        .unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
+        let (processed, batch_error) =
+            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        assert!(batch_error.is_none(), "{batch_error:?}");
+
+        assert_eq!(
+            processed, 0,
+            "an unreadable file is skipped, not half-processed"
+        );
+        assert!(
+            store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "alpha"),
+            "alpha must stay indexed when its file cannot be re-read"
+        );
+        // The incoming edge from the untouched dependent survives too.
+        let alpha_uid = uid_of(&store, &r_uid, "alpha");
+        assert!(
+            store
+                .callers_of(&alpha_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "gamma"),
+            "gamma→alpha edge must survive a failed reindex of b.js"
+        );
+
+        // And the watcher keeps working: a later valid save re-indexes.
+        std::fs::write(
+            canonical_root.join("src/b.js"),
+            "import { helper } from './a.js';\nexport function alpha() { return helper() + 3; }\n",
+        )
+        .unwrap();
+        let (processed, batch_error) =
+            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        assert!(batch_error.is_none(), "{batch_error:?}");
+        assert_eq!(processed, 1, "the batch after a failure must re-index");
+        let alpha_uid = uid_of(&store, &r_uid, "alpha");
+        assert!(
+            store
+                .callees_of(&alpha_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "helper"),
+            "edges are rebuilt once the file is readable again"
+        );
+    }
+
+    /// Deleting a watched file removes its symbols (and, via DETACH
+    /// DELETE, the edges incident to them) — the remove path of
+    /// `reindex_paths`.
+    #[test]
+    fn watch_reindex_removes_symbols_for_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, canonical_root) = index_fixture_repo(&dir);
+
+        std::fs::remove_file(canonical_root.join("src/b.js")).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
+        let (processed, batch_error) =
+            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        assert!(batch_error.is_none(), "{batch_error:?}");
+
+        assert_eq!(processed, 1);
+        assert!(
+            !store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "alpha"),
+            "alpha must be removed when b.js is deleted"
+        );
+        // The untouched files are unaffected.
+        assert!(
+            store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "helper" || s.name == "gamma"),
+        );
     }
 
     #[test]

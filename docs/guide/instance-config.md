@@ -447,7 +447,13 @@ servers and CLI commands read concurrently via read-only connections.
 1. The daemon auto-starts when any CLI write command or MCP server needs it.
    It holds the write lock for its lifetime and exits after 1 hour of idle.
 2. The file-watcher (`nestweaver brain watch`) runs inside the daemon process,
-   sharing the daemon's write connection for incremental updates.
+   sharing the daemon's write connection for incremental updates. Watching does
+   not require an instance config — without one, the daemon falls back to a
+   built-in denylist of unsafe roots. `nestweaver watch --force` replaces an
+   already-running watcher (e.g. one orphaned by a killed `watch` CLI) instead
+   of failing; a direct (non-daemon) watcher is only used when no daemon is
+   running, and if it can't take the DB write lock the error tells you to stop
+   the daemon first.
 3. MCP servers open the database read-only and route write operations
    (like `brain_add_source`) through the daemon's gRPC service.
 4. CLI read commands open the database read-only. CLI write commands

@@ -146,3 +146,20 @@ to the logical name.
 
 Once a database is consolidated and you always start the daemon with `--config`,
 it stays single-convention and you won't need this runbook again.
+
+## Wedged migration journal
+
+The daemon records instance migrations in a journal so an interrupted run can
+be reconciled on the next boot. If the daemon refuses to boot because of a
+wedged journal, clear it while the daemon is stopped:
+
+```sh
+nestweaver instance abort-migration --db ./brain.lbug
+```
+
+A `Prepared` journal (no graph mutation happened) is removed cleanly. A
+`graph-applied` journal is refused unless `--force`, because the graph was
+already mutated — restarting the daemon is preferred (boot self-heals a
+re-runnable merge). `--force` discards the journal anyway, including an
+unreadable/corrupt one whose phase is unknown; after a forced discard,
+reconcile manually (re-run `instance merge` / re-index as needed).

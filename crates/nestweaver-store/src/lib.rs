@@ -31,16 +31,18 @@ pub use regex::{
 };
 pub use search::{EmbeddingIndex, SearchResult};
 pub use tantivy_index::{
-    PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K, SearchHit,
-    TantivyError, TantivyIndex,
+    PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K,
+    SEARCH_PRESENTATION_LIMIT_MAX, SearchHit, SearchLogicalIdentity, TantivyError, TantivyIndex,
 };
-pub use traverse::{ImpactEdge, ImpactNode, ImpactResult};
+pub use traverse::{
+    DEFAULT_IMPACT_THRESHOLD, IMPACT_EDGE_TYPES, ImpactEdge, ImpactNode, ImpactResult,
+};
 pub use write::{
-    DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteVaultCascadeOutcome,
-    DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery, InstanceUidHandoff,
-    InstanceUidHandoffIdentity, InstanceUidMigrationPlan, InstanceUidRemap,
-    InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult, ProjectMutationDisposition,
-    PurgeInstanceResult,
+    DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteRepoCascadeOutcome,
+    DeleteVaultCascadeOutcome, DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery,
+    InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan, InstanceUidRemap,
+    InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult, MutationDisposition,
+    MutationFailure, MutationOutcome, ProjectMutationDisposition, PurgeInstanceResult,
 };
 
 #[cfg(test)]
@@ -2304,6 +2306,72 @@ mod tests {
     }
 
     #[test]
+    fn merge_instance_ids_conserves_notes_across_multiple_vaults() {
+        // nw-091 / Bug 4: reparent_vault is atomic per vault, so a multi-vault
+        // merge (and any interruption between vaults) must never lose a note —
+        // every note stays reachable under exactly one instance. Guards the
+        // multi-vault loop conservation invariant.
+        use nestweaver_schema::uid::vault_uid;
+        use nestweaver_schema::{Note, NoteKind, Vault};
+        let store = test_store();
+
+        let mut total_notes = 0usize;
+        for (v, root) in [("vlt:src:a", "/vault/a"), ("vlt:src:b", "/vault/b")] {
+            store
+                .insert_vault(&Vault {
+                    uid: v.to_string(),
+                    name: format!("vault-{v}"),
+                    root_path: root.to_string(),
+                    instance_id: "src".to_string(),
+                })
+                .unwrap();
+            let notes: Vec<Note> = (0..3)
+                .map(|n| Note {
+                    uid: format!("note:{v}:{n}"),
+                    vault_uid: v.to_string(),
+                    file_path: format!("n{n}.md"),
+                    title: format!("Note {n}"),
+                    note_kind: NoteKind::General,
+                    word_count: n,
+                    content_hash: format!("h{v}{n}"),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .collect();
+            total_notes += notes.len();
+            store.batch_insert_notes(&notes).unwrap();
+            let edges: Vec<(&str, &str)> =
+                notes.iter().map(|note| (v, note.uid.as_str())).collect();
+            store.batch_insert_vault_note_edges(&edges).unwrap();
+        }
+
+        let result = store.merge_instance_ids("src", "tgt").unwrap();
+        assert_eq!(result.vaults, 2);
+        assert!(result.discarded.is_empty(), "no vault discarded");
+
+        // Every note is conserved under the target instance; none lost, none left
+        // under the source.
+        let tgt_a = store
+            .list_notes(Some(&vault_uid("tgt", "/vault/a")))
+            .unwrap();
+        let tgt_b = store
+            .list_notes(Some(&vault_uid("tgt", "/vault/b")))
+            .unwrap();
+        assert_eq!(
+            tgt_a.len() + tgt_b.len(),
+            total_notes,
+            "all notes conserved across the multi-vault merge"
+        );
+        assert!(
+            store.list_vaults(Some("src")).unwrap().is_empty(),
+            "no source vault rows remain after merge"
+        );
+    }
+
+    #[test]
     fn merge_instance_ids_rejects_self_merge_without_mutation() {
         use nestweaver_schema::{Note, NoteKind, Vault};
         let store = test_store();
@@ -2435,7 +2503,7 @@ mod tests {
     /// the Repo node under the target instance.
     #[test]
     fn merge_instance_ids_reports_repos_needing_reindex() {
-        use nestweaver_schema::uid::repo_uid;
+        use nestweaver_schema::uid::{repo_uid, symbol_uid};
         let store = test_store();
 
         // A repo under instance "old" with one symbol child.
@@ -2446,10 +2514,12 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "old".to_string(),
             name: Some("svc".to_string()),
-            root_path: Some("/home/kory/dev/svc".to_string()),
+            root_path: Some("/srv/example/svc".to_string()),
         };
         store.insert_repo(&repo).unwrap();
-        let symbol = make_symbol("sym:old:1", "handler", &repo.uid, "src/lib.rs");
+        // The merge plan verifier only accepts production-shaped UIDs.
+        let symbol_uid = symbol_uid(&repo.uid, "src/lib.rs", "handler", 10);
+        let symbol = make_symbol(&symbol_uid, "handler", &repo.uid, "src/lib.rs");
         store.insert_symbol(&symbol).unwrap();
 
         let report = store.merge_instance_ids("old", "new").unwrap();
@@ -2461,7 +2531,7 @@ mod tests {
         assert!(report.repos_need_reindex());
 
         assert_eq!(report.repo_uids_removed, vec![repo.uid.clone()]);
-        assert!(store.lookup_symbol("sym:old:1").is_err());
+        assert!(store.lookup_symbol(&symbol_uid).is_err());
         assert!(store.lookup_repo(&repo.uid).unwrap().is_none());
         let target_uid = repo_uid("new", "https://github.com/example/svc");
         assert_eq!(
@@ -2472,7 +2542,7 @@ mod tests {
 
     #[test]
     fn merge_instance_ids_repo_collision_preserves_target() {
-        use nestweaver_schema::uid::repo_uid;
+        use nestweaver_schema::uid::{repo_uid, symbol_uid};
         let store = test_store();
         let url = "https://github.com/example/collision";
         let source = Repo {
@@ -2495,9 +2565,11 @@ mod tests {
         };
         store.insert_repo(&source).unwrap();
         store.insert_repo(&target).unwrap();
+        // The merge plan verifier only accepts production-shaped UIDs.
+        let symbol_uid = symbol_uid(&source.uid, "src/lib.rs", "handler", 10);
         store
             .insert_symbol(&make_symbol(
-                "sym:old:collision",
+                &symbol_uid,
                 "handler",
                 &source.uid,
                 "src/lib.rs",
@@ -2507,7 +2579,7 @@ mod tests {
         let report = store.merge_instance_ids("old", "new").unwrap();
         assert_eq!(report.repos, 1);
         assert_eq!(report.repo_uids_removed, vec![source.uid.clone()]);
-        assert!(store.lookup_symbol("sym:old:collision").is_err());
+        assert!(store.lookup_symbol(&symbol_uid).is_err());
         let surviving = store.lookup_repo(&target.uid).unwrap().unwrap();
         assert_eq!(surviving.indexed_sha, "target-sha");
         assert_eq!(store.list_repos(Some("new")).unwrap().len(), 1);

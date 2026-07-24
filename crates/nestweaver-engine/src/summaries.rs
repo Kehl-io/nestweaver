@@ -92,7 +92,13 @@ pub struct SummaryStore {
 /// Generate summaries at the given level from the graph store.
 pub fn generate_summaries(store: &GraphStore, level: SummaryLevel) -> Result<Vec<Summary>> {
     match level {
-        SummaryLevel::Symbol => generate_symbol_summaries(store),
+        // Untargeted symbol-level generation is bounded so it can't hang on a
+        // large graph; callers wanting a specific symbol should use
+        // `generate_symbol_summaries_bounded` with a target for the fast path.
+        SummaryLevel::Symbol => {
+            generate_symbol_summaries_bounded(store, None, DEFAULT_SYMBOL_SUMMARY_CAP)
+                .map(|r| r.summaries)
+        }
         SummaryLevel::File => generate_file_summaries(store),
         SummaryLevel::Cluster => generate_cluster_summaries(store),
         SummaryLevel::Hub => generate_hub_summaries(store),
@@ -144,13 +150,70 @@ fn generate_hub_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     Ok(summaries)
 }
 
-/// Symbol-level: one-line summary per function/class.
+/// Default cap on how many symbols an *untargeted* symbol-level summary will
+/// process. Each symbol costs ~4 graph queries (callers + 3 callee edge types),
+/// so an unbounded scan over a large graph hangs for tens of seconds (~11s even
+/// at 1000). This path is the one the tool description steers away from ("use
+/// target"), so keep the ceiling low enough to stay responsive and rely on the
+/// `partial`/note signal to point callers at a `target`. A targeted call bypasses
+/// the cap entirely since it only touches matches.
+pub const DEFAULT_SYMBOL_SUMMARY_CAP: usize = 500;
+
+/// Result of a bounded / target-filtered symbol-summary generation.
+pub struct SymbolSummaries {
+    pub summaries: Vec<Summary>,
+    /// Symbols that matched the `target` filter (or the whole store when no
+    /// target) BEFORE the cap — so callers can report honest truncation.
+    pub matched_total: usize,
+    /// True when the untargeted cap dropped some matches (`matched_total` >
+    /// `summaries.len()`).
+    pub capped: bool,
+}
+
+/// Symbol-level summaries with the `target` filter pushed DOWN before the
+/// expensive per-symbol caller/callee queries, and a hard cap so an untargeted
+/// call over a large graph can't hang.
 ///
-/// Format: `{kind} {name}({params}) -> {return} | callers: [list] | callees: [list] | file: {path}:{line}`
-fn generate_symbol_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
-    let symbols = store
+/// - `target = Some(t)`: only symbols whose name or uid contains `t`
+///   (case-insensitive) are summarized. The cap does not apply — a targeted
+///   query is inherently small — so `capped` is always false.
+/// - `target = None`: at most `cap` symbols (deterministic by uid) are
+///   summarized; `capped` is set when more exist. This is the pathological case
+///   the tool description already steers away from ("use target to filter").
+pub fn generate_symbol_summaries_bounded(
+    store: &GraphStore,
+    target: Option<&str>,
+    cap: usize,
+) -> Result<SymbolSummaries> {
+    let mut symbols = store
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("list_all_symbols: {e}"))?;
+
+    // Push the target filter down: match name/file-path substring or exact UID
+    // BEFORE any of the per-symbol caller/callee queries, mirroring
+    // `filter_by_target` so the two stay consistent (UIDs embed hex hashes, so
+    // a UID *substring* match would retain virtually every symbol). This turns
+    // the common single-symbol lookup into O(matches) graph queries instead of
+    // O(all symbols).
+    if let Some(t) = target {
+        let needle = t.to_lowercase();
+        symbols.retain(|s| {
+            s.name.to_lowercase().contains(&needle)
+                || s.file_path.to_lowercase().contains(&needle)
+                || s.uid.eq_ignore_ascii_case(t)
+        });
+    }
+
+    let matched_total = symbols.len();
+
+    // Untargeted: bound the work. Sort by uid so the retained subset is
+    // deterministic across runs, then cap.
+    let mut capped = false;
+    if target.is_none() && symbols.len() > cap {
+        symbols.sort_by(|a, b| a.uid.cmp(&b.uid));
+        symbols.truncate(cap);
+        capped = true;
+    }
 
     let mut summaries = Vec::with_capacity(symbols.len());
 
@@ -186,7 +249,11 @@ fn generate_symbol_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     // Sort by content string for deterministic output.
     summaries.sort_by(|a, b| a.content.cmp(&b.content));
 
-    Ok(summaries)
+    Ok(SymbolSummaries {
+        summaries,
+        matched_total,
+        capped,
+    })
 }
 
 /// File-level: exports and import sources per file.
@@ -274,7 +341,7 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     Ok(summaries)
 }
 
-/// Maximum number of clusters to summarize. On large graphs, Leiden can
+/// Maximum number of clusters to summarize. On large graphs, local moving can
 /// produce thousands of tiny communities; summarizing all of them yields
 /// noise rather than signal. We keep only the top-N largest clusters.
 const MAX_CLUSTER_SUMMARIES: usize = 50;
@@ -288,8 +355,8 @@ const FALLBACK_CLUSTER_RESOLUTION: f64 = 0.5;
 ///
 /// Format: `Cluster {id} ({name}, {n} symbols): key types: [{top symbols}] | files: [{file list}] | depends on: [other clusters]`
 ///
-/// At scale (tens of thousands of symbols), Leiden with resolution=1.0 can
-/// produce thousands of singleton or near-singleton communities that are not
+/// At scale (tens of thousands of symbols), local moving with resolution=1.0
+/// can produce thousands of singleton or near-singleton communities that are not
 /// useful for summarization. This function:
 /// 1. Filters out singleton clusters (1 member).
 /// 2. If the default resolution produces no non-singleton clusters, retries
@@ -483,14 +550,23 @@ pub fn truncate_to_budget(summaries: &[Summary], token_budget: usize) -> Vec<&Su
     result
 }
 
-/// Filter summaries by target name or UID.
+/// Filter summaries by target name or file path (substring, case-insensitive),
+/// or by exact UID.
+///
+/// The UID is matched exactly, never as a substring: symbol UIDs embed hex
+/// hashes (`sym:repo:default:c8f000561246:6a4df1030d93:…`), so a one-character
+/// target like `b` substring-matches virtually every UID in the graph and the
+/// filter returns everything.
 pub fn filter_by_target<'a>(summaries: &'a [Summary], target: &str) -> Vec<&'a Summary> {
     let needle = target.to_lowercase();
     summaries
         .iter()
         .filter(|s| {
-            s.target_uid.to_lowercase().contains(&needle)
-                || s.target_name.to_lowercase().contains(&needle)
+            s.target_name.to_lowercase().contains(&needle)
+                || s.file_path
+                    .as_deref()
+                    .is_some_and(|fp| fp.to_lowercase().contains(&needle))
+                || s.target_uid.eq_ignore_ascii_case(target)
         })
         .collect()
 }
@@ -604,6 +680,51 @@ mod tests {
     }
 
     #[test]
+    fn filter_by_target_does_not_substring_match_uid_hash() {
+        // Regression: symbol UIDs embed hex hashes, so a 1-char target like
+        // "b" used to substring-match every UID and return the whole graph.
+        let summaries = vec![
+            Summary {
+                level: SummaryLevel::Symbol,
+                target_uid: "sym:repo:default:c8f000561246:6a4df1030d93:895572949b24:121"
+                    .to_string(),
+                target_name: "compute_score".to_string(),
+                content: "score stuff".to_string(),
+                token_estimate: 3,
+                file_path: Some("src/score.rs".to_string()),
+            },
+            Summary {
+                level: SummaryLevel::Symbol,
+                target_uid: "sym:repo:default:c8f000561246:17b788a70eec:17b788a70eec:126"
+                    .to_string(),
+                target_name: "render".to_string(),
+                content: "render stuff".to_string(),
+                token_estimate: 3,
+                file_path: Some("src/render.rs".to_string()),
+            },
+        ];
+
+        // "b" appears in both UID hashes but in neither name nor file path.
+        assert!(
+            filter_by_target(&summaries, "b").is_empty(),
+            "a hex-digit target must not match UID substrings"
+        );
+
+        // Name substring, file-path substring, and exact UID still match.
+        assert_eq!(filter_by_target(&summaries, "render").len(), 1);
+        assert_eq!(filter_by_target(&summaries, "score.rs").len(), 1);
+        assert_eq!(
+            filter_by_target(
+                &summaries,
+                "sym:repo:default:c8f000561246:6a4df1030d93:895572949b24:121"
+            )
+            .len(),
+            1,
+            "an exact UID must still target its summary"
+        );
+    }
+
+    #[test]
     fn render_text_joins_lines() {
         let summaries = vec![
             Summary {
@@ -653,12 +774,106 @@ mod tests {
         };
         store.insert_symbol(&sym).unwrap();
 
-        let summaries = generate_symbol_summaries(&store).unwrap();
+        let out =
+            generate_symbol_summaries_bounded(&store, None, DEFAULT_SYMBOL_SUMMARY_CAP).unwrap();
+        let summaries = out.summaries;
         assert_eq!(summaries.len(), 1);
+        assert!(!out.capped);
+        assert_eq!(out.matched_total, 1);
         assert!(summaries[0].content.contains("greet"));
         assert!(summaries[0].content.contains("src/main.js:10"));
         assert_eq!(summaries[0].level, SummaryLevel::Symbol);
         assert!(summaries[0].token_estimate > 0);
+    }
+
+    #[test]
+    fn symbol_summaries_target_pushdown_and_cap() {
+        // nw-079: a target filter returns only matching symbols (fast path), and
+        // an untargeted call over more than `cap` symbols is bounded + flagged.
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..5 {
+            let sym = nestweaver_schema::Symbol {
+                uid: format!("sym:test:abc:{i}"),
+                name: if i == 0 {
+                    "analyzeBlastRadius".to_string()
+                } else {
+                    format!("helper{i}")
+                },
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:test".to_string(),
+                file_path: "src/main.js".to_string(),
+                start_line: 10 + i as u32,
+                end_line: 10 + i as u32,
+                signature: format!("function s{i}()"),
+                summary: None,
+                content_hash: format!("h{i}"),
+                embedding: None,
+                pagerank_score: Some(0.5),
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            };
+            store.insert_symbol(&sym).unwrap();
+        }
+
+        // Targeted: only the one matching symbol, cap irrelevant, not capped.
+        let hit = generate_symbol_summaries_bounded(&store, Some("blastradius"), 1).unwrap();
+        assert_eq!(hit.summaries.len(), 1);
+        assert_eq!(hit.matched_total, 1);
+        assert!(!hit.capped);
+        assert_eq!(hit.summaries[0].target_name, "analyzeBlastRadius");
+
+        // Untargeted with cap=2 over 5 symbols: bounded to 2 and flagged capped.
+        let all = generate_symbol_summaries_bounded(&store, None, 2).unwrap();
+        assert_eq!(all.summaries.len(), 2);
+        assert_eq!(all.matched_total, 5);
+        assert!(all.capped);
+    }
+
+    #[test]
+    fn symbol_summaries_pushdown_does_not_substring_match_uid() {
+        // Same regression as filter_by_target: "abc" appears in every test UID
+        // (`sym:test:abc:{i}`) but in no name/file path — a UID substring match
+        // would retain every symbol and defeat the pushdown.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: "sym:test:abc:1".to_string(),
+                name: "foo".to_string(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:test".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn foo()".to_string(),
+                summary: None,
+                content_hash: "a".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+
+        let miss = generate_symbol_summaries_bounded(&store, Some("abc"), 10).unwrap();
+        assert_eq!(
+            miss.matched_total, 0,
+            "a UID-hash substring must not match; matched: {}",
+            miss.matched_total
+        );
+
+        // Exact UID, name substring, and file-path substring all still match.
+        let by_uid = generate_symbol_summaries_bounded(&store, Some("sym:test:abc:1"), 10).unwrap();
+        assert_eq!(by_uid.matched_total, 1, "exact UID must match");
+        let by_path = generate_symbol_summaries_bounded(&store, Some("lib.rs"), 10).unwrap();
+        assert_eq!(by_path.matched_total, 1, "file-path substring must match");
     }
 
     #[test]

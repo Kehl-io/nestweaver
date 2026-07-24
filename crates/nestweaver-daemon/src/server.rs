@@ -111,6 +111,16 @@ enum SearchIndexReconciliation {
     Unavailable(String),
 }
 
+/// A registered daemon-side file watcher and its shutdown handle.
+///
+/// The `id` lets the watcher thread clear only ITS OWN registration on exit:
+/// without it, a force-replaced watcher's exit would wipe the
+/// replacement's registration and re-orphan the slot.
+pub struct WatcherRegistration {
+    id: u64,
+    handle: nestweaver_engine::ShutdownHandle,
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
@@ -132,7 +142,9 @@ pub struct DaemonState {
     pub active_writes: Arc<AtomicU32>,
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
-    pub watcher_stop: std::sync::Mutex<Option<nestweaver_engine::ShutdownHandle>>,
+    pub watcher_stop: std::sync::Mutex<Option<WatcherRegistration>>,
+    /// Monotonic id source for [`WatcherRegistration`]s.
+    pub next_watcher_id: std::sync::atomic::AtomicU64,
     /// Parsed `nestweaver-instance.toml` if `--config` was supplied at
     /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
     /// `brain_search`) via the `set_current_instance_config` thread-local.
@@ -175,6 +187,12 @@ pub struct DaemonState {
     /// Handle to the server-mode worker-pool task. Awaited on shutdown so an
     /// in-flight index write is allowed to finish rather than being abandoned.
     pub worker_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Handle to the `serve_ui` web-server task plus the port it is bound
+    /// to, aborted by `stop_ui` so the listen port is released when the CLI
+    /// exits (LOW: ui port leak). The port is tracked so a repeated
+    /// `serve_ui` can report the ACTUAL running port instead of echoing the
+    /// requested one (which would send the CLI to a dead URL).
+    pub ui_server: std::sync::Mutex<Option<(u16, tokio::task::JoinHandle<()>)>>,
 }
 
 impl DaemonState {
@@ -252,9 +270,77 @@ fn resolve_effective_instance_id(requested: &str, configured: &str) -> Result<St
     Ok(effective.to_string())
 }
 
+/// Stop and unregister any active file watcher. Idempotent.
+///
+/// Called on EVERY shutdown path (gRPC Shutdown, SIGTERM, post-serve
+/// cleanup) so a watcher orphaned by a kill -9'd `watch` CLI can't pin
+/// daemon shutdown — the watcher runs on a `spawn_blocking` thread that
+/// Tokio's runtime drop waits for, so an unstopped watcher hangs the
+/// process until the client's SIGKILL.
+fn stop_active_watcher(state: &DaemonState) {
+    if let Ok(mut guard) = state.watcher_stop.lock()
+        && let Some(reg) = guard.take()
+    {
+        tracing::info!(watcher_id = reg.id, "stopping active watcher");
+        reg.handle.stop();
+    }
+}
+
+/// Register a watcher's shutdown handle, returning its registration id (the
+/// watcher thread passes it to [`clear_watcher_registration`] on exit).
+///
+/// Refuses when a watcher is already registered unless `force` — in
+/// which case the incumbent (possibly orphaned by a kill -9'd `watch` CLI)
+/// is stopped and replaced instead of failing new watch sessions forever.
+fn register_watcher(
+    state: &DaemonState,
+    handle: nestweaver_engine::ShutdownHandle,
+    force: bool,
+) -> Result<u64, Status> {
+    let mut guard = state
+        .watcher_stop
+        .lock()
+        .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
+    if let Some(existing) = guard.as_ref() {
+        if !force {
+            return Err(Status::already_exists(
+                "a watcher is already running; stop it first (StopWatch) or retry with force",
+            ));
+        }
+        tracing::info!(
+            watcher_id = existing.id,
+            "force-stopping existing watcher (possibly orphaned)"
+        );
+        existing.handle.stop();
+    }
+    let id = state.next_watcher_id.fetch_add(1, Ordering::Relaxed);
+    *guard = Some(WatcherRegistration { id, handle });
+    Ok(id)
+}
+
+/// Clear a watcher registration on watcher-thread exit — but only when the
+/// slot still holds THIS watcher. A force-replaced watcher's exit must not
+/// wipe its replacement's registration.
+fn clear_watcher_registration(state: &DaemonState, id: u64) {
+    if let Ok(mut guard) = state.watcher_stop.lock()
+        && guard.as_ref().is_some_and(|reg| reg.id == id)
+    {
+        *guard = None;
+    }
+}
+
 /// The gRPC service implementation. Wraps shared state in an `Arc`.
 pub struct DaemonService {
     state: Arc<DaemonState>,
+}
+
+/// Mutable state shared by the debounce + circuit-breaker in the watcher's
+/// embed-on-change callback (`make_embed_on_change_with`).
+#[cfg(feature = "embed")]
+struct EmbedOnChangeState {
+    last_pass: Option<std::time::Instant>,
+    all_fail_passes: u32,
+    disabled: bool,
 }
 
 impl DaemonService {
@@ -548,11 +634,13 @@ impl DaemonService {
                 args,
                 embed_ref,
                 Some(&cancel),
-                // R9/R9b: scope blast_radius output to the caller's visible
-                // repos (`visible`, resolved from the request Identity by the
-                // typed handler). With no `[authz]` config this is
-                // `VisibleRepos::All` ⇒ redaction is a no-op; non-blast_radius
-                // tools ignore it entirely.
+                // R9/R9b: scope tool output to the caller's visible repos
+                // (`visible`, resolved from the request Identity by the typed
+                // handler). With no `[authz]` config this is
+                // `VisibleRepos::All` ⇒ redaction is a no-op. Enforcement
+                // applies to blast_radius and to the repo-scoped search tools
+                // (brain_search, brain_impact, affected_tests); other tools
+                // ignore it.
                 Some(&visible),
             )
             .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
@@ -574,6 +662,26 @@ impl DaemonService {
 
         result
     }
+
+    /// Minimum interval between embed passes triggered by watcher batches.
+    /// A burst of file saves produces many debounced watcher batches; without
+    /// this throttle each batch synchronously embeds up to 64 nodes INLINE on
+    /// the watcher thread (local-model inference is the dominant CPU cost of
+    /// a watch session), so a 10-file burst could stall the watcher's DB
+    /// writes for minutes at 300%+ CPU. Coalescing to one pass per interval
+    /// keeps embeddings fresh without letting them starve reindexing.
+    #[cfg(feature = "embed")]
+    const EMBED_ON_CHANGE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Consecutive embed passes that attempted nodes but stored nothing
+    /// (every `embed_query` failed or every vector was rejected, e.g. a
+    /// dimension-mismatched/zero-length vector that `add_embedding`
+    /// refuses) before the callback stops retrying. Retrying a
+    /// deterministically-failing embed on every watcher batch is a hot
+    /// loop that burns CPU forever without making progress; the warn tells
+    /// the operator how to recover (`nestweaver embed --force` / restart).
+    #[cfg(feature = "embed")]
+    const EMBED_ON_CHANGE_MAX_ALL_FAIL_PASSES: u32 = 3;
 
     /// Build an `on_change` callback that embeds un-embedded nodes after every
     /// watcher batch.  Returns `None` when the `embed` feature is disabled or
@@ -603,7 +711,35 @@ impl DaemonService {
         embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
         store: Arc<nestweaver_store::GraphStore>,
     ) -> Option<Box<dyn Fn() + Send>> {
+        Self::make_embed_on_change_with(embed_model, store, Self::EMBED_ON_CHANGE_MIN_INTERVAL)
+    }
+
+    /// [`Self::make_embed_on_change`] with an injectable debounce interval
+    /// (tests use `Duration::ZERO` to exercise every pass).
+    #[cfg(feature = "embed")]
+    fn make_embed_on_change_with(
+        embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        store: Arc<nestweaver_store::GraphStore>,
+        min_interval: std::time::Duration,
+    ) -> Option<Box<dyn Fn() + Send>> {
+        let state = Arc::new(std::sync::Mutex::new(EmbedOnChangeState {
+            last_pass: None,
+            all_fail_passes: 0,
+            disabled: false,
+        }));
         Some(Box::new(move || {
+            {
+                let mut st = state.lock().unwrap();
+                if st.disabled {
+                    return;
+                }
+                // Debounce: coalesce a burst of watcher batches into at most
+                // one embed pass per interval.
+                if st.last_pass.is_some_and(|t| t.elapsed() < min_interval) {
+                    return;
+                }
+                st.last_pass = Some(std::time::Instant::now());
+            }
             // Peek at the model without blocking async code — we are already
             // in a blocking thread (the watcher thread, inside spawn_blocking).
             let model = {
@@ -612,6 +748,7 @@ impl DaemonService {
             };
             let Some(model) = model else { return };
 
+            let mut attempted = 0u32;
             let mut embedded = 0u32;
             let limit: usize = 64; // Max nodes per watcher cycle
 
@@ -623,6 +760,7 @@ impl DaemonService {
                         &sym.name,
                         None,
                     );
+                    attempted += 1;
                     match model.embed_query(&text) {
                         Ok(emb) => {
                             // Dimension-guard rejections must not count as
@@ -638,7 +776,11 @@ impl DaemonService {
                 }
             }
 
-            let remaining = limit.saturating_sub(embedded as usize);
+            // Budget on ATTEMPTS, not successes: with a failing
+            // endpoint, success-based budgeting lets one pass fire 64
+            // symbol + 64 note + 64 heading requests. The 64-node cap is
+            // meant to bound work per watcher cycle regardless of outcome.
+            let remaining = limit.saturating_sub(attempted as usize);
 
             // Notes
             if remaining > 0
@@ -650,6 +792,7 @@ impl DaemonService {
                     .take(remaining)
                 {
                     let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
+                    attempted += 1;
                     match model.embed_query(&text) {
                         Ok(emb) => {
                             if store.add_embedding(&note.uid, emb) {
@@ -663,7 +806,7 @@ impl DaemonService {
                 }
             }
 
-            let remaining = limit.saturating_sub(embedded as usize);
+            let remaining = limit.saturating_sub(attempted as usize);
 
             // Headings
             if remaining > 0
@@ -675,6 +818,7 @@ impl DaemonService {
                     .take(remaining)
                 {
                     let text = nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
+                    attempted += 1;
                     match model.embed_query(&text) {
                         Ok(emb) => {
                             if store.add_embedding(&heading.uid, emb) {
@@ -693,6 +837,27 @@ impl DaemonService {
                     tracing::warn!("failed to flush embedding index: {e}");
                 }
                 tracing::debug!(count = embedded, "embedded new nodes from watcher");
+            }
+
+            // Circuit breaker: a pass that attempted nodes but stored none
+            // will fail the same way on every future batch (deterministic
+            // rejection or a dead endpoint). After enough consecutive
+            // all-fail passes, stop retrying instead of hot-looping.
+            let mut st = state.lock().unwrap();
+            if attempted > 0 && embedded == 0 {
+                st.all_fail_passes += 1;
+                if st.all_fail_passes >= Self::EMBED_ON_CHANGE_MAX_ALL_FAIL_PASSES {
+                    st.disabled = true;
+                    tracing::warn!(
+                        passes = st.all_fail_passes,
+                        "watcher embed disabled after repeated all-failed passes \
+                         (every embed_query failed or every vector was rejected); \
+                         fix the embedding model/endpoint and run `nestweaver embed --force` \
+                         or restart the daemon"
+                    );
+                }
+            } else {
+                st.all_fail_passes = 0;
             }
         }))
     }
@@ -1267,17 +1432,56 @@ fn finish_reconciled_mutation<T>(
     operation: &str,
     failures: Vec<nestweaver_engine::DeletionReconciliationFailure>,
 ) -> Result<T, Status> {
-    if failures.is_empty() {
-        return mutation;
-    }
-    let reconciliation = nestweaver_engine::DeletionReconciliationError::new(operation, failures);
     match mutation {
-        Ok(_) => Err(Status::internal(reconciliation.to_string())),
-        Err(mutation) => Err(Status::new(
-            mutation.code(),
-            format!("{}; {reconciliation}", mutation.message()),
-        )),
+        // The destructive mutation COMMITTED. Post-commit reconciliation failures
+        // (a generation-bump, a sidecar removal, an embedding/search reconcile)
+        // must NOT turn a durable success into a reported FAILURE (nw-091 / Bug 2)
+        // — that made a user believe a committed remove_vault had not happened and
+        // take corrective action against already-deleted data (752 → 1 notes).
+        // Return success; the reconciliation debt is logged loudly and is
+        // idempotently retryable by re-running the operation (a re-run is a
+        // confirmed no-op that re-runs finalize). Handlers whose response carries
+        // `committed` / `reconciliation_failures` stamp them BEFORE calling this.
+        Ok(response) => {
+            if !failures.is_empty() {
+                let reconciliation =
+                    nestweaver_engine::DeletionReconciliationError::new(operation, failures);
+                tracing::error!(
+                    operation,
+                    reconciliation = %reconciliation,
+                    "mutation COMMITTED but post-commit reconciliation failed; re-run the \
+                     operation to retry reconciliation"
+                );
+            }
+            Ok(response)
+        }
+        // Genuine failure: the mutation did NOT commit. Fold in any finalize noise.
+        Err(status) if failures.is_empty() => Err(status),
+        Err(status) => {
+            let reconciliation =
+                nestweaver_engine::DeletionReconciliationError::new(operation, failures);
+            Err(Status::new(
+                status.code(),
+                format!("{}; {reconciliation}", status.message()),
+            ))
+        }
     }
+}
+
+/// Convert engine reconciliation failures into their wire form so a committed
+/// mutation can honestly report "succeeded, but N post-commit steps failed"
+/// (nw-091 / Bug 2).
+fn to_proto_reconciliation_failures(
+    failures: &[nestweaver_engine::DeletionReconciliationFailure],
+) -> Vec<nestweaver_proto::ReconciliationFailure> {
+    failures
+        .iter()
+        .map(|f| nestweaver_proto::ReconciliationFailure {
+            stage: f.stage.to_string(),
+            repo_uid: f.repo_uid.clone().unwrap_or_default(),
+            message: f.message.clone(),
+        })
+        .collect()
 }
 
 fn append_search_reconciliation(
@@ -1334,6 +1538,7 @@ where
             .map(|()| RemoveRepoResponse {
                 files_deleted: file_count as u64,
                 symbols_deleted: sym_count as u64,
+                ..Default::default()
             }),
         Err(error) => Err(error),
     };
@@ -1348,6 +1553,14 @@ where
     .map(|error| error.failures)
     .unwrap_or_default();
 
+    // nw-091 / Bug 2: mark the committed response so a post-commit reconciliation
+    // failure is reported as success-with-warnings, never a bare error.
+    let reconciliation_failures = to_proto_reconciliation_failures(&reconciliation);
+    let mutation = mutation.map(|mut response| {
+        response.committed = true;
+        response.reconciliation_failures = reconciliation_failures;
+        response
+    });
     finish_reconciled_mutation(mutation, "repo removal", reconciliation)
 }
 
@@ -1400,6 +1613,7 @@ where
             (
                 Ok(RemoveProjectResponse {
                     project_name: outcome.project_name.unwrap_or_default(),
+                    ..Default::default()
                 }),
                 finalize_needed,
                 cleanup,
@@ -1456,6 +1670,12 @@ where
         failures.extend(finalize(state, "project removal"));
     }
 
+    let reconciliation_failures = to_proto_reconciliation_failures(&failures);
+    let mutation = mutation.map(|mut response| {
+        response.committed = true;
+        response.reconciliation_failures = reconciliation_failures;
+        response
+    });
     finish_reconciled_mutation(mutation, "project removal", failures)
 }
 
@@ -1538,6 +1758,8 @@ where
         None => Ok(PruneStaleResponse {
             removed_repos: removed_repos.names,
             removed_vaults,
+            committed: true,
+            reconciliation_failures: to_proto_reconciliation_failures(&failures),
         }),
     };
     finish_reconciled_mutation(mutation, "prune_stale", failures)
@@ -1740,7 +1962,7 @@ where
             ))
         },
     )?;
-    let migration = if pending.is_active() {
+    let (migration, graph_already_applied) = if pending.is_active() {
         if pending.from_id() != Some(from_id) || pending.to_id() != Some(to_id) {
             return Err(Status::internal(format!(
                 "pending instance migration {:?} -> {:?} conflicts with requested {from_id:?} -> {to_id:?}",
@@ -1787,14 +2009,25 @@ where
                     ))
                 })?
         };
-        if pending.graph_applied()
-            && graph_state != nestweaver_store::InstanceUidRemapPlanState::Applied
-        {
-            return Err(Status::internal(
-                "instance migration is marked graph-applied but source graph rows remain",
-            ));
+        // nw-091 / Bug 3B: SELF-HEAL instead of wedging the daemon. A journal
+        // marked `graph_applied` while the graph still holds source rows is a
+        // durability inversion (the journal sidecar landed, the DB commit didn't).
+        // `merge_instance_ids` is idempotent (reparented vaults are skipped by the
+        // instance_id guard), so we re-derive the ACTUAL applied state and re-run
+        // the merge below rather than erroring with no forward path. The `verify_`
+        // call above already failed closed on a non-reproducible plan, so reaching
+        // here means the plan is still reproducible and safe to re-drive.
+        let graph_already_applied =
+            graph_state == nestweaver_store::InstanceUidRemapPlanState::Applied;
+        if pending.graph_applied() && !graph_already_applied {
+            tracing::warn!(
+                from_id,
+                to_id,
+                "instance migration journal marked graph-applied but source rows remain; \
+                 re-driving the idempotent merge to self-heal"
+            );
         }
-        pending
+        (pending, graph_already_applied)
     } else {
         let plan = state
             .store
@@ -1814,7 +2047,7 @@ where
                 Status::internal(format!("merge failed to project source vaults: {error:#}"))
             })?
             .is_empty();
-        nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
+        let fresh_migration = nestweaver_engine::prepare_instance_uid_migration_with_finalizers(
             &state.db_path,
             from_id,
             to_id,
@@ -1828,7 +2061,9 @@ where
             Status::internal(format!(
                 "merge_instance migration-journal preparation failed: {error:#}"
             ))
-        })?
+        })?;
+        // A freshly prepared migration has not mutated the graph yet.
+        (fresh_migration, false)
     };
 
     if migration.reconciled() {
@@ -1841,7 +2076,11 @@ where
         return Ok(empty_instance_merge_result());
     }
 
-    let mutation = if migration.graph_applied() {
+    // Use the ACTUAL applied state, not just the journal's graph_applied flag, so a
+    // journal that claims applied while the graph still has source rows (a
+    // durability inversion) re-drives the idempotent merge instead of skipping it
+    // (nw-091 / Bug 3B).
+    let mutation = if graph_already_applied {
         Ok(empty_instance_merge_result())
     } else {
         merge(&state.store, from_id, to_id)
@@ -2050,9 +2289,15 @@ fn run_remove_vault_with_projection(
         }
     }
 
+    let reconciliation_failures = to_proto_reconciliation_failures(&failures);
     finish_reconciled_mutation(
         mutation.map(|outcome| RemoveVaultResponse {
             notes_deleted: outcome.notes_deleted as u64,
+            // committed reflects whether the delete actually changed durable state,
+            // so a confirmed no-op stays distinguishable from a committed delete
+            // (nw-091 / Bug 2 — "nothing happened" must remain a distinct signal).
+            committed: outcome.changed,
+            reconciliation_failures,
         }),
         "remove_vault",
         failures,
@@ -2076,6 +2321,9 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
+            // The daemon's own PID, so the CLI can cross-check a pidfile
+            // PID against the socket-reported PID before signaling it.
+            pid: std::process::id(),
         }))
     }
 
@@ -2097,12 +2345,10 @@ impl NestWeaverDaemon for DaemonService {
         // shutdown burns the full drain ceiling doing work it will abandon.
         self.state.drained.store(true, Ordering::Relaxed);
 
-        if let Ok(mut guard) = self.state.watcher_stop.lock()
-            && let Some(handle) = guard.take()
-        {
-            tracing::info!("stopping active watcher before shutdown");
-            handle.stop();
-        }
+        // Stop any active watcher BEFORE the drain wait — an orphaned
+        // watcher's blocking thread would otherwise pin shutdown until the
+        // client's SIGKILL.
+        stop_active_watcher(&self.state);
 
         let state = self.state.clone();
         tokio::spawn(async move {
@@ -2257,29 +2503,14 @@ impl NestWeaverDaemon for DaemonService {
             Status::invalid_argument(format!("cannot canonicalize vault path: {e}"))
         })?;
 
-        // Only allow paths registered in the instance config.
-        if let Some(ref cfg) = self.state.instance_cfg {
-            let allowed: Vec<PathBuf> = cfg
-                .repos
-                .iter()
-                .filter(|r| r.repo_type == Some(nestweaver_engine::config::RepoType::Vault))
-                .filter_map(|r| {
-                    let p = PathBuf::from(&r.url);
-                    p.canonicalize().ok()
-                })
-                .collect();
-            if !allowed.iter().any(|a| vault_path.starts_with(a)) {
-                return Err(Status::invalid_argument(format!(
-                    "vault path {} is not in the instance's registered sources",
-                    vault_path.display()
-                )));
-            }
-        } else {
-            return Err(Status::failed_precondition(
-                "watch_vault requires an instance config (--config); \
-                 path validation cannot be performed without one",
-            ));
-        }
+        // Only allow paths registered in the instance config; without a
+        // config, fall back to the unsafe-root denylist.
+        watch_path_allowed(
+            self.state.instance_cfg.as_ref().map(|c| c.repos.as_slice()),
+            &vault_path,
+            "vault",
+            true,
+        )?;
 
         let db_path = self.state.db_path.clone();
         let manifests_path = nestweaver_engine::sidecar_path(&db_path, ".manifests.json");
@@ -2306,22 +2537,18 @@ impl NestWeaverDaemon for DaemonService {
 
         let shutdown_handle = watcher.shutdown_handle();
 
-        // Hold the lock across check + store to prevent TOCTOU race.
-        {
-            let mut guard = self
-                .state
-                .watcher_stop
-                .lock()
-                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
-            if guard.is_some() {
+        // register_watcher holds the lock across check + store (TOCTOU-safe).
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, false) {
+            Ok(id) => id,
+            Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchVaultResponse {
                     ok: false,
                     message: "A watcher is already running. Stop it first with StopWatch."
                         .to_string(),
                 }));
             }
-            *guard = Some(shutdown_handle);
-        }
+            Err(e) => return Err(e),
+        };
 
         let guard = ConnectionGuard::write(&self.state);
         let write_lock = self.state.write_mutex.clone();
@@ -2345,9 +2572,7 @@ impl NestWeaverDaemon for DaemonService {
                 Err(_) => tracing::error!("watcher thread panicked"),
             }
 
-            if let Ok(mut guard) = state.watcher_stop.lock() {
-                *guard = None;
-            }
+            clear_watcher_registration(&state, watcher_id);
         });
 
         Ok(Response::new(WatchVaultResponse {
@@ -2370,6 +2595,7 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let repo_path = PathBuf::from(&req.repo_path);
+        let force = req.force;
         let instance_id =
             resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
 
@@ -2384,50 +2610,36 @@ impl NestWeaverDaemon for DaemonService {
             .canonicalize()
             .map_err(|e| Status::invalid_argument(format!("cannot canonicalize repo path: {e}")))?;
 
-        // Only allow paths registered in the instance config.
-        if let Some(ref cfg) = self.state.instance_cfg {
-            let allowed: Vec<PathBuf> = cfg
-                .repos
-                .iter()
-                .filter_map(|r| {
-                    let p = PathBuf::from(&r.url);
-                    p.canonicalize().ok()
-                })
-                .collect();
-            if !allowed.iter().any(|a| repo_path.starts_with(a)) {
-                return Err(Status::invalid_argument(format!(
-                    "repo path {} is not in the instance's registered sources",
-                    repo_path.display()
-                )));
-            }
-        } else {
-            return Err(Status::failed_precondition(
-                "watch_code requires an instance config (--config); \
-                 path validation cannot be performed without one",
-            ));
-        }
+        // Only allow paths registered in the instance config; without a
+        // config, fall back to the unsafe-root denylist.
+        watch_path_allowed(
+            self.state.instance_cfg.as_ref().map(|c| c.repos.as_slice()),
+            &repo_path,
+            "repo",
+            false,
+        )?;
 
         let db_path = self.state.db_path.clone();
 
         let watcher = nestweaver_engine::CodeWatcher::new(&db_path, &repo_path, &instance_id);
         let shutdown_handle = watcher.shutdown_handle();
 
-        // Hold the lock across check + store to prevent TOCTOU race.
-        {
-            let mut guard = self
-                .state
-                .watcher_stop
-                .lock()
-                .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
-            if guard.is_some() {
+        // register_watcher holds the lock across check + store (TOCTOU-safe).
+        // With `force`, an already-running watcher (e.g. orphaned by a
+        // kill -9'd `watch` CLI) is stopped and replaced instead of
+        // failing every new watch session.
+        let watcher_id = match register_watcher(&self.state, shutdown_handle, force) {
+            Ok(id) => id,
+            Err(e) if e.code() == tonic::Code::AlreadyExists => {
                 return Ok(Response::new(WatchCodeResponse {
                     ok: false,
-                    message: "A watcher is already running. Stop it first with StopWatch."
+                    message: "A watcher is already running. Stop it first with StopWatch \
+                              (or retry with --force)."
                         .to_string(),
                 }));
             }
-            *guard = Some(shutdown_handle);
-        }
+            Err(e) => return Err(e),
+        };
 
         let guard = ConnectionGuard::write(&self.state);
         let write_lock = self.state.write_mutex.clone();
@@ -2451,9 +2663,7 @@ impl NestWeaverDaemon for DaemonService {
                 Err(_) => tracing::error!("code watcher thread panicked"),
             }
 
-            if let Ok(mut guard) = state.watcher_stop.lock() {
-                *guard = None;
-            }
+            clear_watcher_registration(&state, watcher_id);
         });
 
         Ok(Response::new(WatchCodeResponse {
@@ -2477,9 +2687,9 @@ impl NestWeaverDaemon for DaemonService {
             .lock()
             .map_err(|e| Status::internal(format!("watcher_stop lock poisoned: {e}")))?;
 
-        if let Some(handle) = guard.take() {
-            tracing::info!("stop_watch: stopping active watcher");
-            handle.stop();
+        if let Some(reg) = guard.take() {
+            tracing::info!(watcher_id = reg.id, "stop_watch: stopping active watcher");
+            reg.handle.stop();
             Ok(Response::new(StopWatchResponse { ok: true }))
         } else {
             Ok(Response::new(StopWatchResponse { ok: false }))
@@ -2633,6 +2843,70 @@ impl NestWeaverDaemon for DaemonService {
         let port = if req.port > 0 { req.port as u16 } else { 3000 };
         let open_browser = req.open_browser;
 
+        // LOW (ui port leak): re-asking for the UI while it is already served
+        // is a no-op success, but a FOREIGN process bound to the port must be a
+        // clear error — the old code spawned a task whose bind failure was only
+        // logged, and reported ok:true regardless.
+        {
+            let guard = self
+                .state
+                .ui_server
+                .lock()
+                .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
+            if let Some((running_port, handle)) = guard.as_ref()
+                && !handle.is_finished()
+            {
+                // A watch request must not be silently dropped just because
+                // the UI is already served — start the watcher here too.
+                if req.watch && !req.watch_repo_path.is_empty() {
+                    let watch_db = state.db_path.clone();
+                    let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
+                    let watch_store = state.store.clone();
+                    let watch_instance = watch_instance.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let watcher = nestweaver_engine::CodeWatcher::new(
+                            &watch_db,
+                            &watch_repo,
+                            &watch_instance,
+                        );
+                        if let Err(e) = watcher.run_with_store(watch_store, None) {
+                            tracing::error!("CodeWatcher failed: {e}");
+                        }
+                    });
+                    // Report the ACTUAL running port, not the requested one —
+                    // the CLI prints this port in the URL it shows the user.
+                    return Ok(Response::new(ServeUiResponse {
+                        ok: true,
+                        message: format!(
+                            "UI server already running on port {running_port}; watcher started for {}",
+                            req.watch_repo_path
+                        ),
+                        port: u32::from(*running_port),
+                        error: String::new(),
+                    }));
+                }
+                // Report the ACTUAL running port, not the requested one —
+                // the CLI prints this port in the URL it shows the user.
+                return Ok(Response::new(ServeUiResponse {
+                    ok: true,
+                    message: format!("UI server already running on port {running_port}"),
+                    port: u32::from(*running_port),
+                    error: String::new(),
+                }));
+            }
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            return Ok(Response::new(ServeUiResponse {
+                ok: false,
+                message: format!(
+                    "port {port} is already in use by another process — pick another --port"
+                ),
+                port: 0,
+                error: "port_in_use".to_string(),
+            }));
+        }
+
         // Build web UI router, mounting the admin API when available so the
         // admin dashboard SPA can reach its backend on the same origin.
         let mut web_router = nestweaver_web::create_router(app_state);
@@ -2644,14 +2918,24 @@ impl NestWeaverDaemon for DaemonService {
             tracing::info!("admin API also mounted on web UI server");
         }
 
-        // Spawn web server as a background task inside the daemon.
-        tokio::spawn(async move {
+        // Spawn web server as a background task inside the daemon. The handle
+        // is tracked so `stop_ui` can abort it and release the listen port
+        // (LOW: ui port leak).
+        let handle = tokio::spawn(async move {
             if let Err(e) =
                 nestweaver_web::start_server_with_router(web_router, port, open_browser).await
             {
                 tracing::error!("UI server error: {e}");
             }
         });
+        {
+            let mut guard = self
+                .state
+                .ui_server
+                .lock()
+                .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
+            *guard = Some((port, handle));
+        }
 
         // If watch mode requested, spawn a CodeWatcher.
         if req.watch && !req.watch_repo_path.is_empty() {
@@ -2671,7 +2955,42 @@ impl NestWeaverDaemon for DaemonService {
         Ok(Response::new(ServeUiResponse {
             ok: true,
             message: format!("UI server started on port {port}"),
+            port: u32::from(port),
+            error: String::new(),
         }))
+    }
+
+    async fn stop_ui(
+        &self,
+        request: Request<StopUiRequest>,
+    ) -> Result<Response<StopUiResponse>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
+        let handle = {
+            let mut guard = self
+                .state
+                .ui_server
+                .lock()
+                .map_err(|e| Status::internal(format!("ui_server lock poisoned: {e}")))?;
+            guard.take()
+        };
+        match handle {
+            Some((_port, handle)) if !handle.is_finished() => {
+                // Aborting the task drops the axum listener, releasing the port.
+                handle.abort();
+                Ok(Response::new(StopUiResponse {
+                    ok: true,
+                    message: "UI server stopped".to_string(),
+                }))
+            }
+            _ => Ok(Response::new(StopUiResponse {
+                ok: false,
+                message: "UI server is not running".to_string(),
+            })),
+        }
     }
 
     // ── Indexing ─────────────────────────────────────────────────────
@@ -3315,6 +3634,12 @@ impl NestWeaverDaemon for DaemonService {
                 projects_reparented: result.projects as u64,
                 discarded_vaults,
                 repos_needing_reindex: result.repos_moved,
+                // Reaching here means the merge committed (nw-091 / Bug 2).
+                // Reconciliation warnings, if any, are logged by
+                // finish_reconciled_mutation; wire-surfacing them for merge would
+                // require threading them through the internal MergeResult path.
+                committed: true,
+                reconciliation_failures: Vec::new(),
             })
         })
         .await
@@ -3454,6 +3779,7 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         r: Request<BrainSearchRequest>,
     ) -> Result<Response<BrainSearchResponse>, Status> {
+        let visible = self.state.visible_repos_for(r.extensions())?;
         let req = r.into_inner();
         let mut args = serde_json::json!({
             "query": req.query,
@@ -3471,16 +3797,10 @@ impl NestWeaverDaemon for DaemonService {
             args["root"] = serde_json::json!(root);
         }
 
-        // This typed handler only ever dispatches a fixed non-blast_radius
-        // tool, which ignores the visibility arg, so pass `VisibleRepos::All`
-        // (no scoping needed, and no per-request `list_repos` cost on the hot
-        // path). blast_radius scoping happens on the `json_rpc!` macro path.
+        // `brain_search` includes repo-owned symbols, so the typed hot path
+        // must enforce the same request-derived scope as generic JSON-RPC.
         let value = self
-            .dispatch_tool_json(
-                "brain_search",
-                args,
-                nestweaver_engine::authz::VisibleRepos::All,
-            )
+            .dispatch_tool_json("brain_search", args, visible)
             .await?;
 
         // Parse JSON result into typed response.
@@ -3499,7 +3819,7 @@ impl NestWeaverDaemon for DaemonService {
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32;
 
-        let results = value
+        let results: Vec<SearchResultItem> = value
             .get("results")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -3510,6 +3830,11 @@ impl NestWeaverDaemon for DaemonService {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        canonical_id: item
+                            .get("canonical_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
                         kind: item
                             .get("kind")
                             .and_then(|v| v.as_str())
@@ -3540,6 +3865,11 @@ impl NestWeaverDaemon for DaemonService {
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                             .map(String::from),
+                        vault_uid: item
+                            .get("vault_uid")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
                     })
                     .collect()
             })
@@ -3554,6 +3884,22 @@ impl NestWeaverDaemon for DaemonService {
                     .collect()
             })
             .unwrap_or_default();
+        let returned_matches = value
+            .get("returned_matches")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(results.len() as i64) as i32;
+        let total_matches_relation = value
+            .get("total_matches_relation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("eq")
+            .to_string();
+        let explicit_truncated = value
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let truncated = explicit_truncated
+            || total_matches_relation != "eq"
+            || returned_matches < total_matches;
 
         Ok(Response::new(BrainSearchResponse {
             query: query_echo,
@@ -3561,6 +3907,9 @@ impl NestWeaverDaemon for DaemonService {
             total_matches,
             results,
             expansion_terms,
+            returned_matches,
+            total_matches_relation,
+            truncated,
         }))
     }
 
@@ -3758,6 +4107,40 @@ impl NestWeaverDaemon for DaemonService {
                 .get("section_count")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0) as i32,
+            // Parity with the local note_get JSON: frontmatter (a JSON object)
+            // and the heading outline ride the typed response too — the MCP
+            // daemon path used to drop both.
+            frontmatter_json: value
+                .get("frontmatter")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            outline: value
+                .get("outline")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|h| nestweaver_proto::NoteHeading {
+                            uid: h
+                                .get("uid")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            level: h.get("level").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                            text: h
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            slug: h
+                                .get("slug")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            line: h.get("line").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }))
     }
 
@@ -4147,27 +4530,31 @@ impl NestWeaverDaemon for DaemonService {
         let req = r.into_inner();
         let db_path = self.state.db_path.clone();
 
+        // Errors are wrapped in the standard `tool <name> failed:` format (see
+        // dispatch_err_to_status) so MCP clients don't mislabel tool argument
+        // errors as gRPC transport failures.
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            let args: serde_json::Value = serde_json::from_str(&req.args_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
-            let uid = args
-                .get("uid")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| Status::invalid_argument("'uid' must be a string"))?;
-            let key = args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| Status::invalid_argument("'key' must be a string"))?;
-            let value = args
-                .get("value")
-                .cloned()
-                .ok_or_else(|| Status::invalid_argument("'value' is required"))?;
+            let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "tool set_extension failed: invalid JSON in args_json: {e}"
+                ))
+            })?;
+            let uid = args.get("uid").and_then(|v| v.as_str()).ok_or_else(|| {
+                Status::invalid_argument("tool set_extension failed: 'uid' must be a string")
+            })?;
+            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                Status::invalid_argument("tool set_extension failed: 'key' must be a string")
+            })?;
+            let value = args.get("value").cloned().ok_or_else(|| {
+                Status::invalid_argument("tool set_extension failed: 'value' is required")
+            })?;
 
             let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
             nestweaver_engine::extensions::set_property(&mut store, uid, key, value.clone());
-            nestweaver_engine::extensions::save_extensions(&db_path, &store)
-                .map_err(|e| Status::internal(format!("save_extensions failed: {e:#}")))?;
+            nestweaver_engine::extensions::save_extensions(&db_path, &store).map_err(|e| {
+                Status::internal(format!("tool set_extension failed: save_extensions: {e:#}"))
+            })?;
 
             let result_json = serde_json::json!({
                 "uid": uid,
@@ -4179,7 +4566,7 @@ impl NestWeaverDaemon for DaemonService {
             Ok::<_, Status>(JsonResponse { result_json })
         })
         .await
-        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?;
+        .map_err(|e| Status::internal(format!("tool set_extension failed: spawn_blocking: {e}")))?;
 
         result.map(Response::new)
     }
@@ -4190,12 +4577,19 @@ impl NestWeaverDaemon for DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
         let state = self.state.clone();
-        let args: serde_json::Value = serde_json::from_str(&r.into_inner().args_json)
-            .map_err(|error| Status::invalid_argument(format!("invalid args JSON: {error}")))?;
+        // Same `tool <name> failed:` wrapping as set_extension above.
+        let args: serde_json::Value =
+            serde_json::from_str(&r.into_inner().args_json).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "tool query_extensions failed: invalid args JSON: {error}"
+                ))
+            })?;
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
             let extensions = nestweaver_engine::load_live_extensions(&state.store, &state.db_path)
                 .map_err(|error| {
-                    Status::internal(format!("query extension liveness failed: {error:#}"))
+                    Status::internal(format!(
+                        "tool query_extensions failed: extension liveness: {error:#}"
+                    ))
                 })?;
             if let Some(uid) = args.get("uid").and_then(|value| value.as_str()) {
                 return Ok(serde_json::json!({
@@ -4207,10 +4601,14 @@ impl NestWeaverDaemon for DaemonService {
                 .get("key")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
-                    Status::invalid_argument("provide either 'uid' or both 'key' and 'value'")
+                    Status::invalid_argument(
+                        "tool query_extensions failed: provide either 'uid' or both 'key' and 'value'",
+                    )
                 })?;
             let value = args.get("value").cloned().ok_or_else(|| {
-                Status::invalid_argument("'value' is required when 'key' is given")
+                Status::invalid_argument(
+                    "tool query_extensions failed: 'value' is required when 'key' is given",
+                )
             })?;
             let results: Vec<_> = nestweaver_engine::query_by_property(&extensions, key, &value)
                 .into_iter()
@@ -4229,10 +4627,18 @@ impl NestWeaverDaemon for DaemonService {
             }))
         })
         .await
-        .map_err(|error| Status::internal(format!("spawn_blocking panicked: {error}")))??;
+        .map_err(|error| {
+            Status::internal(format!(
+                "tool query_extensions failed: spawn_blocking panicked: {error}"
+            ))
+        })??;
         serde_json::to_string(&result)
             .map(|result_json| Response::new(JsonResponse { result_json }))
-            .map_err(|error| Status::internal(format!("serialization failed: {error}")))
+            .map_err(|error| {
+                Status::internal(format!(
+                    "tool query_extensions failed: serialization: {error}"
+                ))
+            })
     }
 
     // ── Read RPCs — direct store access (no MCP tool) ──────────────
@@ -4989,6 +5395,51 @@ fn is_unsafe_index_root(path: &std::path::Path) -> bool {
     false
 }
 
+/// Canonicalize a config repo entry URL into an allow-list path.
+///
+/// Config `[[repos]]` entries store `file://`-prefixed identity URLs;
+/// `PathBuf::from("file:///x")` is a *relative* path that never canonicalizes,
+/// which silently emptied the watcher allow-list.
+fn config_repo_canonical_path(url: &str) -> Option<PathBuf> {
+    let stripped = url.strip_prefix("file://").unwrap_or(url);
+    std::fs::canonicalize(stripped).ok()
+}
+
+/// Validate a watcher target path against the instance config's registered
+/// sources (allow-list), or — when the daemon runs without `--config` —
+/// against the system-root denylist so an explicit `watch --repo X --db Y`
+/// works without an instance config. `vault_only` restricts the
+/// allow-list to `type = "vault"` entries (used by `watch_vault`).
+fn watch_path_allowed(
+    repos: Option<&[nestweaver_engine::config::RepoConfig]>,
+    path: &std::path::Path,
+    kind: &str,
+    vault_only: bool,
+) -> Result<(), Status> {
+    let Some(repos) = repos else {
+        if is_unsafe_index_root(path) {
+            return Err(Status::invalid_argument(format!(
+                "refusing to watch {kind} path {}: system roots and home directories \
+                 are not watchable",
+                path.display()
+            )));
+        }
+        return Ok(());
+    };
+    let allowed: Vec<PathBuf> = repos
+        .iter()
+        .filter(|r| !vault_only || r.repo_type == Some(nestweaver_engine::config::RepoType::Vault))
+        .filter_map(|r| config_repo_canonical_path(&r.url))
+        .collect();
+    if !allowed.iter().any(|a| path.starts_with(a)) {
+        return Err(Status::invalid_argument(format!(
+            "{kind} path {} is not in the instance's registered sources",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// The daemon is idle only when there is no active read/write AND no index job
 /// in flight. Index jobs bump `indexing_active` (not `active_writes`), so an
 /// idle-timeout check that ignores it could fire mid-index — the same footgun
@@ -5546,7 +5997,11 @@ mod depth_clamp_tests {
 /// cold-cache download can't delay the socket bind; the download is bounded by a 180s prefetch
 /// timeout so it can't hang. During the load, non-semantic RPCs are served normally and
 /// semantic search returns "model not loaded" until it completes.
-#[cfg(feature = "embed")]
+///
+/// Gated `not(test)` like its call site: unit-test servers run on tokio worker threads, which
+/// can never satisfy the main-thread requirement, and with the call site compiled out this fn
+/// would be dead code under `--all-targets`.
+#[cfg(all(feature = "embed", not(test)))]
 async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     #[cfg(target_os = "macos")]
     {
@@ -5948,6 +6403,7 @@ pub async fn run_server(
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
+        next_watcher_id: std::sync::atomic::AtomicU64::new(0),
         instance_cfg,
         permission_source,
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
@@ -5962,6 +6418,7 @@ pub async fn run_server(
         admin_token,
         admin_state: std::sync::OnceLock::new(),
         worker_handle: std::sync::Mutex::new(None),
+        ui_server: std::sync::Mutex::new(None),
     });
 
     if !read_only {
@@ -6086,6 +6543,7 @@ pub async fn run_server(
     {
         let tx = shutdown_tx.clone();
         let drained = Arc::clone(&state.drained);
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("register SIGTERM handler");
@@ -6095,6 +6553,11 @@ pub async fn run_server(
             // shutdown, mirroring the gRPC Shutdown handler. In-flight jobs
             // still drain via the worker loop's JoinSet; only NEW claims stop.
             drained.store(true, Ordering::Relaxed);
+            // Stop any active watcher too — its `spawn_blocking` thread
+            // would otherwise outlive the broadcast and pin process exit
+            // (Tokio's runtime drop waits for blocking threads) until the
+            // client's stop grace elapses and it SIGKILLs us.
+            stop_active_watcher(&state);
             let _ = tx.send(true);
         });
     }
@@ -7210,7 +7673,17 @@ pub async fn run_server(
     // Race the load against shutdown: a `daemon stop` during a cold-cache model download must
     // not park the main flow inside the 180s prefetch (which would defer cleanup and risk a
     // SIGKILL + stale socket). If shutdown fires first, abandon the load and proceed to drain.
-    #[cfg(feature = "embed")]
+    //
+    // `not(test)`: the load asserts it runs on the PROCESS main thread
+    // (`pthread_main_np`, Metal shader compilation) — a guarantee the test
+    // harness can never provide (unit tests drive `run_server` from a tokio
+    // worker thread). Under `cargo test --workspace`, feature unification
+    // compiles this crate's unit tests WITH `embed` enabled (the root bin's
+    // default features), so without this gate an in-process `run_server`
+    // under test panics on that assert. Skipping the load in unit-test
+    // builds only matches the feature-off behavior those tests already get
+    // from `cargo test -p nestweaver-daemon`.
+    #[cfg(all(feature = "embed", not(test)))]
     {
         let mut load_shutdown = shutdown_tx.subscribe();
         tokio::select! {
@@ -7228,6 +7701,11 @@ pub async fn run_server(
 
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
     tracing::info!("daemon shutting down, cleaning up");
+
+    // Belt-and-suspenders watcher stop covering shutdown triggers that
+    // don't pass through the gRPC Shutdown handler or the SIGTERM handler
+    // (e.g. idle timeout). Idempotent — no-op when already stopped.
+    stop_active_watcher(&state);
 
     // Await the worker pool so an in-flight index write finishes before we exit.
     // The worker loop sees the same shutdown signal, breaks, and drains its
@@ -8018,6 +8496,13 @@ mod startup_helper_tests {
         .unwrap();
 
         assert_eq!(response.notes_deleted, 0);
+        // nw-091 / Bug 2 boundary: a confirmed no-op stays distinguishable from a
+        // committed delete — committed:false and no reconciliation warnings.
+        assert!(
+            !response.committed,
+            "a confirmed no-op did not commit anything"
+        );
+        assert!(response.reconciliation_failures.is_empty());
         assert_eq!(state.store.graph_generation(), generation_before);
         assert!(pagerank_path.exists());
         assert!(state.store.has_embedding("note:nonexistent-vault-noop"));
@@ -8078,10 +8563,24 @@ mod startup_helper_tests {
         });
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
 
-        let error = service.remove_vault(request).await.unwrap_err();
+        // nw-091 / Bug 2: a post-commit reconciliation failure on an ALREADY-
+        // COMMITTED delete must be reported as success-with-warnings, NOT a bare
+        // error. The prior contract (unwrap_err / Code::Internal) is exactly what
+        // made a user believe a committed remove_vault had not happened and take
+        // corrective action against already-deleted data (752 → 1 notes).
+        let response = service.remove_vault(request).await.unwrap().into_inner();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("embedding-index"));
+        assert!(response.committed, "the vault delete durably committed");
+        assert!(
+            response
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("embedding")),
+            "the embedding-index reconciliation failure must surface as a warning, got: {:?}",
+            response.reconciliation_failures
+        );
+        // The mutation genuinely committed (this is what makes the honest
+        // "committed + warnings" response correct, not a lie).
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
         assert!(state.store.graph_generation() > generation_before);
         assert!(
@@ -8144,11 +8643,19 @@ mod startup_helper_tests {
                 Err(anyhow::anyhow!("injected Tantivy rebuild failure"))
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("search-index"));
-        assert!(error.message().contains("injected Tantivy rebuild failure"));
+        // nw-091 / Bug 2: committed prune → success-with-warnings (`error` binds the Ok response).
+        assert!(error.committed);
+        assert!(
+            error
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("search-index")
+                    || f.message.contains("injected Tantivy rebuild failure")),
+            "search-index failure must surface as a warning, got: {:?}",
+            error.reconciliation_failures
+        );
         assert!(
             state.store.graph_generation() > generation_before,
             "generation finalization must precede the surfaced search failure"
@@ -8214,7 +8721,7 @@ mod startup_helper_tests {
             "/missing/merge-search-failure",
         );
 
-        let error = run_merge_instance_with(
+        run_merge_instance_with(
             &state,
             "merge-search-source",
             "merge-search-target",
@@ -8225,11 +8732,10 @@ mod startup_helper_tests {
             },
             |_state, _mutation, _operation| Err(anyhow::anyhow!("injected merge search failure")),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("search-index"));
-        assert!(error.message().contains("injected merge search failure"));
+        // nw-091 / Bug 2: the merge COMMITTED (asserted below); the search
+        // finalizer failure is logged, not returned as an error.
         assert!(
             state
                 .store
@@ -8288,7 +8794,7 @@ mod startup_helper_tests {
             .unwrap();
         let generation_before = state.store.graph_generation();
 
-        let error = run_merge_instance_with_extension_ops(
+        run_merge_instance_with_extension_ops(
             &state,
             "old",
             "new",
@@ -8301,14 +8807,10 @@ mod startup_helper_tests {
             |_store, _db_path, _from, _to| Ok(((), true)),
             |_db_path, _migration| Err(anyhow::anyhow!("injected atomic finalize write failure")),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.message().contains("extension-metadata"));
-        assert!(
-            error
-                .message()
-                .contains("injected atomic finalize write failure")
-        );
+        // nw-091 / Bug 2: merge COMMITTED; the extension-metadata finalize failure
+        // is logged, not returned as an error.
         assert!(!state.store.project_exists("proj:old:finalize").unwrap());
         assert!(state.store.graph_generation() > generation_before);
         assert!(
@@ -8340,7 +8842,7 @@ mod startup_helper_tests {
             serde_json::json!({"retry": [true, {"depth": 2}]}),
         );
 
-        let first_error = run_merge_instance_with_extension_ops(
+        run_merge_instance_with_extension_ops(
             &state,
             "old",
             "new",
@@ -8364,8 +8866,9 @@ mod startup_helper_tests {
                 ))
             },
         )
-        .unwrap_err();
-        assert!(first_error.message().contains("extension-metadata"));
+        .unwrap();
+        // nw-091 / Bug 2: merge COMMITTED; the extension-metadata failure is logged
+        // and the durable journal drives the retry (asserted below).
         assert!(!state.store.project_exists(&source_uid).unwrap());
         let staged = nestweaver_engine::load_extensions(&state.db_path);
         assert!(staged.contains_key(&source_uid));
@@ -8817,6 +9320,53 @@ mod startup_helper_tests {
     }
 
     #[test]
+    fn boot_self_heals_graph_applied_journal_with_remaining_source_rows() {
+        // nw-091 / Bug 3B: a journal marked graph_applied while the graph still
+        // holds source rows (a durability inversion — the journal sidecar landed,
+        // the DB commit didn't) used to WEDGE daemon boot with no forward path.
+        // Recovery must self-heal by re-driving the idempotent merge.
+        use nestweaver_schema::uid::vault_uid;
+        let state = test_state_with_writer();
+        let root = "/self-heal/vault";
+        let source_vault_uid = vault_uid("old", root);
+        seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
+
+        // Prepare a migration journal and advance it to GraphApplied WITHOUT
+        // mutating the graph — exactly the wedge state.
+        let mappings = state.store.plan_instance_uid_remaps("old", "new").unwrap();
+        let migration = nestweaver_engine::prepare_instance_extension_migration(
+            &state.db_path,
+            "old",
+            "new",
+            &mappings,
+        )
+        .unwrap();
+        nestweaver_engine::mark_instance_extension_migration_graph_applied(
+            &state.db_path,
+            &migration,
+        )
+        .unwrap();
+        // Precondition: journal says graph_applied, but the source vault remains.
+        assert!(
+            nestweaver_engine::pending_instance_extension_migration(&state.db_path)
+                .unwrap()
+                .graph_applied()
+        );
+        assert!(!state.store.list_vaults(Some("old")).unwrap().is_empty());
+
+        // Recovery must SELF-HEAL (re-drive the idempotent merge), not error.
+        recover_pending_instance_extension_migration(&state).unwrap();
+
+        // The source vault's notes are reparented under "new"; none remain under
+        // "old" — no data lost, and the daemon boots.
+        assert!(
+            state.store.list_vaults(Some("old")).unwrap().is_empty(),
+            "self-heal must finish migrating the remaining source rows"
+        );
+        assert!(!state.store.list_vaults(Some("new")).unwrap().is_empty());
+    }
+
+    #[test]
     fn graph_applied_finalizer_failure_keeps_journal_for_retry() {
         use nestweaver_schema::uid::vault_uid;
 
@@ -8825,7 +9375,7 @@ mod startup_helper_tests {
         let source_vault_uid = vault_uid("old", root);
         seed_vault_note_heading_embeddings(&state, &source_vault_uid, "old", root);
 
-        let error = run_merge_instance_with(
+        run_merge_instance_with(
             &state,
             "old",
             "new",
@@ -8840,12 +9390,10 @@ mod startup_helper_tests {
                 ))
             },
         )
-        .unwrap_err();
-        assert!(
-            error
-                .message()
-                .contains("persisted search finalizer failure")
-        );
+        .unwrap();
+        // nw-091 / Bug 2: the merge COMMITTED; a post-commit finalizer failure is
+        // logged and the journal is retained at graph_applied for retry (asserted
+        // below), not returned as an error that reads as "the merge failed".
         let pending =
             nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
         assert!(pending.graph_applied());
@@ -8888,7 +9436,7 @@ mod startup_helper_tests {
         let generation_path = nestweaver_engine::sidecar_path(&state.db_path, ".generation");
         std::fs::create_dir(&generation_path).unwrap();
 
-        let error = run_merge_instance_with(
+        run_merge_instance_with(
             &state,
             "old",
             "new",
@@ -8899,8 +9447,9 @@ mod startup_helper_tests {
             },
             |_state, _mutation, _operation| Ok(()),
         )
-        .unwrap_err();
-        assert!(error.message().contains("generation-persistence"));
+        .unwrap();
+        // nw-091 / Bug 2: merge COMMITTED; the generation-persistence failure is
+        // logged and the journal is retained at graph_applied for retry, below.
         let pending =
             nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
         assert!(pending.graph_applied());
@@ -8925,7 +9474,7 @@ mod startup_helper_tests {
         Arc::get_mut(&mut state).unwrap().search_reconciliation =
             SearchIndexReconciliation::Unavailable("injected writer outage".to_string());
 
-        let error = run_merge_instance_with(
+        run_merge_instance_with(
             &state,
             "old",
             "new",
@@ -8936,12 +9485,9 @@ mod startup_helper_tests {
             },
             rebuild_tantivy_after_mutation,
         )
-        .unwrap_err();
-        assert!(
-            error
-                .message()
-                .contains("configured Tantivy index unavailable")
-        );
+        .unwrap();
+        // nw-091 / Bug 2: merge COMMITTED; the search-unavailable finalizer failure
+        // is logged and the journal is retained at graph_applied for retry, below.
         let pending =
             nestweaver_engine::pending_instance_extension_migration(&state.db_path).unwrap();
         assert!(pending.graph_applied());
@@ -10061,10 +10607,18 @@ mod startup_helper_tests {
                 })
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("generation-persistence"));
+        // nw-091 / Bug 2: committed delete → success-with-warnings (`error` binds the Ok response).
+        assert!(error.committed);
+        assert!(
+            error
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("generation-persistence")),
+            "generation-persistence failure must surface as a warning, got: {:?}",
+            error.reconciliation_failures
+        );
         assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
         assert!(state.store.graph_generation() > generation_before);
     }
@@ -10098,9 +10652,20 @@ mod startup_helper_tests {
                 })
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.message().contains("extension-metadata"));
+        // nw-091 / Bug 2: a committed delete with a post-commit reconciliation
+        // failure returns success-with-warnings, never a bare error. (`error` here
+        // now binds the Ok response.)
+        assert!(error.committed);
+        assert!(
+            error
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("extension-metadata")),
+            "extension-metadata failure must surface as a warning, got: {:?}",
+            error.reconciliation_failures
+        );
         assert_eq!(std::fs::read(&extension_path).unwrap(), b"{not-json");
         assert!(state.store.lookup_repo(repo_uid).unwrap().is_none());
 
@@ -10473,11 +11038,20 @@ mod startup_helper_tests {
             nestweaver_engine::remove_extension_uid_durable,
             finalize_node_graph_deletion,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), tonic::Code::Internal);
-        assert!(error.message().contains("generation-persistence"));
-        assert!(error.message().contains("exhaust"));
+        // nw-091 / Bug 2: committed delete → success-with-warnings (`error` binds the Ok response).
+        assert!(error.committed);
+        assert!(
+            error
+                .reconciliation_failures
+                .iter()
+                .any(
+                    |f| f.stage.contains("generation-persistence") || f.message.contains("exhaust")
+                ),
+            "generation-persistence exhaustion must surface as a warning, got: {:?}",
+            error.reconciliation_failures
+        );
         assert!(
             state
                 .store
@@ -10514,16 +11088,22 @@ mod startup_helper_tests {
                 nestweaver_engine::remove_extension_uid_durable,
                 finalize_node_graph_deletion,
             )
-            .unwrap_err();
+            .unwrap();
 
-            assert_eq!(error.code(), tonic::Code::Internal);
+            // nw-091 / Bug 2: committed delete → success-with-warnings (`error` binds the Ok response).
+            assert!(error.committed);
+            let expected_stage = if failure == "generation" {
+                "generation-persistence"
+            } else {
+                "persisted-pagerank"
+            };
             assert!(
-                error.message().contains(if failure == "generation" {
-                    "generation-persistence"
-                } else {
-                    "persisted-pagerank"
-                }),
-                "unexpected {failure} error: {error}"
+                error
+                    .reconciliation_failures
+                    .iter()
+                    .any(|f| f.stage.contains(expected_stage)),
+                "unexpected {failure} reconciliation: {:?}",
+                error.reconciliation_failures
             );
             assert!(
                 state
@@ -10783,13 +11363,18 @@ mod startup_helper_tests {
             |_db_path, _uid| anyhow::bail!("injected extension cleanup failure"),
             finalize_node_graph_deletion,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.message().contains("extension-metadata"));
+        // nw-091 / Bug 2: committed delete → success-with-warnings (`error` binds the Ok response).
+        assert!(error.committed);
         assert!(
             error
-                .message()
-                .contains("injected extension cleanup failure")
+                .reconciliation_failures
+                .iter()
+                .any(|f| f.stage.contains("extension-metadata")
+                    || f.message.contains("injected extension cleanup failure")),
+            "extension-metadata failure must surface as a warning, got: {:?}",
+            error.reconciliation_failures
         );
         assert!(nestweaver_engine::load_extensions(&state.db_path).contains_key(project_uid));
 
@@ -11656,6 +12241,231 @@ mod startup_helper_tests {
         );
     }
 
+    /// An `EmbedQueryFn` that counts calls and returns a fixed vector, for
+    /// exercising the debounce + circuit-breaker in `make_embed_on_change`.
+    #[cfg(feature = "embed")]
+    struct CountingEmbed {
+        calls: Arc<AtomicU32>,
+        vector: Vec<f32>,
+    }
+
+    #[cfg(feature = "embed")]
+    impl nestweaver_engine::EmbedQueryFn for CountingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.vector.clone())
+        }
+    }
+
+    /// Insert one un-embedded symbol so the embed callback has work to do.
+    #[cfg(feature = "embed")]
+    fn insert_unembedded_symbol(store: &GraphStore, uid: &str) {
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+        store
+            .insert_symbol(&Symbol {
+                uid: uid.to_string(),
+                name: format!("name_{uid}"),
+                kind: SymbolKind::Function,
+                repo_uid: "repo-1".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn f()".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+    }
+
+    /// Invoke the callback on a blocking thread — it uses
+    /// `embed_model.blocking_read()`, which panics in an async context
+    /// (mirrors how the watcher thread calls it).
+    #[cfg(feature = "embed")]
+    async fn run_embed_cb(cb: Arc<std::sync::Mutex<Box<dyn Fn() + Send>>>) {
+        tokio::task::spawn_blocking(move || (cb.lock().unwrap())())
+            .await
+            .unwrap();
+    }
+
+    /// Regression (re-embedding stalls the watcher, #perf): back-to-back
+    /// watcher batches must NOT each pay a full inline embed pass — passes
+    /// are debounced to at most one per interval so a burst of saves can't
+    /// stall the watcher's DB writes behind local-model inference.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_embed_debounces_back_to_back_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&dir.path().join("brain.lbug")).unwrap());
+        insert_unembedded_symbol(&store, "sym-debounce");
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let probe = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1_f32, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+
+        let cb = Arc::new(std::sync::Mutex::new(
+            DaemonService::make_embed_on_change_with(
+                embed_model,
+                store,
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("embed callback should be present when a model is loaded"),
+        ));
+
+        run_embed_cb(cb.clone()).await;
+        run_embed_cb(cb.clone()).await;
+        run_embed_cb(cb).await;
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "batches within the debounce window must skip the embed pass"
+        );
+    }
+
+    /// Regression (hot retry loop): when every vector is rejected (e.g. a
+    /// dimension-mismatched/zero-length vector that `add_embedding`
+    /// refuses — the zero-vector case), retrying the same nodes on every
+    /// watcher batch burns CPU forever without progress. After enough
+    /// consecutive all-failed passes the callback must stop calling the
+    /// model.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_embed_circuit_breaks_after_repeated_all_fail_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&dir.path().join("brain.lbug")).unwrap());
+        insert_unembedded_symbol(&store, "sym-reject");
+        // Establish a dim-2 embedding index so the probe's dim-3 vector is
+        // always REJECTED by add_embedding's dimension guard.
+        assert!(store.add_embedding("seed-uid", vec![1.0_f32, 0.0]));
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let probe = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1_f32, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+
+        let cb = Arc::new(std::sync::Mutex::new(
+            DaemonService::make_embed_on_change_with(
+                embed_model,
+                store,
+                std::time::Duration::ZERO, // every pass runs
+            )
+            .expect("embed callback should be present when a model is loaded"),
+        ));
+
+        for _ in 0..DaemonService::EMBED_ON_CHANGE_MAX_ALL_FAIL_PASSES {
+            run_embed_cb(cb.clone()).await;
+        }
+        let after_failures = calls.load(Ordering::Relaxed);
+        assert_eq!(
+            after_failures,
+            DaemonService::EMBED_ON_CHANGE_MAX_ALL_FAIL_PASSES,
+            "each all-fail pass attempts the model exactly once"
+        );
+
+        // The circuit is now open: further batches must not call the model.
+        run_embed_cb(cb.clone()).await;
+        run_embed_cb(cb).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            after_failures,
+            "after repeated all-fail passes the callback must stop retrying the model"
+        );
+    }
+
+    /// Grab a free localhost port (bind :0, read the port, release).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn admin_serve_ui_request(port: u16) -> Request<ServeUiRequest> {
+        let mut request = Request::new(ServeUiRequest {
+            port: u32::from(port),
+            open_browser: false,
+            watch: false,
+            watch_repo_path: String::new(),
+            watch_instance_id: "default".to_string(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        request
+    }
+
+    /// Regression (dead URL): when the UI is already running, `serve_ui`
+    /// must report the ACTUAL running port — not the requested one —
+    /// because the CLI prints that port in the URL it shows the user.
+    #[tokio::test]
+    async fn serve_ui_already_running_reports_actual_port() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+
+        let port_a = free_port();
+        let resp = service
+            .serve_ui(admin_serve_ui_request(port_a))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "first serve_ui must start: {}", resp.message);
+        assert_eq!(resp.port, u32::from(port_a));
+        assert!(resp.error.is_empty());
+
+        // Re-ask with a DIFFERENT port: the response must carry port A.
+        let port_b = free_port();
+        let resp = service
+            .serve_ui(admin_serve_ui_request(port_b))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+        assert_eq!(
+            resp.port,
+            u32::from(port_a),
+            "already-running response must report the ACTUAL port, not the requested one"
+        );
+        assert!(
+            resp.message.contains(&port_a.to_string()),
+            "message must name the actual port: {}",
+            resp.message
+        );
+    }
+
+    /// Regression (ambiguous failure): a port bound by a FOREIGN process
+    /// must come back as ok:false with a machine-readable `port_in_use`
+    /// error code so the CLI can map it to a non-zero exit.
+    #[tokio::test]
+    async fn serve_ui_foreign_busy_port_returns_port_in_use() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy_port = blocker.local_addr().unwrap().port();
+
+        let resp = service
+            .serve_ui(admin_serve_ui_request(busy_port))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert_eq!(resp.error, "port_in_use");
+        assert_eq!(resp.port, 0);
+        drop(blocker);
+    }
+
     /// Build a minimal `DaemonState` with a writer-mode Tantivy index for
     /// exercising admin mutation RPCs in isolation.
     fn test_state_with_writer() -> Arc<DaemonState> {
@@ -11687,6 +12497,7 @@ mod startup_helper_tests {
             idle_notify: Arc::new(Notify::new()),
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
+            next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             permission_source: build_daemon_permission_source(None),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
@@ -11702,6 +12513,7 @@ mod startup_helper_tests {
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
+            ui_server: std::sync::Mutex::new(None),
         })
     }
 
@@ -11725,6 +12537,7 @@ mod startup_helper_tests {
             idle_notify: Arc::new(Notify::new()),
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
+            next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             permission_source,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
@@ -11740,7 +12553,99 @@ mod startup_helper_tests {
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
+            ui_server: std::sync::Mutex::new(None),
         })
+    }
+
+    #[tokio::test]
+    async fn typed_brain_search_enforces_request_repo_visibility_and_preserves_counts() {
+        use nestweaver_engine::authz::{Identity, StaticConfigPermissionSource};
+        use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        for repo in [
+            test_repo("repo:visible", "https://github.com/acme/visible.git", None),
+            test_repo("repo:hidden", "https://github.com/acme/hidden.git", None),
+        ] {
+            store.insert_repo(&repo).unwrap();
+        }
+        for (uid, repo_uid, name) in [
+            ("sym:visible", "repo:visible", "searchneedle_visible"),
+            ("sym:hidden", "repo:hidden", "searchneedle_hidden"),
+        ] {
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.to_string(),
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: repo_uid.to_string(),
+                    file_path: format!("src/{name}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: format!("fn {name}()"),
+                    summary: None,
+                    content_hash: format!("hash:{uid}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: Some(format!("canonical:{uid}")),
+                })
+                .unwrap();
+        }
+
+        let token = "scoped-query-token";
+        let source = Arc::new(StaticConfigPermissionSource::new(
+            [(token.to_string(), vec!["repo:visible".to_string()])]
+                .into_iter()
+                .collect(),
+        ));
+        let service = DaemonService::new(test_state_with_authz(store, source));
+        let search_request = |limit| BrainSearchRequest {
+            query: "searchneedle".to_string(),
+            limit,
+            response_format: None,
+            include_bodies: false,
+            prf: false,
+            rerank: false,
+            root: None,
+        };
+
+        // Warm the unrestricted cache scope first. The subsequent restricted
+        // request must neither reuse this response nor dispatch as `All`.
+        let mut unrestricted = Request::new(search_request(1));
+        unrestricted.extensions_mut().insert(Identity::Admin);
+        let unrestricted = service.search(unrestricted).await.unwrap().into_inner();
+        assert_eq!(unrestricted.total_matches, 2);
+        assert_eq!(unrestricted.results.len(), 1);
+        assert_eq!(unrestricted.returned_matches, 1);
+        assert_eq!(unrestricted.total_matches_relation, "eq");
+        assert!(unrestricted.truncated);
+
+        let mut request = Request::new(search_request(10));
+        request
+            .extensions_mut()
+            .insert(Identity::Token(token.to_string()));
+
+        let response = service.search(request).await.unwrap().into_inner();
+
+        assert_eq!(response.total_matches, 1);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.returned_matches, 1);
+        assert_eq!(response.total_matches_relation, "eq");
+        assert!(!response.truncated);
+        assert_eq!(response.results[0].uid, "sym:visible");
+        assert_eq!(
+            response.results[0].canonical_id.as_deref(),
+            Some("canonical:sym:visible")
+        );
+        assert!(
+            response.results.iter().all(|row| row.uid != "sym:hidden"),
+            "typed Search must not leak hidden symbol rows"
+        );
     }
 
     /// nw-050: a UDS trusted-admin request must see ALL repos under an enabled
@@ -11927,6 +12832,105 @@ mod startup_helper_tests {
             state.drained.load(Ordering::Relaxed),
             "shutdown must set drained immediately (before the drain wait loop) \
              so the worker pool stops claiming new jobs the moment shutdown begins"
+        );
+    }
+
+    /// health_check must report the daemon process's own PID so the CLI
+    /// can cross-check a pidfile PID against the socket-reported PID before
+    /// signaling it (a foreign PID planted in the pidfile fails that check).
+    #[tokio::test]
+    async fn health_check_reports_own_pid() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+        let resp = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("health check ok")
+            .into_inner();
+        assert_eq!(resp.pid, std::process::id());
+    }
+
+    /// A second watcher registration is refused without force; with
+    /// force the incumbent (possibly orphaned by a kill -9'd `watch` CLI) is
+    /// stopped and replaced — and the replaced watcher's exit-clear must not
+    /// wipe the replacement's registration.
+    #[test]
+    fn register_watcher_force_replaces_orphaned_incumbent() {
+        let state = test_state_with_writer();
+        let flag_a = Arc::new(AtomicBool::new(false));
+        let flag_b = Arc::new(AtomicBool::new(false));
+
+        let id_a = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag_a.clone()),
+            false,
+        )
+        .expect("first registration");
+
+        // Without force: refused, incumbent untouched.
+        let err = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag_b.clone()),
+            false,
+        )
+        .expect_err("second registration without force must fail");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(
+            !flag_a.load(Ordering::Relaxed),
+            "refused registration must not stop the incumbent"
+        );
+
+        // With force: incumbent stopped, replacement installed.
+        let id_b = register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag_b.clone()),
+            true,
+        )
+        .expect("force registration");
+        assert!(
+            flag_a.load(Ordering::Relaxed),
+            "force must stop the orphaned incumbent"
+        );
+        assert_ne!(id_a, id_b);
+        assert!(!flag_b.load(Ordering::Relaxed));
+
+        // The replaced watcher's exit-clear must NOT wipe the replacement.
+        clear_watcher_registration(&state, id_a);
+        assert!(
+            state.watcher_stop.lock().unwrap().is_some(),
+            "stale watcher exit must not clear the replacement's registration"
+        );
+        clear_watcher_registration(&state, id_b);
+        assert!(state.watcher_stop.lock().unwrap().is_none());
+    }
+
+    /// The shutdown RPC stops any active watcher up front, so an
+    /// orphaned watcher's blocking thread can't pin the drain until the
+    /// client's SIGKILL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_stops_active_watcher() {
+        let state = test_state_with_writer();
+        let flag = Arc::new(AtomicBool::new(false));
+        register_watcher(
+            &state,
+            nestweaver_engine::ShutdownHandle::from_flag(flag.clone()),
+            false,
+        )
+        .unwrap();
+
+        let service = DaemonService::new(state.clone());
+        let mut req = Request::new(ShutdownRequest {});
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let resp = service.shutdown(req).await.expect("shutdown ok");
+        assert!(resp.into_inner().ok);
+
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "shutdown must stop the active watcher"
+        );
+        assert!(
+            state.watcher_stop.lock().unwrap().is_none(),
+            "shutdown must unregister the watcher"
         );
     }
 
@@ -12201,5 +13205,238 @@ mod startup_helper_tests {
         assert!(!replica_mounts_admin_api(true, false));
         assert!(replica_mounts_admin_api(false, true));
         assert!(!replica_mounts_admin_api(false, false));
+    }
+}
+
+#[cfg(test)]
+mod watch_path_allowed_tests {
+    use super::*;
+    use nestweaver_engine::{RepoConfig, RepoType};
+
+    fn repo_cfg(url: &str, repo_type: Option<RepoType>) -> RepoConfig {
+        RepoConfig {
+            url: url.to_string(),
+            repo_type,
+            name: None,
+            sparse: None,
+            pin_sha: None,
+            use_git_activity: None,
+            branch: None,
+            poll: None,
+        }
+    }
+
+    /// Config repo URLs are `file://`-prefixed; the allow-list must
+    /// strip the scheme before canonicalizing, otherwise every entry drops
+    /// out and every watch is rejected.
+    #[test]
+    fn config_repo_canonical_path_strips_file_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let via_file_url = config_repo_canonical_path(&format!("file://{}", tmp.path().display()));
+        assert_eq!(via_file_url.as_deref(), Some(canonical.as_path()));
+
+        let via_plain = config_repo_canonical_path(&tmp.path().display().to_string());
+        assert_eq!(via_plain.as_deref(), Some(canonical.as_path()));
+
+        assert!(config_repo_canonical_path("file:///definitely/missing/path").is_none());
+    }
+
+    /// Without an instance config, an explicit `--repo` path must be
+    /// watchable (guarded by the unsafe-root denylist instead of failing
+    /// `failed_precondition`).
+    #[test]
+    fn no_config_allows_explicit_safe_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(watch_path_allowed(None, &canonical, "repo", false).is_ok());
+        assert!(watch_path_allowed(None, &canonical, "vault", true).is_ok());
+    }
+
+    /// Without a config, system roots are still refused.
+    #[test]
+    fn no_config_rejects_unsafe_roots() {
+        assert!(watch_path_allowed(None, std::path::Path::new("/"), "repo", false).is_err());
+        assert!(watch_path_allowed(None, std::path::Path::new("/usr"), "repo", false).is_err());
+    }
+
+    /// With a config, a repo registered via `file://` URL must pass the
+    /// allow-list (previously rejected because the scheme was never stripped).
+    #[test]
+    fn config_allows_file_url_registered_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        let canonical = std::fs::canonicalize(&repo_dir).unwrap();
+        let repos = vec![repo_cfg(
+            &format!("file://{}", repo_dir.display()),
+            Some(RepoType::Code),
+        )];
+        assert!(watch_path_allowed(Some(&repos), &canonical, "repo", false).is_ok());
+        // A subdirectory of a registered repo also passes (starts_with).
+        let sub = repo_dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let sub = std::fs::canonicalize(&sub).unwrap();
+        assert!(watch_path_allowed(Some(&repos), &sub, "repo", false).is_ok());
+    }
+
+    /// Paths outside the config's registered sources are still rejected, and
+    /// `vault_only` skips code-type entries.
+    #[test]
+    fn config_rejects_unregistered_and_vault_filter_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code_dir = tmp.path().join("code");
+        let vault_dir = tmp.path().join("vault");
+        std::fs::create_dir(&code_dir).unwrap();
+        std::fs::create_dir(&vault_dir).unwrap();
+        let code_canon = std::fs::canonicalize(&code_dir).unwrap();
+        let vault_canon = std::fs::canonicalize(&vault_dir).unwrap();
+        let repos = vec![
+            repo_cfg(
+                &format!("file://{}", code_dir.display()),
+                Some(RepoType::Code),
+            ),
+            repo_cfg(
+                &format!("file://{}", vault_dir.display()),
+                Some(RepoType::Vault),
+            ),
+        ];
+
+        assert!(watch_path_allowed(Some(&repos), &code_canon, "repo", false).is_ok());
+        // Vault watch must not match a code-type entry.
+        assert!(watch_path_allowed(Some(&repos), &code_canon, "vault", true).is_err());
+        assert!(watch_path_allowed(Some(&repos), &vault_canon, "vault", true).is_ok());
+        // Unregistered path rejected.
+        let other = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(watch_path_allowed(Some(&repos), &other, "repo", false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod watcher_e2e_tests {
+    use super::*;
+    use hyper_util::rt::TokioIo;
+    use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
+    use tonic::transport::{Channel, Endpoint, Uri};
+    use tower::service_fn;
+
+    async fn connect_uds(sock: &std::path::Path) -> Result<NestWeaverDaemonClient<Channel>, ()> {
+        let path = sock.to_path_buf();
+        let channel = Endpoint::try_from("http://[::]:50051")
+            .map_err(|_| ())?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let path = path.clone();
+                async move {
+                    let stream = tokio::net::UnixStream::connect(path).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
+            }))
+            .await
+            .map_err(|_| ())?;
+        Ok(NestWeaverDaemonClient::new(channel))
+    }
+
+    /// End-to-end over a real unix socket:
+    ///  - health_check reports the daemon's own PID (CLI pidfile cross-check);
+    ///  - a watch session whose CLI vanished (no StopWatch — the kill -9
+    ///    scenario) blocks a plain re-watch but is adoptable with force;
+    ///  - shutdown with an ACTIVE watcher completes promptly instead of
+    ///    hanging on the watcher's blocking thread until the drain ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn daemon_e2e_pid_watch_force_and_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("brain.lbug");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        let db_for_server = db_path.clone();
+        let server =
+            tokio::spawn(async move { run_server(&db_for_server, None, None, None).await });
+
+        let instance_id = lifecycle::instance_id_from_db_path(&db_path);
+        let sock = lifecycle::socket_path(&instance_id);
+
+        // Wait for the daemon's socket to accept connections.
+        let mut client = None;
+        for _ in 0..100 {
+            if sock.exists()
+                && let Ok(c) = connect_uds(&sock).await
+            {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut client = client.expect("daemon socket did not come up within 10s");
+
+        // The socket reports the daemon's own PID (in-process here, so
+        // it equals the test process PID).
+        let health = client
+            .health_check(nestweaver_proto::HealthCheckRequest {})
+            .await
+            .expect("health check")
+            .into_inner();
+        assert_eq!(health.pid, std::process::id());
+
+        let repo_str = repo.to_string_lossy().into_owned();
+        let mk_req = |force: bool| nestweaver_proto::WatchCodeRequest {
+            repo_path: repo_str.clone(),
+            instance_id: String::new(),
+            force,
+        };
+
+        let r1 = client
+            .watch_code(mk_req(false))
+            .await
+            .expect("watch_code")
+            .into_inner();
+        assert!(r1.ok, "first watch must start: {}", r1.message);
+
+        // Simulated orphan: the first "CLI" never calls StopWatch.
+        let r2 = client
+            .watch_code(mk_req(false))
+            .await
+            .expect("watch_code")
+            .into_inner();
+        assert!(!r2.ok, "second watch without force must be refused");
+        assert!(
+            r2.message.contains("already running"),
+            "unexpected refusal message: {}",
+            r2.message
+        );
+
+        // Force adopts the orphaned watcher slot.
+        let r3 = client
+            .watch_code(mk_req(true))
+            .await
+            .expect("watch_code")
+            .into_inner();
+        assert!(
+            r3.ok,
+            "force watch must adopt the orphaned slot: {}",
+            r3.message
+        );
+
+        // Shutdown with the watcher ACTIVE must stop it and exit
+        // promptly — the pre-fix SIGTERM/cleanup path left the watcher's
+        // blocking thread running, pinning process exit.
+        client
+            .shutdown(nestweaver_proto::ShutdownRequest {})
+            .await
+            .expect("shutdown RPC");
+
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(30), server)
+            .await
+            .expect("daemon must exit promptly with an active watcher (no drain hang)");
+        finished
+            .expect("server task panicked")
+            .expect("run_server error");
+
+        // run_server writes its log under the real per-user state dir —
+        // clean up this instance's artifacts.
+        let _ = std::fs::remove_dir_all(lifecycle::log_dir(&instance_id));
+        let _ = std::fs::remove_dir_all(lifecycle::runtime_dir(&instance_id));
     }
 }

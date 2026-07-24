@@ -434,6 +434,39 @@ mod tests {
 
     /// Adding a parameter to a committed public fn (changed only in the working
     /// tree) is a `ParamAdded` `Breaking` change.
+    /// nw-063 regression: TS `export function` must be visible to the contract
+    /// diff (the parser once marked it Private, silently disabling breaking-
+    /// change detection for every TypeScript export).
+    #[test]
+    fn breaking_changes_ts_param_added() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        init_repo(repo);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/api.ts"),
+            "export function chargeCustomer(id: string, amount: number): boolean {\n  return true;\n}\n",
+        )
+        .unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", "v1"]);
+        std::fs::write(
+            repo.join("src/api.ts"),
+            "export function chargeCustomer(id: string, amount: number, currency: string): boolean {\n  return true;\n}\n",
+        )
+        .unwrap();
+        let changes =
+            breaking_changes_from_git(repo, "HEAD", &[PathBuf::from("src/api.ts")]).unwrap();
+        assert_eq!(changes.len(), 1, "expected one TS change: {changes:?}");
+        assert_eq!(changes[0].kind, BreakKind::ParamAdded);
+        assert_eq!(changes[0].tier, BreakTier::Breaking);
+        assert_eq!(changes[0].symbol_name, "chargeCustomer");
+    }
+
     #[test]
     fn breaking_changes_param_added() {
         if !git_available() {

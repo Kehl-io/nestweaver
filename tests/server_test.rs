@@ -15,7 +15,9 @@ use nestweaver_client::hybrid::{
 };
 use nestweaver_client::upstream::UpstreamHandle;
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
-use nestweaver_proto::{BackupRequest, BrainStatusRequest, JsonRequest, RepoStatesRequest};
+use nestweaver_proto::{
+    BackupRequest, BrainSearchRequest, BrainStatusRequest, JsonRequest, RepoStatesRequest,
+};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tonic::transport::{Certificate, ClientTlsConfig};
@@ -96,6 +98,7 @@ fn index_repo(repo_dir: &std::path::Path, db_path: &std::path::Path) -> String {
     }
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -124,15 +127,17 @@ const HYBRID_TOKEN: &str = "hybrid-integration-secret-token-0123456789abcdef";
 /// Connect a local `DaemonClient` to an already-running daemon (started via
 /// `ServerGuard`) over its Unix domain socket. The socket is bound before the
 /// port file is written, so by the time `ServerGuard::start` returns it should
-/// exist — but retry briefly to absorb any accept-loop start-up jitter.
+/// exist — but retry briefly to absorb any accept-loop start-up jitter. The
+/// budget (10 s) is sized for full-workspace parallel test load, where the
+/// daemon's accept loop can be starved well past the old 10×150 ms window.
 async fn connect_local(db_path: &std::path::Path) -> DaemonClient {
     let mut last_err = None;
-    for _ in 0..10 {
+    for _ in 0..40 {
         match DaemonClient::connect_existing(db_path).await {
             Ok(client) => return client,
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
     }
@@ -144,7 +149,9 @@ async fn connect_local(db_path: &std::path::Path) -> DaemonClient {
 
 /// Build an `UpstreamHandle` in `Merge` mode pointing at a `ServerGuard`'s gRPC
 /// address with the given bearer token. Empty `repos` globs => matches every
-/// query, so the merge path always selects it.
+/// query, so the merge path always selects it. The upstream timeout is
+/// load-tolerant: 5 s was too tight when the full workspace test suite runs in
+/// parallel and the upstream server competes for CPU.
 fn merge_upstream(grpc_addr: String, token: &str) -> UpstreamHandle {
     let cfg = UpstreamConfig {
         name: Some("server".to_string()),
@@ -152,7 +159,7 @@ fn merge_upstream(grpc_addr: String, token: &str) -> UpstreamHandle {
         token: Some(token.to_string()),
         mode: RoutingMode::Merge,
         repos: vec![],
-        timeout: "5s".to_string(),
+        timeout: "15s".to_string(),
         ca_cert: None,
     };
     UpstreamHandle::from_config(&cfg).expect("build upstream handle")
@@ -180,6 +187,7 @@ fn server_starts_and_writes_port_file() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -210,6 +218,7 @@ async fn server_tcp_brain_status() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -260,6 +269,7 @@ async fn server_transport_parity() {
     // Index (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -350,6 +360,7 @@ async fn server_auth_rejects_unauthenticated() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -399,6 +410,7 @@ async fn server_auth_passes_valid_token() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -549,6 +561,7 @@ async fn server_tls_connection() {
     // Index first so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -611,6 +624,7 @@ async fn server_tls_rejects_plain_tcp() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -666,6 +680,7 @@ async fn server_repo_states_rpc() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -721,6 +736,7 @@ async fn server_mcp_http_initialize() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -768,6 +784,7 @@ async fn server_mcp_http_tools_list() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -816,6 +833,7 @@ async fn server_mcp_http_brain_status_tool() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -878,6 +896,7 @@ async fn server_mcp_sessions_tracked() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -997,6 +1016,7 @@ async fn server_mcp_http_reports_server_mode_true() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1053,6 +1073,7 @@ async fn server_mcp_http_read_symbols_takes_server_path() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1103,6 +1124,196 @@ async fn server_mcp_http_read_symbols_takes_server_path() {
     );
 }
 
+/// Regression guard: the authenticated MCP-HTTP boundary must redact blast
+/// totals before applying `limit`. A query-scoped caller must never receive the
+/// larger admin-visible total or any hidden repo identifiers.
+#[tokio::test]
+async fn server_mcp_http_blast_count_is_exact_within_visible_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("authz").join("test.lbug");
+    let visible_repo = dir.path().join("visible_repo");
+    let hidden_repo = dir.path().join("hidden_repo");
+
+    write_repo_files(
+        &visible_repo,
+        &[
+            (
+                "src/visible_target.js",
+                "export function visibleimpacttarget() { return 1; }",
+            ),
+            (
+                "src/visible_callers.js",
+                r#"
+import { visibleimpacttarget } from "./visible_target.js";
+export function visiblecaller_one() { return visibleimpacttarget(); }
+export function visiblecaller_two() { return visibleimpacttarget(); }
+"#,
+            ),
+        ],
+    );
+    write_repo_files(
+        &hidden_repo,
+        &[
+            (
+                "src/hidden_target.js",
+                "export function hiddenimpacttarget() { return 1; }",
+            ),
+            (
+                "src/hidden_callers.js",
+                r#"
+import { hiddenimpacttarget } from "./hidden_target.js";
+export function hiddencaller_one() { return hiddenimpacttarget(); }
+export function hiddencaller_two() { return hiddenimpacttarget(); }
+export function hiddencaller_three() { return hiddenimpacttarget(); }
+"#,
+            ),
+        ],
+    );
+    index_repo(&visible_repo, &db_path);
+    index_repo(&hidden_repo, &db_path);
+
+    let query_token = "authz-query-token-0123456789abcdef012345";
+    let admin_token = "authz-admin-token-0123456789abcdef012345";
+    let snapshots_dir = dir.path().join("snapshots");
+    let workspace_dir = dir.path().join("workspace");
+    let snapshots_dir = snapshots_dir.display().to_string();
+    let workspace_dir = workspace_dir.display().to_string();
+    let config_path = dir.path().join("instance.toml");
+    let config = format!(
+        r#"
+instance_id = "authz-process-test"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{snapshots_dir}"
+
+[workspace]
+backend = "local"
+path = "{workspace_dir}"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[authz.rules]
+"{query_token}" = ["*visible_repo*"]
+"#,
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let guard = helpers::server_guard::ServerGuard::start_with_admin_auth_and_config(
+        &db_path,
+        query_token,
+        admin_token,
+        &config_path,
+    );
+    let mcp_addr = guard.mcp_addr();
+    let client = reqwest::Client::new();
+    let arguments = json!({
+        "changed_files": ["src/visible_target.js", "src/hidden_target.js"],
+        "limit": 50
+    });
+
+    let admin_response = client
+        .post(format!("{mcp_addr}/mcp"))
+        .bearer_auth(admin_token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 51,
+            "method": "tools/call",
+            "params": {
+                "name": "blast_radius",
+                "arguments": arguments.clone()
+            }
+        }))
+        .send()
+        .await
+        .expect("admin MCP HTTP blast_radius request failed");
+    assert_eq!(admin_response.status(), 200);
+    let admin_body: Value = admin_response.json().await.unwrap();
+    assert_eq!(
+        admin_body["result"]["isError"],
+        json!(false),
+        "admin blast_radius failed: {admin_body}"
+    );
+    let admin = &admin_body["result"]["structuredContent"];
+
+    let query_response = client
+        .post(format!("{mcp_addr}/mcp"))
+        .bearer_auth(query_token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 52,
+            "method": "tools/call",
+            "params": {
+                "name": "blast_radius",
+                "arguments": {
+                    "changed_files": ["src/visible_target.js", "src/hidden_target.js"],
+                    "limit": 1
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("query MCP HTTP blast_radius request failed");
+    assert_eq!(query_response.status(), 200);
+    let query_body: Value = query_response.json().await.unwrap();
+    assert_eq!(
+        query_body["result"]["isError"],
+        json!(false),
+        "query-scoped blast_radius failed: {query_body}"
+    );
+    let visible = &query_body["result"]["structuredContent"];
+
+    let admin_total = admin["affected_symbol_count"]
+        .as_u64()
+        .expect("admin affected_symbol_count");
+    let visible_total = visible["affected_symbol_count"]
+        .as_u64()
+        .expect("visible affected_symbol_count");
+    assert_eq!(
+        admin_total, 5,
+        "admin fixture should include two visible and three hidden affected symbols: {admin}"
+    );
+    assert_eq!(
+        visible_total, 2,
+        "restricted total must count only the two visible affected symbols: {visible}"
+    );
+    assert_eq!(
+        visible["returned_affected_symbol_count"],
+        json!(1),
+        "small limit should return one visible row: {visible}"
+    );
+    assert_eq!(
+        visible["affected_symbols_truncated"],
+        json!(true),
+        "restricted total should remain exact when the visible rows are truncated: {visible}"
+    );
+
+    let admin_serialized = admin.to_string();
+    assert!(
+        admin_serialized.contains("hiddencaller"),
+        "admin fixture must prove hidden affected rows exist: {admin}"
+    );
+    let visible_serialized = visible.to_string();
+    for hidden_marker in [
+        "hidden_repo",
+        "hidden_callers.js",
+        "hiddenimpacttarget",
+        "hiddencaller",
+    ] {
+        assert!(
+            !visible_serialized.contains(hidden_marker),
+            "query-scoped output leaked {hidden_marker}: {visible}"
+        );
+    }
+}
+
 // ── Webhook integration tests ───────────────────────────────────────────
 
 /// Compute HMAC-SHA256 signature in GitHub's `sha256=<hex>` format.
@@ -1130,6 +1341,7 @@ async fn server_webhook_enqueues_job() {
     // Index once so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1200,6 +1412,7 @@ async fn server_webhook_gitea_enqueues_job() {
     // Index once so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1270,6 +1483,7 @@ async fn server_webhook_rejects_invalid_sig() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1327,6 +1541,7 @@ async fn server_webhook_dual_secret_rotation_accepts_old() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1408,6 +1623,7 @@ async fn server_webhook_rejects_missing_sig() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1453,6 +1669,7 @@ async fn server_webhook_rejects_bad_json() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1502,6 +1719,7 @@ async fn server_device_flow_grants_query_token_after_admin_approval() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1613,6 +1831,7 @@ async fn server_status_cli_happy_path_and_401() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1688,6 +1907,7 @@ async fn export_graph_rejects_file_output() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1748,6 +1968,7 @@ async fn export_graph_rejects_msgpack_file_output() {
     // Index first (no daemon) so the DB exists.
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -1814,7 +2035,7 @@ async fn export_graph_rejects_msgpack_file_output() {
 /// actually flowed across the boundary rather than the sources label being
 /// cosmetic.
 #[tokio::test]
-async fn hybrid_merge_combines_local_and_server_sources() {
+async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     let dir = tempfile::tempdir().unwrap();
 
     // Server side: repo A in its own subdir/DB (separate `server.port`).
@@ -1844,9 +2065,82 @@ async fn hybrid_merge_combines_local_and_server_sources() {
     let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
     let _local_guard = helpers::server_guard::ServerGuard::start(&db_local);
 
-    let local = connect_local(&db_local).await;
+    let mut local = connect_local(&db_local).await;
+
+    // The typed local transport must preserve the display-independent total.
+    let local_small = local
+        .inner_mut()
+        .search(BrainSearchRequest {
+            query: "fn".to_string(),
+            limit: 1,
+            response_format: None,
+            include_bodies: false,
+            prf: false,
+            rerank: false,
+            root: None,
+        })
+        .await
+        .expect("typed local brain_search limit=1")
+        .into_inner();
+    let local_large = local
+        .inner_mut()
+        .search(BrainSearchRequest {
+            query: "fn".to_string(),
+            limit: 20,
+            response_format: None,
+            include_bodies: false,
+            prf: false,
+            rerank: false,
+            root: None,
+        })
+        .await
+        .expect("typed local brain_search limit=20")
+        .into_inner();
+    assert_eq!(local_small.total_matches_relation, "eq");
+    assert_eq!(local_large.total_matches_relation, "eq");
+    assert_eq!(local_small.total_matches, local_large.total_matches);
+    assert_eq!(local_small.returned_matches, 1);
+    assert!(local_small.truncated);
+    assert_eq!(local_large.returned_matches, local_large.total_matches);
+    assert!(!local_large.truncated);
+
     let upstream = merge_upstream(server.grpc_addr(), HYBRID_TOKEN);
     let mut hybrid = HybridClient::from_parts(local, vec![upstream]);
+
+    // A source-side display cap makes the hybrid union a conservative lower
+    // bound even when the rows returned by both sources happen to be unique.
+    let merged_small = hybrid
+        .query("brain_search", &json!({ "query": "fn", "limit": 1 }))
+        .await
+        .expect("hybrid brain_search lower-bound merge query");
+    assert_eq!(merged_small["total_matches_relation"], "gte");
+    assert_eq!(
+        merged_small["returned_matches"].as_u64(),
+        merged_small["results"]
+            .as_array()
+            .map(|rows| rows.len() as u64)
+    );
+    assert_eq!(merged_small["truncated"], true);
+    assert!(merged_small["total_matches"].as_u64().is_some());
+
+    // With both sources complete, RRF dedup has the complete union and may
+    // report an exact total without summing overlapping source totals.
+    let merged_large = hybrid
+        .query("brain_search", &json!({ "query": "fn", "limit": 20 }))
+        .await
+        .expect("hybrid brain_search exact merge query");
+    assert_eq!(merged_large["total_matches_relation"], "eq");
+    assert_eq!(
+        merged_large["total_matches"].as_u64(),
+        merged_large["results"]
+            .as_array()
+            .map(|rows| rows.len() as u64)
+    );
+    assert_eq!(
+        merged_large["returned_matches"],
+        merged_large["total_matches"]
+    );
+    assert_eq!(merged_large["truncated"], false);
 
     // `serverfn` exists ONLY on the server. If it shows up in the merged
     // response, the server query genuinely contributed.
@@ -1873,6 +2167,9 @@ async fn hybrid_merge_combines_local_and_server_sources() {
         "merged results must contain the server-only symbol 'serverfn' \
          (proof the server side contributed); got {resp}"
     );
+    assert_eq!(resp["total_matches_relation"], "eq");
+    assert_eq!(resp["returned_matches"], resp["total_matches"]);
+    assert_eq!(resp["truncated"], false);
 
     // Symmetry: a local-only symbol must also surface through the same merge,
     // with both sources still labelled.
@@ -1888,6 +2185,62 @@ async fn hybrid_merge_combines_local_and_server_sources() {
     assert!(
         resp_local.to_string().contains("localfn"),
         "merged results must contain the local-only symbol 'localfn'; got {resp_local}"
+    );
+
+    // Exercise the real non-JSON CLI renderer through daemon + configured
+    // merge routing. A hybrid result must never claim it is a substring
+    // fallback merely because its engine is not the single-source "bm25".
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "server", &server.grpc_addr(), HYBRID_TOKEN);
+    // Retry-bound the CLI probe: even with the generous upstream timeout, a
+    // transient ejection under CI load may yield a local-only first answer;
+    // the circuit breaker re-probes and recovers, so the hybrid path must
+    // appear within a bounded number of attempts.
+    let mut stdout = String::new();
+    for attempt in 1..=10 {
+        let cli = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+            .args([
+                "brain",
+                "search",
+                "fn",
+                "--db",
+                &db_local.display().to_string(),
+                "--config",
+                &cfg_path.display().to_string(),
+            ])
+            .current_dir(dir.path())
+            // This probe exercises the DAEMON + hybrid routing path. CI's
+            // test job exports NESTWEAVER_NO_DAEMON=1, which (with Actions'
+            // ambient CI=true) activates the no-daemon bypass — and the
+            // direct path never federates, so the probe would see local-only
+            // results forever. Strip the bypass for this subprocess.
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .output()
+            .expect("run real hybrid text-mode CLI search");
+        assert!(
+            cli.status.success(),
+            "hybrid text-mode CLI failed: {}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        stdout = String::from_utf8_lossy(&cli.stdout).into_owned();
+        if stdout.contains("Brain search (hybrid)") {
+            break;
+        }
+        let stderr = String::from_utf8_lossy(&cli.stderr);
+        assert!(
+            attempt < 10,
+            "hybrid text output must identify the hybrid engine after {attempt} attempt(s):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    assert!(
+        stdout.contains("Brain search (hybrid)"),
+        "hybrid text output must identify the hybrid engine: {stdout}"
+    );
+    assert!(
+        !stdout.contains("substring fallback"),
+        "hybrid text output must not claim substring fallback: {stdout}"
     );
 }
 
@@ -2319,6 +2672,7 @@ async fn server_backup_rpc_produces_snapshot() {
 
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .args([
             "index",
             "--repo",
@@ -2407,6 +2761,10 @@ name = "{upstream_name}"
 url = "{upstream_grpc_addr}"
 token = "{token}"
 mode = "merge"
+# Generous timeout: the config default (1s) is too tight for a loaded CI
+# runner — one slow upstream response ejects the source and the merge
+# degrades to local-only, flaking the hybrid assertions below.
+timeout = "15s"
 "#
     );
     std::fs::write(path, toml).expect("write instance.toml");
@@ -2521,6 +2879,413 @@ async fn daemon_mcp_boundary_federates_two_tier() {
     assert!(
         meta["nestweaver.io/stale_repos"].is_array(),
         "stale_repos must be present as an array; got {meta}"
+    );
+}
+
+/// A repository-restricted HTTP caller must never inherit the broader
+/// configured upstream credential. The admin request proves the upstream
+/// fixture can return its hidden canary; the restricted request must keep only
+/// its already-authorized local tier and a generic, count-free withheld status.
+#[tokio::test]
+async fn daemon_mcp_boundary_withholds_two_tier_for_repo_restricted_caller() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let hidden_repo = dir.path().join("hidden_upstream_repo");
+    let db_server = dir.path().join("server").join("server.lbug");
+    write_repo_files(
+        &hidden_repo,
+        &[
+            (
+                "shared/entry.js",
+                "export function hiddenfederationcanary() { return 1; }",
+            ),
+            (
+                "hidden/secret-derived-path.js",
+                r#"
+import { hiddenfederationcanary } from "../shared/entry.js";
+export function hiddenfederationcaller() { return hiddenfederationcanary(); }
+"#,
+            ),
+        ],
+    );
+    index_repo(&hidden_repo, &db_server);
+    let upstream = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
+
+    let visible_repo = dir.path().join("visible_local_repo");
+    let db_local = dir.path().join("local").join("local.lbug");
+    write_repo_files(
+        &visible_repo,
+        &[
+            (
+                "shared/entry.js",
+                "export function visiblefederationcanary() { return 1; }",
+            ),
+            (
+                "tests/visible-federation.test.js",
+                "export function visiblefederationtest() { return 1; }",
+            ),
+        ],
+    );
+
+    // Keep a second local repository in the same fronting daemon. Its symbols
+    // and tests prove that repository scoping applies before each local
+    // TwoTier result is counted or serialized, not only before federation.
+    let hidden_local_repo = dir.path().join("hidden_local_repo");
+    write_repo_files(
+        &hidden_local_repo,
+        &[
+            (
+                "hidden/local-caller.js",
+                "export function hiddenlocalcaller() { return 1; }",
+            ),
+            (
+                "hidden/secret-local-path.test.js",
+                "export function hiddenlocaltest() { return 1; }",
+            ),
+        ],
+    );
+    index_repo(&hidden_local_repo, &db_local);
+    index_repo(&visible_repo, &db_local);
+    std::fs::write(
+        hidden_local_repo.join("hidden/secret-local-path.test.js"),
+        "export function hiddenlocaltest() { return 'hiddenbaserefcanary'; }",
+    )
+    .expect("dirty hidden local repo for base_ref scoping");
+    {
+        let store = nestweaver_store::GraphStore::open(&db_local).expect("open local graph");
+        let target = store
+            .lookup_symbols_by_name("visiblefederationcanary")
+            .expect("lookup visible target")
+            .remove(0);
+        for caller_name in [
+            "visiblefederationtest",
+            "hiddenlocalcaller",
+            "hiddenlocaltest",
+        ] {
+            let caller = store
+                .lookup_symbols_by_name(caller_name)
+                .unwrap_or_else(|error| panic!("lookup {caller_name}: {error}"))
+                .remove(0);
+            store
+                .insert_edge(&nestweaver_schema::ResolvedEdge {
+                    source_uid: caller.uid,
+                    target_uid: target.uid.clone(),
+                    edge_type: nestweaver_schema::EdgeType::Calls,
+                    confidence: 0.9,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap_or_else(|error| panic!("insert {caller_name} edge: {error}"));
+        }
+    }
+
+    let query_token = "restricted-query-token-0123456789abcdef";
+    let admin_token = "restricted-admin-token-0123456789abcdef";
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "broad-org", &upstream.grpc_addr(), HYBRID_TOKEN);
+    let mut config = std::fs::read_to_string(&cfg_path).expect("read instance config");
+    config.push_str(&format!(
+        r#"
+
+[authz.rules]
+"{query_token}" = ["*visible_local_repo*"]
+"#
+    ));
+    std::fs::write(&cfg_path, config).expect("write authz rule");
+
+    let fronting = helpers::server_guard::ServerGuard::start_with_admin_auth_and_config(
+        &db_local,
+        query_token,
+        admin_token,
+        &cfg_path,
+    );
+    let client = reqwest::Client::new();
+    let endpoint = format!("{}/mcp", fronting.mcp_addr());
+    let request = |id, tool_name: &str, arguments: Value| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }
+        })
+    };
+    let blast_arguments = json!({
+        "changed_files": ["shared/entry.js"],
+        "max_depth": 3
+    });
+
+    // Prove the configured service credential is broad enough to expose the
+    // upstream-only canary. This also warms the unrestricted local cache,
+    // guarding the restricted request against cross-scope reuse.
+    let admin_response = client
+        .post(&endpoint)
+        .bearer_auth(admin_token)
+        .json(&request(61, "blast_radius", blast_arguments.clone()))
+        .send()
+        .await
+        .expect("admin MCP request");
+    assert_eq!(admin_response.status(), 200);
+    let admin_body: Value = admin_response.json().await.expect("admin JSON");
+    let admin_structured = &admin_body["result"]["structuredContent"];
+    assert_eq!(
+        admin_structured["org_wide_impact"]["source_server"], "broad-org",
+        "fixture must reach the broad upstream: {admin_structured}"
+    );
+    assert!(
+        admin_structured["org_wide_impact"]
+            .to_string()
+            .contains("hiddenfederationcaller"),
+        "fixture must prove the upstream returns a hidden-only symbol: {admin_structured}"
+    );
+    assert!(
+        admin_structured["org_wide_impact"]
+            .to_string()
+            .contains("hidden/secret-derived-path.js"),
+        "fixture must prove the upstream returns a hidden-only path: {admin_structured}"
+    );
+
+    let restricted_response = client
+        .post(&endpoint)
+        .bearer_auth(query_token)
+        .json(&request(62, "blast_radius", blast_arguments))
+        .send()
+        .await
+        .expect("restricted MCP request");
+    assert_eq!(restricted_response.status(), 200);
+    let restricted_body: Value = restricted_response.json().await.expect("restricted JSON");
+    assert_eq!(
+        restricted_body["result"]["isError"], false,
+        "restricted request failed: {restricted_body}"
+    );
+
+    let structured = &restricted_body["result"]["structuredContent"];
+    assert_eq!(structured["tier"], "two_tier");
+    assert!(
+        structured["local_impact"]
+            .to_string()
+            .contains("visiblefederationcanary"),
+        "authorized local tier must remain available: {structured}"
+    );
+    let org = &structured["org_wide_impact"];
+    assert_eq!(org["status"], "withheld");
+    assert_eq!(org["reason"], "authorization-unproven");
+    assert_eq!(
+        org.as_object().expect("org status object").len(),
+        2,
+        "withheld org tier must expose no rows, paths, sources, or counts: {org}"
+    );
+
+    let serialized = restricted_body.to_string();
+    for hidden_marker in [
+        "hidden_upstream_repo",
+        "hidden/secret-derived-path.js",
+        "hiddenfederationcanary",
+        "hiddenfederationcaller",
+        "hidden_local_repo",
+        "hidden/local-caller.js",
+        "hidden/secret-local-path.test.js",
+        "hiddenlocalcaller",
+        "hiddenlocaltest",
+        "broad-org",
+    ] {
+        assert!(
+            !serialized.contains(hidden_marker),
+            "restricted response leaked hidden upstream marker {hidden_marker}: {restricted_body}"
+        );
+    }
+    let meta = &restricted_body["result"]["_meta"];
+    assert_eq!(meta["nestweaver.io/sources"], json!(["daemon"]));
+    assert_eq!(meta["nestweaver.io/scope"], "single-node");
+    assert_eq!(
+        meta["nestweaver.io/stale_repos"],
+        json!([]),
+        "global staleness cache must not leak repo URLs across caller scope"
+    );
+
+    // The unrestricted local tier proves both local repositories participate
+    // in impact traversal. The restricted HTTP route must remove hidden local
+    // rows before computing totals and before the federation envelope is
+    // assembled.
+    let impact_arguments = json!({
+        "symbol": "visiblefederationcanary",
+        "depth": 3
+    });
+    let admin_impact_response = client
+        .post(&endpoint)
+        .bearer_auth(admin_token)
+        .json(&request(63, "brain_impact", impact_arguments.clone()))
+        .send()
+        .await
+        .expect("admin brain_impact request");
+    assert_eq!(admin_impact_response.status(), 200);
+    let admin_impact_body: Value = admin_impact_response
+        .json()
+        .await
+        .expect("admin brain_impact JSON");
+    assert!(
+        admin_impact_body["result"]["structuredContent"]["local_impact"]
+            .to_string()
+            .contains("hiddenlocalcaller"),
+        "fixture must prove the unrestricted local impact includes a hidden-repo caller: \
+         {admin_impact_body}"
+    );
+
+    let restricted_impact_response = client
+        .post(&endpoint)
+        .bearer_auth(query_token)
+        .json(&request(64, "brain_impact", impact_arguments))
+        .send()
+        .await
+        .expect("restricted brain_impact request");
+    assert_eq!(restricted_impact_response.status(), 200);
+    let restricted_impact_body: Value = restricted_impact_response
+        .json()
+        .await
+        .expect("restricted brain_impact JSON");
+    let restricted_impact = &restricted_impact_body["result"]["structuredContent"]["local_impact"];
+    assert_eq!(restricted_impact["status"], "ok");
+    assert_eq!(restricted_impact["total"], 1);
+    assert_eq!(restricted_impact["returned"], 1);
+    assert!(
+        restricted_impact
+            .to_string()
+            .contains("visiblefederationtest"),
+        "authorized caller must remain in the local impact: {restricted_impact_body}"
+    );
+    assert!(
+        !restricted_impact_body.to_string().contains("hiddenlocal"),
+        "restricted brain_impact leaked a hidden local row or count marker: \
+         {restricted_impact_body}"
+    );
+    assert_eq!(
+        restricted_impact_body["result"]["structuredContent"]["org_wide_impact"],
+        json!({
+            "status": "withheld",
+            "reason": "authorization-unproven"
+        })
+    );
+
+    // The same boundary contract applies to affected-test selection: the
+    // hidden test is present for an admin, but it cannot contribute a row,
+    // path, summary count, or learned aggregate for the restricted caller.
+    let tests_arguments = json!({ "changed_files": ["shared/entry.js"] });
+    let admin_tests_response = client
+        .post(&endpoint)
+        .bearer_auth(admin_token)
+        .json(&request(65, "affected_tests", tests_arguments.clone()))
+        .send()
+        .await
+        .expect("admin affected_tests request");
+    assert_eq!(admin_tests_response.status(), 200);
+    let admin_tests_body: Value = admin_tests_response
+        .json()
+        .await
+        .expect("admin affected_tests JSON");
+    assert!(
+        admin_tests_body["result"]["structuredContent"]["local_impact"]
+            .to_string()
+            .contains("hiddenlocaltest"),
+        "fixture must prove the unrestricted selection includes the hidden local test: \
+         {admin_tests_body}"
+    );
+
+    let restricted_tests_response = client
+        .post(&endpoint)
+        .bearer_auth(query_token)
+        .json(&request(66, "affected_tests", tests_arguments))
+        .send()
+        .await
+        .expect("restricted affected_tests request");
+    assert_eq!(restricted_tests_response.status(), 200);
+    let restricted_tests_body: Value = restricted_tests_response
+        .json()
+        .await
+        .expect("restricted affected_tests JSON");
+    let restricted_tests = &restricted_tests_body["result"]["structuredContent"]["local_impact"];
+    assert_eq!(
+        restricted_tests["summary"],
+        "1 tier-1, 0 tier-2, 0 tier-3 tests affected"
+    );
+    assert!(
+        restricted_tests
+            .to_string()
+            .contains("visiblefederationtest"),
+        "authorized test must remain selected: {restricted_tests_body}"
+    );
+    assert!(
+        !restricted_tests_body.to_string().contains("hiddenlocal"),
+        "restricted affected_tests leaked a hidden local row, path, or count marker: \
+         {restricted_tests_body}"
+    );
+    assert!(
+        restricted_tests["measured"].is_null(),
+        "restricted affected_tests must not expose an unscoped measured aggregate: \
+         {restricted_tests_body}"
+    );
+    assert_eq!(
+        restricted_tests_body["result"]["structuredContent"]["org_wide_impact"],
+        json!({
+            "status": "withheld",
+            "reason": "authorization-unproven"
+        })
+    );
+
+    let base_ref_arguments = json!({ "base_ref": "HEAD" });
+    let admin_base_ref_response = client
+        .post(&endpoint)
+        .bearer_auth(admin_token)
+        .json(&request(67, "affected_tests", base_ref_arguments.clone()))
+        .send()
+        .await
+        .expect("admin affected_tests base_ref request");
+    assert_eq!(admin_base_ref_response.status(), 200);
+    let admin_base_ref_body: Value = admin_base_ref_response
+        .json()
+        .await
+        .expect("admin affected_tests base_ref JSON");
+    // Tolerate transient single-node degradation: under load the upstream can
+    // be momentarily ejected, dropping the two-tier envelope for this one
+    // request — the fixture property (admin sees the hidden local repo) holds
+    // in either envelope shape. The authz assertions below stay strict.
+    let admin_base_ref_content = &admin_base_ref_body["result"]["structuredContent"];
+    let admin_base_ref_changed = if admin_base_ref_content["local_impact"].is_object() {
+        admin_base_ref_content["local_impact"]["changed_files"].to_string()
+    } else {
+        admin_base_ref_content["changed_files"].to_string()
+    };
+    assert!(
+        admin_base_ref_changed.contains("secret-local-path.test.js"),
+        "fixture must prove unrestricted base_ref selected the first, hidden local repo: \
+         {admin_base_ref_body}"
+    );
+
+    let restricted_base_ref_response = client
+        .post(&endpoint)
+        .bearer_auth(query_token)
+        .json(&request(68, "affected_tests", base_ref_arguments))
+        .send()
+        .await
+        .expect("restricted affected_tests base_ref request");
+    assert_eq!(restricted_base_ref_response.status(), 200);
+    let restricted_base_ref_body: Value = restricted_base_ref_response
+        .json()
+        .await
+        .expect("restricted affected_tests base_ref JSON");
+    assert_eq!(
+        restricted_base_ref_body["result"]["structuredContent"]["local_impact"]["changed_files"],
+        json!([]),
+        "restricted base_ref must diff the sole visible local repository: \
+         {restricted_base_ref_body}"
+    );
+    assert!(
+        !restricted_base_ref_body
+            .to_string()
+            .contains("secret-local-path.test.js"),
+        "restricted base_ref leaked a changed path from the hidden local repository: \
+         {restricted_base_ref_body}"
     );
 }
 

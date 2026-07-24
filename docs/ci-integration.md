@@ -257,7 +257,11 @@ jobs:
           category: nestweaver-blast-radius
 ```
 
-The SARIF carries the full trust contract, so reviewers see it inline:
+The SARIF carries the full trust contract. Two rendering tiers apply on
+GitHub: **results and tool-execution notifications render in the PR / Security
+tab**, while the namespaced `nestweaver/*` property bags are preserved but NOT
+displayed by GitHub's UI — they are for machine consumers (gating scripts,
+SARIF viewers, downstream tooling) reading the file directly:
 
 - **`invocations[].executionSuccessful` + `toolExecutionNotifications`** — a
   degraded/incomplete run is visible, never silently reported as "clean".
@@ -286,10 +290,19 @@ Integrators parsing both surfaces should map:
 | `gate_state`            | `run.properties["nestweaver/gateState"]`          |
 | `status`                | `run.properties["nestweaver/status"]`             |
 | `risk_level`            | `run.properties["nestweaver/riskLevel"]`          |
+| `affected_symbol_count` | `run.properties["nestweaver/affectedSymbolCount"]` |
+| `returned_affected_symbol_count` | `run.properties["nestweaver/returnedAffectedSymbolCount"]` |
+| `affected_symbols_truncated` | `run.properties["nestweaver/affectedSymbolsTruncated"]` |
 | `blind_spots`           | `run.properties["nestweaver/blindSpots"]`         |
 | `analysis_direction`    | `run.properties["nestweaver/analysisDirection"]`  |
 | `coverage`              | `run.properties["nestweaver/coverage"]`           |
 | (per-result severity provenance) | `result.properties["nestweaver/severitySource"]` |
+
+`affected_symbol_count` is the authorized total before the presentation
+`limit`; `returned_affected_symbol_count` is the number of rows actually
+serialized. Authorization redaction always precedes count exposure and SARIF
+rendering, so hidden symbols cannot influence these totals or appear as SARIF
+results.
 
 Two things do **not** change casing across surfaces:
 
@@ -317,6 +330,100 @@ strict_block_on_high_risk = false # default — the risk score stays advisory
 **Locally**, the same output is one command away — `nestweaver hooks --install`
 adds an advisory pre-push check (see the CLI guide), and `--sarif` can be opened
 in the VS Code *SARIF Viewer* extension for inline review before you push.
+
+## Measuring your own miss rate
+
+`affected_tests` selections are recorded locally (`<db>.rts_selections.jsonl`;
+opt out with `NESTWEAVER_RTS_NO_RECORD=1`). Feed it ground truth from the
+periodic full-suite run the selection wedge already requires, and NestWeaver
+reports its own measured recall — the number competitors like Facebook PTS
+(>99.9% faulty-change recall) and Launchable (empirical confidence curves)
+publish, computed on *your* history:
+
+```yaml
+# after the periodic FULL test run (same sha the selection ran against):
+- name: Report full-suite outcome to NestWeaver
+  if: always()
+  run: |
+    if [ -s failed-test-files.txt ]; then
+      nestweaver rts-eval record-truth --sha "$GITHUB_SHA" \
+        --failed-test-files $(cat failed-test-files.txt) \
+        --total-test-files "$(wc -l < all-test-files.txt)"
+    else
+      nestweaver rts-eval record-truth --sha "$GITHUB_SHA" --none-failed \
+        --total-test-files "$(wc -l < all-test-files.txt)"
+    fi
+- name: Selection quality report
+  run: nestweaver rts-eval report --json
+```
+
+`rts-eval report` joins selections with truth by commit sha and emits rolling
+**file recall** (of the test files that failed in full runs, how many the
+selection had included — the safety-relevant number), **change recall**
+(failing runs where ≥1 failed file was selected), **selection breadth**
+(honestly *not* labelled precision — unexecuted selected tests have unknown
+outcomes), and a file-count **time-saved proxy**. Below 10 joined pairs the
+report refuses to print percentages at all, and `affected_tests` results only
+carry the in-band `measured` field once that bar clears — an unmeasured
+selection never reads as a measured guarantee.
+
+## How accurate is this, honestly?
+
+Published research measures static regression test selection against *dynamic*
+(coverage-traced) selection as the oracle. The result you should know before
+trusting `affected_tests`:
+
+| Approach | Safety violations vs dynamic oracle | Source |
+| --- | --- | --- |
+| Dynamic, file-level (Ekstazi) | analytically safe (proof, not a statistic) | ISSTA 2015 |
+| Static, **class**-level | 0.2% of revisions (avg magnitude 6.8%) | FSE 2016, 985 revisions / 22 projects |
+| Static, **method/symbol**-level | **10.6% of revisions (avg 15.6%)** | FSE 2016 |
+| Reflection-unaware static | 5.8% average safety violation | OOPSLA 2019, 1173 versions / 24 projects |
+
+NestWeaver's selection is static and symbol-granular — the row with the worst
+published safety record — and **reflection is the dominant named cause** of
+static RTS false negatives, which is exactly why `dynamic-dispatch` and
+`reflection` are declared blind spots on every result.
+
+What we do about it, rather than hiding it:
+
+- **We never claim safety.** The tiers are a prioritized signal; `status`,
+  `gate_state`, and `recommendation` tell CI when not to trust them.
+- **Degraded runs widen, never narrow** — `recommendation: run-full-suite`.
+- **Unrecognized file types widen too** — a changed file whose extension the
+  indexer doesn't know (Makefile, CI YAML, `.sql`, `.proto`, …) can't be mapped
+  to symbols, so the result reports `status: partial` with
+  `recommendation: run-full-suite` instead of silently reporting `complete`.
+  Markdown-only changes stay `complete` (docs can't break code).
+- **Changed and recently-failed tests are always included** regardless of what
+  the graph says, so the common miss cases are covered by rule rather than by
+  traversal.
+- **We measure our own miss rate** (see above) instead of asserting one. No
+  coverage-based vendor publishes an accuracy number at all; the only published
+  figures in this space come from ML-based tools.
+
+The honest summary: run `affected_tests` for fast feedback, keep a periodic
+full-suite run as the safety net, and use `rts-eval report` to learn what your
+*actual* recall is on your codebase rather than trusting anyone's marketing.
+
+## Index freshness gate
+
+`affected_tests` and blast-radius results are only as current as the index.
+`stale-check` doubles as a CI freshness gate: it exits **1** when any repo's
+indexed SHA is behind git HEAD **or** its working tree has been deleted
+(flagged `[missing]` in text output, `status: "missing"` in JSON). The JSON
+carries an accurate `stale_repos` array, so a job can fail fast and name the
+repos to re-index:
+
+```yaml
+- name: Fail if the NestWeaver index is stale
+  run: nestweaver stale-check --db nestweaver.lbug   # exit 1 = re-index needed
+```
+
+Read/lookup commands against a non-existent database also fail (exit 1,
+`db_not_found`) instead of creating an empty DB and reporting success — a CI
+job pointed at the wrong `--db` path fails loudly rather than passing on an
+empty graph.
 
 ## Networking
 

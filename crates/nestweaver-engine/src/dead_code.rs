@@ -67,17 +67,29 @@ pub struct DeadCodeResult {
     pub reachable_symbols: usize,
     pub dead_percentage: f64,
     /// Number of symbols excluded from analysis (type-only symbols, `.d.ts`
-    /// declarations, properties). These are not counted in `total_symbols`.
+    /// declarations, properties, module declarations). These are not counted
+    /// in `total_symbols`.
     pub excluded_count: usize,
 }
 
 /// Returns `true` for symbols that should be excluded from dead code analysis
 /// because they are type-only constructs (erased at compile/runtime), live in
-/// `.d.ts` declaration files, or are properties (often accessed dynamically).
+/// `.d.ts` declaration files, are properties (often accessed dynamically), or
+/// are module declarations (e.g. Rust `pub mod alpha;` — a module is an
+/// organizational declaration, never *called* from an entry point, yet it IS
+/// the crate's public API surface, so reporting it as unreachable is pure
+/// noise).
+///
+/// `SymbolKind` was surveyed for other non-callable declaration kinds:
+/// `TypeAlias`/`Interface`/`Property` were already excluded; `Module` is the
+/// only remaining declaration kind that cannot be reached by a call edge.
+/// `Extension` is a member container analyzed like `Class` (its methods are
+/// `Method` symbols); `Trait`/`Enum`/`Constant`/`Variable` are referenceable
+/// items that can legitimately be dead, so they stay in the analysis.
 fn is_excluded_from_dead_code(sym: &nestweaver_schema::Symbol) -> bool {
     matches!(
         sym.kind,
-        SymbolKind::TypeAlias | SymbolKind::Interface | SymbolKind::Property
+        SymbolKind::TypeAlias | SymbolKind::Interface | SymbolKind::Property | SymbolKind::Module
     ) || sym.file_path.ends_with(".d.ts")
 }
 
@@ -104,6 +116,15 @@ const WEAK_EDGE_THRESHOLD: f32 = 0.5;
 /// If `manifests` is provided, symbols whose file paths match `main`, `bin`,
 /// or `exports` entries in a package.json manifest are treated as additional
 /// entry points.
+///
+/// **Known limitation — visibility is not persisted.** Symbol reads rebuild
+/// `visibility` as `Visibility::Inferred` for every row (see
+/// `nestweaver-store/src/read.rs`), so the confidence scoring below cannot
+/// tell a crate-public API function from a private helper: everything scores
+/// off the inferred-visibility heuristic, and genuinely public (externally
+/// consumed) symbols may be reported as Low-confidence dead code. Treat Low
+/// results as review candidates, not proof. Persisting visibility is a
+/// schema change and is deliberately NOT attempted here.
 ///
 /// **Performance note**: The BFS itself is O(V+E) and fast. On large graphs
 /// (80K+ symbols, 100K+ edges), the dominant cost is loading all symbols and
@@ -1093,6 +1114,34 @@ mod tests {
         let result = detect_dead_code(&store).unwrap();
         assert_eq!(result.excluded_count, 1);
         assert_eq!(result.total_symbols, 1);
+    }
+
+    #[test]
+    fn module_excluded_from_dead_code() {
+        // Rust `pub mod alpha;` produces a Module symbol that no entry point
+        // ever *calls* — it is the crate's public API surface, not dead code.
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("entry", "main", true))
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol_with_kind(
+                "mod-alpha",
+                "alpha",
+                SymbolKind::Module,
+                "src/lib.rs",
+                false,
+            ))
+            .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        assert_eq!(result.excluded_count, 1);
+        assert_eq!(result.total_symbols, 1);
+        assert!(
+            result.unreachable_symbols.is_empty(),
+            "module declarations must not be reported as unreachable: {:?}",
+            result.unreachable_symbols
+        );
     }
 
     // ── Dead class method dedup tests ──

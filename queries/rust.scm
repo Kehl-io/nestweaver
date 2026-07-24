@@ -67,16 +67,11 @@
 (macro_invocation
   macro: (identifier) @name) @reference.call
 
-; Use declarations as imports
-(use_declaration
-  argument: (scoped_identifier) @name) @reference.import
-
-(use_declaration
-  argument: (identifier) @name) @reference.import
-
-(use_declaration
-  argument: (use_as_clause
-    path: (scoped_identifier) @name)) @reference.import
+; Use declarations as imports. The whole declaration is captured and expanded
+; in parse.rs (expand_rust_use_imports) so list forms (`use a::{b, c};`),
+; wildcards (`use a::*;`) and aliases (`use a::b as c;`) all yield import
+; references — tree-sitter patterns cannot express the per-leaf expansion.
+(use_declaration) @reference.rust_use
 
 ; Trait implementations as extends
 (impl_item

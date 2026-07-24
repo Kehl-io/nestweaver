@@ -34,8 +34,10 @@ impl EmbedQueryFn for nestweaver_embed::EmbedModel {
 /// - `weight_ppr = 0.40` — structural signal from Personalized PageRank.
 /// - `weight_bm25 = 0.25` — lexical relevance covers what graph
 ///   structure misses (freshly-mentioned terms, exact matches).
-/// - `weight_semantic = 0.35` — embedding-based similarity; set to 0.0
-///   if embeddings are not generated yet (`nestweaver embed`).
+/// - `weight_semantic = 0.35` — embedding-based similarity. Effectively
+///   0.0 on databases without generated embeddings (`nestweaver embed`):
+///   the semantic leg is skipped entirely when the store holds no
+///   embedding vectors, so no BERT forward pass is paid.
 /// - `bm25_limit = 500` — large enough that BM25's tail is comparable
 ///   to PPR's. 500 keeps the candidate pool symmetric.
 /// - `semantic_limit = 200` — cap on vector KNN results fed into
@@ -97,16 +99,27 @@ pub struct SymbolDetail {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SymbolCandidate {
     pub uid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<String>,
     pub name: String,
     pub kind: String,
     pub file_path: String,
     pub start_line: u32,
 }
 
+/// Engine-facing counted symbol candidates. The total relation is preserved
+/// verbatim from the bounded store search.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SymbolCandidatePage {
+    pub results: Vec<SymbolCandidate>,
+    pub total: nestweaver_store::tantivy_index::SearchTotal,
+}
+
 impl From<&Symbol> for SymbolCandidate {
     fn from(s: &Symbol) -> Self {
         SymbolCandidate {
             uid: s.uid.clone(),
+            canonical_id: s.canonical_id.clone(),
             name: s.name.clone(),
             kind: s.kind.to_string(),
             file_path: s.file_path.clone(),
@@ -252,14 +265,128 @@ pub fn search_symbols(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SymbolCandidate>, anyhow::Error> {
-    let syms = store
-        .search_symbols_by_name(
+    Ok(search_symbols_page(store, query, limit)?.results)
+}
+
+/// Search for a bounded page of ranked symbols and independent total metadata.
+pub fn search_symbols_page(
+    store: &GraphStore,
+    query: &str,
+    limit: usize,
+) -> Result<SymbolCandidatePage, anyhow::Error> {
+    let page = store
+        .search_symbols_by_name_page(
             query,
             limit,
             &nestweaver_store::SeedResolutionConfig::default(),
         )
         .context("search_symbols_by_name")?;
-    Ok(syms.iter().map(SymbolCandidate::from).collect())
+    Ok(SymbolCandidatePage {
+        results: page.symbols.iter().map(SymbolCandidate::from).collect(),
+        total: page.total,
+    })
+}
+
+#[cfg(test)]
+mod counted_symbol_search_tests {
+    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+    use nestweaver_store::{GraphStore, TantivyIndex, tantivy_index::SearchTotalRelation};
+
+    use super::{search_symbols, search_symbols_page};
+
+    fn symbol(uid: &str, name: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: format!("src/{uid}.rs"),
+            start_line: 1,
+            end_line: 2,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: Some(format!("canonical:{uid}")),
+        }
+    }
+
+    #[test]
+    fn search_symbols_page_preserves_ranked_results_and_count_metadata() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&symbol("s1", "Payment")).unwrap();
+        store
+            .insert_symbol(&symbol("s2", "PaymentGateway"))
+            .unwrap();
+
+        let page = search_symbols_page(&store, "payment", 1).unwrap();
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.total.value, 2);
+        assert_eq!(page.total.relation, SearchTotalRelation::Exact);
+        assert_eq!(
+            page.results[0].canonical_id.as_deref(),
+            Some("canonical:s1")
+        );
+
+        let legacy = search_symbols(&store, "payment", 1).unwrap();
+        assert_eq!(page.results[0].uid, legacy[0].uid);
+    }
+
+    #[test]
+    fn engine_symbol_search_rejects_extreme_presentation_limits() {
+        use nestweaver_store::SEARCH_PRESENTATION_LIMIT_MAX;
+
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&symbol("s1", "Payment")).unwrap();
+
+        assert!(search_symbols(&store, "payment", 0).unwrap().is_empty());
+        assert!(
+            search_symbols_page(&store, "payment", 0)
+                .unwrap()
+                .results
+                .is_empty()
+        );
+        assert!(search_symbols(&store, "payment", SEARCH_PRESENTATION_LIMIT_MAX).is_ok());
+        assert!(search_symbols_page(&store, "payment", SEARCH_PRESENTATION_LIMIT_MAX).is_ok());
+        for over_limit in [SEARCH_PRESENTATION_LIMIT_MAX + 1, usize::MAX] {
+            assert!(search_symbols(&store, "payment", over_limit).is_err());
+            assert!(search_symbols_page(&store, "payment", over_limit).is_err());
+        }
+    }
+
+    #[test]
+    fn search_symbols_keeps_same_title_note_and_code_symbol_in_distinct_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        index
+            .update_note(
+                "note:payment",
+                "Payment",
+                "vlt:t",
+                &["payment".to_string()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let note_page = index.search_page("payment", 1).unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&symbol("sym:payment", "Payment"))
+            .unwrap();
+        let symbol_page = search_symbols_page(&store, "payment", 1).unwrap();
+
+        assert_eq!(note_page.total.value, 1);
+        assert_eq!(symbol_page.total.value, 1);
+        assert_eq!(note_page.total.value + symbol_page.total.value, 2);
+    }
 }
 
 // ── Context command types ─────────────────────────────────────────────────────
@@ -1082,6 +1209,65 @@ pub fn build_brain_context(
     )
 }
 
+/// Whether the store's embedding sidecar index holds any vectors.
+///
+/// The semantic leg embeds the query text with a full BERT forward pass
+/// whenever `weight_semantic > 0` — pure waste on databases where
+/// `nestweaver embed` never ran, since there are no vectors to match
+/// against. The determination is a per-store property, so it is cached
+/// keyed by db path. A positive probe is invalidated whenever
+/// `graph_generation` changes; a negative probe is additionally
+/// time-bounded (30s) because the embed path adds vectors without
+/// advancing the generation, so embeddings added while the process is
+/// live (e.g. `nestweaver embed` against a running daemon) are picked up
+/// within seconds rather than after an unrelated mutation or a restart.
+/// In-memory stores (no db path) probe directly — `embedding_count` is a
+/// mutex-guarded `len()`.
+fn store_has_embeddings(store: &GraphStore) -> bool {
+    let Some(db_path) = store.db_path().map(std::path::Path::to_path_buf) else {
+        return store.embedding_count() > 0;
+    };
+    let generation = store.graph_generation();
+    struct Entry {
+        generation: u64,
+        has: bool,
+        probed_at: std::time::Instant,
+    }
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Entry>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    match cache.get(&db_path) {
+        // A POSITIVE probe is generation-keyed: embeddings are only added,
+        // and a graph mutation re-probes.
+        Some(entry) if entry.has && entry.generation == generation => true,
+        // A NEGATIVE probe is only trusted briefly: the daemon's embed path
+        // adds and flushes vectors WITHOUT advancing the graph generation,
+        // so a cached "no embeddings" would otherwise hide live embeddings
+        // until an unrelated mutation or a restart.
+        Some(entry)
+            if !entry.has
+                && entry.generation == generation
+                && entry.probed_at.elapsed() < std::time::Duration::from_secs(30) =>
+        {
+            false
+        }
+        _ => {
+            let has = store.embedding_count() > 0;
+            cache.insert(
+                db_path,
+                Entry {
+                    generation,
+                    has,
+                    probed_at: std::time::Instant::now(),
+                },
+            );
+            has
+        }
+    }
+}
+
 /// Hybrid PPR + BM25 retrieval.
 ///
 /// When `tantivy` is supplied, runs BM25 over the seed strings and fuses
@@ -1306,14 +1492,20 @@ pub fn build_brain_context_hybrid_with_aliases(
     seed_uids.retain(|u| seen.insert(u.clone()));
 
     // ── Semantic seed blending ────────────────────────────────────────────
-    // When an embedding model is available and the semantic weight is nonzero,
-    // run a vector KNN search over the entire graph. The top-k hits are
+    // When an embedding model is available and the semantic weight is nonzero
+    // AND the store actually holds embedding vectors (otherwise the whole leg
+    // is a wasted BERT forward pass — see `store_has_embeddings`), run a
+    // vector KNN search over the entire graph. The top-k hits are
     // injected as PPR seeds (always-blend) so the walk explores semantically
     // relevant neighborhoods even when the textual seeds miss them. The full
     // hit list is passed to weighted_score_fuse as the semantic signal.
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();
     if let Some(model) = embed_model
         && config.weight_semantic > 0.0
+        // No vectors in the store → the semantic leg can contribute
+        // nothing; skip the BERT forward pass entirely (perf: this made
+        // every brain_context pay a full embed on un-embedded DBs).
+        && store_has_embeddings(store)
     {
         let query_text = inputs.join(" ");
         if let Ok(query_emb) = model.embed_query(&query_text) {
@@ -2847,6 +3039,7 @@ mod fusion_tests {
                 kind: "function".into(),
                 title: "b".into(),
                 vault_uid: "v".into(),
+                note_uid: String::new(),
                 score: 10.0,
             },
             SearchHit {
@@ -2854,6 +3047,7 @@ mod fusion_tests {
                 kind: "function".into(),
                 title: "c".into(),
                 vault_uid: "v".into(),
+                note_uid: String::new(),
                 score: 8.0,
             },
         ];
@@ -2874,6 +3068,7 @@ mod fusion_tests {
             kind: "function".into(),
             title: "a".into(),
             vault_uid: "v".into(),
+            note_uid: String::new(),
             score: 5.0,
         }];
         let results = weighted_score_fuse(&ppr, &bm25, &[], 0.70, 0.30, 0.0);
@@ -2968,6 +3163,112 @@ mod instance_validation_tests {
         assert!(
             msg.contains("instance merge --from c37ccf01 --to kory-brain"),
             "{msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod semantic_leg_tests {
+    use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
+
+    use super::{EmbedQueryFn, HybridSearchConfig, build_brain_context_hybrid_with_aliases};
+
+    /// Embed model that records how often the (expensive) BERT forward pass
+    /// ran, so tests can prove the semantic leg was skipped entirely.
+    struct CountingEmbed {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbed {
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl EmbedQueryFn for CountingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![0.0; 4])
+        }
+    }
+
+    fn store_with_symbol() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        let symbol = Symbol {
+            uid: "sym:payment".to_string(),
+            name: "Payment".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: "src/payment.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: "fn Payment()".to_string(),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&symbol).unwrap();
+        store
+    }
+
+    fn run_context(store: &GraphStore, model: &CountingEmbed) {
+        let config = HybridSearchConfig {
+            weight_semantic: 0.35,
+            ..HybridSearchConfig::default()
+        };
+        build_brain_context_hybrid_with_aliases(
+            store,
+            &["Payment".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(model),
+            None,
+        )
+        .expect("brain_context must succeed");
+    }
+
+    #[test]
+    fn semantic_leg_skipped_when_store_has_no_embeddings() {
+        // Regression: brain_context used to pay a full BERT forward pass per
+        // call even on databases with zero embedding vectors, where the
+        // semantic leg can contribute nothing (p50 24-27s in debug builds).
+        let store = store_with_symbol();
+        assert_eq!(store.embedding_count(), 0);
+        let model = CountingEmbed { calls: 0.into() };
+
+        run_context(&store, &model);
+
+        assert_eq!(
+            model.call_count(),
+            0,
+            "no embedding vectors in the DB → the semantic leg must not run the BERT embed"
+        );
+    }
+
+    #[test]
+    fn semantic_leg_runs_when_store_has_embeddings() {
+        // Control: once vectors exist, the semantic leg fires as before.
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+        let model = CountingEmbed { calls: 0.into() };
+
+        run_context(&store, &model);
+
+        assert_eq!(
+            model.call_count(),
+            1,
+            "embedding vectors present → the semantic leg must embed the query"
         );
     }
 }
