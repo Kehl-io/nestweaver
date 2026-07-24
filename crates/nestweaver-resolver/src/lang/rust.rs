@@ -60,6 +60,15 @@ pub fn resolve_import(
             resolve_module_path(&base, &rest[ups - 1..], known_files)
         }
         crate_name => {
+            // Rust built-in libraries are never workspace crates — resolve
+            // them to nothing BEFORE any fallback can bind them to a local
+            // module (`use std::fs` must not edge to `src/fs.rs`, P2 review).
+            // Third-party crates (tokio, serde, …) still rely on the
+            // ambiguity guards below; full precision needs package-name
+            // evidence from Cargo.toml (not yet threaded into the resolver).
+            if matches!(crate_name, "std" | "core" | "alloc" | "proc_macro" | "test") {
+                return None;
+            }
             // Named crate: find a workspace crate whose directory basename
             // matches (cargo normalizes `-` → `_` for the crate name).
             if let Some(base) = find_crate_src_dir(crate_name, known_files) {
@@ -264,6 +273,30 @@ mod tests {
 
     fn set<'a>(files: &[&'a str]) -> HashSet<&'a str> {
         files.iter().copied().collect()
+    }
+
+    #[test]
+    fn builtin_crates_never_bind_to_local_modules() {
+        // `use std::fs::File;` in a repo that HAS src/fs.rs: the unique-crate
+        // fallback must not bind std to the local module (P2 review).
+        let known = set(&["src/lib.rs", "src/fs.rs", "src/main.rs"]);
+        assert_eq!(resolve_import("src/main.rs", "std::fs::File", &known), None);
+        assert_eq!(
+            resolve_import("src/main.rs", "std::collections::HashMap", &known),
+            None
+        );
+        assert_eq!(resolve_import("src/main.rs", "core::fmt", &known), None);
+        assert_eq!(resolve_import("src/main.rs", "alloc::vec", &known), None);
+        // …and in a multi-crate workspace where a member has fs.rs.
+        let ws = set(&[
+            "src/lib.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/fs.rs",
+        ]);
+        assert_eq!(
+            resolve_import("crates/app/src/main.rs", "std::fs", &ws),
+            None
+        );
     }
 
     #[test]
