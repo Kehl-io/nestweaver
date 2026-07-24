@@ -228,7 +228,28 @@ impl SidecarLock {
                     // Best-effort: the token lets a stale-taken-over holder
                     // recognize the lock is no longer its own on Drop.
                     let _ = f.write_all(token.as_bytes());
-                    return Ok(Self { path, token });
+                    drop(f);
+                    // Create-then-verify: two contenders can both observe a
+                    // stale lock, and the loser's remove+create can land
+                    // AFTER the winner's create. Verify the file still holds
+                    // OUR token before claiming the lock; if a contender
+                    // replaced it, treat the acquisition as contention and
+                    // wait for the real holder instead of co-owning (P1).
+                    let ours = std::fs::read_to_string(&path)
+                        .map(|content| content == token)
+                        .unwrap_or(false);
+                    if ours {
+                        return Ok(Self { path, token });
+                    }
+                    if start.elapsed() >= Self::WAIT {
+                        anyhow::bail!(
+                            "timed out acquiring rts-eval sidecar lock {} after {:?} \
+                             (another recorder is holding it)",
+                            path.display(),
+                            Self::WAIT
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Break a lock abandoned by a crashed/killed holder.
@@ -466,14 +487,17 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
         if truth.sha == "unknown" || truth.sha.is_empty() {
             continue;
         }
-        // Latest unmatched selection with ts <= truth.ts (RFC3339 compares
-        // lexicographically). When no selection predates the truth, only a
-        // timestamp-less selection may pair — never a future-dated one.
+        // Eligible selection with the GREATEST timestamp at or before the
+        // truth's own (RFC3339 compares lexicographically) — not simply the
+        // last in append order, since parallel recorders can append out of
+        // timestamp order (P2 review). When no selection predates the truth,
+        // only a timestamp-less selection may pair — never a future-dated one.
         let hit = selections
             .iter()
             .enumerate()
             .filter(|(i, s)| !matched_sel.contains(i) && sel_matches(s, truth))
-            .rfind(|(_, s)| !s.ts.is_empty() && s.ts <= truth.ts)
+            .filter(|(_, s)| !s.ts.is_empty() && s.ts <= truth.ts)
+            .max_by(|(_, a), (_, b)| a.ts.cmp(&b.ts))
             .or_else(|| {
                 selections.iter().enumerate().find(|(i, s)| {
                     !matched_sel.contains(i) && sel_matches(s, truth) && s.ts.is_empty()
@@ -487,12 +511,6 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     }
     let unresolved = selections.len() - matched_sel.len();
     let n_unmatched_truths = truths.len() - matched_truth.len();
-
-    // A report "covers all joined data" when the window spans every joined
-    // pair BEFORE any slicing — compare against the pre-drain count, or a
-    // slice that happens to equal its own post-drain length would look
-    // canonical and clobber the cached lifetime report.
-    let covers_all_joined = window == 0 || window >= joined.len();
 
     if window > 0 && joined.len() > window {
         let start = joined.len() - window;
@@ -572,14 +590,15 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     };
 
     // Cache for the in-band `measured` disclosure; best-effort. Refresh it
-    // whenever the report covers ALL joined data — lifetime (window == 0) or
-    // a window that spans every joined pair (the CLI default of 50 qualifies
-    // once history is shorter than the window) — since those reports are the
-    // canonical view. A genuine slice (window < pre-drain joined count) can
-    // be insufficient on its own, and caching it would strip the disclosure
-    // from subsequent affected-tests runs even though full data clears the
-    // bar.
-    if covers_all_joined && let Ok(json) = serde_json::to_string_pretty(&report) {
+    // from ANY report that clears the honesty bar — the disclosure always
+    // carries its own n_joined/window, so a sufficient windowed report is a
+    // valid measured claim. An INSUFFICIENT report is never cached, so a
+    // thin slice can't strip the disclosure from subsequent affected-tests
+    // runs, and the default 50-window workflow keeps refreshing as history
+    // grows past 50 joined pairs (P1 review).
+    if !report.insufficient_data
+        && let Ok(json) = serde_json::to_string_pretty(&report)
+    {
         let _ = std::fs::write(crate::sidecar_path(db_path, REPORT_SUFFIX), json);
     }
 
@@ -1216,6 +1235,101 @@ mod tests {
         assert_eq!(
             cached_after["window"], 50,
             "a genuine slice must not clobber the canonical cached report"
+        );
+    }
+
+    /// P1 review: once history exceeds the default window, the default
+    /// 50-window report must keep refreshing the cache — it clears the bar
+    /// on its own and the disclosure carries its own window.
+    #[test]
+    fn default_window_keeps_refreshing_after_history_exceeds_window() {
+        let (_dir, db) = scratch_db();
+        for i in 0..51 {
+            let sha = format!("sha{i}");
+            record_selection(&db, &result_selecting(&["tests/a.test.ts"]), "repo:1", &sha)
+                .expect("sel");
+            record_truth(&db, "repo:1", &sha, &[], Some(10), &[], Some(3)).expect("truth");
+        }
+        let cache_path = crate::sidecar_path(&db, REPORT_SUFFIX);
+        let _ = std::fs::remove_file(&cache_path);
+
+        compute_report(&db, 50).expect("default-window report");
+        let cached: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cache_path)
+                .expect("cache must refresh for a sufficient windowed report"),
+        )
+        .expect("parse cache");
+        assert_eq!(cached["window"], 50);
+        assert_eq!(cached["n_joined"], 50);
+    }
+
+    /// P2 review: with out-of-order appends (parallel recorders), the join
+    /// must pick the selection with the greatest eligible TIMESTAMP, not the
+    /// last line in the file.
+    #[test]
+    fn join_picks_max_timestamp_not_append_order() {
+        let (_dir, db) = scratch_db();
+        let sel_path = crate::sidecar_path(&db, SELECTIONS_SUFFIX);
+        let truth_path = crate::sidecar_path(&db, TRUTH_SUFFIX);
+
+        // Filler pairs so the report clears the minimum-joined bar.
+        let mut sels: Vec<String> = Vec::new();
+        let mut truths: Vec<String> = Vec::new();
+        for i in 0..12 {
+            sels.push(
+                serde_json::json!({
+                    "ts": format!("2026-01-0{}", (i % 8) + 1), "repo_uid": "", "sha": format!("filler{i}"),
+                    "changed_files": [], "selected_test_files": ["tests/a.rs"],
+                    "status": "complete", "recommendation": "selection-usable"
+                })
+                .to_string(),
+            );
+            truths.push(
+                serde_json::json!({
+                    "ts": "2026-01-09T00:00:00Z", "repo_uid": "", "sha": format!("filler{i}"),
+                    "failed_test_files": [], "total_test_files": 10,
+                    "flaky_test_files": [], "reruns": 3
+                })
+                .to_string(),
+            );
+        }
+        // The case under test: at "target" sha the NEWER selection is
+        // appended BEFORE the older one (out-of-order append). The truth's
+        // failure only exists in the newer selection's set — recall is 1.0
+        // only if the join follows the max timestamp, not file position.
+        sels.push(
+            serde_json::json!({
+                "ts": "2026-01-05T00:00:00Z", "repo_uid": "", "sha": "target",
+                "changed_files": [], "selected_test_files": ["tests/new.rs"],
+                "status": "complete", "recommendation": "selection-usable"
+            })
+            .to_string(),
+        );
+        sels.push(
+            serde_json::json!({
+                "ts": "2026-01-04T00:00:00Z", "repo_uid": "", "sha": "target",
+                "changed_files": [], "selected_test_files": ["tests/old.rs"],
+                "status": "complete", "recommendation": "selection-usable"
+            })
+            .to_string(),
+        );
+        truths.push(
+            serde_json::json!({
+                "ts": "2026-01-06T00:00:00Z", "repo_uid": "", "sha": "target",
+                "failed_test_files": ["tests/new.rs"], "total_test_files": 10,
+                "flaky_test_files": [], "reruns": 3
+            })
+            .to_string(),
+        );
+        std::fs::write(&sel_path, format!("{}\n", sels.join("\n"))).expect("write selections");
+        std::fs::write(&truth_path, format!("{}\n", truths.join("\n"))).expect("write truths");
+
+        let r = compute_report(&db, 0).expect("report");
+        assert_eq!(r.n_joined, 13);
+        assert_eq!(
+            r.file_recall,
+            Some(1.0),
+            "join must follow max timestamp, not append order"
         );
     }
 

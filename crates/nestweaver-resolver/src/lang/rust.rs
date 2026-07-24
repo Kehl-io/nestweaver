@@ -59,10 +59,16 @@ pub fn resolve_import(
                 return resolve_module_path(&base, rest, known_files)
                     .or_else(|| crate_root_file(&base, known_files));
             }
-            // Root-crate fallback (crate under test from tests/, or any
-            // single-crate repo): require at least one module segment to
-            // resolve so external crates (serde, std, …) stay unresolved.
-            if let Some(root) = crate_root_file("src", known_files) {
+            // Root-crate fallback, for `use <crate_under_test>::…` from
+            // integration tests/benches/examples. Restricted to those
+            // directories (P2 review): applying it to ALL files would discard
+            // the unmatched crate name and bind EXTERNAL crates to local
+            // modules (`serde::de` → `src/de.rs`). Requires at least one
+            // module segment to resolve so genuinely-external names stay
+            // unresolved even from tests.
+            if is_dev_target_file(from_file)
+                && let Some(root) = crate_root_file("src", known_files)
+            {
                 let base = parent_dir(&root).to_string();
                 return resolve_module_path(&base, rest, known_files);
             }
@@ -81,6 +87,18 @@ pub fn resolve_import(
             None
         }
     }
+}
+
+/// Whether a file is a cargo dev target (integration test, bench, example) —
+/// the only places `use <crate_under_test>::…` appears, and therefore the
+/// only places the root-crate fallback may discard the unmatched crate name.
+fn is_dev_target_file(from_file: &str) -> bool {
+    from_file.starts_with("tests/")
+        || from_file.starts_with("benches/")
+        || from_file.starts_with("examples/")
+        || from_file.contains("/tests/")
+        || from_file.contains("/benches/")
+        || from_file.contains("/examples/")
 }
 
 /// The crate root source file (`lib.rs` or `main.rs`) directly inside `dir`.

@@ -14,7 +14,10 @@ use crate::workspace::WorkspaceContext;
 /// Three-pass approach:
 /// 1. Build the import graph (what each file imports/exports)
 /// 2. For each non-import reference, find the target symbol using priority:
-///    - Same file → SameFileExact confidence
+///    - Same file → SameFileExact confidence (a local symbol shadows an
+///      import alias of the same name)
+///    - Import alias (`use a::b as c`) → the original name in the binding's
+///      source file → ImportResolved confidence
 ///    - Direct imports → ImportResolved confidence
 ///    - Re-exports (one level deep) → ReExportResolved confidence
 ///    - Same package/directory → SamePackageFallback confidence
@@ -344,7 +347,7 @@ fn resolve_single_reference(
         ReferenceKind::Includes => EdgeType::Includes,
         ReferenceKind::TypeRef => EdgeType::Uses,
         ReferenceKind::ReadAccess | ReferenceKind::WriteAccess => EdgeType::Accesses,
-        ReferenceKind::Import | ReferenceKind::Uses => return None,
+        ReferenceKind::Import | ReferenceKind::ImportAlias | ReferenceKind::Uses => return None,
     };
 
     let source_sym = find_enclosing_symbol(sorted_syms, reference.start_line)?;
@@ -453,20 +456,10 @@ fn resolve_single_reference(
 
     let name = &reference.name;
 
-    // Check if the reference name is a local alias introduced by an aliased import.
-    let effective_name = {
-        let bindings = graph.bindings_of(file_path);
-        if let Some(binding) = bindings.iter().find(|b| b.local_name == *name) {
-            binding.original_name.clone()
-        } else {
-            name.clone()
-        }
-    };
-
-    let candidates = symbol_map.get(effective_name.as_str());
-
-    // Priority 1: Same file
-    if let Some(syms) = &candidates
+    // Priority 1: Same file. A local symbol shadows an import alias of the
+    // same name, so this check runs on the reference's own name, before any
+    // alias rewriting.
+    if let Some(syms) = symbol_map.get(name.as_str())
         && let Some((_, sym)) = syms.iter().find(|(f, _)| *f == file_path)
     {
         let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
@@ -484,6 +477,38 @@ fn resolve_single_reference(
             }],
         });
     }
+
+    // Aliased import (`use path::to::original as name;`): the binding records
+    // the original name and the file it was imported from.
+    let binding = graph
+        .bindings_of(file_path)
+        .into_iter()
+        .find(|b| b.local_name == *name);
+    if let Some(binding) = binding
+        && let Some(syms) = symbol_map.get(binding.original_name.as_str())
+        && let Some((_, sym)) = syms.iter().find(|(f, _)| f == &binding.source_file)
+    {
+        let target_uid = symbol_uid(repo_uid, &binding.source_file, &sym.name, sym.start_line);
+        let confidence = confidence_score(MatchType::ImportResolved, language);
+        return Some(ResolvedEdge {
+            source_uid,
+            target_uid,
+            edge_type,
+            confidence,
+            link_type: None,
+            evidence: vec![EdgeEvidence {
+                kind: "import_alias".to_string(),
+                weight: confidence,
+                note: Some(format!("{} -> {}", name, binding.original_name)),
+            }],
+        });
+    }
+
+    // Fall back to resolving the original name through the normal priority
+    // chain (e.g. the aliased item is re-exported from another import).
+    let effective_name = binding.map_or_else(|| name.clone(), |b| b.original_name.clone());
+
+    let candidates = symbol_map.get(effective_name.as_str());
 
     // Priority 2: Direct imports
     let mut imports = graph.imports_of(file_path);
@@ -2131,6 +2156,143 @@ mod tests {
         assert_eq!(
             edge.target_uid, expected_target,
             "self.store.query() should resolve to Store::query in store.rs"
+        );
+    }
+
+    fn make_alias_ref(alias: &str, specifier: &str, line: u32) -> RawReference {
+        RawReference {
+            name: alias.to_string(),
+            kind: ReferenceKind::ImportAlias,
+            start_line: line,
+            context: specifier.to_string(),
+            receiver: None,
+        }
+    }
+
+    #[test]
+    fn rust_aliased_import_call_resolves_to_original() {
+        // use crate::config::load as load_config;
+        // fn f() { load_config(); }
+        let files = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![make_symbol("f", 3)],
+                vec![
+                    make_ref("crate::config::load", ReferenceKind::Import, 1),
+                    make_alias_ref("load_config", "crate::config::load", 1),
+                    make_ref("load_config", ReferenceKind::Call, 4),
+                ],
+            ),
+            (
+                "src/config.rs".to_string(),
+                vec![make_symbol("load", 1)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "expected one call edge; got: {edges:?}"
+        );
+
+        let expected_target = symbol_uid("repo:test:abc", "src/config.rs", "load", 1);
+        assert_eq!(
+            call_edges[0].target_uid, expected_target,
+            "call through alias should resolve to config::load"
+        );
+        let expected_confidence = confidence_score(MatchType::ImportResolved, Language::Rust);
+        assert!(
+            (call_edges[0].confidence - expected_confidence).abs() < f32::EPSILON,
+            "alias-resolved call should have ImportResolved confidence"
+        );
+    }
+
+    #[test]
+    fn rust_mixed_use_list_alias_and_plain() {
+        // use crate::util::{c as d, e};
+        // fn f() { d(); e(); }
+        let files = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![make_symbol("f", 3)],
+                vec![
+                    make_ref("crate::util::c", ReferenceKind::Import, 1),
+                    make_alias_ref("d", "crate::util::c", 1),
+                    make_ref("crate::util::e", ReferenceKind::Import, 1),
+                    make_ref("d", ReferenceKind::Call, 4),
+                    make_ref("e", ReferenceKind::Call, 5),
+                ],
+            ),
+            (
+                "src/util.rs".to_string(),
+                vec![make_symbol("c", 1), make_symbol("e", 10)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let call_targets: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .map(|e| e.target_uid.as_str())
+            .collect();
+        assert_eq!(
+            call_targets,
+            [
+                symbol_uid("repo:test:abc", "src/util.rs", "c", 1),
+                symbol_uid("repo:test:abc", "src/util.rs", "e", 10),
+            ],
+            "aliased and plain imports from a mixed use list should both resolve"
+        );
+    }
+
+    #[test]
+    fn rust_local_symbol_shadows_import_alias() {
+        // Precedence: a same-file symbol wins over an import alias of the
+        // same name.
+        let files = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![make_symbol("f", 3), make_symbol("load_config", 10)],
+                vec![
+                    make_ref("crate::config::load", ReferenceKind::Import, 1),
+                    make_alias_ref("load_config", "crate::config::load", 1),
+                    make_ref("load_config", ReferenceKind::Call, 4),
+                ],
+            ),
+            (
+                "src/config.rs".to_string(),
+                vec![make_symbol("load", 1)],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .collect();
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "expected one call edge; got: {edges:?}"
+        );
+
+        let expected_target = symbol_uid("repo:test:abc", "src/main.rs", "load_config", 10);
+        assert_eq!(
+            call_edges[0].target_uid, expected_target,
+            "local symbol should shadow the import alias"
+        );
+        let expected_confidence = confidence_score(MatchType::SameFileExact, Language::Rust);
+        assert!(
+            (call_edges[0].confidence - expected_confidence).abs() < f32::EPSILON,
+            "shadowed alias should resolve with SameFileExact confidence"
         );
     }
 }

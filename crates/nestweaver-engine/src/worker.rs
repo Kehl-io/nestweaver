@@ -1718,7 +1718,14 @@ mod tests {
         shutdown_tx.send(true).unwrap();
 
         // The loop task must not resolve until the in-flight job drains.
-        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        // Load-tolerant deadline: the drain includes real indexing work,
+        // which exceeds a tight fixed timeout under full-workspace parallel
+        // test load (CI flake); overridable like the server-test deadline.
+        let drain_timeout_secs: u64 = std::env::var("NESTWEAVER_TEST_SERVER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        tokio::time::timeout(std::time::Duration::from_secs(drain_timeout_secs), handle)
             .await
             .expect("worker drained and exited within the timeout")
             .unwrap();

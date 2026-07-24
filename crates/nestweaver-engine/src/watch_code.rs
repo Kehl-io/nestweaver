@@ -249,18 +249,22 @@ impl CodeWatcher {
             )?;
 
             let start = Instant::now();
-            // Per-file failures are logged and skipped inside `reindex_paths`:
-            // a single unreadable file must not kill the watch session (the
-            // next edit batch retries), and because the reindex re-parses
-            // BEFORE deleting, a failed file keeps its previous graph data
-            // instead of vanishing from the graph while still on disk.
-            let files_processed = self.reindex_paths(&store, &r_uid, &relevant);
+            // Per-file PRE-mutation failures are logged and skipped inside
+            // `reindex_paths`: a single unreadable file must not kill the
+            // watch session (the next edit batch retries), and because the
+            // reindex re-parses BEFORE deleting, a failed file keeps its
+            // previous graph data instead of vanishing from the graph while
+            // still on disk. A POST-mutation failure (delete landed, later
+            // insert failed) is different: the graph holds partial data, so
+            // the batch is reported as failed after publication finalizes —
+            // it must not look cleanly successful (P1 review).
+            let (files_processed, batch_error) = self.reindex_paths(&store, &r_uid, &relevant);
 
             let finalization = self.finalize_graph_publication_with_io(
                 publication,
                 &crate::index::FileSystemIndexEpilogueIo,
             );
-            if finalization.is_ok() {
+            if finalization.is_ok() && batch_error.is_none() {
                 let duration = start.elapsed();
                 tracing::info!(
                     files_processed,
@@ -277,18 +281,32 @@ impl CodeWatcher {
             if let Err(error) = finalization {
                 anyhow::bail!("code watcher batch failed mandatory graph publication: {error}");
             }
+            if let Some(error) = batch_error {
+                anyhow::bail!(
+                    "code watcher batch partially failed mid-mutation (partial index data; \
+                     the next edit retries, or repair with `nestweaver index --force`): {error}"
+                );
+            }
         }
     }
 
     /// Re-index one batch of changed paths against the live graph. Returns
-    /// the number of files processed. Mirrors the engine's incremental index
+    /// the number of files processed plus the FIRST post-mutation failure,
+    /// if any — a post-mutation failure means the graph holds partial data
+    /// for that file and the batch must not be reported as cleanly
+    /// successful (P1 review). Mirrors the engine's incremental index
     /// (`index.rs::incremental_index_with_name_and_io`): nw-008 Phase 0
     /// collects reverse-dependents from the live graph BEFORE any mutation,
     /// and Phase 2 re-resolves them afterwards so the cross-file edges the
     /// per-file `DETACH DELETE` destroys are restored — without this, a
     /// watcher reindex leaves the file's symbols in place but strips ALL
     /// their incoming and outgoing cross-file CALLS/IMPORTS edges.
-    fn reindex_paths(&self, store: &GraphStore, r_uid: &str, relevant: &[PathBuf]) -> usize {
+    fn reindex_paths(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        relevant: &[PathBuf],
+    ) -> (usize, Option<anyhow::Error>) {
         // Partition into changed (still on disk) / removed (deleted), keeping
         // the absolute path alongside for the mutation loop.
         let mut changed: HashSet<String> = HashSet::new();
@@ -320,6 +338,7 @@ impl CodeWatcher {
         let rdeps = crate::index::collect_reverse_dep_files(store, r_uid, &changed, &removed);
 
         let mut files_processed = 0usize;
+        let mut first_post_mutation_error: Option<anyhow::Error> = None;
         for path in &paths {
             let rel_path = match path.strip_prefix(&self.repo_root) {
                 Ok(r) => r,
@@ -346,13 +365,29 @@ impl CodeWatcher {
                         // edge insert is CREATE (duplicates).
                         changed.remove(rel_str.as_ref());
                     }
-                    Err(e) => {
-                        // Same keep-old-data treatment for read/store errors.
+                    Err(ReindexError::PreMutation(e)) => {
+                        // Same keep-old-data treatment for pre-mutation
+                        // read/store errors (delete never landed).
                         changed.remove(rel_str.as_ref());
                         tracing::warn!(
                             path = %rel_str,
                             error = %e,
                             "failed to re-index file; keeping previous index data"
+                        );
+                    }
+                    Err(ReindexError::PostMutation(e)) => {
+                        // The delete already landed: the graph holds PARTIAL
+                        // data for this file, not the old data. Keep the file
+                        // in `changed` so Phase 2 re-resolves whatever edges
+                        // it can, and report the batch as failed instead of
+                        // publishing it as cleanly successful (P1 review).
+                        if first_post_mutation_error.is_none() {
+                            first_post_mutation_error = Some(anyhow::anyhow!("{rel_str}: {e}"));
+                        }
+                        tracing::error!(
+                            path = %rel_str,
+                            error = %e,
+                            "re-index failed mid-mutation; graph holds partial data for this file"
                         );
                     }
                 }
@@ -399,7 +434,7 @@ impl CodeWatcher {
             }
         }
 
-        files_processed
+        (files_processed, first_post_mutation_error)
     }
 }
 
@@ -476,7 +511,7 @@ fn reindex_file(
     rel_path: &Path,
     r_uid: &str,
     store: &GraphStore,
-) -> Result<Option<usize>, anyhow::Error> {
+) -> Result<Option<usize>, ReindexError> {
     use nestweaver_parser::{RawReference, RawSymbol, parse_source};
     use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
     use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
@@ -484,8 +519,9 @@ fn reindex_file(
     let abs_path = repo_root.join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
 
-    let source = std::fs::read_to_string(&abs_path)
-        .with_context(|| format!("read {}", abs_path.display()))?;
+    let source = std::fs::read_to_string(&abs_path).map_err(|e| {
+        ReindexError::PreMutation(anyhow::anyhow!("read {}: {e}", abs_path.display()))
+    })?;
 
     let parsed = match parse_source(&abs_path, &source) {
         Ok(p) => p,
@@ -496,9 +532,11 @@ fn reindex_file(
     };
 
     // Only now that the fresh parse is in hand: drop the stale symbols.
-    let removed = store
-        .delete_symbols_in_file(r_uid, &rel_str)
-        .with_context(|| format!("delete_symbols_in_file {rel_str}"))?;
+    // From this point on the file's graph data is being MUTATED — a failure
+    // here is not "kept previous data" (P1 review).
+    let removed = store.delete_symbols_in_file(r_uid, &rel_str).map_err(|e| {
+        ReindexError::PostMutation(anyhow::anyhow!("delete_symbols_in_file {rel_str}: {e}"))
+    })?;
     if removed > 0 {
         tracing::debug!(
             path = %rel_str,
@@ -519,10 +557,10 @@ fn reindex_file(
     };
     store
         .insert_file(&file)
-        .with_context(|| format!("insert_file {}", rel_str))?;
-    store
-        .insert_repo_file_edge(r_uid, &f_uid)
-        .with_context(|| format!("insert_repo_file_edge {}", rel_str))?;
+        .map_err(|e| ReindexError::PostMutation(anyhow::anyhow!("insert_file {rel_str}: {e}")))?;
+    store.insert_repo_file_edge(r_uid, &f_uid).map_err(|e| {
+        ReindexError::PostMutation(anyhow::anyhow!("insert_repo_file_edge {rel_str}: {e}"))
+    })?;
 
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut file_sym_pairs: Vec<(String, String)> = Vec::new();
@@ -593,9 +631,9 @@ fn reindex_file(
 
     let sym_count = symbols.len();
 
-    store
-        .batch_insert_symbols(&symbols)
-        .with_context(|| format!("batch_insert_symbols {}", rel_str))?;
+    store.batch_insert_symbols(&symbols).map_err(|e| {
+        ReindexError::PostMutation(anyhow::anyhow!("batch_insert_symbols {rel_str}: {e}"))
+    })?;
 
     let file_sym_refs: Vec<(&str, &str)> = file_sym_pairs
         .iter()
@@ -603,7 +641,11 @@ fn reindex_file(
         .collect();
     store
         .batch_insert_file_symbol_edges(&file_sym_refs)
-        .with_context(|| format!("batch_insert_file_symbol_edges {}", rel_str))?;
+        .map_err(|e| {
+            ReindexError::PostMutation(anyhow::anyhow!(
+                "batch_insert_file_symbol_edges {rel_str}: {e}"
+            ))
+        })?;
 
     // Resolve cross-file edges within this file.
     let lang = detect_language(&abs_path).unwrap_or(nestweaver_schema::Language::JavaScript);
@@ -634,12 +676,32 @@ fn reindex_file(
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
         .collect();
     if !insertable_edges.is_empty() {
-        store
-            .batch_insert_edges(&insertable_edges)
-            .with_context(|| format!("batch_insert_edges {}", rel_str))?;
+        store.batch_insert_edges(&insertable_edges).map_err(|e| {
+            ReindexError::PostMutation(anyhow::anyhow!("batch_insert_edges {rel_str}: {e}"))
+        })?;
     }
 
     Ok(Some(sym_count))
+}
+
+/// Why a watcher re-index of one file failed, split by whether the file's
+/// graph data had already been mutated. Callers must NOT treat a
+/// `PostMutation` failure as "previous data preserved" (P1 review): the
+/// delete already landed, so the graph holds partial data for the file and
+/// the batch must not publish as cleanly successful.
+enum ReindexError {
+    /// Failed before any mutation (read/parse/delete) — old graph data intact.
+    PreMutation(anyhow::Error),
+    /// Failed after the file's symbols were deleted — partial data.
+    PostMutation(anyhow::Error),
+}
+
+impl std::fmt::Display for ReindexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreMutation(e) | Self::PostMutation(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -822,7 +884,9 @@ mod tests {
         )
         .unwrap();
         let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
-        let processed = watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        let (processed, batch_error) =
+            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        assert!(batch_error.is_none(), "{batch_error:?}");
         assert_eq!(processed, 1);
 
         // THE critical assertions: outgoing (alpha→helper) and incoming
@@ -862,7 +926,9 @@ mod tests {
         )
         .unwrap();
         let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
-        let processed = watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        let (processed, batch_error) =
+            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        assert!(batch_error.is_none(), "{batch_error:?}");
 
         assert_eq!(
             processed, 0,
@@ -893,7 +959,9 @@ mod tests {
             "import { helper } from './a.js';\nexport function alpha() { return helper() + 3; }\n",
         )
         .unwrap();
-        let processed = watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        let (processed, batch_error) =
+            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        assert!(batch_error.is_none(), "{batch_error:?}");
         assert_eq!(processed, 1, "the batch after a failure must re-index");
         let alpha_uid = uid_of(&store, &r_uid, "alpha");
         assert!(
@@ -916,7 +984,9 @@ mod tests {
 
         std::fs::remove_file(canonical_root.join("src/b.js")).unwrap();
         let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
-        let processed = watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        let (processed, batch_error) =
+            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
+        assert!(batch_error.is_none(), "{batch_error:?}");
 
         assert_eq!(processed, 1);
         assert!(

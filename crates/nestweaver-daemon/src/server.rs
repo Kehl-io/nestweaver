@@ -774,7 +774,11 @@ impl DaemonService {
                 }
             }
 
-            let remaining = limit.saturating_sub(embedded as usize);
+            // Budget on ATTEMPTS, not successes (P2 review): with a failing
+            // endpoint, success-based budgeting lets one pass fire 64
+            // symbol + 64 note + 64 heading requests. The 64-node cap is
+            // meant to bound work per watcher cycle regardless of outcome.
+            let remaining = limit.saturating_sub(attempted as usize);
 
             // Notes
             if remaining > 0
@@ -800,7 +804,7 @@ impl DaemonService {
                 }
             }
 
-            let remaining = limit.saturating_sub(embedded as usize);
+            let remaining = limit.saturating_sub(attempted as usize);
 
             // Headings
             if remaining > 0

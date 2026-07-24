@@ -1215,9 +1215,12 @@ pub fn build_brain_context(
 /// whenever `weight_semantic > 0` — pure waste on databases where
 /// `nestweaver embed` never ran, since there are no vectors to match
 /// against. The determination is a per-store property, so it is cached
-/// keyed by db path and invalidated whenever `graph_generation` changes;
-/// embeddings added while the process is live (e.g. `nestweaver embed`
-/// against a running daemon) are then picked up on the next query.
+/// keyed by db path. A positive probe is invalidated whenever
+/// `graph_generation` changes; a negative probe is additionally
+/// time-bounded (30s) because the embed path adds vectors without
+/// advancing the generation, so embeddings added while the process is
+/// live (e.g. `nestweaver embed` against a running daemon) are picked up
+/// within seconds rather than after an unrelated mutation or a restart.
 /// In-memory stores (no db path) probe directly — `embedding_count` is a
 /// mutex-guarded `len()`.
 fn store_has_embeddings(store: &GraphStore) -> bool {
@@ -1225,16 +1228,41 @@ fn store_has_embeddings(store: &GraphStore) -> bool {
         return store.embedding_count() > 0;
     };
     let generation = store.graph_generation();
+    struct Entry {
+        generation: u64,
+        has: bool,
+        probed_at: std::time::Instant,
+    }
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, bool)>>,
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Entry>>,
     > = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     match cache.get(&db_path) {
-        Some(&(cached_generation, has)) if cached_generation == generation => has,
+        // A POSITIVE probe is generation-keyed: embeddings are only added,
+        // and a graph mutation re-probes.
+        Some(entry) if entry.has && entry.generation == generation => true,
+        // A NEGATIVE probe is only trusted briefly: the daemon's embed path
+        // adds and flushes vectors WITHOUT advancing the graph generation,
+        // so a cached "no embeddings" would otherwise hide live embeddings
+        // until an unrelated mutation or a restart (P1 review).
+        Some(entry)
+            if !entry.has
+                && entry.generation == generation
+                && entry.probed_at.elapsed() < std::time::Duration::from_secs(30) =>
+        {
+            false
+        }
         _ => {
             let has = store.embedding_count() > 0;
-            cache.insert(db_path, (generation, has));
+            cache.insert(
+                db_path,
+                Entry {
+                    generation,
+                    has,
+                    probed_at: std::time::Instant::now(),
+                },
+            );
             has
         }
     }

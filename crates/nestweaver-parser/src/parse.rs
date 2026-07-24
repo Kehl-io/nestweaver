@@ -106,6 +106,13 @@ fn get_or_compile_query(
 pub enum ReferenceKind {
     Call,
     Import,
+    /// The local rename of an aliased import: `use a::b as c;` emits the
+    /// usual [`ReferenceKind::Import`] reference for `a::b` plus one
+    /// `ImportAlias` reference whose `name` is the alias (`c`) and whose
+    /// `context` is the full original import path (`a::b`). The resolver
+    /// turns these into named bindings so calls to the alias resolve to the
+    /// original item.
+    ImportAlias,
     Extends,
     Implements,
     Includes,
@@ -250,8 +257,8 @@ fn leading_rust_attributes(node: &tree_sitter::Node, source: &[u8]) -> String {
 ///
 /// - `use a::b;`        → `a::b`
 /// - `use a::{b, c};`   → `a::b`, `a::c`
-/// - `use a::b as c;`   → `a::b` (the path, not the alias — resolution needs
-///   the origin; the alias itself is not yet tracked)
+/// - `use a::b as c;`   → `a::b` (the path — resolution needs the origin),
+///   plus an `ImportAlias` reference binding the local name `c` to the path
 /// - `use a::*;`        → `a` (the module path; wildcard members resolve
 ///   through the module's import edge)
 /// - `use a::{b::{c, d}};` → `a::b::c`, `a::b::d`
@@ -303,9 +310,29 @@ fn expand_rust_use_tree(
             });
         }
         "use_as_clause" => {
-            // Import the original path; the alias is a local rename.
+            // Import the original path; the alias is a local rename, recorded
+            // as an ImportAlias reference so the resolver can bind it.
             if let Some(path) = node.child_by_field_name("path") {
+                let before = references.len();
                 expand_rust_use_tree(&path, prefix, source, context, references);
+                // Only bind the alias when the path actually produced an
+                // import reference (e.g. bare `self` with no prefix does not).
+                if references.len() > before
+                    && let Some(alias) = node.child_by_field_name("alias")
+                    && let Ok(alias_text) = alias.utf8_text(source)
+                {
+                    let alias_text = alias_text.trim();
+                    if !alias_text.is_empty() {
+                        let specifier = references[before].name.clone();
+                        references.push(RawReference {
+                            name: alias_text.to_string(),
+                            kind: ReferenceKind::ImportAlias,
+                            start_line: node.start_position().row as u32 + 1,
+                            context: specifier,
+                            receiver: None,
+                        });
+                    }
+                }
             }
         }
         "use_wildcard" => {
@@ -2048,6 +2075,23 @@ use crate::config::{Settings, load as load_config};
                 .iter()
                 .any(|n| n.ends_with("::Store") || n.ends_with("::load_config")),
             "alias name must not become an import path; got: {names:?}"
+        );
+
+        // Aliased imports also emit ImportAlias references binding the local
+        // rename to the full original path.
+        let aliases: Vec<(&str, &str)> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::ImportAlias)
+            .map(|r| (r.name.as_str(), r.context.as_str()))
+            .collect();
+        assert_eq!(
+            aliases,
+            [
+                ("Store", "nestweaver_engine::store::GraphStore"),
+                ("load_config", "crate::config::load"),
+            ],
+            "aliased imports should produce ImportAlias bindings"
         );
     }
 

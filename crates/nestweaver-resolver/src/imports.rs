@@ -6,11 +6,10 @@ use nestweaver_schema::{Language, Visibility};
 use crate::lang;
 use crate::workspace::WorkspaceContext;
 
-/// Tracks an aliased import binding (e.g., `import { X as Y }`).
+/// Tracks an aliased import binding (e.g., `use a::b as c;`).
 ///
-/// Currently a placeholder — `named_bindings` in `ImportGraph` is not yet
-/// populated by the parser. The infrastructure is in place for future
-/// extraction of import aliases from .scm query patterns.
+/// Populated from [`ReferenceKind::ImportAlias`] references emitted by the
+/// parser (currently only Rust `use ... as ...` clauses produce them).
 #[derive(Debug, Clone)]
 pub struct NamedBinding {
     /// The local alias used in the importing file.
@@ -86,6 +85,7 @@ pub fn build_import_graph(
 
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
     let mut resolved_imports: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut named_bindings: HashMap<String, Vec<NamedBinding>> = HashMap::new();
 
     for (file_path, symbols, references) in files {
         // v2: filter by visibility — only non-private symbols are exported
@@ -98,7 +98,35 @@ pub fn build_import_graph(
 
         // Resolve import references
         let mut imports: Vec<(String, String)> = Vec::new();
+        let mut bindings: Vec<NamedBinding> = Vec::new();
         for reference in references {
+            // Aliased import (`use a::b as c;`): `name` is the local alias,
+            // `context` is the full original path. Bind the alias to the
+            // last path segment of the resolved source file. The path itself
+            // is already covered by its own Import reference, so it is not
+            // added to `imports` again here.
+            if reference.kind == ReferenceKind::ImportAlias {
+                if let Some(resolved) = resolve_specifier(
+                    file_path,
+                    &reference.context,
+                    &known_files,
+                    language,
+                    workspace_ctx,
+                ) {
+                    let original_name = reference
+                        .context
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(reference.context.as_str())
+                        .to_string();
+                    bindings.push(NamedBinding {
+                        local_name: reference.name.clone(),
+                        original_name,
+                        source_file: resolved,
+                    });
+                }
+                continue;
+            }
             if !matches!(
                 reference.kind,
                 ReferenceKind::Import | ReferenceKind::Includes | ReferenceKind::Uses
@@ -113,12 +141,15 @@ pub fn build_import_graph(
             }
         }
         resolved_imports.insert(file_path.clone(), imports);
+        if !bindings.is_empty() {
+            named_bindings.insert(file_path.clone(), bindings);
+        }
     }
 
     ImportGraph {
         resolved_imports,
         exports,
-        named_bindings: HashMap::new(),
+        named_bindings,
     }
 }
 
@@ -275,6 +306,49 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].local_name, "MyAlias");
         assert_eq!(result[0].original_name, "OriginalName");
+    }
+
+    #[test]
+    fn populates_named_bindings_from_import_alias_refs() {
+        let make_alias_ref = |alias: &str, specifier: &str| RawReference {
+            name: alias.to_string(),
+            kind: ReferenceKind::ImportAlias,
+            start_line: 1,
+            context: specifier.to_string(),
+            receiver: None,
+        };
+        let files = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![make_symbol("main")],
+                vec![
+                    make_import_ref("crate::config::load"),
+                    make_alias_ref("load_config", "crate::config::load"),
+                    // External crate: stays unresolved, so no binding.
+                    make_alias_ref("de", "serde::de"),
+                ],
+            ),
+            (
+                "src/config.rs".to_string(),
+                vec![make_symbol("load")],
+                vec![],
+            ),
+        ];
+
+        let graph = build_import_graph(&files, Language::Rust, &WorkspaceContext::default());
+        let bindings = graph.bindings_of("src/main.rs");
+        assert_eq!(bindings.len(), 1, "only the resolved alias gets a binding");
+        assert_eq!(bindings[0].local_name, "load_config");
+        assert_eq!(bindings[0].original_name, "load");
+        assert_eq!(bindings[0].source_file, "src/config.rs");
+        // The ImportAlias reference must not duplicate the resolved import.
+        assert_eq!(
+            graph.imports_of("src/main.rs"),
+            vec![(
+                "crate::config::load".to_string(),
+                "src/config.rs".to_string()
+            )]
+        );
     }
 
     #[test]
