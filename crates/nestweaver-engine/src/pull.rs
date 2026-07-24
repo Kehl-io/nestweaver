@@ -102,6 +102,12 @@ pub fn pull_repo(
         )));
     }
     let dest = workspace_root.join(&repo_name);
+    // F-14 cleanup below may only ever wipe a dest this pull attempt created
+    // (or an empty one) — never a pre-existing directory with contents.
+    let dest_had_contents = dest
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
     validate_repo_dest(workspace_root, &dest)?;
 
     if dest.exists() && dest.join(".git").exists() {
@@ -129,8 +135,12 @@ pub fn pull_repo(
         if !output.status.success() {
             // F-14: a failed pull must clean up the workspace dir it created —
             // validate_repo_dest pre-creates `dest`, and a partial clone must
-            // not be mistaken for a real checkout on the next run.
-            let _ = std::fs::remove_dir_all(&dest);
+            // not be mistaken for a real checkout on the next run. Never wipe
+            // a pre-existing directory that had contents: the failed clone
+            // did not create those files.
+            if !dest_had_contents {
+                let _ = std::fs::remove_dir_all(&dest);
+            }
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(classify_git_error(&stderr));
         }
@@ -405,6 +415,35 @@ mod tests {
             !dest.exists(),
             "failed pull must not leave its workspace dir behind: {}",
             dest.display()
+        );
+    }
+
+    /// A failed clone must never wipe a PRE-EXISTING destination directory
+    /// that has contents — the pull attempt did not create those files.
+    #[test]
+    fn failed_pull_preserves_preexisting_nonempty_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        let url = "/definitely/missing/nw-f14-repo.git";
+        let dest = ws.join(clone_dir_name_from_url(url));
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("keep-me.txt"), "user data").unwrap();
+
+        let result = pull_repo(
+            &ws,
+            url,
+            "",
+            &PullOptions {
+                mode: PullMode::Full,
+                sha_policy: ShaPolicy::Head,
+                ephemeral: false,
+            },
+        );
+        assert!(result.is_err(), "cloning a missing repo must fail");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("keep-me.txt")).unwrap(),
+            "user data",
+            "pre-existing contents must survive a failed clone"
         );
     }
 }

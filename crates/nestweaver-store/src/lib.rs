@@ -2503,7 +2503,7 @@ mod tests {
     /// the Repo node under the target instance.
     #[test]
     fn merge_instance_ids_reports_repos_needing_reindex() {
-        use nestweaver_schema::uid::repo_uid;
+        use nestweaver_schema::uid::{repo_uid, symbol_uid};
         let store = test_store();
 
         // A repo under instance "old" with one symbol child.
@@ -2517,7 +2517,9 @@ mod tests {
             root_path: Some("/home/kory/dev/svc".to_string()),
         };
         store.insert_repo(&repo).unwrap();
-        let symbol = make_symbol("sym:old:1", "handler", &repo.uid, "src/lib.rs");
+        // The merge plan verifier only accepts production-shaped UIDs.
+        let symbol_uid = symbol_uid(&repo.uid, "src/lib.rs", "handler", 10);
+        let symbol = make_symbol(&symbol_uid, "handler", &repo.uid, "src/lib.rs");
         store.insert_symbol(&symbol).unwrap();
 
         let report = store.merge_instance_ids("old", "new").unwrap();
@@ -2529,7 +2531,7 @@ mod tests {
         assert!(report.repos_need_reindex());
 
         assert_eq!(report.repo_uids_removed, vec![repo.uid.clone()]);
-        assert!(store.lookup_symbol("sym:old:1").is_err());
+        assert!(store.lookup_symbol(&symbol_uid).is_err());
         assert!(store.lookup_repo(&repo.uid).unwrap().is_none());
         let target_uid = repo_uid("new", "https://github.com/example/svc");
         assert_eq!(
@@ -2540,7 +2542,7 @@ mod tests {
 
     #[test]
     fn merge_instance_ids_repo_collision_preserves_target() {
-        use nestweaver_schema::uid::repo_uid;
+        use nestweaver_schema::uid::{repo_uid, symbol_uid};
         let store = test_store();
         let url = "https://github.com/example/collision";
         let source = Repo {
@@ -2563,9 +2565,11 @@ mod tests {
         };
         store.insert_repo(&source).unwrap();
         store.insert_repo(&target).unwrap();
+        // The merge plan verifier only accepts production-shaped UIDs.
+        let symbol_uid = symbol_uid(&source.uid, "src/lib.rs", "handler", 10);
         store
             .insert_symbol(&make_symbol(
-                "sym:old:collision",
+                &symbol_uid,
                 "handler",
                 &source.uid,
                 "src/lib.rs",
@@ -2575,7 +2579,7 @@ mod tests {
         let report = store.merge_instance_ids("old", "new").unwrap();
         assert_eq!(report.repos, 1);
         assert_eq!(report.repo_uids_removed, vec![source.uid.clone()]);
-        assert!(store.lookup_symbol("sym:old:collision").is_err());
+        assert!(store.lookup_symbol(&symbol_uid).is_err());
         let surviving = store.lookup_repo(&target.uid).unwrap().unwrap();
         assert_eq!(surviving.indexed_sha, "target-sha");
         assert_eq!(store.list_repos(Some("new")).unwrap().len(), 1);

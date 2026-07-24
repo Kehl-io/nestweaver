@@ -674,7 +674,7 @@ pub fn run_recorded(
                 .push(crate::blast_radius::Notification {
                     level: crate::blast_radius::NotificationLevel::Note,
                     message: format!(
-                        "always-included {} recently-failed test file(s) from the last                          {} full-suite run(s): {}",
+                        "always-included {} recently-failed test file(s) from the last {} full-suite run(s): {}",
                         included.len(),
                         RECENT_TRUTH_WINDOW,
                         included.join(", ")

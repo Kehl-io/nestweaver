@@ -202,11 +202,25 @@ impl DaemonClient {
         let mut delay = std::time::Duration::from_millis(100);
         let max_delay = std::time::Duration::from_secs(1);
         loop {
+            // health_check has its own 10s timeout, and the deadline below is
+            // only checked BETWEEN attempts — cap each attempt at the
+            // remaining budget so the loop never overshoots `timeout` by up
+            // to 10s.
+            let remaining = timeout.saturating_sub(start.elapsed());
             match Self::connect_existing(db_path).await {
-                Ok(mut client) => match client.health_check().await {
-                    Ok(resp) => return Ok(resp),
-                    Err(e) => tracing::debug!("wait_healthy: health check not yet passing: {e:#}"),
-                },
+                Ok(mut client) => {
+                    match tokio::time::timeout(remaining, client.health_check()).await {
+                        Ok(Ok(resp)) => return Ok(resp),
+                        Ok(Err(e)) => {
+                            tracing::debug!("wait_healthy: health check not yet passing: {e:#}")
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "wait_healthy: health check exceeded the remaining budget"
+                            )
+                        }
+                    }
+                }
                 Err(e) => tracing::debug!("wait_healthy: daemon not yet connectable: {e:#}"),
             }
             if start.elapsed() >= timeout {

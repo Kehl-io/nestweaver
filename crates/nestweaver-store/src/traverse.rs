@@ -255,6 +255,11 @@ impl GraphStore {
     /// the subgraph induced by `allowed_symbols`. Disallowed callers are not
     /// returned or expanded, so an allowed node reachable only through a
     /// disallowed intermediate cannot reveal that hidden topology.
+    #[deprecated(
+        note = "drops the truncation-honesty flags (threshold/depth pruning) from the \
+                underlying ImpactResult; use `impact_with_flags_within` instead so callers \
+                can see when the walk was pruned"
+    )]
     pub fn impact_cancellable_within(
         &self,
         target_uid: &str,

@@ -12,11 +12,18 @@ use std::collections::HashSet;
 /// Crate roots are inferred from the known file set: any `…/src/lib.rs` or
 /// `…/src/main.rs` marks a crate whose name is the normalized directory
 /// basename (`-` and `_` are interchangeable, matching cargo's package-name →
-/// crate-name convention). The repo-root crate (`src/lib.rs`/`src/main.rs`)
-/// has no directory name, so it is used as a fallback only when at least one
-/// module segment of the path actually resolves — this covers integration
-/// tests importing the crate under test without matching unrelated external
-/// crates (e.g. `serde`) whose module segments do not exist under `src/`.
+/// crate-name convention). An unmatched crate name first tries the
+/// unique-crate fallback (the module path resolves under exactly one
+/// workspace crate — covers crates whose directory differs from the package
+/// name), then the repo-root crate (`src/lib.rs`/`src/main.rs`) as a last
+/// resort. The root crate has no directory name, so in a multi-crate
+/// workspace it is never a fallback candidate: matching an unmatched name
+/// against it by module-path coincidence would steal member-crate imports and
+/// bind unrelated external crates (e.g. `serde`) whose module segments happen
+/// to exist under `src/`. In a single-crate repo it is used from dev-target
+/// files only, and only when at least one module segment actually resolves —
+/// this covers integration tests importing the crate under test without
+/// matching unrelated external crates.
 ///
 /// The final path segment usually names an item (function, struct) inside a
 /// module rather than a module itself, so resolution returns the deepest
@@ -59,30 +66,44 @@ pub fn resolve_import(
                 return resolve_module_path(&base, rest, known_files)
                     .or_else(|| crate_root_file(&base, known_files));
             }
-            // Root-crate fallback, for `use <crate_under_test>::…` from
-            // integration tests/benches/examples. Restricted to those
-            // directories (P2 review): applying it to ALL files would discard
-            // the unmatched crate name and bind EXTERNAL crates to local
-            // modules (`serde::de` → `src/de.rs`). Requires at least one
-            // module segment to resolve so genuinely-external names stay
-            // unresolved even from tests.
-            if is_dev_target_file(from_file)
-                && let Some(root) = crate_root_file("src", known_files)
-            {
-                let base = parent_dir(&root).to_string();
-                return resolve_module_path(&base, rest, known_files);
-            }
-            // Unique-crate fallback: the crate directory does not always match
-            // the package name (e.g. package `fixture-engine` in `crates/engine/`).
-            // When the module path resolves under exactly one workspace crate,
-            // use it; ambiguity or no match stays unresolved.
-            let mut matches: Vec<String> = crate_src_dirs(known_files)
+            let src_dirs = crate_src_dirs(known_files);
+            // The root crate's `src/` has no directory name, so it offers no
+            // name evidence: in a multi-crate workspace, matching an
+            // unmatched crate name against it by module-path coincidence both
+            // steals member-crate imports (`fixture_engine::rts_eval` →
+            // `src/rts_eval.rs`) and binds external crates (`serde::de` →
+            // `src/de.rs`). Only a single-crate repo treats the root crate as
+            // a candidate.
+            let multi_crate = src_dirs.len() > 1;
+            // Unique-crate fallback FIRST: the crate directory does not always
+            // match the package name (e.g. package `fixture-engine` in
+            // `crates/engine/`). When the module path resolves under exactly
+            // one workspace crate, use it; ambiguity or no match stays
+            // unresolved. Runs before the dev-target root-crate fallback so a
+            // member crate wins over the root crate when both could match.
+            let mut matches: Vec<String> = src_dirs
                 .into_iter()
+                .filter(|base| !(multi_crate && base == "src"))
                 .filter_map(|base| resolve_module_path(&base, rest, known_files))
                 .collect();
             matches.dedup();
             if matches.len() == 1 {
                 return matches.pop();
+            }
+            // Root-crate fallback, for `use <crate_under_test>::…` from
+            // integration tests/benches/examples — tried only when the
+            // unique-crate fallback found nothing. Restricted to dev-target
+            // files in single-crate repos (P2 review): applying it more
+            // broadly would discard the unmatched crate name and bind EXTERNAL
+            // crates to local modules (`serde::de` → `src/de.rs`). Requires at
+            // least one module segment to resolve so genuinely-external names
+            // stay unresolved even from tests.
+            if !multi_crate
+                && is_dev_target_file(from_file)
+                && let Some(root) = crate_root_file("src", known_files)
+            {
+                let base = parent_dir(&root).to_string();
+                return resolve_module_path(&base, rest, known_files);
             }
             None
         }
@@ -415,6 +436,39 @@ mod tests {
             "crates/c/src/main.rs",
         ]);
         let result = resolve_import("crates/c/src/main.rs", "other_crate::util", &known);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn dev_target_prefers_member_crate_over_root_crate() {
+        // Workspace with a root crate AND a member whose directory differs
+        // from its package name; both happen to have `rts_eval.rs`.
+        // `use fixture_engine::rts_eval` from tests/ must resolve to the
+        // member crate — the unique-crate fallback runs before the
+        // dev-target root-crate fallback.
+        let known = set(&[
+            "src/lib.rs",
+            "src/rts_eval.rs",
+            "crates/engine/src/lib.rs",
+            "crates/engine/src/rts_eval.rs",
+            "tests/it.rs",
+        ]);
+        let result = resolve_import("tests/it.rs", "fixture_engine::rts_eval", &known);
+        assert_eq!(result, Some("crates/engine/src/rts_eval.rs".to_string()));
+    }
+
+    #[test]
+    fn external_crate_from_test_does_not_bind_root_module_in_workspace() {
+        // In a multi-crate workspace the root crate offers no name evidence,
+        // so `use serde::de` from a test file must NOT bind to the root
+        // crate's src/de.rs.
+        let known = set(&[
+            "src/lib.rs",
+            "src/de.rs",
+            "crates/engine/src/lib.rs",
+            "tests/it.rs",
+        ]);
+        let result = resolve_import("tests/it.rs", "serde::de", &known);
         assert_eq!(result, None);
     }
 }

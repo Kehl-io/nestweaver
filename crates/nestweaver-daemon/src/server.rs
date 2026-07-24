@@ -634,11 +634,13 @@ impl DaemonService {
                 args,
                 embed_ref,
                 Some(&cancel),
-                // R9/R9b: scope blast_radius output to the caller's visible
-                // repos (`visible`, resolved from the request Identity by the
-                // typed handler). With no `[authz]` config this is
-                // `VisibleRepos::All` ⇒ redaction is a no-op; non-blast_radius
-                // tools ignore it entirely.
+                // R9/R9b: scope tool output to the caller's visible repos
+                // (`visible`, resolved from the request Identity by the typed
+                // handler). With no `[authz]` config this is
+                // `VisibleRepos::All` ⇒ redaction is a no-op. Enforcement
+                // applies to blast_radius and to the repo-scoped search tools
+                // (brain_search, brain_impact, affected_tests); other tools
+                // ignore it.
                 Some(&visible),
             )
             .map_err(|e| dispatch_err_to_status(&tool_name, e))?;
@@ -2854,6 +2856,36 @@ impl NestWeaverDaemon for DaemonService {
             if let Some((running_port, handle)) = guard.as_ref()
                 && !handle.is_finished()
             {
+                // A watch request must not be silently dropped just because
+                // the UI is already served — start the watcher here too.
+                if req.watch && !req.watch_repo_path.is_empty() {
+                    let watch_db = state.db_path.clone();
+                    let watch_repo = std::path::PathBuf::from(&req.watch_repo_path);
+                    let watch_store = state.store.clone();
+                    let watch_instance = watch_instance.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let watcher = nestweaver_engine::CodeWatcher::new(
+                            &watch_db,
+                            &watch_repo,
+                            &watch_instance,
+                        );
+                        if let Err(e) = watcher.run_with_store(watch_store, None) {
+                            tracing::error!("CodeWatcher failed: {e}");
+                        }
+                    });
+                    // Report the ACTUAL running port, not the requested one —
+                    // the CLI prints this port in the URL it shows the user.
+                    return Ok(Response::new(ServeUiResponse {
+                        ok: true,
+                        message: format!(
+                            "UI server already running on port {running_port}; watcher started for {}",
+                            req.watch_repo_path
+                        ),
+                        port: u32::from(*running_port),
+                        error: String::new(),
+                    }));
+                }
                 // Report the ACTUAL running port, not the requested one —
                 // the CLI prints this port in the URL it shows the user.
                 return Ok(Response::new(ServeUiResponse {

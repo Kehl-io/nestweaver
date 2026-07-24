@@ -152,7 +152,12 @@ fn brain_search_response_to_json(
             if let Some(location) = &result.location {
                 item["location"] = Value::String(location.clone());
             }
-            item["matched_headings"] = serde_json::json!(result.matched_headings);
+            // Parity with the local path: symbol rows carry no
+            // `matched_headings` key at all — omit it when empty instead of
+            // emitting a spurious `[]`.
+            if !result.matched_headings.is_empty() {
+                item["matched_headings"] = serde_json::json!(result.matched_headings);
+            }
             if !concise && let Some(body) = &result.inline_body {
                 item["inline_body"] = Value::String(body.clone());
             }
@@ -568,11 +573,10 @@ mod tests {
         title_only_note.results[0].canonical_id = None;
         title_only_note.results[0].matched_headings.clear();
         let concise_note = brain_search_response_to_json(&title_only_note, true);
-        assert_eq!(
-            concise_note["results"][0]["matched_headings"],
-            serde_json::json!([]),
-            "title-only concise note rows must retain an empty matched-headings field: \
-             {concise_note}"
+        assert!(
+            concise_note["results"][0].get("matched_headings").is_none(),
+            "rows with no matched headings must omit the field (parity with the \
+             daemon-proxy mapper): {concise_note}"
         );
     }
 

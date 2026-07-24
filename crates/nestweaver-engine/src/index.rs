@@ -3740,12 +3740,13 @@ pub(crate) fn reresolve_affected_dependents_on_store(
 /// Shared core of nw-008 Phase 2. Re-parse `S = changed ∪ rdeps` from
 /// `reader`, resolve cross-file references with the full symbol map across
 /// `S`, and return ONLY the edges the per-file `DETACH DELETE` removed: those
-/// whose TARGET lives in a changed file and whose SOURCE lives in a different
-/// file. Intra-file edges and edges into unchanged files were never deleted
-/// (or were re-created by single-file resolution in the mutation loop), so
-/// re-inserting them would duplicate (edge insert is `CREATE`, not `MERGE`) —
-/// the `source_file != target_file` and `target ∈ changed` filters keep the
-/// insert duplicate-free without a `delete_resolved_edges_for_file` pass.
+/// whose SOURCE or TARGET lives in a changed file, with both endpoints in
+/// different files. Intra-file edges and edges between files that were both
+/// untouched were never deleted (or were re-created by single-file resolution
+/// in the mutation loop), so re-inserting them would duplicate (edge insert
+/// is `CREATE`, not `MERGE`) — the `source_file != target_file` and
+/// `source ∈ changed OR target ∈ changed` filters keep the insert
+/// duplicate-free without a `delete_resolved_edges_for_file` pass.
 ///
 /// `db_symbols` must be the repo's live symbol set (post-mutation), used to
 /// give the resolver visibility into unchanged files' symbols as targets.

@@ -3503,6 +3503,12 @@ fn tool_brain_search(
         });
 
         let matched_entities = groups.len();
+        // Parity with the Tantivy path: detailed note rows carry their vault
+        // (resolved from the note list already fetched above).
+        let note_vaults: HashMap<&str, &str> = notes
+            .iter()
+            .map(|n| (n.uid.as_str(), n.vault_uid.as_str()))
+            .collect();
         let rows: Vec<Value> = note_order
             .iter()
             .take(limit)
@@ -3521,6 +3527,7 @@ fn tool_brain_search(
                         "kind": "note",
                         "title": g.best_title,
                         "score": g.best_score,
+                        "vault_uid": note_vaults.get(g.note_uid.as_str()).copied().unwrap_or_default(),
                         "matched_headings": g.matched_headings,
                     })
                 }

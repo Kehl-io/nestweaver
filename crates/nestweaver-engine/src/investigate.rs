@@ -268,10 +268,15 @@ pub fn save_bundle_store(db_path: &Path, store: &BundleStore) -> Result<(), anyh
 /// Advisory lock guarding the load→mutate→save cycle of the bundle sidecar
 /// (F-20). Implemented as a lock file created with `create_new` so it works
 /// across both threads and processes; stale locks (holder crashed) are broken
-/// after [`LOCK_STALE_SECS`]. Acquisition failure degrades to proceeding
-/// unlocked rather than failing the investigation.
+/// after [`LOCK_STALE_SECS`]. An ownership TOKEN is written into the lock file
+/// so that after a stale-lock takeover, the previous holder's Drop does not
+/// delete the successor's lock (pattern mirrors rts_eval.rs's `SidecarLock`).
+/// Acquisition failure degrades to proceeding unlocked rather than failing
+/// the investigation.
 struct BundleStoreLock {
     path: std::path::PathBuf,
+    /// Unique token (pid + nanos) written into the lock file on acquire.
+    token: String,
     /// `false` when the lock was not actually acquired (timeout / IO error) —
     /// Drop must not remove a lock file owned by someone else.
     owned: bool,
@@ -284,7 +289,16 @@ const LOCK_STALE_SECS: u64 = 60;
 
 impl BundleStoreLock {
     fn acquire(db_path: &Path) -> Self {
+        use std::io::Write as _;
         let path = bundle_sidecar_path(db_path).with_extension("lock");
+        let token = format!(
+            "{}:{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(LOCK_WAIT_SECS);
         loop {
             match std::fs::OpenOptions::new()
@@ -292,7 +306,38 @@ impl BundleStoreLock {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Self { path, owned: true },
+                Ok(mut f) => {
+                    // Best-effort: the token lets a stale-taken-over holder
+                    // recognize the lock is no longer its own on Drop.
+                    let _ = f.write_all(token.as_bytes());
+                    drop(f);
+                    // Create-then-verify: a contender breaking the lock as
+                    // stale can land its remove+create after ours. Verify the
+                    // file still holds OUR token before claiming the lock;
+                    // otherwise wait for the real holder (or the deadline).
+                    let ours = std::fs::read_to_string(&path)
+                        .map(|content| content == token)
+                        .unwrap_or(false);
+                    if ours {
+                        return Self {
+                            path,
+                            token,
+                            owned: true,
+                        };
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "bundle sidecar lock not acquired within deadline; proceeding unlocked"
+                        );
+                        return Self {
+                            path,
+                            token,
+                            owned: false,
+                        };
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Break abandoned locks (holder crashed between create and
                     // Drop) so one bad exit doesn't wedge the sidecar forever.
@@ -310,12 +355,22 @@ impl BundleStoreLock {
                             path = %path.display(),
                             "bundle sidecar lock not acquired within deadline; proceeding unlocked"
                         );
-                        return Self { path, owned: false };
+                        return Self {
+                            path,
+                            token,
+                            owned: false,
+                        };
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 // Read-only dir etc.: proceed without a lock rather than fail.
-                Err(_) => return Self { path, owned: false },
+                Err(_) => {
+                    return Self {
+                        path,
+                        token,
+                        owned: false,
+                    };
+                }
             }
         }
     }
@@ -323,8 +378,15 @@ impl BundleStoreLock {
 
 impl Drop for BundleStoreLock {
     fn drop(&mut self) {
+        // Only remove the lock if it is still OURS — a stale-lock takeover
+        // may have replaced it with a successor's lock, which must survive.
         if self.owned {
-            let _ = std::fs::remove_file(&self.path);
+            let still_ours = std::fs::read_to_string(&self.path)
+                .map(|content| content == self.token)
+                .unwrap_or(false);
+            if still_ours {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 }
@@ -676,17 +738,6 @@ enum ScopeFilter {
     ProjectSymbols(std::collections::HashSet<String>),
 }
 
-/// Resolve a scope string into (seed_inputs, optional scope filter).
-///
-/// The `query` always seeds retrieval; project scope additionally seeds the
-/// project's member UIDs and post-filters the results to its member symbols;
-/// repo scope returns a repo-UID set used to post-filter the connected nodes.
-///
-/// F-21: unrecognized scope strings, an empty `repo:`/`project:` name, a
-/// `project:` naming a nonexistent project, or a `repo:` matching no repo are
-/// all hard errors naming the scope — previously they silently degraded to
-/// "no restriction" (or, for an unmatched `repo:`, to filtering out every
-/// symbol).
 /// Strip a `project:`/`repo:` scope prefix case-insensitively (so
 /// `Project:Foo` / `REPO:x` resolve the same as their lowercase spellings,
 /// matching the already case-insensitive `vault`/`all` and project/repo name
@@ -704,6 +755,17 @@ fn strip_scope_prefix<'a>(scope: &'a str, prefix: &str) -> Option<&'a str> {
     scope.get(prefix.len()..)
 }
 
+/// Resolve a scope string into (seed_inputs, optional scope filter).
+///
+/// The `query` always seeds retrieval; project scope additionally seeds the
+/// project's member UIDs and post-filters the results to its member symbols;
+/// repo scope returns a repo-UID set used to post-filter the connected nodes.
+///
+/// F-21: unrecognized scope strings, an empty `repo:`/`project:` name, a
+/// `project:` naming a nonexistent project, or a `repo:` matching no repo are
+/// all hard errors naming the scope — previously they silently degraded to
+/// "no restriction" (or, for an unmatched `repo:`, to filtering out every
+/// symbol).
 fn resolve_scope(
     store: &GraphStore,
     query: &str,
@@ -1052,6 +1114,43 @@ mod tests {
         let (_r, store) =
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
         (dir, src, store)
+    }
+
+    /// After a stale-lock takeover, the previous holder's Drop must not
+    /// delete the successor's lock file (ownership-token back-port from
+    /// rts_eval's `SidecarLock`).
+    #[test]
+    fn bundle_store_lock_drop_preserves_successor_lock_after_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let lock = BundleStoreLock::acquire(&db_path);
+        assert!(lock.owned, "lock on a fresh path must be acquired");
+        let lock_path = bundle_sidecar_path(&db_path).with_extension("lock");
+        // A successor breaks the "stale" lock and installs its own token.
+        std::fs::write(&lock_path, b"other-pid:0").expect("successor token");
+        drop(lock);
+        assert!(
+            lock_path.exists(),
+            "successor lock must survive the taken-over holder's Drop"
+        );
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    /// A normal acquire/drop cycle removes the lock file it created.
+    #[test]
+    fn bundle_store_lock_drop_removes_own_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let lock_path = bundle_sidecar_path(&db_path).with_extension("lock");
+        {
+            let lock = BundleStoreLock::acquire(&db_path);
+            assert!(lock.owned);
+            assert!(lock_path.exists());
+        }
+        assert!(
+            !lock_path.exists(),
+            "Drop must remove the holder's own lock file"
+        );
     }
 
     #[test]

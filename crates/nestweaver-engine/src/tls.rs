@@ -134,6 +134,12 @@ pub fn generate_tls_bundle(
         client_params.not_after =
             OffsetDateTime::now_utc() + Duration::days(i64::from(validity_days));
         client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        // Same strict-verifier extensions as the server cert: AKI naming the
+        // issuing CA, explicit basicConstraints CA:FALSE (critical) + SKI via
+        // ExplicitNoCa, and a key usage appropriate for a TLS client key.
+        client_params.use_authority_key_identifier_extension = true;
+        client_params.is_ca = IsCa::ExplicitNoCa;
+        client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
 
         let client_cert = client_params
             .signed_by(&client_key, &*ca)
@@ -265,7 +271,7 @@ mod tests {
                 })
         }
 
-        let bundle = generate_tls_bundle(&[], 365, false).unwrap();
+        let bundle = generate_tls_bundle(&[], 365, true).unwrap();
         let (_, ca_pem) =
             x509_parser::pem::parse_x509_pem(bundle.ca_cert_pem.as_bytes()).expect("parse CA PEM");
         let (_, ca) = X509Certificate::from_der(&ca_pem.contents).expect("parse CA DER");
@@ -322,6 +328,45 @@ mod tests {
         assert!(
             server_eku.value.server_auth,
             "server EKU must include serverAuth"
+        );
+
+        // Client (mTLS): same strict-verifier extensions as the server cert —
+        // AKI naming the CA's SKI, critical CA:FALSE basicConstraints, SKI,
+        // digitalSignature key usage — plus clientAuth EKU.
+        let client_pem_str = bundle.client_cert_pem.expect("client cert generated");
+        let (_, client_pem) =
+            x509_parser::pem::parse_x509_pem(client_pem_str.as_bytes()).expect("parse client PEM");
+        let (_, client) =
+            X509Certificate::from_der(&client_pem.contents).expect("parse client DER");
+        assert_eq!(
+            key_identifier(&client, true).as_deref(),
+            Some(ca_ski.as_slice()),
+            "client cert must carry an Authority Key Identifier naming the issuing CA"
+        );
+        assert!(
+            key_identifier(&client, false).is_some(),
+            "client cert must carry a Subject Key Identifier"
+        );
+        let client_bc = client
+            .basic_constraints()
+            .unwrap()
+            .expect("client basicConstraints");
+        assert!(
+            client_bc.critical && !client_bc.value.ca,
+            "client cert must assert CA:FALSE"
+        );
+        let client_ku = client.key_usage().unwrap().expect("client key usage");
+        assert!(
+            client_ku.value.digital_signature(),
+            "client key usage must include digitalSignature"
+        );
+        let client_eku = client
+            .extended_key_usage()
+            .unwrap()
+            .expect("client extended key usage");
+        assert!(
+            client_eku.value.client_auth,
+            "client EKU must include clientAuth"
         );
     }
 

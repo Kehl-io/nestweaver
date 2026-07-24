@@ -379,7 +379,7 @@ fn affected_tests_within(
         notifications.push(Notification {
             level: NotificationLevel::Note,
             message: format!(
-                "always-included {} changed test file(s) not yet in the index                  (new test or stale index): {}",
+                "always-included {} changed test file(s) not yet in the index (new test or stale index): {}",
                 always_included.len(),
                 always_included.join(", ")
             ),

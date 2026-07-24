@@ -1174,6 +1174,10 @@ export function hiddencaller_three() { return hiddenimpacttarget(); }
 
     let query_token = "authz-query-token-0123456789abcdef012345";
     let admin_token = "authz-admin-token-0123456789abcdef012345";
+    let snapshots_dir = dir.path().join("snapshots");
+    let workspace_dir = dir.path().join("workspace");
+    let snapshots_dir = snapshots_dir.display().to_string();
+    let workspace_dir = workspace_dir.display().to_string();
     let config_path = dir.path().join("instance.toml");
     let config = format!(
         r#"
@@ -1182,11 +1186,11 @@ repos = []
 
 [snapshot_storage]
 backend = "local"
-path = "/tmp/nw-authz-test-snapshots"
+path = "{snapshots_dir}"
 
 [workspace]
 backend = "local"
-path = "/tmp/nw-authz-test-workspace"
+path = "{workspace_dir}"
 
 [inference]
 endpoint = "http://localhost:8080"

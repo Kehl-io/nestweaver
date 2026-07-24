@@ -2168,8 +2168,8 @@ enum BrainCommands {
         query: String,
         #[arg(
             long,
-            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
-            help = "Maximum results (minimum 1; default: 20, or [limits].default_result_limit from config; matches the MCP brain_search schema)"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
+            help = "Maximum results (1-1000; default: 20, or [limits].default_result_limit from config; matches the MCP brain_search schema)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -7924,8 +7924,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Likewise, --min-score has no daemon-side equivalent (the brain_impact schema is
             // additionalProperties:false and the daemon envelope carries no truncation flags),
             // so an explicit threshold also forces the direct path, where pruning is both
-            // honored and surfaced.
-            if use_daemon && repo_filter.is_none() && min_score.is_none() {
+            // honored and surfaced. Same for a non-default --confidence: the daemon tool
+            // hardcodes 0.0, so an explicit filter must take the direct path or it would be
+            // silently ignored.
+            if use_daemon && repo_filter.is_none() && min_score.is_none() && confidence <= 0.0 {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 if let Some(value) = try_hybrid_json_rpc(
                     true,
@@ -7993,14 +7995,36 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         _ => {}
                     }
                     if json {
-                        // nw-086: emit the bare node array, NOT the daemon's
-                        // {_meta, impact_nodes, total, ...} envelope, so a --json
-                        // consumer sees the same top-level shape as the direct path.
+                        // nw-086: complete walks emit the bare node array (the direct
+                        // path's shape), NOT the daemon's {_meta, impact_nodes, ...}
+                        // envelope. When the daemon reports traversal pruning, mirror
+                        // the direct path's honest object form instead — a bare array
+                        // would hide that the impact set is a floor.
+                        let truncated_by_threshold = value
+                            .get("truncated_by_threshold")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let truncated_by_depth = value
+                            .get("truncated_by_depth")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let payload = value
                             .get("impact_nodes")
                             .cloned()
                             .unwrap_or_else(|| value.clone());
-                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        if truncated_by_threshold || truncated_by_depth {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "nodes": payload,
+                                    "truncated_by_threshold": truncated_by_threshold,
+                                    "truncated_by_depth": truncated_by_depth,
+                                    "note": value.get("note").cloned().unwrap_or(serde_json::Value::Null),
+                                }))?
+                            );
+                        } else {
+                            println!("{}", serde_json::to_string_pretty(&payload)?);
+                        }
                     } else if let Some(arr) = value.get("impact_nodes") {
                         #[derive(serde::Deserialize)]
                         struct DaemonImpactNode {
@@ -8053,6 +8077,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             count,
                             format_elapsed(t0.elapsed())
                         );
+                        // Surface the daemon's truncation honesty in text mode too —
+                        // the reported impact set may be a floor.
+                        if let Some(note) = value.get("note").and_then(|v| v.as_str())
+                            && !out.quiet
+                        {
+                            println!("note: {note} — reported impact is a floor");
+                        }
                         return Ok((EXIT_SUCCESS, Some(stats)));
                     }
                     return Ok((EXIT_SUCCESS, None));
@@ -9675,26 +9706,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // SIGTERM-based stop for Linux + legacy macOS fork-based
                     // daemons — and for a detached daemon that survived the
                     // launchd bootout above.
+                    let socket_pid = daemon_socket_reported_pid(&socket);
                     let pidfile_pid: Option<i32> = std::fs::read_to_string(&pidfile)
                         .ok()
                         .and_then(|s| s.trim().parse().ok());
-                    // The pidfile may be gone or stale while a daemon still
-                    // serves the socket — ask the kernel who is on the other
-                    // end (B-1) instead of trusting the file alone.
-                    let socket_pid = daemon_socket_reported_pid(&socket);
-                    let pid = pidfile_pid.or(socket_pid);
-                    let Some(pid) = pid else {
-                        // No pidfile and nothing serving the socket.
-                        if launchd_stopped {
-                            eprintln!("Daemon stopped.");
-                        } else {
-                            println!("Daemon is not running.");
-                        }
-                        let _ = std::fs::remove_file(&socket);
-                        return Ok((EXIT_SUCCESS, None));
+                    // A stale pidfile can name a DEAD pid while a daemon still
+                    // serves the socket — retarget the stop at the live
+                    // socket-peer pid instead of declaring "not running" and
+                    // deleting a live daemon's socket (the same state the
+                    // identity cross-check exists for).
+                    let pid = match pidfile_pid {
+                        Some(p) if unsafe { libc::kill(p, 0) } == 0 => Some(p),
+                        _ => socket_pid.filter(|p| unsafe { libc::kill(*p, 0) } == 0),
                     };
-                    if unsafe { libc::kill(pid, 0) } != 0 {
-                        // Stale pidfile from a previous run.
+                    let Some(pid) = pid else {
+                        // Nothing alive on either the pidfile or the socket.
                         if launchd_stopped {
                             eprintln!("Daemon stopped.");
                         } else {
@@ -9703,7 +9729,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let _ = std::fs::remove_file(&pidfile);
                         let _ = std::fs::remove_file(&socket);
                         return Ok((EXIT_SUCCESS, None));
-                    }
+                    };
 
                     // F-06: the pidfile PID may have been recycled by an
                     // unrelated process. Verify identity before signaling. A
@@ -10975,7 +11001,7 @@ fn run_rts_eval(command: RtsEvalCommands) -> anyhow::Result<(i32, Option<String>
             )?;
             println!(
                 "Recorded full-suite outcome for {} ({} failed test file(s)).",
-                &sha[..8.min(sha.len())],
+                sha.chars().take(8).collect::<String>(),
                 failed_test_files.len()
             );
             Ok((EXIT_SUCCESS, None))

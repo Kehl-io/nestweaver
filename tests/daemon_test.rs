@@ -538,7 +538,7 @@ fn daemon_index_and_query() {
 }
 
 #[test]
-fn mcp_argument_validation_matches_direct_and_daemon() {
+fn daemon_mcp_argument_validation_matches_direct_and_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
     let db_path = dir.path().join("validation").join("test.lbug");
@@ -648,7 +648,7 @@ fn mcp_argument_validation_matches_direct_and_daemon() {
 }
 
 #[test]
-fn mcp_trust_and_count_contracts_match_direct_and_daemon() {
+fn daemon_mcp_trust_and_count_contracts_match_direct_and_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
     let db_path = dir.path().join("trust-counts").join("test.lbug");

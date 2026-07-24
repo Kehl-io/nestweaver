@@ -612,6 +612,14 @@ fn resolve_single_reference(
 /// like `if __name__ == '__main__':` after the last `def`), walk back to an
 /// earlier symbol whose span does — or return `None` when the reference is
 /// module-level code that belongs to no symbol.
+///
+/// Degenerate-span fallback: the regex-based parsers (astro, svelte, vue,
+/// cobol) emit one-line spans (`end_line == start_line`) while emitting Call
+/// references on later lines, so no span can ever contain those refs. When no
+/// span contains the line, attribute the reference to the nearest preceding
+/// symbol with a degenerate span (`end_line <= start_line`). Symbols with
+/// real spans that ended before `ref_line` still yield `None` — module-level
+/// code belongs to no symbol.
 fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Option<&'a RawSymbol> {
     debug_assert!(
         symbols
@@ -626,10 +634,18 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Opt
     if idx == 0 {
         return None;
     }
-    symbols[..idx]
+    if let Some(enclosing) = symbols[..idx]
         .iter()
         .rev()
         .find(|s| ref_line <= s.end_line.max(s.start_line))
+        .copied()
+    {
+        return Some(enclosing);
+    }
+    symbols[..idx]
+        .iter()
+        .rev()
+        .find(|s| s.end_line <= s.start_line)
         .copied()
 }
 
@@ -1194,6 +1210,74 @@ mod tests {
         let dupes = vec![make_symbol("x", 10), make_symbol("y", 10)];
         let result = check(&dupes, 10);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn find_enclosing_symbol_degenerate_span_fallback() {
+        fn degenerate(name: &str, line: u32) -> RawSymbol {
+            // Regex-based parsers (astro, svelte, vue, cobol) emit one-line spans.
+            let mut sym = make_symbol(name, line);
+            sym.end_line = line;
+            sym
+        }
+
+        fn check(symbols: &[RawSymbol], ref_line: u32) -> Option<u32> {
+            let sorted: Vec<&RawSymbol> = {
+                let mut v: Vec<&RawSymbol> = symbols.iter().collect();
+                v.sort_by_key(|s| s.start_line);
+                v
+            };
+            find_enclosing_symbol(&sorted, ref_line).map(|s| s.start_line)
+        }
+
+        // A call ref on a later line is owned by the nearest preceding
+        // degenerate-span symbol.
+        let symbols = vec![degenerate("a", 10), degenerate("b", 20)];
+        assert_eq!(check(&symbols, 25), Some(20));
+        assert_eq!(check(&symbols, 999), Some(20));
+        assert_eq!(check(&symbols, 12), Some(10));
+
+        // Refs before the first symbol still get nothing.
+        assert!(check(&symbols, 5).is_none());
+
+        // Real-spanned symbols past their end must NOT claim the ref — the
+        // fallback applies to degenerate spans only.
+        let real = vec![make_symbol("real", 10)]; // spans 10..=15
+        assert!(check(&real, 50).is_none());
+
+        // Mixed file: a degenerate span still claims a later ref even when a
+        // real-spanned symbol sits between them and has already ended.
+        let mut short = make_symbol("short", 15);
+        short.end_line = 16;
+        let mixed = vec![degenerate("a", 10), short];
+        assert_eq!(check(&mixed, 50), Some(10));
+    }
+
+    #[test]
+    fn regex_parser_degenerate_spans_still_produce_call_edges() {
+        // Svelte-like file: regex parser emits degenerate spans
+        // (end_line == start_line) and Call references on later lines. The
+        // intra-function call edge must survive the enclosing-span check.
+        let mut helper = make_symbol("helper", 1);
+        helper.end_line = 1;
+        let mut caller = make_symbol("caller", 10);
+        caller.end_line = 10;
+        let files = vec![(
+            "src/App.svelte".to_string(),
+            vec![helper, caller],
+            vec![make_ref("helper", ReferenceKind::Call, 12)],
+        )];
+
+        let edges = resolve_references(&files, Language::Svelte, "repo:test:abc");
+        let call = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Calls && !e.target_uid.starts_with("unresolved:"))
+            .expect("degenerate-span caller should still produce a resolved CALLS edge");
+        assert!(
+            call.source_uid.ends_with(":10"),
+            "call edge should be attributed to caller (line 10), got {}",
+            call.source_uid
+        );
     }
 
     #[test]

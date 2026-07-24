@@ -3752,8 +3752,7 @@ impl GraphStore {
     /// DB. Useful for recovering from a misconfigured `instance merge`
     /// that left an orphan instance ID behind.
     pub fn purge_instance(&self, id: &str) -> Result<PurgeInstanceResult, StoreError> {
-        self.purge_instance_with_outcome(id)
-            .map(|outcome| outcome.value)
+        Self::legacy_mutation_result(self.purge_instance_with_outcome(id))
     }
 
     /// Purge one instance while retaining every confirmed count if a later
@@ -5467,8 +5466,7 @@ impl GraphStore {
     ///
     /// Uses [`reparent_vault`] to preserve notes in the winning vault.
     pub fn merge_instance_ids(&self, from: &str, to: &str) -> Result<MergeResult, StoreError> {
-        self.merge_instance_ids_with_outcome(from, to)
-            .map(|outcome| outcome.value)
+        Self::legacy_mutation_result(self.merge_instance_ids_with_outcome(from, to))
     }
 
     /// Merge two instance IDs and classify failures against the exact remap
@@ -5569,6 +5567,11 @@ impl GraphStore {
         let mut confirmed_changed = initial_state == InstanceUidRemapPlanState::PartiallyApplied;
         let mut value = MergeResult::default();
         let mut mutation_warnings = Vec::new();
+        // Source Vaults deleted because the target won a root_path collision:
+        // their plan remaps are intentionally left without a destination (the
+        // discard IS the plan), so the final probe must not score them as
+        // unapplied.
+        let mut discarded_vault_uids = std::collections::BTreeSet::new();
 
         // Complete all graph discovery before the first mutation.
         let project_merges = match self.plan_instance_project_merges(from, to) {
@@ -5760,6 +5763,7 @@ impl GraphStore {
                         });
                     }
                     confirmed_changed |= deletion.confirmed_changed;
+                    discarded_vault_uids.insert(vault.uid.clone());
                     if deletion.value.notes_deleted > 0 {
                         value.discarded.push(DiscardedVault {
                             root_path,
@@ -5955,7 +5959,21 @@ impl GraphStore {
                 faults.verify,
             );
         }
-        match self.verify_merge_plan(from, to, expected_plan, faults.verify) {
+        // Intentional collision discards satisfy their plan items by deleting
+        // the source — the predicted destination is never created, so verify
+        // the remaining plan only. An empty remainder means every planned
+        // remap was an intentional discard: fully applied.
+        let remaining_plan: Vec<InstanceUidRemap> = expected_plan
+            .iter()
+            .filter(|mapping| !discarded_vault_uids.contains(&mapping.source_uid))
+            .cloned()
+            .collect();
+        let final_state = if remaining_plan.is_empty() {
+            Ok(InstanceUidRemapPlanState::Applied)
+        } else {
+            self.verify_merge_plan(from, to, &remaining_plan, faults.verify)
+        };
+        match final_state {
             Ok(InstanceUidRemapPlanState::Applied) => Ok(MutationOutcome {
                 disposition: MutationDisposition::CommittedComplete,
                 confirmed_changed,
@@ -6711,6 +6729,82 @@ mod tests {
         assert!(outcome.primary_failure.is_some());
     }
 
+    #[test]
+    fn legacy_mutation_result_surfaces_partial_and_ambiguous_as_errors() {
+        // The legacy `purge_instance` / `merge_instance_ids` wrappers route
+        // through `legacy_mutation_result` (like `delete_vault_cascade`), so a
+        // CommittedPartial or Ambiguous disposition must surface as `Err`
+        // instead of being swallowed into a reported success.
+        fn outcome(
+            disposition: MutationDisposition,
+            primary_failure: Option<MutationFailure>,
+        ) -> MutationOutcome<usize> {
+            MutationOutcome {
+                disposition,
+                confirmed_changed: true,
+                value: 1,
+                primary_failure,
+                mutation_warnings: Vec::new(),
+            }
+        }
+
+        let complete = GraphStore::legacy_mutation_result(Ok(outcome(
+            MutationDisposition::CommittedComplete,
+            None,
+        )));
+        assert_eq!(complete.unwrap(), 1);
+
+        let no_change = GraphStore::legacy_mutation_result(Ok(outcome(
+            MutationDisposition::ConfirmedNoChange,
+            None,
+        )));
+        assert_eq!(no_change.unwrap(), 1);
+
+        let partial = GraphStore::legacy_mutation_result(Ok(outcome(
+            MutationDisposition::CommittedPartial,
+            Some(MutationFailure::new("stage-partial", "partial failure")),
+        )))
+        .unwrap_err();
+        assert!(partial.to_string().contains("partial failure"));
+
+        let ambiguous = GraphStore::legacy_mutation_result(Ok(outcome(
+            MutationDisposition::Ambiguous,
+            Some(MutationFailure::new("stage-ambiguous", "ambiguous failure")),
+        )))
+        .unwrap_err();
+        assert!(ambiguous.to_string().contains("ambiguous failure"));
+
+        // A partial/ambiguous outcome without its primary failure is itself an
+        // error, never a silent success.
+        let missing_failure = GraphStore::legacy_mutation_result(Ok(outcome(
+            MutationDisposition::CommittedPartial,
+            None,
+        )))
+        .unwrap_err();
+        assert!(
+            missing_failure
+                .to_string()
+                .contains("omitted its primary failure")
+        );
+    }
+
+    #[test]
+    fn legacy_purge_and_merge_wrappers_succeed_on_clean_runs() {
+        // Success-path behavior of the legacy wrappers is unchanged by the
+        // legacy_mutation_result routing.
+        let store = GraphStore::in_memory().unwrap();
+        seed_purge_repo(&store, "legacy-ok", "one");
+
+        let purged = store.purge_instance("legacy-ok").unwrap();
+        assert_eq!(purged.repos, 1);
+
+        seed_merge_repo(&store, "legacy-merge", "one");
+        let merged = store
+            .merge_instance_ids("legacy-merge", "legacy-target")
+            .unwrap();
+        assert_eq!(merged.repos, 1);
+    }
+
     fn seed_purge_repo(store: &GraphStore, instance_id: &str, suffix: &str) -> String {
         let uid = format!("repo:{instance_id}:{suffix}");
         store
@@ -6978,6 +7072,76 @@ mod tests {
         assert!(outcome.confirmed_changed);
         assert_eq!(outcome.value.repos, 1);
         assert!(outcome.primary_failure.is_some());
+    }
+
+    #[test]
+    fn merge_vault_collision_discard_is_complete_not_partial() {
+        // Source and target vaults share a root_path; equal note counts let
+        // the target win, so the source vault is intentionally discarded. The
+        // discard satisfies the vault's plan remap (the predicted destination
+        // is never created) — the final probe must report CommittedComplete,
+        // not CommittedPartial.
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, instance) in [
+            ("vlt:merge-coll:source", "merge-coll-source"),
+            ("vlt:merge-coll:target", "merge-coll-target"),
+        ] {
+            store
+                .insert_vault(&Vault {
+                    uid: uid.to_string(),
+                    name: uid.to_string(),
+                    root_path: "/shared/merge-coll".to_string(),
+                    instance_id: instance.to_string(),
+                })
+                .unwrap();
+            store
+                .insert_note(&Note {
+                    uid: format!("note:{uid}:one"),
+                    vault_uid: uid.to_string(),
+                    file_path: "one.md".to_string(),
+                    title: "One".to_string(),
+                    note_kind: nestweaver_schema::NoteKind::General,
+                    word_count: 1,
+                    content_hash: "one".to_string(),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+
+        let outcome = store
+            .merge_instance_ids_with_outcome("merge-coll-source", "merge-coll-target")
+            .unwrap();
+
+        assert_eq!(
+            outcome.disposition,
+            MutationDisposition::CommittedComplete,
+            "intentional collision discard must not read as a partial merge: {:?}",
+            outcome.primary_failure
+        );
+        assert_eq!(outcome.value.discarded.len(), 1);
+        assert_eq!(outcome.value.discarded[0].root_path, "/shared/merge-coll");
+        assert_eq!(outcome.value.discarded[0].notes_discarded, 1);
+        let vaults = store.list_vaults(None).unwrap();
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0].uid, "vlt:merge-coll:target");
+
+        // The legacy wrapper surfaces the same clean result.
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:merge-coll:second".to_string(),
+                name: "second".to_string(),
+                root_path: "/shared/merge-coll".to_string(),
+                instance_id: "merge-coll-source".to_string(),
+            })
+            .unwrap();
+        let merged = store
+            .merge_instance_ids("merge-coll-source", "merge-coll-target")
+            .unwrap();
+        assert_eq!(merged.vaults, 1);
     }
 
     #[test]
