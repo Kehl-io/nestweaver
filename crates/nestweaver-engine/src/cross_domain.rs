@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn discovery_on_read_only_store_fails_with_actionable_error() {
-        // Final-hunt finding: `index --repo` then `brain add` on the same DB
+        // `index --repo` then `brain add` on the same DB
         // warned `cross-domain discovery failed:
         // delete_cross_domain_edges_for_note_on` and produced zero
         // REFERENCES_CODE edges. Root cause: `brain add` opens the discovery
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn end_to_end_discovers_link_with_file_backed_store() {
-        // Final-hunt finding companion: the batched-transaction flush path
+        // Companion coverage: the batched-transaction flush path
         // must work against an on-disk (file-backed) database, not just the
         // in-memory store the tests above use. (The `brain add` failure that
         // prompted this turned out to be a read-only store — see

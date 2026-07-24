@@ -358,7 +358,7 @@ fn affected_tests_within(
             // Docs-only changes cannot break tests — keep the selection
             // usable (deliberate nw-064 behavior).
         } else {
-            // F-24: a recognized source file with no indexed symbols is
+            // A recognized source file with no indexed symbols is
             // "new file or stale index"; an UNRECOGNIZED extension (Makefile,
             // ci.yml, …) means we cannot even tell what the file is — the
             // parser may simply not cover a real source language. Both must
@@ -926,7 +926,7 @@ mod tests {
         );
     }
 
-    /// F-24: changed files whose extension we don't recognize (Makefile,
+    /// Changed files whose extension we don't recognize (Makefile,
     /// ci.yml, …) must NOT yield a silent "complete" — the parser may simply
     /// not cover a real source language, so fail safe like an unindexed
     /// source file.

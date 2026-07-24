@@ -35,7 +35,7 @@ pub struct ClusteringResult {
     pub modularity: f64,
 }
 
-/// Newman–Girvan modularity over ALL intra-community pairs (F-22):
+/// Newman–Girvan modularity over ALL intra-community pairs:
 ///
 ///   Q = Σ_c [ l_c/m − (d_c/2m)² ]
 ///
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn single_community_has_zero_modularity() {
-        // F-22: true Newman–Girvan Q puts ALL nodes in one community at
+        // True Newman–Girvan Q puts ALL nodes in one community at
         // Q = 0 (l_c = m and d_c = 2m, so m/m − (2m/2m)² = 0). The old
         // adjacent-pairs-only computation wrongly returned a positive value.
         let graph = triangle(1.0);

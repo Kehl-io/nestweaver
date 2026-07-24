@@ -1830,7 +1830,7 @@ pub enum AbortMigrationOutcome {
     /// mutation itself remains and may need manual reconciliation.
     ForceDiscardedApplied,
     /// An unreadable/unparseable journal was force-discarded. Its phase is
-    /// unknown (F-19): the graph may or may not have been mutated, so manual
+    /// unknown: the graph may or may not have been mutated, so manual
     /// reconciliation may be needed.
     ForceDiscardedUnknownPhase,
 }
@@ -1843,7 +1843,7 @@ pub enum AbortMigrationOutcome {
 /// `force` discards the journal regardless, leaving the graph as-is.
 ///
 /// A journal that fails to parse/validate wedges daemon boot exactly like a
-/// valid one but carries no trustworthy phase information (F-19): without
+/// valid one but carries no trustworthy phase information: without
 /// `force` the abort refuses and says so; with `force` the corrupt journal is
 /// discarded with a loud warning, the outcome reports the phase as unknown
 /// (`ForceDiscardedUnknownPhase`), and the operator reconciles manually.
@@ -3190,7 +3190,7 @@ mod tests {
 
     #[test]
     fn abort_migration_force_discards_unparseable_journal() {
-        // F-19: a corrupt journal wedges daemon boot but yields no trustworthy
+        // A corrupt journal wedges daemon boot but yields no trustworthy
         // phase information — --force must still be able to clear it.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("brain.lbug");
@@ -3209,7 +3209,7 @@ mod tests {
         );
 
         // With --force: discarded so the daemon can boot again. The journal was
-        // unreadable, so the outcome must report the phase as unknown (F-19) —
+        // unreadable, so the outcome must report the phase as unknown —
         // claiming graph-applied would assert something unknowable.
         assert_eq!(
             abort_instance_extension_migration(&db_path, true).unwrap(),

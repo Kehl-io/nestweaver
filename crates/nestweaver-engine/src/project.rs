@@ -68,7 +68,7 @@ pub fn materialize_projects(
 
     // Reject duplicate project names up front: two entries with the same name
     // map to the same project UID, so the per-entry edge reset below would
-    // silently wipe the previous entry's edges (F-08).
+    // silently wipe the previous entry's edges.
     let mut seen_names = std::collections::HashSet::new();
     for project_config in &config.projects {
         if !seen_names.insert(project_config.name.as_str()) {
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn materialize_projects_rejects_duplicate_names() {
-        // F-08: two [[projects]] entries with the same name map to the same
+        // Two [[projects]] entries with the same name map to the same
         // project UID; the per-entry edge reset would silently wipe the first
         // entry's edges. Materialization must refuse instead.
         let toml = r#"

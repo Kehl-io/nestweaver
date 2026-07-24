@@ -27,7 +27,7 @@ pub struct TlsBundle {
 
 /// Maximum accepted certificate validity. 100 years keeps the `time` crate
 /// date math far from its representable range (huge day counts overflowed the
-/// not-after computation and panicked — F-23). The CLI flag enforces the same
+/// not-after computation and panicked). The CLI flag enforces the same
 /// 1..=36500 range.
 pub const MAX_VALIDITY_DAYS: u32 = 36500;
 
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_validity_days() {
-        // F-23: 0 and absurdly large day counts must be a clean error, not a
+        // 0 and absurdly large day counts must be a clean error, not a
         // panic from overflowing the not-after date computation.
         let err = generate_tls_bundle(&[], 0, false)
             .err()

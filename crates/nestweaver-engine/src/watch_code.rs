@@ -257,7 +257,7 @@ impl CodeWatcher {
             // still on disk. A POST-mutation failure (delete landed, later
             // insert failed) is different: the graph holds partial data, so
             // the batch is reported as failed after publication finalizes —
-            // it must not look cleanly successful (P1 review).
+            // it must not look cleanly successful.
             let (files_processed, batch_error) = self.reindex_paths(&store, &r_uid, &relevant);
 
             let finalization = self.finalize_graph_publication_with_io(
@@ -294,7 +294,7 @@ impl CodeWatcher {
     /// the number of files processed plus the FIRST post-mutation failure,
     /// if any — a post-mutation failure means the graph holds partial data
     /// for that file and the batch must not be reported as cleanly
-    /// successful (P1 review). Mirrors the engine's incremental index
+    /// successful. Mirrors the engine's incremental index
     /// (`index.rs::incremental_index_with_name_and_io`): nw-008 Phase 0
     /// collects reverse-dependents from the live graph BEFORE any mutation,
     /// and Phase 2 re-resolves them afterwards so the cross-file edges the
@@ -380,7 +380,7 @@ impl CodeWatcher {
                         // data for this file, not the old data. Keep the file
                         // in `changed` so Phase 2 re-resolves whatever edges
                         // it can, and report the batch as failed instead of
-                        // publishing it as cleanly successful (P1 review).
+                        // publishing it as cleanly successful.
                         if first_post_mutation_error.is_none() {
                             first_post_mutation_error = Some(anyhow::anyhow!("{rel_str}: {e}"));
                         }
@@ -533,7 +533,7 @@ fn reindex_file(
 
     // Only now that the fresh parse is in hand: drop the stale symbols.
     // From this point on the file's graph data is being MUTATED — a failure
-    // here is not "kept previous data" (P1 review).
+    // here is not "kept previous data".
     let removed = store.delete_symbols_in_file(r_uid, &rel_str).map_err(|e| {
         ReindexError::PostMutation(anyhow::anyhow!("delete_symbols_in_file {rel_str}: {e}"))
     })?;
@@ -686,7 +686,7 @@ fn reindex_file(
 
 /// Why a watcher re-index of one file failed, split by whether the file's
 /// graph data had already been mutated. Callers must NOT treat a
-/// `PostMutation` failure as "previous data preserved" (P1 review): the
+/// `PostMutation` failure as "previous data preserved": the
 /// delete already landed, so the graph holds partial data for the file and
 /// the batch must not publish as cleanly successful.
 enum ReindexError {

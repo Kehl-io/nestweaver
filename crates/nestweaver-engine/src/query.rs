@@ -1245,7 +1245,7 @@ fn store_has_embeddings(store: &GraphStore) -> bool {
         // A NEGATIVE probe is only trusted briefly: the daemon's embed path
         // adds and flushes vectors WITHOUT advancing the graph generation,
         // so a cached "no embeddings" would otherwise hide live embeddings
-        // until an unrelated mutation or a restart (P1 review).
+        // until an unrelated mutation or a restart.
         Some(entry)
             if !entry.has
                 && entry.generation == generation

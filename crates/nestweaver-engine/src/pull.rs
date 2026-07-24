@@ -102,7 +102,7 @@ pub fn pull_repo(
         )));
     }
     let dest = workspace_root.join(&repo_name);
-    // F-14 cleanup below may only ever wipe a dest this pull attempt created
+    // The cleanup below may only ever wipe a dest this pull attempt created
     // (or an empty one) — never a pre-existing directory with contents.
     let dest_had_contents = dest
         .read_dir()
@@ -133,7 +133,7 @@ pub fn pull_repo(
 
         let output = Command::new("git").args(&args).output()?;
         if !output.status.success() {
-            // F-14: a failed pull must clean up the workspace dir it created —
+            // A failed pull must clean up the workspace dir it created —
             // validate_repo_dest pre-creates `dest`, and a partial clone must
             // not be mistaken for a real checkout on the next run. Never wipe
             // a pre-existing directory that had contents: the failed clone
@@ -392,7 +392,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// F-14: a failed pull must clean up the workspace dir it created — no
+    /// A failed pull must clean up the workspace dir it created — no
     /// empty/partial dest may survive to masquerade as a checkout later.
     #[test]
     fn failed_pull_cleans_up_created_dest() {

@@ -980,7 +980,7 @@ fn parse_openapi(path: &str, source: &str) -> Option<openapiv3::OpenAPI> {
     match spec_kind(path) {
         Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str(source).ok(),
         Some(SpecFileKind::OpenApiJson) => serde_json::from_str(source).ok(),
-        // F-18: `contracts diff` takes explicit user paths, so an OpenAPI spec
+        // `contracts diff` takes explicit user paths, so an OpenAPI spec
         // named e.g. `api-v1.yaml` must not be rejected by the filename gate
         // (the gate exists so indexing doesn't parse every YAML in the repo).
         // Sniff the content for an `openapi`/`swagger` top-level key instead.
@@ -1312,7 +1312,7 @@ paths:
 
     #[test]
     fn diff_openapi_sniffs_content_for_explicit_paths() {
-        // F-18: explicit user paths must not be gated on the openapi./swagger.
+        // Explicit user paths must not be gated on the openapi./swagger.
         // filename convention — a spec named `api-v1.yaml` diffs the same.
         let spec = r#"
 openapi: 3.0.0

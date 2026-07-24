@@ -128,7 +128,7 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     {
         // Prefer the offending path embedded in our canonical messages
         // ("... does not exist: <path> — ..." / "... is not a directory: <path> — ...")
-        // so the diagnostic names it (F-15) instead of the trailing OS error.
+        // so the diagnostic names it instead of the trailing OS error.
         let path = ["does not exist: ", "not a directory: "]
             .iter()
             .find_map(|marker| {
@@ -146,7 +146,7 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
                     .trim()
                     .to_string()
             });
-        // B-6: a file passed as --repo must be diagnosed as "not a directory",
+        // A file passed as --repo must be diagnosed as "not a directory",
         // not folded into the "does not exist" title.
         if lower.contains("not a directory") {
             return CliDiagnostic::RepoPathNotADirectory { path }.into();
@@ -3217,7 +3217,7 @@ fn make_executable(path: &Path) -> anyhow::Result<()> {
 /// git repo. Backs up any pre-existing non-nestweaver hook.
 fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
-    // LOW: a custom core.hooksPath can point OUTSIDE the repo — installing a
+    // A custom core.hooksPath can point OUTSIDE the repo — installing a
     // hook there affects other repos, so say so loudly. Only checked when the
     // hooks dir already exists and canonicalizes (a not-yet-created custom
     // path can't be resolved reliably).
@@ -3552,7 +3552,7 @@ fn abs_for_daemon(p: &std::path::Path) -> std::path::PathBuf {
 /// Is a daemon process for this DB currently running (per its pidfile)?
 ///
 /// Used to decide whether falling back to a direct store open is safe: while a
-/// daemon holds the DB write lock, a direct open would deadlock/conflict (F-01).
+/// daemon holds the DB write lock, a direct open would deadlock/conflict.
 fn daemon_process_running_for_db(db_path: &std::path::Path) -> bool {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
@@ -3561,7 +3561,7 @@ fn daemon_process_running_for_db(db_path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Pure predicate for F-06: does this process cmdline look like a nestweaver
+/// Pure predicate: does this process cmdline look like a nestweaver
 /// daemon serving `db_path`? The daemon is always started as
 /// `nestweaver daemon --db <path> ...`, so require both markers. The DB path
 /// may be spelled differently at start vs. stop time, so accept the raw or
@@ -3583,7 +3583,7 @@ fn cmdline_is_our_daemon(cmdline: &str, db_path: &std::path::Path) -> bool {
     false
 }
 
-/// F-06: return the cmdline of `pid` when it is verifiably a nestweaver daemon
+/// Return the cmdline of `pid` when it is verifiably a nestweaver daemon
 /// serving `db_path`, else `None`. A stale pidfile PID may have been recycled
 /// by an unrelated process — callers must NOT signal the PID when this returns
 /// `None`.
@@ -3620,10 +3620,10 @@ fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
     std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
 }
 
-/// B-1: PID of the process on the other end of a connected unix socket, as
+/// PID of the process on the other end of a connected unix socket, as
 /// reported by the kernel. Unlike the pidfile (whose contents can be
 /// overwritten while the daemon still holds its flock), this cannot be faked
-/// by another process. Integration point: H-Y1's daemon self-reported-PID RPC
+/// by another process. Integration point: a future daemon self-reported-PID RPC
 /// can supersede this once it lands.
 #[cfg(target_os = "linux")]
 fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
@@ -3652,7 +3652,7 @@ fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> 
     (rc == 0 && cred.pid > 0).then_some(cred.pid)
 }
 
-/// B-1: macOS equivalent of Linux `SO_PEERCRED` — XNU's `LOCAL_PEERPID`.
+/// macOS equivalent of Linux `SO_PEERCRED` — XNU's `LOCAL_PEERPID`.
 #[cfg(target_os = "macos")]
 fn unix_socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
     use std::os::unix::io::AsRawFd;
@@ -3677,7 +3677,7 @@ fn unix_socket_peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<i32>
     None
 }
 
-/// B-1: the PID of the daemon serving `socket`, reported by the kernel at
+/// The PID of the daemon serving `socket`, reported by the kernel at
 /// connect time. `None` when the socket is missing or refuses the connection
 /// — i.e. the daemon cannot confirm its identity and callers must refuse to
 /// signal the pidfile PID.
@@ -3686,12 +3686,12 @@ fn daemon_socket_reported_pid(socket: &std::path::Path) -> Option<i32> {
     unix_socket_peer_pid(&stream)
 }
 
-/// F-06: is the pidfile's PID verifiably our daemon? True when the process
+/// Is the pidfile's PID verifiably our daemon? True when the process
 /// cmdline matches a nestweaver daemon for this DB. When only the pidfile
 /// flock is held, the flock proves *a* live daemon owns THIS pidfile but not
 /// that its contents still name that daemon (the file can be rewritten while
 /// the lock is held) — so cross-check the pidfile PID against the
-/// kernel-reported PID of the process serving the daemon socket (B-1). A
+/// kernel-reported PID of the process serving the daemon socket. A
 /// daemon that cannot confirm its identity is NOT signaled.
 fn daemon_identity_verified(
     pid: i32,
@@ -3708,7 +3708,7 @@ fn daemon_identity_verified(
     daemon_socket_reported_pid(socket) == Some(pid)
 }
 
-/// F-10 (nw-087): commands that operate on an existing database must fail
+/// nw-087: commands that operate on an existing database must fail
 /// `db_not_found` when the file is absent — never autostart a daemon that
 /// CREATES an empty DB (a typo'd `--db` must not false-green). The message is
 /// phrased so `into_diagnostic` maps it to `CliDiagnostic::DatabaseNotFound`.
@@ -3733,7 +3733,7 @@ fn ensure_db_parent_dir(db_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// B-8: when a direct watcher fails to acquire the DB write lock, the raw
+/// When a direct watcher fails to acquire the DB write lock, the raw
 /// lbug message ("Could not set lock on file ...") doesn't say WHO holds it —
 /// usually a live daemon. Return the actionable remedy to append.
 fn watch_lock_hint(err_msg: &str, db_path: &std::path::Path) -> Option<String> {
@@ -3746,7 +3746,7 @@ fn watch_lock_hint(err_msg: &str, db_path: &std::path::Path) -> Option<String> {
     })
 }
 
-/// F-15: canonicalize a `--repo` path and require it to name a directory.
+/// Canonicalize a `--repo` path and require it to name a directory.
 /// A file path canonicalizes fine but can never be indexed — reject it up
 /// front, naming the offending path in both error messages.
 fn canonical_repo_dir(repo_path: &std::path::Path) -> anyhow::Result<PathBuf> {
@@ -3766,7 +3766,7 @@ fn canonical_repo_dir(repo_path: &std::path::Path) -> anyhow::Result<PathBuf> {
     Ok(canonical)
 }
 
-/// F-19: poll until the daemon's unix socket accepts a connection (proving
+/// Poll until the daemon's unix socket accepts a connection (proving
 /// run_server survived boot) or `timeout` elapses.
 fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
@@ -3779,7 +3779,7 @@ fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) 
     std::os::unix::net::UnixStream::connect(socket).is_ok()
 }
 
-/// WS-H: wait up to `grace` for `pid` to exit (after a SIGTERM). Returns true
+/// Wait up to `grace` for `pid` to exit (after a SIGTERM). Returns true
 /// when the process is gone, false when it is still alive at the deadline —
 /// the caller must NOT proceed with an install/start in the false case, or
 /// the old and new daemons would overlap on one DB.
@@ -3799,7 +3799,7 @@ fn pid_exited_within_grace(pid: i32, grace: std::time::Duration) -> bool {
     }
 }
 
-/// LOW (G7): `search` had no truncation signal. When the result count equals
+/// `search` had no truncation signal. When the result count equals
 /// the requested limit there may be more matches — say so, like the MCP
 /// `total`/`returned` fields do.
 fn search_truncation_note(returned: usize, limit: usize) -> Option<String> {
@@ -3818,13 +3818,13 @@ fn print_search_truncation_note(returned: usize, limit: usize) {
     }
 }
 
-/// LOW: is the resolved git hooks dir outside the repo worktree (a custom
+/// Is the resolved git hooks dir outside the repo worktree (a custom
 /// `core.hooksPath`)? Both paths must be canonicalized by the caller.
 fn hooks_dir_outside_repo(hooks_dir: &std::path::Path, repo_root: &std::path::Path) -> bool {
     !hooks_dir.starts_with(repo_root)
 }
 
-// ── F-07: RPC arg builders ─────────────────────────────────────────────────
+// ── RPC arg builders ─────────────────────────────────────────────────
 // The CLI must send the arg names the MCP tools actually read. Keep the
 // builders in one tested place so a rename on either side fails a unit test
 // instead of silently falling back to tool defaults.
@@ -4031,7 +4031,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
             config: config_opt,
         } => {
-            // F-10 (nw-087): read-only command — fail `db_not_found` on a
+            // nw-087: read-only command — fail `db_not_found` on a
             // missing --db before any daemon/store connect could create one.
             let db_path = db.clone().unwrap_or_else(default_db_path);
             require_existing_db(&db_path)?;
@@ -4383,7 +4383,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 .iter()
                 .filter(|s| s.name == name || s.uid == name)
                 .collect();
-            // LOW: an ambiguous name silently picked the first match — at
+            // An ambiguous name silently picked the first match — at
             // least warn so the user knows to disambiguate by UID.
             if matches.len() > 1 {
                 eprintln!(
@@ -4570,7 +4570,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
 
-            // F-14: an ephemeral pull must never reuse — and especially never
+            // An ephemeral pull must never reuse — and especially never
             // DELETE — a pre-existing persistent checkout. Give it a unique
             // temp workspace root that is cleaned up on both success and
             // failure.
@@ -4655,7 +4655,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         eprintln!("Warning: index is {} commits behind HEAD", drift);
                     }
                     if ephemeral {
-                        // F-14: remove the unique temp workspace root we
+                        // Remove the unique temp workspace root we
                         // created — never the persistent checkout path.
                         std::fs::remove_dir_all(&workspace_root)?;
                         println!("Ephemeral: cleaned up");
@@ -4664,7 +4664,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 Err(e) => {
                     if ephemeral {
-                        // F-14: a failed ephemeral pull must not leak the temp
+                        // A failed ephemeral pull must not leak the temp
                         // workspace dir it created.
                         let _ = std::fs::remove_dir_all(&workspace_root);
                     }
@@ -5116,7 +5116,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // the DB directly. When --output is set we write the result
             // to the file locally; --rules-from is applied CLI-side only
             // so we skip the daemon when that flag is present.
-            // F-11: the daemon's brain_guide handler ignores the `config`
+            // The daemon's brain_guide handler ignores the `config`
             // arg, so when --config is given fall back to the local read
             // path, which actually honors it.
             if rules_from.is_none() && config.is_none() && use_daemon {
@@ -5294,7 +5294,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     ));
                     match rpc {
                         Ok(value) => {
-                            // F-11: deserialize into the direct path's type so
+                            // Deserialize into the direct path's type so
                             // both output modes match direct output byte-for-byte
                             // (the daemon envelope carries _meta/count the direct
                             // path never prints).
@@ -5390,7 +5390,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "bridge_nodes", args)
                 {
-                    // F-11: deserialize the tool's `bridges` array into the
+                    // Deserialize the tool's `bridges` array into the
                     // direct path's type so both modes render identically.
                     let bridges: Vec<nestweaver_engine::BridgeNode> = serde_json::from_value(
                         strip_hybrid_meta(value)
@@ -5494,7 +5494,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
-            // F-11: the daemon tool returns the rendered text under
+            // The daemon tool returns the rendered text under
             // "summaries" (not structured data), so it can only serve human
             // mode — for --json fall through to the direct path, whose bare
             // Vec<Summary> output the daemon shape cannot reproduce.
@@ -5600,7 +5600,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // ── daemon guard ──────────────────────────────────────
-            // B-4: the daemon `clusters` tool truncates each community's
+            // The daemon `clusters` tool truncates each community's
             // member list at a 20-member preview, while the direct path
             // serializes full membership — so for --json (where that
             // difference is visible) fall through to the direct read path,
@@ -5614,7 +5614,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "clusters", args)
                 {
-                    // F-11: the tool returns {clusters: [...]} with `size` where
+                    // The tool returns {clusters: [...]} with `size` where
                     // the direct path's ClusteringOutput uses `communities` and
                     // `member_count`. Rebuild the real structs so both modes
                     // match direct output byte-for-byte.
@@ -5732,7 +5732,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            // B-4: no daemon path here. The daemon `clusters` tool recomputes
+            // No daemon path here. The daemon `clusters` tool recomputes
             // at its default resolution and truncates members at a 20-member
             // preview, while the direct path reads the cached sidecar (the
             // resolution the user last computed at) with full membership.
@@ -6432,7 +6432,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = db.unwrap_or_else(default_db_path);
 
             // Resolve changed files: explicit --files, else git diff against --base-ref.
-            // F-07: computed up front so the daemon path can send a proper
+            // Computed up front so the daemon path can send a proper
             // `changed_files` array (the tool never accepted the raw --files
             // string under the legacy `files` key).
             let changed_files: Vec<String> = if let Some(files_str) = files {
@@ -6474,7 +6474,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // ── daemon guard ──────────────────────────────────────
-            // F-11: deserialize the daemon result into the same type the direct
+            // Deserialize the daemon result into the same type the direct
             // path produces so human/JSON output is identical either way.
             let daemon_result: Option<nestweaver_engine::AffectedTestsResult> = if use_daemon {
                 let args = affected_tests_rpc_args(&changed_files);
@@ -6576,7 +6576,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // Route through the daemon when enabled. Choose ONE path up front
-            // (F-01): once a daemon holds this DB's write lock, a direct
+            // Once a daemon holds this DB's write lock, a direct
             // watcher deadlocks against it, so the direct path below is only
             // reachable when NO daemon for this DB is running.
             if use_daemon {
@@ -6629,7 +6629,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Err(e) if daemon_process_running_for_db(&db_path) => {
                         // A daemon (possibly one we just auto-started) holds the
                         // DB write lock — falling back to a direct watcher would
-                        // deadlock. Fail loudly instead (F-01).
+                        // deadlock. Fail loudly instead.
                         eprintln!(
                             "Error: watch via daemon failed ({e:#}); a daemon for this DB is \
                              running and holds the write lock, so a direct watcher cannot be \
@@ -6719,7 +6719,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 db_path.display()
             );
             if let Err(e) = watcher.run() {
-                // B-8: a lock failure here means another process (usually a
+                // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
                 if let Some(hint) = watch_lock_hint(&msg, &db_path) {
@@ -6758,7 +6758,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
             // warn=false: run() already emitted the escape-hatch warning once
-            // for this invocation — warning again here double-prints it (LOW).
+            // for this invocation — warning again here double-prints it.
             let use_daemon_mcp = resolve_use_daemon(no_daemon, false);
             if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
@@ -6870,7 +6870,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let _ = tx.send(());
                         });
                         let _ = rx.recv();
-                        // LOW (ui port leak): tell the daemon to stop serving so
+                        // Tell the daemon to stop serving so
                         // the listen port is released when the CLI exits.
                         match rt.block_on(client.stop_ui()) {
                             Ok(resp) if resp.ok => eprintln!("UI server stopped."),
@@ -7021,7 +7021,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config.as_deref(), "regex_search", args)
                 {
-                    // F-11: strip the hybrid `_meta` provenance so both output
+                    // Strip the hybrid `_meta` provenance so both output
                     // modes match the direct path byte-for-byte.
                     let res: nestweaver_store::regex::RegexSearchResult =
                         serde_json::from_value(strip_hybrid_meta(value)).unwrap_or_else(|_| {
@@ -7110,7 +7110,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, config.as_deref(), "count_patterns", args)
                 {
-                    // F-11/B-3: the tool wraps counts in {"patterns": [...]}
+                    // The tool wraps counts in {"patterns": [...]}
                     // (plus a hybrid `_meta`); rebuild the real PatternCount
                     // structs so daemon output is byte-identical to the direct
                     // path (struct field order, not map order).
@@ -7136,7 +7136,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 println!("    {} ({})", f.path, f.count);
                             }
                         }
-                        // F-03: surface in-band staleness the daemon's stderr
+                        // Surface in-band staleness the daemon's stderr
                         // warning can't reach us with.
                         if counts.iter().any(|c| c.stale_index) {
                             print_stale_index_note();
@@ -7162,7 +7162,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("    {} ({})", f.path, f.count);
                     }
                 }
-                // F-03: surface in-band staleness (the direct path's own
+                // Surface in-band staleness (the direct path's own
                 // stderr warning is a once-per-process latch that may already
                 // have fired inside the store).
                 if counts.iter().any(|c| c.stale_index) {
@@ -7235,7 +7235,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
             // Exit 2 when targets were requested but none resolved to a symbol
             // (consistent with `symbol`/`impact`) — or 3 when the failure was
-            // ambiguity, matching `symbol`'s exit-code contract (LOW). When at
+            // ambiguity, matching `symbol`'s exit-code contract. When at
             // least one target resolves, succeed even if others were
             // not-found/ambiguous.
             if !targets.is_empty() && res.symbols.is_empty() {
@@ -7792,7 +7792,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 render_codequality_json, render_impact_report_markdown,
             };
 
-            // LOW: a missing input file must fail as a clean not-found (exit 2),
+            // A missing input file must fail as a clean not-found (exit 2),
             // not a generic IO error.
             if !input.exists() {
                 eprintln!("Error: impact report not found: {}", input.display());
@@ -9359,7 +9359,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 && let Ok(pid) = pid_str.trim().parse::<i32>()
                                 && unsafe { libc::kill(pid, 0) } == 0
                             {
-                                // F-06: only signal the pidfile PID when it is
+                                // Only signal the pidfile PID when it is
                                 // verifiably our daemon — a recycled PID must
                                 // never be killed.
                                 if !daemon_identity_verified(pid, &db_path, &pidfile, &socket) {
@@ -9372,7 +9372,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     unsafe {
                                         libc::kill(pid, libc::SIGTERM);
                                     }
-                                    // WS-H: if the old daemon is STILL alive
+                                    // If the old daemon is STILL alive
                                     // after its SIGTERM grace, installing the
                                     // new agent would overlap two daemons on
                                     // one DB — abort the start instead.
@@ -9410,7 +9410,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             eprintln!("  Socket: {}", socket.display());
                             eprintln!("  Log:    {}", log_file.display());
 
-                            // WS-G: poll connect_existing + health_check
+                            // Poll connect_existing + health_check
                             // (wait_healthy never auto-starts) instead of the
                             // old fixed 10s socket.exists() wait — a slow boot
                             // blew straight past 10s and false-failed even
@@ -9561,7 +9561,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 });
                             }
                             daemonize2::Outcome::Parent(Ok(parent)) => {
-                                // F-19: the double-fork only proves fork()
+                                // The double-fork only proves fork()
                                 // worked — run_server may still die during boot
                                 // (corrupt migration journal, DB lock, ...).
                                 // Health-check that the child actually bound the
@@ -9731,7 +9731,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         return Ok((EXIT_SUCCESS, None));
                     };
 
-                    // F-06: the pidfile PID may have been recycled by an
+                    // The pidfile PID may have been recycled by an
                     // unrelated process. Verify identity before signaling. A
                     // kernel-reported socket peer PID is self-verifying — it
                     // IS the process serving this daemon's socket.
@@ -9811,7 +9811,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         && let Ok(pid) = pid_str.trim().parse::<i32>()
                         && unsafe { libc::kill(pid, 0) } == 0
                     {
-                        // F-06: a live PID is not proof — it may be recycled.
+                        // A live PID is not proof — it may be recycled.
                         if daemon_identity_verified(pid, &db_path, &pidfile, &socket) {
                             println!("Daemon is running (PID {pid})");
                             println!("  DB:     {}", db_path.display());
@@ -9825,7 +9825,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         return Ok((EXIT_SUCCESS, None));
                     }
                     // The pidfile may be gone/stale while a detached daemon
-                    // still serves the socket — ask the kernel (B-1) before
+                    // still serves the socket — ask the kernel before
                     // declaring "not running".
                     if let Some(pid) = daemon_socket_reported_pid(&socket)
                         && unsafe { libc::kill(pid, 0) } == 0
@@ -9995,7 +9995,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } => {
                 use nestweaver_engine::tls;
 
-                // F-23: re-running init-tls silently replaces the CA, which
+                // Re-running init-tls silently replaces the CA, which
                 // invalidates every cert it signed — warn before doing so.
                 if output_dir.join("ca.pem").exists() {
                     eprintln!(
@@ -10680,7 +10680,7 @@ fn run_memory(
     match command {
         MemoryCommands::Lint { json, db, config } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // F-10 (nw-087): read-only command — fail `db_not_found` on a
+            // nw-087: read-only command — fail `db_not_found` on a
             // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
@@ -10745,7 +10745,7 @@ fn run_memory(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // F-10 (nw-087): fail `db_not_found` on a missing --db, matching
+            // nw-087: fail `db_not_found` on a missing --db, matching
             // the other read commands.
             require_existing_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
@@ -10800,7 +10800,7 @@ fn run_memory(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // F-10 (nw-087): read-only command — fail `db_not_found` on a
+            // nw-087: read-only command — fail `db_not_found` on a
             // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
@@ -10899,7 +10899,7 @@ fn unwrap_hybrid_payload(value: serde_json::Value) -> serde_json::Value {
     value.get("results").cloned().unwrap_or(value)
 }
 
-/// F-11: drop the hybrid provenance `_meta` key from a daemon/hybrid object
+/// Drop the hybrid provenance `_meta` key from a daemon/hybrid object
 /// response so the CLI can deserialize/print the same shape the direct path
 /// produces (the direct store result has no `_meta`).
 fn strip_hybrid_meta(mut value: serde_json::Value) -> serde_json::Value {
@@ -10909,7 +10909,7 @@ fn strip_hybrid_meta(mut value: serde_json::Value) -> serde_json::Value {
     value
 }
 
-/// F-07/F-11: rebuild the direct path's `CommunityInfo` from a `clusters` tool
+/// Rebuild the direct path's `CommunityInfo` from a `clusters` tool
 /// response entry, which uses `size` where the CLI/sidecar schema uses
 /// `member_count`. Serializing the real struct keeps daemon --json output
 /// byte-identical to the direct path (struct field order, not map order).
@@ -10926,7 +10926,7 @@ fn community_info_from_tool_json(
     })
 }
 
-/// B-3/F-11: rebuild the direct path's `PatternCount` from a `count_patterns`
+/// Rebuild the direct path's `PatternCount` from a `count_patterns`
 /// tool payload entry (`PatternCount` is Serialize-only, so this is manual —
 /// same approach as [`community_info_from_tool_json`]). Serializing the real
 /// struct keeps daemon --json output byte-identical to the direct path
@@ -10957,7 +10957,7 @@ fn pattern_count_from_tool_json(
     })
 }
 
-/// F-03: one-line staleness note rendered (text mode only) when a search
+/// One-line staleness note rendered (text mode only) when a search
 /// reports that it bypassed a stale trigram posting table. JSON mode carries
 /// the signal in-band via the `stale_index` field instead.
 fn print_stale_index_note() {
@@ -11741,7 +11741,7 @@ fn run_brain(
 
         BrainCommands::StaleCheck { json, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            // F-10 (nw-087): read-only command — fail `db_not_found` on a
+            // nw-087: read-only command — fail `db_not_found` on a
             // missing --db before any daemon/store connect could create one.
             require_existing_db(&db_path)?;
 
@@ -11753,7 +11753,7 @@ fn run_brain(
                 "stale_check",
                 serde_json::json!({}),
             ) {
-                // F-17/F-11: emit the exact JSON shape the direct path
+                // Emit the exact JSON shape the direct path
                 // produces (the hybrid `_meta` envelope — whose background
                 // `stale_repos` verdict could contradict the tool's fresh
                 // `any_stale` — is replaced by a top-level `stale_repos`
@@ -11830,7 +11830,7 @@ fn run_brain(
                         }
                     }
                 }
-                // F-17: stale-check is a freshness gate — exit non-zero when stale.
+                // Stale-check is a freshness gate — exit non-zero when stale.
                 return Ok((if any_stale { EXIT_ERROR } else { EXIT_SUCCESS }, None));
             }
 
@@ -11841,7 +11841,7 @@ fn run_brain(
             let mut results: Vec<serde_json::Value> = Vec::new();
 
             for repo in &repos {
-                // F-17: a local working tree that no longer exists on disk is
+                // A local working tree that no longer exists on disk is
                 // unverifiable — flag it `[missing]` and count it as stale
                 // instead of silently reporting `[ok]`.
                 let local_missing = repo
@@ -11910,7 +11910,7 @@ fn run_brain(
             }
 
             if json {
-                // F-17: include the actual stale list so `any_stale: true`
+                // Include the actual stale list so `any_stale: true`
                 // never sits next to an empty stale set.
                 let stale_urls: Vec<serde_json::Value> = results
                     .iter()
@@ -11962,7 +11962,7 @@ fn run_brain(
                     }
                 }
             }
-            // F-17: stale-check is a freshness gate — exit non-zero when stale.
+            // Stale-check is a freshness gate — exit non-zero when stale.
             Ok((if any_stale { EXIT_ERROR } else { EXIT_SUCCESS }, None))
         }
 
@@ -12182,7 +12182,7 @@ fn run_brain(
                 db_path.display()
             ));
             if let Err(e) = watcher.run() {
-                // B-8: a lock failure here means another process (usually a
+                // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
                 if let Some(hint) = watch_lock_hint(&msg, &db_path) {
@@ -13216,7 +13216,7 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // F-10 (nw-087): read-only command — fail `db_not_found` on a
+            // nw-087: read-only command — fail `db_not_found` on a
             // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
@@ -13301,7 +13301,7 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // F-10 (nw-087): read-only command — fail `db_not_found` on a
+            // nw-087: read-only command — fail `db_not_found` on a
             // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
@@ -13378,7 +13378,7 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // F-10 (nw-087): read-only command — fail `db_not_found` on a
+            // nw-087: read-only command — fail `db_not_found` on a
             // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
@@ -13494,7 +13494,7 @@ fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // F-10 (nw-087): read-only command — fail `db_not_found` on a
+            // nw-087: read-only command — fail `db_not_found` on a
             // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
 
@@ -14278,7 +14278,7 @@ fn run_embed(
         );
     }
 
-    // LOW (lock trap): the direct write open below fails against a running
+    // Lock trap: the direct write open below fails against a running
     // daemon's write lock with a raw store error. Detect it up front and say
     // exactly what to do instead.
     if daemon_process_running_for_db(path) {
@@ -14935,7 +14935,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
     match command {
         InstanceCommands::Register { config_path } => {
             let config = nestweaver_engine::InstanceConfig::from_file(Path::new(&config_path))?;
-            // LOW: store the canonical path so the registry entry is immune to
+            // Store the canonical path so the registry entry is immune to
             // CWD differences between `register` and later lookups. The file
             // was just read successfully, so canonicalization cannot fail.
             let canonical = std::fs::canonicalize(&config_path)
@@ -14963,7 +14963,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
             purge_graph,
             db,
         } => {
-            // B-7: validate the DB BEFORE mutating the registry — a typo'd
+            // Validate the DB BEFORE mutating the registry — a typo'd
             // --db must fail without the instance already being removed.
             let db_path = if purge_graph {
                 let db_path = db.unwrap_or_else(default_db_path);
@@ -15046,7 +15046,7 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
         }
         InstanceCommands::Merge { from, to, db } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            // F-10: merging against a typo'd --db must fail db_not_found, not
+            // Merging against a typo'd --db must fail db_not_found, not
             // autostart a daemon that creates an empty DB and false-greens
             // ("No rows found").
             require_existing_db(&db_path)?;
@@ -15651,7 +15651,7 @@ fn run_mcp_hybrid(
                         "error": { "code": -32602, "message": "tools/call: 'name' is required" }
                     })
                 } else if let Err(error) = nestweaver_mcp::tools::enforce_tool_allowed(name) {
-                    // F-05: the HybridClient read path dispatches queries itself
+                    // The HybridClient read path dispatches queries itself
                     // and would otherwise bypass the --tools/--lite gate. Same
                     // error text as the local and daemon-proxy paths.
                     serde_json::json!({
@@ -16226,7 +16226,7 @@ mod abs_for_daemon_tests {
         assert!(out.is_absolute());
     }
 
-    /// F-01: with no pidfile for the derived instance, no daemon is reported
+    /// With no pidfile for the derived instance, no daemon is reported
     /// running — the direct-watcher fallback stays reachable.
     #[test]
     fn daemon_process_running_false_for_unknown_db() {
@@ -16234,7 +16234,7 @@ mod abs_for_daemon_tests {
         assert!(!daemon_process_running_for_db(bogus));
     }
 
-    /// F-06: the pidfile-PID identity predicate must match only nestweaver
+    /// The pidfile-PID identity predicate must match only nestweaver
     /// daemon cmdlines serving the same DB (raw or canonical spelling).
     #[test]
     fn cmdline_is_our_daemon_matches_only_our_daemon() {
@@ -16260,7 +16260,7 @@ mod abs_for_daemon_tests {
         assert!(!cmdline_is_our_daemon("", db));
     }
 
-    /// F-06: `daemon_cmdline_if_ours` returns None for a live process that is
+    /// `daemon_cmdline_if_ours` returns None for a live process that is
     /// not a nestweaver daemon for the given DB (PID-reuse protection).
     #[test]
     fn daemon_cmdline_if_ours_rejects_foreign_process() {
@@ -16271,7 +16271,7 @@ mod abs_for_daemon_tests {
         assert!(daemon_cmdline_if_ours(1, bogus_db).is_none());
     }
 
-    /// F-06: the pidfile flock is a spelling-independent identity proof —
+    /// The pidfile flock is a spelling-independent identity proof —
     /// held means a live daemon owns the pidfile, free means it does not.
     #[test]
     fn pidfile_flock_held_detects_lock_owner() {
@@ -16298,7 +16298,7 @@ mod abs_for_daemon_tests {
         assert!(!pidfile_flock_held(&dir.path().join("nope.pid")));
     }
 
-    /// B-1: the kernel reports the listener's PID for a connected unix socket;
+    /// The kernel reports the listener's PID for a connected unix socket;
     /// a missing socket yields None (daemon can't confirm identity).
     #[test]
     fn daemon_socket_reported_pid_matches_listener_owner() {
@@ -16316,7 +16316,7 @@ mod abs_for_daemon_tests {
         );
     }
 
-    /// B-1: with the pidfile flock held but no cmdline match, identity is
+    /// With the pidfile flock held but no cmdline match, identity is
     /// confirmed ONLY when the socket-serving PID equals the pidfile PID — a
     /// rewritten pidfile can no longer redirect a signal at a foreign PID.
     #[test]
@@ -16344,7 +16344,7 @@ mod abs_for_daemon_tests {
         ));
 
         // Pidfile rewritten to a foreign PID while the flock is still held →
-        // the socket cross-check disagrees → refused (the pre-B-1 code would
+        // the socket cross-check disagrees → refused (the earlier code would
         // have signaled it on flock evidence alone).
         assert!(!daemon_identity_verified(
             i32::MAX - 1,
@@ -16645,7 +16645,7 @@ mod snapshot_build_guard_tests {
 mod hybrid_cli_tests {
     use super::*;
 
-    /// F-07: the CLI must send the exact arg names the MCP tools read —
+    /// The CLI must send the exact arg names the MCP tools read —
     /// `top_n` for bridge_nodes, `changed_files` (array) for affected_tests.
     #[test]
     fn rpc_args_use_tool_expected_names() {
@@ -16694,7 +16694,7 @@ mod hybrid_cli_tests {
         );
     }
 
-    /// F-10 (nw-087): a nonexistent --db must fail with the db_not_found
+    /// nw-087: a nonexistent --db must fail with the db_not_found
     /// diagnostic (exit 1), not silently create/spawn anything.
     #[test]
     fn require_existing_db_fails_db_not_found_on_missing_db() {
@@ -16716,7 +16716,7 @@ mod hybrid_cli_tests {
         assert!(require_existing_db(&present).is_ok());
     }
 
-    /// Final-hunt: a create-path store error ("open/create store at
+    /// A create-path store error ("open/create store at
     /// <path>.lbug: ... No such file or directory") must NOT misfire into
     /// the circular db_not_found diagnostic ("Run `nestweaver index` to
     /// create a database") — the user IS running index.
@@ -16751,7 +16751,7 @@ mod hybrid_cli_tests {
         ensure_db_parent_dir(std::path::Path::new("db.lbug")).unwrap();
     }
 
-    /// B-8: a direct-watcher lock failure must suggest `nestweaver daemon
+    /// A direct-watcher lock failure must suggest `nestweaver daemon
     /// stop`; unrelated errors get no hint.
     #[test]
     fn watch_lock_hint_only_for_lock_errors() {
@@ -16768,7 +16768,7 @@ mod hybrid_cli_tests {
         assert!(watch_lock_hint("some other error", db).is_none());
     }
 
-    /// B-3: a `count_patterns` tool payload entry rebuilds into the direct
+    /// A `count_patterns` tool payload entry rebuilds into the direct
     /// path's `PatternCount` — field order byte-identical, `stale_index`
     /// defaulted for pre-field daemons.
     #[test]
@@ -16811,7 +16811,7 @@ mod hybrid_cli_tests {
         assert!(pattern_count_from_tool_json(&serde_json::json!({"pattern": 1})).is_none());
     }
 
-    /// F-11: hybrid `_meta` provenance is stripped so daemon responses render
+    /// Hybrid `_meta` provenance is stripped so daemon responses render
     /// identically to the direct path; other keys are untouched and
     /// non-object values pass through.
     #[test]
@@ -16833,7 +16833,7 @@ mod hybrid_cli_tests {
         );
     }
 
-    /// F-15: `index --repo <file>` is rejected naming the path; a missing
+    /// `index --repo <file>` is rejected naming the path; a missing
     /// path is also rejected naming the path; a directory passes.
     #[test]
     fn canonical_repo_dir_rejects_files_and_missing_paths() {
@@ -16858,7 +16858,7 @@ mod hybrid_cli_tests {
         assert!(canonical_repo_dir(dir.path()).is_ok());
     }
 
-    /// B-6: the miette diagnostic for `--repo <file>` must be titled "not a
+    /// The miette diagnostic for `--repo <file>` must be titled "not a
     /// directory", not folded into the "does not exist" diagnostic.
     #[test]
     fn into_diagnostic_distinguishes_not_a_directory_from_missing() {
@@ -16885,7 +16885,7 @@ mod hybrid_cli_tests {
         assert!(!rendered.contains("repo_not_a_directory"), "{rendered}");
     }
 
-    /// F-19: the boot health-check must report a dead/absent daemon as not
+    /// The boot health-check must report a dead/absent daemon as not
     /// booted (false) and a listening socket as booted (true).
     #[test]
     fn wait_for_daemon_boot_detects_listening_socket() {
@@ -16907,7 +16907,7 @@ mod hybrid_cli_tests {
         ));
     }
 
-    /// LOW (G7): a full page of search results carries a truncation note;
+    /// A full page of search results carries a truncation note;
     /// a partial page does not.
     #[test]
     fn search_truncation_note_only_at_limit() {
@@ -16916,7 +16916,7 @@ mod hybrid_cli_tests {
         assert!(search_truncation_note(0, 10).is_none());
     }
 
-    /// LOW: hooks dir inside the repo is fine; a custom core.hooksPath
+    /// Hooks dir inside the repo is fine; a custom core.hooksPath
     /// pointing elsewhere is flagged.
     #[test]
     fn hooks_dir_outside_repo_detection() {
@@ -17142,7 +17142,7 @@ mod stop_grace_tests {
 mod start_grace_tests {
     use super::*;
 
-    /// WS-H: a pid that is already gone is detected immediately — the
+    /// A pid that is already gone is detected immediately — the
     /// launchd pre-install stop step proceeds only in this case.
     #[test]
     fn exited_pid_is_detected() {
@@ -17154,7 +17154,7 @@ mod start_grace_tests {
         ));
     }
 
-    /// WS-H: a pid that stays alive through the grace reports false — the
+    /// A pid that stays alive through the grace reports false — the
     /// launchd start path must abort rather than overlap two daemons on one
     /// DB. Uses our own pid: guaranteed alive, guaranteed signalable.
     #[test]
@@ -17165,7 +17165,7 @@ mod start_grace_tests {
         ));
     }
 
-    /// WS-H: a pid that exits DURING the grace is still detected (the loop
+    /// A pid that exits DURING the grace is still detected (the loop
     /// does not require the process to be gone at entry).
     #[test]
     fn pid_exiting_mid_grace_is_detected() {
@@ -17749,7 +17749,7 @@ mod stale_check_cli_tests {
             .expect("join");
     }
 
-    /// F-23: --validity-days is range-checked at the clap layer (1..=36500) —
+    /// --validity-days is range-checked at the clap layer (1..=36500) —
     /// 0 and absurd values are rejected before any cert generation (which used
     /// to panic on overflow).
     #[test]
@@ -17785,11 +17785,11 @@ mod stale_check_cli_tests {
 mod cli_bounds_tests {
     use super::*;
 
-    /// CLI numeric bounds must match the MCP tool schemas (F-12 parity):
+    /// CLI numeric bounds must match the MCP tool schemas (MCP parity):
     /// impact/blast-radius --depth 1..=15, regex-search --limit 1..=10000,
     /// --max-millis 1..=600000, project-context --token-budget 1..=16000,
     /// hubs --top 1..=1000, dead-code --limit 1..=1000,
-    /// context/brain-context --token-budget 1..=16000, brain search --limit >= 1.
+    /// context/brain-context --token-budget 1..=16000, brain search --limit 1..=1000.
     #[test]
     fn numeric_flags_enforce_mcp_schema_bounds() {
         std::thread::Builder::new()

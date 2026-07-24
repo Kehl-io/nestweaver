@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn filter_org_results_keeps_rows_without_repo_uid_despite_matching_path() {
-        // Final-hunt finding: org rows carry no `repo_uid`, and a local row
+        // Org rows carry no `repo_uid`, and a local row
         // shares the same `file_path` in a DIFFERENT repo. Matching on the
         // bare path over-dedups — the local `src/refund.js` would hide the
         // org repo's `src/refund.js`. For impact analysis a false-positive
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn filter_org_results_recomputes_counts_and_summary_after_stripping() {
-        // Final-hunt finding: after stripping locally-covered rows the
+        // After stripping locally-covered rows the
         // response still reported the server's pre-filter counts —
         // `changed_symbol_count: 2` next to `changed_symbols: []` with
         // `status: complete` / `gate_state: ok`. Counts and the human summary

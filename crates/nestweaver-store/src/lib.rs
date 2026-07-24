@@ -2514,7 +2514,7 @@ mod tests {
             staleness_commits_behind: 0,
             instance_id: "old".to_string(),
             name: Some("svc".to_string()),
-            root_path: Some("/home/kory/dev/svc".to_string()),
+            root_path: Some("/srv/example/svc".to_string()),
         };
         store.insert_repo(&repo).unwrap();
         // The merge plan verifier only accepts production-shaped UIDs.

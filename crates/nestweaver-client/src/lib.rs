@@ -166,7 +166,7 @@ impl DaemonClient {
     }
 
     /// Health-check the daemon, returning its version, instance, uptime —
-    /// and its own OS PID (B-1). Bounded so an unresponsive daemon can't
+    /// and its own OS PID. Bounded so an unresponsive daemon can't
     /// hang the caller.
     pub async fn health_check(&mut self) -> Result<nestweaver_proto::HealthCheckResponse> {
         let resp = tokio::time::timeout(
@@ -180,7 +180,7 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
-    /// The running daemon's own PID, as reported over its socket (B-1).
+    /// The running daemon's own PID, as reported over its socket.
     ///
     /// Cross-check this against a pidfile PID before signaling that PID: a
     /// foreign PID written into the pidfile of a LIVE daemon fails this
@@ -191,7 +191,7 @@ impl DaemonClient {
     }
 
     /// Poll until the daemon for `db_path` answers a health check or
-    /// `timeout` elapses (WS-G). Does NOT auto-start anything — use after
+    /// `timeout` elapses. Does NOT auto-start anything — use after
     /// triggering a start (launchd kickstart / fork) to detect an
     /// eventually-healthy daemon whose boot outlives a short fixed wait.
     pub async fn wait_healthy(
@@ -377,7 +377,7 @@ impl DaemonClient {
     /// Like [`DaemonClient::watch_code`], with explicit control over
     /// replacing an already-running watcher.
     ///
-    /// B-2: a `watch` CLI that is kill -9'd leaves its daemon-side watcher
+    /// A `watch` CLI that is kill -9'd leaves its daemon-side watcher
     /// running, and every new watch session then fails with "already
     /// running". `force: true` stops the orphaned incumbent and adopts the
     /// new session instead.
@@ -448,7 +448,7 @@ impl DaemonClient {
 mod tests {
     use super::*;
 
-    /// WS-G: `wait_healthy` must keep polling until the timeout and then
+    /// `wait_healthy` must keep polling until the timeout and then
     /// report not-healthy (rather than declaring failure after a short fixed
     /// wait while the daemon is still booting, e.g. under launchd).
     #[tokio::test]

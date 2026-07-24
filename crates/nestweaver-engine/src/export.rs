@@ -86,7 +86,7 @@ pub fn export_cypher(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Resu
     let symbols = store
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // F-13: the `pagerank_score` column is never populated; the real scores
+    // The `pagerank_score` column is never populated; the real scores
     // live in the store's PageRank cache (same source `hubs` reads).
     let pagerank = store.pagerank_scores();
     for sym in &symbols {
@@ -240,7 +240,7 @@ pub fn export_graphml(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Res
     let symbols = store
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // F-13: the `pagerank_score` column is never populated; the real scores
+    // The `pagerank_score` column is never populated; the real scores
     // live in the store's PageRank cache (same source `hubs` reads).
     let pagerank = store.pagerank_scores();
     for sym in &symbols {
@@ -332,7 +332,7 @@ pub fn export_mermaid(
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Sort by PageRank descending, take top N. F-13: the `pagerank_score`
+    // Sort by PageRank descending, take top N. The `pagerank_score`
     // column is never populated; rank by the store's PageRank cache (the same
     // source `hubs` reads), falling back to the column for stores without a
     // computed cache.
@@ -577,7 +577,7 @@ mod tests {
     /// callee's computed PageRank strictly higher than each caller's (with a
     /// single caller the store's reverse-edge weighting ties them at 0.5).
     /// Every symbol carries the same 0.5 column score, so any difference in
-    /// the exported values must come from the cache — a real F-13 regression.
+    /// the exported values must come from the cache — a real regression.
     fn ranked_store() -> GraphStore {
         let store = populated_store();
         store
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn export_uses_computed_pagerank_not_zero_column() {
-        // F-13: the `pagerank_score` column is never populated in production;
+        // The `pagerank_score` column is never populated in production;
         // export must carry the store's computed PageRank cache values.
         let store = ranked_store();
         let scores = store.pagerank_scores();
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn mermaid_top_n_ranks_by_computed_pagerank() {
-        // F-13: make_symbol gives every symbol the same column score (0.5),
+        // Note: make_symbol gives every symbol the same column score (0.5),
         // but sym-b has two inbound CALLS edges, so the computed PageRank
         // must rank it first.
         let store = ranked_store();

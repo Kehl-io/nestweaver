@@ -155,7 +155,7 @@ pub struct RtsEvalReport {
     pub excluded_flaky_failures: usize,
     /// Set when `unconfirmed_failure_runs > 0`: the recall estimate rests on
     /// partially unconfirmed evidence and can err in either direction — it is
-    /// NOT necessarily an upper bound (P2 review).
+    /// NOT necessarily an upper bound.
     pub recall_estimate_uncertain: bool,
 }
 
@@ -170,7 +170,7 @@ pub struct MeasuredRecall {
     /// True when part of the underlying evidence was never rerun-confirmed —
     /// the recall figures can err in EITHER direction (they are not a
     /// bound). Consumers must not present the numbers as exact without this
-    /// caveat (P1 review).
+    /// caveat.
     pub recall_estimate_uncertain: bool,
 }
 
@@ -193,9 +193,9 @@ fn recording_disabled() -> bool {
 /// break, RAII cleanup — plus an ownership TOKEN written into the lock file:
 /// after a stale-lock takeover, the previous holder's Drop must not delete
 /// the successor's lock (that would void mutual exclusion for the next
-/// contender, P2 review). Acquisition failure is an ERROR, not a silent
+/// contender). Acquisition failure is an ERROR, not a silent
 /// unlocked pass — proceeding unlocked would reintroduce the very
-/// lost-update race the lock exists to close (P2 review). Recording
+/// lost-update race the lock exists to close. Recording
 /// failures surface as a non-fatal Note notification on affected-tests,
 /// so erroring here never breaks the selection itself.
 struct SidecarLock {
@@ -300,7 +300,7 @@ impl Drop for SidecarLock {
 fn append_jsonl(path: &Path, line: &str) -> Result<()> {
     // Hold the sidecar lock across append + rotation check: two concurrent
     // recorders interleaving here can each rotate-rewrite over the other's
-    // fresh append and silently lose records (P2 review).
+    // fresh append and silently lose records.
     let _lock = SidecarLock::acquire(path)?;
     {
         let mut f = std::fs::OpenOptions::new()
@@ -314,7 +314,7 @@ fn append_jsonl(path: &Path, line: &str) -> Result<()> {
     // Rotation: cheap line count; rewrite only on overflow. The rewrite
     // goes through atomic_replace_file (tmp + fsync + rename) — a bare
     // `std::fs::write` truncates in place, so a crash mid-rotation would
-    // destroy the whole history (P2 review).
+    // destroy the whole history.
     let content = std::fs::read_to_string(path).context("read for rotation check")?;
     let lines: Vec<&str> = content.lines().collect();
     if lines.len() > MAX_RECORDS {
@@ -470,12 +470,12 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     // before the truth's own timestamp — that is the run the truth
     // actually measures; pairing it with an arbitrary earlier selection
     // at the same sha could score the outcome against the wrong selected
-    // set (P1 review), and pairing it with a FUTURE selection (recorded
+    // set, and pairing it with a FUTURE selection (recorded
     // after the truth) would invert causality, so the fallback for
     // timestamp-less records is restricted to selections that also carry
-    // no timestamp (P1 review). Each truth is consumed at most once, so N
+    // no timestamp. Each truth is consumed at most once, so N
     // selector re-runs against one tested commit can't manufacture sample
-    // size (P1 review).
+    // size.
     let mut joined: Vec<(&SelectionRecord, &TruthRecord)> = Vec::new();
     let mut matched_sel: HashSet<usize> = HashSet::new();
     let mut matched_truth: HashSet<usize> = HashSet::new();
@@ -490,7 +490,7 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
         // Eligible selection with the GREATEST timestamp at or before the
         // truth's own (RFC3339 compares lexicographically) — not simply the
         // last in append order, since parallel recorders can append out of
-        // timestamp order (P2 review). When no selection predates the truth,
+        // timestamp order. When no selection predates the truth,
         // only a timestamp-less selection may pair — never a future-dated one.
         let hit = selections
             .iter()
@@ -595,7 +595,7 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     // valid measured claim. An INSUFFICIENT report is never cached, so a
     // thin slice can't strip the disclosure from subsequent affected-tests
     // runs, and the default 50-window workflow keeps refreshing as history
-    // grows past 50 joined pairs (P1 review).
+    // grows past 50 joined pairs.
     if !report.insufficient_data
         && let Ok(json) = serde_json::to_string_pretty(&report)
     {
@@ -1169,7 +1169,7 @@ mod tests {
         );
     }
 
-    /// P1 review: a truth recorded BEFORE the only selection at its sha must
+    /// A truth recorded BEFORE the only selection at its sha must
     /// NOT pair with that future selection — the selection couldn't have
     /// produced the outcome. Timestamp-less records may still pair (legacy /
     /// hand-written sidecars).
@@ -1206,7 +1206,7 @@ mod tests {
         assert_eq!(r2.n_joined, 1, "truth recorded after the selection pairs");
     }
 
-    /// P1 review: the report cache (which feeds the in-band `measured`
+    /// The report cache (which feeds the in-band `measured`
     /// disclosure) must refresh for any report that covers ALL joined data —
     /// including the CLI default window of 50 — but NOT for a genuine slice.
     #[test]
@@ -1238,7 +1238,7 @@ mod tests {
         );
     }
 
-    /// P1 review: once history exceeds the default window, the default
+    /// Once history exceeds the default window, the default
     /// 50-window report must keep refreshing the cache — it clears the bar
     /// on its own and the disclosure carries its own window.
     #[test]
@@ -1263,7 +1263,7 @@ mod tests {
         assert_eq!(cached["n_joined"], 50);
     }
 
-    /// P2 review: with out-of-order appends (parallel recorders), the join
+    /// With out-of-order appends (parallel recorders), the join
     /// must pick the selection with the greatest eligible TIMESTAMP, not the
     /// last line in the file.
     #[test]
@@ -1333,7 +1333,7 @@ mod tests {
         );
     }
 
-    /// P2 review: after a stale-lock takeover, the previous holder's Drop
+    /// After a stale-lock takeover, the previous holder's Drop
     /// must not delete the successor's lock file.
     #[test]
     fn sidecar_lock_drop_preserves_successor_lock_after_takeover() {

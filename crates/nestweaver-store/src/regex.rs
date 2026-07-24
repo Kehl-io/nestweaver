@@ -11,7 +11,7 @@
 //! depends on it: when no posting table exists (the `index --with-trigrams`
 //! flag was not used), when the pattern yields no usable literal trigrams
 //! (e.g. `.{4,}`), or when the posting table is *stale* (the graph changed
-//! since it was built — F-03), we fall back to scanning every candidate
+//! since it was built), we fall back to scanning every candidate
 //! node's text and running the compiled regex against it. The trigram
 //! pre-filter only ever *narrows* the candidate set — we always confirm with
 //! the real regex.
@@ -50,7 +50,7 @@ pub const MAX_PATTERN_BYTES: usize = 4096;
 /// the posting table as `"<graph_generation>:<candidate_node_count>"`. A
 /// reader compares both values against the current graph; any drift means the
 /// postings no longer reflect the indexed text and the pre-filter must not be
-/// used (F-03).
+/// used.
 const TRIGRAM_INDEX_META_KEY: &str = "trigram_index";
 
 /// One-shot latch so the stale-index warning is printed once per process
@@ -107,7 +107,7 @@ pub struct RegexSearchResult {
     /// candidate text directly (either no posting table, or no usable literals).
     pub scanned_fallback: bool,
     /// True when a trigram posting table EXISTS but was bypassed because it is
-    /// stale (the graph changed since it was built — F-03). This lets callers
+    /// stale (the graph changed since it was built). This lets callers
     /// surface staleness in-band: on the daemon path the once-per-process
     /// stderr warning is invisible. Implies `scanned_fallback` when the
     /// pattern has usable literals; always false when no index was ever built.
@@ -130,7 +130,7 @@ pub struct PatternCount {
     pub files_matched: u64,
     pub top_files: Vec<FileCount>,
     /// True when a trigram posting table EXISTS but was bypassed because it is
-    /// stale (the graph changed since it was built — F-03), so this pattern
+    /// stale (the graph changed since it was built), so this pattern
     /// was counted via a full scan. Lets callers surface staleness in-band on
     /// the daemon path, where the stderr warning is invisible.
     pub stale_index: bool,
@@ -177,7 +177,7 @@ fn trigrams(s: &str) -> HashSet<String> {
 /// The literal extractor already resolves alternations into alternative
 /// literals: for `(alpha|beta)` it yields both `alpha` and `beta`, and a match
 /// needs only ONE of them. All extracted literals are therefore unioned into
-/// a single OR clause. ANDing them per literal (the earlier behavior, F-02)
+/// a single OR clause. ANDing them per literal (the earlier behavior)
 /// required every alternation branch to appear in the same text and silently
 /// dropped real matches.
 ///
@@ -250,7 +250,7 @@ impl GraphStore {
         // provenance write at the end) would otherwise leave the OLD
         // provenance in place — matching the current generation and looking
         // "fresh" while the posting table is empty or partial, silently
-        // dropping regex matches (P1 review). "building" is unparseable by
+        // dropping regex matches. "building" is unparseable by
         // `trigram_index_meta`, so any interrupted build reads as stale and
         // falls back to a full scan. Written on its own auto-committed
         // connection so it survives the build transaction rolling back.
@@ -300,7 +300,7 @@ impl GraphStore {
             // Record provenance so a later reader can detect that the posting
             // table no longer reflects the graph (nodes added/edited after this
             // build) and fall back to a full scan instead of silently missing
-            // matches (F-03). Overwrites the "building" marker written at the
+            // matches. Overwrites the "building" marker written at the
             // start of this rebuild.
             let meta_value = format!("{}:{}", self.graph_generation(), candidates.len());
             Self::write_trigram_meta(&conn, &meta_value)?;
@@ -345,7 +345,7 @@ impl GraphStore {
 
     /// Read the provenance recorded by [`GraphStore::build_trigram_index`].
     /// Returns `None` when the `Meta` table or key is absent (postings built
-    /// before provenance tracking — F-03) or the value is unparseable.
+    /// before provenance tracking) or the value is unparseable.
     fn trigram_index_meta(&self) -> Option<(u64, u64)> {
         let conn = self.conn().ok()?;
         let mut stmt = conn
@@ -392,7 +392,7 @@ impl GraphStore {
     /// True when the posting table exists but was built against a different
     /// graph state: the graph generation advanced (any mutation, e.g. an
     /// in-place edit) or the candidate-node count drifted (nodes added or
-    /// removed) since `index --with-trigrams` ran (F-03). Postings without
+    /// removed) since `index --with-trigrams` ran. Postings without
     /// provenance (built by an older version) cannot be trusted and count as
     /// stale.
     fn trigram_index_is_stale(&self) -> bool {
@@ -508,7 +508,7 @@ impl GraphStore {
     /// candidate set is the intersection across all AND-clauses.
     ///
     /// Returns `(uids, stale_index)`. `uids` is `None` when the posting table
-    /// is missing OR stale (the graph changed since it was built — F-03); the
+    /// is missing OR stale (the graph changed since it was built); the
     /// caller then falls back to a full scan. `stale_index` is true only when
     /// a posting table exists but was bypassed as stale, so callers can
     /// surface that in-band (the stderr warning below fires once per process
@@ -1081,7 +1081,7 @@ mod tests {
         assert!(!res.truncated, "small corpus scans fully, so not truncated");
     }
 
-    /// F-02: an alternation is an OR, so the trigram pre-filter must union the
+    /// An alternation is an OR, so the trigram pre-filter must union the
     /// branch literals — ANDing them per branch used to drop every match
     /// unless ALL branches appeared in the same text. The pre-filtered result
     /// set must be identical to the full-scan result set across the matrix.
@@ -1124,7 +1124,7 @@ mod tests {
         }
     }
 
-    /// F-02: when ANY alternation branch yields no usable trigram (too short
+    /// When ANY alternation branch yields no usable trigram (too short
     /// or non-literal), the pre-filter must be disabled entirely — unioning
     /// only the literal branches would drop matches coming from the other
     /// branch.
@@ -1150,7 +1150,7 @@ mod tests {
         );
     }
 
-    /// F-03: nodes added after the trigram build must not be invisible — the
+    /// Nodes added after the trigram build must not be invisible — the
     /// stale posting table is detected and the search falls back to a full
     /// scan that still finds the new node.
     #[test]
@@ -1207,7 +1207,7 @@ mod tests {
         );
     }
 
-    /// F-03: a generation bump without a count change (e.g. an in-place edit
+    /// A generation bump without a count change (e.g. an in-place edit
     /// through the engine) must also mark the index stale.
     #[test]
     fn generation_bump_marks_trigram_index_stale() {
@@ -1228,7 +1228,7 @@ mod tests {
         );
     }
 
-    /// F-03: postings built before provenance tracking (no `Meta` key) cannot
+    /// Postings built before provenance tracking (no `Meta` key) cannot
     /// be trusted — treat them as stale and scan.
     #[test]
     fn trigram_index_without_provenance_is_treated_as_stale() {
@@ -1252,7 +1252,7 @@ mod tests {
         );
     }
 
-    /// F-03 observability: `stale_index` must report in-band whether a posting
+    /// Observability: `stale_index` must report in-band whether a posting
     /// table existed but was bypassed as stale — false when no index was ever
     /// built, false for a fresh index, true once the graph drifts.
     #[test]
@@ -1298,7 +1298,7 @@ mod tests {
         assert!(!counts[0].stale_index);
     }
 
-    /// F-03 observability: observing a fresh (non-stale) index re-arms the
+    /// Observability: observing a fresh (non-stale) index re-arms the
     /// one-shot stale warning latch, so a long-lived daemon can warn again
     /// after a rebuild + restale instead of staying latched forever.
     #[test]

@@ -77,7 +77,7 @@ pub struct BundleEntry {
     /// Whether the entry has been expanded (full body + neighbors fetched).
     #[serde(default)]
     pub expanded: bool,
-    /// F-09: `true` when this entry was one of the query's resolved seed nodes
+    /// `true` when this entry was one of the query's resolved seed nodes
     /// (a direct hit), as opposed to a node surfaced by graph proximity.
     /// Skipped from JSON when `false` so existing consumers see unchanged
     /// output.
@@ -196,7 +196,7 @@ pub fn bundle_sidecar_path(db_path: &Path) -> std::path::PathBuf {
 
 /// Load the bundle store, dropping any bundles whose `created_at` is older than
 /// the TTL. Returns an empty store when the sidecar is missing. A corrupt
-/// sidecar no longer silently drops every bundle (F-20): individually
+/// sidecar no longer silently drops every bundle: individually
 /// parseable bundles are salvaged and a warning is emitted.
 pub fn load_bundle_store(db_path: &Path) -> BundleStore {
     let path = bundle_sidecar_path(db_path);
@@ -249,7 +249,7 @@ fn salvage_bundles(text: &str) -> BundleStore {
 
 /// Persist the bundle store via atomic write-then-rename.
 ///
-/// F-20: the temp file name is unique per process and per call — the previous
+/// The temp file name is unique per process and per call — the previous
 /// fixed `.json.tmp` name let two concurrent writers rename each other's temp
 /// file out from under themselves (ENOENT) or interleave writes.
 pub fn save_bundle_store(db_path: &Path, store: &BundleStore) -> Result<(), anyhow::Error> {
@@ -266,7 +266,7 @@ pub fn save_bundle_store(db_path: &Path, store: &BundleStore) -> Result<(), anyh
 }
 
 /// Advisory lock guarding the load→mutate→save cycle of the bundle sidecar
-/// (F-20). Implemented as a lock file created with `create_new` so it works
+/// Implemented as a lock file created with `create_new` so it works
 /// across both threads and processes; stale locks (holder crashed) are broken
 /// after [`LOCK_STALE_SECS`]. An ownership TOKEN is written into the lock file
 /// so that after a stale-lock takeover, the previous holder's Drop does not
@@ -392,7 +392,7 @@ impl Drop for BundleStoreLock {
 }
 
 /// Load → mutate → save the bundle store under the sidecar lock so concurrent
-/// investigators never lose each other's bundles (F-20). When the closure
+/// investigators never lose each other's bundles. When the closure
 /// errors, nothing is written.
 fn update_bundle_store<T>(
     db_path: &Path,
@@ -424,7 +424,7 @@ pub fn load_bundle(db_path: &Path, bundle_id: &str) -> Option<Bundle> {
 ///   no repo matches),
 /// - `vault` / `all` / empty — no restriction (default).
 ///
-/// Any other scope string is rejected with an error (F-21) instead of being
+/// Any other scope string is rejected with an error instead of being
 /// silently treated as "no restriction". Note/section/tag nodes are
 /// vault-global and pass through both filters unscoped.
 ///
@@ -470,7 +470,7 @@ pub fn investigate(
         embed_model,
         None,
     );
-    // F-09: the query's own resolved seed nodes are first-class map entries,
+    // The query's own resolved seed nodes are first-class map entries,
     // ordered ahead of the graph-proximity nodes so an exact-match query for
     // an isolated symbol still returns that symbol instead of an empty map.
     let mut seed_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -557,7 +557,7 @@ pub fn investigate(
     let domains = group_into_domains(store, &entries);
 
     // 7. Persist the bundle (24h TTL handled on load) under the sidecar lock
-    //    so concurrent investigators don't lose each other's bundles (F-20).
+    //    so concurrent investigators don't lose each other's bundles.
     let bundle = Bundle {
         bundle_id: bundle_id.clone(),
         created_at: now_epoch(),
@@ -761,7 +761,7 @@ fn strip_scope_prefix<'a>(scope: &'a str, prefix: &str) -> Option<&'a str> {
 /// project's member UIDs and post-filters the results to its member symbols;
 /// repo scope returns a repo-UID set used to post-filter the connected nodes.
 ///
-/// F-21: unrecognized scope strings, an empty `repo:`/`project:` name, a
+/// Unrecognized scope strings, an empty `repo:`/`project:` name, a
 /// `project:` naming a nonexistent project, or a `repo:` matching no repo are
 /// all hard errors naming the scope — previously they silently degraded to
 /// "no restriction" (or, for an unmatched `repo:`, to filtering out every
@@ -1469,7 +1469,7 @@ mod tests {
         assert!(!single.entries.is_empty());
     }
 
-    // ── F-09: seed nodes are first-class map entries ─────────────────────
+    // ── Seed nodes are first-class map entries ─────────────────────
 
     #[test]
     fn investigate_includes_resolved_seeds_first() {
@@ -1505,7 +1505,7 @@ mod tests {
 
     #[test]
     fn investigate_isolated_symbol_exact_match_is_not_empty() {
-        // F-09 acceptance: an exact-match query for an isolated symbol (no
+        // Acceptance: an exact-match query for an isolated symbol (no
         // callers/callees) must not yield an empty map, and the entry must be
         // drillable via expand.
         let dir = tempfile::tempdir().unwrap();
@@ -1561,7 +1561,7 @@ mod tests {
         );
     }
 
-    // ── F-20: bundle sidecar race + corrupt tolerance ────────────────────
+    // ── Bundle sidecar race + corrupt tolerance ────────────────────
 
     #[test]
     fn parallel_bundle_updates_lose_nothing() {
@@ -1681,7 +1681,7 @@ mod tests {
         assert!(store.bundles.is_empty());
     }
 
-    // ── F-21: scope validation + project post-filter ─────────────────────
+    // ── Scope validation + project post-filter ─────────────────────
 
     #[test]
     fn investigate_rejects_unknown_and_empty_scopes() {

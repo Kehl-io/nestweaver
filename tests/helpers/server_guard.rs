@@ -243,7 +243,7 @@ impl ServerGuard {
 
         // Drain the child's stderr from a reader thread into a bounded tail
         // buffer. Without this the child blocks on write once the pipe buffer
-        // fills and the startup deadline fires spuriously (flake F-25).
+        // fills and the startup deadline fires spuriously.
         let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let stderr_thread = child.stderr.take().map(|mut pipe| {
             let tail = Arc::clone(&stderr_tail);

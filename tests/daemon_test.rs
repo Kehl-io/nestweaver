@@ -2884,7 +2884,7 @@ fn daemon_mcp_brain_remove_source() {
     );
 }
 
-/// F-04: `impact` must fail closed on unknown/garbage UIDs — exit 2, never a
+/// `impact` must fail closed on unknown/garbage UIDs — exit 2, never a
 /// false-green `[]` exit 0. DIRECT path (NESTWEAVER_NO_DAEMON=1).
 #[test]
 fn daemon_impact_fail_closed_direct() {
@@ -2926,7 +2926,7 @@ fn daemon_impact_fail_closed_direct() {
         .code(0);
 }
 
-/// F-04: same fail-closed contract through a RUNNING daemon (the
+/// Same fail-closed contract through a RUNNING daemon (the
 /// `try_hybrid_json_rpc` → `brain_impact` path, which must map the tool's
 /// `status: not_found` onto exit 2).
 #[test]

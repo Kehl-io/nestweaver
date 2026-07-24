@@ -575,7 +575,7 @@ mod tool_schema_validation_tests {
 
     #[test]
     fn numeric_ranges_are_enforced_not_silently_coerced() {
-        // F-12: negatives/floats/over-cap values used to vanish through
+        // Negatives/floats/over-cap values used to vanish through
         // `as_u64()` coercion and fall back to defaults. The compiled schemas
         // now reject them on every transport.
         let invalid = [
@@ -669,7 +669,7 @@ mod tool_schema_validation_tests {
 
     #[test]
     fn bounded_tools_reject_unknown_arguments() {
-        // F-12/G1: mistyped arg names must fail loudly instead of being
+        // Mistyped arg names must fail loudly instead of being
         // silently ignored (e.g. `neighbors` for `include_neighbors`).
         for (name, args) in [
             (
@@ -767,7 +767,7 @@ mod tool_schema_validation_tests {
 
     #[test]
     fn local_dispatch_enforces_tools_allowlist_and_lite_mode() {
-        // F-05: the gate must reject with the same error text on the local
+        // The gate must reject with the same error text on the local
         // path (the daemon-proxy test below asserts parity).
         let store = GraphStore::in_memory().unwrap();
 
@@ -800,7 +800,7 @@ mod tool_schema_validation_tests {
     #[cfg(feature = "daemon")]
     #[test]
     fn daemon_proxy_enforces_tools_allowlist_and_lite_mode() {
-        // F-05: the daemon-proxy path used to skip the --tools/--lite gate
+        // The daemon-proxy path used to skip the --tools/--lite gate
         // entirely. The lazy channel never connects, so any call that PASSES
         // the gate fails with a transport error — proving the rejection below
         // happened at the gate, not the wire.
@@ -836,7 +836,7 @@ mod tool_schema_validation_tests {
 
     #[test]
     fn brain_guide_rejects_config_arg_with_explicit_error() {
-        // F-11: the daemon/MCP handler cannot honor an instance config;
+        // The daemon/MCP handler cannot honor an instance config;
         // silently ignoring it would return a guide for the wrong instance.
         let store = GraphStore::in_memory().unwrap();
         let error = tool_brain_guide(&store, json!({ "config": "/tmp/instance.toml" }))
@@ -905,7 +905,7 @@ mod tool_schema_validation_tests {
     #[cfg(feature = "daemon")]
     #[test]
     fn forwarded_bool_preserves_default_true_when_arg_absent() {
-        // F-16: proto3 bools have no presence — an absent arg must forward as
+        // Proto3 bools have no presence — an absent arg must forward as
         // the tool's default (true for these two), not as explicit false.
         assert!(forwarded_bool(&json!({}), "include_components", true));
         assert!(forwarded_bool(&json!({}), "include_body", true));
@@ -1164,7 +1164,7 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
 /// Enforce the `--tools` allowlist and `--lite` mode for a dispatch. Called by
 /// EVERY dispatch entry point (local store, daemon proxy, hybrid routing) so a
 /// restricted server cannot be reached by routing around the local path
-/// (F-05). The allowlist error text is part of the CLI/MCP contract — keep it
+/// The allowlist error text is part of the CLI/MCP contract — keep it
 /// in sync with the `tools/list` filtering in [`tool_list`].
 pub fn enforce_tool_allowed(name: &str) -> Result<(), anyhow::Error> {
     if is_lite_mode() && !LITE_TOOLS.contains(&name) {
@@ -1206,7 +1206,7 @@ pub fn dispatch(
 /// query timeout or client disconnect can stop the work. `cancel = None` is the
 /// original behavior.
 ///
-/// `visible` carries the caller's per-repo visibility (R9/R9b), resolved by the
+/// `visible` carries the caller's per-repo visibility, resolved by the
 /// HTTP boundary from the bearer identity. `None` (and `Some(VisibleRepos::All)`)
 /// means no scoping — the backward-compatible single-trust-domain default, in
 /// which repo-scoped authorization is a no-op. `brain_search`, `brain_impact`,
@@ -1221,7 +1221,7 @@ pub fn dispatch_cancellable(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    // Enforce --tools allowlist and --lite mode (F-05).
+    // Enforce --tools allowlist and --lite mode.
     enforce_tool_allowed(name)?;
 
     validate_tool_arguments(name, &args)?;
@@ -3283,7 +3283,7 @@ fn authorized_symbol_total(
 fn tool_schema_brain_search() -> Value {
     json!({
         "name": "brain_search",
-        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
+        "description": "Find notes, headings, sections, tags, and code symbols by keyword or phrase using BM25 full-text search.\n\nGuidelines:\n- Use for keyword/phrase lookup; for structural context ('what's connected to X') use brain_context instead\n- Returns both notes and code symbols in a single call, with UIDs for follow-up queries; note rows also carry vault_uid and matched_headings (matched_headings is omitted when empty)\n- Use response_format 'concise' for scanning many results; limit is applied per-kind\n- total_matches counts distinct note/tag and symbol entities independently of the display limit; total_matches_relation 'gte' marks a stable lower bound from bounded counting\n- returned_matches is the actual response length, and truncated is true for every lower bound or when fewer rows are returned than total_matches\n\nLimitations:\n- Does not read full note bodies — use note_get after finding the note here\n- Falls back to substring matching when the Tantivy BM25 index is unavailable",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5807,7 +5807,7 @@ fn tool_brain_impact(
     // contract in daemon mode, instead of the daemon path silently returning the best of
     // several matches (which diverged from the direct path).
     let uid = if symbol.contains(':') {
-        // F-04: fail closed on unknown/garbage/cross-DB UIDs — verify the UID
+        // Fail closed on unknown/garbage/cross-DB UIDs — verify the UID
         // actually resolves in this store instead of trusting its shape. Keeps
         // the same not_found contract as the name path; a legit zero-dependent
         // symbol still resolves and returns status ok with an empty list.
@@ -5949,7 +5949,7 @@ fn tool_schema_brain_guide() -> Value {
 }
 
 fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    // F-11: this handler generates from the graph only and has no
+    // This handler generates from the graph only and has no
     // InstanceConfig to honor. Silently ignoring a caller-supplied `config`
     // would return a guide shaped by the wrong instance — fail loudly instead
     // (the CLI already falls back to the local path when --config is given).
@@ -6579,7 +6579,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                         "uid": m.uid,
                         "name": m.name,
                         "file_path": m.file_path,
-                        // F-07: include kind so the daemon path renders the same
+                        // Include kind so the daemon path renders the same
                         // member shape as the CLI direct path (ClusterMember).
                         "kind": m.kind,
                     })
@@ -6630,7 +6630,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
     let mut any_stale = false;
 
     for repo in &repos {
-        // F-17: a local working tree that no longer exists on disk is
+        // A local working tree that no longer exists on disk is
         // unverifiable — flag it `[missing]` and count it as stale instead of
         // silently reporting `[ok]`.
         let local_missing = repo
@@ -8606,7 +8606,7 @@ fn grpc_status_err(status: tonic::Status) -> anyhow::Error {
     }
 }
 
-/// F-16: proto3 scalar bools carry no presence. An MCP arg the caller left
+/// Proto3 scalar bools carry no presence. An MCP arg the caller left
 /// unset would forward as explicit `false`, and the daemon's typed handlers
 /// write that `false` back into the tool args — overriding tool defaults that
 /// are TRUE (`project_context.include_components`, `note_get.include_body`).
@@ -8636,7 +8636,7 @@ pub fn dispatch_via_daemon(
 ) -> Result<serde_json::Value, anyhow::Error> {
     use nestweaver_proto::JsonRequest;
 
-    // F-05: the daemon-proxy path must enforce the same --tools/--lite gate
+    // The daemon-proxy path must enforce the same --tools/--lite gate
     // as the local path, before any RPC is proxied.
     enforce_tool_allowed(name)?;
 
@@ -9102,7 +9102,7 @@ fn dispatch_add_source_via_daemon(
     // friendly name on every nameless re-add (the daemon treats the value
     // literally), while for code repos an empty name is meaningful — the
     // daemon derives the repo name (package/remote) and a directory-name
-    // default would override that derivation (P2 review).
+    // default would override that derivation.
     let name_arg = args.get("name").and_then(|v| v.as_str()).map(String::from);
 
     let resolved = std::path::Path::new(&path);
@@ -11534,7 +11534,7 @@ mod brain_impact_uid_resolution_tests {
         }
     }
 
-    /// F-04: a UID-shaped input that does not resolve in this store (garbage,
+    /// A UID-shaped input that does not resolve in this store (garbage,
     /// typo'd, or from another DB) must fail closed with the same `not_found`
     /// contract as the name path — not return status ok with an empty list.
     #[test]
@@ -11558,7 +11558,7 @@ mod brain_impact_uid_resolution_tests {
         }
     }
 
-    /// F-04: a legit symbol with zero dependents still resolves by UID and
+    /// A legit symbol with zero dependents still resolves by UID and
     /// returns status ok with an empty impact list (exit 0 at the CLI).
     #[test]
     fn brain_impact_zero_dependent_uid_still_ok() {
@@ -11584,7 +11584,7 @@ mod brain_impact_uid_resolution_tests {
 mod stale_check_tool_tests {
     use super::*;
 
-    /// F-17: a repo whose local working tree was deleted must be flagged
+    /// A repo whose local working tree was deleted must be flagged
     /// `status: "missing"` and counted as stale — never silently `[ok]`.
     #[test]
     fn stale_check_flags_deleted_working_tree_as_missing() {

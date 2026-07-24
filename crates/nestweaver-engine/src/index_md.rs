@@ -436,7 +436,7 @@ pub fn index_markdown_directory_since_with_ignore(
         notes_updated += 1;
     }
 
-    // F-03: advance + persist the graph generation when any note was mutated.
+    // Advance + persist the graph generation when any note was mutated.
     // An in-place edit deletes and recreates the note's sections, leaving the
     // candidate-node count unchanged — the generation bump is the only signal
     // that stales the trigram posting table (mirrors `index.rs` and the full
@@ -1369,7 +1369,7 @@ where
         record_repo_indexed_sha(store, instance_id, vault_name, sha)?;
     }
 
-    // F-03: advance + persist the graph generation for this vault mutation,
+    // Advance + persist the graph generation for this vault mutation,
     // mirroring the code path (`index.rs`). Without it the trigram posting
     // table's staleness check is blind to an in-place vault edit: a section
     // delete+recreate keeps the candidate-node count identical, so
@@ -2682,7 +2682,7 @@ sub b body
         );
     }
 
-    /// F-03: a full vault index must advance the graph generation, mirroring
+    /// A full vault index must advance the graph generation, mirroring
     /// the code path (`index.rs`). Without the bump the trigram posting
     /// table's staleness check is blind to vault mutations.
     #[test]
@@ -2695,7 +2695,7 @@ sub b body
         );
     }
 
-    /// F-03: an in-place vault edit (delete + recreate of the same sections)
+    /// An in-place vault edit (delete + recreate of the same sections)
     /// keeps the candidate-node count identical, so the generation bump is the
     /// ONLY signal that stales the trigram posting table. Re-indexing into the
     /// same store after such an edit must advance the generation while the
@@ -2731,7 +2731,7 @@ sub b body
         );
     }
 
-    /// F-03: the incremental (`--since`) refresh path must advance AND persist
+    /// The incremental (`--since`) refresh path must advance AND persist
     /// the graph generation, so a later process (or the daemon) observes the
     /// bump and distrusts the stale trigram postings.
     #[test]

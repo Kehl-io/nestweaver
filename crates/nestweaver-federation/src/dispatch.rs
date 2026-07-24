@@ -501,7 +501,7 @@ fn json_str_array(params: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Presence-aware bool extraction (F-16): proto3 scalar bools carry no
+/// Presence-aware bool extraction: proto3 scalar bools carry no
 /// presence, so an arg the caller left unset would forward as explicit
 /// `false`, and the daemon's typed handlers write that `false` back into the
 /// tool args — overriding tool defaults that are TRUE
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn bool_or_forwards_default_true_when_arg_absent() {
-        // F-16: absent include_components/include_body must NOT collapse to
+        // Absent include_components/include_body must NOT collapse to
         // false (proto3 has no presence); the tool default is true.
         let empty = serde_json::json!({});
         assert!(bool_or(&empty, "include_components", true));

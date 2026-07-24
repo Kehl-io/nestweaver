@@ -114,7 +114,7 @@ enum SearchIndexReconciliation {
 /// A registered daemon-side file watcher and its shutdown handle.
 ///
 /// The `id` lets the watcher thread clear only ITS OWN registration on exit:
-/// without it, a force-replaced watcher's exit (B-2) would wipe the
+/// without it, a force-replaced watcher's exit would wipe the
 /// replacement's registration and re-orphan the slot.
 pub struct WatcherRegistration {
     id: u64,
@@ -272,7 +272,7 @@ fn resolve_effective_instance_id(requested: &str, configured: &str) -> Result<St
 
 /// Stop and unregister any active file watcher. Idempotent.
 ///
-/// B-2: called on EVERY shutdown path (gRPC Shutdown, SIGTERM, post-serve
+/// Called on EVERY shutdown path (gRPC Shutdown, SIGTERM, post-serve
 /// cleanup) so a watcher orphaned by a kill -9'd `watch` CLI can't pin
 /// daemon shutdown — the watcher runs on a `spawn_blocking` thread that
 /// Tokio's runtime drop waits for, so an unstopped watcher hangs the
@@ -289,7 +289,7 @@ fn stop_active_watcher(state: &DaemonState) {
 /// Register a watcher's shutdown handle, returning its registration id (the
 /// watcher thread passes it to [`clear_watcher_registration`] on exit).
 ///
-/// B-2: refuses when a watcher is already registered unless `force` — in
+/// Refuses when a watcher is already registered unless `force` — in
 /// which case the incumbent (possibly orphaned by a kill -9'd `watch` CLI)
 /// is stopped and replaced instead of failing new watch sessions forever.
 fn register_watcher(
@@ -320,7 +320,7 @@ fn register_watcher(
 
 /// Clear a watcher registration on watcher-thread exit — but only when the
 /// slot still holds THIS watcher. A force-replaced watcher's exit must not
-/// wipe its replacement's registration (B-2).
+/// wipe its replacement's registration.
 fn clear_watcher_registration(state: &DaemonState, id: u64) {
     if let Ok(mut guard) = state.watcher_stop.lock()
         && guard.as_ref().is_some_and(|reg| reg.id == id)
@@ -776,7 +776,7 @@ impl DaemonService {
                 }
             }
 
-            // Budget on ATTEMPTS, not successes (P2 review): with a failing
+            // Budget on ATTEMPTS, not successes: with a failing
             // endpoint, success-based budgeting lets one pass fire 64
             // symbol + 64 note + 64 heading requests. The 64-node cap is
             // meant to bound work per watcher cycle regardless of outcome.
@@ -2321,7 +2321,7 @@ impl NestWeaverDaemon for DaemonService {
             db_path: self.state.db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
-            // B-1: the daemon's own PID, so the CLI can cross-check a pidfile
+            // The daemon's own PID, so the CLI can cross-check a pidfile
             // PID against the socket-reported PID before signaling it.
             pid: std::process::id(),
         }))
@@ -2345,7 +2345,7 @@ impl NestWeaverDaemon for DaemonService {
         // shutdown burns the full drain ceiling doing work it will abandon.
         self.state.drained.store(true, Ordering::Relaxed);
 
-        // B-2: stop any active watcher BEFORE the drain wait — an orphaned
+        // Stop any active watcher BEFORE the drain wait — an orphaned
         // watcher's blocking thread would otherwise pin shutdown until the
         // client's SIGKILL.
         stop_active_watcher(&self.state);
@@ -2504,7 +2504,7 @@ impl NestWeaverDaemon for DaemonService {
         })?;
 
         // Only allow paths registered in the instance config; without a
-        // config, fall back to the unsafe-root denylist (F-01).
+        // config, fall back to the unsafe-root denylist.
         watch_path_allowed(
             self.state.instance_cfg.as_ref().map(|c| c.repos.as_slice()),
             &vault_path,
@@ -2611,7 +2611,7 @@ impl NestWeaverDaemon for DaemonService {
             .map_err(|e| Status::invalid_argument(format!("cannot canonicalize repo path: {e}")))?;
 
         // Only allow paths registered in the instance config; without a
-        // config, fall back to the unsafe-root denylist (F-01).
+        // config, fall back to the unsafe-root denylist.
         watch_path_allowed(
             self.state.instance_cfg.as_ref().map(|c| c.repos.as_slice()),
             &repo_path,
@@ -2626,7 +2626,7 @@ impl NestWeaverDaemon for DaemonService {
 
         // register_watcher holds the lock across check + store (TOCTOU-safe).
         // With `force`, an already-running watcher (e.g. orphaned by a
-        // kill -9'd `watch` CLI, B-2) is stopped and replaced instead of
+        // kill -9'd `watch` CLI) is stopped and replaced instead of
         // failing every new watch session.
         let watcher_id = match register_watcher(&self.state, shutdown_handle, force) {
             Ok(id) => id,
@@ -5399,7 +5399,7 @@ fn is_unsafe_index_root(path: &std::path::Path) -> bool {
 ///
 /// Config `[[repos]]` entries store `file://`-prefixed identity URLs;
 /// `PathBuf::from("file:///x")` is a *relative* path that never canonicalizes,
-/// which silently emptied the watcher allow-list (F-01).
+/// which silently emptied the watcher allow-list.
 fn config_repo_canonical_path(url: &str) -> Option<PathBuf> {
     let stripped = url.strip_prefix("file://").unwrap_or(url);
     std::fs::canonicalize(stripped).ok()
@@ -5408,7 +5408,7 @@ fn config_repo_canonical_path(url: &str) -> Option<PathBuf> {
 /// Validate a watcher target path against the instance config's registered
 /// sources (allow-list), or — when the daemon runs without `--config` —
 /// against the system-root denylist so an explicit `watch --repo X --db Y`
-/// works without an instance config (F-01). `vault_only` restricts the
+/// works without an instance config. `vault_only` restricts the
 /// allow-list to `type = "vault"` entries (used by `watch_vault`).
 fn watch_path_allowed(
     repos: Option<&[nestweaver_engine::config::RepoConfig]>,
@@ -6553,7 +6553,7 @@ pub async fn run_server(
             // shutdown, mirroring the gRPC Shutdown handler. In-flight jobs
             // still drain via the worker loop's JoinSet; only NEW claims stop.
             drained.store(true, Ordering::Relaxed);
-            // B-2: stop any active watcher too — its `spawn_blocking` thread
+            // Stop any active watcher too — its `spawn_blocking` thread
             // would otherwise outlive the broadcast and pin process exit
             // (Tokio's runtime drop waits for blocking threads) until the
             // client's stop grace elapses and it SIGKILLs us.
@@ -7702,7 +7702,7 @@ pub async fn run_server(
     // Cleanup — runs on graceful shutdown (not skipped like process::exit would).
     tracing::info!("daemon shutting down, cleaning up");
 
-    // B-2: belt-and-suspenders watcher stop covering shutdown triggers that
+    // Belt-and-suspenders watcher stop covering shutdown triggers that
     // don't pass through the gRPC Shutdown handler or the SIGTERM handler
     // (e.g. idle timeout). Idempotent — no-op when already stopped.
     stop_active_watcher(&state);
@@ -12835,7 +12835,7 @@ mod startup_helper_tests {
         );
     }
 
-    /// B-1: health_check must report the daemon process's own PID so the CLI
+    /// health_check must report the daemon process's own PID so the CLI
     /// can cross-check a pidfile PID against the socket-reported PID before
     /// signaling it (a foreign PID planted in the pidfile fails that check).
     #[tokio::test]
@@ -12850,7 +12850,7 @@ mod startup_helper_tests {
         assert_eq!(resp.pid, std::process::id());
     }
 
-    /// B-2: a second watcher registration is refused without force; with
+    /// A second watcher registration is refused without force; with
     /// force the incumbent (possibly orphaned by a kill -9'd `watch` CLI) is
     /// stopped and replaced — and the replaced watcher's exit-clear must not
     /// wipe the replacement's registration.
@@ -12904,7 +12904,7 @@ mod startup_helper_tests {
         assert!(state.watcher_stop.lock().unwrap().is_none());
     }
 
-    /// B-2: the shutdown RPC stops any active watcher up front, so an
+    /// The shutdown RPC stops any active watcher up front, so an
     /// orphaned watcher's blocking thread can't pin the drain until the
     /// client's SIGKILL.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13226,7 +13226,7 @@ mod watch_path_allowed_tests {
         }
     }
 
-    /// F-01: config repo URLs are `file://`-prefixed; the allow-list must
+    /// Config repo URLs are `file://`-prefixed; the allow-list must
     /// strip the scheme before canonicalizing, otherwise every entry drops
     /// out and every watch is rejected.
     #[test]
@@ -13243,7 +13243,7 @@ mod watch_path_allowed_tests {
         assert!(config_repo_canonical_path("file:///definitely/missing/path").is_none());
     }
 
-    /// F-01: without an instance config, an explicit `--repo` path must be
+    /// Without an instance config, an explicit `--repo` path must be
     /// watchable (guarded by the unsafe-root denylist instead of failing
     /// `failed_precondition`).
     #[test]
@@ -13254,14 +13254,14 @@ mod watch_path_allowed_tests {
         assert!(watch_path_allowed(None, &canonical, "vault", true).is_ok());
     }
 
-    /// F-01: without a config, system roots are still refused.
+    /// Without a config, system roots are still refused.
     #[test]
     fn no_config_rejects_unsafe_roots() {
         assert!(watch_path_allowed(None, std::path::Path::new("/"), "repo", false).is_err());
         assert!(watch_path_allowed(None, std::path::Path::new("/usr"), "repo", false).is_err());
     }
 
-    /// F-01: with a config, a repo registered via `file://` URL must pass the
+    /// With a config, a repo registered via `file://` URL must pass the
     /// allow-list (previously rejected because the scheme was never stripped).
     #[test]
     fn config_allows_file_url_registered_repo() {
@@ -13338,7 +13338,7 @@ mod watcher_e2e_tests {
         Ok(NestWeaverDaemonClient::new(channel))
     }
 
-    /// B-1 + B-2 end-to-end over a real unix socket:
+    /// End-to-end over a real unix socket:
     ///  - health_check reports the daemon's own PID (CLI pidfile cross-check);
     ///  - a watch session whose CLI vanished (no StopWatch — the kill -9
     ///    scenario) blocks a plain re-watch but is adoptable with force;
@@ -13371,7 +13371,7 @@ mod watcher_e2e_tests {
         }
         let mut client = client.expect("daemon socket did not come up within 10s");
 
-        // B-1: the socket reports the daemon's own PID (in-process here, so
+        // The socket reports the daemon's own PID (in-process here, so
         // it equals the test process PID).
         let health = client
             .health_check(nestweaver_proto::HealthCheckRequest {})
@@ -13407,7 +13407,7 @@ mod watcher_e2e_tests {
             r2.message
         );
 
-        // B-2: force adopts the orphaned watcher slot.
+        // Force adopts the orphaned watcher slot.
         let r3 = client
             .watch_code(mk_req(true))
             .await
@@ -13419,7 +13419,7 @@ mod watcher_e2e_tests {
             r3.message
         );
 
-        // B-2: shutdown with the watcher ACTIVE must stop it and exit
+        // Shutdown with the watcher ACTIVE must stop it and exit
         // promptly — the pre-fix SIGTERM/cleanup path left the watcher's
         // blocking thread running, pinning process exit.
         client

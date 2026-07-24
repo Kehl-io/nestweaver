@@ -7,7 +7,7 @@
 //!    These tests run the CLI against a LIVE daemon and assert success with
 //!    non-empty, non-error output.
 //!
-//! B. Daemon-vs-direct output parity tests (bug class F-11) — for each command,
+//! B. Daemon-vs-direct output parity tests — for each command,
 //!    stdout must be byte-identical between direct mode
 //!    (`NESTWEAVER_NO_DAEMON=1`) and daemon mode, in both human and `--json`
 //!    output, and exit codes must match across modes.
@@ -400,7 +400,7 @@ fn contract_affected_tests_files_via_daemon() {
     );
 }
 
-// ─── B. Daemon-vs-direct output parity tests (F-11) ─────────────────────────
+// ─── B. Daemon-vs-direct output parity tests ─────────────────────────
 
 #[test]
 fn parity_count_patterns_direct_vs_daemon() {
@@ -450,7 +450,7 @@ fn parity_affected_tests_direct_vs_daemon() {
     );
 }
 
-/// `stale-check` is a freshness gate (F-17): it exits 1 when the index is
+/// `stale-check` is a freshness gate: it exits 1 when the index is
 /// stale. The fixture here is freshly indexed (not stale), but regardless we
 /// only assert stdout equality and equal exit codes across modes — never
 /// success.

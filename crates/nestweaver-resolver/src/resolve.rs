@@ -1468,7 +1468,7 @@ mod tests {
     #[test]
     fn no_edge_to_symbol_never_referenced_in_source_file() {
         // Regression for the "phantom detect_entry_point → list_all_symbols
-        // CALLS edge" hunt finding: the resolver must never emit an edge whose
+        // CALLS edge" bug: the resolver must never emit an edge whose
         // target name does not appear as a reference in the source file, even
         // with type environments active. (The DB-level instance of that bug
         // was a Symbol node carrying another symbol's UID — an engine/store

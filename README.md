@@ -208,11 +208,11 @@ cargo build --release
 | Command | Description |
 |---------|-------------|
 | `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. |
-| `watch` | Live re-indexing via filesystem watcher with debouncing. Runs daemon-side (no instance config required; unsafe roots are denylisted); `--force` replaces an existing watcher |
+| `watch` | Live re-indexing via filesystem watcher with debouncing. Runs daemon-side (no instance config required; unsafe roots are denylisted); `--force` replaces an existing watcher. Incremental reindex preserves CALLS/IMPORTS edges (reverse dependents are re-resolved) and reports per-file failures instead of dying |
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
 | `search` | Full-text search across indexed symbols and notes |
 | `symbol` | Look up a symbol by name and display its metadata |
-| `impact` | Trace the blast radius of a symbol through the dependency graph (fails closed on unknown/foreign UIDs, exit 2; `--depth` 1–15) |
+| `impact` | Trace the blast radius of a symbol through the dependency graph (fails closed on unknown/foreign UIDs, exit 2; `--depth` 1–15; pruning by impact-score threshold or depth is disclosed, `--min-score 0` opts out) |
 | `read-symbols` | Read a symbol's source span |
 | `regex-search` | Regex search over indexed text (trigram pre-filter; falls back to a full scan with `stale_index: true` when the trigram index is stale — re-run `index --with-trigrams`) |
 | `count-patterns` | Count regex matches per pattern |
@@ -229,8 +229,8 @@ cargo build --release
 | Command | Description |
 |---------|-------------|
 | `brain add` | Add an Obsidian vault or markdown directory to the knowledge graph |
-| `brain search` | Search across code symbols, notes, headings, sections, and tags |
-| `brain context` | Get unified context spanning both code symbols and notes |
+| `brain search` | Search across code symbols, notes, headings, sections, and tags (`--limit` 1–1000) |
+| `brain context` | Get unified context spanning both code symbols and notes (skips the semantic leg entirely when the DB has no embeddings; identical concurrent calls coalesce single-flight) |
 | `brain list` | List all registered vaults |
 | `brain status` | Show vault counts, per-vault staleness, and index health |
 | `brain watch` | Watch vaults for changes and re-index automatically |
@@ -259,7 +259,7 @@ cargo build --release
 | `pr-impact` | PR blast radius analysis with risk scoring (Low/Medium/High); `--sarif` for code scanning, `--strict` to gate on contract-verified breaking changes |
 | `rts-eval record-truth` | Report a full-suite outcome from CI so selection quality can be measured |
 | `rts-eval report` | Measured file-recall / change-recall / selection-breadth of past selections (refuses percentages below 10 joined runs) |
-| `dead-code` | Detect unreachable symbols via entry point reachability (`unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`) |
+| `dead-code` | Detect unreachable symbols via entry point reachability (`unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; Rust `pub mod` Modules are never flagged; visibility isn't persisted, so all confidence scores are inferred/Medium) |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
 | `contracts drift` | Routes declared in a spec but not implemented, and vice versa (presence-level) |
 | `contracts diff` | Field/type-level OpenAPI breaking-change diff between two spec versions (`--base`/`--head`, `--fail-on-breaking` for CI) |

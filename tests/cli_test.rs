@@ -2134,7 +2134,7 @@ fn index_setup_retries_secondary_before_writing_done_marker() {
     assert!(marker.exists());
 }
 
-// ── F-10 (nw-087): missing-DB guard matrix ───────────────────────────────────
+// ── nw-087: missing-DB guard matrix ───────────────────────────────────
 //
 // A command run against a NONEXISTENT --db must fail loudly with the
 // `db_not_found` diagnostic (exit 1) — never CREATE an empty DB, exit 0 on a
@@ -2387,7 +2387,7 @@ fn cli_list_repos_and_search_honor_stats_flag() {
         .stderr(contains("stats:"));
 }
 
-// ── F-19: `instance abort-migration` journal recovery ────────────────────────
+// ── `instance abort-migration` journal recovery ────────────────────────
 
 /// The instance-migration journal lives at `<db>.extensions.migration.json`
 /// (see `instance_extension_migration_journal_path` in
@@ -2450,7 +2450,7 @@ fn cli_abort_migration_wedged_valid_journal_requires_force() {
 
 #[test]
 fn cli_abort_migration_corrupt_journal_force_discards() {
-    // F-19a: a journal that fails to parse carries no trustworthy phase
+    // A journal that fails to parse carries no trustworthy phase
     // information. Without --force the abort refuses; with --force the corrupt
     // journal is discarded (phase reported as unknown) so the daemon can boot.
     let dir = tempfile::tempdir().unwrap();

@@ -104,7 +104,7 @@ enum FallbackDirStatus {
     ModeTightened,
 }
 
-/// Create or verify the `/tmp/nw-sock-<uid>` fallback socket dir (B-5).
+/// Create or verify the `/tmp/nw-sock-<uid>` fallback socket dir.
 ///
 /// Anyone can create paths in `/tmp`, so a pre-existing dir owned by ANOTHER
 /// user is a squat: binding our socket inside it would let that user swap or
@@ -150,7 +150,7 @@ fn secure_fallback_sock_dir(dir: &Path, expected_uid: u32) -> std::io::Result<Fa
 /// /tmp-based path and say so. All callers derive the socket through this
 /// function, so client and daemon always agree on the fallback.
 ///
-/// B-5: the /tmp fallback dir is created mode 0700 and ownership-checked.
+/// The /tmp fallback dir is created mode 0700 and ownership-checked.
 /// A dir squatted by another uid is never used — the error is logged and we
 /// fall back to the (over-long) runtime-dir path so the bind fails loudly
 /// instead of trusting the squatted dir.
@@ -484,7 +484,7 @@ mod tests {
         assert!(sock.parent().is_some_and(|p| p.exists()));
     }
 
-    /// B-5: the /tmp fallback dir is created mode 0700 so no other user can
+    /// The /tmp fallback dir is created mode 0700 so no other user can
     /// reach in and swap or delete our socket.
     #[test]
     fn fallback_sock_dir_created_private() {
@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(status, FallbackDirStatus::Verified);
     }
 
-    /// B-5: a pre-existing dir we own but with a permissive mode is tightened
+    /// A pre-existing dir we own but with a permissive mode is tightened
     /// to 0700 rather than trusted as-is.
     #[test]
     fn fallback_sock_dir_tightens_permissive_mode() {
@@ -525,7 +525,7 @@ mod tests {
         );
     }
 
-    /// B-5: a dir owned by a DIFFERENT uid (a squat) is refused — never used.
+    /// A dir owned by a DIFFERENT uid (a squat) is refused — never used.
     #[test]
     fn fallback_sock_dir_refuses_foreign_owner() {
         let tmp = tempfile::tempdir().unwrap();

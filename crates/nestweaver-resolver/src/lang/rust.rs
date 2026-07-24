@@ -62,7 +62,7 @@ pub fn resolve_import(
         crate_name => {
             // Rust built-in libraries are never workspace crates — resolve
             // them to nothing BEFORE any fallback can bind them to a local
-            // module (`use std::fs` must not edge to `src/fs.rs`, P2 review).
+            // module (`use std::fs` must not edge to `src/fs.rs`).
             // Third-party crates (tokio, serde, …) still rely on the
             // ambiguity guards below; full precision needs package-name
             // evidence from Cargo.toml (not yet threaded into the resolver).
@@ -102,7 +102,7 @@ pub fn resolve_import(
             // Root-crate fallback, for `use <crate_under_test>::…` from
             // integration tests/benches/examples — tried only when the
             // unique-crate fallback found nothing. Restricted to dev-target
-            // files in single-crate repos (P2 review): applying it more
+            // files in single-crate repos: applying it more
             // broadly would discard the unmatched crate name and bind EXTERNAL
             // crates to local modules (`serde::de` → `src/de.rs`). Requires at
             // least one module segment to resolve so genuinely-external names
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn builtin_crates_never_bind_to_local_modules() {
         // `use std::fs::File;` in a repo that HAS src/fs.rs: the unique-crate
-        // fallback must not bind std to the local module (P2 review).
+        // fallback must not bind std to the local module.
         let known = set(&["src/lib.rs", "src/fs.rs", "src/main.rs"]);
         assert_eq!(resolve_import("src/main.rs", "std::fs::File", &known), None);
         assert_eq!(
