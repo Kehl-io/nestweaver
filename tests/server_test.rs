@@ -2193,7 +2193,6 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     // the circuit breaker re-probes and recovers, so the hybrid path must
     // appear within a bounded number of attempts.
     let mut stdout = String::new();
-    let mut stderr = String::new();
     for attempt in 1..=10 {
         let cli = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
             .args([
@@ -2206,6 +2205,13 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
                 &cfg_path.display().to_string(),
             ])
             .current_dir(dir.path())
+            // This probe exercises the DAEMON + hybrid routing path. CI's
+            // test job exports NESTWEAVER_NO_DAEMON=1, which (with Actions'
+            // ambient CI=true) activates the no-daemon bypass — and the
+            // direct path never federates, so the probe would see local-only
+            // results forever. Strip the bypass for this subprocess.
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
             .output()
             .expect("run real hybrid text-mode CLI search");
         assert!(
@@ -2214,10 +2220,10 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
             String::from_utf8_lossy(&cli.stderr)
         );
         stdout = String::from_utf8_lossy(&cli.stdout).into_owned();
-        stderr = String::from_utf8_lossy(&cli.stderr).into_owned();
         if stdout.contains("Brain search (hybrid)") {
             break;
         }
+        let stderr = String::from_utf8_lossy(&cli.stderr);
         assert!(
             attempt < 10,
             "hybrid text output must identify the hybrid engine after {attempt} attempt(s):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"

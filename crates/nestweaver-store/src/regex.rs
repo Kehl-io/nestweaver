@@ -245,6 +245,15 @@ impl GraphStore {
     /// written.
     pub fn build_trigram_index(&self) -> Result<usize, StoreError> {
         let conn = self.conn()?;
+        // Mark the index as mid-build BEFORE touching the postings. An
+        // interrupted rebuild (crash/kill between the clear below and the
+        // provenance write at the end) would otherwise leave the OLD
+        // provenance in place — matching the current generation and looking
+        // "fresh" while the posting table is empty or partial, silently
+        // dropping regex matches (P1 review). "building" is unparseable by
+        // `trigram_index_meta`, so any interrupted build reads as stale and
+        // falls back to a full scan.
+        Self::write_trigram_meta(&conn, "building")?;
         // Clear existing postings so a rebuild reflects the current graph.
         conn.query("MATCH (t:TrigramPosting) DETACH DELETE t")
             .map_err(|e| StoreError::Query(format!("clear trigram postings: {e}")))?;
@@ -280,8 +289,16 @@ impl GraphStore {
         // Record provenance so a later reader can detect that the posting
         // table no longer reflects the graph (nodes added/edited after this
         // build) and fall back to a full scan instead of silently missing
-        // matches (F-03). Upsert pattern mirrors the other `Meta` singletons.
+        // matches (F-03). Overwrites the "building" marker written at the
+        // start of this rebuild.
         let meta_value = format!("{}:{}", self.graph_generation(), candidates.len());
+        Self::write_trigram_meta(&conn, &meta_value)?;
+        Ok(postings.len())
+    }
+
+    /// Upsert the trigram-index provenance singleton in the `Meta` table
+    /// (same delete+insert pattern as the other `Meta` singletons).
+    fn write_trigram_meta(conn: &lbug::Connection<'_>, value: &str) -> Result<(), StoreError> {
         let mut del = conn
             .prepare("MATCH (m:Meta {key: $k}) DETACH DELETE m")
             .map_err(|e| StoreError::Query(format!("prepare trigram meta delete: {e}")))?;
@@ -297,11 +314,11 @@ impl GraphStore {
             &mut ins,
             vec![
                 ("k", Value::String(TRIGRAM_INDEX_META_KEY.to_string())),
-                ("v", Value::String(meta_value)),
+                ("v", Value::String(value.to_string())),
             ],
         )
         .map_err(|e| StoreError::Query(format!("write trigram meta: {e}")))?;
-        Ok(postings.len())
+        Ok(())
     }
 
     /// Read the provenance recorded by [`GraphStore::build_trigram_index`].

@@ -21,7 +21,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -144,14 +144,18 @@ pub struct RtsEvalReport {
     /// Window the report was computed over (last N joined pairs; 0 = all).
     pub window: usize,
     /// Joined pairs whose failures were NOT rerun-confirmed. While this is
-    /// non-zero the recall figures are an UPPER BOUND — flaky failures that
-    /// the selection "missed" are counted as real misses only if confirmed,
-    /// and unconfirmed ones can inflate the number either way.
+    /// non-zero the recall figures are UNCERTAIN in both directions:
+    /// unconfirmed failures excluded as flaky shrink the denominator (recall
+    /// drifts up), but unconfirmed failures the selection caught are also
+    /// excluded from the numerator (recall drifts down) — so no bound
+    /// direction can be claimed.
     pub unconfirmed_failure_runs: usize,
     /// Failures excluded as flaky across the window.
     pub excluded_flaky_failures: usize,
-    /// Set when `unconfirmed_failure_runs > 0`: recall is an upper bound.
-    pub recall_is_upper_bound: bool,
+    /// Set when `unconfirmed_failure_runs > 0`: the recall estimate rests on
+    /// partially unconfirmed evidence and can err in either direction — it is
+    /// NOT necessarily an upper bound (P2 review).
+    pub recall_estimate_uncertain: bool,
 }
 
 /// In-band measured-recall disclosure attached to affected_tests results
@@ -174,9 +178,78 @@ fn recording_disabled() -> bool {
     std::env::var(NO_RECORD_ENV).is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
+/// Advisory lock guarding read-modify-write cycles on the rts-eval sidecars.
+/// `append_jsonl` (append + rotation) and `record_truth` (read + upsert +
+/// atomic replace) are both read-modify-write: two concurrent recorders
+/// (parallel CI steps sharing a DB) can silently lose each other's records
+/// without mutual exclusion. Pattern mirrors investigate.rs's
+/// `BundleStoreLock`: `create_new` lock file, bounded wait, stale-lock
+/// break, RAII cleanup. Recording is best-effort, so on timeout we degrade
+/// to proceeding unlocked rather than failing the record.
+struct SidecarLock {
+    path: PathBuf,
+    owned: bool,
+}
+
+impl SidecarLock {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    const STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn acquire(sidecar: &Path) -> Self {
+        let path = sidecar.with_extension("lock");
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(_) => return Self { path, owned: true },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Break a lock abandoned by a crashed/killed holder.
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > Self::STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if start.elapsed() >= Self::WAIT {
+                        tracing::warn!(
+                            "rts-eval sidecar lock wait exceeded {:?} — proceeding unlocked",
+                            Self::WAIT
+                        );
+                        return Self { path, owned: false };
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(_) => {
+                    // Lock file itself unusable (perms, missing parent) —
+                    // degrade to unlocked; recording must not fail over this.
+                    return Self { path, owned: false };
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SidecarLock {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Append one JSON line to `path`, enforcing [`MAX_RECORDS`] by rewriting
 /// with the oldest lines dropped when the cap is exceeded.
 fn append_jsonl(path: &Path, line: &str) -> Result<()> {
+    // Hold the sidecar lock across append + rotation check: two concurrent
+    // recorders interleaving here can each rotate-rewrite over the other's
+    // fresh append and silently lose records (P2 review).
+    let _lock = SidecarLock::acquire(path);
     {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -278,6 +351,9 @@ pub fn record_truth(
     };
     let line = serde_json::to_string(&rec).context("serialize truth record")?;
     let path = crate::sidecar_path(db_path, TRUTH_SUFFIX);
+    // Hold the sidecar lock across the whole read → upsert → atomic replace
+    // cycle so concurrent recorders don't lose each other's updates.
+    let _lock = SidecarLock::acquire(&path);
 
     // Drop any existing record for the same (repo_uid, sha) before appending.
     // Unparseable lines are preserved verbatim (one bad line must not disable
@@ -331,10 +407,11 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     let (truths, _truth_corrupt) =
         load_jsonl::<TruthRecord>(&crate::sidecar_path(db_path, TRUTH_SUFFIX));
 
-    // Join: for each selection, the first truth with the same sha (and same
-    // repo_uid when both are non-empty). Later selections win a truth over
-    // none; a truth is consumable by multiple selections at the same sha
-    // (re-runs of the selector against one tested commit).
+    // Join 1:1 — each truth is consumed by at most ONE selection. Letting
+    // multiple selections at the same sha share one truth (e.g. re-running
+    // the selector N times against one tested commit) manufactures sample
+    // size: one measured outcome would count as N joined pairs and dominate
+    // the recall metrics (P1 review).
     let mut joined: Vec<(&SelectionRecord, &TruthRecord)> = Vec::new();
     let mut matched_truth: HashSet<usize> = HashSet::new();
     let mut unresolved = 0usize;
@@ -343,8 +420,9 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
             unresolved += 1;
             continue;
         }
-        let hit = truths.iter().enumerate().find(|(_, t)| {
-            t.sha == sel.sha
+        let hit = truths.iter().enumerate().find(|(idx, t)| {
+            !matched_truth.contains(idx)
+                && t.sha == sel.sha
                 && (t.repo_uid.is_empty() || sel.repo_uid.is_empty() || t.repo_uid == sel.repo_uid)
         });
         match hit {
@@ -431,7 +509,7 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
         window,
         unconfirmed_failure_runs,
         excluded_flaky_failures,
-        recall_is_upper_bound: unconfirmed_failure_runs > 0,
+        recall_estimate_uncertain: unconfirmed_failure_runs > 0,
     };
 
     // Cache for the in-band `measured` disclosure; best-effort.
@@ -766,7 +844,7 @@ mod tests {
 
     /// nw-066: a FLAKY failure must not count as a miss (it would deflate
     /// recall), must not pin itself into future selections, and an
-    /// UNCONFIRMED failure run must mark recall as an upper bound.
+    /// UNCONFIRMED failure run must mark the recall estimate as uncertain.
     #[test]
     fn flaky_failures_excluded_and_unconfirmed_flagged() {
         let (_dir, db) = scratch_db();
@@ -797,12 +875,15 @@ mod tests {
             Some(1.0),
             "flaky miss must not deflate recall"
         );
-        assert!(!r.recall_is_upper_bound, "all runs were rerun-confirmed");
+        assert!(
+            !r.recall_estimate_uncertain,
+            "all runs were rerun-confirmed"
+        );
         assert_eq!(r.unconfirmed_failure_runs, 0);
     }
 
     #[test]
-    fn unconfirmed_failures_mark_recall_as_upper_bound() {
+    fn unconfirmed_failures_mark_recall_estimate_uncertain() {
         let (_dir, db) = scratch_db();
         for i in 0..12 {
             let sha = format!("sha{i}");
@@ -819,8 +900,8 @@ mod tests {
         let r = compute_report(&db, 0).expect("report");
         assert_eq!(r.unconfirmed_failure_runs, 1);
         assert!(
-            r.recall_is_upper_bound,
-            "unconfirmed failures must flag recall as an upper bound"
+            r.recall_estimate_uncertain,
+            "unconfirmed failures must flag the recall estimate as uncertain"
         );
     }
 

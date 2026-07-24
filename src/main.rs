@@ -10909,14 +10909,15 @@ fn run_rts_eval(command: RtsEvalCommands) -> anyhow::Result<(i32, Option<String>
                         report.excluded_flaky_failures
                     );
                 }
-                if report.recall_is_upper_bound {
+                if report.recall_estimate_uncertain {
                     println!();
                     println!(
                         "  NOTE: {} run(s) reported failures that were never re-run, so these",
                         report.unconfirmed_failure_runs
                     );
-                    println!("  recall figures are an UPPER BOUND. Pass --reruns (and --flaky) to");
-                    println!("  rts-eval record-truth to report confirmed failures.");
+                    println!("  recall figures are UNCERTAIN in either direction (not a bound).");
+                    println!("  Pass --reruns (and --flaky) to rts-eval record-truth to report");
+                    println!("  confirmed failures.");
                 }
             }
             Ok((EXIT_SUCCESS, None))
