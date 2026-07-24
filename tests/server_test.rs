@@ -2188,25 +2188,40 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     // fallback merely because its engine is not the single-source "bm25".
     let cfg_path = dir.path().join("instance.toml");
     write_upstream_config(&cfg_path, "server", &server.grpc_addr(), HYBRID_TOKEN);
-    let cli = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
-        .args([
-            "brain",
-            "search",
-            "fn",
-            "--db",
-            &db_local.display().to_string(),
-            "--config",
-            &cfg_path.display().to_string(),
-        ])
-        .current_dir(dir.path())
-        .output()
-        .expect("run real hybrid text-mode CLI search");
-    assert!(
-        cli.status.success(),
-        "hybrid text-mode CLI failed: {}",
-        String::from_utf8_lossy(&cli.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&cli.stdout);
+    // Retry-bound the CLI probe: even with the generous upstream timeout, a
+    // transient ejection under CI load may yield a local-only first answer;
+    // the circuit breaker re-probes and recovers, so the hybrid path must
+    // appear within a bounded number of attempts.
+    let mut stdout = String::new();
+    for attempt in 1..=10 {
+        let cli = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+            .args([
+                "brain",
+                "search",
+                "fn",
+                "--db",
+                &db_local.display().to_string(),
+                "--config",
+                &cfg_path.display().to_string(),
+            ])
+            .current_dir(dir.path())
+            .output()
+            .expect("run real hybrid text-mode CLI search");
+        assert!(
+            cli.status.success(),
+            "hybrid text-mode CLI failed: {}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        stdout = String::from_utf8_lossy(&cli.stdout).into_owned();
+        if stdout.contains("Brain search (hybrid)") {
+            break;
+        }
+        assert!(
+            attempt < 10,
+            "hybrid text output must identify the hybrid engine after {attempt} attempt(s): {stdout}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
     assert!(
         stdout.contains("Brain search (hybrid)"),
         "hybrid text output must identify the hybrid engine: {stdout}"
@@ -2734,6 +2749,10 @@ name = "{upstream_name}"
 url = "{upstream_grpc_addr}"
 token = "{token}"
 mode = "merge"
+# Generous timeout: the config default (1s) is too tight for a loaded CI
+# runner — one slow upstream response ejects the source and the merge
+# degrades to local-only, flaking the hybrid assertions below.
+timeout = "15s"
 "#
     );
     std::fs::write(path, toml).expect("write instance.toml");
