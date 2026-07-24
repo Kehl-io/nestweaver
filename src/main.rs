@@ -3766,6 +3766,9 @@ fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) 
 /// when the process is gone, false when it is still alive at the deadline —
 /// the caller must NOT proceed with an install/start in the false case, or
 /// the old and new daemons would overlap on one DB.
+///
+/// Only called from the launchd start path, which is macOS-only.
+#[cfg(target_os = "macos")]
 fn pid_exited_within_grace(pid: i32, grace: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
@@ -16993,7 +16996,7 @@ mod stop_grace_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod start_grace_tests {
     use super::*;
 
