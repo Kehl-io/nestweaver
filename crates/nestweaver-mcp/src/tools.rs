@@ -9090,19 +9090,13 @@ fn dispatch_add_source_via_daemon(
         .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?
         .to_string();
 
-    // Schema promises "Defaults to the directory name" — resolve it here;
-    // forwarding "" blanks the vault's stored friendly name on every
-    // nameless re-add (the daemon treats the value literally).
-    let name = args
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| {
-            std::path::Path::new(&path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
-        .unwrap_or_default();
+    // Vault schema promises "Defaults to the directory name" — resolve it
+    // here, but ONLY for vaults: forwarding "" blanks a vault's stored
+    // friendly name on every nameless re-add (the daemon treats the value
+    // literally), while for code repos an empty name is meaningful — the
+    // daemon derives the repo name (package/remote) and a directory-name
+    // default would override that derivation (P2 review).
+    let name_arg = args.get("name").and_then(|v| v.as_str()).map(String::from);
 
     let resolved = std::path::Path::new(&path);
     // nw-089: validate the path exists — the old code returned a phantom
@@ -9132,9 +9126,14 @@ fn dispatch_add_source_via_daemon(
 
     rt.block_on(async {
         if is_vault {
+            let vault_name = name_arg.clone().or_else(|| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            });
             let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
                 vault_path: path.clone(),
-                vault_name: name,
+                vault_name: vault_name.unwrap_or_default(),
                 extra_ignore_patterns: vec![],
                 instance_id: instance_id.clone(),
             });
@@ -9153,7 +9152,10 @@ fn dispatch_add_source_via_daemon(
         } else {
             let req = tonic::Request::new(nestweaver_proto::IndexRepoRequest {
                 repo_path: path.clone(),
-                name,
+                // Empty when omitted: the daemon derives the repo name
+                // (package/remote) — a directory-name default would override
+                // that derivation.
+                name: name_arg.clone().unwrap_or_default(),
                 force: false,
                 with_trigrams: false,
                 with_git_activity: false,

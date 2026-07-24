@@ -87,9 +87,10 @@ pub struct TruthRecord {
     #[serde(default)]
     pub flaky_test_files: Vec<String>,
     /// How many times failures were re-run before being reported. `None` or 0
-    /// means the failures are UNCONFIRMED — recall computed over them is an
-    /// upper bound (Meta measured a ~20-point recall illusion from not
-    /// de-flaking; ICSE-SEIP 2019).
+    /// means the failures are UNCONFIRMED — recall computed over them can err
+    /// in either direction and is flagged uncertain, not a bound (Meta
+    /// measured a ~20-point recall illusion from not de-flaking; ICSE-SEIP
+    /// 2019).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reruns: Option<u32>,
 }
@@ -189,13 +190,17 @@ fn recording_disabled() -> bool {
 /// (parallel CI steps sharing a DB) can silently lose each other's records
 /// without mutual exclusion. Pattern mirrors investigate.rs's
 /// `BundleStoreLock`: `create_new` lock file, bounded wait, stale-lock
-/// break, RAII cleanup. Acquisition failure is an ERROR, not a silent
+/// break, RAII cleanup — plus an ownership TOKEN written into the lock file:
+/// after a stale-lock takeover, the previous holder's Drop must not delete
+/// the successor's lock (that would void mutual exclusion for the next
+/// contender, P2 review). Acquisition failure is an ERROR, not a silent
 /// unlocked pass — proceeding unlocked would reintroduce the very
 /// lost-update race the lock exists to close (P2 review). Recording
 /// failures surface as a non-fatal Note notification on affected-tests,
 /// so erroring here never breaks the selection itself.
 struct SidecarLock {
     path: PathBuf,
+    token: String,
 }
 
 impl SidecarLock {
@@ -204,6 +209,14 @@ impl SidecarLock {
 
     fn acquire(sidecar: &Path) -> Result<Self> {
         let path = sidecar.with_extension("lock");
+        let token = format!(
+            "{}:{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         let start = std::time::Instant::now();
         loop {
             match std::fs::OpenOptions::new()
@@ -211,7 +224,12 @@ impl SidecarLock {
                 .write(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(Self { path }),
+                Ok(mut f) => {
+                    // Best-effort: the token lets a stale-taken-over holder
+                    // recognize the lock is no longer its own on Drop.
+                    let _ = f.write_all(token.as_bytes());
+                    return Ok(Self { path, token });
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Break a lock abandoned by a crashed/killed holder.
                     let stale = std::fs::metadata(&path)
@@ -245,7 +263,14 @@ impl SidecarLock {
 
 impl Drop for SidecarLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only remove the lock if it is still OURS — a stale-lock takeover
+        // may have replaced it with a successor's lock, which must survive.
+        let still_ours = std::fs::read_to_string(&self.path)
+            .map(|content| content == self.token)
+            .unwrap_or(false);
+        if still_ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -424,10 +449,12 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     // before the truth's own timestamp — that is the run the truth
     // actually measures; pairing it with an arbitrary earlier selection
     // at the same sha could score the outcome against the wrong selected
-    // set (P1 review). When timestamps don't order (clock skew, manual
-    // records) fall back to the earliest unmatched selection at that sha.
-    // Each truth is consumed at most once, so N selector re-runs against
-    // one tested commit can't manufacture sample size (P1 review).
+    // set (P1 review), and pairing it with a FUTURE selection (recorded
+    // after the truth) would invert causality, so the fallback for
+    // timestamp-less records is restricted to selections that also carry
+    // no timestamp (P1 review). Each truth is consumed at most once, so N
+    // selector re-runs against one tested commit can't manufacture sample
+    // size (P1 review).
     let mut joined: Vec<(&SelectionRecord, &TruthRecord)> = Vec::new();
     let mut matched_sel: HashSet<usize> = HashSet::new();
     let mut matched_truth: HashSet<usize> = HashSet::new();
@@ -440,17 +467,17 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
             continue;
         }
         // Latest unmatched selection with ts <= truth.ts (RFC3339 compares
-        // lexicographically); else earliest unmatched selection at the sha.
+        // lexicographically). When no selection predates the truth, only a
+        // timestamp-less selection may pair — never a future-dated one.
         let hit = selections
             .iter()
             .enumerate()
             .filter(|(i, s)| !matched_sel.contains(i) && sel_matches(s, truth))
             .rfind(|(_, s)| !s.ts.is_empty() && s.ts <= truth.ts)
             .or_else(|| {
-                selections
-                    .iter()
-                    .enumerate()
-                    .find(|(i, s)| !matched_sel.contains(i) && sel_matches(s, truth))
+                selections.iter().enumerate().find(|(i, s)| {
+                    !matched_sel.contains(i) && sel_matches(s, truth) && s.ts.is_empty()
+                })
             });
         if let Some((s_idx, sel)) = hit {
             matched_sel.insert(s_idx);
@@ -460,6 +487,12 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
     }
     let unresolved = selections.len() - matched_sel.len();
     let n_unmatched_truths = truths.len() - matched_truth.len();
+
+    // A report "covers all joined data" when the window spans every joined
+    // pair BEFORE any slicing — compare against the pre-drain count, or a
+    // slice that happens to equal its own post-drain length would look
+    // canonical and clobber the cached lifetime report.
+    let covers_all_joined = window == 0 || window >= joined.len();
 
     if window > 0 && joined.len() > window {
         let start = joined.len() - window;
@@ -538,14 +571,15 @@ pub fn compute_report(db_path: &Path, window: usize) -> Result<RtsEvalReport> {
         recall_estimate_uncertain: unconfirmed_failure_runs > 0,
     };
 
-    // Cache for the in-band `measured` disclosure; best-effort. Only the
-    // canonical lifetime report (window == 0) refreshes the cache — a
-    // `--window N` slice can be insufficient on its own, and caching it
-    // would strip the disclosure from subsequent affected-tests runs even
-    // though lifetime data clears the bar.
-    if window == 0
-        && let Ok(json) = serde_json::to_string_pretty(&report)
-    {
+    // Cache for the in-band `measured` disclosure; best-effort. Refresh it
+    // whenever the report covers ALL joined data — lifetime (window == 0) or
+    // a window that spans every joined pair (the CLI default of 50 qualifies
+    // once history is shorter than the window) — since those reports are the
+    // canonical view. A genuine slice (window < pre-drain joined count) can
+    // be insufficient on its own, and caching it would strip the disclosure
+    // from subsequent affected-tests runs even though full data clears the
+    // bar.
+    if covers_all_joined && let Ok(json) = serde_json::to_string_pretty(&report) {
         let _ = std::fs::write(crate::sidecar_path(db_path, REPORT_SUFFIX), json);
     }
 
@@ -1114,5 +1148,92 @@ mod tests {
             "recording failure must surface as a note: {:?}",
             degraded.notifications
         );
+    }
+
+    /// P1 review: a truth recorded BEFORE the only selection at its sha must
+    /// NOT pair with that future selection — the selection couldn't have
+    /// produced the outcome. Timestamp-less records may still pair (legacy /
+    /// hand-written sidecars).
+    #[test]
+    fn truth_is_never_paired_with_a_future_selection() {
+        let (_dir, db) = scratch_db();
+        let sel_path = crate::sidecar_path(&db, SELECTIONS_SUFFIX);
+        let truth_path = crate::sidecar_path(&db, TRUTH_SUFFIX);
+        let sel = serde_json::json!({
+            "ts": "2026-01-02T00:00:00Z", "repo_uid": "", "sha": "sha1",
+            "changed_files": [], "selected_test_files": ["tests/t.rs"],
+            "status": "complete", "recommendation": "selection-usable"
+        });
+        std::fs::write(&sel_path, format!("{sel}\n")).expect("write selection");
+        let truth_early = serde_json::json!({
+            "ts": "2026-01-01T00:00:00Z", "repo_uid": "", "sha": "sha1",
+            "failed_test_files": ["tests/t.rs"], "total_test_files": 10,
+            "flaky_test_files": [], "reruns": 3
+        });
+        std::fs::write(&truth_path, format!("{truth_early}\n")).expect("write truth");
+
+        let r = compute_report(&db, 0).expect("report");
+        assert_eq!(r.n_joined, 0, "future selection must not pair");
+        assert_eq!(r.n_unmatched_truths, 1);
+
+        // Sanity: a truth recorded AFTER the selection pairs normally.
+        let truth_late = serde_json::json!({
+            "ts": "2026-01-03T00:00:00Z", "repo_uid": "", "sha": "sha1",
+            "failed_test_files": ["tests/t.rs"], "total_test_files": 10,
+            "flaky_test_files": [], "reruns": 3
+        });
+        std::fs::write(&truth_path, format!("{truth_late}\n")).expect("rewrite truth");
+        let r2 = compute_report(&db, 0).expect("report2");
+        assert_eq!(r2.n_joined, 1, "truth recorded after the selection pairs");
+    }
+
+    /// P1 review: the report cache (which feeds the in-band `measured`
+    /// disclosure) must refresh for any report that covers ALL joined data —
+    /// including the CLI default window of 50 — but NOT for a genuine slice.
+    #[test]
+    fn window_covering_all_joined_refreshes_report_cache() {
+        let (_dir, db) = scratch_db();
+        for i in 0..12 {
+            let sha = format!("sha{i}");
+            record_selection(&db, &result_selecting(&["tests/a.test.ts"]), "repo:1", &sha)
+                .expect("sel");
+            record_truth(&db, "repo:1", &sha, &[], Some(10), &[], Some(3)).expect("truth");
+        }
+        let cache_path = crate::sidecar_path(&db, REPORT_SUFFIX);
+
+        compute_report(&db, 50).expect("default-window report");
+        let cached: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cache_path).expect("cache must be written"),
+        )
+        .expect("parse cache");
+        assert_eq!(cached["window"], 50, "default window refreshes the cache");
+
+        compute_report(&db, 5).expect("slice report");
+        let cached_after: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cache_path).expect("cache must survive"),
+        )
+        .expect("parse cache");
+        assert_eq!(
+            cached_after["window"], 50,
+            "a genuine slice must not clobber the canonical cached report"
+        );
+    }
+
+    /// P2 review: after a stale-lock takeover, the previous holder's Drop
+    /// must not delete the successor's lock file.
+    #[test]
+    fn sidecar_lock_drop_preserves_successor_lock_after_takeover() {
+        let (_dir, db) = scratch_db();
+        let sidecar = crate::sidecar_path(&db, TRUTH_SUFFIX);
+        let lock = SidecarLock::acquire(&sidecar).expect("acquire");
+        let lock_path = sidecar.with_extension("lock");
+        // A successor breaks the "stale" lock and installs its own token.
+        std::fs::write(&lock_path, b"other-pid:0").expect("successor token");
+        drop(lock);
+        assert!(
+            lock_path.exists(),
+            "successor lock must survive the taken-over holder's Drop"
+        );
+        let _ = std::fs::remove_file(&lock_path);
     }
 }

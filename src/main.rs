@@ -1991,7 +1991,8 @@ enum RtsEvalCommands {
         #[arg(long = "flaky", num_args = 0..)]
         flaky_test_files: Vec<String>,
         /// How many times failures were re-run before reporting. Without this,
-        /// failures are UNCONFIRMED and the report marks recall an upper bound.
+        /// failures are UNCONFIRMED and the report marks the recall estimate
+        /// as uncertain (it can err in either direction — it is not a bound).
         #[arg(long)]
         reruns: Option<u32>,
         #[arg(
