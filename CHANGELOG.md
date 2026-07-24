@@ -40,6 +40,84 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [2.6.0](https://github.com/Kehl-io/nestweaver/compare/v2.5.11...v2.6.0) (2026-07-24)
+
+
+### Features
+
+* **cli:** rts-eval record-truth and report subcommands + CI docs ([1615073](https://github.com/Kehl-io/nestweaver/commit/16150738e2270c4c74d69ee70199f7a8d3196041))
+* **engine,mcp:** surface git co-change coupling in blast radius ([d8b5747](https://github.com/Kehl-io/nestweaver/commit/d8b57477c09ec6093a826c242e3672d0715bcf1d))
+* **engine:** machine-readable run-full-suite recommendation on affected_tests ([d1c2f40](https://github.com/Kehl-io/nestweaver/commit/d1c2f402bfe7725f5a31ab96ceed014d3d9eadd6))
+* **engine:** rts_eval measured-recall loop — recording, metrics, in-band disclosure ([7d8d96e](https://github.com/Kehl-io/nestweaver/commit/7d8d96e6df68b97c1b0867020e9c095dd8c3975f))
+* **engine:** TIA-style always-include rules and stale-index disclosure for affected_tests ([7d78531](https://github.com/Kehl-io/nestweaver/commit/7d78531dbe521f9628a00fb31347d15f48e71bc7))
+* **mcp:** compile advertised tool schemas for validation ([3496344](https://github.com/Kehl-io/nestweaver/commit/349634489d1a0c996098a55bbe04ff1372b1033a))
+* **search:** expose bounded result cardinality alongside ranked hits ([127702e](https://github.com/Kehl-io/nestweaver/commit/127702e17e46c44aeb4465b90e24061d5d0467e5))
+
+
+### Bug Fixes
+
+* address PR review — rts-eval integrity, trigram rebuild safety, CI probe env ([f1ec712](https://github.com/Kehl-io/nestweaver/commit/f1ec712e23b0e32edabc792b4a5379ff0755522f))
+* **affected_tests:** select Rust inline #[test] functions (nw-085 part B) ([46c9630](https://github.com/Kehl-io/nestweaver/commit/46c963039ba31e815c972420f06ecdb6131e3998))
+* **affected-tests:** fail closed on symbol enumeration errors ([989c4d5](https://github.com/Kehl-io/nestweaver/commit/989c4d5d43065245cae49607e2a8654f470e8906))
+* **authz:** close blast-radius response leaks ([79239f9](https://github.com/Kehl-io/nestweaver/commit/79239f9bcb3a529932fb039eeeb03473cd3d3942))
+* **authz:** fail closed on unknown symbol ownership ([fbe665f](https://github.com/Kehl-io/nestweaver/commit/fbe665fd2a10f2d7a3df3eb0082ae77d1578d79a))
+* blast-radius trust & accuracy batch — verdict integrity, live centrality boost, CI fail-safe signal, co-change tier ([8399125](https://github.com/Kehl-io/nestweaver/commit/83991255cf699f593898a32aa8d4269fbca81d04))
+* **blast-radius:** report total affected count without authz leaks ([2e986e5](https://github.com/Kehl-io/nestweaver/commit/2e986e54cd950ed60130f80b562fb23879ecbbfc))
+* bug-hunt batch — search integrity, MCP validation, daemon lifecycle, CLI correctness ([fbd8d54](https://github.com/Kehl-io/nestweaver/commit/fbd8d54ffa3f568e5d041acf71257c4460af3b70))
+* **ci:** gate pid_exited_within_grace to macOS ([09fe2d7](https://github.com/Kehl-io/nestweaver/commit/09fe2d7fd9e9ab143c09653bb45601f044477cb0))
+* **cli:** don't double-warn about the daemon bypass on autostart ([6112db2](https://github.com/Kehl-io/nestweaver/commit/6112db228bbf602a5e97ea2b773a27f1354c64e1))
+* **cli:** hard-disable the daemon bypass outside CI ([56eed52](https://github.com/Kehl-io/nestweaver/commit/56eed5204c80bb136bbc490309f0feb2366ae27d))
+* **cli:** impact --json parity, missing-db guard, and CLI nits (nw-086/087/088) ([66667f0](https://github.com/Kehl-io/nestweaver/commit/66667f0fb18620de0bcebd99a8357fe1d746272d))
+* **clustering:** make Leiden community labels deterministic (nw-081) ([ab145df](https://github.com/Kehl-io/nestweaver/commit/ab145dff0030f1660b9107537b344ad2c3a336a9))
+* **daemon:** committed admin mutations report success-with-warnings, never a bare error (nw-091 Bug 2) ([249cc17](https://github.com/Kehl-io/nestweaver/commit/249cc1796cb4660c4e82688a7d201717e7fa593a))
+* **daemon:** self-heal wedged migration journals + operator abort-migration recovery ([cf22844](https://github.com/Kehl-io/nestweaver/commit/cf22844deeaa57dd5a0d80f49f782ecd95ef314a))
+* **engine:** carry repo_uid on ChangedSymbolRef for selection recording ([74af722](https://github.com/Kehl-io/nestweaver/commit/74af722d2065e5ecceb03fc68c4ff7075d7fb343))
+* **engine:** compute blast-radius risk and gate from the pre-truncation set ([aab53e2](https://github.com/Kehl-io/nestweaver/commit/aab53e2620d4b37dc30725c4c75ba2ca4730470b))
+* **engine:** fail safe on unindexed changed source files ([70a6a78](https://github.com/Kehl-io/nestweaver/commit/70a6a78e5b86773c4dd53cbeb4a19817cf393e52))
+* **engine:** hydrate changed-symbol PageRank from the ranking cache ([324ed79](https://github.com/Kehl-io/nestweaver/commit/324ed7958cba5a011b8d364c8fa51a924ecc683d))
+* **engine:** make measured recall flakiness-aware, and document the honest prior ([0e479c2](https://github.com/Kehl-io/nestweaver/commit/0e479c2bac027ad9d96637f96479acc12f4577bf))
+* **engine:** preserve handoffs on migration abort ([674ce7b](https://github.com/Kehl-io/nestweaver/commit/674ce7b031af5191b1d4bd6453373f4b4c026761))
+* full-diff review round 5 — resolver spans, mutation wrappers, daemon/cli honesty ([94212b5](https://github.com/Kehl-io/nestweaver/commit/94212b5f39ca3690d316fcf570802a805c0b6dd4))
+* hunt-round-2 accuracy — watcher edge preservation, cross-crate resolution, impact honesty, perf ([c265750](https://github.com/Kehl-io/nestweaver/commit/c265750a5289a9a9dc4e76f9fb22c2d674e047c4))
+* **investigate:** union per-token seeds for multi-word queries (nw-080) ([a4fa100](https://github.com/Kehl-io/nestweaver/commit/a4fa1006f3c7ecd02f1234defd6bb03d645087a6))
+* **mcp:** bound schema validation errors ([262d810](https://github.com/Kehl-io/nestweaver/commit/262d8108eeaeb9a08d96321e245e3d050c27b2b5))
+* **mcp:** constrain scoped impact traversal ([39930e4](https://github.com/Kehl-io/nestweaver/commit/39930e4d0021dd6e6244dd152990cfc4999af6f6))
+* **mcp:** honesty + validation nits across read_symbols/get_summary/investigate (nw-084) ([fff24f5](https://github.com/Kehl-io/nestweaver/commit/fff24f5c91f555e8904037362ba2ba83e32c3262))
+* **mcp:** make brain search totals independent of display limits ([984c474](https://github.com/Kehl-io/nestweaver/commit/984c474031f74ecfa27294c3d3ebaa0773c684ba))
+* **mcp:** repair the daemon-proxy write tools — remove/add source, extension cache (nw-089) ([a330d6e](https://github.com/Kehl-io/nestweaver/commit/a330d6eab35e363f134c3fbbcbf1cd88f4dcf2f2))
+* **mcp:** scope local two-tier results ([46ee7d0](https://github.com/Kehl-io/nestweaver/commit/46ee7d01b8f7d9383951be9fc0d9e0166c7efe85))
+* **mcp:** stop caching read_symbols (nw-077) ([192b222](https://github.com/Kehl-io/nestweaver/commit/192b22232b4d05276d726162d874c1d6114aeaf0))
+* **mcp:** validate arguments before every transport dispatch ([64abd1a](https://github.com/Kehl-io/nestweaver/commit/64abd1ad36ccbe89b947d79b247f0780f6b03372))
+* **mcp:** validate HTTP arguments before routing ([1084c9d](https://github.com/Kehl-io/nestweaver/commit/1084c9dceb01b096753a4a8980eaf764c4505da0))
+* **mcp:** withhold org impact for restricted callers ([c7a6765](https://github.com/Kehl-io/nestweaver/commit/c7a6765121b26b82d3f998fc23beba13b003a8ab))
+* **parser:** mark exported TS/JS declarations Public via export_statement ancestors ([934140a](https://github.com/Kehl-io/nestweaver/commit/934140ac2fb8d189a108683deea510be778516d9))
+* **process:** bound detect_changes with an in-memory scoped trace (nw-078) ([bf1b163](https://github.com/Kehl-io/nestweaver/commit/bf1b16391d224e12cb98f16a8a9204d029b5a709))
+* regex_search drops real matches; affected_tests base_ref; clusters paging (nw-076/088/090) ([1e4673d](https://github.com/Kehl-io/nestweaver/commit/1e4673df7eb4e4ae0a113557c6bcae16c486b628))
+* **resolver:** never resolve Rust builtin crates to local modules ([d00d197](https://github.com/Kehl-io/nestweaver/commit/d00d19740de6f37e5c86d541c7669dd5fd43f68b))
+* review round 2 + manual-test findings ([aeefa19](https://github.com/Kehl-io/nestweaver/commit/aeefa19f24fc85cff4ac5473c66b03cbe5465384))
+* review round 3 — rts-eval cache/join/lock correctness, repo-name default ([a3b9eaf](https://github.com/Kehl-io/nestweaver/commit/a3b9eafd3db582368e7f83f0d08de1dd9f1c6653))
+* review round 4 — rts-eval, embeddings, watcher, resolver, alias bindings ([1805da4](https://github.com/Kehl-io/nestweaver/commit/1805da462308f05e1080a0393fe9198d55314cb6))
+* **search:** enforce authz and indexed ownership ([34930e7](https://github.com/Kehl-io/nestweaver/commit/34930e7305e47dfc75df7542fa5c5c5065480540))
+* **search:** fail closed across hybrid transports ([a721484](https://github.com/Kehl-io/nestweaver/commit/a7214849d039ba18436e8e7bde42fe7c96f785db))
+* **search:** harden counted result contracts ([d36f7d3](https://github.com/Kehl-io/nestweaver/commit/d36f7d3c5f7ddac58d6a48d461fc530272f8d1d7))
+* **search:** keep legacy counts conservative ([a1a927f](https://github.com/Kehl-io/nestweaver/commit/a1a927f06619020f2ddc2616d48b67f9173d295f))
+* **search:** preserve honest totals through daemon and federation ([87bc3dc](https://github.com/Kehl-io/nestweaver/commit/87bc3dcc81828f8856334dc56d6c2d55f33d89de))
+* **search:** reject noncanonical symbol lines ([75ee4f6](https://github.com/Kehl-io/nestweaver/commit/75ee4f63e5750cc45f6319109fb279d6fee71737))
+* **search:** reject reads from migrated index handles ([3e5196c](https://github.com/Kehl-io/nestweaver/commit/3e5196cebef5dcdc65f9900c3c5177b7eb2a21a0))
+* **search:** use stable symbol identity across tiers ([81fb7e8](https://github.com/Kehl-io/nestweaver/commit/81fb7e80d10b88ae50273f1919e063b5d50b431e))
+* **search:** validate hybrid identity proofs ([8a8966c](https://github.com/Kehl-io/nestweaver/commit/8a8966ca94471d5b56c29628cc642be2dd4266db))
+* **store:** bound the engine thread pool on write opens to close the crash race ([33ae54d](https://github.com/Kehl-io/nestweaver/commit/33ae54d7cc0896645ba0dfc2220821bbc20e91e0))
+* **store:** classify destructive mutation outcomes ([433b77a](https://github.com/Kehl-io/nestweaver/commit/433b77a167e2e2747bcc2fdc7873f50d2aedf428))
+* **store:** loud NUL-corruption canary at the string-extraction choke point ([3358e48](https://github.com/Kehl-io/nestweaver/commit/3358e486d4aafa4fff0ac633c8f0ec8b549d5648))
+* **store:** recover an abandoned index-publication generation reservation (nw-091 Bug 3A) ([481b6fc](https://github.com/Kehl-io/nestweaver/commit/481b6fc32e0ea585dadbd611aa9b55cc8bdb180a))
+* **store:** repair impact-traversal display fields via primary-key lookups ([22159d8](https://github.com/Kehl-io/nestweaver/commit/22159d81eaa96caf33057821532f1cf90c7af833))
+* **summary:** bound symbol-level summaries and push target down (nw-079) ([897e0fa](https://github.com/Kehl-io/nestweaver/commit/897e0fa4f313961646790787f02eb2f4f44ca4f6))
+
+
+### Performance Improvements
+
+* **affected_tests:** walk the reverse-impact graph in memory (nw-085 part A) ([6fe4eb4](https://github.com/Kehl-io/nestweaver/commit/6fe4eb424c2a68e86dd14b06a93f3dc0a55e08b7))
+
 ## [2.5.11](https://github.com/Kehl-io/nestweaver/compare/v2.5.10...v2.5.11) (2026-07-21)
 
 
