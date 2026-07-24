@@ -1995,12 +1995,13 @@ fn tool_schema_read_symbols() -> Value {
         "name": "read_symbols",
         "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- Requires the repo root to resolve file paths (defaults to server working directory)\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
         "inputSchema": {
+            "type": "object",
             "properties": {
                 "targets": {
                     "type": "array",
                     "items": { "type": "string" },
                     "minItems": 1,
-                    "description": "Symbol UIDs (sym:...), names, or FQNs to read."
+                    "description": "Symbol UIDs (sym:...), names, or FQNs to read. One of 'targets' or 'uids_or_fqns' is required."
                 },
                 "uids_or_fqns": {
                     "type": "array",
@@ -2023,10 +2024,6 @@ fn tool_schema_read_symbols() -> Value {
                     "description": "Repository root for resolving file paths (default: server working directory)."
                 }
             },
-            "anyOf": [
-                { "type": "object", "required": ["targets"] },
-                { "type": "object", "required": ["uids_or_fqns"] }
-            ],
             "additionalProperties": false
         }
     })
@@ -2107,8 +2104,9 @@ fn tool_schema_regex_search() -> Value {
         "name": "regex_search",
         "description": "Run a Rust regex against indexed text (section bodies, note titles, symbol signatures) with trigram-accelerated pre-filtering.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output includes {results:[{uid, kind, title, location, line, snippet}], truncated, scanned_fallback, stale_index}\n- scanned_fallback is set when no trigram index exists or the pattern has no usable literals\n- stale_index is set when a trigram index EXISTS but was bypassed as stale (graph changed since it was built) — results are still correct (full scan), but reindex to restore the pre-filter\n\nLimitations:\n- Candidate cap of 200000 or time budget (default 2000ms) may truncate results\n- Does not search binary files or unindexed content",
         "inputSchema": {
+            "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\"." },
+                "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\". One of 'pattern' or 'query' is required." },
                 "query": { "type": "string", "description": "Backward-compatible alias for pattern." },
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
@@ -2121,10 +2119,6 @@ fn tool_schema_regex_search() -> Value {
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
-            "anyOf": [
-                { "type": "object", "required": ["pattern"] },
-                { "type": "object", "required": ["query"] }
-            ],
             "additionalProperties": false
         }
     })
@@ -6230,12 +6224,13 @@ fn tool_schema_detect_changes() -> Value {
         "name": "detect_changes",
         "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high)\n- Treat `risk` as usable only when `status == complete`; `degraded-unknown` requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts",
         "inputSchema": {
+            "type": "object",
             "properties": {
                 "changed_files": {
                     "type": "array",
                     "items": { "type": "string" },
                     "minItems": 1,
-                    "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
+                    "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]. One of 'changed_files' or 'files' is required."
                 },
                 "files": {
                     "type": "array",
@@ -6243,11 +6238,7 @@ fn tool_schema_detect_changes() -> Value {
                     "minItems": 1,
                     "description": "Backward-compatible alias for changed_files."
                 }
-            },
-            "anyOf": [
-                { "type": "object", "required": ["changed_files"] },
-                { "type": "object", "required": ["files"] }
-            ]
+            }
         }
     })
 }
