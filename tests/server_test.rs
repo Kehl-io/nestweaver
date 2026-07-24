@@ -2193,6 +2193,7 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     // the circuit breaker re-probes and recovers, so the hybrid path must
     // appear within a bounded number of attempts.
     let mut stdout = String::new();
+    let mut stderr = String::new();
     for attempt in 1..=10 {
         let cli = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
             .args([
@@ -2213,12 +2214,13 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
             String::from_utf8_lossy(&cli.stderr)
         );
         stdout = String::from_utf8_lossy(&cli.stdout).into_owned();
+        stderr = String::from_utf8_lossy(&cli.stderr).into_owned();
         if stdout.contains("Brain search (hybrid)") {
             break;
         }
         assert!(
             attempt < 10,
-            "hybrid text output must identify the hybrid engine after {attempt} attempt(s): {stdout}"
+            "hybrid text output must identify the hybrid engine after {attempt} attempt(s):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
