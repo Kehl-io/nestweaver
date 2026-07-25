@@ -51,7 +51,7 @@ impl CpuThrottle {
 
     fn from_env_value(value: Option<&str>) -> Self {
         let percent = value
-            .and_then(|s| s.parse::<u32>().ok())
+            .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(DEFAULT_PERCENT);
         let target = (percent > 0 && percent < 100).then(|| f64::from(percent) / 100.0);
         Self::new(target)
@@ -221,6 +221,12 @@ mod tests {
     fn env_partial_percent_is_honored() {
         let t = CpuThrottle::from_env_value(Some("25"));
         assert_eq!(t.target, Some(0.25));
+    }
+
+    #[test]
+    fn env_value_is_trimmed() {
+        let t = CpuThrottle::from_env_value(Some(" 45 "));
+        assert_eq!(t.target, Some(0.45));
     }
 
     #[test]

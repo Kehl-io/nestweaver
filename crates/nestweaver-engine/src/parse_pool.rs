@@ -29,6 +29,11 @@ where
 fn parse_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| {
+        // Note this DOUBLES the process's rayon thread count: the global pool
+        // (kept responsive for query serving) retains its own N threads on
+        // top of these N parse workers. Accepted deliberately — the throttle
+        // (cpu_throttle) bounds total CPU, and utility-QoS parse threads
+        // preempt poorly against query latency, not the other way round.
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
@@ -66,14 +71,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pool_is_available_and_named() {
-        let name = install_parse_pool(|| {
-            rayon::current_num_threads();
-            std::thread::current().name().map(str::to_owned)
-        });
-        if parse_pool().is_some() {
-            assert_eq!(name.as_deref(), Some("nw-parse-0"));
+    fn pool_constructs_and_runs_named_workers() {
+        // Construction must succeed on a normal unix dev/CI runner — if it
+        // ever fails here, the graceful fallback in `install_parse_pool`
+        // would silently hide a real environment problem.
+        #[cfg(unix)]
+        assert!(
+            parse_pool().is_some(),
+            "parse pool must construct on unix test runners"
+        );
+        if parse_pool().is_none() {
+            return; // Non-unix fallback path: nothing further to assert.
         }
+        // `install` runs the closure on an arbitrary pool worker.
+        let name = install_parse_pool(|| std::thread::current().name().map(str::to_owned));
+        assert!(
+            name.as_deref().is_some_and(|n| n.starts_with("nw-parse-")),
+            "closure must run on a named parse-pool worker, got {name:?}"
+        );
     }
 
     #[test]

@@ -2448,39 +2448,43 @@ where
 
         // Build type environments per file for type-aware resolution.
         // Each file's type env is independent, so we build them in parallel.
+        let build_env = |(file_path, symbols, _references, source_opt): &ParsedFileEntry| {
+            // Same CPU budget as the parse phase above.
+            cpu_throttle.check();
+            let source_owned;
+            let source: &str = if let Some(s) = source_opt.as_deref() {
+                s
+            } else {
+                source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
+                &source_owned
+            };
+
+            let empty_bindings = Vec::new();
+            let file_ast_bindings = ast_bindings_by_file
+                .get(file_path.as_str())
+                .unwrap_or(&empty_bindings);
+
+            let env = nestweaver_resolver::types::TypeEnvironment::build(
+                source,
+                language,
+                symbols,
+                file_ast_bindings,
+            );
+
+            if env.binding_count() > 0 {
+                Some((file_path.clone(), env))
+            } else {
+                None
+            }
+        };
+        // Same dedicated low-priority pool as the parse phase.
         let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
-            parsed_files_for_resolver
-                .par_iter()
-                .filter_map(|(file_path, symbols, _references, source_opt)| {
-                    // Same CPU budget as the parse phase above.
-                    cpu_throttle.check();
-                    let source_owned;
-                    let source: &str = if let Some(s) = source_opt.as_deref() {
-                        s
-                    } else {
-                        source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
-                        &source_owned
-                    };
-
-                    let empty_bindings = Vec::new();
-                    let file_ast_bindings = ast_bindings_by_file
-                        .get(file_path.as_str())
-                        .unwrap_or(&empty_bindings);
-
-                    let env = nestweaver_resolver::types::TypeEnvironment::build(
-                        source,
-                        language,
-                        symbols,
-                        file_ast_bindings,
-                    );
-
-                    if env.binding_count() > 0 {
-                        Some((file_path.clone(), env))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            crate::parse_pool::install_parse_pool(|| {
+                parsed_files_for_resolver
+                    .par_iter()
+                    .filter_map(build_env)
+                    .collect()
+            });
         tracing::info!(
             files_with_bindings = type_envs.len(),
             total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
@@ -3060,7 +3064,7 @@ fn incremental_index_with_name_and_io(
     };
 
     // 2. If no existing Repo → full index.
-    let old_sha = match existing_repo {
+    let existing_repo = match existing_repo {
         None => {
             tracing::info!("no existing repo found; falling back to full index");
             return full_index_fallback(
@@ -3077,19 +3081,20 @@ fn incremental_index_with_name_and_io(
                 },
             );
         }
-        Some(r) => r.indexed_sha,
+        Some(r) => r,
     };
+    let old_sha = existing_repo.indexed_sha.clone();
 
     // 2b. Self-heal an incomplete index BEFORE the up-to-date shortcut below:
     // an empty indexed_sha (Repo row created but SHA never committed — today
     // only handled implicitly via `is_ancestor("")` → false) or a committed
-    // SHA with zero symbols (crash between the SHA write and content landing)
+    // SHA with no content (crash between the SHA write and content landing)
     // can never be repaired incrementally, and would otherwise self-perpetuate
     // through the `old_sha == new_sha` skip.
     let index_incomplete = old_sha.is_empty()
-        || !store
-            .repo_has_symbols(&r_uid)
-            .with_context(|| "repo_has_symbols failed")?;
+        || store
+            .repo_index_incomplete(&existing_repo)
+            .with_context(|| "repo_index_incomplete failed")?;
     if index_incomplete {
         tracing::warn!(
             old_sha,
@@ -3321,23 +3326,6 @@ where
         .map(|r| r.indexed_sha)
         .filter(|sha| !sha.is_empty())
         .ok_or_else(|| anyhow::anyhow!("incremental index requires an existing indexed repo"))?;
-
-    // A committed SHA with zero symbols (crash between the SHA write and
-    // content landing) must not take the up-to-date skip below — report the
-    // full-index fallback so the caller rebuilds the repo from scratch.
-    if !store
-        .repo_has_symbols(&r_uid)
-        .with_context(|| "repo_has_symbols failed")?
-    {
-        tracing::warn!(
-            old_sha,
-            "index is incomplete (SHA set but no symbols); falling back to full re-index"
-        );
-        return Ok(IncrementalResult {
-            fell_back_to_full: true,
-            ..IncrementalResult::default()
-        });
-    }
 
     if old_sha == new_sha {
         tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
@@ -6589,11 +6577,11 @@ function hello(name) { return "Hello " + name; }
     }
 
     /// Regression: a crash between the SHA commit and content landing leaves a
-    /// Repo row whose indexed_sha matches HEAD but owns zero symbols. The
+    /// Repo row whose indexed_sha matches HEAD but owns zero content. The
     /// `old_sha == new_sha` skip must not self-perpetuate that empty state —
     /// incremental_index must force a full re-index.
     #[test]
-    fn sha_set_but_no_symbols_forces_full_reindex() {
+    fn sha_set_but_no_content_forces_full_reindex() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let db_path = dir.path().join("test.lbug");
@@ -6644,9 +6632,10 @@ function hello(name) { return "Hello " + name; }
             "SHA-set-but-empty repo must force a full re-index"
         );
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_row = store.lookup_repo(&r_uid).unwrap().unwrap();
         assert!(
-            store.repo_has_symbols(&r_uid).unwrap(),
-            "full re-index must land symbols for the repo"
+            store.repo_has_content(&repo_row).unwrap(),
+            "full re-index must land content for the repo"
         );
     }
 
@@ -6703,9 +6692,10 @@ function hello(name) { return "Hello " + name; }
             "empty indexed_sha must force a full re-index"
         );
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_row = store.lookup_repo(&r_uid).unwrap().unwrap();
         assert!(
-            store.repo_has_symbols(&r_uid).unwrap(),
-            "full re-index must land symbols for the repo"
+            store.repo_has_content(&repo_row).unwrap(),
+            "full re-index must land content for the repo"
         );
     }
 

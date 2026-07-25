@@ -492,16 +492,31 @@ fn prepare_job(
 
     // 4. Compare against the SHA we last indexed.
     let r_uid = nestweaver_schema::repo_uid(instance_id, &job.repo_url);
-    let indexed_sha = store
-        .lookup_repo(&r_uid)
-        .ok()
-        .flatten()
-        .map(|r| r.indexed_sha)
+    let existing_repo = store.lookup_repo(&r_uid).ok().flatten();
+    let indexed_sha = existing_repo
+        .as_ref()
+        .map(|r| r.indexed_sha.clone())
         .unwrap_or_default();
 
     if remote_sha == indexed_sha {
-        tracing::debug!(repo = job.repo_id, "already up to date");
-        return Ok(None);
+        // Self-heal an incomplete index: the SHA matches but no content ever
+        // landed (crash between the SHA commit and the content write), so the
+        // repo serves an empty graph. Do NOT skip — hand the job to the
+        // commit phase, which routes it to a full re-index.
+        let incomplete = existing_repo
+            .as_ref()
+            .map(|repo| store.repo_index_incomplete(repo))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("repo_index_incomplete: {e}"))?
+            .unwrap_or(false);
+        if !incomplete {
+            tracing::debug!(repo = job.repo_id, "already up to date");
+            return Ok(None);
+        }
+        tracing::warn!(
+            repo = job.repo_id,
+            "indexed SHA matches but repo has no content; preparing healing re-index"
+        );
     }
 
     Ok(Some(PreparedIndexJob {
@@ -683,9 +698,27 @@ where
         .map(|r| r.indexed_sha.as_str())
         .unwrap_or("");
 
-    if prepared.remote_sha == indexed_sha {
+    // Self-heal an incomplete index BEFORE the up-to-date short-circuit: a
+    // crash between the SHA commit and content landing leaves a Repo row
+    // whose indexed_sha matches HEAD with zero content, which compares equal
+    // and would be skipped forever. The probe covers code repos (File nodes)
+    // and server-mode vaults (notes via Vault.name == repo url) alike.
+    let index_incomplete = match existing_repo.as_ref() {
+        Some(repo) => store
+            .repo_index_incomplete(repo)
+            .map_err(|e| anyhow::anyhow!("repo_index_incomplete: {e}"))?,
+        None => false,
+    };
+
+    if prepared.remote_sha == indexed_sha && !index_incomplete {
         tracing::debug!(repo = prepared.repo_id, "already up to date");
         return Ok(ReindexOutcome::Skipped);
+    }
+    if index_incomplete {
+        tracing::warn!(
+            repo = prepared.repo_id,
+            "index is incomplete (SHA set but no content); forcing full re-index"
+        );
     }
 
     // Build a reader over the bare clone at the new SHA.
@@ -737,7 +770,8 @@ where
             Ok(ReindexOutcome::Full)
         }
         RepoType::Code => {
-            let can_incremental = !indexed_sha.is_empty()
+            let can_incremental = !index_incomplete
+                && !indexed_sha.is_empty()
                 && !force_full_reindex
                 && crate::git_diff::is_ancestor(
                     &prepared.bare_path,
@@ -1568,6 +1602,99 @@ mod tests {
         assert!(
             second.is_none(),
             "an unchanged vault must be skipped on the next poll"
+        );
+    }
+
+    /// Crash-between-SHA-and-content self-heal: a Repo row whose indexed_sha
+    /// matches HEAD but owns zero content must NOT take either up-to-date
+    /// short-circuit — prepare_job hands it to the commit phase, which runs a
+    /// FULL re-index and reports that outcome truthfully (so the reindex
+    /// tracker's backstop only resets on work that actually happened).
+    #[test]
+    fn sha_match_but_empty_repo_self_heals_via_full_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("src/lib.rs", "pub fn healed() -> i32 { 1 }\n")]);
+        let url = format!("file://{}", src.display());
+        let head = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&src)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let instance_id = "test-instance";
+
+        // Poison the state: SHA committed, no content ever landed.
+        let r_uid = nestweaver_schema::repo_uid(instance_id, &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: r_uid.clone(),
+                url: url.clone(),
+                indexed_sha: head,
+                staleness_commits_behind: 0,
+                instance_id: instance_id.to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        let job = IndexJob {
+            id: 1,
+            repo_id: "code-repo".to_string(),
+            repo_url: url.clone(),
+            trigger: JobTrigger::Unindexed,
+            priority: 0,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            claimed_by: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        };
+
+        // prepare_job must NOT take the up-to-date skip: the incomplete state
+        // still hands the job to the commit phase.
+        let prepared = prepare_job(&job, &ws, &store, instance_id, None, RepoType::Code)
+            .unwrap()
+            .expect("SHA-match-but-empty repo must still be prepared");
+
+        // The commit phase routes it to the FULL path and reports that
+        // outcome truthfully.
+        let outcome = commit_prepared_job_with_reindex_decision(
+            &prepared,
+            &store,
+            instance_id,
+            false,
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ReindexOutcome::Full,
+            "incomplete index must be rebuilt via the full path"
+        );
+
+        // Content actually landed — the empty graph is healed.
+        let repo = store.lookup_repo(&r_uid).unwrap().unwrap();
+        assert!(
+            store.repo_has_content(&repo).unwrap(),
+            "full re-index must land content for the repo"
+        );
+        assert!(
+            !store.list_files_by_repo(&r_uid).unwrap().is_empty(),
+            "full re-index must write File nodes"
         );
     }
 
