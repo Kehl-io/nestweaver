@@ -23,15 +23,23 @@ backend = "local"
 path = "/data/nestweaver/workspace"
 
 [inference]
-# Embeddings are optional on the server — BM25 + PageRank is the baseline and
-# needs no inference endpoint. To enable semantic search, point this at an
-# Ollama / OpenAI-compatible endpoint and pick models.
+# Required connection settings for commands that request remote embeddings or
+# summaries. [inference] is separate from [embedding] below: it names remote
+# models, while [embedding] controls the local semantic-search model.
 endpoint = "http://localhost:11434"
 embedding_model = "nomic-embed-text"
 summary_model = "qwen2.5-coder:7b"
 
+[embedding]
+# Local semantic-search model and retrieval-fusion weights. This does not
+# configure the remote inference endpoint or its models above.
+model_id = "sentence-transformers/all-MiniLM-L6-v2"
+weight_ppr = 0.40
+weight_bm25 = 0.25
+weight_semantic = 0.35
+
 [git]
-# How the server authenticates to clone/fetch private repos: "ssh" or "token".
+# Credential strategy used when cloning or fetching private repositories.
 credential_method = "ssh"
 
 # [authz] — optional per-repo authorization for Blast Radius (host-agnostic).

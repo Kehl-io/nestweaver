@@ -1113,6 +1113,19 @@ url = "https://github.com/example/repo"
 "#;
 
     #[test]
+    fn shipped_instance_configs_parse() {
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for relative_path in [
+            "examples/minimal-instance.toml",
+            "examples/nestweaver-instance.toml",
+            "instance.toml",
+        ] {
+            InstanceConfig::from_file(&repository_root.join(relative_path))
+                .unwrap_or_else(|err| panic!("{relative_path} must parse: {err}"));
+        }
+    }
+
+    #[test]
     fn shipped_docker_instance_toml_is_valid() {
         // The instance.toml committed at the repo root is mounted by
         // docker-compose. It must parse and validate or the container fails to
