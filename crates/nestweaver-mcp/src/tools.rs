@@ -6669,10 +6669,9 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
         // A repo whose SHA was committed but whose content never landed
         // (interrupted index) compares equal to HEAD yet serves an empty
         // graph — flag it stale so the CI gate catches it.
-        let content_missing = !repo.indexed_sha.is_empty()
-            && !store
-                .repo_has_symbols(&repo.uid)
-                .map_err(|e| anyhow!("repo_has_symbols: {e}"))?;
+        let content_missing = store
+            .repo_index_incomplete(repo)
+            .map_err(|e| anyhow!("repo_index_incomplete: {e}"))?;
         let is_stale = is_stale || content_missing;
 
         if is_stale {
@@ -11621,13 +11620,11 @@ mod stale_check_tool_tests {
         assert_eq!(repo["is_stale"], true, "{result}");
     }
 
-    /// A repo whose SHA was committed but whose symbols never landed
+    /// A repo whose SHA was committed but whose content never landed
     /// (interrupted index) compares equal to HEAD — it must still be flagged
     /// stale (`status: "incomplete"`) so the CI gate catches the empty graph.
     #[test]
     fn stale_check_flags_sha_set_but_empty_repo_as_incomplete() {
-        use nestweaver_schema::{Symbol, Visibility};
-
         let store = GraphStore::in_memory().expect("in_memory store");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().display().to_string();
@@ -11651,31 +11648,76 @@ mod stale_check_tool_tests {
         assert_eq!(repo["status"], "incomplete", "{result}");
         assert_eq!(repo["is_stale"], true, "{result}");
 
-        // Once content lands, the same repo must read healthy again.
+        // Once content lands, the same repo must read healthy again. A File
+        // node is the content marker: the code index writes one for every
+        // parsed file, even files that yield zero symbols.
         store
-            .insert_symbol(&Symbol {
-                uid: "sym:1".to_string(),
-                name: "f".to_string(),
-                kind: SymbolKind::Function,
+            .insert_file(&nestweaver_schema::File {
+                uid: "file:1".to_string(),
+                path: "src/a.rs".to_string(),
                 repo_uid: "repo:empty".to_string(),
-                file_path: "a.rs".to_string(),
-                start_line: 1,
-                end_line: 1,
-                signature: "fn f()".to_string(),
-                summary: None,
                 content_hash: "h".to_string(),
-                embedding: None,
-                pagerank_score: None,
-                is_entry_point: false,
-                entry_point_kind: None,
-                visibility: Visibility::Inferred,
-                type_info: None,
-                framework_hint: None,
-                canonical_id: None,
             })
-            .expect("insert symbol");
+            .expect("insert file");
         let healed = tool_stale_check(&store).expect("stale check");
         assert_eq!(healed["any_stale"], false, "{healed}");
         assert_eq!(healed["repos"][0]["status"], "ok", "{healed}");
+    }
+
+    /// A server-mode vault Repo row carries the SHA while its content lives in
+    /// Note nodes off the Vault (whose `name` equals the repo's `url`). Such a
+    /// healthy vault must NOT be flagged incomplete forever.
+    #[test]
+    fn stale_check_does_not_flag_healthy_vault_repo() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string();
+        let url = format!("file://{root}");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:vault".to_string(),
+                url: url.clone(),
+                // Not a git working tree → SHA comparison alone would call
+                // this healthy; the content probe must agree for vaults too.
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.clone()),
+            })
+            .expect("insert repo");
+        store
+            .upsert_vault(&Vault {
+                uid: "vlt:1".to_string(),
+                name: url.clone(),
+                root_path: root.clone(),
+                instance_id: "test".to_string(),
+            })
+            .expect("upsert vault");
+        store
+            .insert_note(&Note {
+                uid: "note:1".to_string(),
+                vault_uid: "vlt:1".to_string(),
+                file_path: "a.md".to_string(),
+                title: "A".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .expect("insert note");
+        store
+            .insert_vault_note_edge("vlt:1", "note:1")
+            .expect("insert vault note edge");
+
+        let result = tool_stale_check(&store).expect("stale check");
+        assert_eq!(result["any_stale"], false, "{result}");
+        assert_eq!(result["repos"][0]["status"], "ok", "{result}");
     }
 }
