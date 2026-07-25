@@ -1309,6 +1309,24 @@ impl GraphStore {
         Ok(counts)
     }
 
+    /// Returns true when the repo owns at least one Symbol — a cheap
+    /// existence probe (`LIMIT 1`) used to detect repos whose indexed SHA was
+    /// committed but whose content never landed (interrupted index).
+    pub fn repo_has_symbols(&self, repo_uid: &str) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (s:Symbol) WHERE s.repo_uid = $repo RETURN s.uid LIMIT 1";
+        let mut stmt = conn
+            .prepare(q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("repo", Value::String(repo_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        Ok(result.next().is_some())
+    }
+
     /// Returns the dimension of stored embeddings, or 0 if none exist.
     ///
     /// Checks the sidecar `EmbeddingIndex` (the authoritative source since
@@ -2527,5 +2545,48 @@ mod corruption_canary_tests {
             extract_opt_string(&row, 0),
             Err(StoreError::CorruptValue { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod repo_has_symbols_tests {
+    use super::*;
+
+    fn make_symbol(uid: &str, repo_uid: &str) -> Symbol {
+        Symbol {
+            uid: uid.to_string(),
+            name: "f".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: repo_uid.to_string(),
+            file_path: "a.js".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: "function f()".to_string(),
+            summary: None,
+            content_hash: "x".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    #[test]
+    fn empty_repo_has_no_symbols() {
+        let store = GraphStore::in_memory().unwrap();
+        assert!(!store.repo_has_symbols("r:empty").unwrap());
+    }
+
+    #[test]
+    fn repo_with_symbol_is_reported_and_scoped_per_repo() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_symbol(&make_symbol("sym:1", "r:a")).unwrap();
+        assert!(store.repo_has_symbols("r:a").unwrap());
+        // Another repo's symbols must not satisfy the probe.
+        assert!(!store.repo_has_symbols("r:b").unwrap());
     }
 }

@@ -11817,6 +11817,7 @@ fn run_brain(
                             let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
                             let marker = match r["status"].as_str() {
                                 Some("missing") => "missing",
+                                Some("incomplete") => "incomplete",
                                 _ if stale => "STALE",
                                 _ => "ok",
                             };
@@ -11895,6 +11896,13 @@ fn run_brain(
                         None => commits_behind > 0,
                     }
                 };
+                // A repo whose SHA was committed but whose content never
+                // landed (interrupted index) compares equal to HEAD yet
+                // serves an empty graph — flag it stale so the gate catches
+                // it. Mirrors the daemon path's `stale_check` tool.
+                let content_missing = !repo.indexed_sha.is_empty()
+                    && !store.repo_has_symbols(&repo.uid).unwrap_or(false);
+                let is_stale = is_stale || content_missing;
                 if is_stale {
                     any_stale = true;
                 }
@@ -11905,7 +11913,7 @@ fn run_brain(
                     "current_head": current_head,
                     "is_stale": is_stale,
                     "staleness_commits_behind": commits_behind,
-                    "status": if local_missing { "missing" } else if is_stale { "stale" } else { "ok" },
+                    "status": if local_missing { "missing" } else if content_missing { "incomplete" } else if is_stale { "stale" } else { "ok" },
                 }));
             }
 
@@ -11950,6 +11958,7 @@ fn run_brain(
                     let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
                     let marker = match r["status"].as_str() {
                         Some("missing") => "missing",
+                        Some("incomplete") => "incomplete",
                         _ if stale => "STALE",
                         _ => "ok",
                     };

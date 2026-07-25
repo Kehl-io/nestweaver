@@ -898,9 +898,13 @@ where
     // multi-core execution.
     use rayon::prelude::*;
 
+    // Same duty-cycle budget as the code-parse phase (see index.rs).
+    let cpu_throttle = crate::cpu_throttle::CpuThrottle::from_env();
+
     let outcomes: Vec<NoteOutcome> = scanned_notes
         .par_iter()
         .map(|scanned| {
+            cpu_throttle.check();
             let rel_path = scanned.rel_path.to_string_lossy().into_owned();
 
             // Read via ContentReader.

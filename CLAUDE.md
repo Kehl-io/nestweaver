@@ -19,6 +19,10 @@ that owns the LadybugDB write lock. The daemon auto-starts on the first CLI
 invocation and self-terminates after an idle timeout. The client auto-restarts
 the daemon on version mismatch. Shutdown is graceful: the daemon drains active
 write RPCs before exiting (up to `NESTWEAVER_DRAIN_TIMEOUT_SECS`, default 660s).
+Indexing is CPU-throttled to a rolling 5s duty-cycle window so a saturated
+daemon stays under macOS CPU-violation limits; tune with
+`NESTWEAVER_INDEX_CPU_PERCENT` (percent of one core, 1–99, default 50; `0` or
+`>=100` disables throttling).
 
 **The daemon is the sole writer to the DB file.** Never run `sqlite3` or other
 tools against the DB while the daemon is running. The `--no-daemon` flag and

@@ -6666,6 +6666,15 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             }
         };
 
+        // A repo whose SHA was committed but whose content never landed
+        // (interrupted index) compares equal to HEAD yet serves an empty
+        // graph — flag it stale so the CI gate catches it.
+        let content_missing = !repo.indexed_sha.is_empty()
+            && !store
+                .repo_has_symbols(&repo.uid)
+                .map_err(|e| anyhow!("repo_has_symbols: {e}"))?;
+        let is_stale = is_stale || content_missing;
+
         if is_stale {
             any_stale = true;
         }
@@ -6676,7 +6685,7 @@ fn tool_stale_check(store: &GraphStore) -> Result<Value, anyhow::Error> {
             "current_head": current_head,
             "is_stale": is_stale,
             "staleness_commits_behind": commits_behind,
-            "status": if local_missing { "missing" } else if is_stale { "stale" } else { "ok" },
+            "status": if local_missing { "missing" } else if content_missing { "incomplete" } else if is_stale { "stale" } else { "ok" },
         }));
     }
 
@@ -11610,5 +11619,63 @@ mod stale_check_tool_tests {
         let repo = &result["repos"][0];
         assert_eq!(repo["status"], "missing", "{result}");
         assert_eq!(repo["is_stale"], true, "{result}");
+    }
+
+    /// A repo whose SHA was committed but whose symbols never landed
+    /// (interrupted index) compares equal to HEAD — it must still be flagged
+    /// stale (`status: "incomplete"`) so the CI gate catches the empty graph.
+    #[test]
+    fn stale_check_flags_sha_set_but_empty_repo_as_incomplete() {
+        use nestweaver_schema::{Symbol, Visibility};
+
+        let store = GraphStore::in_memory().expect("in_memory store");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:empty".to_string(),
+                url: format!("file://{root}"),
+                // Not a git working tree → HEAD unreadable, commits_behind 0:
+                // the SHA comparison alone would call this repo healthy.
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.clone()),
+            })
+            .expect("insert repo");
+
+        let result = tool_stale_check(&store).expect("stale check");
+        assert_eq!(result["any_stale"], true, "{result}");
+        let repo = &result["repos"][0];
+        assert_eq!(repo["status"], "incomplete", "{result}");
+        assert_eq!(repo["is_stale"], true, "{result}");
+
+        // Once content lands, the same repo must read healthy again.
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:1".to_string(),
+                name: "f".to_string(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:empty".to_string(),
+                file_path: "a.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: "fn f()".to_string(),
+                summary: None,
+                content_hash: "h".to_string(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .expect("insert symbol");
+        let healed = tool_stale_check(&store).expect("stale check");
+        assert_eq!(healed["any_stale"], false, "{healed}");
+        assert_eq!(healed["repos"][0]["status"], "ok", "{healed}");
     }
 }
