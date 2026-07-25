@@ -2,6 +2,7 @@
   "packages": {
     ".": {
       "release-type": "simple",
+      "draft-pull-request": true,
       "component": "nestweaver",
       "include-component-in-tag": false,
       "bump-minor-pre-major": true,
