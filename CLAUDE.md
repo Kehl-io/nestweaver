@@ -22,7 +22,10 @@ write RPCs before exiting (up to `NESTWEAVER_DRAIN_TIMEOUT_SECS`, default 660s).
 Indexing is CPU-throttled to a rolling 5s duty-cycle window so a saturated
 daemon stays under macOS CPU-violation limits; tune with
 `NESTWEAVER_INDEX_CPU_PERCENT` (percent of one core, 1–99, default 50; `0` or
-`>=100` disables throttling).
+`>=100` disables throttling). The var reaches the daemon two ways: from the
+shell env for directly-spawned daemons, or baked into the launchd plist's
+`EnvironmentVariables` at `daemon start` time (launchd jobs don't inherit the
+shell env — re-run `daemon start` after changing it).
 
 **The daemon is the sole writer to the DB file.** Never run `sqlite3` or other
 tools against the DB while the daemon is running. The `--no-daemon` flag and

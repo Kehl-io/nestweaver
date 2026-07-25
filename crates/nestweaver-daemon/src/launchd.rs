@@ -193,11 +193,23 @@ pub fn generate_plist(
     binary_path: &Path,
     db_path: &Path,
     log_path: &Path,
+    index_cpu_percent: Option<&str>,
 ) -> String {
     let label = lifecycle::launchd_label(instance_id);
     let binary = binary_path.display();
     let db = db_path.display();
     let log = log_path.display();
+
+    // launchd jobs don't inherit the invoking shell's environment, so the
+    // index CPU-throttle knob is baked into the plist when it was set (and
+    // validated) at install time. Value is validated numeric by the caller.
+    let env_block = match index_cpu_percent {
+        Some(v) => format!(
+            "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>NESTWEAVER_INDEX_CPU_PERCENT</key>\n        <string>{}</string>\n    </dict>\n",
+            v.trim()
+        ),
+        None => String::new(),
+    };
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -229,7 +241,7 @@ pub fn generate_plist(
     <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
-</dict>
+{env_block}</dict>
 </plist>
 "#
     )
@@ -260,12 +272,7 @@ pub fn install_and_start(instance_id: &str, plist_content: &str) -> Result<()> {
     // If the label is already bootstrapped, bootout first: bootstrap of an
     // already-loaded label is a no-op, so without this an updated plist (new
     // keys, changed paths) would never take effect on existing installs.
-    let already_bootstrapped = Command::new("launchctl")
-        .args(["print", &format!("gui/{uid}/{label}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if already_bootstrapped {
+    if is_running(instance_id) {
         let bootout = Command::new("launchctl")
             .args(["bootout", &format!("gui/{uid}/{label}")])
             .output()
@@ -345,6 +352,7 @@ mod tests {
             Path::new("/usr/local/bin/nestweaver"),
             Path::new("/Users/k/dev/repo/brain.lbug"),
             Path::new("/tmp/log"),
+            None,
         );
         assert_eq!(
             parse_db_path_from_plist(&plist),
@@ -360,14 +368,16 @@ mod tests {
             Path::new("/usr/local/bin/nestweaver"),
             Path::new("/Users/k/dev/repo/brain.lbug"),
             Path::new("/tmp/log"),
+            None,
         );
         // Top-level LowPriorityIO demotes the daemon's disk I/O.
         assert!(
             plist.contains("<key>LowPriorityIO</key>\n    <true/>"),
             "{plist}"
         );
-        // Top-level ThrottleInterval damps tight respawn loops after
-        // repeated crashes (launchd.plist(5) documents it as a top-level key).
+        // Top-level ThrottleInterval pins launchd's default 10s respawn
+        // delay explicitly (it equals the default; writing it makes the
+        // value deliberate rather than inherited).
         assert!(
             plist.contains("<key>ThrottleInterval</key>\n    <integer>10</integer>"),
             "{plist}"
@@ -376,6 +386,30 @@ mod tests {
         assert!(
             plist.contains("<key>ProcessType</key>\n    <string>Interactive</string>"),
             "{plist}"
+        );
+        // No EnvironmentVariables block without the CPU knob.
+        assert!(!plist.contains("EnvironmentVariables"), "{plist}");
+    }
+
+    #[test]
+    fn plist_bakes_cpu_percent_into_environment_variables() {
+        let plist = generate_plist(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            Some("45"),
+        );
+        assert!(
+            plist.contains(
+                "<key>EnvironmentVariables</key>\n    <dict>\n        <key>NESTWEAVER_INDEX_CPU_PERCENT</key>\n        <string>45</string>\n    </dict>"
+            ),
+            "{plist}"
+        );
+        // Still parses back to the same db path with the env block present.
+        assert_eq!(
+            parse_db_path_from_plist(&plist),
+            Some(PathBuf::from("/Users/k/dev/repo/brain.lbug"))
         );
     }
 
