@@ -43,6 +43,143 @@ fn cli_help_lists_commands() {
 }
 
 #[test]
+fn config_validate_accepts_minimal_fixture() {
+    let config_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/minimal-instance.toml");
+    let output = nestweaver_cmd()
+        .args(["config", "validate"])
+        .arg(&config_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["valid"], true);
+    assert_eq!(result["path"], config_path.display().to_string());
+    assert_eq!(result["instance_id"], "minimal-example");
+    assert_eq!(result["repo_count"], 0);
+}
+
+#[test]
+fn config_validate_rejects_obsolete_instance_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("obsolete-instance.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[instance]
+name = "obsolete-example"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nestweaver/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nestweaver/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[[repos]]
+path = "/tmp/nestweaver/repo"
+"#,
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .args(["config", "validate"])
+        .arg(&config_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(result["valid"], false);
+    assert_eq!(result["path"], config_path.display().to_string());
+    let error = result["error"].as_str().unwrap();
+    assert!(error.contains("[instance]"), "error: {error}");
+    assert!(error.contains("instance_id"), "error: {error}");
+    assert!(error.contains("[[repos]]"), "error: {error}");
+    assert!(error.contains("url"), "error: {error}");
+    assert!(error.contains("path"), "error: {error}");
+}
+
+#[test]
+fn config_validate_has_no_filesystem_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("instance.toml");
+    let db_path = dir.path().join("graph.lbug");
+    let snapshot_path = dir.path().join("snapshots");
+    let workspace_path = dir.path().join("workspace");
+    let missing_repo = dir.path().join("missing-repo");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "side-effect-check"
+db = "{}"
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[[repos]]
+url = "{}"
+"#,
+            toml_basic_string(&db_path),
+            toml_basic_string(&snapshot_path),
+            toml_basic_string(&workspace_path),
+            toml_basic_string(&missing_repo),
+        ),
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["config", "validate"])
+        .arg(&config_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut entries = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(entries, vec![std::ffi::OsString::from("instance.toml")]);
+}
+
+#[test]
 fn standalone_suggest_links_reads_canonical_manifest_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("brain.lbug");

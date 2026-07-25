@@ -750,6 +750,41 @@ pub fn validate_instance_id(instance_id: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn reject_obsolete_instance_shape(s: &str) -> Result<(), anyhow::Error> {
+    let document: toml::Value = toml::from_str(s)?;
+    let Some(table) = document.as_table() else {
+        return Ok(());
+    };
+
+    let mut issues = Vec::new();
+    if table.contains_key("instance") {
+        issues.push(
+            "obsolete [instance] table; replace `[instance] name = \"...\"` with the \
+             top-level `instance_id = \"...\"` field",
+        );
+    }
+    let repo_uses_path = table
+        .get("repos")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|repos| {
+            repos.iter().any(|repo| {
+                repo.as_table()
+                    .is_some_and(|repo| repo.contains_key("path"))
+            })
+        });
+    if repo_uses_path {
+        issues.push("obsolete `[[repos]].path`; each `[[repos]]` entry requires `url = \"...\"`");
+    }
+
+    if !issues.is_empty() {
+        anyhow::bail!(
+            "unsupported instance configuration shape: {}",
+            issues.join("; ")
+        );
+    }
+    Ok(())
+}
+
 impl InstanceConfig {
     /// The DB path declared by this instance, if any.
     pub fn db_path(&self) -> Option<std::path::PathBuf> {
@@ -758,6 +793,7 @@ impl InstanceConfig {
 
     /// Parse an `InstanceConfig` from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, anyhow::Error> {
+        reject_obsolete_instance_shape(s)?;
         let mut config: Self = toml::from_str(s)?;
         // nw-052: reject an instance_id containing a colon (or other uid
         // delimiters) up front — it flows into `repo:<instance>:<hash>` /

@@ -1630,6 +1630,11 @@ enum Commands {
         #[command(subcommand)]
         action: ServerAction,
     },
+    /// Validate NestWeaver configuration files
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Show hardware and configuration information
     Info {
         /// Show hardware acceleration details
@@ -2604,6 +2609,18 @@ enum InstanceCommands {
         /// Discard a graph-applied journal too (the graph mutation stays).
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Validate an instance config without creating files or contacting services
+    Validate {
+        /// Path to the instance config file (.toml)
+        path: PathBuf,
+        /// Output a machine-readable validation result
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -5920,6 +5937,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
+        Commands::Config { command } => run_config(command),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
         Commands::RtsEval { command } => run_rts_eval(command),
         Commands::StaleCheck { json, db } => run_brain(
@@ -14947,6 +14965,46 @@ fn run_contracts(
                 EXIT_SUCCESS
             };
             Ok((exit, None))
+        }
+    }
+}
+
+fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        ConfigCommands::Validate { path, json } => {
+            match nestweaver_engine::InstanceConfig::from_file(&path) {
+                Ok(config) => {
+                    if json {
+                        let result = serde_json::json!({
+                            "valid": true,
+                            "path": path.display().to_string(),
+                            "instance_id": config.instance_id,
+                            "repo_count": config.repos.len(),
+                        });
+                        println!("{}", serde_json::to_string(&result)?);
+                    } else {
+                        println!(
+                            "Valid instance config: {} (instance_id: {}, repos: {})",
+                            path.display(),
+                            config.instance_id,
+                            config.repos.len()
+                        );
+                    }
+                    Ok((EXIT_SUCCESS, None))
+                }
+                Err(error) if json => {
+                    let message = format!("validate instance config {}: {error:#}", path.display());
+                    let result = serde_json::json!({
+                        "valid": false,
+                        "path": path.display().to_string(),
+                        "error": message,
+                    });
+                    eprintln!("{}", serde_json::to_string(&result)?);
+                    Ok((EXIT_ERROR, None))
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("validate instance config {}", path.display())),
+            }
         }
     }
 }
