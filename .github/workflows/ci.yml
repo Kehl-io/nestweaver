@@ -55,6 +55,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    env:
+      # Test binaries with full debug info exhaust the GitHub-hosted runner's
+      # disk once the entire workspace is compiled. Backtraces still retain
+      # symbol names while keeping target/ small enough for the full suite.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Free disk space
         run: |
@@ -92,19 +98,17 @@ jobs:
             target/**/build/openssl-sys-*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
-      - name: Build (triggers lbug prebuilt download on first run)
-        # --locked: fail the PR (not the release build) when Cargo.lock drifts
-        # out of sync with the manifests.
+      - name: Validate lockfile and warm native dependencies
         run: |
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build --locked --tests
       - name: Tests
         # --workspace is REQUIRED: the root manifest is both [package] and
         # [workspace], so `cargo test` without it runs ONLY the root package's
         # tests and silently skips every sub-crate's unit tests (engine, store,
         # federation, mcp, …) — where most of the logic lives.
-        run: cargo test --workspace --no-fail-fast -- --skip daemon_
+        run: cargo test --locked --workspace --no-fail-fast -- --skip daemon_
         env:
           NESTWEAVER_NO_DAEMON: "1"
 
@@ -161,6 +165,8 @@ jobs:
       # Shared CI runners are slower than a dev box; give the test server
       # startup deadline (tests/helpers/server_guard.rs) extra headroom.
       NESTWEAVER_TEST_SERVER_TIMEOUT_SECS: "60"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Free disk space
         run: |
@@ -196,23 +202,21 @@ jobs:
             target/**/build/openssl-sys-*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
-      - name: Build (triggers lbug prebuilt download on first run)
-        # --locked: fail the PR (not the release build) when Cargo.lock drifts
-        # out of sync with the manifests.
+      - name: Validate lockfile and warm native dependencies
         run: |
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build --locked --tests
       - name: Daemon-named tests (skipped in the main job)
         # The main job's `--skip daemon_` keeps these out of the flaky-prone
         # parallel run; they run here instead so daemon integration coverage
         # (authz boundary, migration self-heal, daemon proxy, …) is not lost.
         # The `daemon_` filter is the exact complement of the main job's skip.
-        run: cargo test --workspace --no-fail-fast -- daemon_
+        run: cargo test --locked --workspace --no-fail-fast -- daemon_
       - name: MCP daemon-feature tests
         # `cargo test --workspace` builds nestweaver-mcp without its optional
         # `daemon` feature, so these tests never run in the main job.
-        run: cargo test -p nestweaver-mcp --features daemon --no-fail-fast
+        run: cargo test --locked -p nestweaver-mcp --features daemon --no-fail-fast
 
   coverage:
     name: Coverage

@@ -33,19 +33,26 @@ jobs:
       - name: Synchronize release lockfile
         if: steps.release.outputs.prs_created == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_PR: ${{ steps.release.outputs.pr }}
         run: |
+          set -euo pipefail
+
+          RELEASE_PR_NUMBER="$(jq -er '.number' <<< "$RELEASE_PR")"
           RELEASE_PR_BRANCH="$(jq -er '.headBranchName' <<< "$RELEASE_PR")"
           cargo update --workspace
-          if git diff --quiet -- Cargo.lock; then
-            exit 0
+
+          if ! git diff --quiet -- Cargo.lock; then
+            git add Cargo.lock
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: synchronize Cargo.lock for release"
+            git push origin "HEAD:$RELEASE_PR_BRANCH"
           fi
 
-          git add Cargo.lock
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: synchronize Cargo.lock for release"
-          git push origin "HEAD:$RELEASE_PR_BRANCH"
+          if [ "$(gh pr view "$RELEASE_PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "true" ]; then
+            gh pr ready "$RELEASE_PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+          fi
 
   build:
     name: Build ${{ matrix.target }}
