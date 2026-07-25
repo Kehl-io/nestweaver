@@ -223,6 +223,10 @@ pub fn generate_plist(
         <key>Crashed</key>
         <true/>
     </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
 </dict>
@@ -252,6 +256,28 @@ pub fn install_and_start(instance_id: &str, plist_content: &str) -> Result<()> {
     let _ = Command::new("launchctl")
         .args(["enable", &format!("gui/{uid}/{label}")])
         .output();
+
+    // If the label is already bootstrapped, bootout first: bootstrap of an
+    // already-loaded label is a no-op, so without this an updated plist (new
+    // keys, changed paths) would never take effect on existing installs.
+    let already_bootstrapped = Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{label}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if already_bootstrapped {
+        let bootout = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{label}")])
+            .output()
+            .context("failed to run launchctl bootout")?;
+        if !bootout.status.success() {
+            let stderr = String::from_utf8_lossy(&bootout.stderr);
+            // Tolerate the job vanishing between the print probe and bootout.
+            if !stderr.contains("No such process") && !stderr.contains("Could not find service") {
+                anyhow::bail!("launchctl bootout failed: {stderr}");
+            }
+        }
+    }
 
     let output = Command::new("launchctl")
         .args([
@@ -325,6 +351,32 @@ mod tests {
             Some(PathBuf::from("/Users/k/dev/repo/brain.lbug"))
         );
         assert_eq!(parse_db_path_from_plist("<plist></plist>"), None);
+    }
+
+    #[test]
+    fn plist_renders_low_priority_io_and_throttle_interval() {
+        let plist = generate_plist(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+        );
+        // Top-level LowPriorityIO demotes the daemon's disk I/O.
+        assert!(
+            plist.contains("<key>LowPriorityIO</key>\n    <true/>"),
+            "{plist}"
+        );
+        // Top-level ThrottleInterval damps tight respawn loops after
+        // repeated crashes (launchd.plist(5) documents it as a top-level key).
+        assert!(
+            plist.contains("<key>ThrottleInterval</key>\n    <integer>10</integer>"),
+            "{plist}"
+        );
+        // ProcessType must stay Interactive (Background would throttle harder).
+        assert!(
+            plist.contains("<key>ProcessType</key>\n    <string>Interactive</string>"),
+            "{plist}"
+        );
     }
 
     #[test]
