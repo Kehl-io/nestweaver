@@ -51,7 +51,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   build-and-check:
-    name: Build, Clippy & Tests
+    name: Build & Tests
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -69,18 +69,36 @@ jobs:
           cache-on-failure: true
           shared-key: build
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Build (triggers lbug prebuilt download on first run)
+          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+      - name: Compute native dependency cache key
+        id: nativekey
         run: |
-          cargo build -p nestweaver-store 2>/dev/null || true
+          LBUG_VER=$(awk '/^name = "lbug"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          OSSL_VER=$(awk '/^name = "openssl-sys"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          RUSTC_VER=$(rustc --version | awk '{print $2}')
+          echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache native build outputs (lbug C++, OpenSSL)
+        # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
+        # cold-build time. Keyed on their package versions (not Cargo.lock as a
+        # whole) so they survive release-please lockfile churn.
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/**/build/lbug-*/out
+            target/**/build/openssl-sys-*/out
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
+          restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build (triggers lbug prebuilt download on first run)
+        # --locked: fail the PR (not the release build) when Cargo.lock drifts
+        # out of sync with the manifests.
+        run: |
+          cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build --tests
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+          cargo build --locked --tests
       - name: Tests
         # --workspace is REQUIRED: the root manifest is both [package] and
         # [workspace], so `cargo test` without it runs ONLY the root package's
@@ -89,6 +107,50 @@ jobs:
         run: cargo test --workspace --no-fail-fast -- --skip daemon_
         env:
           NESTWEAVER_NO_DAEMON: "1"
+
+  clippy:
+    name: Clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: build
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+      - name: Configure linker for lbug+tantivy zstd coexistence
+        run: |
+          mkdir -p .cargo
+          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+      - name: Compute native dependency cache key
+        id: nativekey
+        run: |
+          LBUG_VER=$(awk '/^name = "lbug"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          OSSL_VER=$(awk '/^name = "openssl-sys"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          RUSTC_VER=$(rustc --version | awk '{print $2}')
+          echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache native build outputs (lbug C++, OpenSSL)
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/**/build/lbug-*/out
+            target/**/build/openssl-sys-*/out
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
+          restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
+      # Parallel with Build & Tests: when the shared rust cache is warm this
+      # finishes in minutes instead of adding ~20 min serial to the build job.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   daemon-tests:
     name: Daemon Integration Tests
@@ -111,16 +173,36 @@ jobs:
           cache-on-failure: true
           shared-key: build
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Build (triggers lbug prebuilt download on first run)
+          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+      - name: Compute native dependency cache key
+        id: nativekey
         run: |
-          cargo build -p nestweaver-store 2>/dev/null || true
+          LBUG_VER=$(awk '/^name = "lbug"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          OSSL_VER=$(awk '/^name = "openssl-sys"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          RUSTC_VER=$(rustc --version | awk '{print $2}')
+          echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache native build outputs (lbug C++, OpenSSL)
+        # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
+        # cold-build time. Keyed on their package versions (not Cargo.lock as a
+        # whole) so they survive release-please lockfile churn.
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/**/build/lbug-*/out
+            target/**/build/openssl-sys-*/out
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
+          restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build (triggers lbug prebuilt download on first run)
+        # --locked: fail the PR (not the release build) when Cargo.lock drifts
+        # out of sync with the manifests.
+        run: |
+          cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build --tests
+          cargo build --locked --tests
       - name: Daemon-named tests (skipped in the main job)
         # The main job's `--skip daemon_` keeps these out of the flaky-prone
         # parallel run; they run here instead so daemon integration coverage
@@ -157,16 +239,36 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
-      - name: Build (triggers lbug prebuilt download on first run)
+          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+      - name: Compute native dependency cache key
+        id: nativekey
         run: |
-          cargo build -p nestweaver-store 2>/dev/null || true
+          LBUG_VER=$(awk '/^name = "lbug"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          OSSL_VER=$(awk '/^name = "openssl-sys"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          RUSTC_VER=$(rustc --version | awk '{print $2}')
+          echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache native build outputs (lbug C++, OpenSSL)
+        # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
+        # cold-build time. Keyed on their package versions (not Cargo.lock as a
+        # whole) so they survive release-please lockfile churn.
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/**/build/lbug-*/out
+            target/**/build/openssl-sys-*/out
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
+          restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build (triggers lbug prebuilt download on first run)
+        # --locked: fail the PR (not the release build) when Cargo.lock drifts
+        # out of sync with the manifests.
+        run: |
+          cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
-          cargo build --tests
+          cargo build --locked --tests
       - name: Generate coverage
         # --workspace so coverage reflects the whole codebase, not just the root
         # package (see the Tests step note on the [package]+[workspace] manifest).
@@ -221,14 +323,32 @@ jobs:
           cache: "npm"
           cache-dependency-path: crates/nestweaver-web/frontend/package-lock.json
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
           mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]\n' > .cargo/config.toml
+          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
       - name: Install frontend dependencies
         working-directory: crates/nestweaver-web/frontend
         run: npm ci
+      - name: Compute native dependency cache key
+        id: nativekey
+        run: |
+          LBUG_VER=$(awk '/^name = "lbug"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          OSSL_VER=$(awk '/^name = "openssl-sys"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          RUSTC_VER=$(rustc --version | awk '{print $2}')
+          echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache native build outputs (lbug C++, OpenSSL)
+        # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
+        # cold-build time. Keyed on their package versions (not Cargo.lock as a
+        # whole) so they survive release-please lockfile churn.
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/**/build/lbug-*/out
+            target/**/build/openssl-sys-*/out
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
+          restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
       - name: Build (triggers lbug prebuilt download on first run)
         run: |
           cargo build -p nestweaver-store 2>/dev/null || true

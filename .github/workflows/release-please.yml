@@ -93,7 +93,7 @@ jobs:
           cache-on-failure: true
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
@@ -116,10 +116,10 @@ jobs:
           mkdir -p .cargo
           cat > .cargo/config.toml << 'EOF'
           [target.x86_64-unknown-linux-gnu]
-          rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+          rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]
 
           [target.aarch64-unknown-linux-gnu]
-          rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+          rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]
           EOF
       - uses: actions/setup-node@v7
         with:
@@ -129,6 +129,25 @@ jobs:
       - name: Build frontend
         run: npm ci && npm run build
         working-directory: crates/nestweaver-web/frontend
+      - name: Compute native dependency cache key
+        id: nativekey
+        shell: bash
+        run: |
+          LBUG_VER=$(awk '/^name = "lbug"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          OSSL_VER=$(awk '/^name = "openssl-sys"$/{getline; print $3}' Cargo.lock | tr -d '"')
+          RUSTC_VER=$(rustc --version | awk '{print $2}')
+          echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache native build outputs (lbug C++, OpenSSL)
+        # Keyed on package versions (not Cargo.lock) so the cache survives
+        # release lockfile churn; per-target since the build matrix crosses
+        # os/arch.
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/**/build/lbug-*/out
+            target/**/build/openssl-sys-*/out
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ steps.nativekey.outputs.key }}
+          restore-keys: native-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
       - name: Build target OpenSSL
         shell: bash
         run: |
