@@ -40,6 +40,22 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [2.6.1](https://github.com/Kehl-io/nestweaver/compare/v2.6.0...v2.6.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **daemon:** bake NESTWEAVER_INDEX_CPU_PERCENT into the launchd plist ([906b1ae](https://github.com/Kehl-io/nestweaver/commit/906b1ae186fe9923bec699be71a997e1337d203c))
+* **daemon:** reload launchd plist on install; add LowPriorityIO and ThrottleInterval ([c711a05](https://github.com/Kehl-io/nestweaver/commit/c711a050a4056b076cab35ad32903780c10de55d))
+* **engine:** self-heal incomplete index on the server worker path ([8eb8854](https://github.com/Kehl-io/nestweaver/commit/8eb8854a95b9c68451720e90bd8f297a5580a9ab))
+* **engine:** survive and self-heal mid-index process kills ([764f587](https://github.com/Kehl-io/nestweaver/commit/764f58759c7b135cf7160973f6d7c2d96d439b59))
+* **engine:** survive and self-heal mid-index process kills ([5ae091a](https://github.com/Kehl-io/nestweaver/commit/5ae091a1ea68d8c2bfec01bf0303b3f7a4172683))
+* **mcp:** drop anyOf from tool schemas so strict providers accept them ([9205501](https://github.com/Kehl-io/nestweaver/commit/9205501ac91aebce809d602626575f9ee7ac7abc))
+* **mcp:** drop anyOf from tool schemas, keep root "type": "object" ([c2e7810](https://github.com/Kehl-io/nestweaver/commit/c2e7810c6d8bc5631972ba20402427eba092feb0))
+* **mcp:** move "type": "object" into anyOf items in tool schemas ([d2bdba3](https://github.com/Kehl-io/nestweaver/commit/d2bdba36a81a0848e1b726f34b38621e3bab0cc3))
+* share the incomplete-index probe across stale-check paths ([ca2e54b](https://github.com/Kehl-io/nestweaver/commit/ca2e54b846ce56b770ee16d0d1c1c5211c2934cb))
+* **store:** probe repo content across File and vault Note nodes ([f855313](https://github.com/Kehl-io/nestweaver/commit/f8553134183a71a86c138927d60deafa0befe39b))
+
 ## [2.6.0](https://github.com/Kehl-io/nestweaver/compare/v2.5.11...v2.6.0) (2026-07-24)
 
 
