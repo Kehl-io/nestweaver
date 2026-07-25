@@ -40,6 +40,15 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [2.6.3](https://github.com/Kehl-io/nestweaver/compare/v2.6.2...v2.6.3) (2026-07-25)
+
+
+### Bug Fixes
+
+* **ci:** gate releases on lockfile synchronization ([b3b863c](https://github.com/Kehl-io/nestweaver/commit/b3b863c0bce34cf689138b47d6a1bb4748965949))
+* **ci:** gate releases on lockfile synchronization ([6b5cda6](https://github.com/Kehl-io/nestweaver/commit/6b5cda6f24546c1c1ba755545445aa656a283a06))
+* **ci:** keep test artifacts within runner disk ([1f75f5c](https://github.com/Kehl-io/nestweaver/commit/1f75f5c6569c9cc80ad8bf109dd5d5566c3bc240))
+
 ## [2.6.2](https://github.com/Kehl-io/nestweaver/compare/v2.6.1...v2.6.2) (2026-07-25)
 
 
