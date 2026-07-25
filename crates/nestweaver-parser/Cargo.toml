@@ -18,7 +18,10 @@ tree-sitter-cpp = "0.23"
 tree-sitter-rust = "0.24"
 tree-sitter-c = "0.24"
 tree-sitter-c-sharp = "0.23"
-tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", branch = "main" }
+# Pinned to an exact rev: branch-pinned git deps drift and break `cargo build
+# --locked` in the release workflow on fresh runners (cargo refuses to update
+# the lock). Bump deliberately when a grammar update is needed.
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "c8ac3d2627240160b999a2c100de3babbdb8f419" }
 tree-sitter-php = "0.24"
 tree-sitter-ruby = "0.23"
 tree-sitter-swift = "0.7"
