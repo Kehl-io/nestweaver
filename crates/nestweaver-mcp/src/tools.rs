@@ -2001,7 +2001,7 @@ fn tool_schema_read_symbols() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "minItems": 1,
-                    "description": "Symbol UIDs (sym:...), names, or FQNs to read."
+                    "description": "Symbol UIDs (sym:...), names, or FQNs to read. One of 'targets' or 'uids_or_fqns' is required."
                 },
                 "uids_or_fqns": {
                     "type": "array",
@@ -2024,10 +2024,6 @@ fn tool_schema_read_symbols() -> Value {
                     "description": "Repository root for resolving file paths (default: server working directory)."
                 }
             },
-            "anyOf": [
-                { "required": ["targets"] },
-                { "required": ["uids_or_fqns"] }
-            ],
             "additionalProperties": false
         }
     })
@@ -2110,7 +2106,7 @@ fn tool_schema_regex_search() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\"." },
+                "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\". One of 'pattern' or 'query' is required." },
                 "query": { "type": "string", "description": "Backward-compatible alias for pattern." },
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
@@ -2123,10 +2119,6 @@ fn tool_schema_regex_search() -> Value {
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
             },
-            "anyOf": [
-                { "required": ["pattern"] },
-                { "required": ["query"] }
-            ],
             "additionalProperties": false
         }
     })
@@ -6238,7 +6230,7 @@ fn tool_schema_detect_changes() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "minItems": 1,
-                    "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]."
+                    "description": "List of changed file paths (repo-relative). Example: [\"src/auth/login.ts\", \"src/utils/validate.ts\"]. One of 'changed_files' or 'files' is required."
                 },
                 "files": {
                     "type": "array",
@@ -6246,11 +6238,7 @@ fn tool_schema_detect_changes() -> Value {
                     "minItems": 1,
                     "description": "Backward-compatible alias for changed_files."
                 }
-            },
-            "anyOf": [
-                { "required": ["changed_files"] },
-                { "required": ["files"] }
-            ]
+            }
         }
     })
 }
