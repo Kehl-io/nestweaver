@@ -1309,6 +1309,65 @@ impl GraphStore {
         Ok(counts)
     }
 
+    /// Returns true when the repo has any indexed content — an existence
+    /// probe (`LIMIT 1`) used to detect repos whose indexed SHA was committed
+    /// but whose content never landed (interrupted index).
+    ///
+    /// Two legs, matching what each index path writes:
+    /// - Code index: `File` nodes keyed by `repo_uid` are written for EVERY
+    ///   parsed file regardless of symbol count (`index.rs`), so a healthy
+    ///   code repo — even one whose files yield zero symbols — always has
+    ///   File rows; a crash before content landed has none.
+    /// - Server-mode vault index: writes only Note/Section/Heading nodes
+    ///   (linked `Vault -[:VAULT_HAS_NOTE]-> Note`; notes carry `vault_uid`,
+    ///   no `repo_uid`) and records the SHA on a Repo row whose `url` equals
+    ///   the Vault's `name` — both are the job's repo URL (`vault_name` in
+    ///   `index_md.rs`). The name is matched with and without a trailing
+    ///   slash: the Repo row stores the trimmed URL while `Vault.name` keeps
+    ///   it verbatim.
+    pub fn repo_has_content(&self, repo: &Repo) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        // Leg 1: code content.
+        let mut stmt = conn
+            .prepare("MATCH (f:File) WHERE f.repo_uid = $repo RETURN f.uid LIMIT 1")
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(&mut stmt, vec![("repo", Value::String(repo.uid.clone()))])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        if result.next().is_some() {
+            return Ok(true);
+        }
+        // Leg 2: vault content (server-mode vault Repo rows).
+        let trimmed = repo.url.trim_end_matches('/');
+        let mut stmt = conn
+            .prepare(
+                "MATCH (v:Vault)-[:VAULT_HAS_NOTE]->(n:Note) \
+                 WHERE v.instance_id = $inst AND (v.name = $url OR v.name = $url_slash) \
+                 RETURN n.uid LIMIT 1",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![
+                    ("inst", Value::String(repo.instance_id.clone())),
+                    ("url", Value::String(trimmed.to_string())),
+                    ("url_slash", Value::String(format!("{trimmed}/"))),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        Ok(result.next().is_some())
+    }
+
+    /// True when the repo's indexed SHA was committed but no content ever
+    /// landed (interrupted index) — the state the incremental self-heal and
+    /// stale-check must flag. Shared so both stale-check call sites cannot
+    /// drift on the predicate; errors propagate (a CI gate that cannot
+    /// answer must fail, not silently pass).
+    pub fn repo_index_incomplete(&self, repo: &Repo) -> Result<bool, StoreError> {
+        Ok(!repo.indexed_sha.is_empty() && !self.repo_has_content(repo)?)
+    }
+
     /// Returns the dimension of stored embeddings, or 0 if none exist.
     ///
     /// Checks the sidecar `EmbeddingIndex` (the authoritative source since
@@ -2527,5 +2586,143 @@ mod corruption_canary_tests {
             extract_opt_string(&row, 0),
             Err(StoreError::CorruptValue { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod repo_has_content_tests {
+    use super::*;
+    use nestweaver_schema::{File, Note, NoteKind, Vault};
+
+    fn make_repo(uid: &str, url: &str, sha: &str) -> Repo {
+        Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: sha.to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: None,
+        }
+    }
+
+    fn insert_code_file(store: &GraphStore, repo_uid: &str, path: &str) {
+        store
+            .insert_file(&File {
+                uid: format!("file:{repo_uid}:{path}"),
+                path: path.to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "h".to_string(),
+            })
+            .unwrap();
+    }
+
+    fn insert_vault_with_note(store: &GraphStore, vault_uid: &str, name: &str) {
+        store
+            .upsert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: name.to_string(),
+                root_path: format!("/bare/{name}"),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let n_uid = format!("note:{vault_uid}:a");
+        store
+            .insert_note(&Note {
+                uid: n_uid.clone(),
+                vault_uid: vault_uid.to_string(),
+                file_path: "a.md".to_string(),
+                title: "A".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store.insert_vault_note_edge(vault_uid, &n_uid).unwrap();
+    }
+
+    #[test]
+    fn empty_repo_has_no_content() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo = make_repo("repo:r", "https://example.com/r", "abc");
+        assert!(!store.repo_has_content(&repo).unwrap());
+    }
+
+    #[test]
+    fn code_repo_with_file_but_zero_symbols_has_content() {
+        let store = GraphStore::in_memory().unwrap();
+        insert_code_file(&store, "repo:r", "src/empty.js");
+        // A repo whose parsed files yielded no symbols is still healthy:
+        // File nodes are written for every parsed file.
+        assert!(
+            store
+                .repo_has_content(&make_repo("repo:r", "https://example.com/r", "abc"))
+                .unwrap()
+        );
+        // Per-repo scoping: another repo's files must not satisfy the probe.
+        assert!(
+            !store
+                .repo_has_content(&make_repo("repo:other", "https://example.com/other", "abc"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn server_vault_repo_has_content_via_vault_name_match() {
+        let store = GraphStore::in_memory().unwrap();
+        // Server-mode vault: Repo.url == Vault.name (both the job's repo URL).
+        insert_vault_with_note(&store, "vlt:test:1", "https://example.com/notes");
+        assert!(
+            store
+                .repo_has_content(&make_repo("repo:vault", "https://example.com/notes", "abc"))
+                .unwrap()
+        );
+        // The Repo row stores the trimmed URL while Vault.name may keep the
+        // trailing slash — both spellings must match.
+        insert_vault_with_note(&store, "vlt:test:2", "https://example.com/slash/");
+        assert!(
+            store
+                .repo_has_content(&make_repo(
+                    "repo:slash",
+                    "https://example.com/slash/",
+                    "abc"
+                ))
+                .unwrap()
+        );
+        // A different repo url must not match the vault.
+        assert!(
+            !store
+                .repo_has_content(&make_repo("repo:other", "https://example.com/other", "abc"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn index_incomplete_requires_sha_and_no_content() {
+        let store = GraphStore::in_memory().unwrap();
+        // No SHA yet → not "incomplete" (nothing committed to contradict).
+        assert!(
+            !store
+                .repo_index_incomplete(&make_repo("repo:r", "https://example.com/r", ""))
+                .unwrap()
+        );
+        // SHA committed, no content → incomplete.
+        assert!(
+            store
+                .repo_index_incomplete(&make_repo("repo:r", "https://example.com/r", "abc"))
+                .unwrap()
+        );
+        // SHA committed and content landed → complete.
+        insert_code_file(&store, "repo:r", "src/a.js");
+        assert!(
+            !store
+                .repo_index_incomplete(&make_repo("repo:r", "https://example.com/r", "abc"))
+                .unwrap()
+        );
     }
 }

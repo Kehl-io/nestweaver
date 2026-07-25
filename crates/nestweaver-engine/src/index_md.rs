@@ -898,189 +898,193 @@ where
     // multi-core execution.
     use rayon::prelude::*;
 
-    let outcomes: Vec<NoteOutcome> = scanned_notes
-        .par_iter()
-        .map(|scanned| {
-            let rel_path = scanned.rel_path.to_string_lossy().into_owned();
+    // Same duty-cycle budget as the code-parse phase (see index.rs).
+    let cpu_throttle = crate::cpu_throttle::CpuThrottle::from_env();
 
-            // Read via ContentReader.
-            let source = match reader.read_file(&scanned.rel_path) {
-                Ok(s) => s,
-                Err(err) => {
-                    parse_pb.inc(1);
-                    return NoteOutcome::Skipped(SkippedFile {
-                        path: rel_path,
-                        reason: format!("read error: {err}"),
-                    });
-                }
-            };
+    let parse_one = |scanned: &ScannedNote| -> NoteOutcome {
+        cpu_throttle.check();
+        let rel_path = scanned.rel_path.to_string_lossy().into_owned();
 
-            let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
-                Ok(p) => p,
-                Err(err) => {
-                    parse_pb.inc(1);
-                    return NoteOutcome::Skipped(SkippedFile {
-                        path: rel_path.clone(),
-                        reason: err.to_string(),
-                    });
-                }
-            };
-
-            if let Some(fm_err) = &parsed.frontmatter_error {
-                tracing::warn!("frontmatter parse warning for {rel_path}: {fm_err}");
+        // Read via ContentReader.
+        let source = match reader.read_file(&scanned.rel_path) {
+            Ok(s) => s,
+            Err(err) => {
+                parse_pb.inc(1);
+                return NoteOutcome::Skipped(SkippedFile {
+                    path: rel_path,
+                    reason: format!("read error: {err}"),
+                });
             }
+        };
 
-            let n_uid = note_uid(&v_uid, &rel_path);
-            let frontmatter_json = if parsed
-                .frontmatter
-                .as_object()
-                .is_some_and(|m| !m.is_empty())
-            {
-                serde_json::to_string(&parsed.frontmatter).ok()
-            } else {
-                None
-            };
+        let parsed: ParsedNote = match parse_markdown(&rel_path, &source) {
+            Ok(p) => p,
+            Err(err) => {
+                parse_pb.inc(1);
+                return NoteOutcome::Skipped(SkippedFile {
+                    path: rel_path.clone(),
+                    reason: err.to_string(),
+                });
+            }
+        };
 
-            // File timestamps — best-effort, never fatal. Uses direct
-            // fs::metadata for created_at (not in ContentReader trait).
-            let (created_at, modified_at) =
-                match std::fs::metadata(vault_root.join(&scanned.rel_path)) {
-                    Ok(meta) => {
-                        let created = meta.created().ok().and_then(format_system_time);
-                        let modified = meta.modified().ok().and_then(format_system_time);
-                        (created, modified)
-                    }
-                    Err(_) => (None, None),
-                };
+        if let Some(fm_err) = &parsed.frontmatter_error {
+            tracing::warn!("frontmatter parse warning for {rel_path}: {fm_err}");
+        }
 
-            let note = Note {
-                uid: n_uid.clone(),
-                vault_uid: v_uid.clone(),
-                file_path: rel_path.clone(),
-                title: parsed.title.clone(),
-                note_kind: parsed.note_kind,
-                word_count: parsed.word_count,
-                content_hash: parsed.content_hash.clone(),
-                frontmatter: frontmatter_json,
-                created_at,
-                modified_at,
-                pagerank_score: None,
+        let n_uid = note_uid(&v_uid, &rel_path);
+        let frontmatter_json = if parsed
+            .frontmatter
+            .as_object()
+            .is_some_and(|m| !m.is_empty())
+        {
+            serde_json::to_string(&parsed.frontmatter).ok()
+        } else {
+            None
+        };
+
+        // File timestamps — best-effort, never fatal. Uses direct
+        // fs::metadata for created_at (not in ContentReader trait).
+        let (created_at, modified_at) = match std::fs::metadata(vault_root.join(&scanned.rel_path))
+        {
+            Ok(meta) => {
+                let created = meta.created().ok().and_then(format_system_time);
+                let modified = meta.modified().ok().and_then(format_system_time);
+                (created, modified)
+            }
+            Err(_) => (None, None),
+        };
+
+        let note = Note {
+            uid: n_uid.clone(),
+            vault_uid: v_uid.clone(),
+            file_path: rel_path.clone(),
+            title: parsed.title.clone(),
+            note_kind: parsed.note_kind,
+            word_count: parsed.word_count,
+            content_hash: parsed.content_hash.clone(),
+            frontmatter: frontmatter_json,
+            created_at,
+            modified_at,
+            pagerank_score: None,
+            embedding: None,
+        };
+        let vault_note_edge = (v_uid.clone(), n_uid.clone());
+
+        // Derive Heading UIDs and Heading nodes from the parsed outline.
+        let heading_uids: Vec<String> = parsed
+            .headings
+            .iter()
+            .map(|h| heading_uid(&n_uid, &h.slug, h.start_line))
+            .collect();
+        let mut headings = Vec::with_capacity(parsed.headings.len());
+        let mut n_h_edges = Vec::with_capacity(parsed.headings.len());
+        for (idx, h) in parsed.headings.iter().enumerate() {
+            let h_uid = heading_uids[idx].clone();
+            headings.push(Heading {
+                uid: h_uid.clone(),
+                note_uid: n_uid.clone(),
+                level: h.level,
+                text: h.text.clone(),
+                slug: h.slug.clone(),
+                start_line: h.start_line,
+                end_line: h.end_line,
+                content_hash: crate::hash::blake3_hex_short(&h.text),
                 embedding: None,
-            };
-            let vault_note_edge = (v_uid.clone(), n_uid.clone());
+            });
+            n_h_edges.push((n_uid.clone(), h_uid));
+        }
 
-            // Derive Heading UIDs and Heading nodes from the parsed outline.
-            let heading_uids: Vec<String> = parsed
-                .headings
-                .iter()
-                .map(|h| heading_uid(&n_uid, &h.slug, h.start_line))
-                .collect();
-            let mut headings = Vec::with_capacity(parsed.headings.len());
-            let mut n_h_edges = Vec::with_capacity(parsed.headings.len());
-            for (idx, h) in parsed.headings.iter().enumerate() {
-                let h_uid = heading_uids[idx].clone();
-                headings.push(Heading {
-                    uid: h_uid.clone(),
-                    note_uid: n_uid.clone(),
-                    level: h.level,
-                    text: h.text.clone(),
-                    slug: h.slug.clone(),
-                    start_line: h.start_line,
-                    end_line: h.end_line,
-                    content_hash: crate::hash::blake3_hex_short(&h.text),
-                    embedding: None,
-                });
-                n_h_edges.push((n_uid.clone(), h_uid));
-            }
-
-            // Heading parent edges: for each heading, find its nearest preceding
-            // ancestor — the most recent heading whose level is strictly shallower.
-            let mut h_parent_edges = Vec::new();
-            for (idx, h) in parsed.headings.iter().enumerate() {
-                for prev_idx in (0..idx).rev() {
-                    if parsed.headings[prev_idx].level < h.level {
-                        h_parent_edges
-                            .push((heading_uids[idx].clone(), heading_uids[prev_idx].clone()));
-                        break;
-                    }
+        // Heading parent edges: for each heading, find its nearest preceding
+        // ancestor — the most recent heading whose level is strictly shallower.
+        let mut h_parent_edges = Vec::new();
+        for (idx, h) in parsed.headings.iter().enumerate() {
+            for prev_idx in (0..idx).rev() {
+                if parsed.headings[prev_idx].level < h.level {
+                    h_parent_edges
+                        .push((heading_uids[idx].clone(), heading_uids[prev_idx].clone()));
+                    break;
                 }
             }
+        }
 
-            // Derive Section UIDs and Section nodes.
-            let mut sections = Vec::with_capacity(parsed.sections.len());
-            let mut n_s_edges = Vec::with_capacity(parsed.sections.len());
-            let mut h_s_edges = Vec::new();
-            let mut section_uids: Vec<String> = Vec::with_capacity(parsed.sections.len());
-            for sec in &parsed.sections {
-                let text_hash = crate::hash::blake3_hex(&sec.text);
-                let short = &text_hash[..12];
-                let s_uid = section_uid(&n_uid, sec.start_line, short);
-                let word_count =
-                    u32::try_from(sec.text.split_whitespace().count()).unwrap_or(u32::MAX);
-                let heading_link = sec.heading_idx.map(|i| heading_uids[i].clone());
-                sections.push(Section {
-                    uid: s_uid.clone(),
-                    note_uid: n_uid.clone(),
-                    heading_uid: heading_link.clone(),
-                    start_line: sec.start_line,
-                    end_line: sec.end_line,
-                    text_hash,
-                    text_content: sec.text.clone(),
-                    word_count,
-                    pagerank_score: None,
-                });
-                n_s_edges.push((n_uid.clone(), s_uid.clone()));
-                if let Some(h_uid) = heading_link {
-                    h_s_edges.push((h_uid, s_uid.clone()));
-                }
-                section_uids.push(s_uid);
+        // Derive Section UIDs and Section nodes.
+        let mut sections = Vec::with_capacity(parsed.sections.len());
+        let mut n_s_edges = Vec::with_capacity(parsed.sections.len());
+        let mut h_s_edges = Vec::new();
+        let mut section_uids: Vec<String> = Vec::with_capacity(parsed.sections.len());
+        for sec in &parsed.sections {
+            let text_hash = crate::hash::blake3_hex(&sec.text);
+            let short = &text_hash[..12];
+            let s_uid = section_uid(&n_uid, sec.start_line, short);
+            let word_count = u32::try_from(sec.text.split_whitespace().count()).unwrap_or(u32::MAX);
+            let heading_link = sec.heading_idx.map(|i| heading_uids[i].clone());
+            sections.push(Section {
+                uid: s_uid.clone(),
+                note_uid: n_uid.clone(),
+                heading_uid: heading_link.clone(),
+                start_line: sec.start_line,
+                end_line: sec.end_line,
+                text_hash,
+                text_content: sec.text.clone(),
+                word_count,
+                pagerank_score: None,
+            });
+            n_s_edges.push((n_uid.clone(), s_uid.clone()));
+            if let Some(h_uid) = heading_link {
+                h_s_edges.push((h_uid, s_uid.clone()));
             }
+            section_uids.push(s_uid);
+        }
 
-            // Record per-note context for pass-2 cross-reference resolution.
-            let folder = Path::new(&rel_path)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let section_heading_text: Vec<Option<String>> = parsed
-                .sections
-                .iter()
-                .map(|sec| {
-                    sec.heading_idx
-                        .and_then(|i| parsed.headings.get(i))
-                        .map(|h| h.text.to_lowercase())
-                })
-                .collect();
-
-            let note_context = NoteContext {
-                note_uid: n_uid,
-                rel_path,
-                title: parsed.title.clone(),
-                folder,
-                aliases: parsed.aliases.clone(),
-                heading_uids,
-                heading_slugs: parsed.headings.iter().map(|h| h.slug.clone()).collect(),
-                section_uids,
-                wikilinks: parsed.wikilinks.clone(),
-                tags: parsed.tags.clone(),
-                frontmatter: parsed.frontmatter.clone(),
-                section_heading_text,
-            };
-
-            parse_pb.inc(1);
-
-            NoteOutcome::Parsed(NoteParseOutcome {
-                note,
-                headings,
-                sections,
-                vault_note_edge,
-                note_heading_edges: n_h_edges,
-                note_section_edges: n_s_edges,
-                heading_section_edges: h_s_edges,
-                heading_parent_edges: h_parent_edges,
-                note_context,
+        // Record per-note context for pass-2 cross-reference resolution.
+        let folder = Path::new(&rel_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let section_heading_text: Vec<Option<String>> = parsed
+            .sections
+            .iter()
+            .map(|sec| {
+                sec.heading_idx
+                    .and_then(|i| parsed.headings.get(i))
+                    .map(|h| h.text.to_lowercase())
             })
+            .collect();
+
+        let note_context = NoteContext {
+            note_uid: n_uid,
+            rel_path,
+            title: parsed.title.clone(),
+            folder,
+            aliases: parsed.aliases.clone(),
+            heading_uids,
+            heading_slugs: parsed.headings.iter().map(|h| h.slug.clone()).collect(),
+            section_uids,
+            wikilinks: parsed.wikilinks.clone(),
+            tags: parsed.tags.clone(),
+            frontmatter: parsed.frontmatter.clone(),
+            section_heading_text,
+        };
+
+        parse_pb.inc(1);
+
+        NoteOutcome::Parsed(NoteParseOutcome {
+            note,
+            headings,
+            sections,
+            vault_note_edge,
+            note_heading_edges: n_h_edges,
+            note_section_edges: n_s_edges,
+            heading_section_edges: h_s_edges,
+            heading_parent_edges: h_parent_edges,
+            note_context,
         })
-        .collect();
+    };
+
+    // Same dedicated low-priority pool as the code-parse phase (index.rs).
+    let outcomes: Vec<NoteOutcome> =
+        crate::parse_pool::install_parse_pool(|| scanned_notes.par_iter().map(parse_one).collect());
 
     parse_pb.finish_and_clear();
 

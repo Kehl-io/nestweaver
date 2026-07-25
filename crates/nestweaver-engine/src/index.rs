@@ -1850,103 +1850,113 @@ where
     // Immutable borrow of the parsed cache for the parallel phase.
     let pc_ref: Option<&crate::parsed_cache::ParsedCache> = parsed_cache.as_deref();
 
-    let outcomes: Vec<ParseOutcome> = file_entries
-        .par_iter()
-        .map(|(path, lang)| {
-            let display_name = path
-                .strip_prefix(repo_path)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .into_owned();
+    // Duty-cycle throttle for the CPU-bound phases below (parse + type-env
+    // build) — keeps an indexing daemon under runningboardd's CPU limits.
+    let cpu_throttle = crate::cpu_throttle::CpuThrottle::from_env();
 
-            // Cooperative cancellation: once the daemon trips the flag (index
-            // timeout or client disconnect), skip the expensive read+parse for
-            // every remaining file so all cores are freed promptly. The index
-            // then bails before any graph mutation (checked right after the
-            // collect), so no partial/empty graph is ever persisted.
-            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
-                parse_pb.inc(1);
-                return ParseOutcome::Skipped(SkippedFile {
-                    path: display_name,
-                    reason: "index cancelled".to_string(),
-                });
-            }
+    let parse_one = |(path, lang): &(PathBuf, Language)| -> ParseOutcome {
+        let display_name = path
+            .strip_prefix(repo_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
 
-            // Tiered change detection.
-            let (source, content_hash, file_meta) =
-                match tiered_change_check(reader, &display_name, cache) {
-                    Ok(ChangeVerdict::Unchanged) => {
-                        parse_pb.inc(1);
-                        // Check parsed cache: if we have cached symbols for this
-                        // file's content hash, return CachedParsed so symbols are
-                        // available for resolution while still counting as unchanged.
-                        if let Some(cached_meta) = cache.get(&display_name)
-                            && let Some(pc) = pc_ref
-                            && let Some(cached_parse) = pc.get(&cached_meta.content_hash)
-                        {
-                            return ParseOutcome::CachedParsed {
-                                rel_path: display_name,
-                                symbols: cached_parse.symbols.clone(),
-                                references: cached_parse.references.clone(),
-                                type_bindings: cached_parse.type_bindings.clone(),
-                            };
-                        }
-                        return ParseOutcome::Unchanged {
-                            rel_path: display_name,
-                        };
-                    }
-                    Ok(ChangeVerdict::Changed {
-                        source,
-                        content_hash,
-                        meta,
-                    }) => (source, content_hash, meta),
-                    Err(err) => {
-                        parse_pb.inc(1);
-                        return ParseOutcome::Skipped(SkippedFile {
-                            path: path.to_string_lossy().into_owned(),
-                            reason: format!("stat/read error: {err}"),
-                        });
-                    }
-                };
+        // Cooperative cancellation: once the daemon trips the flag (index
+        // timeout or client disconnect), skip the expensive read+parse for
+        // every remaining file so all cores are freed promptly. The index
+        // then bails before any graph mutation (checked right after the
+        // collect), so no partial/empty graph is ever persisted.
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            parse_pb.inc(1);
+            return ParseOutcome::Skipped(SkippedFile {
+                path: display_name,
+                reason: "index cancelled".to_string(),
+            });
+        }
 
-            // Parse the file (CPU-bound tree-sitter work).
-            match parse_source(path, &source) {
-                Ok(parsed) => {
+        // Tiered change detection.
+        let (source, content_hash, file_meta) =
+            match tiered_change_check(reader, &display_name, cache) {
+                Ok(ChangeVerdict::Unchanged) => {
                     parse_pb.inc(1);
-                    // Retain source for all languages up to 2 MB so Phase 3
-                    // (type env build) can skip redundant disk re-reads.
-                    // TS/JS must clone because `source` is still needed below
-                    // for NestJS controller detection; other languages move it.
-                    const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
-                    let retained_source =
-                        if matches!(*lang, Language::TypeScript | Language::JavaScript) {
-                            Some(source.clone())
-                        } else if source.len() <= SOURCE_RETENTION_CAP {
-                            Some(source)
-                        } else {
-                            None
+                    // Check parsed cache: if we have cached symbols for this
+                    // file's content hash, return CachedParsed so symbols are
+                    // available for resolution while still counting as unchanged.
+                    if let Some(cached_meta) = cache.get(&display_name)
+                        && let Some(pc) = pc_ref
+                        && let Some(cached_parse) = pc.get(&cached_meta.content_hash)
+                    {
+                        return ParseOutcome::CachedParsed {
+                            rel_path: display_name,
+                            symbols: cached_parse.symbols.clone(),
+                            references: cached_parse.references.clone(),
+                            type_bindings: cached_parse.type_bindings.clone(),
                         };
-                    ParseOutcome::Parsed {
-                        rel_path: display_name,
-                        lang: *lang,
-                        file_meta,
-                        content_hash,
-                        symbols: parsed.symbols,
-                        references: parsed.references,
-                        type_bindings: parsed.type_bindings,
-                        source: retained_source,
                     }
+                    return ParseOutcome::Unchanged {
+                        rel_path: display_name,
+                    };
                 }
+                Ok(ChangeVerdict::Changed {
+                    source,
+                    content_hash,
+                    meta,
+                }) => (source, content_hash, meta),
                 Err(err) => {
                     parse_pb.inc(1);
-                    ParseOutcome::Skipped(SkippedFile {
+                    return ParseOutcome::Skipped(SkippedFile {
                         path: path.to_string_lossy().into_owned(),
-                        reason: err.to_string(),
-                    })
+                        reason: format!("stat/read error: {err}"),
+                    });
+                }
+            };
+
+        // Parse the file (CPU-bound tree-sitter work). Throttle first so
+        // a saturated daemon yields often enough to stay under its CPU
+        // budget (mirrors the cancellation check above).
+        cpu_throttle.check();
+        match parse_source(path, &source) {
+            Ok(parsed) => {
+                parse_pb.inc(1);
+                // Retain source for all languages up to 2 MB so Phase 3
+                // (type env build) can skip redundant disk re-reads.
+                // TS/JS must clone because `source` is still needed below
+                // for NestJS controller detection; other languages move it.
+                const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
+                let retained_source =
+                    if matches!(*lang, Language::TypeScript | Language::JavaScript) {
+                        Some(source.clone())
+                    } else if source.len() <= SOURCE_RETENTION_CAP {
+                        Some(source)
+                    } else {
+                        None
+                    };
+                ParseOutcome::Parsed {
+                    rel_path: display_name,
+                    lang: *lang,
+                    file_meta,
+                    content_hash,
+                    symbols: parsed.symbols,
+                    references: parsed.references,
+                    type_bindings: parsed.type_bindings,
+                    source: retained_source,
                 }
             }
-        })
-        .collect();
+            Err(err) => {
+                parse_pb.inc(1);
+                ParseOutcome::Skipped(SkippedFile {
+                    path: path.to_string_lossy().into_owned(),
+                    reason: err.to_string(),
+                })
+            }
+        }
+    };
+
+    // Parse on the dedicated low-priority pool (utility QoS on macOS) so the
+    // daemon's query serving on the global pool stays responsive; falls back
+    // to the global pool if the dedicated one cannot be built.
+    let outcomes: Vec<ParseOutcome> =
+        crate::parse_pool::install_parse_pool(|| file_entries.par_iter().map(parse_one).collect());
 
     parse_pb.finish_and_clear();
     drop(_phase2_span);
@@ -2438,37 +2448,43 @@ where
 
         // Build type environments per file for type-aware resolution.
         // Each file's type env is independent, so we build them in parallel.
+        let build_env = |(file_path, symbols, _references, source_opt): &ParsedFileEntry| {
+            // Same CPU budget as the parse phase above.
+            cpu_throttle.check();
+            let source_owned;
+            let source: &str = if let Some(s) = source_opt.as_deref() {
+                s
+            } else {
+                source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
+                &source_owned
+            };
+
+            let empty_bindings = Vec::new();
+            let file_ast_bindings = ast_bindings_by_file
+                .get(file_path.as_str())
+                .unwrap_or(&empty_bindings);
+
+            let env = nestweaver_resolver::types::TypeEnvironment::build(
+                source,
+                language,
+                symbols,
+                file_ast_bindings,
+            );
+
+            if env.binding_count() > 0 {
+                Some((file_path.clone(), env))
+            } else {
+                None
+            }
+        };
+        // Same dedicated low-priority pool as the parse phase.
         let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
-            parsed_files_for_resolver
-                .par_iter()
-                .filter_map(|(file_path, symbols, _references, source_opt)| {
-                    let source_owned;
-                    let source: &str = if let Some(s) = source_opt.as_deref() {
-                        s
-                    } else {
-                        source_owned = reader.read_file(Path::new(file_path.as_str())).ok()?;
-                        &source_owned
-                    };
-
-                    let empty_bindings = Vec::new();
-                    let file_ast_bindings = ast_bindings_by_file
-                        .get(file_path.as_str())
-                        .unwrap_or(&empty_bindings);
-
-                    let env = nestweaver_resolver::types::TypeEnvironment::build(
-                        source,
-                        language,
-                        symbols,
-                        file_ast_bindings,
-                    );
-
-                    if env.binding_count() > 0 {
-                        Some((file_path.clone(), env))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            crate::parse_pool::install_parse_pool(|| {
+                parsed_files_for_resolver
+                    .par_iter()
+                    .filter_map(build_env)
+                    .collect()
+            });
         tracing::info!(
             files_with_bindings = type_envs.len(),
             total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
@@ -3048,7 +3064,7 @@ fn incremental_index_with_name_and_io(
     };
 
     // 2. If no existing Repo → full index.
-    let old_sha = match existing_repo {
+    let existing_repo = match existing_repo {
         None => {
             tracing::info!("no existing repo found; falling back to full index");
             return full_index_fallback(
@@ -3065,8 +3081,41 @@ fn incremental_index_with_name_and_io(
                 },
             );
         }
-        Some(r) => r.indexed_sha,
+        Some(r) => r,
     };
+    let old_sha = existing_repo.indexed_sha.clone();
+
+    // 2b. Self-heal an incomplete index BEFORE the up-to-date shortcut below:
+    // an empty indexed_sha (Repo row created but SHA never committed — today
+    // only handled implicitly via `is_ancestor("")` → false) or a committed
+    // SHA with no content (crash between the SHA write and content landing)
+    // can never be repaired incrementally, and would otherwise self-perpetuate
+    // through the `old_sha == new_sha` skip.
+    let index_incomplete = old_sha.is_empty()
+        || store
+            .repo_index_incomplete(&existing_repo)
+            .with_context(|| "repo_index_incomplete failed")?;
+    if index_incomplete {
+        tracing::warn!(
+            old_sha,
+            "index is incomplete (empty SHA or no symbols); forcing full re-index"
+        );
+        return full_index_fallback(
+            &store,
+            FullIndexFallback {
+                repo_path,
+                db_path,
+                instance_id,
+                repo_url,
+                new_sha: &new_sha,
+                name,
+                // Force the core path so bulk_reindex_write deletes the old
+                // graph and installs its replacement in one transaction.
+                force: true,
+                epilogue_io,
+            },
+        );
+    }
 
     // 3. Verify old_sha is an ancestor of new_sha.
     if !crate::git_diff::is_ancestor(repo_path, &old_sha, &new_sha) {
@@ -6524,6 +6573,129 @@ function hello(name) { return "Hello " + name; }
         assert!(
             pagerank_after.len() < pagerank_before.len(),
             "PageRank sidecar must drop symbols deleted before non-ancestor fallback"
+        );
+    }
+
+    /// Regression: a crash between the SHA commit and content landing leaves a
+    /// Repo row whose indexed_sha matches HEAD but owns zero content. The
+    /// `old_sha == new_sha` skip must not self-perpetuate that empty state —
+    /// incremental_index must force a full re-index.
+    #[test]
+    fn sha_set_but_no_content_forces_full_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "function healed() { return 1; }").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "main.js"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        let repo_url = "https://example.com/sha-set-but-empty";
+        let r_uid = nestweaver_schema::repo_uid("test", repo_url);
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: r_uid.clone(),
+                    url: repo_url.into(),
+                    // SHA matches HEAD but no symbols were ever indexed.
+                    indexed_sha: head,
+                    staleness_commits_behind: 0,
+                    instance_id: "test".into(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+
+        let result = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+
+        assert!(
+            result.fell_back_to_full,
+            "SHA-set-but-empty repo must force a full re-index"
+        );
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_row = store.lookup_repo(&r_uid).unwrap().unwrap();
+        assert!(
+            store.repo_has_content(&repo_row).unwrap(),
+            "full re-index must land content for the repo"
+        );
+    }
+
+    /// An empty indexed_sha (Repo row created but SHA never committed) must
+    /// explicitly take the full-index path rather than relying on
+    /// `is_ancestor("")` returning false downstream.
+    #[test]
+    fn empty_indexed_sha_forces_full_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.js"), "function healed() { return 1; }").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "main.js"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let repo_url = "https://example.com/empty-sha";
+        let r_uid = nestweaver_schema::repo_uid("test", repo_url);
+        {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: r_uid.clone(),
+                    url: repo_url.into(),
+                    indexed_sha: String::new(),
+                    staleness_commits_behind: 0,
+                    instance_id: "test".into(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+
+        let result = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+
+        assert!(
+            result.fell_back_to_full,
+            "empty indexed_sha must force a full re-index"
+        );
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let repo_row = store.lookup_repo(&r_uid).unwrap().unwrap();
+        assert!(
+            store.repo_has_content(&repo_row).unwrap(),
+            "full re-index must land content for the repo"
         );
     }
 

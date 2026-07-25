@@ -9174,7 +9174,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 edges_count = 0; // not tracked separately in incremental
 
                 if inc.fell_back_to_full {
-                    out.status("Incremental: no prior index found, performed full index.");
+                    out.status(
+                        "Incremental: prior index missing or incomplete, performed full index.",
+                    );
                 } else {
                     out.status(&format!(
                         "Incremental: {} added, {} modified, {} deleted, {} renamed, {} skipped.",
@@ -9344,11 +9346,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             // ("Read-only file system"). Pin the absolute
                             // path in the plist.
                             let db_path_abs = abs_for_daemon(&db_path);
+                            // launchd jobs don't inherit this shell's env, so
+                            // bake the index CPU-throttle knob into the plist
+                            // when the invoker set a valid value.
+                            let index_cpu_percent = std::env::var("NESTWEAVER_INDEX_CPU_PERCENT")
+                                .ok()
+                                .filter(|v| v.trim().parse::<u32>().is_ok());
                             let plist = nestweaver_daemon::launchd::generate_plist(
                                 &instance_id,
                                 &binary_path,
                                 &db_path_abs,
                                 &log_file,
+                                index_cpu_percent.as_deref(),
                             );
 
                             // Clean up any existing agent or fork-based daemon
@@ -11817,6 +11826,7 @@ fn run_brain(
                             let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
                             let marker = match r["status"].as_str() {
                                 Some("missing") => "missing",
+                                Some("incomplete") => "incomplete",
                                 _ if stale => "STALE",
                                 _ => "ok",
                             };
@@ -11895,6 +11905,15 @@ fn run_brain(
                         None => commits_behind > 0,
                     }
                 };
+                // A repo whose SHA was committed but whose content never
+                // landed (interrupted index) compares equal to HEAD yet
+                // serves an empty graph — flag it stale so the gate catches
+                // it. Mirrors the daemon path's `stale_check` tool; errors
+                // propagate (a gate that cannot answer must fail).
+                let content_missing = store
+                    .repo_index_incomplete(repo)
+                    .map_err(|e| anyhow::anyhow!("repo_index_incomplete: {e}"))?;
+                let is_stale = is_stale || content_missing;
                 if is_stale {
                     any_stale = true;
                 }
@@ -11905,7 +11924,7 @@ fn run_brain(
                     "current_head": current_head,
                     "is_stale": is_stale,
                     "staleness_commits_behind": commits_behind,
-                    "status": if local_missing { "missing" } else if is_stale { "stale" } else { "ok" },
+                    "status": if local_missing { "missing" } else if content_missing { "incomplete" } else if is_stale { "stale" } else { "ok" },
                 }));
             }
 
@@ -11950,6 +11969,7 @@ fn run_brain(
                     let behind = r["staleness_commits_behind"].as_u64().unwrap_or(0);
                     let marker = match r["status"].as_str() {
                         Some("missing") => "missing",
+                        Some("incomplete") => "incomplete",
                         _ if stale => "STALE",
                         _ => "ok",
                     };
