@@ -1565,11 +1565,12 @@ impl Drop for FlightLeader {
 
 /// Run `compute` at most once among concurrent callers sharing `key`
 /// (single-flight). The first caller computes; followers block on the shared
-/// slot's condvar and receive a clone of the leader's result. Followers
-/// inherit the leader's cancellation/failure — for an identical query that
-/// is the same outcome they would have produced themselves.
+/// slot's condvar and receive a clone of the leader's result. Cancellable
+/// followers use bounded waits so they can stop independently without
+/// disturbing the leader or other followers.
 fn coalesce_in_flight(
     key: InFlightKey,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     compute: impl FnOnce() -> Result<Value, anyhow::Error>,
 ) -> Result<Value, anyhow::Error> {
     let (slot, leader) = {
@@ -1599,13 +1600,22 @@ fn coalesce_in_flight(
         // Follower: wait for the leader to publish its result, then share it.
         let mut result = slot.result.lock().unwrap_or_else(|e| e.into_inner());
         loop {
+            ensure_dispatch_not_cancelled(cancel)?;
             if let Some(res) = &*result {
                 return match res {
                     Ok(value) => Ok(value.clone()),
                     Err(msg) => Err(anyhow!("{msg}")),
                 };
             }
-            result = slot.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+            if cancel.is_some() {
+                let (next_result, _) = slot
+                    .ready
+                    .wait_timeout(result, std::time::Duration::from_millis(25))
+                    .unwrap_or_else(|e| e.into_inner());
+                result = next_result;
+            } else {
+                result = slot.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+            }
         }
     };
 
@@ -1680,13 +1690,17 @@ fn maybe_cached(
     // Single-flight: concurrent identical calls share one computation
     // instead of stampeding it (see `coalesce_in_flight`).
     let flight_key: InFlightKey = (db_path.clone(), key, generation, scope_digest);
-    let result = coalesce_in_flight(flight_key, || {
+    let result = coalesce_in_flight(flight_key, cancel, || {
         let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)?;
         // Check inside the leader computation so cancellation is converted to
         // an error before FlightLeader publishes to followers.
         ensure_dispatch_not_cancelled(cancel)?;
         Ok(result)
     })?;
+    // Every caller must honor its own cancellation state. Followers bypass
+    // the leader closure above, so re-check after the shared result arrives
+    // before this caller can return or publish it.
+    ensure_dispatch_not_cancelled(cancel)?;
     if store.is_index_publication_dirty() || store.graph_generation() != generation {
         return Ok(result);
     }
@@ -10488,6 +10502,165 @@ mod cache_dispatch_tests {
     }
 
     #[test]
+    fn cancelled_follower_rejects_failed_leaders_degraded_result() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        let store = std::sync::Arc::new(GraphStore::open(&db_path).unwrap());
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(store.add_embedding("sym:cancelled-follower-probe", vec![1.0, 0.0, 0.0]));
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let model = std::sync::Arc::new(BlockingFailingCacheEmbed {
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+
+        let flight_key = {
+            let key = mix_visibility_cache_key(
+                nestweaver_store::cache::ResponseCache::key("brain_context", &args),
+                visibility_cache_salt(None),
+            );
+            let key =
+                mix_visibility_cache_key(key, semantic_cache_salt("brain_context", Some(&*model)));
+            (
+                db_path.clone(),
+                key,
+                store.graph_generation(),
+                whole_db_scope_digest(&db_path),
+            )
+        };
+
+        let leader_store = store.clone();
+        let leader_path = db_path.clone();
+        let leader_args = args.clone();
+        let leader_model = model.clone();
+        let leader = std::thread::spawn(move || {
+            reset_session();
+            set_current_db_path(leader_path.clone());
+            let result = dispatch(
+                &leader_store,
+                None,
+                "brain_context",
+                leader_args,
+                Some(leader_model.as_ref()),
+            );
+            let cache_is_empty = RESPONSE_CACHE.with(|caches| {
+                caches
+                    .borrow()
+                    .get(&leader_path)
+                    .is_none_or(nestweaver_store::cache::ResponseCache::is_empty)
+            });
+            flush_response_cache();
+            (result, cache_is_empty)
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("leader must block inside failing inference");
+
+        let leader_ref_count = {
+            let flights = IN_FLIGHT
+                .get()
+                .expect("leader must initialize the flight map")
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::sync::Arc::strong_count(
+                flights
+                    .get(&flight_key)
+                    .expect("leader must publish the in-flight slot"),
+            )
+        };
+
+        let follower_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let follower_store = store.clone();
+        let follower_path = db_path.clone();
+        let follower_model = model.clone();
+        let follower_cancel_worker = follower_cancel.clone();
+        let (follower_done_tx, follower_done_rx) = std::sync::mpsc::sync_channel(1);
+        let follower = std::thread::spawn(move || {
+            reset_session();
+            set_current_db_path(follower_path.clone());
+            let result = dispatch_cancellable(
+                &follower_store,
+                None,
+                "brain_context",
+                args,
+                Some(follower_model.as_ref()),
+                Some(&follower_cancel_worker),
+                None,
+            );
+            let cache_is_empty = RESPONSE_CACHE.with(|caches| {
+                caches
+                    .borrow()
+                    .get(&follower_path)
+                    .is_none_or(nestweaver_store::cache::ResponseCache::is_empty)
+            });
+            flush_response_cache();
+            follower_done_tx.send(()).unwrap();
+            (result, cache_is_empty)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let follower_registered = IN_FLIGHT.get().is_some_and(|flights| {
+                let flights = flights.lock().unwrap_or_else(|error| error.into_inner());
+                flights
+                    .get(&flight_key)
+                    .is_some_and(|slot| std::sync::Arc::strong_count(slot) > leader_ref_count)
+            });
+            if follower_registered {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follower must join the leader's in-flight slot"
+            );
+            std::thread::yield_now();
+        }
+
+        follower_cancel.store(true, std::sync::atomic::Ordering::Release);
+        let follower_stopped_waiting = follower_done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        release_tx.send(()).unwrap();
+
+        let (leader_result, leader_cache_is_empty) = leader.join().unwrap();
+        let leader_result = leader_result.unwrap();
+        assert_eq!(leader_result["degraded_components"], json!(["semantic"]));
+        assert!(
+            leader_cache_is_empty,
+            "leader's degraded result must not enter its response cache"
+        );
+        assert!(
+            follower_stopped_waiting,
+            "cancelled follower must stop waiting before the leader publishes"
+        );
+        let (follower_result, follower_cache_is_empty) = follower.join().unwrap();
+        let follower_error = follower_result
+            .expect_err("cancelled follower must reject the leader's degraded success");
+        assert!(
+            follower_error
+                .downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(nestweaver_store::StoreError::is_cancelled),
+            "expected StoreError::Cancelled, got: {follower_error:#}"
+        );
+        assert!(
+            follower_cache_is_empty,
+            "cancelled follower must not enter a result into its response cache"
+        );
+        let persisted_cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(
+            persisted_cache.is_empty(),
+            "failed/degraded flight must not create a persisted response-cache entry"
+        );
+    }
+
+    #[test]
     fn cancelled_query_is_not_cached() {
         reset_session();
         let (_dir, db_path) = index_on_disk();
@@ -10724,7 +10897,7 @@ mod cache_dispatch_tests {
         let leader_calls = Arc::clone(&calls);
         let leader_release = Arc::clone(&release);
         let leader = std::thread::spawn(move || {
-            coalesce_in_flight(leader_key, move || {
+            coalesce_in_flight(leader_key, None, move || {
                 leader_calls.fetch_add(1, Ordering::SeqCst);
                 // Hold the flight open until the main thread has watched the
                 // follower attach, then released us below.
@@ -10737,7 +10910,7 @@ mod cache_dispatch_tests {
         let baseline = wait_for_flight_count(&key, |c| c >= 1);
         let follower_key = key.clone();
         let follower = std::thread::spawn(move || {
-            coalesce_in_flight(follower_key, || {
+            coalesce_in_flight(follower_key, None, || {
                 panic!("follower must never run the computation")
             })
         });
@@ -10771,11 +10944,11 @@ mod cache_dispatch_tests {
             3,
         );
 
-        let err = coalesce_in_flight(key.clone(), || Err(anyhow!("boom"))).unwrap_err();
+        let err = coalesce_in_flight(key.clone(), None, || Err(anyhow!("boom"))).unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
 
         // The flight entry must be gone and the next call must compute fresh.
-        let ok = coalesce_in_flight(key.clone(), || Ok(json!("recovered"))).unwrap();
+        let ok = coalesce_in_flight(key.clone(), None, || Ok(json!("recovered"))).unwrap();
         assert_eq!(ok, json!("recovered"));
         let entry_gone = IN_FLIGHT
             .get()
