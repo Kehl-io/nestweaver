@@ -158,28 +158,49 @@ fn select_device_with<F>(policy: DevicePolicy, metal_factory: F) -> Result<(Devi
 where
     F: FnOnce() -> Result<Device>,
 {
+    match select_device_choice_with(policy, metal_factory)? {
+        DeviceChoice::Cpu => Ok((Device::Cpu, DeviceKind::Cpu)),
+        DeviceChoice::Metal(device) => {
+            if !device.is_metal() {
+                anyhow::bail!(
+                    "Metal device factory returned a non-Metal device for requested device policy {policy:?}"
+                );
+            }
+            Ok((device, DeviceKind::Metal))
+        }
+    }
+}
+
+#[allow(dead_code)] // `Metal` is constructed only in Metal-feature builds.
+enum DeviceChoice<T> {
+    Metal(T),
+    Cpu,
+}
+
+fn select_device_choice_with<F, T>(
+    policy: DevicePolicy,
+    metal_factory: F,
+) -> Result<DeviceChoice<T>>
+where
+    F: FnOnce() -> Result<T>,
+{
     match policy {
-        DevicePolicy::Cpu => Ok((Device::Cpu, DeviceKind::Cpu)),
-        DevicePolicy::Auto | DevicePolicy::Metal => {
+        DevicePolicy::Cpu => Ok(DeviceChoice::Cpu),
+        DevicePolicy::Auto => {
             #[cfg(feature = "metal")]
             {
-                let device = std::panic::catch_unwind(std::panic::AssertUnwindSafe(metal_factory))
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "Metal device creation panicked for requested device policy {policy:?}"
-                        )
-                    })?
-                    .with_context(|| {
-                        format!(
-                            "Metal device creation failed for requested device policy {policy:?}"
-                        )
-                    })?;
-                if !device.is_metal() {
-                    anyhow::bail!(
-                        "Metal device factory returned a non-Metal device for requested device policy {policy:?}"
-                    );
-                }
-                Ok((device, DeviceKind::Metal))
+                select_metal_device_choice(policy, metal_factory)
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                let _ = metal_factory;
+                Ok(DeviceChoice::Cpu)
+            }
+        }
+        DevicePolicy::Metal => {
+            #[cfg(feature = "metal")]
+            {
+                select_metal_device_choice(policy, metal_factory)
             }
             #[cfg(not(feature = "metal"))]
             {
@@ -192,6 +213,23 @@ where
     }
 }
 
+#[cfg(feature = "metal")]
+fn select_metal_device_choice<F, T>(
+    policy: DevicePolicy,
+    metal_factory: F,
+) -> Result<DeviceChoice<T>>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let device = std::panic::catch_unwind(std::panic::AssertUnwindSafe(metal_factory))
+        .map_err(|_| {
+            anyhow::anyhow!("Metal device creation panicked for requested device policy {policy:?}")
+        })?
+        .with_context(|| {
+            format!("Metal device creation failed for requested device policy {policy:?}")
+        })?;
+    Ok(DeviceChoice::Metal(device))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +264,27 @@ mod tests {
         assert!(!probed_metal.get());
         assert!(selected.0.is_cpu());
         assert_eq!(selected.1, DeviceKind::Cpu);
+    }
+
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn auto_policy_uses_cpu_without_metal_feature() {
+        let selected = select_device_with(DevicePolicy::Auto, || -> Result<Device> {
+            panic!("Auto must not invoke the Metal factory without Metal support");
+        })
+        .expect("Auto must select CPU when Metal is not compiled");
+
+        assert!(selected.0.is_cpu());
+        assert_eq!(selected.1, DeviceKind::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn successful_metal_factory_selects_metal() {
+        let selected = select_device_choice_with(DevicePolicy::Metal, || Ok(()))
+            .expect("a successful Metal factory must select Metal");
+
+        assert!(matches!(selected, DeviceChoice::Metal(())));
     }
 }
 

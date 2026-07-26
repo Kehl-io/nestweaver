@@ -34,6 +34,14 @@ const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
 
+/// Explicit device policy for direct local embedding.
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum CliEmbeddingAccelerator {
+    Auto,
+    Metal,
+    Cpu,
+}
+
 // ── Daemon index-stream phases ────────────────────────────────────────────────
 /// Drain one daemon index stream with the shared fail-closed terminal-state
 /// classifier while letting each CLI command preserve its progress rendering.
@@ -1359,6 +1367,13 @@ enum Commands {
             help = "HuggingFace model ID for local inference"
         )]
         model_id: String,
+        #[arg(
+            long,
+            value_enum,
+            requires = "local",
+            help = "Device policy for --local embedding: auto, metal, or cpu"
+        )]
+        accelerator: Option<CliEmbeddingAccelerator>,
         #[arg(long, default_value = "32", help = "Batch size")]
         batch_size: usize,
         #[arg(
@@ -5956,6 +5971,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             endpoint,
             model,
             model_id,
+            accelerator,
             batch_size,
             scope,
             force,
@@ -5966,6 +5982,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             endpoint.as_deref(),
             model.as_deref(),
             &model_id,
+            accelerator,
             batch_size,
             &scope,
             force,
@@ -14204,6 +14221,7 @@ fn run_embed(
     endpoint: Option<&str>,
     model: Option<&str>,
     model_id: &str,
+    accelerator: Option<CliEmbeddingAccelerator>,
     batch_size: usize,
     scope: &str,
     force: bool,
@@ -14213,6 +14231,9 @@ fn run_embed(
     // Validate flags
     if local && endpoint.is_some() {
         anyhow::bail!("--local and --endpoint are mutually exclusive");
+    }
+    if accelerator.is_some() && !local {
+        anyhow::bail!("--accelerator requires --local");
     }
     if batch_size == 0 {
         anyhow::bail!("--batch-size must be at least 1");
@@ -14506,6 +14527,11 @@ fn run_embed(
         {
             let config = nestweaver_embed::EmbedConfig {
                 model_id: model_id.to_string(),
+                device_policy: match accelerator.unwrap_or(CliEmbeddingAccelerator::Auto) {
+                    CliEmbeddingAccelerator::Auto => nestweaver_embed::DevicePolicy::Auto,
+                    CliEmbeddingAccelerator::Metal => nestweaver_embed::DevicePolicy::Metal,
+                    CliEmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
+                },
                 ..Default::default()
             };
             let embed_model = nestweaver_embed::EmbedModel::load(&config)
@@ -17941,6 +17967,37 @@ mod cli_bounds_tests {
                         assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
                     }
                 }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+}
+
+#[cfg(test)]
+mod embed_accelerator_cli_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_embed_accelerator_is_parsed_only_for_direct_local_embedding() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["nestweaver", "embed", "--local", "--accelerator", "cpu"])
+                        .expect("explicit local accelerator must parse");
+                assert!(matches!(
+                    cli.command,
+                    Commands::Embed {
+                        accelerator: Some(CliEmbeddingAccelerator::Cpu),
+                        ..
+                    }
+                ));
+
+                assert!(
+                    Cli::try_parse_from(["nestweaver", "embed", "--accelerator", "metal"]).is_err(),
+                    "an explicit accelerator must not be silently ignored by the daemon path"
+                );
             })
             .expect("spawn")
             .join()
