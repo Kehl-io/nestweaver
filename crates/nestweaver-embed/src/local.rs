@@ -34,17 +34,32 @@ pub struct MissingModelArtifactError {
     pub cache_dir: PathBuf,
 }
 
+fn posix_shell_quote(value: &str) -> String {
+    const SAFE_PUNCTUATION: &[u8] = b"_@%+=:,./-";
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || SAFE_PUNCTUATION.contains(&byte))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 impl std::fmt::Display for MissingModelArtifactError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let model_id = posix_shell_quote(&self.model_id);
+        let cache_dir = posix_shell_quote(&self.cache_dir.to_string_lossy());
         write!(
             formatter,
             "required embedding artifact '{}' for model '{}' is missing from configured cache '{}'; \
-             run `nestweaver embed --local --model-id {} --cache-dir '{}'` to download missing model files into that cache",
+             run `nestweaver embed --local --model-id {} --cache-dir {}` to download missing model files into that cache",
             self.filename,
             self.model_id,
             self.cache_dir.display(),
-            self.model_id,
-            self.cache_dir.display()
+            model_id,
+            cache_dir
         )
     }
 }
@@ -468,6 +483,42 @@ mod tests {
         assert_eq!(missing.filename, "model.safetensors");
         assert_eq!(missing.cache_dir, cache.path());
         assert!(err.to_string().contains("nestweaver embed --local"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_artifact_remediation_round_trips_posix_shell_arguments() {
+        for (model_id, cache_dir) in [
+            ("owner/safe-model-1", "/tmp/safe-cache-1"),
+            ("owner/model with spaces", "/tmp/cache with spaces"),
+            ("owner/model's", "/tmp/Kory's cache"),
+        ] {
+            let remediation = MissingModelArtifactError {
+                model_id: model_id.to_string(),
+                filename: "model.safetensors".to_string(),
+                cache_dir: PathBuf::from(cache_dir),
+            }
+            .to_string();
+            let command = remediation
+                .split('`')
+                .nth(1)
+                .expect("remediation must contain a shell command");
+            let script = format!("set -- {command}; printf '%s\\n%s\\n%s\\n' \"$#\" \"$5\" \"$7\"");
+            let output = Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .expect("run remediation through a POSIX shell");
+
+            assert!(
+                output.status.success(),
+                "shell rejected remediation for {model_id:?} and {cache_dir:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                format!("7\n{model_id}\n{cache_dir}\n")
+            );
+        }
     }
 
     #[test]
