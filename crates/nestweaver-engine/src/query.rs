@@ -20,6 +20,13 @@ pub trait EmbedQueryFn: Send + Sync {
     fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>>;
 }
 
+/// Supplies the current embedding model from a runtime-owned readiness
+/// snapshot. Daemon transports use this indirection so every handler observes
+/// the model published atomically with its readiness state.
+pub trait EmbedModelProvider: Send + Sync {
+    fn current_model(&self) -> Option<std::sync::Arc<dyn EmbedQueryFn>>;
+}
+
 #[cfg(feature = "embed")]
 impl EmbedQueryFn for nestweaver_embed::EmbedModel {
     fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
@@ -1317,6 +1324,17 @@ pub fn build_brain_context_hybrid(
     )
 }
 
+fn ensure_brain_context_not_cancelled(
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), anyhow::Error> {
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
+            nestweaver_store::CancelReason::Timeout,
+        )));
+    }
+    Ok(())
+}
+
 /// Like `build_brain_context_hybrid` but also accepts a taxonomy alias map
 /// (from `load_alias_sidecar`) for vault-defined name canonicalization.
 ///
@@ -1526,7 +1544,14 @@ pub fn build_brain_context_hybrid_with_aliases(
         && store_has_embeddings(store)
     {
         let query_text = inputs.join(" ");
-        if let Ok(query_emb) = model.embed_query(&query_text) {
+        ensure_brain_context_not_cancelled(cancel)?;
+        let query_embedding = model.embed_query(&query_text);
+        // Inference is a synchronous, potentially long-running boundary. A
+        // timeout/disconnect can arrive while it is blocked, including on an
+        // inference error. Preserve cancellation as an incomplete query rather
+        // than degrading that error into a cacheable semantic miss.
+        ensure_brain_context_not_cancelled(cancel)?;
+        if let Ok(query_emb) = query_embedding {
             match crate::vector_search::vector_knn_all_cancellable(
                 store,
                 &query_emb,
@@ -1624,6 +1649,9 @@ pub fn build_brain_context_hybrid_with_aliases(
         }
     }
 
+    // Cover cancellation after inference/vector work but before the completed
+    // result crosses the engine boundary into single-flight/cache publication.
+    ensure_brain_context_not_cancelled(cancel)?;
     Ok(BrainContextResult {
         seeds,
         connected,
@@ -3209,6 +3237,10 @@ mod semantic_leg_tests {
 
     struct WrongDimensionEmbed;
     struct FailingEmbed;
+    struct BlockingFailingEmbed {
+        inference_started: std::sync::Arc<std::sync::Barrier>,
+        cancellation_published: std::sync::Arc<std::sync::Barrier>,
+    }
 
     impl CountingEmbed {
         fn call_count(&self) -> usize {
@@ -3232,6 +3264,14 @@ mod semantic_leg_tests {
     impl EmbedQueryFn for FailingEmbed {
         fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             anyhow::bail!("probe inference failed")
+        }
+    }
+
+    impl EmbedQueryFn for BlockingFailingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.inference_started.wait();
+            self.cancellation_published.wait();
+            anyhow::bail!("inference failed after cancellation")
         }
     }
 
@@ -3349,6 +3389,49 @@ mod semantic_leg_tests {
         assert!(
             !result.seeds.is_empty() || !result.connected.is_empty(),
             "graph/PPR results must survive"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_failed_inference_is_not_degraded_to_success() {
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+        let inference_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let cancellation_published = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let model = BlockingFailingEmbed {
+            inference_started: inference_started.clone(),
+            cancellation_published: cancellation_published.clone(),
+        };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_from_worker = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            inference_started.wait();
+            cancel_from_worker.store(true, std::sync::atomic::Ordering::Release);
+            cancellation_published.wait();
+        });
+        let config = HybridSearchConfig {
+            weight_semantic: 0.35,
+            ..HybridSearchConfig::default()
+        };
+
+        let err = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["Payment".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(&model),
+            Some(&cancel),
+        )
+        .expect_err("cancellation during failed inference must remain a cancellation error");
+        canceller.join().unwrap();
+
+        assert!(
+            err.downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(nestweaver_store::StoreError::is_cancelled),
+            "expected StoreError::Cancelled, got: {err:#}"
         );
     }
 
