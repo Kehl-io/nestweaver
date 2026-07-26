@@ -167,7 +167,7 @@ a `.app` bundle or DMG. Build it from source (it bundles Metal-accelerated
 embeddings and the web UI):
 
 ```sh
-cd app && bash build.sh
+bash app/build.sh
 open target/release/NestWeaver.app
 ```
 
@@ -430,7 +430,7 @@ NestWeaver can build a native macOS `.app` bundle from source. No release
 
 ```sh
 # Build from source (requires Xcode Command Line Tools)
-cd app && bash build.sh
+bash app/build.sh
 open target/release/NestWeaver.app
 ```
 

@@ -60,7 +60,7 @@ a `.app` bundle or DMG. Build it from a checkout with `app/build.sh`; that build
 uses the Metal feature.
 
 ```sh
-cd app && bash build.sh
+bash app/build.sh
 open target/release/NestWeaver.app
 ```
 

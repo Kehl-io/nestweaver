@@ -187,10 +187,13 @@ fn installation_docs_only_claim_live_channels() {
         "README.md",
         "docs/guide/instance-config.md",
         "docs/server-mode.md",
+        "docs/architecture/project-brain.md",
+        "CLAUDE.md",
     ];
     let unsupported_commands = [
         "npm install -g @kehl-io/nestweaver",
         "cargo install nestweaver",
+        "brew install nestweaver",
     ];
 
     for relative_path in docs {

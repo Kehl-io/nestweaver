@@ -1127,9 +1127,10 @@ fn detect(path: &Path) -> SourceKind {
 ### 9.5 What happens on first run — the full UX walkthrough
 
 ```
-$ brew install nestweaver
-==> Pouring nestweaver--0.2.0.arm64_sonoma.bottle.tar.gz
-==> nestweaver installed
+$ # Follow INSTALL.md to download the matching GitHub Release archive,
+$ # verify its .sha256 file, and install the nestweaver binary.
+$ nestweaver --version
+nestweaver <release-version>
 
 $ nestweaver brain add ~/Documents/my-vault
 Detecting source type...
@@ -1328,7 +1329,9 @@ On startup, validate `effective_schema_hash` against the DB. If unchanged → lo
 
 The shipping bar is: **a user who has never read a NestWeaver doc must be able to follow this sequence without help:**
 
-1. Install via package manager: `brew install nestweaver` or `cargo install nestweaver`.
+1. Install a verified GitHub Release archive (the primary pre-built path), or
+   clone the repository and run `cargo install --locked --path .` from the
+   checkout.
 2. Run one command: `nestweaver brain add ~/my-vault` (or any folder path).
 3. Never run another command. The brain stays current automatically across saves, reboots, branch switches, and sync events.
 4. Configure Claude Desktop / Claude Code with one MCP server entry, then ask Claude about their projects and get accurate, current answers.
