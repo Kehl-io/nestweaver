@@ -2,11 +2,114 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::{HFClientSync, split_id};
+use hf_hub::{HFClient, HFClientSync, HFError, split_id};
+use std::path::PathBuf;
 use tokenizers::Tokenizer;
 use tracing::info;
 
 use crate::{DeviceKind, DevicePolicy};
+
+/// The three files required to construct the bundled BERT embedding model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelArtifacts {
+    pub config: PathBuf,
+    pub tokenizer: PathBuf,
+    pub weights: PathBuf,
+}
+
+/// Whether artifact resolution may contact Hugging Face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactMode {
+    /// Resolve strictly from the configured cache without network access.
+    CacheOnly,
+    /// Download any artifacts absent from the configured cache.
+    DownloadMissing,
+}
+
+/// Typed cache-only failure for a required local model artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingModelArtifactError {
+    pub model_id: String,
+    pub filename: String,
+    pub cache_dir: PathBuf,
+}
+
+impl std::fmt::Display for MissingModelArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "required embedding artifact '{}' for model '{}' is missing from configured cache '{}'; \
+             run `nestweaver embed --local --model-id {}` to download missing model files",
+            self.filename,
+            self.model_id,
+            self.cache_dir.display(),
+            self.model_id
+        )
+    }
+}
+
+impl std::error::Error for MissingModelArtifactError {}
+
+/// Resolve all local model files through the cache root in [`crate::EmbedConfig`].
+pub fn resolve_model_artifacts(
+    config: &crate::EmbedConfig,
+    mode: ArtifactMode,
+) -> Result<ModelArtifacts> {
+    let async_client = HFClient::builder()
+        .cache_dir(config.cache_dir.clone())
+        .build()
+        .context("failed to configure Hugging Face client")?;
+    let client = HFClientSync::from_inner(async_client)
+        .context("failed to create blocking Hugging Face client")?;
+    let (owner, name) = split_id(&config.model_id);
+    let repo = client.model(owner, name);
+
+    let resolve = |filename: &'static str| -> Result<PathBuf> {
+        repo.download_file()
+            .filename(filename)
+            .local_files_only(mode == ArtifactMode::CacheOnly)
+            .send()
+            .map_err(|source| {
+                if mode == ArtifactMode::CacheOnly
+                    && matches!(
+                        &source,
+                        HFError::LocalEntryNotFound { .. } | HFError::EntryNotFound { .. }
+                    )
+                {
+                    anyhow::Error::new(MissingModelArtifactError {
+                        model_id: config.model_id.clone(),
+                        filename: filename.to_string(),
+                        cache_dir: config.cache_dir.clone(),
+                    })
+                } else {
+                    anyhow::Error::new(source).context(format!(
+                        "failed to resolve embedding artifact '{filename}' for model '{}'",
+                        config.model_id
+                    ))
+                }
+            })
+    };
+
+    Ok(ModelArtifacts {
+        config: resolve("config.json")?,
+        tokenizer: resolve("tokenizer.json")?,
+        weights: resolve("model.safetensors")?,
+    })
+}
+
+fn resolve_and_construct<T, Resolve, Construct>(
+    config: &crate::EmbedConfig,
+    mode: ArtifactMode,
+    resolve: Resolve,
+    construct: Construct,
+) -> Result<T>
+where
+    Resolve: FnOnce(&crate::EmbedConfig, ArtifactMode) -> Result<ModelArtifacts>,
+    Construct: FnOnce(ModelArtifacts) -> Result<T>,
+{
+    let artifacts = resolve(config, mode)?;
+    construct(artifacts)
+}
 
 pub struct LocalModel {
     model: BertModel,
@@ -19,44 +122,47 @@ pub struct LocalModel {
 impl LocalModel {
     /// Load using the default automatic device-selection policy.
     pub fn load(config: &crate::EmbedConfig) -> Result<Self> {
-        Self::load_with_policy(config, DevicePolicy::Auto)
+        Self::load_with_policy_and_artifact_mode(
+            config,
+            DevicePolicy::Auto,
+            ArtifactMode::DownloadMissing,
+        )
     }
 
     /// Load with an explicit device-selection policy.
     pub fn load_with_policy(config: &crate::EmbedConfig, policy: DevicePolicy) -> Result<Self> {
+        Self::load_with_policy_and_artifact_mode(config, policy, ArtifactMode::DownloadMissing)
+    }
+
+    /// Load with explicit device and artifact-resolution policies.
+    pub fn load_with_policy_and_artifact_mode(
+        config: &crate::EmbedConfig,
+        policy: DevicePolicy,
+        mode: ArtifactMode,
+    ) -> Result<Self> {
+        resolve_and_construct(config, mode, resolve_model_artifacts, |artifacts| {
+            Self::from_artifacts(config, policy, artifacts)
+        })
+    }
+
+    fn from_artifacts(
+        config: &crate::EmbedConfig,
+        policy: DevicePolicy,
+        artifacts: ModelArtifacts,
+    ) -> Result<Self> {
         let (device, device_kind) = select_device(policy)?;
-        let client = HFClientSync::new()?;
-        let (owner, name) = split_id(&config.model_id);
-        let repo = client.model(owner, name);
-
-        let config_path = repo
-            .download_file()
-            .filename("config.json")
-            .send()
-            .context("Failed to download config.json")?;
-        let tokenizer_path = repo
-            .download_file()
-            .filename("tokenizer.json")
-            .send()
-            .context("Failed to download tokenizer.json")?;
-        let weights_path = repo
-            .download_file()
-            .filename("model.safetensors")
-            .send()
-            .context("Failed to download model weights")?;
-
-        let config_str = std::fs::read_to_string(&config_path)?;
+        let config_str = std::fs::read_to_string(&artifacts.config)?;
         let bert_config: BertConfig = serde_json::from_str(&config_str)?;
         let dimension = bert_config.hidden_size;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        let tokenizer = Tokenizer::from_file(&artifacts.tokenizer)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
         info!(?device_kind, device = ?device, model = %config.model_id, "Loading embedding model");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&weights_path),
+                    std::slice::from_ref(&artifacts.weights),
                     candle_core::DType::F32,
                     &device,
                 )?
@@ -233,33 +339,190 @@ where
         })?;
     Ok(DeviceChoice::Metal(device))
 }
-/// Download a model's files (config, tokenizer, weights) into the HuggingFace cache
-/// WITHOUT building the model. Lets a caller bound a cold-cache download with a timeout so
-/// a slow/unreachable HuggingFace can't hang startup. A no-op (fast) when already cached.
-pub fn prefetch_model(model_id: &str) -> Result<()> {
-    let client = HFClientSync::new()?;
-    let (owner, name) = split_id(model_id);
-    let repo = client.model(owner, name);
-    repo.download_file()
-        .filename("config.json")
-        .send()
-        .context("prefetch config.json")?;
-    repo.download_file()
-        .filename("tokenizer.json")
-        .send()
-        .context("prefetch tokenizer.json")?;
-    repo.download_file()
-        .filename("model.safetensors")
-        .send()
-        .context("prefetch model.safetensors")?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{DeviceKind, DevicePolicy};
     use std::cell::Cell;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TEST_MODEL_ID: &str = "test-owner/test-model";
+    const TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+    static HF_CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "nestweaver-embed-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: callers hold HF_CACHE_ENV_LOCK until this guard is dropped,
+            // serializing this process-wide test environment mutation.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard remains protected by HF_CACHE_ENV_LOCK and
+            // restores the environment before the lock guard is dropped.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn test_config(cache_dir: &Path) -> crate::EmbedConfig {
+        crate::EmbedConfig {
+            model_id: TEST_MODEL_ID.to_string(),
+            cache_dir: cache_dir.to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        }
+    }
+
+    fn write_cached_artifacts(cache_dir: &Path, omitted: Option<&str>) -> ModelArtifacts {
+        // hf-hub documents refs/<revision> and snapshots/<commit>/<filename>
+        // as its public cache representation. Regular files are sufficient for
+        // cache-only resolution; production code never constructs these paths.
+        let repo_dir = cache_dir.join("models--test-owner--test-model");
+        let snapshot_dir = repo_dir.join("snapshots").join(TEST_COMMIT);
+        std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
+        std::fs::create_dir_all(&snapshot_dir).expect("create snapshot");
+        std::fs::write(repo_dir.join("refs").join("main"), TEST_COMMIT).expect("write ref");
+
+        let artifacts = ModelArtifacts {
+            config: snapshot_dir.join("config.json"),
+            tokenizer: snapshot_dir.join("tokenizer.json"),
+            weights: snapshot_dir.join("model.safetensors"),
+        };
+        for path in [&artifacts.config, &artifacts.tokenizer, &artifacts.weights] {
+            if path.file_name().and_then(|name| name.to_str()) != omitted {
+                std::fs::write(path, b"fixture").expect("write cached artifact");
+            }
+        }
+        artifacts
+    }
+
+    #[test]
+    fn cache_only_resolves_complete_configured_cache() {
+        let cache = TestDir::new("complete-cache");
+        let expected = write_cached_artifacts(cache.path(), None);
+
+        let actual = resolve_model_artifacts(&test_config(cache.path()), ArtifactMode::CacheOnly)
+            .expect("a complete configured cache must resolve offline");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn cache_only_missing_artifact_is_typed_and_actionable() {
+        let cache = TestDir::new("missing-cache");
+        write_cached_artifacts(cache.path(), Some("model.safetensors"));
+
+        let err = resolve_model_artifacts(&test_config(cache.path()), ArtifactMode::CacheOnly)
+            .expect_err("a missing required artifact must fail");
+        let missing = err
+            .downcast_ref::<MissingModelArtifactError>()
+            .expect("cache-only misses must preserve their error type");
+
+        assert_eq!(missing.model_id, TEST_MODEL_ID);
+        assert_eq!(missing.filename, "model.safetensors");
+        assert_eq!(missing.cache_dir, cache.path());
+        assert!(err.to_string().contains("nestweaver embed --local"));
+    }
+
+    #[test]
+    fn configured_cache_roots_are_isolated() {
+        let populated = TestDir::new("populated-cache");
+        let empty = TestDir::new("empty-cache");
+        let expected = write_cached_artifacts(populated.path(), None);
+        let _env_lock = HF_CACHE_ENV_LOCK.lock().expect("lock HF cache environment");
+        let _global_cache = EnvVarGuard::set("HF_HUB_CACHE", populated.path());
+
+        let resolved =
+            resolve_model_artifacts(&test_config(populated.path()), ArtifactMode::CacheOnly)
+                .expect("configured populated cache must resolve");
+        assert_eq!(resolved, expected);
+
+        let err = resolve_model_artifacts(&test_config(empty.path()), ArtifactMode::CacheOnly)
+            .expect_err("configured cache must not read the populated process-global root");
+        assert!(
+            err.downcast_ref::<MissingModelArtifactError>().is_some(),
+            "isolated empty cache must report its own miss"
+        );
+    }
+
+    #[test]
+    fn one_load_resolves_once_and_constructs_from_resolved_artifacts() {
+        let cache = TestDir::new("one-pass-cache");
+        let config = test_config(cache.path());
+        let expected = ModelArtifacts {
+            config: PathBuf::from("resolved-config"),
+            tokenizer: PathBuf::from("resolved-tokenizer"),
+            weights: PathBuf::from("resolved-weights"),
+        };
+        let resolution_count = Cell::new(0);
+        let construction_count = Cell::new(0);
+
+        let loaded = resolve_and_construct(
+            &config,
+            ArtifactMode::CacheOnly,
+            |seen_config, seen_mode| {
+                resolution_count.set(resolution_count.get() + 1);
+                assert_eq!(seen_config.cache_dir, config.cache_dir);
+                assert_eq!(seen_mode, ArtifactMode::CacheOnly);
+                Ok(expected.clone())
+            },
+            |artifacts| {
+                construction_count.set(construction_count.get() + 1);
+                assert_eq!(artifacts, expected);
+                Ok("loaded")
+            },
+        )
+        .expect("one-pass load orchestration must succeed");
+
+        assert_eq!(loaded, "loaded");
+        assert_eq!(resolution_count.get(), 1);
+        assert_eq!(construction_count.get(), 1);
+    }
 
     #[test]
     fn one_argument_load_remains_publicly_callable() {

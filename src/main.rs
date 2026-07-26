@@ -54,6 +54,11 @@ fn cli_embedding_device_policy(
     }
 }
 
+#[cfg(feature = "embed")]
+fn cli_embedding_artifact_mode() -> nestweaver_embed::ArtifactMode {
+    nestweaver_embed::ArtifactMode::DownloadMissing
+}
+
 fn external_embedding_model(model: Option<&str>) -> &str {
     model.unwrap_or(DEFAULT_EXTERNAL_EMBEDDING_MODEL)
 }
@@ -14570,8 +14575,12 @@ fn run_embed(
             };
             let policy =
                 cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
-            let embed_model = nestweaver_embed::EmbedModel::load_with_policy(&config, policy)
-                .context("failed to load local embedding model")?;
+            let embed_model = nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(
+                &config,
+                policy,
+                cli_embedding_artifact_mode(),
+            )
+            .context("failed to load local embedding model")?;
 
             if do_symbols {
                 let all = store
@@ -18095,6 +18104,14 @@ mod embed_accelerator_cli_tests {
         assert_eq!(
             cli_embedding_device_policy(CliEmbeddingAccelerator::Cpu),
             nestweaver_embed::DevicePolicy::Cpu
+        );
+    }
+
+    #[test]
+    fn explicit_direct_local_embedding_may_download_missing_artifacts() {
+        assert_eq!(
+            cli_embedding_artifact_mode(),
+            nestweaver_embed::ArtifactMode::DownloadMissing
         );
     }
 

@@ -5993,6 +5993,56 @@ mod depth_clamp_tests {
 #[cfg(all(test, feature = "embed"))]
 mod embedding_load_config_tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static HF_ENDPOINT_ENV: Mutex<()> = Mutex::new(());
+
+    struct HfEndpointGuard(Option<OsString>);
+
+    impl HfEndpointGuard {
+        fn unreachable() -> Self {
+            let previous = std::env::var_os("HF_ENDPOINT");
+            // SAFETY: this test module serializes every HF_ENDPOINT mutation
+            // with HF_ENDPOINT_ENV and restores the prior value on drop.
+            unsafe {
+                std::env::set_var("HF_ENDPOINT", "http://127.0.0.1:9");
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for HfEndpointGuard {
+        fn drop(&mut self) {
+            // SAFETY: guarded by HF_ENDPOINT_ENV for this guard's lifetime.
+            unsafe {
+                if let Some(previous) = self.0.take() {
+                    std::env::set_var("HF_ENDPOINT", previous);
+                } else {
+                    std::env::remove_var("HF_ENDPOINT");
+                }
+            }
+        }
+    }
+
+    fn write_complete_hf_cache(cache_dir: &Path) -> nestweaver_embed::ModelArtifacts {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let repo_dir = cache_dir.join("models--test-owner--test-model");
+        let snapshot_dir = repo_dir.join("snapshots").join(commit);
+        std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
+        std::fs::create_dir_all(&snapshot_dir).expect("create snapshot");
+        std::fs::write(repo_dir.join("refs").join("main"), commit).expect("write ref");
+        let artifacts = nestweaver_embed::ModelArtifacts {
+            config: snapshot_dir.join("config.json"),
+            tokenizer: snapshot_dir.join("tokenizer.json"),
+            weights: snapshot_dir.join("model.safetensors"),
+        };
+        for path in [&artifacts.config, &artifacts.tokenizer, &artifacts.weights] {
+            std::fs::write(path, b"fixture").expect("write cached artifact");
+        }
+        artifacts
+    }
 
     #[test]
     fn daemon_accelerator_maps_each_policy() {
@@ -6030,6 +6080,32 @@ mod embedding_load_config_tests {
             Some("stored-external")
         );
     }
+
+    #[test]
+    fn daemon_embedding_startup_is_cache_only_with_unreachable_hub() {
+        let _env_lock = HF_ENDPOINT_ENV.lock().expect("HF endpoint env lock");
+        let _endpoint = HfEndpointGuard::unreachable();
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        let expected = write_complete_hf_cache(cache.path());
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: cache.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+
+        let artifacts = load_daemon_embedding_backend_with(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            |seen_config, seen_policy, seen_mode| {
+                assert_eq!(seen_policy, nestweaver_embed::DevicePolicy::Cpu);
+                nestweaver_embed::resolve_model_artifacts(seen_config, seen_mode)
+            },
+        )
+        .expect("daemon startup must resolve a complete configured cache offline");
+
+        assert_eq!(artifacts, expected);
+    }
 }
 
 #[cfg(feature = "embed")]
@@ -6045,6 +6121,22 @@ fn daemon_embedding_device_policy(
         }
         nestweaver_engine::config::EmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
     }
+}
+
+#[cfg(feature = "embed")]
+fn load_daemon_embedding_backend_with<T, Load>(
+    config: &nestweaver_embed::EmbedConfig,
+    policy: nestweaver_embed::DevicePolicy,
+    load: Load,
+) -> anyhow::Result<T>
+where
+    Load: FnOnce(
+        &nestweaver_embed::EmbedConfig,
+        nestweaver_embed::DevicePolicy,
+        nestweaver_embed::ArtifactMode,
+    ) -> anyhow::Result<T>,
+{
+    load(config, policy, nestweaver_embed::ArtifactMode::CacheOnly)
 }
 
 #[cfg(feature = "embed")]
@@ -6081,10 +6173,10 @@ fn embedding_load_config(
 /// Load the embedding model into `state.embed_model`. MUST be called on the daemon's main
 /// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
 /// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
-/// thread (there it silently falls back to CPU). Called AFTER the UDS server is spawned so a
-/// cold-cache download can't delay the socket bind; the download is bounded by a 180s prefetch
-/// timeout so it can't hang. During the load, non-semantic RPCs are served normally and
-/// semantic search returns "model not loaded" until it completes.
+/// thread. Called AFTER the UDS server is spawned. Local model artifacts are resolved strictly
+/// from the configured cache, so daemon startup never initiates a network download. During the
+/// load, non-semantic RPCs are served normally and semantic search returns "model not loaded"
+/// until it completes.
 ///
 /// Gated `not(test)` like its call site: unit-test servers run on tokio worker threads, which
 /// can never satisfy the main-thread requirement, and with the call site compiled out this fn
@@ -6147,38 +6239,11 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
     let config = embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
-    // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't hang the
-    // load. On a warm cache this is instant; only the local-model path downloads.
-    //
-    // NOTE on cancellation: when the 180s timeout fires, the `spawn_blocking` download keeps
-    // running detached — hf-hub's blocking (ureq) `repo.get` exposes no abort hook, and the
-    // dominant cost is a single indivisible `model.safetensors` GET, so there is no useful
-    // point to inject a cooperative check. Accepted: the daemon's wait is bounded by this
-    // timeout plus the shutdown `select!` around the caller; the orphaned thread only writes
-    // into the HF cache dir and exits on its own when the transfer finishes or errors.
-    let loaded = if config.external_endpoint.is_some() {
-        Some(nestweaver_embed::EmbedModel::load_with_policy(
-            &config, policy,
-        ))
-    } else {
-        let model_id = config.model_id.clone();
-        let prefetch =
-            tokio::task::spawn_blocking(move || nestweaver_embed::local::prefetch_model(&model_id));
-        match tokio::time::timeout(std::time::Duration::from_secs(180), prefetch).await {
-            Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load_with_policy(
-                &config, policy,
-            )),
-            _ => {
-                tracing::warn!(
-                    "embedding model download timed out or failed — semantic search disabled \
-                     until the daemon restarts with the model available"
-                );
-                None
-            }
-        }
-    };
+    let loaded = load_daemon_embedding_backend_with(&config, policy, |config, policy, mode| {
+        nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(config, policy, mode)
+    });
     match loaded {
-        Some(Ok(model)) => {
+        Ok(model) => {
             tracing::info!(
                 backend = ?model.backend_kind(),
                 device = ?model.device_kind(),
@@ -6202,10 +6267,9 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
                     as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
             }
         }
-        Some(Err(e)) => {
+        Err(e) => {
             tracing::warn!("Failed to load embedding model: {e}");
         }
-        None => {}
     }
 }
 
@@ -7756,7 +7820,8 @@ pub async fn run_server(
     // Spawn the UDS gRPC server so the socket binds and accepts immediately, THEN load the
     // embedding model on this (main) thread concurrently — non-semantic RPCs are served during
     // the load, and semantic search returns "model not loaded" until it completes. candle needs
-    // the main thread for Metal, and this keeps a cold-cache download from delaying the bind.
+    // the main thread for Metal, and this keeps cache resolution and model construction from
+    // delaying the bind.
     let uds_serve = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(uds_svc)
@@ -7765,9 +7830,8 @@ pub async fn run_server(
             }),
     );
 
-    // Race the load against shutdown: a `daemon stop` during a cold-cache model download must
-    // not park the main flow inside the 180s prefetch (which would defer cleanup and risk a
-    // SIGKILL + stale socket). If shutdown fires first, abandon the load and proceed to drain.
+    // Keep shutdown and model loading in the same control point. If shutdown wins before the
+    // synchronous model-construction phase begins, abandon the load and proceed to drain.
     //
     // `not(test)`: the load asserts it runs on the PROCESS main thread
     // (`pthread_main_np`, Metal shader compilation) — a guarantee the test
