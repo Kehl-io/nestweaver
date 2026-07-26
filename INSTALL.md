@@ -1,120 +1,110 @@
 # Installing NestWeaver
 
-Step-by-step guide for installing and configuring NestWeaver.
+Install a pre-built CLI from [GitHub Releases](https://github.com/Kehl-io/nestweaver/releases/latest), or build from source. There is currently no published npm or crates.io package.
 
-## Option 1: npm (recommended, no Rust needed)
+## Pre-built CLI (recommended)
 
-```bash
-npm install -g @kehl-io/nestweaver
+Open the latest GitHub Release and download the archive and matching `.sha256`
+file for your platform. Release archive names follow this pattern:
+
+| Platform | Release target |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` |
+| macOS Intel | `x86_64-apple-darwin` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+
+For the selected release tag and target, download
+`nestweaver-<tag>-<target>.tar.gz` and
+`nestweaver-<tag>-<target>.tar.gz.sha256`. Do not substitute a version number
+in this guide; use the tag displayed by the release you selected.
+
+Verify the archive before extracting it:
+
+```sh
+ARCHIVE="nestweaver-<tag>-<target>.tar.gz"
+shasum -a 256 -c "$ARCHIVE.sha256"
+tar -xzf "$ARCHIVE"
+sudo install -m 755 nestweaver /usr/local/bin/nestweaver
 nestweaver --version
-# Expected: nestweaver X.Y.Z
 ```
 
-## Option 2: Cargo (Rust users)
+On Linux, `sha256sum -c "$ARCHIVE.sha256"` is an equivalent checksum command.
 
-Build and install from a local checkout (crates.io publishing is not yet
-automated, so `cargo install nestweaver` from the registry may lag the latest
-release — build from source to guarantee the current version):
+Current macOS release archives are **CPU-only**: they are not built with the
+Metal feature. This warning must be removed only in the release that passes the
+artifact capability smoke test from Metal Task 5.
 
-```bash
-git clone https://github.com/Kehl-io/nestweaver && cd nestweaver
-cargo install --path .
+## Build from source
+
+Building from source requires Rust 1.85+.
+
+```sh
+git clone https://github.com/Kehl-io/nestweaver.git
+cd nestweaver
+cargo install --locked --path .
 nestweaver --version
-# Expected: nestweaver X.Y.Z
 ```
 
-Semantic embeddings are included by default (`embed` feature). On **macOS**, add
-`--features metal` for GPU-accelerated embeddings from the CLI:
+Semantic embeddings are included by default. On macOS, build with Metal when
+you want GPU-accelerated embeddings:
 
-```bash
-cargo install --path . --features metal   # macOS: Metal GPU embeddings
+```sh
+cargo install --locked --path . --features metal
 ```
 
-> The macOS `.app` bundle (below) is already built with Metal and is the
-> recommended way to run on a Mac.
+## macOS app
 
-> **Building from source?** If you previously installed via `cargo install` and
-> are now building from a local checkout, run `cargo install --path .` after
-> each build to update `~/.cargo/bin/nestweaver`. Otherwise the installed binary
-> will be stale and may lack newer subcommands (e.g. `server`, `connect`).
+The native `NestWeaver.app` is source-build-only until a release job publishes
+a `.app` bundle or DMG. Build it from a checkout with `app/build.sh`; that build
+uses the Metal feature.
 
-## Option 3: Pre-built binary
-
-Download the latest release for your platform from
-[GitHub Releases](https://github.com/Kehl-io/nestweaver/releases/latest).
-
-Extract and install:
-```bash
-tar xzf nestweaver-*.tar.gz
-sudo mv nestweaver /usr/local/bin/
+```sh
+cd app && bash build.sh
+open target/release/NestWeaver.app
 ```
 
 ## Configure for your AI tool
 
-```bash
+```sh
 nestweaver setup
-# Expected output:
-# NestWeaver Setup
-# ────────────────────────────────────────
-# ✓ Claude Code — .claude/settings.json — MCP server configured
-# ✓ Cursor — .cursor/mcp.json — MCP server (lite: 6 tools)
-# ...
 ```
 
-## Index your codebase
+## Index and verify
 
-```bash
+```sh
 nestweaver index --repo .
-# Expected: Indexing /path/to/repo → ./nestweaver.lbug
-```
-
-## Add a markdown vault (optional)
-
-```bash
-nestweaver brain add ~/path/to/vault
-# Expected: Indexed vault '...': N note(s), M heading(s), ...
-```
-
-## Verify
-
-```bash
 nestweaver search "main"
-# Expected: Found N symbol(s) matching 'main':
-
-nestweaver brain status
-# Expected: Brain status with vault counts
 ```
 
 ## Start the MCP server
 
-```bash
+```sh
 nestweaver mcp --db ./nestweaver.lbug
-# Auto-starts a background daemon on first use (~1s startup delay)
-# The server runs on stdio, proxying queries through the daemon
 ```
 
-The daemon owns the database exclusively, enabling concurrent access from multiple AI tools and CLI commands. Daemon logs are at `~/.local/state/nestweaver/<instance>/daemon.log`.
+The daemon owns the database exclusively. It auto-starts on first use and logs
+to `~/.local/state/nestweaver/<instance>/daemon.log`.
 
 ## Optional: Git history analysis
 
-```bash
+```sh
 nestweaver index --repo . --with-git-activity
 ```
 
-This enables co-change mining (finds files that always change together) and git recency scoring for ranking. Results are stored as sidecars alongside the database.
+## Server mode
 
-## Server Mode
+NestWeaver can connect to a shared upstream server for org-wide code
+intelligence:
 
-NestWeaver can connect to a shared upstream server for org-wide code intelligence.
-
-Connect to a server:
-```bash
+```sh
 nestweaver connect <url> --token <bearer-token>
 ```
 
 Or set the environment variable:
-```bash
+
+```sh
 export NESTWEAVER_UPSTREAM=grpcs://nestweaver.example.com:9378
 ```
 
-Local queries are automatically augmented with server-side results when an upstream is configured. See `AGENTS.md` for detailed routing behavior and configuration.
+See [Server Mode](docs/server-mode.md) for routing behavior and configuration.

@@ -95,8 +95,8 @@ Opt-in usage tracking that learns from agent query patterns to improve PPR ranki
 ## Quick Start
 
 ```sh
-# Install (requires Rust 1.85+)
-cargo install --path .
+# From a source checkout (requires Rust 1.85+)
+cargo install --locked --path .
 
 # Index a repository (auto-detects repo root from .git)
 nestweaver index
@@ -160,9 +160,11 @@ See [Server Mode Guide](docs/server-mode.md) for full documentation.
 
 ## Install
 
-### macOS (recommended: native app)
+### macOS app (source build)
 
-Build the native **NestWeaver.app** from source (it bundles Metal-accelerated embeddings and the web UI):
+The native **NestWeaver.app** is source-build-only until a release job publishes
+a `.app` bundle or DMG. Build it from source (it bundles Metal-accelerated
+embeddings and the web UI):
 
 ```sh
 cd app && bash build.sh
@@ -173,18 +175,28 @@ The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x f
 
 ### All platforms (CLI)
 
-```sh
-# npm (recommended — no Rust needed)
-npm install -g @kehl-io/nestweaver
+The primary pre-built installation path is a GitHub Release archive. Select the
+archive for your platform, verify its matching SHA-256 file, then install it as
+described in [INSTALL.md](INSTALL.md#pre-built-cli-recommended). Current macOS
+archives are CPU-only; build from source with `--features metal` when Metal
+embeddings are required.
 
-# or Cargo
-cargo install --path .
+| Platform | Release target |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` |
+| macOS Intel | `x86_64-apple-darwin` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+
+```sh
+# After cloning the source repository (Rust 1.85+)
+cargo install --locked --path .
 ```
 
 <details>
 <summary>Pre-built binaries</summary>
 
-Download a pre-built binary for your platform from [GitHub Releases](https://github.com/Kehl-io/nestweaver/releases). Binaries are available for Linux and macOS on both x86_64 and aarch64.
+Download a pre-built CLI archive and its matching `.sha256` file from [GitHub Releases](https://github.com/Kehl-io/nestweaver/releases). Binaries are available for Linux and macOS on both x86_64 and aarch64; use the target table above and follow the checksum verification in [INSTALL.md](INSTALL.md#pre-built-cli-recommended).
 
 </details>
 
@@ -194,8 +206,9 @@ Download a pre-built binary for your platform from [GitHub Releases](https://git
 ```sh
 git clone https://github.com/Kehl-io/nestweaver.git
 cd nestweaver
-cargo build --release
-# Binary is at target/release/nestweaver
+cargo install --locked --path .
+# On macOS with Metal embeddings:
+# cargo install --locked --path . --features metal
 ```
 
 </details>
@@ -406,7 +419,8 @@ weight_semantic = 0.35
 <details>
 <summary>macOS App</summary>
 
-NestWeaver includes a native macOS `.app` bundle — the recommended way to run on Mac. It provides:
+NestWeaver can build a native macOS `.app` bundle from source. No release
+`.app` bundle or DMG is currently published. A source build provides:
 
 - **Menubar status icon** with quick access to the web UI and daemon status
 - **Metal GPU acceleration** — the app launches the daemon as a launchd Aqua agent so it runs in the GUI session and can reach the Metal shader compiler for GPU embeddings (~5x faster: 7ms vs 37ms). The daemon loads the embedding model on its main thread, which is what lets a background process reach Metal.

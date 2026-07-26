@@ -180,6 +180,32 @@ url = "{}"
 }
 
 #[test]
+fn installation_docs_only_claim_live_channels() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs = [
+        "INSTALL.md",
+        "README.md",
+        "docs/guide/instance-config.md",
+        "docs/server-mode.md",
+    ];
+    let unsupported_commands = [
+        "npm install -g @kehl-io/nestweaver",
+        "cargo install nestweaver",
+    ];
+
+    for relative_path in docs {
+        let contents = std::fs::read_to_string(repo_root.join(relative_path))
+            .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
+        for command in unsupported_commands {
+            assert!(
+                !contents.contains(command),
+                "{relative_path} advertises unavailable installation command `{command}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn standalone_suggest_links_reads_canonical_manifest_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("brain.lbug");

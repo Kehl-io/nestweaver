@@ -24,9 +24,8 @@ backend = "local"
 path = "~/.local/share/nestweaver/acme/workspace"
 
 [inference]
-# Required connection settings for an inference service used by commands that
-# request remote embeddings or summaries. This is separate from the local
-# semantic-search model configured in [embedding] below.
+# Required connection settings for the remote inference subsystem. This is
+# separate from the semantic-search subsystem configured in [embedding] below.
 endpoint = "http://localhost:11434"
 embedding_model = "nomic-embed-text"
 summary_model = "qwen2.5-coder:7b"
@@ -34,9 +33,10 @@ summary_model = "qwen2.5-coder:7b"
 # NESTWEAVER_EMBED_API_KEY environment variable — it is sent as a bearer token and
 # is NEVER written to config, the graph, or a snapshot. Omit it for local Ollama.
 
-# Local semantic-search model + retrieval fusion weights. [embedding] is
-# independent from [inference]: it selects the local model used to search and
-# embed the graph, while [inference] names the remote models for requests.
+# [embedding] is independently configured local/external semantic search plus
+# retrieval fusion. Its defaults apply when omitted; it does not inherit values
+# from [inference]. Do not rely on silent external-to-local fallback: the current
+# transitional fallback is not a configuration guarantee and is being removed.
 [embedding]
 model_id = "sentence-transformers/all-MiniLM-L6-v2"
 weight_ppr = 0.40      # graph structure (Personalized PageRank)
@@ -47,9 +47,12 @@ weight_semantic = 0.35 # embedding similarity
 credential_method = "gh"
 
 # ── Repositories ──────────────────────────────────────────────────────────
+# `url` is required. `name` is optional, and `type` is optional: `code` is the
+# default; use `vault` for Markdown repositories.
 
 [[repos]]
 url = "https://github.com/acme/web-client"
+name = "web-client"
 
 [[repos]]
 url = "https://github.com/acme/api-service"
