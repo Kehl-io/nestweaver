@@ -35,10 +35,11 @@ summary_model = "qwen2.5-coder:7b"
 
 # [embedding] is independently configured local/external semantic search plus
 # retrieval fusion. Its defaults apply when omitted; it does not inherit values
-# from [inference]. Do not rely on silent external-to-local fallback: the current
-# transitional fallback is not a configuration guarantee and is being removed.
+# from [inference]. An external endpoint is authoritative: failures are returned
+# directly and never fall back to a local model.
 [embedding]
 model_id = "sentence-transformers/all-MiniLM-L6-v2"
+accelerator = "auto" # auto | metal | cpu
 weight_ppr = 0.40      # graph structure (Personalized PageRank)
 weight_bm25 = 0.25     # text match
 weight_semantic = 0.35 # embedding similarity

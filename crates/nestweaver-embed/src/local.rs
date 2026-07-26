@@ -6,15 +6,19 @@ use hf_hub::{HFClientSync, split_id};
 use tokenizers::Tokenizer;
 use tracing::info;
 
+use crate::{DeviceKind, DevicePolicy};
+
 pub struct LocalModel {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
+    device_kind: DeviceKind,
     dimension: usize,
 }
 
 impl LocalModel {
     pub fn load(config: &crate::EmbedConfig) -> Result<Self> {
+        let (device, device_kind) = select_device(config.device_policy)?;
         let client = HFClientSync::new()?;
         let (owner, name) = split_id(&config.model_id);
         let repo = client.model(owner, name);
@@ -42,55 +46,51 @@ impl LocalModel {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
-        // Try each candidate device. Metal can panic when the compiler service
-        // is unavailable (common in daemons),
-        // so wrap each attempt in catch_unwind.
-        for device in candidate_devices() {
-            info!(device = ?device, model = %config.model_id, "Loading embedding model");
-            let bc = bert_config.clone();
-            let wp = weights_path.clone();
-            let tok = tokenizer.clone();
-            let dim = dimension;
+        info!(?device_kind, device = ?device, model = %config.model_id, "Loading embedding model");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    std::slice::from_ref(&weights_path),
+                    candle_core::DType::F32,
+                    &device,
+                )?
+            };
+            let model = BertModel::load(vb, &bert_config)?;
+            let candidate = Self {
+                model,
+                tokenizer,
+                device,
+                device_kind,
+                dimension,
+            };
+            candidate.embed(&["test"])?;
+            Ok::<Self, anyhow::Error>(candidate)
+        }));
 
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let vb = unsafe {
-                    VarBuilder::from_mmaped_safetensors(
-                        std::slice::from_ref(&wp),
-                        candle_core::DType::F32,
-                        &device,
-                    )?
-                };
-                let model = BertModel::load(vb, &bc)?;
-                let candidate = Self {
-                    model,
-                    tokenizer: tok,
-                    device,
-                    dimension: dim,
-                };
-                candidate.embed(&["test"])?;
-                Ok::<Self, anyhow::Error>(candidate)
-            }));
-
-            match result {
-                Ok(Ok(mut model)) => {
-                    model.tokenizer = tokenizer;
-                    info!(dimension, device = ?model.device, "Embedding model loaded");
-                    return Ok(model);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Device probe failed: {e}");
-                }
-                Err(_) => {
-                    tracing::warn!("Device probe panicked, trying next device");
-                }
+        match result {
+            Ok(Ok(model)) => {
+                info!(dimension, ?device_kind, "Embedding model loaded");
+                Ok(model)
             }
+            Ok(Err(err)) => Err(err).with_context(|| {
+                format!(
+                    "embedding model probe failed for requested device policy {policy:?}",
+                    policy = config.device_policy
+                )
+            }),
+            Err(_) => anyhow::bail!(
+                "embedding model probe panicked for requested device policy {:?}",
+                config.device_policy
+            ),
         }
-
-        anyhow::bail!("No working device found for embedding model")
     }
 
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    pub fn device_kind(&self) -> DeviceKind {
+        self.device_kind
     }
 
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -141,16 +141,92 @@ impl LocalModel {
     }
 }
 
-#[allow(unused_mut)]
-fn candidate_devices() -> Vec<Device> {
-    let mut devices = vec![Device::Cpu];
-    #[cfg(feature = "metal")]
-    {
-        if let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) {
-            devices.insert(0, device);
+fn select_device(policy: DevicePolicy) -> Result<(Device, DeviceKind)> {
+    select_device_with(policy, || {
+        #[cfg(feature = "metal")]
+        {
+            Device::new_metal(0).map_err(Into::into)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            anyhow::bail!("Metal support is not compiled")
+        }
+    })
+}
+
+fn select_device_with<F>(policy: DevicePolicy, metal_factory: F) -> Result<(Device, DeviceKind)>
+where
+    F: FnOnce() -> Result<Device>,
+{
+    match policy {
+        DevicePolicy::Cpu => Ok((Device::Cpu, DeviceKind::Cpu)),
+        DevicePolicy::Auto | DevicePolicy::Metal => {
+            #[cfg(feature = "metal")]
+            {
+                let device = std::panic::catch_unwind(std::panic::AssertUnwindSafe(metal_factory))
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Metal device creation panicked for requested device policy {policy:?}"
+                        )
+                    })?
+                    .with_context(|| {
+                        format!(
+                            "Metal device creation failed for requested device policy {policy:?}"
+                        )
+                    })?;
+                if !device.is_metal() {
+                    anyhow::bail!(
+                        "Metal device factory returned a non-Metal device for requested device policy {policy:?}"
+                    );
+                }
+                Ok((device, DeviceKind::Metal))
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                let _ = metal_factory;
+                anyhow::bail!(
+                    "requested device policy {policy:?} requires Metal, but Metal support is not compiled"
+                )
+            }
         }
     }
-    devices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DeviceKind, DevicePolicy};
+    use std::cell::Cell;
+
+    #[test]
+    fn metal_policy_never_returns_cpu() {
+        let selected = select_device_with(DevicePolicy::Metal, || Ok(Device::Cpu));
+
+        match selected {
+            Ok((device, kind)) => {
+                assert!(
+                    device.is_metal(),
+                    "explicit Metal must not return a CPU device"
+                );
+                assert_eq!(kind, DeviceKind::Metal);
+            }
+            Err(err) => assert!(err.to_string().contains("Metal")),
+        }
+    }
+
+    #[test]
+    fn cpu_policy_never_probes_metal() {
+        let probed_metal = Cell::new(false);
+        let selected = select_device_with(DevicePolicy::Cpu, || -> Result<Device> {
+            probed_metal.set(true);
+            panic!("CPU policy must not invoke the Metal factory");
+        })
+        .expect("CPU must select CPU without probing Metal");
+
+        assert!(!probed_metal.get());
+        assert!(selected.0.is_cpu());
+        assert_eq!(selected.1, DeviceKind::Cpu);
+    }
 }
 
 /// Download a model's files (config, tokenizer, weights) into the HuggingFace cache

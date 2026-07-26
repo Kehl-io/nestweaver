@@ -6054,6 +6054,17 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
         cache_dir,
         external_endpoint: cfg.external_endpoint.clone(),
         external_model: cfg.external_model.clone(),
+        device_policy: match cfg.accelerator {
+            nestweaver_engine::config::EmbeddingAccelerator::Auto => {
+                nestweaver_embed::DevicePolicy::Auto
+            }
+            nestweaver_engine::config::EmbeddingAccelerator::Metal => {
+                nestweaver_embed::DevicePolicy::Metal
+            }
+            nestweaver_engine::config::EmbeddingAccelerator::Cpu => {
+                nestweaver_embed::DevicePolicy::Cpu
+            }
+        },
     };
     // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't hang the
     // load. On a warm cache this is instant; only the local-model path downloads.
@@ -6083,23 +6094,22 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     };
     match loaded {
         Some(Ok(model)) => {
-            tracing::info!(dim = model.dimension(), "Embedding model loaded");
-            // Only the LOCAL model's dimension is comparable to the stored index.
-            // With an external endpoint, queries are embedded by the remote model
-            // (whatever dimension built the index), so the local dim is irrelevant
-            // — comparing it would falsely disable semantic search for every
-            // remote-embedded index. Any real remote/index dimension mismatch is
-            // handled gracefully at query time by the cosine length guard.
-            if !model.uses_external_endpoint()
+            tracing::info!(
+                backend = ?model.backend_kind(),
+                device = ?model.device_kind(),
+                dim = ?model.dimension(),
+                "Embedding model loaded"
+            );
+            if let Some(model_dimension) = model.dimension()
                 && let Some(stored_dim) = state.store.embedding_index_dimension()
-                && stored_dim != model.dimension()
+                && stored_dim != model_dimension
             {
                 tracing::warn!(
-                    model_dim = model.dimension(),
+                    model_dim = model_dimension,
                     stored_dim,
                     "Embedding model dimension ({}) does not match stored embeddings ({}). \
                      Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
-                    model.dimension(),
+                    model_dimension,
                     stored_dim
                 );
             } else {
