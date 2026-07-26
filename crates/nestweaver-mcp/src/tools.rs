@@ -973,6 +973,8 @@ mod tool_schema_validation_tests {
             // Proto3 defaults from a pre-Task-7 daemon: the new scalar fields
             // decode as zero/empty/false because they were absent on the wire.
             truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -1045,6 +1047,8 @@ mod tool_schema_validation_tests {
             returned_matches: 2,
             total_matches_relation: "eq".to_string(),
             truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -1440,6 +1444,60 @@ fn mix_visibility_cache_key(base: u64, salt: u64) -> u64 {
     hasher.finish()
 }
 
+/// Semantic context is a function of both graph contents and the exact model
+/// instance available to this process. Include a versioned model namespace in
+/// its cache/single-flight key so a loading request cannot join or hit a ready
+/// model request, and a replaced model cannot inherit its predecessor's
+/// response. Process-local identity intentionally prevents semantic entries
+/// from being reused after a restart when the configured model name may point
+/// at different artifacts or an external endpoint may have changed.
+fn semantic_cache_salt(name: &str, embed_model: Option<&dyn EmbedQueryFn>) -> u64 {
+    if !matches!(name, "brain_context" | "project_context") {
+        return 0;
+    }
+    use std::hash::{Hash, Hasher};
+    static PROCESS_NAMESPACE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let process_namespace = *PROCESS_NAMESPACE.get_or_init(|| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut hasher);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .hash(&mut hasher);
+        (&PROCESS_NAMESPACE as *const std::sync::OnceLock<u64> as usize).hash(&mut hasher);
+        hasher.finish()
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "semantic-response-cache-v2".hash(&mut hasher);
+    process_namespace.hash(&mut hasher);
+    embed_model.is_some().hash(&mut hasher);
+    if let Some(model) = embed_model {
+        let data_pointer = model as *const dyn EmbedQueryFn as *const () as usize;
+        data_pointer.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn semantic_response_is_degraded(name: &str, value: &Value) -> bool {
+    matches!(name, "brain_context" | "project_context")
+        && value
+            .get("degraded_components")
+            .and_then(Value::as_array)
+            .is_some_and(|components| !components.is_empty())
+}
+
+fn ensure_dispatch_not_cancelled(
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), anyhow::Error> {
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
+            nestweaver_store::CancelReason::Timeout,
+        )));
+    }
+    Ok(())
+}
+
 // ── Single-flight coalescing for cache misses ────────────────────────────────
 /// Identical concurrent cacheable calls (same tool, args, visibility,
 /// generation, scope) otherwise stampede: every dispatch thread misses its
@@ -1507,11 +1565,12 @@ impl Drop for FlightLeader {
 
 /// Run `compute` at most once among concurrent callers sharing `key`
 /// (single-flight). The first caller computes; followers block on the shared
-/// slot's condvar and receive a clone of the leader's result. Followers
-/// inherit the leader's cancellation/failure — for an identical query that
-/// is the same outcome they would have produced themselves.
+/// slot's condvar and receive a clone of the leader's result. Cancellable
+/// followers use bounded waits so they can stop independently without
+/// disturbing the leader or other followers.
 fn coalesce_in_flight(
     key: InFlightKey,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     compute: impl FnOnce() -> Result<Value, anyhow::Error>,
 ) -> Result<Value, anyhow::Error> {
     let (slot, leader) = {
@@ -1541,13 +1600,22 @@ fn coalesce_in_flight(
         // Follower: wait for the leader to publish its result, then share it.
         let mut result = slot.result.lock().unwrap_or_else(|e| e.into_inner());
         loop {
+            ensure_dispatch_not_cancelled(cancel)?;
             if let Some(res) = &*result {
                 return match res {
                     Ok(value) => Ok(value.clone()),
                     Err(msg) => Err(anyhow!("{msg}")),
                 };
             }
-            result = slot.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+            if cancel.is_some() {
+                let (next_result, _) = slot
+                    .ready
+                    .wait_timeout(result, std::time::Duration::from_millis(25))
+                    .unwrap_or_else(|e| e.into_inner());
+                result = next_result;
+            } else {
+                result = slot.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+            }
         }
     };
 
@@ -1589,6 +1657,7 @@ fn maybe_cached(
         nestweaver_store::cache::ResponseCache::key(name, &args),
         visibility_cache_salt(visible),
     );
+    let key = mix_visibility_cache_key(key, semantic_cache_salt(name, embed_model));
     let generation = store.graph_generation();
     let scope_digest = whole_db_scope_digest(&db_path);
 
@@ -1605,21 +1674,37 @@ fn maybe_cached(
         && !store.is_index_publication_dirty()
         && store.graph_generation() == generation
     {
-        CACHE_HITS.with(|c| c.set(c.get() + 1));
         // No save() on hit — LRU timestamp update is not worth a disk round-trip.
         let value: Value =
             serde_json::from_slice(&bytes).with_context(|| "decode cached response")?;
-        return Ok(value);
+        // Defense in depth for persisted entries produced by an older binary:
+        // degraded semantic responses are transient readiness/inference states,
+        // never durable answers. Ignore them even if their legacy key matches.
+        if !semantic_response_is_degraded(name, &value) {
+            CACHE_HITS.with(|c| c.set(c.get() + 1));
+            return Ok(value);
+        }
     }
 
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
     // Single-flight: concurrent identical calls share one computation
     // instead of stampeding it (see `coalesce_in_flight`).
     let flight_key: InFlightKey = (db_path.clone(), key, generation, scope_digest);
-    let result = coalesce_in_flight(flight_key, || {
-        dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
+    let result = coalesce_in_flight(flight_key, cancel, || {
+        let result = dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)?;
+        // Check inside the leader computation so cancellation is converted to
+        // an error before FlightLeader publishes to followers.
+        ensure_dispatch_not_cancelled(cancel)?;
+        Ok(result)
     })?;
+    // Every caller must honor its own cancellation state. Followers bypass
+    // the leader closure above, so re-check after the shared result arrives
+    // before this caller can return or publish it.
+    ensure_dispatch_not_cancelled(cancel)?;
     if store.is_index_publication_dirty() || store.graph_generation() != generation {
+        return Ok(result);
+    }
+    if semantic_response_is_degraded(name, &result) {
         return Ok(result);
     }
     match serde_json::to_vec(&result) {
@@ -3104,6 +3189,8 @@ fn tool_brain_context(
         "connected": connected_json,
         "tokens_used": used_tokens,
         "token_budget": token_budget,
+        "semantic_applied": result.semantic_applied,
+        "degraded_components": &result.degraded_components,
     });
 
     if include_seeds {
@@ -7605,6 +7692,8 @@ fn tool_project_context(
             "connected": connected_json,
             "tokens_used": used_tokens,
             "token_budget": token_budget,
+            "semantic_applied": result.semantic_applied,
+            "degraded_components": &result.degraded_components,
         });
         if let Some(ref sj) = seeds_json {
             probe["seeds"] = json!(sj);
@@ -7636,6 +7725,8 @@ fn tool_project_context(
         "connected": connected_json,
         "tokens_used": used_tokens,
         "token_budget": token_budget,
+        "semantic_applied": result.semantic_applied,
+        "degraded_components": &result.degraded_components,
     });
 
     if let Some(sj) = seeds_json {
@@ -8578,6 +8669,8 @@ fn daemon_brain_search_response_to_json(
         "returned_matches": returned_matches,
         "truncated": truncated,
         "results": results,
+        "semantic_applied": response.semantic_applied,
+        "degraded_components": &response.degraded_components,
     });
     if !response.expansion_terms.is_empty() {
         value["expansion_terms"] = json!(response.expansion_terms);
@@ -8834,7 +8927,20 @@ pub fn dispatch_via_daemon(
                     recency_half_life_days: f64_field("recency_half_life_days"),
                 });
                 let resp = client.get_context(req).await.map_err(grpc_status_err)?;
-                Ok(resp.into_inner().result_json)
+                let inner = resp.into_inner();
+                let mut value: Value = serde_json::from_str(&inner.result_json)
+                    .unwrap_or(Value::String(inner.result_json));
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "semantic_applied".to_string(),
+                        json!(inner.semantic_applied),
+                    );
+                    object.insert(
+                        "degraded_components".to_string(),
+                        json!(inner.degraded_components),
+                    );
+                }
+                Ok(serde_json::to_string(&value)?)
             }
             "project_context" => {
                 use nestweaver_proto::ProjectContextRequest;
@@ -10105,6 +10211,455 @@ mod cache_dispatch_tests {
         }
     }
 
+    struct CountingFailingEmbed {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    struct BlockingFailingCacheEmbed {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct SignallingFixedEmbed {
+        called: std::sync::mpsc::SyncSender<()>,
+        vector: Vec<f32>,
+    }
+
+    impl EmbedQueryFn for CountingFailingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("deterministic inference failure")
+        }
+    }
+
+    impl EmbedQueryFn for BlockingFailingCacheEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            anyhow::bail!("loading epoch inference failed")
+        }
+    }
+
+    impl EmbedQueryFn for SignallingFixedEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.called.send(()).unwrap();
+            Ok(self.vector.clone())
+        }
+    }
+
+    #[test]
+    fn loading_semantic_result_cannot_mask_ready_model_in_process() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(store.add_embedding("sym:semantic-cache-probe", vec![1.0, 0.0, 0.0]));
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+
+        let loading = dispatch(&store, None, "brain_context", args.clone(), None).unwrap();
+        assert_eq!(loading["semantic_applied"], false);
+        assert_eq!(loading["degraded_components"], json!(["semantic"]));
+
+        let ready_model = FixedEmbed(vec![1.0, 0.0, 0.0]);
+        let ready = dispatch(&store, None, "brain_context", args, Some(&ready_model)).unwrap();
+        assert_eq!(
+            ready["semantic_applied"], true,
+            "ready model must recompute instead of hitting a loading result"
+        );
+        assert_eq!(ready["degraded_components"], json!([]));
+    }
+
+    #[test]
+    fn degraded_semantic_result_is_not_persisted_across_readiness_transition() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(store.add_embedding("sym:persisted-semantic-probe", vec![1.0, 0.0, 0.0]));
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+
+        let degraded = dispatch(&store, None, "brain_context", args.clone(), None).unwrap();
+        assert_eq!(degraded["degraded_components"], json!(["semantic"]));
+        flush_response_cache();
+
+        // Simulate a new dispatch session reopening the persisted cache after
+        // the daemon's model transitions from loading to ready.
+        reset_session();
+        set_current_db_path(db_path.clone());
+        let ready_model = FixedEmbed(vec![1.0, 0.0, 0.0]);
+        let ready = dispatch(&store, None, "brain_context", args, Some(&ready_model)).unwrap();
+        assert_eq!(
+            ready["semantic_applied"], true,
+            "persisted loading response must not survive model readiness"
+        );
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn inference_failed_semantic_result_is_never_cached() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(store.add_embedding("sym:failed-semantic-probe", vec![1.0, 0.0, 0.0]));
+        let model = CountingFailingEmbed { calls: 0.into() };
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+
+        for _ in 0..2 {
+            let result =
+                dispatch(&store, None, "brain_context", args.clone(), Some(&model)).unwrap();
+            assert_eq!(result["degraded_components"], json!(["semantic"]));
+        }
+
+        assert_eq!(
+            model.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "failed inference must be retried, never served from cache"
+        );
+        flush_response_cache();
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(
+            cache.is_empty(),
+            "degraded semantic responses must not be persisted"
+        );
+    }
+
+    #[test]
+    fn project_context_inference_failure_is_never_cached() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        let project = nestweaver_schema::Project {
+            uid: "proj:semantic-cache".to_string(),
+            name: "Semantic Cache Project".to_string(),
+            summary: None,
+            instance_id: "test".to_string(),
+        };
+        store.insert_project(&project).unwrap();
+        let symbol_uid = store.lookup_symbols_by_name("greet").unwrap()[0]
+            .uid
+            .clone();
+        store
+            .batch_insert_project_symbol_edges(&project.uid, std::slice::from_ref(&symbol_uid), 1.0)
+            .unwrap();
+        assert!(store.add_embedding(&symbol_uid, vec![1.0, 0.0, 0.0]));
+        let model = CountingFailingEmbed { calls: 0.into() };
+        let args = json!({ "project": "Semantic Cache Project", "token_budget": 2000 });
+
+        for _ in 0..2 {
+            let result =
+                dispatch(&store, None, "project_context", args.clone(), Some(&model)).unwrap();
+            assert_eq!(result["degraded_components"], json!(["semantic"]));
+        }
+
+        assert_eq!(
+            model.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "project_context inference failure must be retried, never cached"
+        );
+    }
+
+    #[test]
+    fn ready_model_does_not_join_degraded_single_flight() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        let store = std::sync::Arc::new(GraphStore::open(&db_path).unwrap());
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(store.add_embedding("sym:single-flight-probe", vec![1.0, 0.0, 0.0]));
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let loading_model = std::sync::Arc::new(BlockingFailingCacheEmbed {
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+
+        let loading_store = store.clone();
+        let loading_path = db_path.clone();
+        let loading_args = args.clone();
+        let loading = std::thread::spawn(move || {
+            set_current_db_path(loading_path);
+            dispatch(
+                &loading_store,
+                None,
+                "brain_context",
+                loading_args,
+                Some(loading_model.as_ref()),
+            )
+            .unwrap()
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("loading model must enter inference");
+
+        let (ready_called_tx, ready_called_rx) = std::sync::mpsc::sync_channel(1);
+        let ready_model = std::sync::Arc::new(SignallingFixedEmbed {
+            called: ready_called_tx,
+            vector: vec![1.0, 0.0, 0.0],
+        });
+        let ready_store = store.clone();
+        let ready_path = db_path.clone();
+        let ready = std::thread::spawn(move || {
+            set_current_db_path(ready_path);
+            dispatch(
+                &ready_store,
+                None,
+                "brain_context",
+                args,
+                Some(ready_model.as_ref()),
+            )
+            .unwrap()
+        });
+
+        ready_called_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("ready model must compute independently of degraded in-flight request");
+        let ready_result = ready.join().unwrap();
+        assert_eq!(ready_result["semantic_applied"], true);
+
+        release_tx.send(()).unwrap();
+        let loading_result = loading.join().unwrap();
+        assert_eq!(loading_result["degraded_components"], json!(["semantic"]));
+    }
+
+    #[test]
+    fn cancellation_during_failed_inference_is_not_published_or_cached() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        let store = std::sync::Arc::new(GraphStore::open(&db_path).unwrap());
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(store.add_embedding("sym:cancel-error-probe", vec![1.0, 0.0, 0.0]));
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let model = std::sync::Arc::new(BlockingFailingCacheEmbed {
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+
+        let worker_store = store.clone();
+        let worker_path = db_path.clone();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            reset_session();
+            set_current_db_path(worker_path);
+            let result = dispatch_cancellable(
+                &worker_store,
+                None,
+                "brain_context",
+                args,
+                Some(model.as_ref()),
+                Some(&worker_cancel),
+                None,
+            );
+            flush_response_cache();
+            result
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("failing inference must start");
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        release_tx.send(()).unwrap();
+
+        let err = worker
+            .join()
+            .unwrap()
+            .expect_err("cancelled inference error must not degrade to success");
+        assert!(
+            err.downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(nestweaver_store::StoreError::is_cancelled),
+            "expected StoreError::Cancelled, got: {err:#}"
+        );
+        let cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(
+            cache.is_empty(),
+            "cancelled inference result must not be published to the persisted cache"
+        );
+    }
+
+    #[test]
+    fn cancelled_follower_rejects_failed_leaders_degraded_result() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        let store = std::sync::Arc::new(GraphStore::open(&db_path).unwrap());
+        store
+            .load_pagerank_cache(&nestweaver_engine::sidecar_path(&db_path, ".pagerank.json"))
+            .unwrap();
+        assert!(store.add_embedding("sym:cancelled-follower-probe", vec![1.0, 0.0, 0.0]));
+        let args = json!({ "seeds": ["greet"], "token_budget": 2000 });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let model = std::sync::Arc::new(BlockingFailingCacheEmbed {
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+
+        let flight_key = {
+            let key = mix_visibility_cache_key(
+                nestweaver_store::cache::ResponseCache::key("brain_context", &args),
+                visibility_cache_salt(None),
+            );
+            let key =
+                mix_visibility_cache_key(key, semantic_cache_salt("brain_context", Some(&*model)));
+            (
+                db_path.clone(),
+                key,
+                store.graph_generation(),
+                whole_db_scope_digest(&db_path),
+            )
+        };
+
+        let leader_store = store.clone();
+        let leader_path = db_path.clone();
+        let leader_args = args.clone();
+        let leader_model = model.clone();
+        let leader = std::thread::spawn(move || {
+            reset_session();
+            set_current_db_path(leader_path.clone());
+            let result = dispatch(
+                &leader_store,
+                None,
+                "brain_context",
+                leader_args,
+                Some(leader_model.as_ref()),
+            );
+            let cache_is_empty = RESPONSE_CACHE.with(|caches| {
+                caches
+                    .borrow()
+                    .get(&leader_path)
+                    .is_none_or(nestweaver_store::cache::ResponseCache::is_empty)
+            });
+            flush_response_cache();
+            (result, cache_is_empty)
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("leader must block inside failing inference");
+
+        let leader_ref_count = {
+            let flights = IN_FLIGHT
+                .get()
+                .expect("leader must initialize the flight map")
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::sync::Arc::strong_count(
+                flights
+                    .get(&flight_key)
+                    .expect("leader must publish the in-flight slot"),
+            )
+        };
+
+        let follower_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let follower_store = store.clone();
+        let follower_path = db_path.clone();
+        let follower_model = model.clone();
+        let follower_cancel_worker = follower_cancel.clone();
+        let (follower_done_tx, follower_done_rx) = std::sync::mpsc::sync_channel(1);
+        let follower = std::thread::spawn(move || {
+            reset_session();
+            set_current_db_path(follower_path.clone());
+            let result = dispatch_cancellable(
+                &follower_store,
+                None,
+                "brain_context",
+                args,
+                Some(follower_model.as_ref()),
+                Some(&follower_cancel_worker),
+                None,
+            );
+            let cache_is_empty = RESPONSE_CACHE.with(|caches| {
+                caches
+                    .borrow()
+                    .get(&follower_path)
+                    .is_none_or(nestweaver_store::cache::ResponseCache::is_empty)
+            });
+            flush_response_cache();
+            follower_done_tx.send(()).unwrap();
+            (result, cache_is_empty)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let follower_registered = IN_FLIGHT.get().is_some_and(|flights| {
+                let flights = flights.lock().unwrap_or_else(|error| error.into_inner());
+                flights
+                    .get(&flight_key)
+                    .is_some_and(|slot| std::sync::Arc::strong_count(slot) > leader_ref_count)
+            });
+            if follower_registered {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follower must join the leader's in-flight slot"
+            );
+            std::thread::yield_now();
+        }
+
+        follower_cancel.store(true, std::sync::atomic::Ordering::Release);
+        let follower_stopped_waiting = follower_done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        release_tx.send(()).unwrap();
+
+        let (leader_result, leader_cache_is_empty) = leader.join().unwrap();
+        let leader_result = leader_result.unwrap();
+        assert_eq!(leader_result["degraded_components"], json!(["semantic"]));
+        assert!(
+            leader_cache_is_empty,
+            "leader's degraded result must not enter its response cache"
+        );
+        assert!(
+            follower_stopped_waiting,
+            "cancelled follower must stop waiting before the leader publishes"
+        );
+        let (follower_result, follower_cache_is_empty) = follower.join().unwrap();
+        let follower_error = follower_result
+            .expect_err("cancelled follower must reject the leader's degraded success");
+        assert!(
+            follower_error
+                .downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(nestweaver_store::StoreError::is_cancelled),
+            "expected StoreError::Cancelled, got: {follower_error:#}"
+        );
+        assert!(
+            follower_cache_is_empty,
+            "cancelled follower must not enter a result into its response cache"
+        );
+        let persisted_cache = nestweaver_store::cache::ResponseCache::open(
+            &db_path,
+            nestweaver_store::cache::DEFAULT_MAX_SIZE_MB,
+        );
+        assert!(
+            persisted_cache.is_empty(),
+            "failed/degraded flight must not create a persisted response-cache entry"
+        );
+    }
+
     #[test]
     fn cancelled_query_is_not_cached() {
         reset_session();
@@ -10342,7 +10897,7 @@ mod cache_dispatch_tests {
         let leader_calls = Arc::clone(&calls);
         let leader_release = Arc::clone(&release);
         let leader = std::thread::spawn(move || {
-            coalesce_in_flight(leader_key, move || {
+            coalesce_in_flight(leader_key, None, move || {
                 leader_calls.fetch_add(1, Ordering::SeqCst);
                 // Hold the flight open until the main thread has watched the
                 // follower attach, then released us below.
@@ -10355,7 +10910,7 @@ mod cache_dispatch_tests {
         let baseline = wait_for_flight_count(&key, |c| c >= 1);
         let follower_key = key.clone();
         let follower = std::thread::spawn(move || {
-            coalesce_in_flight(follower_key, || {
+            coalesce_in_flight(follower_key, None, || {
                 panic!("follower must never run the computation")
             })
         });
@@ -10389,11 +10944,11 @@ mod cache_dispatch_tests {
             3,
         );
 
-        let err = coalesce_in_flight(key.clone(), || Err(anyhow!("boom"))).unwrap_err();
+        let err = coalesce_in_flight(key.clone(), None, || Err(anyhow!("boom"))).unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
 
         // The flight entry must be gone and the next call must compute fresh.
-        let ok = coalesce_in_flight(key.clone(), || Ok(json!("recovered"))).unwrap();
+        let ok = coalesce_in_flight(key.clone(), None, || Ok(json!("recovered"))).unwrap();
         assert_eq!(ok, json!("recovered"));
         let entry_gone = IN_FLIGHT
             .get()

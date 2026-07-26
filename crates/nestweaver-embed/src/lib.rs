@@ -32,13 +32,38 @@ pub enum EmbeddingBackendKind {
 
 /// Check if Metal GPU acceleration is available on this machine.
 pub fn is_metal_available() -> bool {
+    probe_metal_runtime().is_ok()
+}
+
+/// Whether this embedding crate was compiled with Candle's Metal backend.
+pub const fn metal_compiled() -> bool {
+    cfg!(feature = "metal")
+}
+
+/// Run a tiny Metal compute/readback probe without loading model artifacts.
+///
+/// Creating a Metal device alone does not prove kernels can compile and
+/// execute. The affine operation forces a real GPU kernel and `to_vec1`
+/// synchronizes/readbacks its result.
+pub fn probe_metal_runtime() -> Result<()> {
     #[cfg(feature = "metal")]
     {
-        std::panic::catch_unwind(|| candle_core::Device::new_metal(0).is_ok()).unwrap_or(false)
+        std::panic::catch_unwind(|| -> Result<()> {
+            let device = candle_core::Device::new_metal(0)?;
+            let input = candle_core::Tensor::from_slice(&[1.0_f32, 2.0], 2, &device)?;
+            let output = input.affine(2.0, 1.0)?;
+            let values = output.to_vec1::<f32>()?;
+            anyhow::ensure!(
+                values == [3.0_f32, 5.0],
+                "Metal compute/readback returned unexpected values: {values:?}"
+            );
+            Ok(())
+        })
+        .map_err(|_| anyhow::anyhow!("Metal runtime probe panicked"))?
     }
     #[cfg(not(feature = "metal"))]
     {
-        false
+        anyhow::bail!("Metal support was not compiled into this binary")
     }
 }
 
@@ -188,6 +213,16 @@ impl EmbedModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metal_capability_distinguishes_compile_support_from_runtime_probe() {
+        assert_eq!(metal_compiled(), cfg!(feature = "metal"));
+        if !metal_compiled() {
+            let error = probe_metal_runtime()
+                .expect_err("a build without Metal must not report a successful runtime probe");
+            assert!(error.to_string().contains("not compiled"));
+        }
+    }
 
     #[test]
     fn external_failure_does_not_load_local() {

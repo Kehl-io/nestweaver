@@ -201,6 +201,10 @@ pub struct McpHttpState {
     /// daemon's gRPC path. Populated by a background task when the `embed`
     /// feature is enabled.
     pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+    /// Optional runtime snapshot provider. Daemon mode installs this so model
+    /// reads are atomic with readiness publication; standalone MCP retains the
+    /// mutable lock above for backward compatibility.
+    pub embed_model_provider: Option<Arc<dyn nestweaver_engine::EmbedModelProvider>>,
     /// Daemon-side federation coordinator, built once from the instance
     /// config's `[[upstream]]` entries. `None` for the common single-node case
     /// (no upstreams configured) — the `/mcp` boundary then stamps the honest
@@ -281,6 +285,7 @@ impl McpHttpState {
             permission_source,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            embed_model_provider: None,
             #[cfg(feature = "daemon")]
             federation: None,
         }
@@ -314,6 +319,7 @@ impl McpHttpState {
             permission_source,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            embed_model_provider: None,
             #[cfg(feature = "daemon")]
             federation: None,
         }
@@ -896,7 +902,9 @@ async fn handle_mcp(
 
             // Read the embed model Arc outside the blocking thread (matches the
             // gRPC handler pattern in server.rs), then drop the RwLock guard.
-            let embed_arc = {
+            let embed_arc = if let Some(provider) = &state.embed_model_provider {
+                provider.current_model()
+            } else {
                 let guard = state.embed_model.read().await;
                 guard.clone()
             };

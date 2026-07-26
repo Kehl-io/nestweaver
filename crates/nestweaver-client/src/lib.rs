@@ -180,6 +180,16 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    /// Return graph and structured embedding readiness for the running daemon.
+    pub async fn brain_status(&mut self) -> Result<nestweaver_proto::BrainStatusResponse> {
+        let resp = self
+            .inner
+            .brain_status(nestweaver_proto::BrainStatusRequest {})
+            .await
+            .context("brain_status RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
     /// The running daemon's own PID, as reported over its socket.
     ///
     /// Cross-check this against a pidfile PID before signaling that PID: a

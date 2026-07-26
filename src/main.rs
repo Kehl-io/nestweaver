@@ -365,6 +365,104 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
     }
 }
 
+fn capability_diagnostics_value(
+    embedding_compiled: bool,
+    metal_compiled: bool,
+    runtime_probe: Result<(), String>,
+) -> serde_json::Value {
+    let (metal_runtime_available, metal_runtime_error) = match runtime_probe {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(error)),
+    };
+    serde_json::json!({
+        "embedding_compiled": embedding_compiled,
+        "metal_compiled": metal_compiled,
+        "metal_runtime_available": metal_runtime_available,
+        "metal_runtime_error": metal_runtime_error,
+    })
+}
+
+fn current_capability_diagnostics() -> serde_json::Value {
+    #[cfg(feature = "embed")]
+    {
+        capability_diagnostics_value(
+            true,
+            nestweaver_embed::metal_compiled(),
+            nestweaver_embed::probe_metal_runtime().map_err(|error| format!("{error:#}")),
+        )
+    }
+    #[cfg(not(feature = "embed"))]
+    {
+        capability_diagnostics_value(
+            false,
+            false,
+            Err("embedding support was not compiled into this binary".to_string()),
+        )
+    }
+}
+
+fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String {
+    let selected = if status.selected_device.is_empty() {
+        "unavailable"
+    } else {
+        &status.selected_device
+    };
+    let mut lines = vec![
+        format!("  State:            {}", status.state),
+        format!("  Backend:          {}", status.backend),
+        format!(
+            "  Device:           {} -> {selected}",
+            status.requested_device
+        ),
+        format!("  Model:            {}", status.model_id),
+        format!("  Metal compiled:   {}", status.metal_compiled),
+        format!("  Fallback used:    {}", status.fallback_used),
+    ];
+    if !status.error.is_empty() {
+        lines.push(format!("  Error:            {}", status.error));
+    }
+    lines.join("\n")
+}
+
+fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::EmbeddingStatus {
+    nestweaver_proto::EmbeddingStatus {
+        state: value["state"].as_str().unwrap_or("unknown").to_string(),
+        backend: value["backend"].as_str().unwrap_or("").to_string(),
+        requested_device: value["requested_device"].as_str().unwrap_or("").to_string(),
+        selected_device: value["selected_device"].as_str().unwrap_or("").to_string(),
+        model_id: value["model_id"].as_str().unwrap_or("").to_string(),
+        error: value["error"].as_str().unwrap_or("").to_string(),
+        metal_compiled: value["metal_compiled"].as_bool().unwrap_or(false),
+        fallback_used: value["fallback_used"].as_bool().unwrap_or(false),
+    }
+}
+
+fn print_daemon_embedding_status(db_path: &Path) {
+    let result = tokio::runtime::Runtime::new()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                let mut client = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
+                client.brain_status().await
+            })
+        });
+    match result {
+        Ok(status) => {
+            println!("Embedding:");
+            if let Some(status) = status.embedding_status {
+                println!("{}", format_embedding_status(&status));
+            } else {
+                println!("  State:            unknown (older daemon)");
+            }
+        }
+        Err(error) => {
+            println!("Embedding:");
+            println!("  State:            unavailable (daemon booting or unreachable)");
+            println!("  Error:            {error:#}");
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// List all indexed repositories
@@ -1718,6 +1816,11 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Inspect compiled and runtime capabilities
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommands,
+    },
     /// Show hardware and configuration information
     Info {
         /// Show hardware acceleration details
@@ -1744,6 +1847,15 @@ enum Commands {
         /// change (tune what --strict blocks on via [pr_impact] in the config)
         #[arg(long)]
         strict: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiagnosticsCommands {
+    /// Report embedding and Metal compile/runtime capabilities
+    Capabilities {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
 }
 
@@ -10118,6 +10230,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
                         println!("  Log:    {}", log_file.display());
+                        print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
 
@@ -10132,6 +10245,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("  DB:     {}", db_path.display());
                             println!("  Socket: {}", socket.display());
                             println!("  Log:    {}", log_file.display());
+                            print_daemon_embedding_status(&db_path);
                         } else {
                             println!(
                                 "Daemon is not running (pidfile PID {pid} belongs to another process)."
@@ -10149,6 +10263,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
                         println!("  Log:    {}", log_file.display());
+                        print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
                     println!("Daemon is not running.");
@@ -10404,6 +10519,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
         },
+
+        Commands::Diagnostics {
+            command: DiagnosticsCommands::Capabilities { json },
+        } => {
+            let capabilities = current_capability_diagnostics();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&capabilities)?);
+            } else {
+                println!("NestWeaver capabilities:");
+                println!(
+                    "  Embedding compiled: {}",
+                    capabilities["embedding_compiled"]
+                );
+                println!("  Metal compiled:     {}", capabilities["metal_compiled"]);
+                println!(
+                    "  Metal runtime:      {}",
+                    if capabilities["metal_runtime_available"] == true {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }
+                );
+                if let Some(error) = capabilities["metal_runtime_error"].as_str() {
+                    println!("  Runtime probe error: {error}");
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
 
         Commands::Info { hardware } => {
             if hardware {
@@ -11713,6 +11856,13 @@ fn run_brain(
                     println!("  Tags:      {tags}");
                     println!("  Wikilinks: {wikilinks}");
                     println!("  Repos:     {repo_count}");
+                    if let Some(embedding) = value.get("embedding_status") {
+                        println!("Embedding:");
+                        println!(
+                            "{}",
+                            format_embedding_status(&embedding_status_from_json(embedding))
+                        );
+                    }
                     // Interaction tracking — local check (not in MCP response).
                     // The sidecar is created (empty) by `InteractionTracker::new`
                     // when an MCP/daemon starts with --track-interactions, so:
@@ -14145,6 +14295,8 @@ fn render_brain_search_response(
             "total_matches_relation": total_matches_relation,
             "returned_matches": returned_matches,
             "truncated": truncated,
+            "semantic_applied": resp.semantic_applied,
+            "degraded_components": &resp.degraded_components,
         });
         if !resp.expansion_terms.is_empty() {
             payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
@@ -14231,6 +14383,8 @@ mod brain_search_renderer_tests {
             returned_matches: 0,
             total_matches_relation: String::new(),
             truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         };
 
         let metadata = brain_search_display_metadata(&response);
@@ -18152,6 +18306,66 @@ mod stale_check_cli_tests {
             .expect("spawn")
             .join()
             .expect("join");
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_cli_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_capabilities_json_parses() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["nestweaver", "diagnostics", "capabilities", "--json"])
+                        .expect("diagnostics capabilities --json must parse");
+                assert!(matches!(
+                    cli.command,
+                    Commands::Diagnostics {
+                        command: DiagnosticsCommands::Capabilities { json: true }
+                    }
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn capability_payload_keeps_compile_and_runtime_results_separate() {
+        let value = capability_diagnostics_value(
+            true,
+            true,
+            Err("Metal compute/readback failed".to_string()),
+        );
+        assert_eq!(value["embedding_compiled"], true);
+        assert_eq!(value["metal_compiled"], true);
+        assert_eq!(value["metal_runtime_available"], false);
+        assert_eq!(
+            value["metal_runtime_error"],
+            "Metal compute/readback failed"
+        );
+    }
+
+    #[test]
+    fn embedding_status_text_includes_policy_invariant_and_error() {
+        let status = nestweaver_proto::EmbeddingStatus {
+            state: "failed".to_string(),
+            backend: "local".to_string(),
+            requested_device: "metal".to_string(),
+            selected_device: String::new(),
+            model_id: "test-model".to_string(),
+            error: "Metal probe failed".to_string(),
+            metal_compiled: true,
+            fallback_used: false,
+        };
+        let text = format_embedding_status(&status);
+        assert!(text.contains("State:            failed"));
+        assert!(text.contains("Device:           metal -> unavailable"));
+        assert!(text.contains("Fallback used:    false"));
+        assert!(text.contains("Metal probe failed"));
     }
 }
 
