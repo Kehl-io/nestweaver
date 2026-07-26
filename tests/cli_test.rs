@@ -218,6 +218,171 @@ fn installation_docs_only_claim_live_channels() {
     }
 }
 
+fn workflow_step<'a>(workflow: &'a str, name: &str) -> &'a str {
+    let marker = format!("      - name: {name}\n");
+    let start = workflow
+        .find(&marker)
+        .unwrap_or_else(|| panic!("workflow is missing step `{name}`"));
+    let remainder = &workflow[start + marker.len()..];
+    remainder
+        .split("\n      - ")
+        .next()
+        .expect("step body must be present")
+}
+
+fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let marker = "      matrix:\n        include:\n";
+    let matrix = workflow
+        .split_once(marker)
+        .expect("release workflow must define an include matrix")
+        .1
+        .split_once("\n    steps:\n")
+        .expect("release matrix must be followed by build steps")
+        .0;
+    let mut entries = Vec::new();
+    let mut current: Option<(String, Option<String>, Option<String>)> = None;
+
+    for line in matrix.lines().map(str::trim) {
+        if let Some(target) = line.strip_prefix("- target: ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some((target.trim_matches(['"', '\'']).to_string(), None, None));
+        } else if let Some(os) = line.strip_prefix("os: ") {
+            current.as_mut().expect("os must follow target").1 =
+                Some(os.trim_matches(['"', '\'']).to_string());
+        } else if let Some(features) = line.strip_prefix("features: ") {
+            current.as_mut().expect("features must follow target").2 =
+                Some(features.trim_matches(['"', '\'']).to_string());
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+#[test]
+fn release_workflow_matrix_assigns_metal_only_to_apple_targets() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let entries = release_matrix(&workflow);
+    let actual = entries
+        .iter()
+        .cloned()
+        .map(|(target, os, features)| (target, (os, features)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let expected = std::collections::BTreeMap::from([
+        (
+            "aarch64-apple-darwin".to_string(),
+            (Some("macos-latest".to_string()), Some("metal".to_string())),
+        ),
+        (
+            "aarch64-unknown-linux-gnu".to_string(),
+            (Some("ubuntu-24.04-arm".to_string()), Some(String::new())),
+        ),
+        (
+            "x86_64-apple-darwin".to_string(),
+            (
+                Some("macos-15-intel".to_string()),
+                Some("metal".to_string()),
+            ),
+        ),
+        (
+            "x86_64-unknown-linux-gnu".to_string(),
+            (Some("ubuntu-latest".to_string()), Some(String::new())),
+        ),
+    ]);
+
+    assert_eq!(
+        entries.len(),
+        actual.len(),
+        "release matrix must not contain duplicate targets"
+    );
+    assert_eq!(
+        actual, expected,
+        "release target/os/features contract drifted"
+    );
+}
+
+#[test]
+fn release_workflow_build_quotes_target_and_conditionally_enables_features() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let step = workflow_step(&workflow, "Build binary");
+
+    for required in [
+        "TARGET: ${{ matrix.target }}",
+        "FEATURES: ${{ matrix.features }}",
+        "if [ -n \"$FEATURES\" ]; then",
+        "cargo build --locked --release --target \"$TARGET\" --features \"$FEATURES\"",
+        "cargo build --locked --release --target \"$TARGET\"",
+    ] {
+        assert!(
+            step.contains(required),
+            "Build binary must contain `{required}`\nstep:\n{step}"
+        );
+    }
+}
+
+#[test]
+fn release_workflow_native_apple_verifies_metal_capability_and_artifact() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let verify_binary = workflow_step(&workflow, "Verify release binary");
+
+    for preserved in [
+        "x86_64-apple-darwin) echo \"$FILE_INFO\" | grep -q 'x86_64'",
+        "aarch64-apple-darwin) echo \"$FILE_INFO\" | grep -Eq 'arm64|ARM64'",
+        "otool -L \"$BIN\"",
+        "release binary has a non-system OpenSSL dependency",
+    ] {
+        assert!(
+            verify_binary.contains(preserved),
+            "release artifact validation must preserve `{preserved}`"
+        );
+    }
+
+    let capability = workflow_step(&workflow, "Verify Apple Metal capability");
+    for required in [
+        "if: runner.os == 'macOS'",
+        "TARGET: ${{ matrix.target }}",
+        "BIN=\"target/$TARGET/release/nestweaver\"",
+        "CAPABILITIES=\"$(\"$BIN\" diagnostics capabilities --json)\"",
+        "jq -e '.metal_compiled == true' <<< \"$CAPABILITIES\"",
+    ] {
+        assert!(
+            capability.contains(required),
+            "Apple capability step must contain `{required}`\nstep:\n{capability}"
+        );
+    }
+}
+
+#[test]
+fn ci_runs_release_workflow_contract_when_release_definition_changes() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let rust_filter = workflow
+        .split_once("            rust:\n")
+        .expect("CI must define the Rust change filter")
+        .1
+        .split_once("            frontend:\n")
+        .expect("Rust filter must precede the frontend filter")
+        .0;
+
+    assert!(
+        rust_filter.contains("- '.github/workflows/release-please.yml'"),
+        "changing release-please.yml must select the Rust test job"
+    );
+    assert!(
+        workflow.contains("cargo test --locked --workspace"),
+        "selected Rust changes must execute the workspace tests containing this contract"
+    );
+}
+
 #[test]
 fn standalone_suggest_links_reads_canonical_manifest_sidecar() {
     let dir = tempfile::tempdir().unwrap();

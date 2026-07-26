@@ -177,9 +177,10 @@ The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x f
 
 The primary pre-built installation path is a GitHub Release archive. Select the
 archive for your platform, verify its matching SHA-256 file, then install it as
-described in [INSTALL.md](INSTALL.md#pre-built-cli-recommended). Current macOS
-archives are CPU-only; build from source with `--features metal` when Metal
-embeddings are required.
+described in [INSTALL.md](INSTALL.md#pre-built-cli-recommended). Starting with
+the release that contains this change, both macOS CLI archives are built with
+Metal support. To opt out explicitly, set `accelerator = "cpu"` in the
+`[embedding]` section of your instance configuration.
 
 | Platform | Release target |
 | --- | --- |

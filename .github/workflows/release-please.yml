@@ -65,12 +65,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            features: ""
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            features: ""
           - target: x86_64-apple-darwin
             os: macos-15-intel
+            features: metal
           - target: aarch64-apple-darwin
             os: macos-latest
+            features: metal
     steps:
       - name: Verify native runner architecture
         shell: bash
@@ -185,17 +189,27 @@ jobs:
           nm -arch x86_64 "$CLANG_RT" | grep '___cpu_model'
           echo "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=$CLANG_RT" >> "$GITHUB_ENV"
       - name: Build binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        shell: bash
         env:
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
           LBUG_BUILD_FROM_SOURCE: "1"
+        run: |
+          if [ -n "$FEATURES" ]; then
+            cargo build --locked --release --target "$TARGET" --features "$FEATURES"
+          else
+            cargo build --locked --release --target "$TARGET"
+          fi
       - name: Verify release binary
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          BIN="target/${{ matrix.target }}/release/nestweaver"
+          BIN="target/$TARGET/release/nestweaver"
           FILE_INFO="$(file "$BIN")"
           echo "$FILE_INFO"
 
-          case "${{ matrix.target }}" in
+          case "$TARGET" in
             x86_64-unknown-linux-gnu) echo "$FILE_INFO" | grep -q 'x86-64' ;;
             aarch64-unknown-linux-gnu) echo "$FILE_INFO" | grep -Eq 'ARM aarch64|ARM64' ;;
             x86_64-apple-darwin) echo "$FILE_INFO" | grep -q 'x86_64' ;;
@@ -217,11 +231,21 @@ jobs:
           fi
 
           HOST="$(uname -s)-$(uname -m)"
-          case "$HOST:${{ matrix.target }}" in
+          case "$HOST:$TARGET" in
             Linux-x86_64:x86_64-unknown-linux-gnu|Linux-aarch64:aarch64-unknown-linux-gnu|Darwin-x86_64:x86_64-apple-darwin|Darwin-arm64:aarch64-apple-darwin)
               "$BIN" --version
               ;;
           esac
+      - name: Verify Apple Metal capability
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="target/$TARGET/release/nestweaver"
+          CAPABILITIES="$("$BIN" diagnostics capabilities --json)"
+          printf '%s\n' "$CAPABILITIES"
+          jq -e '.metal_compiled == true' <<< "$CAPABILITIES"
       - name: Package binary
         run: |
           ARCHIVE="nestweaver-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}.tar.gz"
