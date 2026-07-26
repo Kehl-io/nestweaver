@@ -41,7 +41,7 @@ jobs:
               - 'README.md'
               - 'CLAUDE.md'
               - 'docs/**'
-              - 'npm/README.md'
+              - 'npm/**'
               - 'smithery.yaml'
             frontend:
               - 'crates/nestweaver-web/frontend/**'

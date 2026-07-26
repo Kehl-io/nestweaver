@@ -17,7 +17,9 @@ const target = PLATFORM_MAP[key];
 if (!target) {
   console.warn(`Unsupported platform: ${key}`);
   console.warn("Supported: darwin-x64, darwin-arm64, linux-x64, linux-arm64");
-  console.warn("Unsupported platform. Install from source: cargo install nestweaver");
+  console.warn(
+    "Unsupported platform. Install a verified GitHub Release archive for a supported target, or from a source checkout: cargo install --locked --path .",
+  );
   process.exit(0); // Don't break npm install
 }
 
@@ -70,6 +72,8 @@ try {
 } catch (err) {
   console.warn(`Failed to install NestWeaver binary: ${err.message}`);
   console.warn(`  URL: ${url}`);
-  console.warn("Build from source instead: cargo install --path . (from a checkout)");
+  console.warn(
+    "Download a verified GitHub Release archive, or build from a source checkout: cargo install --locked --path .",
+  );
   process.exit(0); // Don't break npm install on transient/network failures
 }

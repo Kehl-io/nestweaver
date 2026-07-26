@@ -190,12 +190,15 @@ fn installation_docs_only_claim_live_channels() {
         "docs/architecture/project-brain.md",
         "CLAUDE.md",
         "npm/README.md",
+        "npm/install.js",
+        "npm/bin/nestweaver",
     ];
     if repo_root.join("smithery.yaml").exists() {
         docs.push("smithery.yaml");
     }
     let unsupported_commands = [
         "npm install -g @kehl-io/nestweaver",
+        "npm install @kehl-io/nestweaver",
         "cargo install nestweaver",
         "brew install nestweaver",
         "npx @kehl-io/nestweaver",
