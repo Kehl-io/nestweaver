@@ -102,7 +102,9 @@ impl EmbedModel {
         let backend = if config.external_endpoint.is_some() {
             EmbedBackend::External
         } else {
-            EmbedBackend::Local(Box::new(local::LocalModel::load(config, policy)?))
+            EmbedBackend::Local(Box::new(local::LocalModel::load_with_policy(
+                config, policy,
+            )?))
         };
         Ok(Self {
             backend,

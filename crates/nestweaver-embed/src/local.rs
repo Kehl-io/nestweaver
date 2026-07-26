@@ -17,7 +17,13 @@ pub struct LocalModel {
 }
 
 impl LocalModel {
-    pub fn load(config: &crate::EmbedConfig, policy: DevicePolicy) -> Result<Self> {
+    /// Load using the default automatic device-selection policy.
+    pub fn load(config: &crate::EmbedConfig) -> Result<Self> {
+        Self::load_with_policy(config, DevicePolicy::Auto)
+    }
+
+    /// Load with an explicit device-selection policy.
+    pub fn load_with_policy(config: &crate::EmbedConfig, policy: DevicePolicy) -> Result<Self> {
         let (device, device_kind) = select_device(policy)?;
         let client = HFClientSync::new()?;
         let (owner, name) = split_id(&config.model_id);
@@ -254,6 +260,12 @@ mod tests {
     use super::*;
     use crate::{DeviceKind, DevicePolicy};
     use std::cell::Cell;
+
+    #[test]
+    fn one_argument_load_remains_publicly_callable() {
+        let load: fn(&crate::EmbedConfig) -> Result<LocalModel> = LocalModel::load;
+        let _ = load;
+    }
 
     #[test]
     fn metal_policy_never_returns_cpu() {
