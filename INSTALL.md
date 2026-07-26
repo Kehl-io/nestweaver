@@ -31,9 +31,14 @@ nestweaver --version
 
 On Linux, `sha256sum -c "$ARCHIVE.sha256"` is an equivalent checksum command.
 
-Current macOS release archives are **CPU-only**: they are not built with the
-Metal feature. This warning must be removed only in the release that passes the
-artifact capability smoke test from Metal Task 5.
+Starting with the release that contains this change, both macOS CLI archives
+are built with Metal support. To opt out explicitly and use CPU embeddings,
+set:
+
+```toml
+[embedding]
+accelerator = "cpu"
+```
 
 ## Build from source
 

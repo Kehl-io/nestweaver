@@ -35,6 +35,7 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/release-please.yml'
               - 'examples/**'
               - 'instance.toml'
               - 'INSTALL.md'
