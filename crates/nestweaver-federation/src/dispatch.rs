@@ -192,6 +192,8 @@ fn brain_search_response_to_json(
         "truncated": truncated,
         "results": results,
         "expansion_terms": response.expansion_terms,
+        "semantic_applied": response.semantic_applied,
+        "degraded_components": response.degraded_components,
     })
 }
 
@@ -330,8 +332,18 @@ async fn dispatch_typed_brain_context(
         .await
         .context("brain_context RPC failed")?
         .into_inner();
-    let parsed: Value =
+    let mut parsed: Value =
         serde_json::from_str(&resp.result_json).unwrap_or(Value::String(resp.result_json));
+    if let Some(object) = parsed.as_object_mut() {
+        object.insert(
+            "semantic_applied".to_string(),
+            Value::Bool(resp.semantic_applied),
+        );
+        object.insert(
+            "degraded_components".to_string(),
+            serde_json::json!(resp.degraded_components),
+        );
+    }
     Ok(parsed)
 }
 
@@ -539,6 +551,8 @@ mod tests {
             // Proto3 defaults from a pre-Task-7 daemon: the new scalar fields
             // decode as zero/empty/false because they were absent on the wire.
             truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         };
 
         let value = brain_search_response_to_json(&response, false);

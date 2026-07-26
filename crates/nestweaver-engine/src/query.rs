@@ -632,6 +632,8 @@ mod promote_tests {
             connected: vec![symbol("sym:handler")],
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         };
         let members: HashSet<String> = ["note:prd".to_string(), "note:status".to_string()]
             .into_iter()
@@ -659,6 +661,8 @@ mod promote_tests {
             connected: vec![note("note:prd"), symbol("sym:handler")],
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         };
         let members: HashSet<String> = ["note:prd".to_string()].into_iter().collect();
 
@@ -695,6 +699,8 @@ mod promote_tests {
             connected: vec![note("note:overview")],
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         };
         let members: HashSet<String> = ["sym:foo".to_string(), "sym:bar".to_string()]
             .into_iter()
@@ -724,6 +730,8 @@ mod promote_tests {
             connected: vec![symbol("sym:foo")],
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         };
         let members: HashSet<String> = ["sym:foo".to_string()].into_iter().collect();
 
@@ -1084,6 +1092,14 @@ pub struct BrainContextResult {
     /// default (PRF-off) output is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expansion_terms: Vec<String>,
+    /// Whether the requested semantic leg embedded the query and completed
+    /// vector search successfully.
+    #[serde(default)]
+    pub semantic_applied: bool,
+    /// Retrieval components that were requested but unavailable. The graph,
+    /// PPR, and BM25 legs remain usable when semantic retrieval degrades.
+    #[serde(default)]
+    pub degraded_components: Vec<String>,
 }
 
 /// Surface a project's curated member notes into the rendered `connected`
@@ -1499,6 +1515,8 @@ pub fn build_brain_context_hybrid_with_aliases(
     // injected as PPR seeds (always-blend) so the walk explores semantically
     // relevant neighborhoods even when the textual seeds miss them. The full
     // hit list is passed to weighted_score_fuse as the semantic signal.
+    let semantic_requested = config.weight_semantic > 0.0;
+    let mut semantic_applied = false;
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();
     if let Some(model) = embed_model
         && config.weight_semantic > 0.0
@@ -1516,6 +1534,7 @@ pub fn build_brain_context_hybrid_with_aliases(
                 cancel,
             ) {
                 Ok(hits) => {
+                    semantic_applied = true;
                     if config.always_blend_semantic {
                         for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
                             if !seed_uids.contains(uid) {
@@ -1610,6 +1629,12 @@ pub fn build_brain_context_hybrid_with_aliases(
         connected,
         unresolved_seeds: unresolved,
         expansion_terms,
+        semantic_applied,
+        degraded_components: if semantic_requested && !semantic_applied {
+            vec!["semantic".to_string()]
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -2942,6 +2967,8 @@ mod dedup_heading_section_tests {
             connected,
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         }
     }
 
@@ -3181,6 +3208,7 @@ mod semantic_leg_tests {
     }
 
     struct WrongDimensionEmbed;
+    struct FailingEmbed;
 
     impl CountingEmbed {
         fn call_count(&self) -> usize {
@@ -3198,6 +3226,12 @@ mod semantic_leg_tests {
     impl EmbedQueryFn for WrongDimensionEmbed {
         fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             Ok(vec![1.0, 0.0])
+        }
+    }
+
+    impl EmbedQueryFn for FailingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("probe inference failed")
         }
     }
 
@@ -3227,9 +3261,13 @@ mod semantic_leg_tests {
         store
     }
 
-    fn run_context(store: &GraphStore, model: &CountingEmbed) {
+    fn run_context(
+        store: &GraphStore,
+        model: Option<&dyn EmbedQueryFn>,
+        weight_semantic: f64,
+    ) -> super::BrainContextResult {
         let config = HybridSearchConfig {
-            weight_semantic: 0.35,
+            weight_semantic,
             ..HybridSearchConfig::default()
         };
         build_brain_context_hybrid_with_aliases(
@@ -3240,10 +3278,10 @@ mod semantic_leg_tests {
             &std::collections::HashMap::new(),
             None,
             None,
-            Some(model),
+            model,
             None,
         )
-        .expect("brain_context must succeed");
+        .expect("brain_context must preserve graph results")
     }
 
     #[test]
@@ -3255,13 +3293,15 @@ mod semantic_leg_tests {
         assert_eq!(store.embedding_count(), 0);
         let model = CountingEmbed { calls: 0.into() };
 
-        run_context(&store, &model);
+        let result = run_context(&store, Some(&model), 0.35);
 
         assert_eq!(
             model.call_count(),
             0,
             "no embedding vectors in the DB → the semantic leg must not run the BERT embed"
         );
+        assert!(!result.semantic_applied);
+        assert_eq!(result.degraded_components, ["semantic"]);
     }
 
     #[test]
@@ -3271,13 +3311,55 @@ mod semantic_leg_tests {
         assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
         let model = CountingEmbed { calls: 0.into() };
 
-        run_context(&store, &model);
+        let result = run_context(&store, Some(&model), 0.35);
 
         assert_eq!(
             model.call_count(),
             1,
             "embedding vectors present → the semantic leg must embed the query"
         );
+        assert!(result.semantic_applied);
+        assert!(result.degraded_components.is_empty());
+    }
+
+    #[test]
+    fn requested_semantic_leg_degrades_when_model_is_not_ready() {
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+
+        let result = run_context(&store, None, 0.35);
+
+        assert!(!result.semantic_applied);
+        assert_eq!(result.degraded_components, ["semantic"]);
+        assert!(
+            !result.seeds.is_empty() || !result.connected.is_empty(),
+            "graph/PPR results must survive"
+        );
+    }
+
+    #[test]
+    fn requested_semantic_leg_degrades_when_inference_fails() {
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+
+        let result = run_context(&store, Some(&FailingEmbed), 0.35);
+
+        assert!(!result.semantic_applied);
+        assert_eq!(result.degraded_components, ["semantic"]);
+        assert!(
+            !result.seeds.is_empty() || !result.connected.is_empty(),
+            "graph/PPR results must survive"
+        );
+    }
+
+    #[test]
+    fn zero_semantic_weight_is_not_reported_as_degraded() {
+        let store = store_with_symbol();
+
+        let result = run_context(&store, None, 0.0);
+
+        assert!(!result.semantic_applied);
+        assert!(result.degraded_components.is_empty());
     }
 
     #[test]

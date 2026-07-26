@@ -215,6 +215,8 @@ message BrainSearchResponse {
   int32 returned_matches = 6;
   string total_matches_relation = 7; // "eq" | "gte"
   bool truncated = 8;
+  bool semantic_applied = 9;
+  repeated string degraded_components = 10;
 }
 message SearchResultItem {
   string uid = 1;
@@ -231,6 +233,16 @@ message SearchResultItem {
 
 // brain_status
 message BrainStatusRequest {}
+message EmbeddingStatus {
+  string state = 1;              // disabled | loading | ready | failed
+  string backend = 2;            // local | external
+  string requested_device = 3;   // auto | metal | cpu
+  string selected_device = 4;    // metal | cpu | empty
+  string model_id = 5;
+  string error = 6;
+  bool metal_compiled = 7;
+  bool fallback_used = 8;        // invariant: always false
+}
 message BrainStatusResponse {
   int32 vault_count = 1;
   int32 notes = 2;
@@ -244,6 +256,7 @@ message BrainStatusResponse {
   bool indexing_active = 10;
   string indexing_repo = 11;  // repo currently being indexed (empty if idle)
   int32 queue_depth = 12;     // number of pending + running jobs
+  EmbeddingStatus embedding_status = 13;
 }
 
 // repo_states — per-repo indexed SHA and metadata for staleness comparison
@@ -312,7 +325,11 @@ message BrainContextRequest {
   double recency_weight = 20;
   double recency_half_life_days = 21;
 }
-message BrainContextResponse { string result_json = 1; }
+message BrainContextResponse {
+  string result_json = 1;
+  bool semantic_applied = 2;
+  repeated string degraded_components = 3;
+}
 
 // project_context (typed request, JSON response)
 message ProjectContextRequest {

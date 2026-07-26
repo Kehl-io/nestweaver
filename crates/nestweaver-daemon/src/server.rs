@@ -121,6 +121,145 @@ pub struct WatcherRegistration {
     handle: nestweaver_engine::ShutdownHandle,
 }
 
+#[derive(Debug, Clone)]
+struct EmbeddingRuntimeStatus {
+    state: String,
+    backend: String,
+    requested_device: String,
+    selected_device: String,
+    model_id: String,
+    error: String,
+    metal_compiled: bool,
+    fallback_used: bool,
+}
+
+#[cfg(any(feature = "embed", test))]
+#[derive(Debug, Clone, Copy)]
+struct EmbeddingProbeMetadata {
+    backend: &'static str,
+    selected_device: &'static str,
+    vector_dimension: usize,
+}
+
+fn initial_embedding_status(
+    cfg: &nestweaver_engine::config::EmbeddingConfig,
+    stored_model_id: Option<&str>,
+    embedding_compiled: bool,
+    metal_compiled: bool,
+) -> EmbeddingRuntimeStatus {
+    let backend = if cfg.external_endpoint.is_some() {
+        "external"
+    } else {
+        "local"
+    };
+    let requested_device = match cfg.accelerator {
+        nestweaver_engine::config::EmbeddingAccelerator::Auto => "auto",
+        nestweaver_engine::config::EmbeddingAccelerator::Metal => "metal",
+        nestweaver_engine::config::EmbeddingAccelerator::Cpu => "cpu",
+    };
+    let model_id = stored_model_id
+        .filter(|model_id| !model_id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if backend == "external" {
+                cfg.external_model
+                    .clone()
+                    .unwrap_or_else(|| "text-embedding-3-small".to_string())
+            } else {
+                cfg.model_id.clone()
+            }
+        });
+    EmbeddingRuntimeStatus {
+        state: if embedding_compiled {
+            "loading".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        backend: backend.to_string(),
+        requested_device: requested_device.to_string(),
+        selected_device: String::new(),
+        model_id,
+        error: String::new(),
+        metal_compiled,
+        fallback_used: false,
+    }
+}
+
+#[cfg(any(feature = "embed", test))]
+fn finalize_embedding_status(
+    mut status: EmbeddingRuntimeStatus,
+    stored_dimension: Option<usize>,
+    result: Result<EmbeddingProbeMetadata, String>,
+) -> EmbeddingRuntimeStatus {
+    match result {
+        Ok(metadata) => {
+            if let Some(stored_dimension) = stored_dimension
+                && stored_dimension != metadata.vector_dimension
+            {
+                status.state = "failed".to_string();
+                status.error = format!(
+                    "embedding model dimension ({}) does not match stored embeddings ({}); \
+                     run `nestweaver embed --force` to re-embed",
+                    metadata.vector_dimension, stored_dimension
+                );
+                status.selected_device.clear();
+                return status;
+            }
+            status.state = "ready".to_string();
+            status.backend = metadata.backend.to_string();
+            status.selected_device = if metadata.backend == "local" {
+                metadata.selected_device.to_string()
+            } else {
+                String::new()
+            };
+            status.error.clear();
+        }
+        Err(error) => {
+            status.state = "failed".to_string();
+            status.selected_device.clear();
+            status.error = error;
+        }
+    }
+    status
+}
+
+fn embedding_status_proto(status: &EmbeddingRuntimeStatus) -> nestweaver_proto::EmbeddingStatus {
+    nestweaver_proto::EmbeddingStatus {
+        state: status.state.clone(),
+        backend: status.backend.clone(),
+        requested_device: status.requested_device.clone(),
+        selected_device: status.selected_device.clone(),
+        model_id: status.model_id.clone(),
+        error: status.error.clone(),
+        metal_compiled: status.metal_compiled,
+        fallback_used: status.fallback_used,
+    }
+}
+
+fn embedding_status_json(status: &EmbeddingRuntimeStatus) -> serde_json::Value {
+    serde_json::json!({
+        "state": status.state,
+        "backend": status.backend,
+        "requested_device": status.requested_device,
+        "selected_device": status.selected_device,
+        "model_id": status.model_id,
+        "error": status.error,
+        "metal_compiled": status.metal_compiled,
+        "fallback_used": status.fallback_used,
+    })
+}
+
+fn daemon_metal_compiled() -> bool {
+    #[cfg(feature = "embed")]
+    {
+        nestweaver_embed::metal_compiled()
+    }
+    #[cfg(not(feature = "embed"))]
+    {
+        false
+    }
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
@@ -157,6 +296,9 @@ pub struct DaemonState {
     /// Lazily-loaded embedding model for semantic search. Populated by a
     /// background task when the `embed` feature is enabled.
     pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+    /// Explicit embedding readiness/device state. This is initialized before
+    /// the service starts and updated atomically after startup probing.
+    embedding_status: Arc<tokio::sync::RwLock<EmbeddingRuntimeStatus>>,
     /// Serializes write RPCs so only one runs at a time (KùzuDB allows a
     /// single write transaction).
     pub write_mutex: Arc<tokio::sync::Mutex<()>>,
@@ -3910,6 +4052,10 @@ impl NestWeaverDaemon for DaemonService {
             returned_matches,
             total_matches_relation,
             truncated,
+            // `brain_search` is keyword/BM25-only; it must not claim a
+            // semantic leg was requested or degraded.
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         }))
     }
 
@@ -3984,8 +4130,26 @@ impl NestWeaverDaemon for DaemonService {
             .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
+        let semantic_applied = value
+            .get("semantic_applied")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let degraded_components = value
+            .get("degraded_components")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        Ok(Response::new(BrainContextResponse { result_json }))
+        Ok(Response::new(BrainContextResponse {
+            result_json,
+            semantic_applied,
+            degraded_components,
+        }))
     }
 
     async fn get_project_context(
@@ -4165,6 +4329,8 @@ impl NestWeaverDaemon for DaemonService {
             String::new()
         };
         let queue_depth = self.state.indexing_queue_depth.load(Ordering::Relaxed) as i32;
+        let embedding_status =
+            embedding_status_proto(&self.state.embedding_status.read().await.clone());
 
         Ok(Response::new(BrainStatusResponse {
             vault_count: value
@@ -4191,6 +4357,7 @@ impl NestWeaverDaemon for DaemonService {
             indexing_active,
             indexing_repo,
             queue_depth,
+            embedding_status: Some(embedding_status),
         }))
     }
 
@@ -4246,6 +4413,8 @@ impl NestWeaverDaemon for DaemonService {
             }
             value["queue_depth"] =
                 serde_json::json!(self.state.indexing_queue_depth.load(Ordering::Relaxed));
+            let embedding_status = self.state.embedding_status.read().await;
+            value["embedding_status"] = embedding_status_json(&embedding_status);
             if let Ok(s) = serde_json::to_string(&value) {
                 json_resp.result_json = s;
             }
@@ -5092,7 +5261,7 @@ impl NestWeaverDaemon for DaemonService {
         #[cfg(not(feature = "embed"))]
         {
             let _ = request;
-            return Err(Status::unavailable(
+            return Err(Status::failed_precondition(
                 "embedding is not available — the daemon was built without the `embed` feature",
             ));
         }
@@ -5124,9 +5293,15 @@ impl NestWeaverDaemon for DaemonService {
             };
 
             let Some(model) = model else {
-                return Err(Status::unavailable(
-                    "embedding model is not loaded — it may still be initializing",
-                ));
+                let status = self.state.embedding_status.read().await.clone();
+                return Err(Status::failed_precondition(if status.error.is_empty() {
+                    format!("embedding is not ready (state: {})", status.state)
+                } else {
+                    format!(
+                        "embedding is not ready (state: {}): {}",
+                        status.state, status.error
+                    )
+                }));
             };
 
             let store = self.state.store.clone();
@@ -5993,6 +6168,116 @@ mod depth_clamp_tests {
     }
 }
 
+#[cfg(test)]
+mod embedding_status_tests {
+    use super::*;
+    use nestweaver_engine::config::{EmbeddingAccelerator, EmbeddingConfig};
+
+    fn config(accelerator: EmbeddingAccelerator, external: bool) -> EmbeddingConfig {
+        EmbeddingConfig {
+            accelerator,
+            external_endpoint: external.then(|| "http://127.0.0.1:9".to_string()),
+            external_model: external.then(|| "external-model".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn loading_and_disabled_statuses_are_explicit() {
+        let loading = initial_embedding_status(
+            &config(EmbeddingAccelerator::Auto, false),
+            Some("stored-model"),
+            true,
+            true,
+        );
+        assert_eq!(loading.state, "loading");
+        assert_eq!(loading.backend, "local");
+        assert_eq!(loading.requested_device, "auto");
+        assert_eq!(loading.selected_device, "");
+        assert_eq!(loading.model_id, "stored-model");
+        assert!(loading.metal_compiled);
+        assert!(!loading.fallback_used);
+
+        let disabled = initial_embedding_status(
+            &config(EmbeddingAccelerator::Cpu, false),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(disabled.state, "disabled");
+        assert_eq!(disabled.selected_device, "");
+        assert!(!disabled.fallback_used);
+    }
+
+    #[test]
+    fn ready_local_status_reports_the_selected_device_without_fallback() {
+        for (selected, requested) in [
+            ("metal", EmbeddingAccelerator::Metal),
+            ("cpu", EmbeddingAccelerator::Cpu),
+        ] {
+            let initial = initial_embedding_status(
+                &config(requested, false),
+                None,
+                true,
+                selected == "metal",
+            );
+            let ready = finalize_embedding_status(
+                initial,
+                Some(384),
+                Ok(EmbeddingProbeMetadata {
+                    backend: "local",
+                    selected_device: selected,
+                    vector_dimension: 384,
+                }),
+            );
+            assert_eq!(ready.state, "ready");
+            assert_eq!(ready.selected_device, selected);
+            assert!(ready.error.is_empty());
+            assert!(!ready.fallback_used);
+        }
+    }
+
+    #[test]
+    fn failed_local_external_and_dimension_states_are_actionable() {
+        let metal = initial_embedding_status(
+            &config(EmbeddingAccelerator::Metal, false),
+            None,
+            true,
+            true,
+        );
+        let metal_failed =
+            finalize_embedding_status(metal, None, Err("Metal device unavailable".to_string()));
+        assert_eq!(metal_failed.state, "failed");
+        assert!(metal_failed.error.contains("Metal"));
+        assert_eq!(metal_failed.selected_device, "");
+
+        let external =
+            initial_embedding_status(&config(EmbeddingAccelerator::Auto, true), None, true, true);
+        let external_failed =
+            finalize_embedding_status(external, None, Err("external endpoint refused".to_string()));
+        assert_eq!(external_failed.state, "failed");
+        assert_eq!(external_failed.backend, "external");
+        assert_eq!(external_failed.selected_device, "");
+
+        let cpu =
+            initial_embedding_status(&config(EmbeddingAccelerator::Cpu, false), None, true, false);
+        let mismatch = finalize_embedding_status(
+            cpu,
+            Some(768),
+            Ok(EmbeddingProbeMetadata {
+                backend: "local",
+                selected_device: "cpu",
+                vector_dimension: 384,
+            }),
+        );
+        assert_eq!(mismatch.state, "failed");
+        assert!(mismatch.error.contains("384"));
+        assert!(mismatch.error.contains("768"));
+        assert_eq!(mismatch.selected_device, "");
+        assert!(!mismatch.fallback_used);
+    }
+}
+
 #[cfg(all(test, feature = "embed"))]
 mod embedding_load_config_tests {
     use super::*;
@@ -6271,30 +6556,59 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     );
     match loaded {
         Ok(model) => {
-            tracing::info!(
-                backend = ?model.backend_kind(),
-                device = ?model.device_kind(),
-                dim = ?model.known_dimension(),
-                "Embedding model loaded"
+            let backend = match model.backend_kind() {
+                nestweaver_embed::EmbeddingBackendKind::Local => "local",
+                nestweaver_embed::EmbeddingBackendKind::External => "external",
+            };
+            let selected_device = match model.device_kind() {
+                Some(nestweaver_embed::DeviceKind::Metal) => "metal",
+                Some(nestweaver_embed::DeviceKind::Cpu) => "cpu",
+                None => "",
+            };
+            let probe = model
+                .embed_query("NestWeaver embedding readiness probe")
+                .and_then(|vector| {
+                    anyhow::ensure!(
+                        !vector.is_empty(),
+                        "readiness probe returned an empty vector"
+                    );
+                    anyhow::ensure!(
+                        vector.iter().all(|value| value.is_finite()),
+                        "readiness probe returned a non-finite vector"
+                    );
+                    Ok(EmbeddingProbeMetadata {
+                        backend,
+                        selected_device,
+                        vector_dimension: vector.len(),
+                    })
+                })
+                .map_err(|error| format!("{error:#}"));
+            let status = finalize_embedding_status(
+                state.embedding_status.read().await.clone(),
+                state.store.embedding_index_dimension(),
+                probe,
             );
-            if let Some(model_dimension) = model.known_dimension()
-                && let Some(stored_dim) = state.store.embedding_index_dimension()
-                && stored_dim != model_dimension
-            {
-                tracing::warn!(
-                    model_dim = model_dimension,
-                    stored_dim,
-                    "Embedding model dimension ({}) does not match stored embeddings ({}). \
-                     Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
-                    model_dimension,
-                    stored_dim
-                );
-            } else {
+            let ready = status.state == "ready";
+            *state.embedding_status.write().await = status.clone();
+            if ready {
                 *state.embed_model.write().await = Some(std::sync::Arc::new(model)
                     as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
+                tracing::info!(
+                    backend = %status.backend,
+                    device = %status.selected_device,
+                    "Embedding model ready"
+                );
+            } else {
+                tracing::warn!("Embedding model failed readiness: {}", status.error);
             }
         }
         Err(e) => {
+            let status = finalize_embedding_status(
+                state.embedding_status.read().await.clone(),
+                state.store.embedding_index_dimension(),
+                Err(format!("{e:#}")),
+            );
+            *state.embedding_status.write().await = status;
             tracing::warn!("Failed to load embedding model: {e}");
         }
     }
@@ -6574,6 +6888,21 @@ pub async fn run_server(
 
     // Build the per-repo authz policy ONCE, before the state is assembled.
     let permission_source = build_daemon_permission_source(instance_cfg.as_ref());
+    let embedding_cfg = instance_cfg
+        .as_ref()
+        .map(|config| config.embedding.clone())
+        .unwrap_or_default();
+    let stored_embedding_model = store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(model_id, _)| model_id);
+    let embedding_status = initial_embedding_status(
+        &embedding_cfg,
+        stored_embedding_model.as_deref(),
+        cfg!(feature = "embed"),
+        daemon_metal_compiled(),
+    );
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
@@ -6593,6 +6922,7 @@ pub async fn run_server(
         instance_cfg,
         permission_source,
         embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+        embedding_status: Arc::new(tokio::sync::RwLock::new(embedding_status)),
         write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         server_mode: is_server_mode,
         indexing_active: Arc::new(AtomicBool::new(false)),
@@ -12687,6 +13017,12 @@ mod startup_helper_tests {
             instance_cfg: None,
             permission_source: build_daemon_permission_source(None),
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            embedding_status: Arc::new(tokio::sync::RwLock::new(initial_embedding_status(
+                &nestweaver_engine::config::EmbeddingConfig::default(),
+                None,
+                cfg!(feature = "embed"),
+                daemon_metal_compiled(),
+            ))),
             write_mutex: Arc::new(tokio::sync::Mutex::new(())),
             server_mode: false,
             read_only: false,
@@ -12727,6 +13063,12 @@ mod startup_helper_tests {
             instance_cfg: None,
             permission_source,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            embedding_status: Arc::new(tokio::sync::RwLock::new(initial_embedding_status(
+                &nestweaver_engine::config::EmbeddingConfig::default(),
+                None,
+                cfg!(feature = "embed"),
+                daemon_metal_compiled(),
+            ))),
             write_mutex: Arc::new(tokio::sync::Mutex::new(())),
             server_mode: false,
             read_only: false,
@@ -12741,6 +13083,74 @@ mod startup_helper_tests {
             worker_handle: std::sync::Mutex::new(None),
             ui_server: std::sync::Mutex::new(None),
         })
+    }
+
+    #[tokio::test]
+    async fn embedding_status_is_exposed_by_typed_and_json_status_rpcs() {
+        let state = test_state_with_writer();
+        *state.embedding_status.write().await = EmbeddingRuntimeStatus {
+            state: "failed".to_string(),
+            backend: "local".to_string(),
+            requested_device: "metal".to_string(),
+            selected_device: String::new(),
+            model_id: "test-model".to_string(),
+            error: "Metal runtime probe failed".to_string(),
+            metal_compiled: true,
+            fallback_used: false,
+        };
+        let service = DaemonService::new(state);
+
+        let typed = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("typed brain status")
+            .into_inner()
+            .embedding_status
+            .expect("structured embedding status");
+        assert_eq!(typed.state, "failed");
+        assert_eq!(typed.requested_device, "metal");
+        assert_eq!(typed.selected_device, "");
+        assert!(typed.error.contains("Metal"));
+        assert!(!typed.fallback_used);
+
+        let json = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .expect("JSON brain status")
+            .into_inner();
+        let value: serde_json::Value =
+            serde_json::from_str(&json.result_json).expect("valid status JSON");
+        assert_eq!(value["embedding_status"]["state"], "failed");
+        assert_eq!(value["embedding_status"]["requested_device"], "metal");
+        assert_eq!(value["embedding_status"]["selected_device"], "");
+        assert_eq!(value["embedding_status"]["fallback_used"], false);
+    }
+
+    #[tokio::test]
+    async fn embedding_status_blocks_embed_rpc_until_ready() {
+        let state = test_state_with_writer();
+        let expected_state = state.embedding_status.read().await.state.clone();
+        let service = DaemonService::new(state);
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 0,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let error = service
+            .embed(request)
+            .await
+            .expect_err("an unavailable embedding model must block embedding");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains(&expected_state)
+                || error.message().contains("without the `embed` feature"),
+            "error should identify the structured readiness failure: {error}"
+        );
     }
 
     #[tokio::test]

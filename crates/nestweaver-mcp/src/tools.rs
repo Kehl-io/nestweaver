@@ -973,6 +973,8 @@ mod tool_schema_validation_tests {
             // Proto3 defaults from a pre-Task-7 daemon: the new scalar fields
             // decode as zero/empty/false because they were absent on the wire.
             truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -1045,6 +1047,8 @@ mod tool_schema_validation_tests {
             returned_matches: 2,
             total_matches_relation: "eq".to_string(),
             truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         };
 
         let value = daemon_brain_search_response_to_json(&response, false);
@@ -3104,6 +3108,8 @@ fn tool_brain_context(
         "connected": connected_json,
         "tokens_used": used_tokens,
         "token_budget": token_budget,
+        "semantic_applied": result.semantic_applied,
+        "degraded_components": &result.degraded_components,
     });
 
     if include_seeds {
@@ -8578,6 +8584,8 @@ fn daemon_brain_search_response_to_json(
         "returned_matches": returned_matches,
         "truncated": truncated,
         "results": results,
+        "semantic_applied": response.semantic_applied,
+        "degraded_components": &response.degraded_components,
     });
     if !response.expansion_terms.is_empty() {
         value["expansion_terms"] = json!(response.expansion_terms);
@@ -8834,7 +8842,20 @@ pub fn dispatch_via_daemon(
                     recency_half_life_days: f64_field("recency_half_life_days"),
                 });
                 let resp = client.get_context(req).await.map_err(grpc_status_err)?;
-                Ok(resp.into_inner().result_json)
+                let inner = resp.into_inner();
+                let mut value: Value = serde_json::from_str(&inner.result_json)
+                    .unwrap_or(Value::String(inner.result_json));
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "semantic_applied".to_string(),
+                        json!(inner.semantic_applied),
+                    );
+                    object.insert(
+                        "degraded_components".to_string(),
+                        json!(inner.degraded_components),
+                    );
+                }
+                Ok(serde_json::to_string(&value)?)
             }
             "project_context" => {
                 use nestweaver_proto::ProjectContextRequest;
