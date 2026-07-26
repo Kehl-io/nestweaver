@@ -542,6 +542,17 @@ fn ci_runs_release_workflow_contract_when_release_definition_changes() {
 }
 
 #[test]
+fn ci_runs_for_staging_pull_requests() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        workflow.contains("  pull_request:\n    branches: [main, staging]"),
+        "feature-to-staging pull requests must run the same CI gate as main"
+    );
+}
+
+#[test]
 fn ci_metal_smoke_is_required_and_narrowly_routed_to_apple_hardware_changes() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
