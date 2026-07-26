@@ -4,6 +4,48 @@ pub mod nestweaver_daemon_v1 {
 
 pub use nestweaver_daemon_v1::*;
 
+#[cfg(test)]
+mod embedding_telemetry_contract_tests {
+    use super::*;
+
+    #[test]
+    fn status_and_hybrid_responses_expose_additive_embedding_telemetry() {
+        let status = EmbeddingStatus {
+            state: "ready".to_string(),
+            backend: "local".to_string(),
+            requested_device: "metal".to_string(),
+            selected_device: "metal".to_string(),
+            model_id: "model".to_string(),
+            error: String::new(),
+            metal_compiled: true,
+            fallback_used: false,
+        };
+        let brain_status = BrainStatusResponse {
+            embedding_status: Some(status),
+            ..Default::default()
+        };
+        assert_eq!(
+            brain_status.embedding_status.unwrap().selected_device,
+            "metal"
+        );
+
+        let search = BrainSearchResponse {
+            semantic_applied: false,
+            degraded_components: Vec::new(),
+            ..Default::default()
+        };
+        assert!(!search.semantic_applied);
+        assert!(search.degraded_components.is_empty());
+
+        let context = BrainContextResponse {
+            result_json: "{}".to_string(),
+            semantic_applied: false,
+            degraded_components: vec!["semantic".to_string()],
+        };
+        assert_eq!(context.degraded_components, ["semantic"]);
+    }
+}
+
 /// Fail-closed state machine for daemon indexing progress streams.
 ///
 /// gRPC transport success does not imply that indexing succeeded: logical

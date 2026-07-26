@@ -5,18 +5,25 @@ to each other, and what cross-cutting features span them.
 
 ## Quick Start
 
-Create a file (e.g., `nestweaver-instance.toml`):
+Start with the canonical minimal fixture, then validate it before using it:
+
+```sh
+cp examples/minimal-instance.toml nestweaver-instance.toml
+nestweaver config validate nestweaver-instance.toml
+```
+
+It contains every required setting and no repository declarations:
 
 ```toml
-instance_id = "my-project"
+instance_id = "minimal-example"
 
 [snapshot_storage]
 backend = "local"
-path = "~/.local/share/nestweaver/my-project/snapshots"
+path = "~/.local/share/nestweaver/minimal/snapshots"
 
 [workspace]
 backend = "local"
-path = "~/.local/share/nestweaver/my-project/workspace"
+path = "~/.local/share/nestweaver/minimal/workspace"
 
 [inference]
 endpoint = "http://localhost:11434"
@@ -25,15 +32,10 @@ summary_model = "qwen2.5-coder:7b"
 
 [git]
 credential_method = "gh"
-
-[[repos]]
-url = "https://github.com/myorg/frontend"
-
-[[repos]]
-url = "https://github.com/myorg/backend"
 ```
 
-Then:
+Add one or more `[[repos]]` entries when the instance should declare remote
+repositories, then:
 
 ```sh
 # Index each repo
@@ -47,7 +49,7 @@ nestweaver context UserService --db ./my-project.lbug
 
 ## Config Reference
 
-### Required sections
+### Required settings
 
 #### `instance_id`
 
@@ -77,11 +79,12 @@ backend = "local"
 path = "/path/to/workspace"
 ```
 
-#### `[inference]`
+#### `[inference]` (required)
 
-LLM endpoint for generating summaries and embeddings. Must be set
-explicitly — there is no global default. This prevents routing one
-instance's source to another instance's model.
+Required connection settings for the remote inference subsystem, including the
+models used for remote embeddings and summaries. It has no global default, so
+each instance explicitly selects its endpoint and models. It is separate from
+the semantic-search subsystem in `[embedding]`.
 
 ```toml
 [inference]
@@ -90,26 +93,28 @@ embedding_model = "nomic-embed-text"
 summary_model = "qwen2.5-coder:7b"
 ```
 
-#### `[embedding]`
+#### `[embedding]` (optional; defaults apply)
 
-Controls the local embedding model and hybrid retrieval weights. The embedding
-layer enables natural language queries by finding semantically similar symbols,
-notes, and headings as seeds for the graph walk.
+`[embedding]` independently configures local or external semantic search and
+hybrid retrieval weights. Its defaults apply when the section is omitted; it
+does not inherit settings from `[inference]`. The semantic layer finds related
+symbols, notes, and headings as seeds for graph retrieval.
 
 `model_id` here is the default for a *fresh* database. When you run `nestweaver
 embed`, NestWeaver records the model actually used, and the daemon loads that
 recorded model at startup regardless of this setting — so a database always uses
-a model matching its stored vectors. Pick a model per-database with
-`nestweaver embed --model-id <id>`: the default `all-MiniLM-L6-v2` is 384-dim,
+a model matching its stored vectors. The default `all-MiniLM-L6-v2` is 384-dim,
 fast, and CPU-friendly (best for most users); `thenlper/gte-base` is 768-dim for
-higher-quality retrieval. Any mean-pooled BERT-compatible HuggingFace model works.
+higher-quality retrieval. Any mean-pooled BERT-compatible HuggingFace model
+works.
 
 ```toml
 [embedding]
 model_id = "sentence-transformers/all-MiniLM-L6-v2"  # default for fresh DBs; the embedded model is recorded & auto-loaded
 cache_dir = "~/.cache/nestweaver/models"
+accelerator = "auto" # auto | metal | cpu
 
-# Optional: use an external API instead of the local model (falls back to local on failure)
+# Optional: use an authoritative external API instead of the local model.
 # external_endpoint = "https://api.openai.com"
 # external_model = "text-embedding-3-small"
 
@@ -127,8 +132,9 @@ semantic_search_limit = 200    # top-k semantic hits fed into fusion
 | Field | Default | Description |
 |-------|---------|-------------|
 | `model_id` | `"sentence-transformers/all-MiniLM-L6-v2"` | Default local model for fresh DBs (any mean-pooled BERT-compatible HF model). The model a DB was embedded with is recorded and auto-loaded, overriding this. |
-| `cache_dir` | `"~/.cache/nestweaver/models"` | Directory to cache downloaded model weights |
-| `external_endpoint` | — | Optional external embedding API endpoint (falls back to local on failure) |
+| `cache_dir` | `"~/.cache/nestweaver/models"` | Hugging Face cache root. The daemon expands a leading `~/` against its user's home directory. |
+| `accelerator` | `"auto"` | Local device policy; exact behavior is below. Ignored for an external backend. |
+| `external_endpoint` | — | Optional authoritative external embedding API endpoint |
 | `external_model` | — | Model name for the external endpoint |
 | `weight_ppr` | `0.40` | Fusion weight for graph structure (Personalized PageRank) |
 | `weight_bm25` | `0.25` | Fusion weight for BM25 text match |
@@ -136,6 +142,57 @@ semantic_search_limit = 200    # top-k semantic hits fed into fusion
 | `always_blend_semantic` | `true` | Add semantic matches to PPR seeds even when name resolution finds results |
 | `semantic_seed_limit` | `5` | Top-k semantic hits injected as PPR seeds |
 | `semantic_search_limit` | `200` | Top-k semantic hits fed into fusion scoring |
+
+Device policies for the local backend are exact:
+
+| Value | Behavior |
+|-------|----------|
+| `auto` | Metal in a Metal-enabled build; CPU only when Metal is not compiled. A Metal failure is reported; `auto` does not retry on CPU. |
+| `metal` | Requires Metal to be compiled and both device creation and the full model inference probe to succeed. Failure leaves embedding state `failed`; CPU is never selected. |
+| `cpu` | Selects CPU directly and never probes Metal. Use this for an intentional CPU deployment or to opt out of Metal. |
+
+An external endpoint is authoritative. NestWeaver does not load or invoke the
+local backend after an external load, readiness, or request failure. Fix the
+endpoint, or follow the forced re-embedding procedure below to switch to a local
+backend.
+
+Daemon startup is cache-only. It does not contact Hugging Face or download
+missing model files. To populate a new cache, stop the daemon (which owns the DB
+write lock) and run the direct local command. Its required form is
+`nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>`.
+The direct path downloads missing files into that cache and records the model
+used by the database:
+
+```sh
+CONFIG=/absolute/path/to/nestweaver-instance.toml
+DB=/absolute/path/to/brain.lbug
+MODEL=sentence-transformers/all-MiniLM-L6-v2
+CACHE="$HOME/.cache/nestweaver/models"
+nestweaver daemon --db "$DB" stop
+nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE"
+nestweaver daemon --db "$DB" start --config "$CONFIG"
+```
+
+Do not omit `--local`: without it, `embed` routes to the configured cache-only
+daemon and cannot populate missing model files. The direct command receives
+`--cache-dir` from the shell, so prefer an absolute path or `$HOME/...`; the
+leading-tilde expansion described above applies to the TOML setting.
+
+Switching from an external backend to a local model requires more than removing
+`external_endpoint`: the database records the external model that produced its
+vectors, and that recorded model overrides the configured local default at
+daemon startup. Remove `external_endpoint`/`external_model`, stop the daemon,
+and replace both vectors and recorded metadata with a forced direct-local embed:
+
+```sh
+CONFIG=/absolute/path/to/nestweaver-instance.toml
+DB=/absolute/path/to/brain.lbug
+MODEL=sentence-transformers/all-MiniLM-L6-v2
+CACHE="$HOME/.cache/nestweaver/models"
+nestweaver daemon --db "$DB" stop
+nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE" --force
+nestweaver daemon --db "$DB" start --config "$CONFIG"
+```
 
 #### `[git]`
 
@@ -148,11 +205,18 @@ credential_method = "gh"   # "gh" | "ssh" | "credential-helper"
 
 #### `[[repos]]`
 
-List of repositories to index. Each entry needs at minimum a URL.
+List of repositories to index. `url` is required. `name` is an optional display
+alias, and `type` is optional: omit it (or set `type = "code"`) for source code,
+or set `type = "vault"` for a markdown vault.
 
 ```toml
 [[repos]]
 url = "https://github.com/myorg/frontend"
+name = "frontend"       # optional display alias
+
+[[repos]]
+url = "https://github.com/myorg/docs"
+type = "vault"          # optional: "code" (default) | "vault"
 
 [[repos]]
 url = "https://github.com/myorg/backend"

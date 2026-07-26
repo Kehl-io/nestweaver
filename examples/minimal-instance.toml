@@ -1,0 +1,21 @@
+# Canonical minimal NestWeaver instance configuration.
+# Validate it without creating a database or contacting services:
+#   nestweaver config validate examples/minimal-instance.toml
+
+instance_id = "minimal-example"
+
+[snapshot_storage]
+backend = "local"
+path = "~/.local/share/nestweaver/minimal/snapshots"
+
+[workspace]
+backend = "local"
+path = "~/.local/share/nestweaver/minimal/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"

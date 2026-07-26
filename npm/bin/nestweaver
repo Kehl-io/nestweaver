@@ -4,7 +4,7 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="$DIR/.nestweaver-bin/nestweaver"
 
 if [ ! -x "$BINARY" ]; then
-  echo "NestWeaver binary not found. Run: npm install @kehl-io/nestweaver" >&2
+  echo "NestWeaver binary not found. Install a verified GitHub Release archive, or from a source checkout run: cargo install --locked --path ." >&2
   exit 1
 fi
 

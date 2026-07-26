@@ -232,9 +232,6 @@ impl ServerGuard {
             cmd.args(["--config", &config.display().to_string()]);
         }
 
-        // Run in foreground — launchd-style daemonisation doesn't work in tests.
-        cmd.env("NESTWEAVER_DAEMON_FORK", "0");
-
         let mut child = cmd
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())

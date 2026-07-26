@@ -33,6 +33,77 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
+const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+
+/// Explicit device policy for direct local embedding.
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum CliEmbeddingAccelerator {
+    Auto,
+    Metal,
+    Cpu,
+}
+
+#[cfg(feature = "embed")]
+fn cli_embedding_device_policy(
+    accelerator: CliEmbeddingAccelerator,
+) -> nestweaver_embed::DevicePolicy {
+    match accelerator {
+        CliEmbeddingAccelerator::Auto => nestweaver_embed::DevicePolicy::Auto,
+        CliEmbeddingAccelerator::Metal => nestweaver_embed::DevicePolicy::Metal,
+        CliEmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
+    }
+}
+
+#[cfg(feature = "embed")]
+fn cli_embedding_artifact_mode() -> nestweaver_embed::ArtifactMode {
+    nestweaver_embed::ArtifactMode::DownloadMissing
+}
+
+#[cfg(feature = "embed")]
+fn direct_local_embedding_config(
+    model_id: &str,
+    cache_dir: Option<&Path>,
+) -> nestweaver_embed::EmbedConfig {
+    let mut config = nestweaver_embed::EmbedConfig {
+        model_id: model_id.to_string(),
+        ..Default::default()
+    };
+    if let Some(cache_dir) = cache_dir {
+        config.cache_dir = cache_dir.to_path_buf();
+    }
+    config
+}
+
+fn external_embedding_model(model: Option<&str>) -> &str {
+    model.unwrap_or(DEFAULT_EXTERNAL_EMBEDDING_MODEL)
+}
+
+fn local_embedding_model_id(model_id: Option<&str>) -> &str {
+    model_id.unwrap_or(nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID)
+}
+
+/// A daemon uses its configured backend, so an omitted local model is not a
+/// request to override that backend. Only reject a model ID the user explicitly
+/// asked the daemon to honor.
+fn daemon_route_model_override_is_honored(
+    requested_model_id: Option<&str>,
+    recorded_model_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(requested_model_id) = requested_model_id else {
+        return Ok(());
+    };
+    let daemon_model_id =
+        recorded_model_id.unwrap_or(nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID);
+    if requested_model_id == daemon_model_id {
+        Ok(())
+    } else {
+        Err(format!(
+            "--model-id '{requested_model_id}' cannot be honored through the daemon; \
+             the daemon uses the model recorded in the database ('{daemon_model_id}'). \
+             Use --local --model-id '{requested_model_id}' --force to switch models."
+        ))
+    }
+}
 
 // ── Daemon index-stream phases ────────────────────────────────────────────────
 /// Drain one daemon index stream with the shared fail-closed terminal-state
@@ -291,6 +362,104 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
         format!("{secs:.1}s")
     } else {
         format!("{}ms", elapsed.as_millis())
+    }
+}
+
+fn capability_diagnostics_value(
+    embedding_compiled: bool,
+    metal_compiled: bool,
+    runtime_probe: Result<(), String>,
+) -> serde_json::Value {
+    let (metal_runtime_available, metal_runtime_error) = match runtime_probe {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(error)),
+    };
+    serde_json::json!({
+        "embedding_compiled": embedding_compiled,
+        "metal_compiled": metal_compiled,
+        "metal_runtime_available": metal_runtime_available,
+        "metal_runtime_error": metal_runtime_error,
+    })
+}
+
+fn current_capability_diagnostics() -> serde_json::Value {
+    #[cfg(feature = "embed")]
+    {
+        capability_diagnostics_value(
+            true,
+            nestweaver_embed::metal_compiled(),
+            nestweaver_embed::probe_metal_runtime().map_err(|error| format!("{error:#}")),
+        )
+    }
+    #[cfg(not(feature = "embed"))]
+    {
+        capability_diagnostics_value(
+            false,
+            false,
+            Err("embedding support was not compiled into this binary".to_string()),
+        )
+    }
+}
+
+fn format_embedding_status(status: &nestweaver_proto::EmbeddingStatus) -> String {
+    let selected = if status.selected_device.is_empty() {
+        "unavailable"
+    } else {
+        &status.selected_device
+    };
+    let mut lines = vec![
+        format!("  State:            {}", status.state),
+        format!("  Backend:          {}", status.backend),
+        format!(
+            "  Device:           {} -> {selected}",
+            status.requested_device
+        ),
+        format!("  Model:            {}", status.model_id),
+        format!("  Metal compiled:   {}", status.metal_compiled),
+        format!("  Fallback used:    {}", status.fallback_used),
+    ];
+    if !status.error.is_empty() {
+        lines.push(format!("  Error:            {}", status.error));
+    }
+    lines.join("\n")
+}
+
+fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::EmbeddingStatus {
+    nestweaver_proto::EmbeddingStatus {
+        state: value["state"].as_str().unwrap_or("unknown").to_string(),
+        backend: value["backend"].as_str().unwrap_or("").to_string(),
+        requested_device: value["requested_device"].as_str().unwrap_or("").to_string(),
+        selected_device: value["selected_device"].as_str().unwrap_or("").to_string(),
+        model_id: value["model_id"].as_str().unwrap_or("").to_string(),
+        error: value["error"].as_str().unwrap_or("").to_string(),
+        metal_compiled: value["metal_compiled"].as_bool().unwrap_or(false),
+        fallback_used: value["fallback_used"].as_bool().unwrap_or(false),
+    }
+}
+
+fn print_daemon_embedding_status(db_path: &Path) {
+    let result = tokio::runtime::Runtime::new()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                let mut client = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
+                client.brain_status().await
+            })
+        });
+    match result {
+        Ok(status) => {
+            println!("Embedding:");
+            if let Some(status) = status.embedding_status {
+                println!("{}", format_embedding_status(&status));
+            } else {
+                println!("  State:            unknown (older daemon)");
+            }
+        }
+        Err(error) => {
+            println!("Embedding:");
+            println!("  State:            unavailable (daemon booting or unreachable)");
+            println!("  Error:            {error:#}");
+        }
     }
 }
 
@@ -1333,7 +1502,7 @@ enum Commands {
     /// Only nodes that do not yet have an embedding are processed (incremental);
     /// use --force to re-embed everything.
     #[command(
-        after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing"
+        after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --local --cache-dir /path/to/cache  # populate a configured daemon cache\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing"
     )]
     Embed {
         #[arg(long, help = "Path to the database file [env: NESTWEAVER_DB]")]
@@ -1355,10 +1524,22 @@ enum Commands {
         model: Option<String>,
         #[arg(
             long,
-            default_value = nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID,
-            help = "HuggingFace model ID for local inference"
+            help = "HuggingFace model ID for local inference (default: sentence-transformers/all-MiniLM-L6-v2)"
         )]
-        model_id: String,
+        model_id: Option<String>,
+        #[arg(
+            long,
+            requires = "local",
+            help = "Hugging Face cache directory for direct --local embedding"
+        )]
+        cache_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            value_enum,
+            requires = "local",
+            help = "Device policy for --local embedding: auto, metal, or cpu"
+        )]
+        accelerator: Option<CliEmbeddingAccelerator>,
         #[arg(long, default_value = "32", help = "Batch size")]
         batch_size: usize,
         #[arg(
@@ -1630,6 +1811,16 @@ enum Commands {
         #[command(subcommand)]
         action: ServerAction,
     },
+    /// Validate NestWeaver configuration files
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+    /// Inspect compiled and runtime capabilities
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommands,
+    },
     /// Show hardware and configuration information
     Info {
         /// Show hardware acceleration details
@@ -1656,6 +1847,15 @@ enum Commands {
         /// change (tune what --strict blocks on via [pr_impact] in the config)
         #[arg(long)]
         strict: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiagnosticsCommands {
+    /// Report embedding and Metal compile/runtime capabilities
+    Capabilities {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
 }
 
@@ -1821,6 +2021,10 @@ enum DaemonAction {
         /// Path to instance.toml for server config (repos, polling, etc.)
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Exit after this many idle seconds. Used by ephemeral child daemons.
+        #[arg(long, default_value = "0", hide = true)]
+        idle_timeout: u64,
 
         /// Boot as a read-only snapshot replica: materialize this snapshot
         /// directory into a private working copy and serve it read-only
@@ -2604,6 +2808,18 @@ enum InstanceCommands {
         /// Discard a graph-applied journal too (the graph mutation stays).
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Validate an instance config without creating files or contacting services
+    Validate {
+        /// Path to the instance config file (.toml)
+        path: PathBuf,
+        /// Output a machine-readable validation result
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -3599,10 +3815,10 @@ fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<String>
     cmdline_is_our_daemon(&cmdline, db_path).then_some(cmdline)
 }
 
-/// Is the pidfile's flock currently held? daemonize2 holds LOCK_EX on the
-/// pidfile for the daemon's whole lifetime (see autostart.rs), so a held flock
-/// proves a live daemon owns THIS pidfile — regardless of how its `--db` path
-/// was spelled at start time (which a cmdline match can't always prove).
+/// Is the pidfile's flock currently held? The serving process owns LOCK_EX for
+/// its whole lifetime, so a held flock proves a live daemon owns THIS pidfile —
+/// regardless of how its `--db` path was spelled at start time (which a cmdline
+/// match can't always prove).
 fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
     use std::os::unix::io::AsRawFd;
     let Ok(file) = std::fs::OpenOptions::new()
@@ -3618,6 +3834,34 @@ fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
         return false;
     }
     std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// Retire failed-start runtime files only while proving no concurrent daemon
+/// owns them. Holding the pidfile flock closes the check-then-unlink race:
+/// another starter cannot acquire this inode before the stale socket is
+/// removed, and the pidfile is unlinked last so a later starter gets a fresh
+/// inode that this cleanup never touches.
+#[cfg(target_os = "macos")]
+fn remove_unowned_daemon_runtime(pidfile: &std::path::Path, socket: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pidfile)
+    else {
+        return;
+    };
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return;
+    }
+
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(pidfile);
+    unsafe {
+        libc::flock(fd, libc::LOCK_UN);
+    }
 }
 
 /// PID of the process on the other end of a connected unix socket, as
@@ -3768,6 +4012,7 @@ fn canonical_repo_dir(repo_path: &std::path::Path) -> anyhow::Result<PathBuf> {
 
 /// Poll until the daemon's unix socket accepts a connection (proving
 /// run_server survived boot) or `timeout` elapses.
+#[cfg(any(not(target_os = "macos"), test))]
 fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -3777,6 +4022,90 @@ fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+/// Build the cold child process used for ephemeral macOS daemons.
+///
+/// The child runs the foreground server directly. Spawning a fresh executable
+/// gives it a cold process lifecycle and avoids inheriting initialized parent
+/// state across a fork.
+#[cfg(target_os = "macos")]
+fn macos_temp_daemon_command(
+    executable: &std::path::Path,
+    db_path: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+    idle_timeout: u64,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(["daemon", "--db"])
+        .arg(db_path)
+        .arg("run")
+        .arg("--idle-timeout")
+        .arg(idle_timeout.to_string());
+    if let Some(config_path) = config_path {
+        command.arg("--config").arg(config_path);
+    }
+    command
+        .env_remove("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+
+/// Wait for a temporary macOS daemon without losing sight of its child.
+///
+/// A foreground child can fail before its socket exists (for example, while
+/// opening its database). Polling its exit concurrently with RPC readiness
+/// reaps that failure immediately instead of leaving a zombie until the full
+/// health timeout. If another starter owns the pidfile lock, the exited child
+/// lost a legitimate concurrent-start race, so continue waiting for that
+/// incumbent to become healthy.
+#[cfg(target_os = "macos")]
+fn wait_for_macos_temp_daemon(
+    child: &mut std::process::Child,
+    db_path: &std::path::Path,
+    pidfile: &std::path::Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<nestweaver_proto::HealthCheckResponse> {
+    let started = std::time::Instant::now();
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    rt.block_on(async {
+        let child_exit = async {
+            loop {
+                if let Some(status) = child.try_wait().context("inspect temporary daemon child")? {
+                    return Ok::<_, anyhow::Error>(status);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+
+        tokio::select! {
+            biased;
+            health = nestweaver_client::DaemonClient::wait_healthy(db_path, timeout) => {
+                health.context("temporary daemon health check failed")
+            }
+            exit = child_exit => {
+                let status = exit?;
+                if pidfile_flock_held(pidfile) {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    return nestweaver_client::DaemonClient::wait_healthy(db_path, remaining)
+                        .await
+                        .context(
+                            "temporary daemon child lost a concurrent-start race, but the \
+                             pidfile owner did not become healthy",
+                        );
+                }
+                anyhow::bail!(
+                    "temporary daemon child exited before becoming healthy ({status}) after \
+                     {:.2}s; database: {}",
+                    started.elapsed().as_secs_f64(),
+                    db_path.display()
+                );
+            }
+        }
+    })
 }
 
 /// Wait up to `grace` for `pid` to exit (after a SIGTERM). Returns true
@@ -5920,6 +6249,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Snapshot { command } => run_snapshot(command, use_daemon).map(|c| (c, None)),
         Commands::Backup { command } => run_backup(command).map(|c| (c, None)),
         Commands::Instance { command } => run_instance(command).map(|c| (c, None)),
+        Commands::Config { command } => run_config(command),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon, no_embed),
         Commands::RtsEval { command } => run_rts_eval(command),
         Commands::StaleCheck { json, db } => run_brain(
@@ -5938,6 +6268,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             endpoint,
             model,
             model_id,
+            cache_dir,
+            accelerator,
             batch_size,
             scope,
             force,
@@ -5947,7 +6279,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             local,
             endpoint.as_deref(),
             model.as_deref(),
-            &model_id,
+            model_id.as_deref(),
+            cache_dir.as_deref(),
+            accelerator,
             batch_size,
             &scope,
             force,
@@ -9318,17 +9652,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     std::fs::create_dir_all(&log_dir)
                         .with_context(|| format!("create log dir: {}", log_dir.display()))?;
 
-                    // On macOS, use launchd to manage the daemon unless
-                    // NESTWEAVER_DAEMON_FORK=1 is set (useful for tests and
-                    // environments where launchd is not available). Also never
-                    // register a persistent launchd agent for a temp-DB daemon —
-                    // those are ephemeral (tests/repros) and leak crash-looping
-                    // plists; fall through to the fork path instead.
+                    // On macOS, launchd owns persistent daemons. Temporary
+                    // databases are intentionally not registered as persistent
+                    // agents; a fresh foreground child owns those instead.
                     #[cfg(target_os = "macos")]
-                    let use_launchd = std::env::var("NESTWEAVER_DAEMON_FORK")
-                        .map(|v| v != "1")
-                        .unwrap_or(true)
-                        && !nestweaver_daemon::launchd::is_temp_db_path(&db_path);
+                    let use_launchd = !nestweaver_daemon::launchd::is_temp_db_path(&db_path);
                     #[cfg(not(target_os = "macos"))]
                     let use_launchd = false;
 
@@ -9352,12 +9680,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let index_cpu_percent = std::env::var("NESTWEAVER_INDEX_CPU_PERCENT")
                                 .ok()
                                 .filter(|v| v.trim().parse::<u32>().is_ok());
-                            let plist = nestweaver_daemon::launchd::generate_plist(
+                            let config_abs = config.as_deref().map(abs_for_daemon);
+                            let plist = nestweaver_daemon::launchd::generate_plist_with_config(
                                 &instance_id,
                                 &binary_path,
                                 &db_path_abs,
                                 &log_file,
                                 index_cpu_percent.as_deref(),
+                                config_abs.as_deref(),
                             );
 
                             // Clean up any existing agent or fork-based daemon
@@ -9456,7 +9786,89 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         unreachable!("use_launchd is always false on non-macOS");
                     }
 
-                    // Fork-based daemon path (Linux + macOS with NESTWEAVER_DAEMON_FORK=1)
+                    #[cfg(target_os = "macos")]
+                    {
+                        let executable =
+                            std::env::current_exe().context("cannot determine binary path")?;
+                        let db_path_abs = abs_for_daemon(&db_path);
+                        let config_abs = config.as_deref().map(abs_for_daemon);
+                        let mut child = macos_temp_daemon_command(
+                            &executable,
+                            &db_path_abs,
+                            config_abs.as_deref(),
+                            idle_timeout,
+                        )
+                        .spawn()
+                        .with_context(|| {
+                            format!(
+                                "spawn temporary daemon process for {}",
+                                db_path_abs.display()
+                            )
+                        })?;
+
+                        eprintln!(
+                            "Starting temporary daemon for {} (instance {instance_id})...",
+                            db_path_abs.display()
+                        );
+                        eprintln!("  Child PID: {}", child.id());
+                        eprintln!("  PID file:  {}", pidfile.display());
+                        eprintln!("  Socket:    {}", socket.display());
+
+                        match wait_for_macos_temp_daemon(
+                            &mut child,
+                            &db_path_abs,
+                            &pidfile,
+                            std::time::Duration::from_secs(60),
+                        ) {
+                            Ok(health) => {
+                                if health.pid == child.id() {
+                                    if let Some(status) = child
+                                        .try_wait()
+                                        .context("inspect temporary daemon child")?
+                                    {
+                                        anyhow::bail!(
+                                            "temporary daemon child exited after reporting health \
+                                             ({status})"
+                                        );
+                                    }
+                                    eprintln!("Daemon started.");
+                                } else {
+                                    // A concurrent start won the pidfile race.
+                                    // Stop and reap this losing child if it has
+                                    // not observed the lock loss yet, then use
+                                    // the healthy daemon that owns the instance.
+                                    if child
+                                        .try_wait()
+                                        .context("inspect losing temporary daemon child")?
+                                        .is_none()
+                                    {
+                                        let _ = child.kill();
+                                        let _ = child.wait();
+                                    }
+                                    eprintln!("Daemon already running (PID {}).", health.pid);
+                                }
+                                Ok((EXIT_SUCCESS, None))
+                            }
+                            Err(error) => {
+                                if child
+                                    .try_wait()
+                                    .context("inspect failed temporary daemon child")?
+                                    .is_none()
+                                {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                }
+                                remove_unowned_daemon_runtime(&pidfile, &socket);
+                                anyhow::bail!(
+                                    "temporary daemon for {} did not become healthy: {error:#}",
+                                    db_path_abs.display()
+                                );
+                            }
+                        }
+                    }
+
+                    // Non-macOS keeps the existing double-fork daemon lifecycle.
+                    #[cfg(not(target_os = "macos"))]
                     {
                         // Atomically detect another running or starting daemon via
                         // a non-blocking exclusive flock on the pidfile. daemonize2
@@ -9621,6 +10033,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     webhook_secret,
                     webhook_secret_old,
                     config,
+                    idle_timeout,
                     snapshot,
                     acme_domain,
                     acme_email,
@@ -9676,10 +10089,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     };
 
                     let rt = tokio::runtime::Runtime::new()?;
+                    let idle = if idle_timeout > 0 {
+                        Some(std::time::Duration::from_secs(idle_timeout))
+                    } else {
+                        None
+                    };
                     rt.block_on(async {
                         nestweaver_daemon::run_server(
                             &db_path,
-                            None,
+                            idle,
                             config.as_deref(),
                             server_opts,
                         )
@@ -9812,6 +10230,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
                         println!("  Log:    {}", log_file.display());
+                        print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
 
@@ -9826,6 +10245,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("  DB:     {}", db_path.display());
                             println!("  Socket: {}", socket.display());
                             println!("  Log:    {}", log_file.display());
+                            print_daemon_embedding_status(&db_path);
                         } else {
                             println!(
                                 "Daemon is not running (pidfile PID {pid} belongs to another process)."
@@ -9843,6 +10263,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
                         println!("  Log:    {}", log_file.display());
+                        print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
                     println!("Daemon is not running.");
@@ -10098,6 +10519,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
         },
+
+        Commands::Diagnostics {
+            command: DiagnosticsCommands::Capabilities { json },
+        } => {
+            let capabilities = current_capability_diagnostics();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&capabilities)?);
+            } else {
+                println!("NestWeaver capabilities:");
+                println!(
+                    "  Embedding compiled: {}",
+                    capabilities["embedding_compiled"]
+                );
+                println!("  Metal compiled:     {}", capabilities["metal_compiled"]);
+                println!(
+                    "  Metal runtime:      {}",
+                    if capabilities["metal_runtime_available"] == true {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }
+                );
+                if let Some(error) = capabilities["metal_runtime_error"].as_str() {
+                    println!("  Runtime probe error: {error}");
+                }
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
 
         Commands::Info { hardware } => {
             if hardware {
@@ -11407,6 +11856,13 @@ fn run_brain(
                     println!("  Tags:      {tags}");
                     println!("  Wikilinks: {wikilinks}");
                     println!("  Repos:     {repo_count}");
+                    if let Some(embedding) = value.get("embedding_status") {
+                        println!("Embedding:");
+                        println!(
+                            "{}",
+                            format_embedding_status(&embedding_status_from_json(embedding))
+                        );
+                    }
                     // Interaction tracking — local check (not in MCP response).
                     // The sidecar is created (empty) by `InteractionTracker::new`
                     // when an MCP/daemon starts with --track-interactions, so:
@@ -13839,6 +14295,8 @@ fn render_brain_search_response(
             "total_matches_relation": total_matches_relation,
             "returned_matches": returned_matches,
             "truncated": truncated,
+            "semantic_applied": resp.semantic_applied,
+            "degraded_components": &resp.degraded_components,
         });
         if !resp.expansion_terms.is_empty() {
             payload["expansion_terms"] = serde_json::json!(resp.expansion_terms);
@@ -13925,6 +14383,8 @@ mod brain_search_renderer_tests {
             returned_matches: 0,
             total_matches_relation: String::new(),
             truncated: false,
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         };
 
         let metadata = brain_search_display_metadata(&response);
@@ -14185,7 +14645,9 @@ fn run_embed(
     local: bool,
     endpoint: Option<&str>,
     model: Option<&str>,
-    model_id: &str,
+    model_id: Option<&str>,
+    cache_dir: Option<&Path>,
+    accelerator: Option<CliEmbeddingAccelerator>,
     batch_size: usize,
     scope: &str,
     force: bool,
@@ -14196,6 +14658,12 @@ fn run_embed(
     if local && endpoint.is_some() {
         anyhow::bail!("--local and --endpoint are mutually exclusive");
     }
+    if accelerator.is_some() && !local {
+        anyhow::bail!("--accelerator requires --local");
+    }
+    if cache_dir.is_some() && !local {
+        anyhow::bail!("--cache-dir requires --local");
+    }
     if batch_size == 0 {
         anyhow::bail!("--batch-size must be at least 1");
     }
@@ -14203,8 +14671,9 @@ fn run_embed(
     let t0 = std::time::Instant::now();
     let default = default_db_path();
     let path = db.unwrap_or(&default);
+    let local_model_id = local_embedding_model_id(model_id);
 
-    // ── Try the daemon path first (Metal-accelerated) ───────────
+    // ── Try the daemon path first (configured embedding backend) ───────────
     // Only use daemon for local-model embedding (no --endpoint, no --local) AND
     // when the daemon is enabled. Under --no-daemon / NESTWEAVER_NO_DAEMON=1 we must
     // NOT touch the daemon: connecting auto-starts one, whose held DB lock then
@@ -14231,20 +14700,16 @@ fn run_embed(
                 None
             }
         };
-        let daemon_model = recorded_model
-            .map(|(recorded_model, _dim)| recorded_model)
-            .unwrap_or_else(|| nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID.to_string());
-        if model_id != daemon_model {
-            anyhow::bail!(
-                "--model-id '{model_id}' cannot be honored through the daemon; \
-                 the daemon uses the model recorded in the database ('{daemon_model}'). \
-                 Use --local --model-id '{model_id}' --force to switch models."
-            );
+        let recorded_model = recorded_model
+            .as_ref()
+            .map(|(model_id, _)| model_id.as_str());
+        if let Err(error) = daemon_route_model_override_is_honored(model_id, recorded_model) {
+            anyhow::bail!("{error}");
         }
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
-                eprintln!("Embedding via daemon (Metal-accelerated)…");
+                eprintln!("Embedding via daemon (configured backend)…");
                 match rt.block_on(client.embed(scope, force, batch_size as u32)) {
                     Ok(resp) => {
                         let elapsed = t0.elapsed();
@@ -14332,7 +14797,7 @@ fn run_embed(
 
     if let Some(ep) = endpoint {
         // ── External API path ────────────────────────────────────
-        let api_model = model.unwrap_or("text-embedding-3-small");
+        let api_model = external_embedding_model(model);
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
         if do_symbols {
@@ -14486,12 +14951,15 @@ fn run_embed(
         // ── Local model path (default) ───────────────────────────
         #[cfg(feature = "embed")]
         {
-            let config = nestweaver_embed::EmbedConfig {
-                model_id: model_id.to_string(),
-                ..Default::default()
-            };
-            let embed_model = nestweaver_embed::EmbedModel::load(&config)
-                .context("failed to load local embedding model")?;
+            let config = direct_local_embedding_config(local_model_id, cache_dir);
+            let policy =
+                cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
+            let embed_model = nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(
+                &config,
+                policy,
+                cli_embedding_artifact_mode(),
+            )
+            .context("failed to load local embedding model")?;
 
             if do_symbols {
                 let all = store
@@ -14666,9 +15134,9 @@ fn run_embed(
     // given DB transparently uses whatever model it was embedded with.
     if let Some(dim) = store.embedding_index_dimension() {
         let effective_model = if endpoint.is_some() {
-            model.unwrap_or(model_id)
+            external_embedding_model(model)
         } else {
-            model_id
+            local_model_id
         };
         if !effective_model.is_empty()
             && let Err(e) = store.set_embedding_metadata(effective_model, dim as u32)
@@ -14947,6 +15415,46 @@ fn run_contracts(
                 EXIT_SUCCESS
             };
             Ok((exit, None))
+        }
+    }
+}
+
+fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option<String>)> {
+    match command {
+        ConfigCommands::Validate { path, json } => {
+            match nestweaver_engine::InstanceConfig::from_file(&path) {
+                Ok(config) => {
+                    if json {
+                        let result = serde_json::json!({
+                            "valid": true,
+                            "path": path.display().to_string(),
+                            "instance_id": config.instance_id,
+                            "repo_count": config.repos.len(),
+                        });
+                        println!("{}", serde_json::to_string(&result)?);
+                    } else {
+                        println!(
+                            "Valid instance config: {} (instance_id: {}, repos: {})",
+                            path.display(),
+                            config.instance_id,
+                            config.repos.len()
+                        );
+                    }
+                    Ok((EXIT_SUCCESS, None))
+                }
+                Err(error) if json => {
+                    let message = format!("validate instance config {}: {error:#}", path.display());
+                    let result = serde_json::json!({
+                        "valid": false,
+                        "path": path.display().to_string(),
+                        "error": message,
+                    });
+                    eprintln!("{}", serde_json::to_string(&result)?);
+                    Ok((EXIT_ERROR, None))
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("validate instance config {}", path.display())),
+            }
         }
     }
 }
@@ -17802,6 +18310,214 @@ mod stale_check_cli_tests {
 }
 
 #[cfg(test)]
+mod diagnostics_cli_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_capabilities_json_parses() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["nestweaver", "diagnostics", "capabilities", "--json"])
+                        .expect("diagnostics capabilities --json must parse");
+                assert!(matches!(
+                    cli.command,
+                    Commands::Diagnostics {
+                        command: DiagnosticsCommands::Capabilities { json: true }
+                    }
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn capability_payload_keeps_compile_and_runtime_results_separate() {
+        let value = capability_diagnostics_value(
+            true,
+            true,
+            Err("Metal compute/readback failed".to_string()),
+        );
+        assert_eq!(value["embedding_compiled"], true);
+        assert_eq!(value["metal_compiled"], true);
+        assert_eq!(value["metal_runtime_available"], false);
+        assert_eq!(
+            value["metal_runtime_error"],
+            "Metal compute/readback failed"
+        );
+    }
+
+    #[test]
+    fn embedding_status_text_includes_policy_invariant_and_error() {
+        let status = nestweaver_proto::EmbeddingStatus {
+            state: "failed".to_string(),
+            backend: "local".to_string(),
+            requested_device: "metal".to_string(),
+            selected_device: String::new(),
+            model_id: "test-model".to_string(),
+            error: "Metal probe failed".to_string(),
+            metal_compiled: true,
+            fallback_used: false,
+        };
+        let text = format_embedding_status(&status);
+        assert!(text.contains("State:            failed"));
+        assert!(text.contains("Device:           metal -> unavailable"));
+        assert!(text.contains("Fallback used:    false"));
+        assert!(text.contains("Metal probe failed"));
+    }
+}
+
+#[cfg(test)]
+mod daemon_cli_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_run_accepts_an_explicit_idle_timeout() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "daemon",
+                    "--db",
+                    "/tmp/brain.lbug",
+                    "run",
+                    "--idle-timeout",
+                    "17",
+                ])
+                .expect("the temp-daemon child timeout must parse");
+                assert!(matches!(
+                    cli.command,
+                    Commands::Daemon {
+                        action: DaemonAction::Run {
+                            idle_timeout: 17,
+                            ..
+                        },
+                        ..
+                    }
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_temp_daemon_child_runs_foreground_with_null_stdio() {
+        let command = macos_temp_daemon_command(
+            Path::new("/opt/nestweaver"),
+            Path::new("/tmp/brain.lbug"),
+            Some(Path::new("/tmp/nestweaver-instance.toml")),
+            17,
+        );
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                "/tmp/brain.lbug",
+                "run",
+                "--idle-timeout",
+                "17",
+                "--config",
+                "/tmp/nestweaver-instance.toml",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+        assert_eq!(
+            command.get_envs().find_map(|(name, value)| {
+                (name == "NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD").then_some(value)
+            }),
+            Some(None)
+        );
+        assert_eq!(command.get_program(), "/opt/nestweaver");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_temp_daemon_wait_reaps_an_early_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("never-healthy.lbug");
+        let pidfile = dir.path().join("never-healthy.pid");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id() as i32;
+        let started = std::time::Instant::now();
+
+        let error = wait_for_macos_temp_daemon(
+            &mut child,
+            &db_path,
+            &pidfile,
+            std::time::Duration::from_secs(3),
+        )
+        .expect_err("an exited child cannot become healthy");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "early child exit must preempt the readiness timeout: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("exited before becoming healthy"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("exit status: 23"), "{error:#}");
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1, "the readiness waiter must reap PID {pid}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "PID {pid} must no longer be a waitable zombie"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_failed_start_cleanup_preserves_concurrent_owner() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let socket = dir.path().join("daemon.sock");
+        let owner = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&pidfile)
+            .unwrap();
+        std::fs::write(&socket, "incumbent socket").unwrap();
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        remove_unowned_daemon_runtime(&pidfile, &socket);
+        assert!(
+            pidfile.exists(),
+            "a concurrent owner's pidfile must survive"
+        );
+        assert!(socket.exists(), "a concurrent owner's socket must survive");
+
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(owner);
+        remove_unowned_daemon_runtime(&pidfile, &socket);
+        assert!(!socket.exists(), "unowned socket must be retired");
+        assert!(!pidfile.exists(), "unowned pidfile must be retired");
+    }
+}
+
+#[cfg(test)]
 mod cli_bounds_tests {
     use super::*;
 
@@ -17883,6 +18599,211 @@ mod cli_bounds_tests {
                         assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
                     }
                 }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+}
+
+#[cfg(all(test, feature = "embed"))]
+mod embed_accelerator_cli_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_route_ignores_external_metadata_without_local_model_override() {
+        assert!(
+            daemon_route_model_override_is_honored(None, Some(DEFAULT_EXTERNAL_EMBEDDING_MODEL))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn daemon_route_rejects_conflicting_explicit_local_model_override() {
+        let err = daemon_route_model_override_is_honored(
+            Some("sentence-transformers/custom"),
+            Some("sentence-transformers/stored"),
+        )
+        .expect_err("a conflicting local override cannot be honored by the daemon");
+
+        assert!(err.contains("sentence-transformers/custom"));
+        assert!(err.contains("sentence-transformers/stored"));
+    }
+
+    #[test]
+    fn daemon_route_allows_matching_explicit_local_model_override() {
+        assert!(
+            daemon_route_model_override_is_honored(
+                Some("sentence-transformers/stored"),
+                Some("sentence-transformers/stored"),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cli_keeps_the_local_model_default_without_an_override() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["nestweaver", "embed"])
+                    .expect("the established embed syntax must remain accepted");
+                let Commands::Embed { model_id, .. } = cli.command else {
+                    panic!("expected embed command");
+                };
+                assert_eq!(model_id, None);
+                assert_eq!(
+                    local_embedding_model_id(None),
+                    nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID
+                );
+
+                let explicit = Cli::try_parse_from([
+                    "nestweaver",
+                    "embed",
+                    "--local",
+                    "--model-id",
+                    "sentence-transformers/custom",
+                ])
+                .expect("an explicit local model override must remain accepted");
+                assert!(matches!(
+                    explicit.command,
+                    Commands::Embed {
+                        model_id: Some(model_id),
+                        ..
+                    } if model_id == "sentence-transformers/custom"
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn cli_accelerator_maps_each_policy() {
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Auto),
+            nestweaver_embed::DevicePolicy::Auto
+        );
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Metal),
+            nestweaver_embed::DevicePolicy::Metal
+        );
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Cpu),
+            nestweaver_embed::DevicePolicy::Cpu
+        );
+    }
+
+    #[test]
+    fn explicit_direct_local_embedding_may_download_missing_artifacts() {
+        assert_eq!(
+            cli_embedding_artifact_mode(),
+            nestweaver_embed::ArtifactMode::DownloadMissing
+        );
+    }
+
+    #[test]
+    fn direct_local_cache_option_populates_the_remediation_target() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cache = tempfile::tempdir().expect("embedding cache tempdir");
+                let cache_dir = cache.path().to_path_buf();
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "embed",
+                    "--local",
+                    "--model-id",
+                    "test-owner/test-model",
+                    "--cache-dir",
+                    cache_dir.to_str().expect("UTF-8 test cache"),
+                ])
+                .expect("an explicit local cache directory must parse");
+                let Commands::Embed {
+                    model_id,
+                    cache_dir: parsed_cache_dir,
+                    ..
+                } = cli.command
+                else {
+                    panic!("expected embed command");
+                };
+
+                let config = direct_local_embedding_config(
+                    local_embedding_model_id(model_id.as_deref()),
+                    parsed_cache_dir.as_deref(),
+                );
+                assert_eq!(config.cache_dir, cache_dir);
+                assert!(
+                    Cli::try_parse_from([
+                        "nestweaver",
+                        "embed",
+                        "--cache-dir",
+                        "/tmp/must-not-target-daemon-cache",
+                    ])
+                    .is_err(),
+                    "an explicit cache directory must require direct --local embedding"
+                );
+
+                let err = nestweaver_embed::resolve_model_artifacts(
+                    &config,
+                    nestweaver_embed::ArtifactMode::CacheOnly,
+                )
+                .expect_err("empty configured cache must produce remediation");
+                let missing = err
+                    .downcast_ref::<nestweaver_embed::MissingModelArtifactError>()
+                    .expect("cache-only miss must remain typed");
+                assert_eq!(missing.cache_dir, cache_dir);
+
+                let remediation = err.to_string();
+                assert!(remediation.contains("--cache-dir"));
+                assert!(remediation.contains(cache_dir.to_str().expect("UTF-8 test cache")));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn direct_local_cache_option_preserves_the_default_when_omitted() {
+        let config = direct_local_embedding_config("test-owner/test-model", None);
+        assert_eq!(
+            config.cache_dir,
+            nestweaver_embed::EmbedConfig::default().cache_dir
+        );
+    }
+
+    #[test]
+    fn external_metadata_uses_the_actual_default_api_model() {
+        assert_eq!(
+            external_embedding_model(None),
+            DEFAULT_EXTERNAL_EMBEDDING_MODEL
+        );
+        assert_eq!(
+            external_embedding_model(Some("configured-model")),
+            "configured-model"
+        );
+    }
+
+    #[test]
+    fn explicit_embed_accelerator_is_parsed_only_for_direct_local_embedding() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["nestweaver", "embed", "--local", "--accelerator", "cpu"])
+                        .expect("explicit local accelerator must parse");
+                assert!(matches!(
+                    cli.command,
+                    Commands::Embed {
+                        accelerator: Some(CliEmbeddingAccelerator::Cpu),
+                        ..
+                    }
+                ));
+
+                assert!(
+                    Cli::try_parse_from(["nestweaver", "embed", "--accelerator", "metal"]).is_err(),
+                    "an explicit accelerator must not be silently ignored by the daemon path"
+                );
             })
             .expect("spawn")
             .join()

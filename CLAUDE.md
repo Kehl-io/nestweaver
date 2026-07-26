@@ -44,10 +44,10 @@ On macOS, prefer the native `.app` bundle over the CLI daemon. It provides:
 
 ```sh
 # Build and launch
-cd app && bash build.sh
+bash app/build.sh
 open target/release/NestWeaver.app
 
-# Or download NestWeaver.app from GitHub Releases
+# NestWeaver.app is source-build-only until a release job publishes a .app or DMG.
 ```
 
 The web UI defaults to port 3000 (`nestweaver ui`); the macOS .app uses 9377. The app is menubar-only (no Dock icon).
@@ -262,4 +262,3 @@ federation          (leaf: schema + proto only)
 | 3 | Ambiguous match (multiple symbols with same name) |
 | 4 | Unauthorized (pull) |
 | 5 | Unavailable (pull) |
-
