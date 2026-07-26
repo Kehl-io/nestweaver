@@ -328,6 +328,41 @@ fn release_workflow_build_quotes_target_and_conditionally_enables_features() {
 }
 
 #[test]
+fn release_workflow_stages_openssl_outside_build_script_out_dir() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let step = workflow_step(&workflow, "Build target OpenSSL");
+
+    assert!(
+        !step.contains("OPENSSL_INSTALL=\"$(find"),
+        "OpenSSL exports must not reference openssl-sys's self-deleting OUT_DIR\nstep:\n{step}"
+    );
+    for required in [
+        "TARGET: ${{ matrix.target }}",
+        "cargo build --locked --release --target \"$TARGET\" -p openssl-sys",
+        "OPENSSL_SOURCE=\"$(find \"target/$TARGET/release/build\"",
+        "OPENSSL_INSTALL=\"$RUNNER_TEMP/nestweaver-openssl/$TARGET\"",
+        "mkdir -p \"$OPENSSL_INSTALL\"",
+        "cp -R \"$OPENSSL_SOURCE/.\" \"$OPENSSL_INSTALL/\"",
+        "test -f \"$OPENSSL_INSTALL/lib/libssl.a\"",
+        "test -f \"$OPENSSL_INSTALL/lib/libcrypto.a\"",
+        "test -f \"$OPENSSL_INSTALL/include/openssl/ssl.h\"",
+        "test -f \"$OPENSSL_INSTALL/include/openssl/opensslconf.h\"",
+        "echo \"OPENSSL_DIR=$OPENSSL_INSTALL\"",
+        "echo \"OPENSSL_ROOT_DIR=$OPENSSL_INSTALL\"",
+        "echo \"OPENSSL_LIB_DIR=$OPENSSL_INSTALL/lib\"",
+        "echo \"OPENSSL_INCLUDE_DIR=$OPENSSL_INSTALL/include\"",
+        "echo \"CMAKE_PREFIX_PATH=$OPENSSL_INSTALL\"",
+    ] {
+        assert!(
+            step.contains(required),
+            "OpenSSL staging must contain `{required}`\nstep:\n{step}"
+        );
+    }
+}
+
+#[test]
 fn release_workflow_native_apple_verifies_metal_capability_and_artifact() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow =
