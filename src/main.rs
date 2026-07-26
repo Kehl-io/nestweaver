@@ -1910,6 +1910,10 @@ enum DaemonAction {
         #[arg(long)]
         config: Option<PathBuf>,
 
+        /// Exit after this many idle seconds. Used by ephemeral child daemons.
+        #[arg(long, default_value = "0", hide = true)]
+        idle_timeout: u64,
+
         /// Boot as a read-only snapshot replica: materialize this snapshot
         /// directory into a private working copy and serve it read-only
         /// (requires --server; write RPCs and background indexing are disabled).
@@ -3699,10 +3703,10 @@ fn daemon_cmdline_if_ours(pid: i32, db_path: &std::path::Path) -> Option<String>
     cmdline_is_our_daemon(&cmdline, db_path).then_some(cmdline)
 }
 
-/// Is the pidfile's flock currently held? daemonize2 holds LOCK_EX on the
-/// pidfile for the daemon's whole lifetime (see autostart.rs), so a held flock
-/// proves a live daemon owns THIS pidfile — regardless of how its `--db` path
-/// was spelled at start time (which a cmdline match can't always prove).
+/// Is the pidfile's flock currently held? The serving process owns LOCK_EX for
+/// its whole lifetime, so a held flock proves a live daemon owns THIS pidfile —
+/// regardless of how its `--db` path was spelled at start time (which a cmdline
+/// match can't always prove).
 fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
     use std::os::unix::io::AsRawFd;
     let Ok(file) = std::fs::OpenOptions::new()
@@ -3868,6 +3872,7 @@ fn canonical_repo_dir(repo_path: &std::path::Path) -> anyhow::Result<PathBuf> {
 
 /// Poll until the daemon's unix socket accepts a connection (proving
 /// run_server survived boot) or `timeout` elapses.
+#[cfg(any(not(target_os = "macos"), test))]
 fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -3877,6 +3882,36 @@ fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+/// Build the cold child process used for ephemeral macOS daemons.
+///
+/// The child runs the foreground server directly. Spawning a fresh executable
+/// gives it a cold process lifecycle and avoids inheriting initialized parent
+/// state across a fork.
+#[cfg(target_os = "macos")]
+fn macos_temp_daemon_command(
+    executable: &std::path::Path,
+    db_path: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+    idle_timeout: u64,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(["daemon", "--db"])
+        .arg(db_path)
+        .arg("run")
+        .arg("--idle-timeout")
+        .arg(idle_timeout.to_string());
+    if let Some(config_path) = config_path {
+        command.arg("--config").arg(config_path);
+    }
+    command
+        .env_remove("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
 }
 
 /// Wait up to `grace` for `pid` to exit (after a SIGTERM). Returns true
@@ -9423,17 +9458,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     std::fs::create_dir_all(&log_dir)
                         .with_context(|| format!("create log dir: {}", log_dir.display()))?;
 
-                    // On macOS, use launchd to manage the daemon unless
-                    // NESTWEAVER_DAEMON_FORK=1 is set (useful for tests and
-                    // environments where launchd is not available). Also never
-                    // register a persistent launchd agent for a temp-DB daemon —
-                    // those are ephemeral (tests/repros) and leak crash-looping
-                    // plists; fall through to the fork path instead.
+                    // On macOS, launchd owns persistent daemons. Temporary
+                    // databases are intentionally not registered as persistent
+                    // agents; a fresh foreground child owns those instead.
                     #[cfg(target_os = "macos")]
-                    let use_launchd = std::env::var("NESTWEAVER_DAEMON_FORK")
-                        .map(|v| v != "1")
-                        .unwrap_or(true)
-                        && !nestweaver_daemon::launchd::is_temp_db_path(&db_path);
+                    let use_launchd = !nestweaver_daemon::launchd::is_temp_db_path(&db_path);
                     #[cfg(not(target_os = "macos"))]
                     let use_launchd = false;
 
@@ -9457,12 +9486,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let index_cpu_percent = std::env::var("NESTWEAVER_INDEX_CPU_PERCENT")
                                 .ok()
                                 .filter(|v| v.trim().parse::<u32>().is_ok());
-                            let plist = nestweaver_daemon::launchd::generate_plist(
+                            let config_abs = config.as_deref().map(abs_for_daemon);
+                            let plist = nestweaver_daemon::launchd::generate_plist_with_config(
                                 &instance_id,
                                 &binary_path,
                                 &db_path_abs,
                                 &log_file,
                                 index_cpu_percent.as_deref(),
+                                config_abs.as_deref(),
                             );
 
                             // Clean up any existing agent or fork-based daemon
@@ -9561,7 +9592,88 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         unreachable!("use_launchd is always false on non-macOS");
                     }
 
-                    // Fork-based daemon path (Linux + macOS with NESTWEAVER_DAEMON_FORK=1)
+                    #[cfg(target_os = "macos")]
+                    {
+                        let executable =
+                            std::env::current_exe().context("cannot determine binary path")?;
+                        let db_path_abs = abs_for_daemon(&db_path);
+                        let config_abs = config.as_deref().map(abs_for_daemon);
+                        let mut child = macos_temp_daemon_command(
+                            &executable,
+                            &db_path_abs,
+                            config_abs.as_deref(),
+                            idle_timeout,
+                        )
+                        .spawn()
+                        .with_context(|| {
+                            format!(
+                                "spawn temporary daemon process for {}",
+                                db_path_abs.display()
+                            )
+                        })?;
+
+                        eprintln!(
+                            "Starting temporary daemon for {} (instance {instance_id})...",
+                            db_path_abs.display()
+                        );
+                        eprintln!("  Child PID: {}", child.id());
+                        eprintln!("  PID file:  {}", pidfile.display());
+                        eprintln!("  Socket:    {}", socket.display());
+
+                        let rt = tokio::runtime::Runtime::new()
+                            .context("failed to create tokio runtime")?;
+                        match rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
+                            &db_path_abs,
+                            std::time::Duration::from_secs(60),
+                        )) {
+                            Ok(health) => {
+                                if health.pid == child.id() {
+                                    if let Some(status) = child
+                                        .try_wait()
+                                        .context("inspect temporary daemon child")?
+                                    {
+                                        anyhow::bail!(
+                                            "temporary daemon child exited after reporting health \
+                                             ({status})"
+                                        );
+                                    }
+                                    eprintln!("Daemon started.");
+                                } else {
+                                    // A concurrent start won the pidfile race.
+                                    // Stop and reap this losing child if it has
+                                    // not observed the lock loss yet, then use
+                                    // the healthy daemon that owns the instance.
+                                    if child
+                                        .try_wait()
+                                        .context("inspect losing temporary daemon child")?
+                                        .is_none()
+                                    {
+                                        let _ = child.kill();
+                                        let _ = child.wait();
+                                    }
+                                    eprintln!("Daemon already running (PID {}).", health.pid);
+                                }
+                                Ok((EXIT_SUCCESS, None))
+                            }
+                            Err(error) => {
+                                if child
+                                    .try_wait()
+                                    .context("inspect failed temporary daemon child")?
+                                    .is_none()
+                                {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                }
+                                anyhow::bail!(
+                                    "temporary daemon for {} did not become healthy: {error:#}",
+                                    db_path_abs.display()
+                                );
+                            }
+                        }
+                    }
+
+                    // Non-macOS keeps the existing double-fork daemon lifecycle.
+                    #[cfg(not(target_os = "macos"))]
                     {
                         // Atomically detect another running or starting daemon via
                         // a non-blocking exclusive flock on the pidfile. daemonize2
@@ -9726,6 +9838,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     webhook_secret,
                     webhook_secret_old,
                     config,
+                    idle_timeout,
                     snapshot,
                     acme_domain,
                     acme_email,
@@ -9781,10 +9894,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     };
 
                     let rt = tokio::runtime::Runtime::new()?;
+                    let idle = if idle_timeout > 0 {
+                        Some(std::time::Duration::from_secs(idle_timeout))
+                    } else {
+                        None
+                    };
                     rt.block_on(async {
                         nestweaver_daemon::run_server(
                             &db_path,
-                            None,
+                            idle,
                             config.as_deref(),
                             server_opts,
                         )
@@ -17951,6 +18069,78 @@ mod stale_check_cli_tests {
             .expect("spawn")
             .join()
             .expect("join");
+    }
+}
+
+#[cfg(test)]
+mod daemon_cli_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_run_accepts_an_explicit_idle_timeout() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "daemon",
+                    "--db",
+                    "/tmp/brain.lbug",
+                    "run",
+                    "--idle-timeout",
+                    "17",
+                ])
+                .expect("the temp-daemon child timeout must parse");
+                assert!(matches!(
+                    cli.command,
+                    Commands::Daemon {
+                        action: DaemonAction::Run {
+                            idle_timeout: 17,
+                            ..
+                        },
+                        ..
+                    }
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_temp_daemon_child_runs_foreground_with_null_stdio() {
+        let command = macos_temp_daemon_command(
+            Path::new("/opt/nestweaver"),
+            Path::new("/tmp/brain.lbug"),
+            Some(Path::new("/tmp/nestweaver-instance.toml")),
+            17,
+        );
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                "/tmp/brain.lbug",
+                "run",
+                "--idle-timeout",
+                "17",
+                "--config",
+                "/tmp/nestweaver-instance.toml",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+        assert_eq!(
+            command.get_envs().find_map(|(name, value)| {
+                (name == "NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD").then_some(value)
+            }),
+            Some(None)
+        );
+        assert_eq!(command.get_program(), "/opt/nestweaver");
     }
 }
 

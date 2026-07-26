@@ -32,9 +32,9 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
         .open(&pidfile)
         .with_context(|| format!("failed to open pidfile {}", pidfile.display()))?;
 
-    // Try a non-blocking exclusive flock. The `daemonize2` crate holds
-    // LOCK_EX on the pidfile for the daemon's entire lifetime, so if we
-    // can't acquire it the daemon is definitely running.
+    // Try a non-blocking exclusive flock. Every daemon server owns this lock
+    // for its process lifetime, regardless of whether launchd, a foreground
+    // child, or a non-macOS daemonized launcher created it.
     let fd = file.as_raw_fd();
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if ret != 0 {
@@ -144,24 +144,26 @@ pub fn is_process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+fn daemon_start_command(
+    exe: &Path,
+    db_path: &Path,
+    config_path: Option<&Path>,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["daemon", "--db"]).arg(db_path).arg("start");
+    if let Some(cfg) = config_path {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd
+}
+
 /// Spawn `nestweaver daemon --db <path> start [--config <path>]` as a detached child.
 fn spawn_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe().context("failed to determine current executable path")?;
 
     debug!(exe = %exe.display(), db = %db_path.display(), "spawning daemon");
 
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args(["daemon", "--db"]).arg(db_path).arg("start");
-    if let Some(cfg) = config_path {
-        cmd.arg("--config").arg(cfg);
-    }
-    // Auto-spawned daemons are ephemeral — one per DB a client happens to touch —
-    // so they must NOT install a persistent launchd agent. Doing so leaked
-    // hundreds of `io.kehl.nestweaver.<hash>.plist` files with
-    // KeepAlive{Crashed:true}, which then crash-looped. Force the fork-based
-    // daemonization path here; launchd registration is reserved for an explicit
-    // `nestweaver daemon start` invoked by the user (or the menubar app).
-    cmd.env("NESTWEAVER_DAEMON_FORK", "1");
+    let mut cmd = daemon_start_command(&exe, db_path, config_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -283,6 +285,48 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn daemon_start_command_does_not_pin_fork_routing() {
+        let command = daemon_start_command(
+            Path::new("/opt/nestweaver"),
+            Path::new("/tmp/brain.lbug"),
+            None,
+        );
+
+        assert!(
+            command
+                .get_envs()
+                .all(|(name, _)| name != "NESTWEAVER_DAEMON_FORK"),
+            "autostart must leave platform routing to `daemon start`"
+        );
+    }
+
+    #[test]
+    fn daemon_start_command_forwards_db_and_config() {
+        let command = daemon_start_command(
+            Path::new("/opt/nestweaver"),
+            Path::new("/tmp/brain.lbug"),
+            Some(Path::new("/tmp/nestweaver-instance.toml")),
+        );
+
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                "/tmp/brain.lbug",
+                "start",
+                "--config",
+                "/tmp/nestweaver-instance.toml",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
 
     #[test]
     fn wait_for_socket_does_not_return_until_socket_accepts_connections() {

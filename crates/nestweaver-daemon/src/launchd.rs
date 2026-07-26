@@ -195,10 +195,38 @@ pub fn generate_plist(
     log_path: &Path,
     index_cpu_percent: Option<&str>,
 ) -> String {
+    generate_plist_with_config(
+        instance_id,
+        binary_path,
+        db_path,
+        log_path,
+        index_cpu_percent,
+        None,
+    )
+}
+
+/// Render a per-instance launch agent, optionally forwarding an absolute
+/// instance configuration path to the foreground `daemon run` process.
+pub fn generate_plist_with_config(
+    instance_id: &str,
+    binary_path: &Path,
+    db_path: &Path,
+    log_path: &Path,
+    index_cpu_percent: Option<&str>,
+    config_path: Option<&Path>,
+) -> String {
     let label = lifecycle::launchd_label(instance_id);
     let binary = binary_path.display();
     let db = db_path.display();
     let log = log_path.display();
+    let config_args = config_path
+        .map(|path| {
+            format!(
+                "        <string>--config</string>\n        <string>{}</string>\n",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
 
     // launchd jobs don't inherit the invoking shell's environment, so the
     // index CPU-throttle knob is baked into the plist when it was set (and
@@ -225,6 +253,7 @@ pub fn generate_plist(
         <string>--db</string>
         <string>{db}</string>
         <string>run</string>
+{config_args}
     </array>
     <key>StandardOutPath</key>
     <string>{log}</string>
@@ -410,6 +439,29 @@ mod tests {
         assert_eq!(
             parse_db_path_from_plist(&plist),
             Some(PathBuf::from("/Users/k/dev/repo/brain.lbug"))
+        );
+    }
+
+    #[test]
+    fn plist_forwards_absolute_config_to_daemon_run() {
+        let plist = generate_plist_with_config(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            None,
+            Some(Path::new("/Users/k/dev/repo/nestweaver-instance.toml")),
+        );
+        assert!(
+            plist.contains(
+                "<string>run</string>\n        <string>--config</string>\n        \
+                 <string>/Users/k/dev/repo/nestweaver-instance.toml</string>"
+            ),
+            "{plist}"
+        );
+        assert!(
+            !plist.lines().any(|line| line.trim() == "\\"),
+            "plist must not contain a literal format-continuation escape:\n{plist}"
         );
     }
 
