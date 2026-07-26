@@ -182,18 +182,24 @@ url = "{}"
 #[test]
 fn installation_docs_only_claim_live_channels() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let docs = [
+    let mut docs = vec![
         "INSTALL.md",
         "README.md",
         "docs/guide/instance-config.md",
         "docs/server-mode.md",
         "docs/architecture/project-brain.md",
         "CLAUDE.md",
+        "npm/README.md",
     ];
+    if repo_root.join("smithery.yaml").exists() {
+        docs.push("smithery.yaml");
+    }
     let unsupported_commands = [
         "npm install -g @kehl-io/nestweaver",
         "cargo install nestweaver",
         "brew install nestweaver",
+        "npx @kehl-io/nestweaver",
+        "npm exec @kehl-io/nestweaver",
     ];
 
     for relative_path in docs {
