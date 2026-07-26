@@ -39,7 +39,10 @@ jobs:
               - 'instance.toml'
               - 'INSTALL.md'
               - 'README.md'
+              - 'CLAUDE.md'
               - 'docs/**'
+              - 'npm/**'
+              - 'smithery.yaml'
             frontend:
               - 'crates/nestweaver-web/frontend/**'
 

@@ -174,11 +174,12 @@ When TLS is enabled:
 
 ## Repo Configuration
 
-Repos are declared in the instance config. The server clones them as blobless bare repos (~90% smaller than full clones) and indexes them automatically.
+Repos are declared in the instance config. The server clones them as blobless bare repos (~90% smaller than full clones) and indexes them automatically. Each `[[repos]]` entry requires `url`; `name` is an optional display alias, and `type` is optional (`code` is the default, `vault` indexes Markdown).
 
 ```toml
 [[repos]]
 url = "https://github.com/acme/api-service"
+name = "api"             # optional display alias
 
 [[repos]]
 url = "https://github.com/acme/web-client"
