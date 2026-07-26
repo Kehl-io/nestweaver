@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use assert_cmd::assert::OutputAssertExt;
 use nestweaver_engine::sidecar_path;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::process::Command as StdCommand;
 
@@ -1502,7 +1503,8 @@ fn cli_daemon_run_server_help() {
         .stdout(contains("--tls-key"))
         .stdout(contains("--auth-token"))
         .stdout(contains("--admin-token"))
-        .stdout(contains("--port-file"));
+        .stdout(contains("--port-file"))
+        .stdout(predicates::str::contains("--idle-timeout").not());
 }
 
 #[test]

@@ -5717,9 +5717,9 @@ fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
 
 /// Claim the exclusive per-instance lock — the pidfile flock that makes an
 /// `instance_id` single-owner on this host — and return the pidfile handle
-/// whose lifetime holds the lock (dropping it releases the lock). `None` only
-/// in a daemonize child that proves the inherited daemonize2 pidfile belongs to
-/// its own PID.
+/// whose lifetime holds the lock (dropping it releases the lock). On non-macOS,
+/// `None` identifies the daemonized child that proves it inherited the
+/// launcher's pidfile lock.
 ///
 /// Acquired **before** snapshot materialization so a duplicate replica started
 /// with the identical `--db` (hence identical `instance_id` and
@@ -5728,19 +5728,22 @@ fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
 /// same pidfile hold independent open-file descriptions, so `flock(LOCK_EX)`
 /// from a second process fails even though the first holder is also us-shaped.
 fn claim_instance_lock(instance_id: &str) -> Result<Option<std::fs::File>, anyhow::Error> {
-    // daemonize2 acquired this flock before forking and the child inherited
-    // its open file description. Opening the pidfile again would conflict with
-    // that inherited lock. The launcher marks only the real daemonize child;
-    // matching the file's PID prevents an inherited/user-set environment value
-    // from disabling duplicate-daemon exclusion for a normal `daemon run`.
-    let inherited_daemonize_lock = std::env::var("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD").as_deref()
-        == Ok("1")
-        && std::fs::read_to_string(lifecycle::pidfile_path(instance_id))
-            .ok()
-            .and_then(|pid| pid.trim().parse::<u32>().ok())
-            == Some(std::process::id());
-    if inherited_daemonize_lock {
-        return Ok(None);
+    #[cfg(not(target_os = "macos"))]
+    {
+        // daemonize2 acquired this flock before forking and the child inherited
+        // its open file description. Opening the pidfile again would conflict
+        // with that inherited lock. The launcher marks only the real daemonize
+        // child; matching the file's PID prevents an inherited/user-set value
+        // from disabling exclusion for a normal foreground server.
+        let inherited_daemonize_lock =
+            std::env::var("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD").as_deref() == Ok("1")
+                && std::fs::read_to_string(lifecycle::pidfile_path(instance_id))
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<u32>().ok())
+                    == Some(std::process::id());
+        if inherited_daemonize_lock {
+            return Ok(None);
+        }
     }
     // The pidfile lives in the per-instance runtime dir (created on demand).
     Ok(Some(claim_pidfile_lock(&lifecycle::pidfile_path(

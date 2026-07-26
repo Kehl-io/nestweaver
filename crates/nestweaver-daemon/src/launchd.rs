@@ -29,6 +29,35 @@ pub fn is_temp_db_path(db_path: &Path) -> bool {
     bases.iter().any(|b| db_path.starts_with(b))
 }
 
+/// Escape a dynamic value for use as XML character data in a plist `<string>`.
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Decode the XML entities emitted by [`xml_escape`].
+///
+/// `&amp;` is decoded last so an original literal such as `&lt;` survives one
+/// round trip as `&lt;` instead of being decoded twice into `<`.
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 /// Extract the `--db <path>` value from a nestweaver launchd plist's
 /// ProgramArguments. Returns `None` if not present.
 pub fn parse_db_path_from_plist(content: &str) -> Option<PathBuf> {
@@ -45,7 +74,7 @@ pub fn parse_db_path_from_plist(content: &str) -> Option<PathBuf> {
         }
     }
     let pos = strings.iter().position(|s| *s == "--db")?;
-    strings.get(pos + 1).map(|s| PathBuf::from(*s))
+    strings.get(pos + 1).map(|s| PathBuf::from(xml_unescape(s)))
 }
 
 /// Result of a [`gc_orphaned_agents`] pass.
@@ -195,19 +224,47 @@ pub fn generate_plist(
     log_path: &Path,
     index_cpu_percent: Option<&str>,
 ) -> String {
-    let label = lifecycle::launchd_label(instance_id);
-    let binary = binary_path.display();
-    let db = db_path.display();
-    let log = log_path.display();
+    generate_plist_with_config(
+        instance_id,
+        binary_path,
+        db_path,
+        log_path,
+        index_cpu_percent,
+        None,
+    )
+}
+
+/// Render a per-instance launch agent, optionally forwarding an absolute
+/// instance configuration path to the foreground `daemon run` process.
+pub fn generate_plist_with_config(
+    instance_id: &str,
+    binary_path: &Path,
+    db_path: &Path,
+    log_path: &Path,
+    index_cpu_percent: Option<&str>,
+    config_path: Option<&Path>,
+) -> String {
+    let label = xml_escape(&lifecycle::launchd_label(instance_id));
+    let binary = xml_escape(&binary_path.display().to_string());
+    let db = xml_escape(&db_path.display().to_string());
+    let log = xml_escape(&log_path.display().to_string());
+    let config_args = config_path
+        .map(|path| {
+            let path = xml_escape(&path.display().to_string());
+            format!("        <string>--config</string>\n        <string>{path}</string>\n")
+        })
+        .unwrap_or_default();
 
     // launchd jobs don't inherit the invoking shell's environment, so the
     // index CPU-throttle knob is baked into the plist when it was set (and
     // validated) at install time. Value is validated numeric by the caller.
     let env_block = match index_cpu_percent {
-        Some(v) => format!(
-            "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>NESTWEAVER_INDEX_CPU_PERCENT</key>\n        <string>{}</string>\n    </dict>\n",
-            v.trim()
-        ),
+        Some(v) => {
+            let value = xml_escape(v.trim());
+            format!(
+                "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>NESTWEAVER_INDEX_CPU_PERCENT</key>\n        <string>{value}</string>\n    </dict>\n"
+            )
+        }
         None => String::new(),
     };
 
@@ -225,6 +282,7 @@ pub fn generate_plist(
         <string>--db</string>
         <string>{db}</string>
         <string>run</string>
+{config_args}
     </array>
     <key>StandardOutPath</key>
     <string>{log}</string>
@@ -410,6 +468,128 @@ mod tests {
         assert_eq!(
             parse_db_path_from_plist(&plist),
             Some(PathBuf::from("/Users/k/dev/repo/brain.lbug"))
+        );
+    }
+
+    #[test]
+    fn plist_forwards_absolute_config_to_daemon_run() {
+        let plist = generate_plist_with_config(
+            "abc123",
+            Path::new("/usr/local/bin/nestweaver"),
+            Path::new("/Users/k/dev/repo/brain.lbug"),
+            Path::new("/tmp/log"),
+            None,
+            Some(Path::new("/Users/k/dev/repo/nestweaver-instance.toml")),
+        );
+        assert!(
+            plist.contains(
+                "<string>run</string>\n        <string>--config</string>\n        \
+                 <string>/Users/k/dev/repo/nestweaver-instance.toml</string>"
+            ),
+            "{plist}"
+        );
+        assert!(
+            !plist.lines().any(|line| line.trim() == "\\"),
+            "plist must not contain a literal format-continuation escape:\n{plist}"
+        );
+    }
+
+    #[test]
+    fn plist_escapes_all_dynamic_strings_and_round_trips_db_path() {
+        let metacharacters = r#"& < > " '"#;
+        let instance_id = format!("instance-{metacharacters}");
+        let binary = PathBuf::from(format!("/Applications/Nest {metacharacters}/nestweaver"));
+        let db = PathBuf::from(format!("/Users/k/Brain {metacharacters}/brain.lbug"));
+        let config = PathBuf::from(format!("/Users/k/Config {metacharacters}/instance.toml"));
+        let log = PathBuf::from(format!("/Users/k/Logs {metacharacters}/daemon.log"));
+        let cpu = format!("cpu-{metacharacters}");
+
+        let plist =
+            generate_plist_with_config(&instance_id, &binary, &db, &log, Some(&cpu), Some(&config));
+        let escaped = "&amp; &lt; &gt; &quot; &apos;";
+
+        for expected in [
+            format!("<string>io.kehl.nestweaver.instance-{escaped}</string>"),
+            format!("<string>/Applications/Nest {escaped}/nestweaver</string>"),
+            format!("<string>/Users/k/Brain {escaped}/brain.lbug</string>"),
+            format!("<string>/Users/k/Config {escaped}/instance.toml</string>"),
+            format!("<string>/Users/k/Logs {escaped}/daemon.log</string>"),
+            format!("<string>cpu-{escaped}</string>"),
+        ] {
+            assert!(
+                plist.contains(&expected),
+                "missing escaped dynamic value {expected:?}:\n{plist}"
+            );
+        }
+        assert_eq!(parse_db_path_from_plist(&plist), Some(db));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plist_with_xml_metacharacters_is_valid_and_preserves_values() {
+        let metacharacters = r#"& < > " '"#;
+        let instance_id = format!("instance-{metacharacters}");
+        let binary = PathBuf::from(format!("/Applications/Nest {metacharacters}/nestweaver"));
+        let db = PathBuf::from(format!("/Users/k/Brain {metacharacters}/brain.lbug"));
+        let config = PathBuf::from(format!("/Users/k/Config {metacharacters}/instance.toml"));
+        let log = PathBuf::from(format!("/Users/k/Logs {metacharacters}/daemon.log"));
+        let cpu = format!("cpu-{metacharacters}");
+        let plist =
+            generate_plist_with_config(&instance_id, &binary, &db, &log, Some(&cpu), Some(&config));
+        let dir = tempfile::tempdir().unwrap();
+        let plist_path = dir.path().join("special-values.plist");
+        std::fs::write(&plist_path, &plist).unwrap();
+
+        let lint = Command::new("plutil")
+            .arg("-lint")
+            .arg(&plist_path)
+            .output()
+            .expect("plutil must be available on macOS");
+        assert!(
+            lint.status.success(),
+            "plutil rejected generated plist:\n{}",
+            String::from_utf8_lossy(&lint.stderr)
+        );
+
+        let json = Command::new("plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(&plist_path)
+            .output()
+            .expect("plutil must decode generated plist");
+        assert!(
+            json.status.success(),
+            "plutil JSON conversion failed:\n{}",
+            String::from_utf8_lossy(&json.stderr)
+        );
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&json.stdout).expect("plutil must emit JSON");
+        assert_eq!(
+            decoded["Label"],
+            serde_json::json!(format!("io.kehl.nestweaver.{instance_id}"))
+        );
+        assert_eq!(
+            decoded["ProgramArguments"],
+            serde_json::json!([
+                binary.display().to_string(),
+                "daemon",
+                "--db",
+                db.display().to_string(),
+                "run",
+                "--config",
+                config.display().to_string(),
+            ])
+        );
+        assert_eq!(
+            decoded["StandardOutPath"],
+            serde_json::json!(log.display().to_string())
+        );
+        assert_eq!(
+            decoded["StandardErrorPath"],
+            serde_json::json!(log.display().to_string())
+        );
+        assert_eq!(
+            decoded["EnvironmentVariables"]["NESTWEAVER_INDEX_CPU_PERCENT"],
+            serde_json::json!(cpu)
         );
     }
 

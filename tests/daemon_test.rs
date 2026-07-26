@@ -21,21 +21,29 @@ use std::time::Duration;
 fn daemon_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
     cmd.env_remove("NESTWEAVER_NO_DAEMON");
-    // Use fork-based daemon in tests — launchd agents don't work
-    // reliably in the cargo test environment.
+    // Non-macOS retains the daemonized start backend.
+    #[cfg(not(target_os = "macos"))]
     cmd.env("NESTWEAVER_DAEMON_FORK", "1");
     cmd
 }
 
 /// Build a daemon command with the same environment a user gets from a normal
-/// shell. Temp database paths select the fork backend on macOS without the
-/// test-only `NESTWEAVER_DAEMON_FORK` override.
+/// shell.
 fn normal_daemon_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
     cmd.env_remove("NESTWEAVER_NO_DAEMON");
-    cmd.env_remove("NESTWEAVER_DAEMON_FORK");
     cmd.env_remove("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD");
     cmd
+}
+
+#[cfg(target_os = "macos")]
+fn process_command(pid: i32) -> String {
+    let output = StdCommand::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .expect("ps must inspect the daemon child");
+    assert!(output.status.success(), "ps failed for PID {pid}");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// Helper: build a `Command` with `NESTWEAVER_NO_DAEMON=1` for initial DB
@@ -57,8 +65,7 @@ fn daemon_action_cmd(db_path: &Path, action: &str) -> Command {
 
 /// Start a daemon and wait until its Unix socket is accepting connections.
 ///
-/// Fork-based `daemon start` returns before the child binds the socket. Tests
-/// must synchronize on readiness instead of guessing how long startup takes,
+/// Tests synchronize on readiness instead of guessing how long startup takes,
 /// especially when the workspace suite starts several daemons in parallel.
 fn start_daemon(db_path: &Path) {
     daemon_action_cmd(db_path, "start").assert().success();
@@ -234,6 +241,39 @@ impl Drop for DaemonGuard {
     }
 }
 
+#[cfg(target_os = "macos")]
+struct LaunchdTestGuard {
+    db_path: std::path::PathBuf,
+    root: std::path::PathBuf,
+    instance_id: String,
+}
+
+#[cfg(target_os = "macos")]
+impl LaunchdTestGuard {
+    fn new(db_path: &Path, root: &Path) -> Self {
+        Self {
+            db_path: db_path.to_path_buf(),
+            root: root.to_path_buf(),
+            instance_id: nestweaver_daemon::instance_id_from_db_path(db_path),
+        }
+    }
+
+    fn cleanup(&self) {
+        stop_daemon(&self.db_path);
+        let _ = nestweaver_daemon::launchd::stop_and_uninstall(&self.instance_id);
+        let _ = std::fs::remove_dir_all(nestweaver_daemon::runtime_dir(&self.instance_id));
+        let _ = std::fs::remove_dir_all(nestweaver_daemon::log_dir(&self.instance_id));
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for LaunchdTestGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 /// Send an MCP JSON-RPC request sequence (initialize + notification + tool call)
 /// to `nestweaver mcp` and return the stdout.
 fn mcp_tool_call(db_path: &Path, tool_name: &str, arguments: serde_json::Value) -> String {
@@ -288,8 +328,9 @@ fn mcp_tool_call_in_mode(
             command
                 .env_remove("NESTWEAVER_NO_DAEMON")
                 .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
-                .env_remove("NESTWEAVER_UPSTREAM")
-                .env("NESTWEAVER_DAEMON_FORK", "1");
+                .env_remove("NESTWEAVER_UPSTREAM");
+            #[cfg(not(target_os = "macos"))]
+            command.env("NESTWEAVER_DAEMON_FORK", "1");
         }
     }
     let mut child = command
@@ -402,6 +443,7 @@ fn daemon_start_stop() {
         .stdout(contains("not running"));
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
     let dir = tempfile::tempdir().unwrap();
@@ -468,6 +510,232 @@ fn daemon_normal_fork_start_hands_off_pidfile_lock_and_cleans_up() {
     }
     assert!(!pidfile.exists(), "clean stop must retire the pidfile");
     assert!(!socket.exists(), "clean stop must retire the socket");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_autostart_temp_db_spawns_daemon_run_without_plist() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("normal-start").join("test.lbug");
+    let config_path = dir.path().join("nestweaver-instance.toml");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, "").unwrap();
+    let _guard = DaemonGuard::new(&db_path);
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let plist = nestweaver_daemon::launchd_plist_path(&instance_id);
+    assert!(
+        !plist.exists(),
+        "unique temp instance must start without a plist"
+    );
+
+    let mut start = normal_daemon_cmd();
+    start
+        .arg("--no-embed")
+        .args([
+            "daemon",
+            "--db",
+            &db_path.display().to_string(),
+            "start",
+            "--idle-timeout",
+            "30",
+            "--config",
+            &config_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    wait_for_daemon_readiness(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || std::os::unix::net::UnixStream::connect(&socket).map(drop),
+        || stop_daemon(&db_path),
+    )
+    .expect("temporary daemon child must accept connections");
+
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("live temp daemon must own a pidfile")
+        .trim()
+        .parse()
+        .expect("pidfile must contain a PID");
+    let command = process_command(pid);
+    assert!(command.contains(" daemon "), "{command}");
+    assert!(command.contains(" run "), "{command}");
+    assert!(command.contains("--idle-timeout 30"), "{command}");
+    assert!(
+        command.contains(&config_path.display().to_string()),
+        "{command}"
+    );
+    assert!(
+        !plist.exists(),
+        "temporary daemon start must not create a persistent launch agent"
+    );
+
+    let mut stop = normal_daemon_cmd();
+    stop.arg("--no-embed")
+        .args(["daemon", "--db", &db_path.display().to_string(), "stop"])
+        .assert()
+        .success();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while (pidfile.exists() || socket.exists()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!pidfile.exists(), "clean stop must retire the pidfile");
+    assert!(!socket.exists(), "clean stop must retire the socket");
+    assert!(!plist.exists(), "cleanup must leave no launch agent");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_temp_start_reports_child_failure_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocked_parent = dir.path().join("not-a-directory");
+    std::fs::write(&blocked_parent, "regular file").unwrap();
+    let db_path = blocked_parent.join("test.lbug");
+    let _guard = DaemonGuard::new(&db_path);
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    let plist = nestweaver_daemon::launchd_plist_path(&instance_id);
+    let started = std::time::Instant::now();
+
+    let mut command = normal_daemon_cmd();
+    command.arg("--no-embed").args([
+        "daemon",
+        "--db",
+        &db_path.display().to_string(),
+        "start",
+        "--idle-timeout",
+        "30",
+    ]);
+    let assert = command.timeout(Duration::from_secs(30)).assert().failure();
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "child exit must preempt the 60s health timeout (elapsed {elapsed:?}):\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exited before becoming healthy"),
+        "startup error must report the child exit:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&db_path.display().to_string()),
+        "startup error must identify the failed database:\n{stderr}"
+    );
+    assert!(!pidfile.exists(), "failed child must retire its pidfile");
+    assert!(!socket.exists(), "failed child must leave no socket");
+    assert!(!plist.exists(), "temp startup must leave no plist");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_autostart_normal_db_is_owned_by_launchd() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    write_test_repo(repo_dir.path());
+
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let root = dirs::home_dir()
+        .expect("macOS test requires a home directory")
+        .join("Library")
+        .join("Caches")
+        .join("io.kehl.nestweaver-tests")
+        .join(format!("{unique} & < > \" '"));
+    let db_path = root.join("brain.lbug");
+    std::fs::create_dir_all(&root).unwrap();
+    let guard = LaunchdTestGuard::new(&db_path, &root);
+    create_db(repo_dir.path(), &db_path);
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let label = nestweaver_daemon::lifecycle::launchd_label(&instance_id);
+    let plist = nestweaver_daemon::launchd_plist_path(&instance_id);
+    assert!(
+        !plist.exists(),
+        "unique instance must begin without a plist"
+    );
+
+    // A normal command exercises client autostart rather than an explicit
+    // `daemon start`; the client must leave macOS ownership to launchd.
+    let autostart = normal_daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.path().display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .expect("normal index command must run");
+    if !autostart.status.success() {
+        let log_path = nestweaver_daemon::log_path(&instance_id);
+        let log = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|error| format!("<could not read {}: {error}>", log_path.display()));
+        panic!(
+            "normal command failed to autostart launchd daemon\nstderr:\n{}\nlog:\n{}",
+            String::from_utf8_lossy(&autostart.stderr),
+            log
+        );
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let health = runtime
+        .block_on(nestweaver_client::DaemonClient::wait_healthy(
+            &db_path,
+            Duration::from_secs(60),
+        ))
+        .expect("launchd-owned daemon must serve health");
+    assert!(health.pid > 0, "health must report the daemon PID");
+    assert!(
+        plist.exists(),
+        "persistent autostart must install its plist"
+    );
+
+    let uid = unsafe { libc::getuid() };
+    let launchctl = StdCommand::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{label}")])
+        .output()
+        .expect("launchctl must inspect the test agent");
+    assert!(
+        launchctl.status.success(),
+        "launchd label {label} was not loaded: {}",
+        String::from_utf8_lossy(&launchctl.stderr)
+    );
+    let launchctl_output = String::from_utf8_lossy(&launchctl.stdout);
+    assert!(
+        launchctl_output.contains(&format!("pid = {}", health.pid)),
+        "launchd label {label} does not own health PID {}:\n{launchctl_output}",
+        health.pid
+    );
+    let command = process_command(health.pid as i32);
+    assert!(command.contains(" daemon "), "{command}");
+    assert!(command.contains(" run"), "{command}");
+
+    guard.cleanup();
+    assert!(
+        !nestweaver_daemon::launchd::is_running(&instance_id),
+        "cleanup must boot out {label}"
+    );
+    assert!(!plist.exists(), "cleanup must remove the test plist");
+    assert!(!root.exists(), "cleanup must remove the test database");
+    assert!(
+        !nestweaver_daemon::pidfile_path(&instance_id).exists(),
+        "cleanup must remove the pidfile"
+    );
+    assert!(
+        !nestweaver_daemon::socket_path(&instance_id).exists(),
+        "cleanup must remove the socket"
+    );
 }
 
 #[test]
