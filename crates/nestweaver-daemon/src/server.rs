@@ -5993,40 +5993,33 @@ mod depth_clamp_tests {
 #[cfg(all(test, feature = "embed"))]
 mod embedding_load_config_tests {
     use super::*;
-    use std::ffi::OsString;
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+    use candle_transformers::models::bert::{BertModel, Config as BertConfig};
     use std::path::Path;
-    use std::sync::Mutex;
-
-    static HF_ENDPOINT_ENV: Mutex<()> = Mutex::new(());
-
-    struct HfEndpointGuard(Option<OsString>);
-
-    impl HfEndpointGuard {
-        fn unreachable() -> Self {
-            let previous = std::env::var_os("HF_ENDPOINT");
-            // SAFETY: this test module serializes every HF_ENDPOINT mutation
-            // with HF_ENDPOINT_ENV and restores the prior value on drop.
-            unsafe {
-                std::env::set_var("HF_ENDPOINT", "http://127.0.0.1:9");
-            }
-            Self(previous)
-        }
-    }
-
-    impl Drop for HfEndpointGuard {
-        fn drop(&mut self) {
-            // SAFETY: guarded by HF_ENDPOINT_ENV for this guard's lifetime.
-            unsafe {
-                if let Some(previous) = self.0.take() {
-                    std::env::set_var("HF_ENDPOINT", previous);
-                } else {
-                    std::env::remove_var("HF_ENDPOINT");
-                }
-            }
-        }
-    }
+    use tokenizers::Tokenizer;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
     fn write_complete_hf_cache(cache_dir: &Path) -> nestweaver_embed::ModelArtifacts {
+        const CONFIG_JSON: &str = r#"{
+            "vocab_size": 3,
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "intermediate_size": 8,
+            "hidden_act": "gelu",
+            "hidden_dropout_prob": 0.0,
+            "max_position_embeddings": 8,
+            "type_vocab_size": 2,
+            "initializer_range": 0.02,
+            "layer_norm_eps": 0.000000000001,
+            "pad_token_id": 0,
+            "position_embedding_type": "absolute",
+            "use_cache": false,
+            "classifier_dropout": null,
+            "model_type": "bert"
+        }"#;
         let commit = "0123456789abcdef0123456789abcdef01234567";
         let repo_dir = cache_dir.join("models--test-owner--test-model");
         let snapshot_dir = repo_dir.join("snapshots").join(commit);
@@ -6038,9 +6031,34 @@ mod embedding_load_config_tests {
             tokenizer: snapshot_dir.join("tokenizer.json"),
             weights: snapshot_dir.join("model.safetensors"),
         };
-        for path in [&artifacts.config, &artifacts.tokenizer, &artifacts.weights] {
-            std::fs::write(path, b"fixture").expect("write cached artifact");
-        }
+
+        std::fs::write(&artifacts.config, CONFIG_JSON).expect("write model config");
+        let config: BertConfig = serde_json::from_str(CONFIG_JSON).expect("parse model config");
+        let varmap = VarMap::new();
+        let builder = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        BertModel::load(builder, &config).expect("initialize tiny BERT fixture");
+        varmap
+            .save(&artifacts.weights)
+            .expect("write model weights");
+
+        let vocab = [
+            ("[PAD]".to_string(), 0_u32),
+            ("[UNK]".to_string(), 1_u32),
+            ("test".to_string(), 2_u32),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer_model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("build tokenizer model");
+        let mut tokenizer = Tokenizer::new(tokenizer_model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .save(&artifacts.tokenizer, false)
+            .expect("write tokenizer");
+
         artifacts
     }
 
@@ -6082,11 +6100,9 @@ mod embedding_load_config_tests {
     }
 
     #[test]
-    fn daemon_embedding_startup_is_cache_only_with_unreachable_hub() {
-        let _env_lock = HF_ENDPOINT_ENV.lock().expect("HF endpoint env lock");
-        let _endpoint = HfEndpointGuard::unreachable();
+    fn daemon_embedding_startup_constructs_cached_model_offline() {
         let cache = tempfile::tempdir().expect("cache tempdir");
-        let expected = write_complete_hf_cache(cache.path());
+        write_complete_hf_cache(cache.path());
         let config = nestweaver_embed::EmbedConfig {
             model_id: "test-owner/test-model".to_string(),
             cache_dir: cache.path().to_path_buf(),
@@ -6094,17 +6110,23 @@ mod embedding_load_config_tests {
             external_model: None,
         };
 
-        let artifacts = load_daemon_embedding_backend_with(
+        let model = load_daemon_embedding_backend_with(
             &config,
             nestweaver_embed::DevicePolicy::Cpu,
-            |seen_config, seen_policy, seen_mode| {
-                assert_eq!(seen_policy, nestweaver_embed::DevicePolicy::Cpu);
-                nestweaver_embed::resolve_model_artifacts(seen_config, seen_mode)
-            },
+            nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
         )
-        .expect("daemon startup must resolve a complete configured cache offline");
+        .expect("daemon startup must construct a complete configured-cache model offline");
 
-        assert_eq!(artifacts, expected);
+        assert_eq!(
+            model.backend_kind(),
+            nestweaver_embed::EmbeddingBackendKind::Local
+        );
+        assert_eq!(model.device_kind(), Some(nestweaver_embed::DeviceKind::Cpu));
+        assert_eq!(model.known_dimension(), Some(4));
+        let embeddings = model.embed(&["test"]).expect("embed with loaded fixture");
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), 4);
+        assert!(embeddings[0].iter().all(|value| value.is_finite()));
     }
 }
 
@@ -6239,9 +6261,11 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
     let config = embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
-    let loaded = load_daemon_embedding_backend_with(&config, policy, |config, policy, mode| {
-        nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(config, policy, mode)
-    });
+    let loaded = load_daemon_embedding_backend_with(
+        &config,
+        policy,
+        nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+    );
     match loaded {
         Ok(model) => {
             tracing::info!(

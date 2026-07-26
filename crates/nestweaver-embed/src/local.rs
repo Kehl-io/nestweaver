@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::{HFClient, HFClientSync, HFError, split_id};
+use hf_hub::{HFClient, HFClientBuilder, HFClientSync, HFError, split_id};
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 use tracing::info;
@@ -39,11 +39,12 @@ impl std::fmt::Display for MissingModelArtifactError {
         write!(
             formatter,
             "required embedding artifact '{}' for model '{}' is missing from configured cache '{}'; \
-             run `nestweaver embed --local --model-id {}` to download missing model files",
+             run `nestweaver embed --local --model-id {} --cache-dir '{}'` to download missing model files into that cache",
             self.filename,
             self.model_id,
             self.cache_dir.display(),
-            self.model_id
+            self.model_id,
+            self.cache_dir.display()
         )
     }
 }
@@ -55,7 +56,15 @@ pub fn resolve_model_artifacts(
     config: &crate::EmbedConfig,
     mode: ArtifactMode,
 ) -> Result<ModelArtifacts> {
-    let async_client = HFClient::builder()
+    resolve_model_artifacts_with_builder(config, mode, HFClient::builder())
+}
+
+fn resolve_model_artifacts_with_builder(
+    config: &crate::EmbedConfig,
+    mode: ArtifactMode,
+    builder: HFClientBuilder,
+) -> Result<ModelArtifacts> {
+    let async_client = builder
         .cache_dir(config.cache_dir.clone())
         .build()
         .context("failed to configure Hugging Face client")?;
@@ -97,18 +106,22 @@ pub fn resolve_model_artifacts(
     })
 }
 
-fn resolve_and_construct<T, Resolve, Construct>(
+fn select_resolve_and_construct<T, Selected, Select, Resolve, Construct>(
     config: &crate::EmbedConfig,
+    policy: DevicePolicy,
     mode: ArtifactMode,
+    select: Select,
     resolve: Resolve,
     construct: Construct,
 ) -> Result<T>
 where
+    Select: FnOnce(DevicePolicy) -> Result<Selected>,
     Resolve: FnOnce(&crate::EmbedConfig, ArtifactMode) -> Result<ModelArtifacts>,
-    Construct: FnOnce(ModelArtifacts) -> Result<T>,
+    Construct: FnOnce(Selected, ModelArtifacts) -> Result<T>,
 {
+    let selected = select(policy)?;
     let artifacts = resolve(config, mode)?;
-    construct(artifacts)
+    construct(selected, artifacts)
 }
 
 pub struct LocalModel {
@@ -140,17 +153,25 @@ impl LocalModel {
         policy: DevicePolicy,
         mode: ArtifactMode,
     ) -> Result<Self> {
-        resolve_and_construct(config, mode, resolve_model_artifacts, |artifacts| {
-            Self::from_artifacts(config, policy, artifacts)
-        })
+        select_resolve_and_construct(
+            config,
+            policy,
+            mode,
+            select_device,
+            resolve_model_artifacts,
+            |(device, device_kind), artifacts| {
+                Self::from_artifacts(config, policy, device, device_kind, artifacts)
+            },
+        )
     }
 
     fn from_artifacts(
         config: &crate::EmbedConfig,
         policy: DevicePolicy,
+        device: Device,
+        device_kind: DeviceKind,
         artifacts: ModelArtifacts,
     ) -> Result<Self> {
-        let (device, device_kind) = select_device(policy)?;
         let config_str = std::fs::read_to_string(&artifacts.config)?;
         let bert_config: BertConfig = serde_json::from_str(&config_str)?;
         let dimension = bert_config.hidden_size;
@@ -345,15 +366,16 @@ mod tests {
     use super::*;
     use crate::{DeviceKind, DevicePolicy};
     use std::cell::Cell;
-    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_MODEL_ID: &str = "test-owner/test-model";
     const TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const CACHE_ISOLATION_CHILD: &str = "NESTWEAVER_EMBED_CACHE_ISOLATION_CHILD";
+    const POPULATED_CACHE_PATH: &str = "NESTWEAVER_EMBED_POPULATED_CACHE_PATH";
+    const EMPTY_CACHE_PATH: &str = "NESTWEAVER_EMBED_EMPTY_CACHE_PATH";
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
-    static HF_CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestDir(PathBuf);
 
@@ -377,35 +399,6 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: callers hold HF_CACHE_ENV_LOCK until this guard is dropped,
-            // serializing this process-wide test environment mutation.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: the guard remains protected by HF_CACHE_ENV_LOCK and
-            // restores the environment before the lock guard is dropped.
-            unsafe {
-                if let Some(previous) = &self.previous {
-                    std::env::set_var(self.key, previous);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
         }
     }
 
@@ -446,8 +439,12 @@ mod tests {
         let cache = TestDir::new("complete-cache");
         let expected = write_cached_artifacts(cache.path(), None);
 
-        let actual = resolve_model_artifacts(&test_config(cache.path()), ArtifactMode::CacheOnly)
-            .expect("a complete configured cache must resolve offline");
+        let actual = resolve_model_artifacts_with_builder(
+            &test_config(cache.path()),
+            ArtifactMode::CacheOnly,
+            HFClient::builder().endpoint("http://127.0.0.1:9"),
+        )
+        .expect("a complete configured cache must resolve with an unreachable endpoint");
 
         assert_eq!(actual, expected);
     }
@@ -457,8 +454,12 @@ mod tests {
         let cache = TestDir::new("missing-cache");
         write_cached_artifacts(cache.path(), Some("model.safetensors"));
 
-        let err = resolve_model_artifacts(&test_config(cache.path()), ArtifactMode::CacheOnly)
-            .expect_err("a missing required artifact must fail");
+        let err = resolve_model_artifacts_with_builder(
+            &test_config(cache.path()),
+            ArtifactMode::CacheOnly,
+            HFClient::builder().endpoint("http://127.0.0.1:9"),
+        )
+        .expect_err("a missing required artifact must fail without contacting the endpoint");
         let missing = err
             .downcast_ref::<MissingModelArtifactError>()
             .expect("cache-only misses must preserve their error type");
@@ -471,22 +472,50 @@ mod tests {
 
     #[test]
     fn configured_cache_roots_are_isolated() {
+        if std::env::var_os(CACHE_ISOLATION_CHILD).is_some() {
+            let populated = PathBuf::from(
+                std::env::var_os(POPULATED_CACHE_PATH).expect("populated cache child path"),
+            );
+            let empty =
+                PathBuf::from(std::env::var_os(EMPTY_CACHE_PATH).expect("empty cache child path"));
+            let expected = write_cached_artifacts(&populated, None);
+
+            let resolved =
+                resolve_model_artifacts(&test_config(&populated), ArtifactMode::CacheOnly)
+                    .expect("configured populated cache must resolve");
+            assert_eq!(resolved, expected);
+
+            let err = resolve_model_artifacts(&test_config(&empty), ArtifactMode::CacheOnly)
+                .expect_err("configured cache must not read the populated process-global root");
+            assert!(
+                err.downcast_ref::<MissingModelArtifactError>().is_some(),
+                "isolated empty cache must report its own miss"
+            );
+            return;
+        }
+
         let populated = TestDir::new("populated-cache");
         let empty = TestDir::new("empty-cache");
-        let expected = write_cached_artifacts(populated.path(), None);
-        let _env_lock = HF_CACHE_ENV_LOCK.lock().expect("lock HF cache environment");
-        let _global_cache = EnvVarGuard::set("HF_HUB_CACHE", populated.path());
+        write_cached_artifacts(populated.path(), None);
 
-        let resolved =
-            resolve_model_artifacts(&test_config(populated.path()), ArtifactMode::CacheOnly)
-                .expect("configured populated cache must resolve");
-        assert_eq!(resolved, expected);
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "local::tests::configured_cache_roots_are_isolated",
+                "--nocapture",
+            ])
+            .env(CACHE_ISOLATION_CHILD, "1")
+            .env("HF_HUB_CACHE", populated.path())
+            .env(POPULATED_CACHE_PATH, populated.path())
+            .env(EMPTY_CACHE_PATH, empty.path())
+            .output()
+            .expect("run isolated cache test child");
 
-        let err = resolve_model_artifacts(&test_config(empty.path()), ArtifactMode::CacheOnly)
-            .expect_err("configured cache must not read the populated process-global root");
         assert!(
-            err.downcast_ref::<MissingModelArtifactError>().is_some(),
-            "isolated empty cache must report its own miss"
+            output.status.success(),
+            "isolated cache child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -499,20 +528,28 @@ mod tests {
             tokenizer: PathBuf::from("resolved-tokenizer"),
             weights: PathBuf::from("resolved-weights"),
         };
+        let selection_count = Cell::new(0);
         let resolution_count = Cell::new(0);
         let construction_count = Cell::new(0);
 
-        let loaded = resolve_and_construct(
+        let loaded = select_resolve_and_construct(
             &config,
+            DevicePolicy::Cpu,
             ArtifactMode::CacheOnly,
+            |seen_policy| {
+                selection_count.set(selection_count.get() + 1);
+                assert_eq!(seen_policy, DevicePolicy::Cpu);
+                Ok("selected-device")
+            },
             |seen_config, seen_mode| {
                 resolution_count.set(resolution_count.get() + 1);
                 assert_eq!(seen_config.cache_dir, config.cache_dir);
                 assert_eq!(seen_mode, ArtifactMode::CacheOnly);
                 Ok(expected.clone())
             },
-            |artifacts| {
+            |device, artifacts| {
                 construction_count.set(construction_count.get() + 1);
+                assert_eq!(device, "selected-device");
                 assert_eq!(artifacts, expected);
                 Ok("loaded")
             },
@@ -520,14 +557,62 @@ mod tests {
         .expect("one-pass load orchestration must succeed");
 
         assert_eq!(loaded, "loaded");
+        assert_eq!(selection_count.get(), 1);
         assert_eq!(resolution_count.get(), 1);
         assert_eq!(construction_count.get(), 1);
+    }
+
+    #[test]
+    fn failed_device_selection_never_invokes_artifact_resolver() {
+        let cache = TestDir::new("failed-device-selection-cache");
+        let config = test_config(cache.path());
+        let resolution_count = Cell::new(0);
+
+        let result: Result<()> = select_resolve_and_construct(
+            &config,
+            DevicePolicy::Metal,
+            ArtifactMode::DownloadMissing,
+            |_| anyhow::bail!("unsupported device"),
+            |_, _| {
+                resolution_count.set(resolution_count.get() + 1);
+                anyhow::bail!("artifact resolver must not run")
+            },
+            |_: (), _| Ok(()),
+        );
+
+        assert!(
+            result
+                .expect_err("device selection must fail")
+                .to_string()
+                .contains("unsupported")
+        );
+        assert_eq!(resolution_count.get(), 0);
     }
 
     #[test]
     fn one_argument_load_remains_publicly_callable() {
         let load: fn(&crate::EmbedConfig) -> Result<LocalModel> = LocalModel::load;
         let _ = load;
+    }
+
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn unsupported_metal_fails_before_artifact_resolution() {
+        let cache = TestDir::new("unsupported-metal-cache");
+        let err = match LocalModel::load_with_policy_and_artifact_mode(
+            &test_config(cache.path()),
+            DevicePolicy::Metal,
+            ArtifactMode::CacheOnly,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("unsupported Metal must fail before inspecting an empty cache"),
+        };
+
+        assert!(err.to_string().contains("Metal"));
+        assert!(
+            err.downcast_ref::<MissingModelArtifactError>().is_none(),
+            "unsupported Metal must fail before artifact resolution"
+        );
     }
 
     #[test]

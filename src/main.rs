@@ -59,6 +59,21 @@ fn cli_embedding_artifact_mode() -> nestweaver_embed::ArtifactMode {
     nestweaver_embed::ArtifactMode::DownloadMissing
 }
 
+#[cfg(feature = "embed")]
+fn direct_local_embedding_config(
+    model_id: &str,
+    cache_dir: Option<&Path>,
+) -> nestweaver_embed::EmbedConfig {
+    let mut config = nestweaver_embed::EmbedConfig {
+        model_id: model_id.to_string(),
+        ..Default::default()
+    };
+    if let Some(cache_dir) = cache_dir {
+        config.cache_dir = cache_dir.to_path_buf();
+    }
+    config
+}
+
 fn external_embedding_model(model: Option<&str>) -> &str {
     model.unwrap_or(DEFAULT_EXTERNAL_EMBEDDING_MODEL)
 }
@@ -1389,7 +1404,7 @@ enum Commands {
     /// Only nodes that do not yet have an embedding are processed (incremental);
     /// use --force to re-embed everything.
     #[command(
-        after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing"
+        after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --local --cache-dir /path/to/cache  # populate a configured daemon cache\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing"
     )]
     Embed {
         #[arg(long, help = "Path to the database file [env: NESTWEAVER_DB]")]
@@ -1414,6 +1429,12 @@ enum Commands {
             help = "HuggingFace model ID for local inference (default: sentence-transformers/all-MiniLM-L6-v2)"
         )]
         model_id: Option<String>,
+        #[arg(
+            long,
+            requires = "local",
+            help = "Hugging Face cache directory for direct --local embedding"
+        )]
+        cache_dir: Option<PathBuf>,
         #[arg(
             long,
             value_enum,
@@ -6018,6 +6039,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             endpoint,
             model,
             model_id,
+            cache_dir,
             accelerator,
             batch_size,
             scope,
@@ -6029,6 +6051,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             endpoint.as_deref(),
             model.as_deref(),
             model_id.as_deref(),
+            cache_dir.as_deref(),
             accelerator,
             batch_size,
             &scope,
@@ -14268,6 +14291,7 @@ fn run_embed(
     endpoint: Option<&str>,
     model: Option<&str>,
     model_id: Option<&str>,
+    cache_dir: Option<&Path>,
     accelerator: Option<CliEmbeddingAccelerator>,
     batch_size: usize,
     scope: &str,
@@ -14281,6 +14305,9 @@ fn run_embed(
     }
     if accelerator.is_some() && !local {
         anyhow::bail!("--accelerator requires --local");
+    }
+    if cache_dir.is_some() && !local {
+        anyhow::bail!("--cache-dir requires --local");
     }
     if batch_size == 0 {
         anyhow::bail!("--batch-size must be at least 1");
@@ -14569,10 +14596,7 @@ fn run_embed(
         // ── Local model path (default) ───────────────────────────
         #[cfg(feature = "embed")]
         {
-            let config = nestweaver_embed::EmbedConfig {
-                model_id: local_model_id.to_string(),
-                ..Default::default()
-            };
+            let config = direct_local_embedding_config(local_model_id, cache_dir);
             let policy =
                 cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
             let embed_model = nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(
@@ -18112,6 +18136,76 @@ mod embed_accelerator_cli_tests {
         assert_eq!(
             cli_embedding_artifact_mode(),
             nestweaver_embed::ArtifactMode::DownloadMissing
+        );
+    }
+
+    #[test]
+    fn direct_local_cache_option_populates_the_remediation_target() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cache = tempfile::tempdir().expect("embedding cache tempdir");
+                let cache_dir = cache.path().to_path_buf();
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "embed",
+                    "--local",
+                    "--model-id",
+                    "test-owner/test-model",
+                    "--cache-dir",
+                    cache_dir.to_str().expect("UTF-8 test cache"),
+                ])
+                .expect("an explicit local cache directory must parse");
+                let Commands::Embed {
+                    model_id,
+                    cache_dir: parsed_cache_dir,
+                    ..
+                } = cli.command
+                else {
+                    panic!("expected embed command");
+                };
+
+                let config = direct_local_embedding_config(
+                    local_embedding_model_id(model_id.as_deref()),
+                    parsed_cache_dir.as_deref(),
+                );
+                assert_eq!(config.cache_dir, cache_dir);
+                assert!(
+                    Cli::try_parse_from([
+                        "nestweaver",
+                        "embed",
+                        "--cache-dir",
+                        "/tmp/must-not-target-daemon-cache",
+                    ])
+                    .is_err(),
+                    "an explicit cache directory must require direct --local embedding"
+                );
+
+                let err = nestweaver_embed::resolve_model_artifacts(
+                    &config,
+                    nestweaver_embed::ArtifactMode::CacheOnly,
+                )
+                .expect_err("empty configured cache must produce remediation");
+                let missing = err
+                    .downcast_ref::<nestweaver_embed::MissingModelArtifactError>()
+                    .expect("cache-only miss must remain typed");
+                assert_eq!(missing.cache_dir, cache_dir);
+
+                let remediation = err.to_string();
+                assert!(remediation.contains("--cache-dir"));
+                assert!(remediation.contains(cache_dir.to_str().expect("UTF-8 test cache")));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn direct_local_cache_option_preserves_the_default_when_omitted() {
+        let config = direct_local_embedding_config("test-owner/test-model", None);
+        assert_eq!(
+            config.cache_dir,
+            nestweaver_embed::EmbedConfig::default().cache_dir
         );
     }
 
