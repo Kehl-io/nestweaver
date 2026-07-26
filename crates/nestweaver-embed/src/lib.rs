@@ -87,7 +87,7 @@ pub struct EmbedModel {
 }
 
 enum EmbedBackend {
-    Local(local::LocalModel),
+    Local(Box<local::LocalModel>),
     External,
 }
 
@@ -96,7 +96,7 @@ impl EmbedModel {
         let backend = if config.external_endpoint.is_some() {
             EmbedBackend::External
         } else {
-            EmbedBackend::Local(local::LocalModel::load(config)?)
+            EmbedBackend::Local(Box::new(local::LocalModel::load(config)?))
         };
         Ok(Self {
             backend,

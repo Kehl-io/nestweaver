@@ -230,6 +230,28 @@ where
         })?;
     Ok(DeviceChoice::Metal(device))
 }
+/// Download a model's files (config, tokenizer, weights) into the HuggingFace cache
+/// WITHOUT building the model. Lets a caller bound a cold-cache download with a timeout so
+/// a slow/unreachable HuggingFace can't hang startup. A no-op (fast) when already cached.
+pub fn prefetch_model(model_id: &str) -> Result<()> {
+    let client = HFClientSync::new()?;
+    let (owner, name) = split_id(model_id);
+    let repo = client.model(owner, name);
+    repo.download_file()
+        .filename("config.json")
+        .send()
+        .context("prefetch config.json")?;
+    repo.download_file()
+        .filename("tokenizer.json")
+        .send()
+        .context("prefetch tokenizer.json")?;
+    repo.download_file()
+        .filename("model.safetensors")
+        .send()
+        .context("prefetch model.safetensors")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,26 +308,4 @@ mod tests {
 
         assert!(matches!(selected, DeviceChoice::Metal(())));
     }
-}
-
-/// Download a model's files (config, tokenizer, weights) into the HuggingFace cache
-/// WITHOUT building the model. Lets a caller bound a cold-cache download with a timeout so
-/// a slow/unreachable HuggingFace can't hang startup. A no-op (fast) when already cached.
-pub fn prefetch_model(model_id: &str) -> Result<()> {
-    let client = HFClientSync::new()?;
-    let (owner, name) = split_id(model_id);
-    let repo = client.model(owner, name);
-    repo.download_file()
-        .filename("config.json")
-        .send()
-        .context("prefetch config.json")?;
-    repo.download_file()
-        .filename("tokenizer.json")
-        .send()
-        .context("prefetch tokenizer.json")?;
-    repo.download_file()
-        .filename("model.safetensors")
-        .send()
-        .context("prefetch model.safetensors")?;
-    Ok(())
 }
