@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      metal: ${{ steps.filter.outputs.metal }}
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
       - uses: actions/checkout@v7
@@ -44,8 +45,245 @@ jobs:
               - 'docs/**'
               - 'npm/**'
               - 'smithery.yaml'
+            metal:
+              - 'crates/nestweaver-embed/**'
+              - 'crates/nestweaver-daemon/src/lifecycle.rs'
+              - 'crates/nestweaver-daemon/src/launchd.rs'
+              - 'crates/nestweaver-daemon/src/server.rs'
+              - 'crates/nestweaver-daemon/Cargo.toml'
+              - 'crates/nestweaver-client/src/autostart.rs'
+              - 'src/main.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release-please.yml'
+              - 'tests/metal_smoke.rs'
             frontend:
               - 'crates/nestweaver-web/frontend/**'
+
+  metal-smoke:
+    name: Cold Metal daemon smoke
+    needs: changes
+    if: needs.changes.outputs.metal == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.3"
+      NESTWEAVER_METAL_SMOKE_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
+    steps:
+      - name: Verify native Apple Silicon runner
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: metal-smoke
+      - name: Install build dependencies
+        run: brew install protobuf
+      - name: Build Metal-enabled CLI
+        run: cargo build --locked --release --features metal
+      - name: Verify daemon cache-only contract
+        run: |
+          cargo test --locked --release -p nestweaver-daemon --features embed \
+            daemon_embedding_startup_constructs_cached_model_offline
+      - name: Configure isolated smoke paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          SMOKE_KEY="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          TARGET_ROOT="$HOME/Library/Caches/io.kehl.nestweaver-metal-smoke/$SMOKE_KEY"
+          SETUP_ROOT="$RUNNER_TEMP/nestweaver-metal-cache-$SMOKE_KEY"
+          TARGET_DB="$TARGET_ROOT/brain.lbug"
+          TARGET_CONFIG="$TARGET_ROOT/instance.toml"
+          SETUP_DB="$SETUP_ROOT/cache-seed.lbug"
+          MODEL_CACHE="$SETUP_ROOT/model-cache"
+          OUTPUT_DIR="$RUNNER_TEMP/nestweaver-metal-evidence-$SMOKE_KEY"
+          mkdir -p "$TARGET_ROOT" "$SETUP_ROOT"
+          CANONICAL_DB="$(cd "$TARGET_ROOT" && pwd -P)/brain.lbug"
+          INSTANCE_ID="$(printf '%s' "$CANONICAL_DB" | shasum -a 256 | cut -c1-8)"
+          RUNTIME_DIR="$HOME/.local/state/nestweaver/$INSTANCE_ID"
+          {
+            echo "TARGET_ROOT=$TARGET_ROOT"
+            echo "SETUP_ROOT=$SETUP_ROOT"
+            echo "TARGET_DB=$TARGET_DB"
+            echo "TARGET_CONFIG=$TARGET_CONFIG"
+            echo "SETUP_DB=$SETUP_DB"
+            echo "MODEL_CACHE=$MODEL_CACHE"
+            echo "OUTPUT_DIR=$OUTPUT_DIR"
+            echo "INSTANCE_ID=$INSTANCE_ID"
+            echo "RUNTIME_DIR=$RUNTIME_DIR"
+            echo "PLIST_PATH=$HOME/Library/LaunchAgents/io.kehl.nestweaver.$INSTANCE_ID.plist"
+            echo "NESTWEAVER_METAL_SMOKE_DB=$TARGET_DB"
+            echo "NESTWEAVER_METAL_SMOKE_OUTPUT_DIR=$OUTPUT_DIR"
+            echo "NESTWEAVER_METAL_SMOKE_CACHE_DIR=$MODEL_CACHE"
+          } >> "$GITHUB_ENV"
+      - name: Populate model cache on CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/nestweaver"
+          "$BIN" --no-daemon --no-embed index \
+            --repo testdata/js --db "$SETUP_DB"
+          "$BIN" --no-daemon embed --local --accelerator cpu \
+            --cache-dir "$MODEL_CACHE" --db "$SETUP_DB" \
+            --scope symbols --force
+          find "$MODEL_CACHE" -type f -print0 |
+            sort -z |
+            xargs -0 shasum -a 256 > "$SETUP_ROOT/cache-before.sha256"
+          chmod -R a-w "$MODEL_CACHE"
+      - name: Assert clean daemon preconditions
+        run: |
+          cargo test --locked --release --features metal --test metal_smoke \
+            apple_hardware::cold_daemon_preconditions_are_clean \
+            -- --ignored --exact --nocapture
+      - name: Write explicit Metal instance config
+        shell: bash
+        run: |
+          {
+            printf 'instance_id = "metal-smoke"\n\n'
+            printf '[snapshot_storage]\nbackend = "local"\npath = "%s/snapshots"\n\n' "$TARGET_ROOT"
+            printf '[workspace]\nbackend = "local"\npath = "%s/workspace"\n\n' "$TARGET_ROOT"
+            printf '[inference]\nendpoint = "http://127.0.0.1:9"\n'
+            printf 'embedding_model = "unused"\nsummary_model = "unused"\n\n'
+            printf '[embedding]\nmodel_id = "%s"\n' "$NESTWEAVER_METAL_SMOKE_MODEL_ID"
+            printf 'accelerator = "metal"\ncache_dir = "%s"\n\n' "$MODEL_CACHE"
+            printf '[git]\ncredential_method = "gh"\n'
+          } > "$TARGET_CONFIG"
+          ./target/release/nestweaver config validate "$TARGET_CONFIG"
+      - name: Cold Metal daemon inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/nestweaver"
+          mkdir -p "$OUTPUT_DIR"
+          "$BIN" index --repo testdata/js --db "$TARGET_DB" --config "$TARGET_CONFIG" \
+            >"$OUTPUT_DIR/cold-index.stdout" 2>"$OUTPUT_DIR/cold-index.stderr"
+
+          ready=false
+          for _ in $(seq 1 60); do
+            if "$BIN" brain status --db "$TARGET_DB" --config "$TARGET_CONFIG" --json \
+              >"$OUTPUT_DIR/cold-status.json" 2>"$OUTPUT_DIR/cold-status.stderr" &&
+              jq -e '
+                .embedding_status.state == "ready" and
+                .embedding_status.requested_device == "metal" and
+                .embedding_status.selected_device == "metal" and
+                .embedding_status.fallback_used == false
+              ' "$OUTPUT_DIR/cold-status.json" >/dev/null; then
+              ready=true
+              break
+            fi
+            if jq -e '.embedding_status.state == "failed"' \
+              "$OUTPUT_DIR/cold-status.json" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          test -f "$PLIST_PATH"
+          launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
+            >"$OUTPUT_DIR/cold-launchd.txt"
+          "$BIN" embed --db "$TARGET_DB" --scope symbols --force --stats \
+            >"$OUTPUT_DIR/cold-embed.stdout" 2>"$OUTPUT_DIR/cold-embed.stderr"
+          grep -q "Embedding via daemon" "$OUTPUT_DIR/cold-embed.stderr"
+      - name: Restart and repeat warm Metal inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/nestweaver"
+          "$BIN" daemon --db "$TARGET_DB" stop \
+            >"$OUTPUT_DIR/stop.stdout" 2>"$OUTPUT_DIR/stop.stderr"
+
+          ready=false
+          for _ in $(seq 1 60); do
+            if "$BIN" brain status --db "$TARGET_DB" --config "$TARGET_CONFIG" --json \
+              >"$OUTPUT_DIR/warm-status.json" 2>"$OUTPUT_DIR/warm-status.stderr" &&
+              jq -e '
+                .embedding_status.state == "ready" and
+                .embedding_status.requested_device == "metal" and
+                .embedding_status.selected_device == "metal" and
+                .embedding_status.fallback_used == false
+              ' "$OUTPUT_DIR/warm-status.json" >/dev/null; then
+              ready=true
+              break
+            fi
+            if jq -e '.embedding_status.state == "failed"' \
+              "$OUTPUT_DIR/warm-status.json" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          test -f "$PLIST_PATH"
+          launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
+            >"$OUTPUT_DIR/warm-launchd.txt"
+          "$BIN" embed --db "$TARGET_DB" --scope symbols --force --stats \
+            >"$OUTPUT_DIR/warm-embed.stdout" 2>"$OUTPUT_DIR/warm-embed.stderr"
+          grep -q "Embedding via daemon" "$OUTPUT_DIR/warm-embed.stderr"
+      - name: Verify cache-only Metal vector
+        run: |
+          cargo test --locked --release --features metal --test metal_smoke \
+            apple_hardware::metal_embedding_is_finite_normalized_and_uses_metal \
+            -- --ignored --exact --nocapture
+          find "$MODEL_CACHE" -type f -print0 |
+            sort -z |
+            xargs -0 shasum -a 256 > "$SETUP_ROOT/cache-after.sha256"
+          diff -u "$SETUP_ROOT/cache-before.sha256" "$SETUP_ROOT/cache-after.sha256"
+      - name: Collect Metal smoke evidence
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          BIN="$PWD/target/release/nestweaver"
+          "$BIN" diagnostics capabilities --json \
+            >"$OUTPUT_DIR/capabilities.json" 2>"$OUTPUT_DIR/capabilities.stderr" || true
+          "$BIN" daemon --db "$TARGET_DB" status \
+            >"$OUTPUT_DIR/daemon-status.txt" 2>"$OUTPUT_DIR/daemon-status.stderr" || true
+          DAEMON_LOG="$RUNTIME_DIR/daemon.log"
+          if [ -f "$DAEMON_LOG" ]; then
+            cp "$DAEMON_LOG" "$OUTPUT_DIR/daemon.log"
+          fi
+          launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
+            >"$OUTPUT_DIR/launchd.txt" 2>&1 || true
+      - name: Upload Metal smoke evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: metal-smoke-evidence
+          path: ${{ runner.temp }}/nestweaver-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}-metal-smoke
+          if-no-files-found: error
+      - name: Clean up isolated Metal daemon
+        if: always()
+        shell: bash
+        run: |
+          daemon_stopped=false
+          if [ -n "${TARGET_DB:-}" ] && [ -x target/release/nestweaver ]; then
+            if target/release/nestweaver daemon --db "$TARGET_DB" stop; then
+              daemon_stopped=true
+            fi
+          fi
+          if [ "$daemon_stopped" = true ] &&
+            [ -n "${INSTANCE_ID:-}" ] &&
+            [ "${RUNTIME_DIR:-}" = "$HOME/.local/state/nestweaver/$INSTANCE_ID" ]; then
+            case "$RUNTIME_DIR" in
+              "$HOME/.local/state/nestweaver/"?*) rm -rf -- "$RUNTIME_DIR" ;;
+            esac
+          fi
+          if [ -n "${MODEL_CACHE:-}" ] && [ -d "$MODEL_CACHE" ]; then
+            chmod -R u+w "$MODEL_CACHE" || true
+          fi
+          case "${TARGET_ROOT:-}" in
+            "$HOME/Library/Caches/io.kehl.nestweaver-metal-smoke/"*)
+              rm -rf -- "$TARGET_ROOT"
+              ;;
+          esac
+          case "${SETUP_ROOT:-}" in
+            "$RUNNER_TEMP/nestweaver-metal-cache-"*) rm -rf -- "$SETUP_ROOT" ;;
+          esac
+          case "${OUTPUT_DIR:-}" in
+            "$RUNNER_TEMP/nestweaver-metal-evidence-"*) rm -rf -- "$OUTPUT_DIR" ;;
+          esac
 
   fmt:
     name: Rustfmt
