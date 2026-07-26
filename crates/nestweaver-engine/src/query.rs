@@ -3180,6 +3180,8 @@ mod semantic_leg_tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
+    struct WrongDimensionEmbed;
+
     impl CountingEmbed {
         fn call_count(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
@@ -3190,6 +3192,12 @@ mod semantic_leg_tests {
         fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(vec![0.0; 4])
+        }
+    }
+
+    impl EmbedQueryFn for WrongDimensionEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
         }
     }
 
@@ -3270,5 +3278,30 @@ mod semantic_leg_tests {
             1,
             "embedding vectors present → the semantic leg must embed the query"
         );
+    }
+
+    #[test]
+    fn wrong_dimension_query_embedding_cannot_create_semantic_seeds() {
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![1.0, 0.0, 0.0, 0.0]));
+        let config = HybridSearchConfig {
+            weight_semantic: 0.35,
+            ..HybridSearchConfig::default()
+        };
+
+        let err = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["not-a-real-seed".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(&WrongDimensionEmbed),
+            None,
+        )
+        .expect_err("wrong-dimensional query vectors must not inject semantic seeds");
+
+        assert!(format!("{err:#}").contains("No seeds resolved"));
     }
 }

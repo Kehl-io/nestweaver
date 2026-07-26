@@ -33,6 +33,57 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
+const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+
+/// Explicit device policy for direct local embedding.
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum CliEmbeddingAccelerator {
+    Auto,
+    Metal,
+    Cpu,
+}
+
+#[cfg(feature = "embed")]
+fn cli_embedding_device_policy(
+    accelerator: CliEmbeddingAccelerator,
+) -> nestweaver_embed::DevicePolicy {
+    match accelerator {
+        CliEmbeddingAccelerator::Auto => nestweaver_embed::DevicePolicy::Auto,
+        CliEmbeddingAccelerator::Metal => nestweaver_embed::DevicePolicy::Metal,
+        CliEmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
+    }
+}
+
+fn external_embedding_model(model: Option<&str>) -> &str {
+    model.unwrap_or(DEFAULT_EXTERNAL_EMBEDDING_MODEL)
+}
+
+fn local_embedding_model_id(model_id: Option<&str>) -> &str {
+    model_id.unwrap_or(nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID)
+}
+
+/// A daemon uses its configured backend, so an omitted local model is not a
+/// request to override that backend. Only reject a model ID the user explicitly
+/// asked the daemon to honor.
+fn daemon_route_model_override_is_honored(
+    requested_model_id: Option<&str>,
+    recorded_model_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(requested_model_id) = requested_model_id else {
+        return Ok(());
+    };
+    let daemon_model_id =
+        recorded_model_id.unwrap_or(nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID);
+    if requested_model_id == daemon_model_id {
+        Ok(())
+    } else {
+        Err(format!(
+            "--model-id '{requested_model_id}' cannot be honored through the daemon; \
+             the daemon uses the model recorded in the database ('{daemon_model_id}'). \
+             Use --local --model-id '{requested_model_id}' --force to switch models."
+        ))
+    }
+}
 
 // ── Daemon index-stream phases ────────────────────────────────────────────────
 /// Drain one daemon index stream with the shared fail-closed terminal-state
@@ -1355,10 +1406,16 @@ enum Commands {
         model: Option<String>,
         #[arg(
             long,
-            default_value = nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID,
-            help = "HuggingFace model ID for local inference"
+            help = "HuggingFace model ID for local inference (default: sentence-transformers/all-MiniLM-L6-v2)"
         )]
-        model_id: String,
+        model_id: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            requires = "local",
+            help = "Device policy for --local embedding: auto, metal, or cpu"
+        )]
+        accelerator: Option<CliEmbeddingAccelerator>,
         #[arg(long, default_value = "32", help = "Batch size")]
         batch_size: usize,
         #[arg(
@@ -5956,6 +6013,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             endpoint,
             model,
             model_id,
+            accelerator,
             batch_size,
             scope,
             force,
@@ -5965,7 +6023,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             local,
             endpoint.as_deref(),
             model.as_deref(),
-            &model_id,
+            model_id.as_deref(),
+            accelerator,
             batch_size,
             &scope,
             force,
@@ -14203,7 +14262,8 @@ fn run_embed(
     local: bool,
     endpoint: Option<&str>,
     model: Option<&str>,
-    model_id: &str,
+    model_id: Option<&str>,
+    accelerator: Option<CliEmbeddingAccelerator>,
     batch_size: usize,
     scope: &str,
     force: bool,
@@ -14214,6 +14274,9 @@ fn run_embed(
     if local && endpoint.is_some() {
         anyhow::bail!("--local and --endpoint are mutually exclusive");
     }
+    if accelerator.is_some() && !local {
+        anyhow::bail!("--accelerator requires --local");
+    }
     if batch_size == 0 {
         anyhow::bail!("--batch-size must be at least 1");
     }
@@ -14221,8 +14284,9 @@ fn run_embed(
     let t0 = std::time::Instant::now();
     let default = default_db_path();
     let path = db.unwrap_or(&default);
+    let local_model_id = local_embedding_model_id(model_id);
 
-    // ── Try the daemon path first (Metal-accelerated) ───────────
+    // ── Try the daemon path first (configured embedding backend) ───────────
     // Only use daemon for local-model embedding (no --endpoint, no --local) AND
     // when the daemon is enabled. Under --no-daemon / NESTWEAVER_NO_DAEMON=1 we must
     // NOT touch the daemon: connecting auto-starts one, whose held DB lock then
@@ -14249,20 +14313,16 @@ fn run_embed(
                 None
             }
         };
-        let daemon_model = recorded_model
-            .map(|(recorded_model, _dim)| recorded_model)
-            .unwrap_or_else(|| nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID.to_string());
-        if model_id != daemon_model {
-            anyhow::bail!(
-                "--model-id '{model_id}' cannot be honored through the daemon; \
-                 the daemon uses the model recorded in the database ('{daemon_model}'). \
-                 Use --local --model-id '{model_id}' --force to switch models."
-            );
+        let recorded_model = recorded_model
+            .as_ref()
+            .map(|(model_id, _)| model_id.as_str());
+        if let Err(error) = daemon_route_model_override_is_honored(model_id, recorded_model) {
+            anyhow::bail!("{error}");
         }
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
-                eprintln!("Embedding via daemon (Metal-accelerated)…");
+                eprintln!("Embedding via daemon (configured backend)…");
                 match rt.block_on(client.embed(scope, force, batch_size as u32)) {
                     Ok(resp) => {
                         let elapsed = t0.elapsed();
@@ -14350,7 +14410,7 @@ fn run_embed(
 
     if let Some(ep) = endpoint {
         // ── External API path ────────────────────────────────────
-        let api_model = model.unwrap_or("text-embedding-3-small");
+        let api_model = external_embedding_model(model);
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
         if do_symbols {
@@ -14505,10 +14565,12 @@ fn run_embed(
         #[cfg(feature = "embed")]
         {
             let config = nestweaver_embed::EmbedConfig {
-                model_id: model_id.to_string(),
+                model_id: local_model_id.to_string(),
                 ..Default::default()
             };
-            let embed_model = nestweaver_embed::EmbedModel::load(&config)
+            let policy =
+                cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
+            let embed_model = nestweaver_embed::EmbedModel::load_with_policy(&config, policy)
                 .context("failed to load local embedding model")?;
 
             if do_symbols {
@@ -14684,9 +14746,9 @@ fn run_embed(
     // given DB transparently uses whatever model it was embedded with.
     if let Some(dim) = store.embedding_index_dimension() {
         let effective_model = if endpoint.is_some() {
-            model.unwrap_or(model_id)
+            external_embedding_model(model)
         } else {
-            model_id
+            local_model_id
         };
         if !effective_model.is_empty()
             && let Err(e) = store.set_embedding_metadata(effective_model, dim as u32)
@@ -17941,6 +18003,133 @@ mod cli_bounds_tests {
                         assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
                     }
                 }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+}
+
+#[cfg(all(test, feature = "embed"))]
+mod embed_accelerator_cli_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_route_ignores_external_metadata_without_local_model_override() {
+        assert!(
+            daemon_route_model_override_is_honored(None, Some(DEFAULT_EXTERNAL_EMBEDDING_MODEL))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn daemon_route_rejects_conflicting_explicit_local_model_override() {
+        let err = daemon_route_model_override_is_honored(
+            Some("sentence-transformers/custom"),
+            Some("sentence-transformers/stored"),
+        )
+        .expect_err("a conflicting local override cannot be honored by the daemon");
+
+        assert!(err.contains("sentence-transformers/custom"));
+        assert!(err.contains("sentence-transformers/stored"));
+    }
+
+    #[test]
+    fn daemon_route_allows_matching_explicit_local_model_override() {
+        assert!(
+            daemon_route_model_override_is_honored(
+                Some("sentence-transformers/stored"),
+                Some("sentence-transformers/stored"),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cli_keeps_the_local_model_default_without_an_override() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["nestweaver", "embed"])
+                    .expect("the established embed syntax must remain accepted");
+                let Commands::Embed { model_id, .. } = cli.command else {
+                    panic!("expected embed command");
+                };
+                assert_eq!(model_id, None);
+                assert_eq!(
+                    local_embedding_model_id(None),
+                    nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID
+                );
+
+                let explicit = Cli::try_parse_from([
+                    "nestweaver",
+                    "embed",
+                    "--local",
+                    "--model-id",
+                    "sentence-transformers/custom",
+                ])
+                .expect("an explicit local model override must remain accepted");
+                assert!(matches!(
+                    explicit.command,
+                    Commands::Embed {
+                        model_id: Some(model_id),
+                        ..
+                    } if model_id == "sentence-transformers/custom"
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn cli_accelerator_maps_each_policy() {
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Auto),
+            nestweaver_embed::DevicePolicy::Auto
+        );
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Metal),
+            nestweaver_embed::DevicePolicy::Metal
+        );
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Cpu),
+            nestweaver_embed::DevicePolicy::Cpu
+        );
+    }
+
+    #[test]
+    fn external_metadata_uses_the_actual_default_api_model() {
+        assert_eq!(
+            external_embedding_model(None),
+            DEFAULT_EXTERNAL_EMBEDDING_MODEL
+        );
+        assert_eq!(
+            external_embedding_model(Some("configured-model")),
+            "configured-model"
+        );
+    }
+
+    #[test]
+    fn explicit_embed_accelerator_is_parsed_only_for_direct_local_embedding() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["nestweaver", "embed", "--local", "--accelerator", "cpu"])
+                        .expect("explicit local accelerator must parse");
+                assert!(matches!(
+                    cli.command,
+                    Commands::Embed {
+                        accelerator: Some(CliEmbeddingAccelerator::Cpu),
+                        ..
+                    }
+                ));
+
+                assert!(
+                    Cli::try_parse_from(["nestweaver", "embed", "--accelerator", "metal"]).is_err(),
+                    "an explicit accelerator must not be silently ignored by the daemon path"
+                );
             })
             .expect("spawn")
             .join()

@@ -288,6 +288,10 @@ pub struct EmbeddingConfig {
     /// Default: `"~/.cache/nestweaver/models"`.
     #[serde(default = "default_embedding_cache_dir")]
     pub cache_dir: String,
+    /// Accelerator used by the local embedding backend. Default: automatically
+    /// select Metal when compiled with Metal support, otherwise CPU.
+    #[serde(default)]
+    pub accelerator: EmbeddingAccelerator,
     /// Optional HTTP endpoint for an external embedding service (e.g. Ollama,
     /// OpenAI-compatible). When set, the local model is not loaded.
     pub external_endpoint: Option<String>,
@@ -313,6 +317,16 @@ pub struct EmbeddingConfig {
     /// Candidate pool size for the semantic ANN search. Default 200.
     #[serde(default = "default_semantic_search_limit")]
     pub semantic_search_limit: usize,
+}
+
+/// Device-selection policy for the local embedding backend.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingAccelerator {
+    #[default]
+    Auto,
+    Metal,
+    Cpu,
 }
 
 /// The default local embedding model, canonical for the whole workspace.
@@ -356,6 +370,7 @@ impl Default for EmbeddingConfig {
         Self {
             model_id: default_model_id(),
             cache_dir: default_embedding_cache_dir(),
+            accelerator: EmbeddingAccelerator::Auto,
             external_endpoint: None,
             external_model: None,
             weight_ppr: default_weight_ppr(),
@@ -1153,6 +1168,35 @@ url = "https://github.com/example/repo"
         assert_eq!(cfg.repos.len(), 1);
         assert_eq!(cfg.repos[0].url, "https://github.com/example/repo");
         assert!(cfg.schema_extensions.is_none());
+    }
+
+    #[test]
+    fn embedding_accelerator_defaults_to_auto() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+
+        assert_eq!(cfg.embedding.accelerator, EmbeddingAccelerator::Auto);
+    }
+
+    #[test]
+    fn embedding_accelerator_accepts_metal_and_cpu() {
+        for (value, expected) in [
+            ("metal", EmbeddingAccelerator::Metal),
+            ("cpu", EmbeddingAccelerator::Cpu),
+        ] {
+            let toml = format!("{MINIMAL_TOML}\n[embedding]\naccelerator = {value:?}\n");
+            let cfg = InstanceConfig::from_toml_str(&toml).expect("accelerator must parse");
+
+            assert_eq!(cfg.embedding.accelerator, expected);
+        }
+    }
+
+    #[test]
+    fn embedding_accelerator_rejects_unknown_values() {
+        let toml = format!("{MINIMAL_TOML}\n[embedding]\naccelerator = \"cuda\"\n");
+        let err = InstanceConfig::from_toml_str(&toml)
+            .expect_err("unsupported accelerator must be rejected");
+
+        assert!(err.to_string().contains("accelerator"));
     }
 
     // Configured instance IDs are daemon write defaults, so empty values and
