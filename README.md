@@ -179,8 +179,11 @@ The primary pre-built installation path is a GitHub Release archive. Select the
 archive for your platform, verify its matching SHA-256 file, then install it as
 described in [INSTALL.md](INSTALL.md#pre-built-cli-recommended). Starting with
 the release that contains this change, both macOS CLI archives are built with
-Metal support. To opt out explicitly, set `accelerator = "cpu"` in the
-`[embedding]` section of your instance configuration.
+Metal support. The default `accelerator = "auto"` therefore requires Metal in
+those builds and reports a Metal initialization or inference-probe failure
+instead of retrying on CPU. To opt out explicitly, set `accelerator = "cpu"` in
+the `[embedding]` section of your instance configuration. Builds without Metal
+support select CPU for `auto`.
 
 | Platform | Release target |
 | --- | --- |
@@ -384,7 +387,11 @@ nestweaver brain context "MyProject"
 <details>
 <summary>Semantic Search (Embedding Seed Layer)</summary>
 
-Query with natural language — no need to know exact symbol names. NestWeaver embeds symbols, notes, and headings using a local BERT model (Metal-accelerated on Apple Silicon, CPU fallback elsewhere), then uses semantic similarity to find entry points for the graph walk.
+Query with natural language — no need to know exact symbol names. NestWeaver
+embeds symbols, notes, and headings using the configured local or external
+backend, then uses semantic similarity to find entry points for the graph walk.
+Backend and device selection are explicit: failures are reported and never
+switch to another backend or device.
 
 ```sh
 # Embed all indexed content (one-time, incremental after)
@@ -396,13 +403,89 @@ nestweaver context "BLE bluetooth connection handling"
 nestweaver context "where does the upload pipeline start"
 ```
 
-Three retrieval signals are fused via Convex Combination: PPR (graph structure), BM25 (text match), and semantic (embedding similarity). The embedding model downloads automatically on first use.
+Three retrieval signals are fused via Convex Combination: PPR (graph
+structure), BM25 (text match), and semantic (embedding similarity).
 
-**Model selection.** The default is the light, fast `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~90MB) — a good fit for most repos and CPU-only servers. For higher-quality retrieval, embed with a stronger model, e.g. `nestweaver embed --model-id thenlper/gte-base` (768-dim). NestWeaver **records which model a database was embedded with**, and the daemon automatically loads that same model at startup — so you can pick a model per-database (or override the default in `instance.toml`) without dimension mismatches.
+**Device policy.**
 
-**External embedding endpoints.** Instead of a local model you can embed via an OpenAI-compatible endpoint: `nestweaver embed --endpoint http://localhost:11434 --model nomic-embed-text` (Ollama), or a hosted gateway. For **keyed** gateways (OpenAI, Azure), set `NESTWEAVER_EMBED_API_KEY` — it is sent as a bearer token and is **never** written to config, the graph, or a snapshot. Omit it for a local Ollama endpoint. NestWeaver records the index dimension and rejects vectors of a mismatched dimension, so switching models requires re-embedding with `--force`. The direct path (`--endpoint`/`--local`) can't run while a daemon holds the DB write lock — `embed` detects this and tells you to stop the daemon first (or embed through the daemon by dropping `--endpoint`/`--local`).
+| `accelerator` | Local-backend behavior |
+| --- | --- |
+| `auto` | Metal in a Metal-enabled build; CPU only when Metal is not compiled. A Metal failure is reported; `auto` does not retry on CPU. |
+| `metal` | Requires Metal to be compiled and the device plus full model inference probe to succeed; otherwise embedding state is `failed`. |
+| `cpu` | Selects CPU directly and never probes Metal. |
 
-**Performance:** 7ms query embedding (Metal), 37ms (CPU) for all-MiniLM; heavier models trade speed for quality. Query-time embedding runs on the GPU in the daemon (the model is loaded on the daemon's main thread so Metal is reachable). Forward Push PPR replaces power iteration for sub-10ms graph walks. LRU cache makes repeated queries instant (~8ms).
+**Model selection and cache.** The default is the light, fast
+`sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~90MB) — a good fit for most
+repos and CPU-only servers. NestWeaver records the model used for each database,
+and the daemon loads that recorded model to avoid dimension mismatches. Daemon
+startup is cache-only: it never downloads model files or contacts Hugging Face.
+The configured `cache_dir` expands a leading `~/` against the daemon user's home
+directory.
+
+If the model is absent, stop the daemon and use the direct local path, which may
+download missing artifacts. The required form is
+`nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>`.
+Use the same model ID and expanded cache directory configured for the daemon:
+
+```sh
+CONFIG=/absolute/path/to/nestweaver-instance.toml
+DB=/absolute/path/to/brain.lbug
+MODEL=sentence-transformers/all-MiniLM-L6-v2
+CACHE="$HOME/.cache/nestweaver/models"
+nestweaver daemon --db "$DB" stop
+nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE"
+nestweaver daemon --db "$DB" start --config "$CONFIG"
+```
+
+**External embedding endpoints.** Instead of a local model you can embed via an
+OpenAI-compatible endpoint:
+`nestweaver embed --endpoint http://localhost:11434 --model nomic-embed-text`
+(Ollama), or a hosted gateway. For keyed gateways (OpenAI, Azure), set
+`NESTWEAVER_EMBED_API_KEY` — it is sent as a bearer token and is never written
+to config, the graph, or a snapshot. An external endpoint is authoritative: a
+load or request failure is reported and does not load a local model. Switching
+backends requires both an explicit configuration change and re-embedding:
+remove `external_endpoint`, stop the daemon, and replace the recorded external
+model metadata/vectors with the chosen local model:
+
+```sh
+CONFIG=/absolute/path/to/nestweaver-instance.toml
+DB=/absolute/path/to/brain.lbug
+MODEL=sentence-transformers/all-MiniLM-L6-v2
+CACHE="$HOME/.cache/nestweaver/models"
+nestweaver daemon --db "$DB" stop
+nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE" --force
+nestweaver daemon --db "$DB" start --config "$CONFIG"
+```
+
+NestWeaver records the index dimension and rejects mismatched vectors, so any
+model/backend switch requires `--force`. The direct path
+(`--endpoint`/`--local`) cannot run while a daemon holds the DB write lock; stop
+that daemon first or, when the configured daemon backend is already ready, drop
+both direct-path flags.
+
+**Readiness and diagnostics.** On macOS, background start/autostart uses launchd
+to own a foreground daemon process; `daemon run` stays in the invoking
+foreground. Neither path forks or self-daemonizes. Readiness is published only
+after a real embedding inference succeeds. Inspect compile/runtime capability
+and the selected backend with:
+
+```sh
+nestweaver diagnostics capabilities --json
+nestweaver daemon --db <path> status
+nestweaver brain status --db <path> --json
+```
+
+The status reports `requested_device`, `selected_device`, and `fallback_used`.
+A local backend is ready only when `selected_device` is `metal` or `cpu` and
+`fallback_used` is `false`; an external backend has no local selected device.
+When semantic retrieval was requested but unavailable, context responses keep
+the graph/PPR/BM25 result and report `"semantic"` in `degraded_components`.
+
+**Performance:** 7ms query embedding (Metal), 37ms (CPU) for all-MiniLM;
+heavier models trade speed for quality. Forward Push PPR replaces power
+iteration for sub-10ms graph walks. LRU cache makes repeated queries instant
+(~8ms).
 
 Configure the model and fusion weights in `instance.toml`:
 ```toml
@@ -410,6 +493,8 @@ Configure the model and fusion weights in `instance.toml`:
 # Shipped default; the model a DB was actually embedded with is recorded and
 # auto-loaded by the daemon. Set this to override the default for fresh instances.
 model_id = "sentence-transformers/all-MiniLM-L6-v2"
+cache_dir = "~/.cache/nestweaver/models"
+accelerator = "auto" # auto | metal | cpu; see the policy table above
 weight_ppr = 0.40
 weight_bm25 = 0.25
 weight_semantic = 0.35
@@ -424,7 +509,7 @@ NestWeaver can build a native macOS `.app` bundle from source. No release
 `.app` bundle or DMG is currently published. A source build provides:
 
 - **Menubar status icon** with quick access to the web UI and daemon status
-- **Metal GPU acceleration** — the app launches the daemon as a launchd Aqua agent so it runs in the GUI session and can reach the Metal shader compiler for GPU embeddings (~5x faster: 7ms vs 37ms). The daemon loads the embedding model on its main thread, which is what lets a background process reach Metal.
+- **Metal GPU acceleration** — the app launches the daemon as a non-forking launchd Aqua agent, then the daemon proves full model inference before reporting the Metal backend ready (~5x faster: 7ms vs 37ms).
 - **Managed daemon lifecycle** — launches the daemon via launchd (which owns crash-restart); the daemon is a shared service (MCP/CLI/UI all use it) and persists across app quits, so the app re-attaches to it on next launch
 - **Daemon coexistence** — detects if a daemon is already running (via CLI or launchd) and connects to it instead of starting a second instance
 - **Web UI** at `http://127.0.0.1:9377` — opens automatically on launch

@@ -218,6 +218,129 @@ fn installation_docs_only_claim_live_channels() {
     }
 }
 
+#[test]
+fn embedding_docs_match_runtime_contract() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let documentation = [
+        ("README.md", "README.md"),
+        ("instance config guide", "docs/guide/instance-config.md"),
+        ("server mode guide", "docs/server-mode.md"),
+        (
+            "annotated instance config",
+            "examples/nestweaver-instance.toml",
+        ),
+    ]
+    .map(|(label, relative_path)| {
+        let contents = std::fs::read_to_string(repo_root.join(relative_path))
+            .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
+        (label, contents)
+    });
+
+    let combined = documentation
+        .iter()
+        .map(|(_, contents)| contents.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let combined_lowercase = combined.to_lowercase();
+
+    for obsolete_claim in [
+        "cpu fallback",
+        "fallback to cpu",
+        "downloads automatically",
+        "daemon's main thread",
+        "external-to-local fallback",
+    ] {
+        assert!(
+            !combined_lowercase.contains(obsolete_claim),
+            "embedding docs contain obsolete claim `{obsolete_claim}`"
+        );
+    }
+
+    for required_contract in [
+        "Metal in a Metal-enabled build; CPU only when Metal is not compiled",
+        "A Metal failure is reported; `auto` does not retry on CPU",
+        "`metal`",
+        "`cpu`",
+        "Daemon startup is cache-only",
+        "nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>",
+        "nestweaver diagnostics capabilities --json",
+        "nestweaver daemon --db <path> status",
+        "nestweaver brain status --db <path> --json",
+        "nestweaver daemon --db \"$DB\" start --config \"$CONFIG\"",
+        "nestweaver embed --db \"$DB\" --local --model-id \"$MODEL\" --cache-dir \"$CACHE\" --force",
+        "`requested_device`",
+        "`selected_device`",
+        "`fallback_used`",
+        "`degraded_components`",
+    ] {
+        assert!(
+            combined.contains(required_contract),
+            "embedding docs are missing runtime contract `{required_contract}`"
+        );
+    }
+
+    let required_by_document: &[(&str, &[&str])] = &[
+        (
+            "README.md",
+            &[
+                "**Device policy.**",
+                "**Model selection and cache.**",
+                "**External embedding endpoints.**",
+                "**Readiness and diagnostics.**",
+                "CONFIG=/absolute/path/to/nestweaver-instance.toml",
+            ],
+        ),
+        (
+            "instance config guide",
+            &[
+                "Device policies for the local backend are exact:",
+                "An external endpoint is authoritative.",
+                "Do not omit `--local`",
+                "Switching from an external backend to a local model",
+            ],
+        ),
+        (
+            "server mode guide",
+            &[
+                "### Embedding backend and readiness",
+                "### Embedding or semantic retrieval unavailable",
+                "`metal_compiled = false`",
+                "`selected_device = \"\"`",
+                "--cache-dir \"$CACHE\" --force",
+            ],
+        ),
+    ];
+    for (label, required_claims) in required_by_document {
+        let contents = documentation
+            .iter()
+            .find_map(|(candidate, contents)| (candidate == label).then_some(contents))
+            .unwrap_or_else(|| panic!("{label} must be part of the documentation contract"));
+        for required_claim in *required_claims {
+            assert!(
+                contents.contains(required_claim),
+                "{label} is missing `{required_claim}`"
+            );
+        }
+    }
+
+    let example = documentation
+        .iter()
+        .find_map(|(label, contents)| (*label == "annotated instance config").then_some(contents))
+        .expect("annotated instance config must be part of the documentation contract");
+    for required_example_claim in [
+        "accelerator = \"auto\"",
+        "# auto:",
+        "# metal:",
+        "# cpu:",
+        "# Daemon startup is cache-only",
+    ] {
+        assert!(
+            example.contains(required_example_claim),
+            "annotated instance config is missing `{required_example_claim}`"
+        );
+    }
+}
+
 fn workflow_step<'a>(workflow: &'a str, name: &str) -> &'a str {
     let marker = format!("      - name: {name}\n");
     let start = workflow
