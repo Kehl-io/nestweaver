@@ -5993,6 +5993,74 @@ mod depth_clamp_tests {
 #[cfg(all(test, feature = "embed"))]
 mod embedding_load_config_tests {
     use super::*;
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+    use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+    use std::path::Path;
+    use tokenizers::Tokenizer;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    fn write_complete_hf_cache(cache_dir: &Path) -> nestweaver_embed::ModelArtifacts {
+        const CONFIG_JSON: &str = r#"{
+            "vocab_size": 3,
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "intermediate_size": 8,
+            "hidden_act": "gelu",
+            "hidden_dropout_prob": 0.0,
+            "max_position_embeddings": 8,
+            "type_vocab_size": 2,
+            "initializer_range": 0.02,
+            "layer_norm_eps": 0.000000000001,
+            "pad_token_id": 0,
+            "position_embedding_type": "absolute",
+            "use_cache": false,
+            "classifier_dropout": null,
+            "model_type": "bert"
+        }"#;
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let repo_dir = cache_dir.join("models--test-owner--test-model");
+        let snapshot_dir = repo_dir.join("snapshots").join(commit);
+        std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
+        std::fs::create_dir_all(&snapshot_dir).expect("create snapshot");
+        std::fs::write(repo_dir.join("refs").join("main"), commit).expect("write ref");
+        let artifacts = nestweaver_embed::ModelArtifacts {
+            config: snapshot_dir.join("config.json"),
+            tokenizer: snapshot_dir.join("tokenizer.json"),
+            weights: snapshot_dir.join("model.safetensors"),
+        };
+
+        std::fs::write(&artifacts.config, CONFIG_JSON).expect("write model config");
+        let config: BertConfig = serde_json::from_str(CONFIG_JSON).expect("parse model config");
+        let varmap = VarMap::new();
+        let builder = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        BertModel::load(builder, &config).expect("initialize tiny BERT fixture");
+        varmap
+            .save(&artifacts.weights)
+            .expect("write model weights");
+
+        let vocab = [
+            ("[PAD]".to_string(), 0_u32),
+            ("[UNK]".to_string(), 1_u32),
+            ("test".to_string(), 2_u32),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer_model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("build tokenizer model");
+        let mut tokenizer = Tokenizer::new(tokenizer_model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .save(&artifacts.tokenizer, false)
+            .expect("write tokenizer");
+
+        artifacts
+    }
 
     #[test]
     fn daemon_accelerator_maps_each_policy() {
@@ -6030,6 +6098,36 @@ mod embedding_load_config_tests {
             Some("stored-external")
         );
     }
+
+    #[test]
+    fn daemon_embedding_startup_constructs_cached_model_offline() {
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        write_complete_hf_cache(cache.path());
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: cache.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+
+        let model = load_daemon_embedding_backend_with(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+        )
+        .expect("daemon startup must construct a complete configured-cache model offline");
+
+        assert_eq!(
+            model.backend_kind(),
+            nestweaver_embed::EmbeddingBackendKind::Local
+        );
+        assert_eq!(model.device_kind(), Some(nestweaver_embed::DeviceKind::Cpu));
+        assert_eq!(model.known_dimension(), Some(4));
+        let embeddings = model.embed(&["test"]).expect("embed with loaded fixture");
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), 4);
+        assert!(embeddings[0].iter().all(|value| value.is_finite()));
+    }
 }
 
 #[cfg(feature = "embed")]
@@ -6045,6 +6143,22 @@ fn daemon_embedding_device_policy(
         }
         nestweaver_engine::config::EmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
     }
+}
+
+#[cfg(feature = "embed")]
+fn load_daemon_embedding_backend_with<T, Load>(
+    config: &nestweaver_embed::EmbedConfig,
+    policy: nestweaver_embed::DevicePolicy,
+    load: Load,
+) -> anyhow::Result<T>
+where
+    Load: FnOnce(
+        &nestweaver_embed::EmbedConfig,
+        nestweaver_embed::DevicePolicy,
+        nestweaver_embed::ArtifactMode,
+    ) -> anyhow::Result<T>,
+{
+    load(config, policy, nestweaver_embed::ArtifactMode::CacheOnly)
 }
 
 #[cfg(feature = "embed")]
@@ -6081,10 +6195,10 @@ fn embedding_load_config(
 /// Load the embedding model into `state.embed_model`. MUST be called on the daemon's main
 /// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
 /// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
-/// thread (there it silently falls back to CPU). Called AFTER the UDS server is spawned so a
-/// cold-cache download can't delay the socket bind; the download is bounded by a 180s prefetch
-/// timeout so it can't hang. During the load, non-semantic RPCs are served normally and
-/// semantic search returns "model not loaded" until it completes.
+/// thread. Called AFTER the UDS server is spawned. Local model artifacts are resolved strictly
+/// from the configured cache, so daemon startup never initiates a network download. During the
+/// load, non-semantic RPCs are served normally and semantic search returns "model not loaded"
+/// until it completes.
 ///
 /// Gated `not(test)` like its call site: unit-test servers run on tokio worker threads, which
 /// can never satisfy the main-thread requirement, and with the call site compiled out this fn
@@ -6147,38 +6261,13 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
     let config = embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
-    // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't hang the
-    // load. On a warm cache this is instant; only the local-model path downloads.
-    //
-    // NOTE on cancellation: when the 180s timeout fires, the `spawn_blocking` download keeps
-    // running detached — hf-hub's blocking (ureq) `repo.get` exposes no abort hook, and the
-    // dominant cost is a single indivisible `model.safetensors` GET, so there is no useful
-    // point to inject a cooperative check. Accepted: the daemon's wait is bounded by this
-    // timeout plus the shutdown `select!` around the caller; the orphaned thread only writes
-    // into the HF cache dir and exits on its own when the transfer finishes or errors.
-    let loaded = if config.external_endpoint.is_some() {
-        Some(nestweaver_embed::EmbedModel::load_with_policy(
-            &config, policy,
-        ))
-    } else {
-        let model_id = config.model_id.clone();
-        let prefetch =
-            tokio::task::spawn_blocking(move || nestweaver_embed::local::prefetch_model(&model_id));
-        match tokio::time::timeout(std::time::Duration::from_secs(180), prefetch).await {
-            Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load_with_policy(
-                &config, policy,
-            )),
-            _ => {
-                tracing::warn!(
-                    "embedding model download timed out or failed — semantic search disabled \
-                     until the daemon restarts with the model available"
-                );
-                None
-            }
-        }
-    };
+    let loaded = load_daemon_embedding_backend_with(
+        &config,
+        policy,
+        nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+    );
     match loaded {
-        Some(Ok(model)) => {
+        Ok(model) => {
             tracing::info!(
                 backend = ?model.backend_kind(),
                 device = ?model.device_kind(),
@@ -6202,10 +6291,9 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
                     as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
             }
         }
-        Some(Err(e)) => {
+        Err(e) => {
             tracing::warn!("Failed to load embedding model: {e}");
         }
-        None => {}
     }
 }
 
@@ -7756,7 +7844,8 @@ pub async fn run_server(
     // Spawn the UDS gRPC server so the socket binds and accepts immediately, THEN load the
     // embedding model on this (main) thread concurrently — non-semantic RPCs are served during
     // the load, and semantic search returns "model not loaded" until it completes. candle needs
-    // the main thread for Metal, and this keeps a cold-cache download from delaying the bind.
+    // the main thread for Metal, and this keeps cache resolution and model construction from
+    // delaying the bind.
     let uds_serve = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(uds_svc)
@@ -7765,9 +7854,8 @@ pub async fn run_server(
             }),
     );
 
-    // Race the load against shutdown: a `daemon stop` during a cold-cache model download must
-    // not park the main flow inside the 180s prefetch (which would defer cleanup and risk a
-    // SIGKILL + stale socket). If shutdown fires first, abandon the load and proceed to drain.
+    // Keep shutdown and model loading in the same control point. If shutdown wins before the
+    // synchronous model-construction phase begins, abandon the load and proceed to drain.
     //
     // `not(test)`: the load asserts it runs on the PROCESS main thread
     // (`pthread_main_np`, Metal shader compilation) — a guarantee the test

@@ -5,6 +5,7 @@ pub mod preprocess;
 use std::path::PathBuf;
 
 use anyhow::Result;
+pub use local::{ArtifactMode, MissingModelArtifactError, ModelArtifacts, resolve_model_artifacts};
 
 /// Requested device-selection policy for the local embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,12 +100,21 @@ impl EmbedModel {
     /// The policy is ignored by an external backend, which never loads local
     /// inference as a fallback.
     pub fn load_with_policy(config: &EmbedConfig, policy: DevicePolicy) -> Result<Self> {
+        Self::load_with_policy_and_artifact_mode(config, policy, ArtifactMode::DownloadMissing)
+    }
+
+    /// Load with explicit device and artifact-resolution policies.
+    pub fn load_with_policy_and_artifact_mode(
+        config: &EmbedConfig,
+        policy: DevicePolicy,
+        mode: ArtifactMode,
+    ) -> Result<Self> {
         let backend = if config.external_endpoint.is_some() {
             EmbedBackend::External
         } else {
-            EmbedBackend::Local(Box::new(local::LocalModel::load_with_policy(
-                config, policy,
-            )?))
+            EmbedBackend::Local(Box::new(
+                local::LocalModel::load_with_policy_and_artifact_mode(config, policy, mode)?,
+            ))
         };
         Ok(Self {
             backend,
@@ -199,5 +209,24 @@ mod tests {
             .embed(&["query"])
             .expect_err("a closed external endpoint must return its error");
         assert!(err.to_string().contains("embedding API"));
+    }
+
+    #[test]
+    fn external_backend_never_resolves_local_artifacts() {
+        let config = EmbedConfig {
+            model_id: "definitely-not-a-local-model".to_string(),
+            cache_dir: std::env::temp_dir().join("nestweaver-missing-external-artifact-cache"),
+            external_endpoint: Some("http://127.0.0.1:9".to_string()),
+            external_model: Some("test-embedding-model".to_string()),
+        };
+
+        let model = EmbedModel::load_with_policy_and_artifact_mode(
+            &config,
+            DevicePolicy::Cpu,
+            ArtifactMode::CacheOnly,
+        )
+        .expect("external backend must not inspect the local artifact cache");
+
+        assert_eq!(model.backend_kind(), EmbeddingBackendKind::External);
     }
 }
