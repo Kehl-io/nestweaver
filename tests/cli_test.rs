@@ -419,6 +419,223 @@ fn ci_runs_release_workflow_contract_when_release_definition_changes() {
 }
 
 #[test]
+fn ci_metal_smoke_is_required_and_narrowly_routed_to_apple_hardware_changes() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let filters = workflow
+        .split_once("          filters: |\n")
+        .expect("CI must define path filters")
+        .1
+        .split_once("\n\n  fmt:")
+        .expect("change filters must precede CI jobs")
+        .0;
+    let metal_filter = filters
+        .split_once("            metal:\n")
+        .expect("CI must define a Metal smoke-test change filter")
+        .1
+        .split_once("            frontend:\n")
+        .expect("Metal filter must precede the frontend filter")
+        .0;
+
+    for selected_path in [
+        "crates/nestweaver-embed/**",
+        "crates/nestweaver-daemon/src/lifecycle.rs",
+        "crates/nestweaver-daemon/src/launchd.rs",
+        "crates/nestweaver-daemon/src/server.rs",
+        "crates/nestweaver-daemon/Cargo.toml",
+        "crates/nestweaver-client/src/autostart.rs",
+        "src/main.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release-please.yml",
+        "tests/metal_smoke.rs",
+    ] {
+        assert!(
+            metal_filter.contains(&format!("- '{selected_path}'")),
+            "Metal filter must select `{selected_path}`\nfilter:\n{metal_filter}"
+        );
+    }
+    assert!(
+        !metal_filter.contains("'**/*.rs'"),
+        "Metal smoke must not run for every Rust change"
+    );
+
+    let job = workflow
+        .split_once("\n  metal-smoke:\n")
+        .expect("CI must define a metal-smoke job")
+        .1
+        .split_once("\n  fmt:\n")
+        .expect("metal-smoke must be a top-level job")
+        .0;
+    for required in [
+        "needs: changes",
+        "if: needs.changes.outputs.metal == 'true'",
+        "runs-on: macos-latest",
+        "test \"$(uname -m)\" = \"arm64\"",
+    ] {
+        assert!(
+            job.contains(required),
+            "metal-smoke job must contain `{required}`\njob:\n{job}"
+        );
+    }
+    assert!(
+        !job.contains("continue-on-error: true"),
+        "Metal smoke is a required gate, not an informational job"
+    );
+}
+
+#[test]
+fn ci_metal_smoke_gates_offline_cold_and_warm_daemon_inference() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let job = workflow
+        .split_once("\n  metal-smoke:\n")
+        .expect("CI must define a metal-smoke job")
+        .1
+        .split_once("\n  fmt:\n")
+        .expect("metal-smoke must be a top-level job")
+        .0;
+
+    let cache_setup = workflow_step(job, "Populate model cache on CPU");
+    for required in [
+        "--no-daemon",
+        "--accelerator cpu",
+        "--cache-dir \"$MODEL_CACHE\"",
+        "--db \"$SETUP_DB\"",
+    ] {
+        assert!(
+            cache_setup.contains(required),
+            "network-enabled cache setup must contain `{required}`\nstep:\n{cache_setup}"
+        );
+    }
+
+    let cache_contract = workflow_step(job, "Verify daemon cache-only contract");
+    assert!(
+        cache_contract.contains("daemon_embedding_startup_constructs_cached_model_offline"),
+        "the hardware gate must execute the focused CacheOnly daemon contract"
+    );
+
+    let path_setup = workflow_step(job, "Configure isolated smoke paths");
+    for required in [
+        "RUNTIME_DIR=\"$HOME/.local/state/nestweaver/$INSTANCE_ID\"",
+        "echo \"RUNTIME_DIR=$RUNTIME_DIR\"",
+    ] {
+        assert!(
+            path_setup.contains(required),
+            "path setup must export the exact per-instance runtime directory via `{required}`"
+        );
+    }
+
+    let preflight = workflow_step(job, "Assert clean daemon preconditions");
+    assert!(
+        preflight.contains("apple_hardware::cold_daemon_preconditions_are_clean"),
+        "the cold gate must select exactly the module-qualified precondition test"
+    );
+
+    let cold = workflow_step(job, "Cold Metal daemon inference");
+    for required in [
+        "index --repo testdata/js --db \"$TARGET_DB\" --config \"$TARGET_CONFIG\"",
+        "requested_device == \"metal\"",
+        "selected_device == \"metal\"",
+        "fallback_used == false",
+        "embed --db \"$TARGET_DB\" --scope symbols --force",
+        "Embedding via daemon",
+        "launchctl print",
+        "test -f \"$PLIST_PATH\"",
+    ] {
+        assert!(
+            cold.contains(required),
+            "cold inference must contain `{required}`\nstep:\n{cold}"
+        );
+    }
+    assert!(
+        !cold.contains("--no-daemon"),
+        "the cold gate must exercise normal client autostart"
+    );
+
+    let warm = workflow_step(job, "Restart and repeat warm Metal inference");
+    for required in [
+        "daemon --db \"$TARGET_DB\" stop",
+        "brain status --db \"$TARGET_DB\" --config \"$TARGET_CONFIG\" --json",
+        "requested_device == \"metal\"",
+        "selected_device == \"metal\"",
+        "fallback_used == false",
+        "embed --db \"$TARGET_DB\" --scope symbols --force",
+        "Embedding via daemon",
+        "launchctl print",
+        "test -f \"$PLIST_PATH\"",
+    ] {
+        assert!(
+            warm.contains(required),
+            "warm inference must contain `{required}`\nstep:\n{warm}"
+        );
+    }
+
+    let hardware = workflow_step(job, "Verify cache-only Metal vector");
+    assert!(
+        hardware.contains("apple_hardware::metal_embedding_is_finite_normalized_and_uses_metal"),
+        "the direct vector check must select exactly the module-qualified Metal test"
+    );
+
+    let evidence = workflow_step(job, "Collect Metal smoke evidence");
+    for required in [
+        "if: failure()",
+        "diagnostics capabilities --json",
+        "daemon.log",
+    ] {
+        assert!(
+            evidence.contains(required),
+            "failure evidence must contain `{required}`\nstep:\n{evidence}"
+        );
+    }
+    let upload = workflow_step(job, "Upload Metal smoke evidence");
+    for required in [
+        "if: failure()",
+        "actions/upload-artifact@",
+        "metal-smoke-evidence",
+    ] {
+        assert!(
+            upload.contains(required),
+            "failure upload must contain `{required}`\nstep:\n{upload}"
+        );
+    }
+
+    let cleanup = workflow_step(job, "Clean up isolated Metal daemon");
+    for required in [
+        "daemon_stopped=false",
+        "daemon_stopped=true",
+        "[ -n \"${INSTANCE_ID:-}\" ]",
+        "[ \"${RUNTIME_DIR:-}\" = \"$HOME/.local/state/nestweaver/$INSTANCE_ID\" ]",
+        "\"$HOME/.local/state/nestweaver/\"?*",
+        "rm -rf -- \"$RUNTIME_DIR\"",
+    ] {
+        assert!(
+            cleanup.contains(required),
+            "cleanup must remove only the stopped instance's scoped runtime directory via \
+             `{required}`\nstep:\n{cleanup}"
+        );
+    }
+    let stop_position = cleanup
+        .find("target/release/nestweaver daemon --db \"$TARGET_DB\" stop")
+        .unwrap();
+    let runtime_remove_position = cleanup.find("rm -rf -- \"$RUNTIME_DIR\"").unwrap();
+    assert!(
+        stop_position < runtime_remove_position,
+        "the exact per-instance runtime directory may be removed only after the scoped daemon stop"
+    );
+
+    let setup_position = job.find("- name: Populate model cache on CPU").unwrap();
+    let cold_position = job.find("- name: Cold Metal daemon inference").unwrap();
+    let direct_position = job.find("- name: Verify cache-only Metal vector").unwrap();
+    assert!(
+        setup_position < cold_position && cold_position < direct_position,
+        "CPU cache population must precede the daemon's first Metal operation, and direct Metal \
+         verification must run only afterward"
+    );
+}
+
+#[test]
 fn standalone_suggest_links_reads_canonical_manifest_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("brain.lbug");
