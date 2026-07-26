@@ -589,6 +589,51 @@ fn macos_autostart_temp_db_spawns_daemon_run_without_plist() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn macos_temp_start_reports_child_failure_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocked_parent = dir.path().join("not-a-directory");
+    std::fs::write(&blocked_parent, "regular file").unwrap();
+    let db_path = blocked_parent.join("test.lbug");
+    let _guard = DaemonGuard::new(&db_path);
+
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let socket = nestweaver_daemon::socket_path(&instance_id);
+    let plist = nestweaver_daemon::launchd_plist_path(&instance_id);
+    let started = std::time::Instant::now();
+
+    let mut command = normal_daemon_cmd();
+    command.arg("--no-embed").args([
+        "daemon",
+        "--db",
+        &db_path.display().to_string(),
+        "start",
+        "--idle-timeout",
+        "30",
+    ]);
+    let assert = command.timeout(Duration::from_secs(30)).assert().failure();
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "child exit must preempt the 60s health timeout (elapsed {elapsed:?}):\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exited before becoming healthy"),
+        "startup error must report the child exit:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&db_path.display().to_string()),
+        "startup error must identify the failed database:\n{stderr}"
+    );
+    assert!(!pidfile.exists(), "failed child must retire its pidfile");
+    assert!(!socket.exists(), "failed child must leave no socket");
+    assert!(!plist.exists(), "temp startup must leave no plist");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn macos_autostart_normal_db_is_owned_by_launchd() {
     let repo_dir = tempfile::tempdir().unwrap();
     write_test_repo(repo_dir.path());
@@ -606,7 +651,7 @@ fn macos_autostart_normal_db_is_owned_by_launchd() {
         .join("Library")
         .join("Caches")
         .join("io.kehl.nestweaver-tests")
-        .join(unique);
+        .join(format!("{unique} & < > \" '"));
     let db_path = root.join("brain.lbug");
     std::fs::create_dir_all(&root).unwrap();
     let guard = LaunchdTestGuard::new(&db_path, &root);

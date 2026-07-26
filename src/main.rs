@@ -3724,6 +3724,34 @@ fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
     std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
 }
 
+/// Retire failed-start runtime files only while proving no concurrent daemon
+/// owns them. Holding the pidfile flock closes the check-then-unlink race:
+/// another starter cannot acquire this inode before the stale socket is
+/// removed, and the pidfile is unlinked last so a later starter gets a fresh
+/// inode that this cleanup never touches.
+#[cfg(target_os = "macos")]
+fn remove_unowned_daemon_runtime(pidfile: &std::path::Path, socket: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pidfile)
+    else {
+        return;
+    };
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return;
+    }
+
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(pidfile);
+    unsafe {
+        libc::flock(fd, libc::LOCK_UN);
+    }
+}
+
 /// PID of the process on the other end of a connected unix socket, as
 /// reported by the kernel. Unlike the pidfile (whose contents can be
 /// overwritten while the daemon still holds its flock), this cannot be faked
@@ -3912,6 +3940,60 @@ fn macos_temp_daemon_command(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     command
+}
+
+/// Wait for a temporary macOS daemon without losing sight of its child.
+///
+/// A foreground child can fail before its socket exists (for example, while
+/// opening its database). Polling its exit concurrently with RPC readiness
+/// reaps that failure immediately instead of leaving a zombie until the full
+/// health timeout. If another starter owns the pidfile lock, the exited child
+/// lost a legitimate concurrent-start race, so continue waiting for that
+/// incumbent to become healthy.
+#[cfg(target_os = "macos")]
+fn wait_for_macos_temp_daemon(
+    child: &mut std::process::Child,
+    db_path: &std::path::Path,
+    pidfile: &std::path::Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<nestweaver_proto::HealthCheckResponse> {
+    let started = std::time::Instant::now();
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    rt.block_on(async {
+        let child_exit = async {
+            loop {
+                if let Some(status) = child.try_wait().context("inspect temporary daemon child")? {
+                    return Ok::<_, anyhow::Error>(status);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+
+        tokio::select! {
+            biased;
+            health = nestweaver_client::DaemonClient::wait_healthy(db_path, timeout) => {
+                health.context("temporary daemon health check failed")
+            }
+            exit = child_exit => {
+                let status = exit?;
+                if pidfile_flock_held(pidfile) {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    return nestweaver_client::DaemonClient::wait_healthy(db_path, remaining)
+                        .await
+                        .context(
+                            "temporary daemon child lost a concurrent-start race, but the \
+                             pidfile owner did not become healthy",
+                        );
+                }
+                anyhow::bail!(
+                    "temporary daemon child exited before becoming healthy ({status}) after \
+                     {:.2}s; database: {}",
+                    started.elapsed().as_secs_f64(),
+                    db_path.display()
+                );
+            }
+        }
+    })
 }
 
 /// Wait up to `grace` for `pid` to exit (after a SIGTERM). Returns true
@@ -9620,12 +9702,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         eprintln!("  PID file:  {}", pidfile.display());
                         eprintln!("  Socket:    {}", socket.display());
 
-                        let rt = tokio::runtime::Runtime::new()
-                            .context("failed to create tokio runtime")?;
-                        match rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
+                        match wait_for_macos_temp_daemon(
+                            &mut child,
                             &db_path_abs,
+                            &pidfile,
                             std::time::Duration::from_secs(60),
-                        )) {
+                        ) {
                             Ok(health) => {
                                 if health.pid == child.id() {
                                     if let Some(status) = child
@@ -9664,6 +9746,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     let _ = child.kill();
                                     let _ = child.wait();
                                 }
+                                remove_unowned_daemon_runtime(&pidfile, &socket);
                                 anyhow::bail!(
                                     "temporary daemon for {} did not become healthy: {error:#}",
                                     db_path_abs.display()
@@ -18141,6 +18224,82 @@ mod daemon_cli_tests {
             Some(None)
         );
         assert_eq!(command.get_program(), "/opt/nestweaver");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_temp_daemon_wait_reaps_an_early_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("never-healthy.lbug");
+        let pidfile = dir.path().join("never-healthy.pid");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id() as i32;
+        let started = std::time::Instant::now();
+
+        let error = wait_for_macos_temp_daemon(
+            &mut child,
+            &db_path,
+            &pidfile,
+            std::time::Duration::from_secs(3),
+        )
+        .expect_err("an exited child cannot become healthy");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "early child exit must preempt the readiness timeout: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("exited before becoming healthy"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("exit status: 23"), "{error:#}");
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1, "the readiness waiter must reap PID {pid}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "PID {pid} must no longer be a waitable zombie"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_failed_start_cleanup_preserves_concurrent_owner() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let socket = dir.path().join("daemon.sock");
+        let owner = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&pidfile)
+            .unwrap();
+        std::fs::write(&socket, "incumbent socket").unwrap();
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        remove_unowned_daemon_runtime(&pidfile, &socket);
+        assert!(
+            pidfile.exists(),
+            "a concurrent owner's pidfile must survive"
+        );
+        assert!(socket.exists(), "a concurrent owner's socket must survive");
+
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(owner);
+        remove_unowned_daemon_runtime(&pidfile, &socket);
+        assert!(!socket.exists(), "unowned socket must be retired");
+        assert!(!pidfile.exists(), "unowned pidfile must be retired");
     }
 }
 
