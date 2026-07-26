@@ -409,7 +409,7 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
-    /// Run bulk embedding on the daemon using its Metal-accelerated model.
+    /// Run bulk embedding on the daemon using its configured embedding backend.
     pub async fn embed(
         &mut self,
         scope: &str,

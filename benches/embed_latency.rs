@@ -10,7 +10,7 @@ fn main() {
         let load_start = Instant::now();
         let model = EmbedModel::load(&config).expect("Failed to load model");
         eprintln!(
-            "Model loaded in {:.1}ms (dim={:?})",
+            "Model loaded in {:.1}ms (dim={})",
             load_start.elapsed().as_millis(),
             model.dimension()
         );

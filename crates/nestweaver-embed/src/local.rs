@@ -17,8 +17,8 @@ pub struct LocalModel {
 }
 
 impl LocalModel {
-    pub fn load(config: &crate::EmbedConfig) -> Result<Self> {
-        let (device, device_kind) = select_device(config.device_policy)?;
+    pub fn load(config: &crate::EmbedConfig, policy: DevicePolicy) -> Result<Self> {
+        let (device, device_kind) = select_device(policy)?;
         let client = HFClientSync::new()?;
         let (owner, name) = split_id(&config.model_id);
         let repo = client.model(owner, name);
@@ -73,14 +73,11 @@ impl LocalModel {
                 Ok(model)
             }
             Ok(Err(err)) => Err(err).with_context(|| {
-                format!(
-                    "embedding model probe failed for requested device policy {policy:?}",
-                    policy = config.device_policy
-                )
+                format!("embedding model probe failed for requested device policy {policy:?}")
             }),
             Err(_) => anyhow::bail!(
                 "embedding model probe panicked for requested device policy {:?}",
-                config.device_policy
+                policy
             ),
         }
     }
@@ -307,5 +304,33 @@ mod tests {
             .expect("a successful Metal factory must select Metal");
 
         assert!(matches!(selected, DeviceChoice::Metal(())));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_and_auto_propagate_metal_factory_failures() {
+        for policy in [DevicePolicy::Metal, DevicePolicy::Auto] {
+            let err = match select_device_choice_with(policy, || -> Result<()> {
+                anyhow::bail!("factory failed")
+            }) {
+                Err(err) => err,
+                Ok(_) => panic!("Metal failure must not fall back to CPU"),
+            };
+            assert!(err.to_string().contains("Metal device creation failed"));
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_and_auto_propagate_metal_factory_panics() {
+        for policy in [DevicePolicy::Metal, DevicePolicy::Auto] {
+            let err = match select_device_choice_with(policy, || -> Result<()> {
+                panic!("factory panic");
+            }) {
+                Err(err) => err,
+                Ok(_) => panic!("Metal panic must not fall back to CPU"),
+            };
+            assert!(err.to_string().contains("Metal device creation panicked"));
+        }
     }
 }

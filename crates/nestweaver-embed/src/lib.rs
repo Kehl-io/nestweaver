@@ -56,7 +56,6 @@ pub struct EmbedConfig {
     pub cache_dir: PathBuf,
     pub external_endpoint: Option<String>,
     pub external_model: Option<String>,
-    pub device_policy: DevicePolicy,
 }
 
 impl Default for EmbedConfig {
@@ -69,7 +68,6 @@ impl Default for EmbedConfig {
             cache_dir: default_cache_dir(),
             external_endpoint: None,
             external_model: None,
-            device_policy: DevicePolicy::Auto,
         }
     }
 }
@@ -92,11 +90,19 @@ enum EmbedBackend {
 }
 
 impl EmbedModel {
+    /// Load using the default automatic device-selection policy.
     pub fn load(config: &EmbedConfig) -> Result<Self> {
+        Self::load_with_policy(config, DevicePolicy::Auto)
+    }
+
+    /// Load with an explicit device-selection policy for the local backend.
+    /// The policy is ignored by an external backend, which never loads local
+    /// inference as a fallback.
+    pub fn load_with_policy(config: &EmbedConfig, policy: DevicePolicy) -> Result<Self> {
         let backend = if config.external_endpoint.is_some() {
             EmbedBackend::External
         } else {
-            EmbedBackend::Local(Box::new(local::LocalModel::load(config)?))
+            EmbedBackend::Local(Box::new(local::LocalModel::load(config, policy)?))
         };
         Ok(Self {
             backend,
@@ -104,9 +110,15 @@ impl EmbedModel {
         })
     }
 
+    /// Embedding dimension, preserving the original public API. External
+    /// backends have no trustworthy dimension at load time and return `0`.
+    pub fn dimension(&self) -> usize {
+        self.known_dimension().unwrap_or(0)
+    }
+
     /// Dimension known at model-load time. External services do not provide a
     /// trustworthy dimension until they return an embedding.
-    pub fn dimension(&self) -> Option<usize> {
+    pub fn known_dimension(&self) -> Option<usize> {
         match &self.backend {
             EmbedBackend::Local(model) => Some(model.dimension()),
             EmbedBackend::External => None,
@@ -172,14 +184,14 @@ mod tests {
             cache_dir: std::env::temp_dir().join("nestweaver-empty-embedding-cache"),
             external_endpoint: Some("http://127.0.0.1:9".to_string()),
             external_model: Some("test-embedding-model".to_string()),
-            device_policy: DevicePolicy::Cpu,
         };
 
-        let model = EmbedModel::load(&config)
+        let model = EmbedModel::load_with_policy(&config, DevicePolicy::Cpu)
             .expect("external backend must load without a local model or cache");
         assert_eq!(model.backend_kind(), EmbeddingBackendKind::External);
         assert_eq!(model.device_kind(), None);
-        assert_eq!(model.dimension(), None);
+        assert_eq!(model.dimension(), 0);
+        assert_eq!(model.known_dimension(), None);
 
         let err = model
             .embed(&["query"])

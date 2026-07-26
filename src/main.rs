@@ -33,6 +33,7 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_AMBIGUOUS: i32 = 3;
+const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// Explicit device policy for direct local embedding.
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
@@ -40,6 +41,21 @@ enum CliEmbeddingAccelerator {
     Auto,
     Metal,
     Cpu,
+}
+
+#[cfg(feature = "embed")]
+fn cli_embedding_device_policy(
+    accelerator: CliEmbeddingAccelerator,
+) -> nestweaver_embed::DevicePolicy {
+    match accelerator {
+        CliEmbeddingAccelerator::Auto => nestweaver_embed::DevicePolicy::Auto,
+        CliEmbeddingAccelerator::Metal => nestweaver_embed::DevicePolicy::Metal,
+        CliEmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
+    }
+}
+
+fn external_embedding_model(model: Option<&str>) -> &str {
+    model.unwrap_or(DEFAULT_EXTERNAL_EMBEDDING_MODEL)
 }
 
 // ── Daemon index-stream phases ────────────────────────────────────────────────
@@ -14243,7 +14259,7 @@ fn run_embed(
     let default = default_db_path();
     let path = db.unwrap_or(&default);
 
-    // ── Try the daemon path first (Metal-accelerated) ───────────
+    // ── Try the daemon path first (configured embedding backend) ───────────
     // Only use daemon for local-model embedding (no --endpoint, no --local) AND
     // when the daemon is enabled. Under --no-daemon / NESTWEAVER_NO_DAEMON=1 we must
     // NOT touch the daemon: connecting auto-starts one, whose held DB lock then
@@ -14283,7 +14299,7 @@ fn run_embed(
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
-                eprintln!("Embedding via daemon (Metal-accelerated)…");
+                eprintln!("Embedding via daemon (configured backend)…");
                 match rt.block_on(client.embed(scope, force, batch_size as u32)) {
                     Ok(resp) => {
                         let elapsed = t0.elapsed();
@@ -14371,7 +14387,7 @@ fn run_embed(
 
     if let Some(ep) = endpoint {
         // ── External API path ────────────────────────────────────
-        let api_model = model.unwrap_or("text-embedding-3-small");
+        let api_model = external_embedding_model(model);
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
         if do_symbols {
@@ -14527,14 +14543,11 @@ fn run_embed(
         {
             let config = nestweaver_embed::EmbedConfig {
                 model_id: model_id.to_string(),
-                device_policy: match accelerator.unwrap_or(CliEmbeddingAccelerator::Auto) {
-                    CliEmbeddingAccelerator::Auto => nestweaver_embed::DevicePolicy::Auto,
-                    CliEmbeddingAccelerator::Metal => nestweaver_embed::DevicePolicy::Metal,
-                    CliEmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
-                },
                 ..Default::default()
             };
-            let embed_model = nestweaver_embed::EmbedModel::load(&config)
+            let policy =
+                cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
+            let embed_model = nestweaver_embed::EmbedModel::load_with_policy(&config, policy)
                 .context("failed to load local embedding model")?;
 
             if do_symbols {
@@ -14710,7 +14723,7 @@ fn run_embed(
     // given DB transparently uses whatever model it was embedded with.
     if let Some(dim) = store.embedding_index_dimension() {
         let effective_model = if endpoint.is_some() {
-            model.unwrap_or(model_id)
+            external_embedding_model(model)
         } else {
             model_id
         };
@@ -17974,9 +17987,37 @@ mod cli_bounds_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embed"))]
 mod embed_accelerator_cli_tests {
     use super::*;
+
+    #[test]
+    fn cli_accelerator_maps_each_policy() {
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Auto),
+            nestweaver_embed::DevicePolicy::Auto
+        );
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Metal),
+            nestweaver_embed::DevicePolicy::Metal
+        );
+        assert_eq!(
+            cli_embedding_device_policy(CliEmbeddingAccelerator::Cpu),
+            nestweaver_embed::DevicePolicy::Cpu
+        );
+    }
+
+    #[test]
+    fn external_metadata_uses_the_actual_default_api_model() {
+        assert_eq!(
+            external_embedding_model(None),
+            DEFAULT_EXTERNAL_EMBEDDING_MODEL
+        );
+        assert_eq!(
+            external_embedding_model(Some("configured-model")),
+            "configured-model"
+        );
+    }
 
     #[test]
     fn explicit_embed_accelerator_is_parsed_only_for_direct_local_embedding() {

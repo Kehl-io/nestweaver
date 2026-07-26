@@ -5990,6 +5990,94 @@ mod depth_clamp_tests {
     }
 }
 
+#[cfg(all(test, feature = "embed"))]
+mod embedding_load_config_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_accelerator_maps_each_policy() {
+        assert_eq!(
+            daemon_embedding_device_policy(nestweaver_engine::config::EmbeddingAccelerator::Auto),
+            nestweaver_embed::DevicePolicy::Auto
+        );
+        assert_eq!(
+            daemon_embedding_device_policy(nestweaver_engine::config::EmbeddingAccelerator::Metal),
+            nestweaver_embed::DevicePolicy::Metal
+        );
+        assert_eq!(
+            daemon_embedding_device_policy(nestweaver_engine::config::EmbeddingAccelerator::Cpu),
+            nestweaver_embed::DevicePolicy::Cpu
+        );
+    }
+
+    #[test]
+    fn stored_model_identity_targets_the_active_backend() {
+        let cache_dir = std::path::PathBuf::from("/tmp/nestweaver-embed-test");
+        let local = nestweaver_engine::config::EmbeddingConfig::default();
+        let local_config = embedding_load_config(&local, cache_dir.clone(), Some("stored-local"));
+        assert_eq!(local_config.model_id, "stored-local");
+        assert_eq!(local_config.external_model, None);
+
+        let external = nestweaver_engine::config::EmbeddingConfig {
+            external_endpoint: Some("http://127.0.0.1:11434/v1".to_string()),
+            external_model: Some("configured-external".to_string()),
+            ..Default::default()
+        };
+        let external_config = embedding_load_config(&external, cache_dir, Some("stored-external"));
+        assert_eq!(external_config.model_id, external.model_id);
+        assert_eq!(
+            external_config.external_model.as_deref(),
+            Some("stored-external")
+        );
+    }
+}
+
+#[cfg(feature = "embed")]
+fn daemon_embedding_device_policy(
+    accelerator: nestweaver_engine::config::EmbeddingAccelerator,
+) -> nestweaver_embed::DevicePolicy {
+    match accelerator {
+        nestweaver_engine::config::EmbeddingAccelerator::Auto => {
+            nestweaver_embed::DevicePolicy::Auto
+        }
+        nestweaver_engine::config::EmbeddingAccelerator::Metal => {
+            nestweaver_embed::DevicePolicy::Metal
+        }
+        nestweaver_engine::config::EmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
+    }
+}
+
+#[cfg(feature = "embed")]
+fn embedding_load_config(
+    cfg: &nestweaver_engine::config::EmbeddingConfig,
+    cache_dir: std::path::PathBuf,
+    stored_model_id: Option<&str>,
+) -> nestweaver_embed::EmbedConfig {
+    let stored_model_id = stored_model_id.filter(|model_id| !model_id.is_empty());
+    let (model_id, external_model) = if cfg.external_endpoint.is_some() {
+        (
+            cfg.model_id.clone(),
+            stored_model_id
+                .map(ToOwned::to_owned)
+                .or_else(|| cfg.external_model.clone()),
+        )
+    } else {
+        (
+            stored_model_id
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| cfg.model_id.clone()),
+            cfg.external_model.clone(),
+        )
+    };
+
+    nestweaver_embed::EmbedConfig {
+        model_id,
+        cache_dir,
+        external_endpoint: cfg.external_endpoint.clone(),
+        external_model,
+    }
+}
+
 /// Load the embedding model into `state.embed_model`. MUST be called on the daemon's main
 /// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
 /// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
@@ -6018,7 +6106,7 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
             );
         }
     }
-    let mut cfg = state
+    let cfg = state
         .instance_cfg
         .as_ref()
         .map(|c| c.embedding.clone())
@@ -6027,17 +6115,25 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     // model regardless of the compiled default or config — it must match the stored vectors,
     // or semantic search is disabled on a dimension mismatch. This lets the shipped default
     // stay light while a given instance uses whatever it was actually embedded with.
-    if let Ok(Some((stored_model_id, _))) = state.store.get_embedding_metadata()
-        && !stored_model_id.is_empty()
-    {
-        if stored_model_id != cfg.model_id {
+    let stored_model_id = state
+        .store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(model_id, _)| model_id);
+    if let Some(stored_model_id) = stored_model_id.as_deref() {
+        let configured_model = if cfg.external_endpoint.is_some() {
+            cfg.external_model.as_deref().unwrap_or_default()
+        } else {
+            &cfg.model_id
+        };
+        if stored_model_id != configured_model {
             tracing::info!(
                 stored = %stored_model_id,
-                configured = %cfg.model_id,
+                configured = %configured_model,
                 "Loading the embedding model recorded in the DB (matches stored embeddings)"
             );
         }
-        cfg.model_id = stored_model_id;
     }
     // Expand tilde in cache_dir using the home directory.
     let cache_dir = if cfg.cache_dir.starts_with("~/") {
@@ -6049,23 +6145,8 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     } else {
         std::path::PathBuf::from(&cfg.cache_dir)
     };
-    let config = nestweaver_embed::EmbedConfig {
-        model_id: cfg.model_id.clone(),
-        cache_dir,
-        external_endpoint: cfg.external_endpoint.clone(),
-        external_model: cfg.external_model.clone(),
-        device_policy: match cfg.accelerator {
-            nestweaver_engine::config::EmbeddingAccelerator::Auto => {
-                nestweaver_embed::DevicePolicy::Auto
-            }
-            nestweaver_engine::config::EmbeddingAccelerator::Metal => {
-                nestweaver_embed::DevicePolicy::Metal
-            }
-            nestweaver_engine::config::EmbeddingAccelerator::Cpu => {
-                nestweaver_embed::DevicePolicy::Cpu
-            }
-        },
-    };
+    let policy = daemon_embedding_device_policy(cfg.accelerator);
+    let config = embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
     // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't hang the
     // load. On a warm cache this is instant; only the local-model path downloads.
     //
@@ -6076,13 +6157,17 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     // timeout plus the shutdown `select!` around the caller; the orphaned thread only writes
     // into the HF cache dir and exits on its own when the transfer finishes or errors.
     let loaded = if config.external_endpoint.is_some() {
-        Some(nestweaver_embed::EmbedModel::load(&config))
+        Some(nestweaver_embed::EmbedModel::load_with_policy(
+            &config, policy,
+        ))
     } else {
         let model_id = config.model_id.clone();
         let prefetch =
             tokio::task::spawn_blocking(move || nestweaver_embed::local::prefetch_model(&model_id));
         match tokio::time::timeout(std::time::Duration::from_secs(180), prefetch).await {
-            Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load(&config)),
+            Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load_with_policy(
+                &config, policy,
+            )),
             _ => {
                 tracing::warn!(
                     "embedding model download timed out or failed — semantic search disabled \
@@ -6097,10 +6182,10 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
             tracing::info!(
                 backend = ?model.backend_kind(),
                 device = ?model.device_kind(),
-                dim = ?model.dimension(),
+                dim = ?model.known_dimension(),
                 "Embedding model loaded"
             );
-            if let Some(model_dimension) = model.dimension()
+            if let Some(model_dimension) = model.known_dimension()
                 && let Some(stored_dim) = state.store.embedding_index_dimension()
                 && stored_dim != model_dimension
             {
