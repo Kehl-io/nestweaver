@@ -1828,6 +1828,52 @@ mod tests {
     }
 
     #[test]
+    fn exact_batch_lookup_rejects_a_missing_uid() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:exact-present",
+                "present_fn",
+                "repo-1",
+                "a.rs",
+            ))
+            .unwrap();
+
+        let error = store
+            .batch_lookup_symbols_exact(&["sym:exact-present", "sym:exact-ghost"])
+            .expect_err("an exact lookup must not silently omit a requested symbol");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing symbol UID sym:exact-ghost"),
+            "the error must identify the missing primary key, got: {error}"
+        );
+    }
+
+    #[test]
+    fn exact_batch_lookup_rejects_duplicate_requested_uids() {
+        let store = test_store();
+        store
+            .insert_symbol(&make_symbol(
+                "sym:exact-duplicate",
+                "duplicate_fn",
+                "repo-1",
+                "a.rs",
+            ))
+            .unwrap();
+
+        let error = store
+            .batch_lookup_symbols_exact(&["sym:exact-duplicate", "sym:exact-duplicate"])
+            .expect_err("an exact lookup must reject duplicate requested primary keys");
+
+        assert!(
+            error.to_string().contains("duplicate requested UID"),
+            "the error must identify the duplicate request, got: {error}"
+        );
+    }
+
+    #[test]
     fn batch_lookup_symbols_empty_input_returns_empty_map() {
         let store = test_store();
         let map = store.batch_lookup_symbols(&[]).unwrap();

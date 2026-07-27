@@ -432,21 +432,22 @@ impl GraphStore {
     ///
     /// Strict scans of the impact edge tables supply the distinct endpoint
     /// primary keys. Every participating symbol is then re-read through an
-    /// individual primary-key point lookup before any of its display fields
-    /// can enter the snapshot. This intentionally avoids the engine's
-    /// `UNWIND`/filtered-scan path: a prior optimization could align a valid
-    /// edge with the wrong scanned symbol row. Any edge-table query failure,
-    /// missing point lookup, duplicate key, dangling symbol edge, or non-
-    /// finite/out-of-range confidence fails the entire build rather than
-    /// producing a deceptively incomplete impact graph. Symbols with no impact
-    /// edges are omitted because they cannot appear in an impact result.
+    /// exact `UNWIND`-driven batch of primary-key probes before any display
+    /// fields can enter the snapshot. This intentionally avoids a filtered
+    /// `Symbol` scan: a prior optimization could align a valid edge with the
+    /// wrong scanned symbol row. The expected key set is reconciled against
+    /// every result row. Any edge-table query failure, missing or unexpected
+    /// symbol, duplicate key, dangling symbol edge, or non-finite/out-of-range
+    /// confidence fails the entire build rather than producing a deceptively
+    /// incomplete impact graph. Symbols with no impact edges are omitted
+    /// because they cannot appear in an impact result.
     ///
     /// # Performance
     ///
-    /// This correctness-first candidate performs one primary-key lookup per
-    /// distinct impact-edge endpoint and can be expensive on large graphs. It
-    /// must remain off hot paths until a safe bulk loader passes the real-graph
-    /// golden-output and latency gates.
+    /// Snapshot construction still scales with the full impact-edge endpoint
+    /// set and can be expensive on large graphs. It must remain off hot paths
+    /// until a generation-keyed cache passes the real-graph golden-output and
+    /// latency gates.
     pub fn load_impact_snapshot(&self) -> Result<ImpactSnapshot, StoreError> {
         let conn = self.conn()?;
         let mut snapshot_edges = Vec::new();
@@ -494,55 +495,17 @@ impl GraphStore {
             }
         }
 
-        let point_query = format!(
-            "MATCH (s:Symbol {{uid: $uid}}) RETURN {}",
-            crate::read::SYMBOL_COLUMNS
-        );
-        let mut point_stmt = conn.prepare(&point_query).map_err(|error| {
-            StoreError::Query(format!(
-                "impact snapshot failed to prepare primary-key lookup: {error}"
-            ))
-        })?;
         let mut required_uids: Vec<String> = required_uids.into_iter().collect();
         required_uids.sort();
-        let mut symbols_by_uid = HashMap::with_capacity(required_uids.len());
-        for uid in required_uids {
-            let trusted = {
-                let mut rows = conn
-                    .execute(
-                        &mut point_stmt,
-                        vec![("uid", lbug::Value::String(uid.clone()))],
-                    )
-                    .map_err(|error| {
-                        StoreError::Query(format!(
-                            "impact snapshot primary-key lookup failed for {uid}: {error}"
-                        ))
-                    })?;
-                let row = rows.next().ok_or_else(|| {
-                    StoreError::Query(format!(
-                        "impact snapshot primary-key lookup returned no row for {uid}"
-                    ))
-                })?;
-                let trusted = crate::read::row_to_symbol(&row)?;
-                if rows.next().is_some() {
-                    return Err(StoreError::Query(format!(
-                        "impact snapshot primary-key lookup returned duplicate rows for {uid}"
-                    )));
-                }
-                trusted
-            };
-            if trusted.uid != uid {
-                return Err(StoreError::Query(format!(
-                    "impact snapshot primary-key mismatch: requested {uid}, received {}",
-                    trusted.uid
-                )));
-            }
-            if symbols_by_uid.insert(uid.clone(), trusted).is_some() {
-                return Err(StoreError::Query(format!(
-                    "impact snapshot duplicate symbol primary key: {uid}"
-                )));
-            }
-        }
+        let required_uid_refs: Vec<&str> = required_uids.iter().map(String::as_str).collect();
+        drop(conn);
+        let symbols_by_uid = self
+            .batch_lookup_symbols_exact(&required_uid_refs)
+            .map_err(|error| {
+                StoreError::Query(format!(
+                    "impact snapshot exact bulk symbol lookup failed: {error}"
+                ))
+            })?;
 
         let mut callers_by_target: HashMap<String, HashMap<String, Vec<SnapshotCaller>>> =
             HashMap::new();
@@ -2492,6 +2455,48 @@ mod tests {
             as_bytes(&from_snapshot),
             as_bytes(&live),
             "the snapshot traversal must be byte-equivalent before it can replace the live path"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_bulk_loads_thousands_of_endpoints_within_two_seconds() {
+        use std::time::{Duration, Instant};
+
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        const SYMBOL_COUNT: usize = 2_048;
+
+        let store = GraphStore::in_memory().unwrap();
+        let symbols: Vec<_> = (0..SYMBOL_COUNT)
+            .map(|index| {
+                let uid = format!("bulk-endpoint-{index:04}");
+                make_symbol(&uid, &uid)
+            })
+            .collect();
+        store.batch_insert_symbols(&symbols).unwrap();
+
+        let edges: Vec<_> = symbols
+            .windows(2)
+            .map(|pair| ResolvedEdge {
+                source_uid: pair[0].uid.clone(),
+                target_uid: pair[1].uid.clone(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.95,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .collect();
+        store.batch_insert_edges(&edges).unwrap();
+
+        let started = Instant::now();
+        let snapshot = store.load_impact_snapshot().unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(snapshot.symbols_by_uid.len(), SYMBOL_COUNT);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "loading {SYMBOL_COUNT} endpoint symbols took {elapsed:?}; \
+             the snapshot must not issue one query per UID"
         );
     }
 

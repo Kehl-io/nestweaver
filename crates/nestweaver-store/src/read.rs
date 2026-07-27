@@ -380,16 +380,49 @@ impl GraphStore {
 
     /// Fetch multiple symbols in a single query, keyed by UID.
     ///
-    /// Builds one `WHERE s.uid IN [...]` query instead of N individual lookups.
+    /// Drives primary-key probes through one `UNWIND` query instead of N
+    /// individual lookups.
     /// UIDs not found in the graph are simply absent from the returned map.
     /// Returns an empty map when `uids` is empty.
     pub fn batch_lookup_symbols(
         &self,
         uids: &[&str],
     ) -> Result<std::collections::HashMap<String, Symbol>, StoreError> {
+        self.batch_lookup_symbols_impl(uids, false)
+    }
+
+    /// Exact variant for trust-sensitive snapshots.
+    ///
+    /// In addition to using primary-key probes, this rejects duplicate
+    /// requests, missing rows, unexpected rows, and duplicate result rows.
+    pub(crate) fn batch_lookup_symbols_exact(
+        &self,
+        uids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Symbol>, StoreError> {
+        self.batch_lookup_symbols_impl(uids, true)
+    }
+
+    fn batch_lookup_symbols_impl(
+        &self,
+        uids: &[&str],
+        require_exact: bool,
+    ) -> Result<std::collections::HashMap<String, Symbol>, StoreError> {
         if uids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        let expected = if require_exact {
+            let mut expected = std::collections::HashSet::with_capacity(uids.len());
+            for uid in uids {
+                if !expected.insert(*uid) {
+                    return Err(StoreError::Query(format!(
+                        "batch_lookup_symbols_exact: duplicate requested UID {uid}"
+                    )));
+                }
+            }
+            Some(expected)
+        } else {
+            None
+        };
         let conn = self.conn()?;
         // Drive PRIMARY-KEY point lookups via UNWIND rather than a
         // `WHERE s.uid IN [...]` scan-with-filter. Two reasons:
@@ -398,9 +431,8 @@ impl GraphStore {
         //      delete+checkpoint cycles (re-indexing), while primary-key point
         //      lookups return correct values for the same rows. Driving the
         //      lookup through the PK index is what keeps names/paths intact.
-        //   2. Speed: N index probes instead of a filtered scan, and one
-        //      parameterized statement instead of a fresh query string (which
-        //      would force a re-plan) per distinct key set.
+        //   2. Speed: N index probes inside one query plan instead of a
+        //      filtered scan or a separately planned query per UID.
         let in_list: String = uids
             .iter()
             .map(|u| format!("'{}'", u.replace('\'', "''")))
@@ -414,10 +446,32 @@ impl GraphStore {
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(format!("batch_lookup_symbols: {e}")))?;
-        let mut map = std::collections::HashMap::new();
+        let mut map = std::collections::HashMap::with_capacity(uids.len());
         for row in result {
             let sym = row_to_symbol(&row)?;
-            map.insert(sym.uid.clone(), sym);
+            if let Some(expected) = &expected
+                && !expected.contains(sym.uid.as_str())
+            {
+                return Err(StoreError::Query(format!(
+                    "batch_lookup_symbols_exact: unexpected symbol UID {}",
+                    sym.uid
+                )));
+            }
+            let uid = sym.uid.clone();
+            if map.insert(uid.clone(), sym).is_some() && require_exact {
+                return Err(StoreError::Query(format!(
+                    "batch_lookup_symbols_exact: duplicate result row for {uid}"
+                )));
+            }
+        }
+        if expected.is_some() {
+            for uid in uids {
+                if !map.contains_key(*uid) {
+                    return Err(StoreError::Query(format!(
+                        "batch_lookup_symbols_exact: missing symbol UID {uid}"
+                    )));
+                }
+            }
         }
         Ok(map)
     }
