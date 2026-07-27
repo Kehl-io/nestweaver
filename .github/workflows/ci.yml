@@ -325,8 +325,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -385,8 +384,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -433,8 +431,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -497,8 +494,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -581,8 +577,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Install frontend dependencies
         working-directory: crates/nestweaver-web/frontend
         run: npm ci

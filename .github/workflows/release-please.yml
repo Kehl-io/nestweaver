@@ -124,8 +124,8 @@ jobs:
       - name: Configure linker (Linux)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml << 'EOF'
+          cat >> .cargo/config.toml << 'EOF'
+
           [target.x86_64-unknown-linux-gnu]
           rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]
 

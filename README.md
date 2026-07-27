@@ -197,6 +197,13 @@ support select CPU for `auto`.
 cargo install --locked --path .
 ```
 
+Source builds also require CMake, a C++20 compiler, OpenSSL and zstd
+development files, `pkg-config`, and Protocol Buffers. The checkout currently
+compiles an immutable LadybugDB source pin to include the filtered multi-segment
+string-scan correction; keep `.cargo/config.toml` intact. See
+[the source-build prerequisites and pin provenance](INSTALL.md#build-from-source)
+before building.
+
 <details>
 <summary>Pre-built binaries</summary>
 
@@ -214,6 +221,10 @@ cargo install --locked --path .
 # On macOS with Metal embeddings:
 # cargo install --locked --path . --features metal
 ```
+
+The first build compiles the pinned LadybugDB source and may take several
+minutes. If you need the filtered-scan correction before a NestWeaver release
+containing it is available, use this source-build path.
 
 </details>
 

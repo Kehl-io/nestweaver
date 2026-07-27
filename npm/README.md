@@ -6,7 +6,9 @@ channel.
 
 Install NestWeaver from a verified
 [GitHub Release archive](../INSTALL.md#pre-built-cli-recommended), including
-its matching SHA-256 file, or build from a source checkout with Rust 1.85+:
+its matching SHA-256 file, or build from a source checkout with Rust 1.85+ and
+the native prerequisites listed in
+[INSTALL.md](../INSTALL.md#build-from-source):
 
 ```sh
 git clone https://github.com/Kehl-io/nestweaver.git
