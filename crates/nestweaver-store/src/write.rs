@@ -2326,26 +2326,48 @@ impl GraphStore {
     pub fn delete_note_cascade(&self, note_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
 
-        // 1. Drop every Section under this note. DETACH removes the
+        // 1. Drop every Section whose ownership property references this
+        //    note, including fragments whose NOTE_HAS_SECTION edge is missing.
+        //    DETACH removes the
         //    NOTE_HAS_SECTION, HEADING_HAS_SECTION, WIKILINK_TO_NOTE
         //    (incoming) and SECTION_TAGGED_WITH edges along with it.
+        exec_params(
+            &conn,
+            "MATCH (s:Section) WHERE s.note_uid = $uid DETACH DELETE s",
+            vec![("uid", lbug::Value::String(note_uid.to_string()))],
+        )?;
+
+        // 2. Drop Sections whose ownership edge references this note. This
+        //    independent pass also handles a missing or corrupt note_uid
+        //    property.
         exec_params(
             &conn,
             "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_SECTION]->(s:Section) DETACH DELETE s",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
 
-        // 2. Drop every Heading under this note. DETACH removes
+        // 3. Drop every Heading whose ownership property references this
+        //    note, including fragments whose NOTE_HAS_HEADING edge is missing.
+        //    DETACH removes
         //    NOTE_HAS_HEADING, HEADING_HAS_SECTION (already gone if its
         //    section was dropped above), HEADING_PARENT (both directions),
         //    and WIKILINK_TO_HEADING (incoming).
+        exec_params(
+            &conn,
+            "MATCH (h:Heading) WHERE h.note_uid = $uid DETACH DELETE h",
+            vec![("uid", lbug::Value::String(note_uid.to_string()))],
+        )?;
+
+        // 4. Drop Headings whose ownership edge references this note. This
+        //    independent pass also handles a missing or corrupt note_uid
+        //    property.
         exec_params(
             &conn,
             "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
 
-        // 3. Drop the Note itself. DETACH removes VAULT_HAS_NOTE,
+        // 5. Drop the Note itself. DETACH removes VAULT_HAS_NOTE,
         //    NOTE_TAGGED_WITH, PROJECT_INCLUDES_NOTE, and any incoming
         //    WIKILINK_TO_NOTE edges from other notes' sections.
         exec_params(
@@ -2354,7 +2376,7 @@ impl GraphStore {
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
 
-        // 4. Drop any recorded unresolved-wikilink rows for this note so they
+        // 6. Drop any recorded unresolved-wikilink rows for this note so they
         //    do not linger after re-index (e.g. once the target note appears).
         self.delete_unresolved_wikilinks_for_note(note_uid)?;
 
@@ -2367,8 +2389,8 @@ impl GraphStore {
     ///
     /// Order of operations (within a single transaction):
     ///   1. Count notes (before deleting, so we can return the count).
-    ///   2. Delete Sections via edge traversal (NOTE_HAS_SECTION).
-    ///   3. Delete Headings via edge traversal (NOTE_HAS_HEADING).
+    ///   2. Delete Sections by note_uid property and NOTE_HAS_SECTION edge.
+    ///   3. Delete Headings by note_uid property and NOTE_HAS_HEADING edge.
     ///   4. Delete UnresolvedWikilinks via cross-node join on source_note_uid.
     ///   5. Delete all Note nodes (vault_uid property; DETACH removes
     ///      VAULT_HAS_NOTE, NOTE_TAGGED_WITH, PROJECT_INCLUDES_NOTE, and
@@ -2733,21 +2755,47 @@ impl GraphStore {
             ));
         }
 
-        // 1. Delete all Sections under notes in this vault.
+        // 1. Delete all Sections whose ownership property references notes in
+        //    this vault, including fragments whose NOTE_HAS_SECTION edge is
+        //    missing.
+        exec_params(
+            conn,
+            "MATCH (n:Note), (s:Section) \
+             WHERE n.vault_uid = $vid AND s.note_uid = n.uid \
+             DETACH DELETE s",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        // 2. Delete Sections whose ownership edge references notes in this
+        //    vault. This independent pass also handles a missing or corrupt
+        //    note_uid property.
         exec_params(
             conn,
             "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_SECTION]->(s:Section) DETACH DELETE s",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
-        // 2. Delete all Headings under notes in this vault.
+        // 3. Delete all Headings whose ownership property references notes in
+        //    this vault, including fragments whose NOTE_HAS_HEADING edge is
+        //    missing.
+        exec_params(
+            conn,
+            "MATCH (n:Note), (h:Heading) \
+             WHERE n.vault_uid = $vid AND h.note_uid = n.uid \
+             DETACH DELETE h",
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        )?;
+
+        // 4. Delete Headings whose ownership edge references notes in this
+        //    vault. This independent pass also handles a missing or corrupt
+        //    note_uid property.
         exec_params(
             conn,
             "MATCH (n:Note {vault_uid: $vid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
-        // 3. Delete UnresolvedWikilinks whose source note belongs to this vault.
+        // 5. Delete UnresolvedWikilinks whose source note belongs to this vault.
         //    Uses a cross-node join: LadybugDB supports `MATCH (a), (b) WHERE a.prop = b.prop`.
         //    Best-effort: silently skip if the table does not exist on older DBs.
         {
@@ -2771,7 +2819,7 @@ impl GraphStore {
             }
         }
 
-        // 4. Delete all Note nodes (DETACH removes VAULT_HAS_NOTE, NOTE_TAGGED_WITH,
+        // 6. Delete all Note nodes (DETACH removes VAULT_HAS_NOTE, NOTE_TAGGED_WITH,
         //    PROJECT_INCLUDES_NOTE, and any incoming/outgoing wikilink edges).
         exec_params(
             conn,
@@ -2779,14 +2827,14 @@ impl GraphStore {
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
-        // 5. Delete Tag nodes belonging to this vault.
+        // 7. Delete Tag nodes belonging to this vault.
         exec_params(
             conn,
             "MATCH (t:Tag {vault_uid: $vid}) DETACH DELETE t",
             vec![("vid", lbug::Value::String(vault_uid.to_string()))],
         )?;
 
-        // 6. Delete the Vault node itself.
+        // 8. Delete the Vault node itself.
         exec_params(
             conn,
             "MATCH (v:Vault {uid: $vid}) DETACH DELETE v",
