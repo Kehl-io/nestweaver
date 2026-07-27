@@ -250,6 +250,14 @@ pub struct GraphStore {
     /// Avoids full-table scans on every seed-resolution call for brain_context,
     /// flow_trace, blast_radius, etc.
     pub(crate) symbol_name_cache: Mutex<Option<Arc<crate::traverse::SymbolNameCached>>>,
+    /// Reverse-adjacency snapshot used by impact traversals. The generation
+    /// travels with the snapshot so a graph publication can never reuse stale
+    /// adjacency, even when the old allocation has not yet been reclaimed.
+    pub(crate) impact_snapshot_cache: Mutex<Option<(u64, Arc<crate::traverse::ImpactSnapshot>)>>,
+    /// Single-flights the expensive first snapshot construction for each graph
+    /// generation. Waiters re-check the generation-keyed cache after acquiring
+    /// this lock instead of issuing duplicate full edge-table scans.
+    pub(crate) impact_snapshot_compute_lock: Mutex<()>,
     /// In-memory embedding index backed by a JSON sidecar file
     /// (`<db>.embeddings`). Embeddings are stored here instead of in
     /// LadybugDB (which has no float-array column type). Loaded on open,
@@ -382,6 +390,8 @@ impl GraphStore {
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
+            impact_snapshot_cache: Mutex::new(None),
+            impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
@@ -411,6 +421,8 @@ impl GraphStore {
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
+            impact_snapshot_cache: Mutex::new(None),
+            impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
@@ -439,6 +451,8 @@ impl GraphStore {
             db_path: Some(path.to_path_buf()),
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
+            impact_snapshot_cache: Mutex::new(None),
+            impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(Self::load_embedding_index(path)),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
@@ -492,6 +506,8 @@ impl GraphStore {
             db_path: None,
             ppr_graph_cache: Mutex::new(None),
             symbol_name_cache: Mutex::new(None),
+            impact_snapshot_cache: Mutex::new(None),
+            impact_snapshot_compute_lock: Mutex::new(()),
             embedding_index: Mutex::new(crate::search::EmbeddingIndex::new()),
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
@@ -550,6 +566,10 @@ impl GraphStore {
             .clear();
         *self
             .symbol_name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .impact_snapshot_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
