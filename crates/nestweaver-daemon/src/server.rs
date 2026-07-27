@@ -972,7 +972,11 @@ impl DaemonService {
 
             // Symbols
             if let Ok(symbols) = store.list_all_symbols() {
-                for sym in symbols.iter().filter(|s| s.embedding.is_none()).take(limit) {
+                for sym in symbols
+                    .iter()
+                    .filter(|s| !store.has_embedding(&s.uid))
+                    .take(limit)
+                {
                     let text = nestweaver_embed::preprocess::symbol_embed_text(
                         &sym.kind.to_string(),
                         &sym.name,
@@ -1006,7 +1010,7 @@ impl DaemonService {
             {
                 for note in notes
                     .iter()
-                    .filter(|n| n.embedding.is_none())
+                    .filter(|n| !store.has_embedding(&n.uid))
                     .take(remaining)
                 {
                     let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
@@ -1032,7 +1036,7 @@ impl DaemonService {
             {
                 for heading in headings
                     .iter()
-                    .filter(|h| h.embedding.is_none())
+                    .filter(|h| !store.has_embedding(&h.uid))
                     .take(remaining)
                 {
                     let text = nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
@@ -5393,7 +5397,10 @@ impl NestWeaverDaemon for DaemonService {
                     let to_embed: Vec<_> = if force {
                         symbols.iter().collect()
                     } else {
-                        symbols.iter().filter(|s| s.embedding.is_none()).collect()
+                        symbols
+                            .iter()
+                            .filter(|s| !store.has_embedding(&s.uid))
+                            .collect()
                     };
                     for chunk in to_embed.chunks(batch_size) {
                         for sym in chunk {
@@ -5423,7 +5430,10 @@ impl NestWeaverDaemon for DaemonService {
                     let to_embed: Vec<_> = if force {
                         notes.iter().collect()
                     } else {
-                        notes.iter().filter(|n| n.embedding.is_none()).collect()
+                        notes
+                            .iter()
+                            .filter(|n| !store.has_embedding(&n.uid))
+                            .collect()
                     };
                     for chunk in to_embed.chunks(batch_size) {
                         for note in chunk {
@@ -5450,7 +5460,10 @@ impl NestWeaverDaemon for DaemonService {
                     let to_embed: Vec<_> = if force {
                         headings.iter().collect()
                     } else {
-                        headings.iter().filter(|h| h.embedding.is_none()).collect()
+                        headings
+                            .iter()
+                            .filter(|h| !store.has_embedding(&h.uid))
+                            .collect()
                     };
                     for chunk in to_embed.chunks(batch_size) {
                         for heading in chunk {
@@ -12943,6 +12956,47 @@ mod startup_helper_tests {
             .unwrap();
     }
 
+    #[cfg(feature = "embed")]
+    fn insert_unembedded_nodes_for_every_scope(store: &GraphStore, suffix: &str) -> [String; 3] {
+        use nestweaver_schema::{Heading, Note, NoteKind};
+
+        let symbol_uid = format!("sym-{suffix}");
+        let note_uid = format!("note-{suffix}");
+        let heading_uid = format!("heading-{suffix}");
+        insert_unembedded_symbol(store, &symbol_uid);
+        store
+            .insert_note(&Note {
+                uid: note_uid.clone(),
+                vault_uid: "vault-1".to_string(),
+                file_path: format!("notes/{suffix}.md"),
+                title: suffix.to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: format!("note-hash-{suffix}"),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: heading_uid.clone(),
+                note_uid: note_uid.clone(),
+                level: 1,
+                text: suffix.to_string(),
+                slug: suffix.to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: format!("heading-hash-{suffix}"),
+                embedding: None,
+            })
+            .unwrap();
+
+        [symbol_uid, note_uid, heading_uid]
+    }
+
     /// Invoke the callback on a blocking thread — it uses
     /// the callback is synchronous (mirrors how the watcher thread calls it).
     #[cfg(feature = "embed")]
@@ -12950,6 +13004,43 @@ mod startup_helper_tests {
         tokio::task::spawn_blocking(move || (cb.lock().unwrap())())
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_embed_skips_sidecar_embeddings_for_every_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&dir.path().join("brain.lbug")).unwrap());
+        let uids = insert_unembedded_nodes_for_every_scope(&store, "watcher-incremental");
+        for uid in &uids {
+            assert!(
+                store.add_embedding(uid, vec![0.1, 0.2, 0.3]),
+                "fixture embedding should be accepted for {uid}"
+            );
+            assert!(store.has_embedding(uid));
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let probe = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1_f32, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let callback = Arc::new(std::sync::Mutex::new(
+            DaemonService::make_embed_on_change_with(
+                ready_test_embedding_runtime(probe),
+                store,
+                std::time::Duration::ZERO,
+            )
+            .expect("embed callback should be present when a model is loaded"),
+        ));
+
+        run_embed_cb(callback).await;
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "watcher embedding must consult the sidecar index, not graph-row fields"
+        );
     }
 
     /// Regression (re-embedding stalls the watcher, #perf): back-to-back
@@ -13291,6 +13382,47 @@ mod startup_helper_tests {
             error.message().contains(&expected_state)
                 || error.message().contains("without the `embed` feature"),
             "error should identify the structured readiness failure: {error}"
+        );
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_embed_rpc_skips_sidecar_embeddings_for_every_scope() {
+        let mut state = test_state_with_writer();
+        let uids = insert_unembedded_nodes_for_every_scope(&state.store, "rpc-incremental");
+        for uid in &uids {
+            assert!(
+                state.store.add_embedding(uid, vec![0.1, 0.2, 0.3]),
+                "fixture embedding should be accepted for {uid}"
+            );
+            assert!(state.store.has_embedding(uid));
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let model = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        Arc::get_mut(&mut state)
+            .expect("test owns the only state Arc")
+            .embedding_runtime = ready_test_embedding_runtime(model);
+        let service = DaemonService::new(state);
+
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 1,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let response = service.embed(request).await.unwrap().into_inner();
+
+        assert_eq!(response.succeeded, 0);
+        assert_eq!(response.failed, 0);
+        assert_eq!(response.rejected, 0);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "incremental embedding must consult the sidecar index, not graph-row fields"
         );
     }
 
