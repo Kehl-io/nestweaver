@@ -187,6 +187,137 @@ struct CallerRow {
     confidence: f32,
 }
 
+#[derive(Debug, Clone)]
+struct SnapshotCaller {
+    uid: String,
+    confidence: f64,
+}
+
+/// An immutable reverse-adjacency view of the symbol graph.
+///
+/// This is an equivalence candidate for impact traversal, not the default
+/// implementation. Building it fails closed if a scan cannot be reconciled
+/// with primary-key symbol lookups or if an edge has invalid confidence. The
+/// live database traversal remains selected until real-graph golden coverage
+/// proves this path byte-equivalent at scale.
+#[derive(Debug, Clone)]
+pub struct ImpactSnapshot {
+    symbols_by_uid: HashMap<String, nestweaver_schema::Symbol>,
+    callers_by_target: HashMap<String, HashMap<String, Vec<SnapshotCaller>>>,
+}
+
+struct ImpactEdgePlan<'a> {
+    structural: &'a [EdgeType],
+    combined: Vec<EdgeType>,
+    data_active: bool,
+    data_max_depth: u32,
+}
+
+impl<'a> ImpactEdgePlan<'a> {
+    fn new(structural: &'a [EdgeType], data: &[EdgeType], data_max_depth: u32) -> Self {
+        let data_active = data_max_depth > 0 && !data.is_empty();
+        let combined = if data_active {
+            structural
+                .iter()
+                .copied()
+                .chain(data.iter().copied())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            structural,
+            combined,
+            data_active,
+            data_max_depth,
+        }
+    }
+
+    fn prepare_set(&self) -> &[EdgeType] {
+        if self.data_active {
+            &self.combined
+        } else {
+            self.structural
+        }
+    }
+
+    fn edges_at_depth(&self, depth: u32) -> &[EdgeType] {
+        if self.data_active && depth < self.data_max_depth {
+            &self.combined
+        } else {
+            self.structural
+        }
+    }
+
+    fn result_edge_types(&self) -> Vec<EdgeType> {
+        if self.data_active {
+            self.combined.clone()
+        } else {
+            self.structural.to_vec()
+        }
+    }
+}
+
+impl ImpactSnapshot {
+    /// Traverse this snapshot with the same structural and shallow data-edge
+    /// policy as [`GraphStore::impact_with_data_edges`].
+    pub fn impact_with_data_edges(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        data_max_depth: u32,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        let plan = ImpactEdgePlan::new(IMPACT_EDGE_TYPES, IMPACT_DATA_EDGE_TYPES, data_max_depth);
+        run_impact_walk(
+            target_uid,
+            max_depth,
+            min_confidence,
+            &plan,
+            DEFAULT_IMPACT_THRESHOLD,
+            None,
+            cancel,
+            |uid, min_confidence, edges| self.direct_callers(uid, min_confidence, edges),
+        )
+    }
+
+    fn direct_callers(&self, uid: &str, min_confidence: f32, edges: &[EdgeType]) -> Vec<CallerRow> {
+        let Some(by_edge) = self.callers_by_target.get(uid) else {
+            return Vec::new();
+        };
+        let min_confidence = min_confidence as f64;
+        let mut callers = Vec::new();
+        // Preserve the requested edge-type order used by the live prepared
+        // statements. Equal-score paths therefore keep the same first winner.
+        for edge in edges {
+            let edge_label = edge.rel_table_name();
+            let Some(rows) = by_edge.get(edge_label) else {
+                continue;
+            };
+            callers.extend(
+                rows.iter()
+                    .filter(|row| row.confidence >= min_confidence)
+                    .map(|row| {
+                        let symbol = self
+                            .symbols_by_uid
+                            .get(&row.uid)
+                            .expect("impact snapshot adjacency must reference a validated symbol");
+                        CallerRow {
+                            uid: row.uid.clone(),
+                            name: symbol.name.clone(),
+                            file_path: symbol.file_path.clone(),
+                            start_line: symbol.start_line,
+                            edge_type: edge_label.to_string(),
+                            confidence: row.confidence as f32,
+                        }
+                    }),
+            );
+        }
+        callers
+    }
+}
+
 /// Structural reverse-impact edge set. The confidence-weighted reverse BFS
 /// (`impact_bfs`) and any in-memory equivalent (e.g. `affected_tests`) must use
 /// exactly this set, so it is public to keep the two implementations from
@@ -205,7 +336,244 @@ pub const IMPACT_EDGE_TYPES: &[EdgeType] = &[
 /// depth because they fan out heavily.
 pub const IMPACT_DATA_EDGE_TYPES: &[EdgeType] = &[EdgeType::Uses, EdgeType::Accesses];
 
+#[allow(clippy::too_many_arguments)]
+fn run_impact_walk(
+    target_uid: &str,
+    max_depth: u32,
+    min_confidence: f32,
+    plan: &ImpactEdgePlan<'_>,
+    min_score: f64,
+    allowed_symbols: Option<&HashSet<String>>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    mut direct_callers: impl FnMut(&str, f32, &[EdgeType]) -> Vec<CallerRow>,
+) -> Result<ImpactResult, StoreError> {
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    scores.insert(target_uid.to_string(), 1.0);
+
+    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+    queue.push_back((target_uid.to_string(), 0));
+
+    let mut result_map: HashMap<String, ImpactNode> = HashMap::new();
+    let mut truncated_by_threshold = false;
+    let mut truncated_by_depth = false;
+
+    while let Some((current_uid, depth)) = queue.pop_front() {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            // The shared cancel flag is a bare bool and cannot carry a reason,
+            // so the leaf always reports Timeout (see CancelReason).
+            return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
+        }
+        if depth >= max_depth {
+            // A frontier node reached the depth boundary unexpanded; deeper
+            // dependents may exist beyond the returned set.
+            truncated_by_depth = true;
+            continue;
+        }
+
+        let parent_score = scores.get(&current_uid).copied().unwrap_or(0.0);
+        let callers = direct_callers(&current_uid, min_confidence, plan.edges_at_depth(depth));
+        for row in callers {
+            if row.uid == target_uid {
+                continue;
+            }
+            if allowed_symbols.is_some_and(|allowed| !allowed.contains(&row.uid)) {
+                continue;
+            }
+
+            let candidate_score = parent_score * row.confidence as f64;
+            if candidate_score < min_score {
+                truncated_by_threshold = true;
+                continue;
+            }
+
+            let prev_score = scores.get(&row.uid).copied().unwrap_or(0.0);
+            if candidate_score > prev_score {
+                scores.insert(row.uid.clone(), candidate_score);
+                result_map.insert(
+                    row.uid.clone(),
+                    ImpactNode {
+                        uid: row.uid.clone(),
+                        name: row.name,
+                        file_path: row.file_path,
+                        start_line: row.start_line,
+                        edge_type: row.edge_type,
+                        confidence: row.confidence,
+                        depth: depth + 1,
+                        impact_score: candidate_score,
+                    },
+                );
+                // Re-enqueue so downstream nodes can inherit an improved
+                // max-product score.
+                queue.push_back((row.uid, depth + 1));
+            }
+        }
+    }
+
+    let mut nodes: Vec<ImpactNode> = result_map.into_values().collect();
+    nodes.sort_by(|left, right| {
+        right
+            .impact_score
+            .partial_cmp(&left.impact_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.uid.cmp(&right.uid))
+    });
+
+    Ok(ImpactResult {
+        nodes,
+        truncated_by_threshold,
+        truncated_by_depth,
+        edge_types: plan.result_edge_types(),
+    })
+}
+
 impl GraphStore {
+    /// Build a corruption-checked reverse-adjacency snapshot without selecting
+    /// it as the default impact implementation.
+    ///
+    /// Strict scans of the impact edge tables supply the distinct endpoint
+    /// primary keys. Every participating symbol is then re-read through an
+    /// individual primary-key point lookup before any of its display fields
+    /// can enter the snapshot. This intentionally avoids the engine's
+    /// `UNWIND`/filtered-scan path: a prior optimization could align a valid
+    /// edge with the wrong scanned symbol row. Any edge-table query failure,
+    /// missing point lookup, duplicate key, dangling symbol edge, or non-
+    /// finite/out-of-range confidence fails the entire build rather than
+    /// producing a deceptively incomplete impact graph. Symbols with no impact
+    /// edges are omitted because they cannot appear in an impact result.
+    ///
+    /// # Performance
+    ///
+    /// This correctness-first candidate performs one primary-key lookup per
+    /// distinct impact-edge endpoint and can be expensive on large graphs. It
+    /// must remain off hot paths until a safe bulk loader passes the real-graph
+    /// golden-output and latency gates.
+    pub fn load_impact_snapshot(&self) -> Result<ImpactSnapshot, StoreError> {
+        let conn = self.conn()?;
+        let mut snapshot_edges = Vec::new();
+        let mut required_uids = HashSet::new();
+        for edge_type in IMPACT_EDGE_TYPES.iter().chain(IMPACT_DATA_EDGE_TYPES) {
+            let edge_label = edge_type.rel_table_name();
+            let query = format!(
+                "MATCH (source:Symbol)-[edge:{edge_label}]->(target:Symbol) \
+                 RETURN source.uid, target.uid, edge.confidence"
+            );
+            let rows = conn.query(&query).map_err(|error| {
+                StoreError::Query(format!(
+                    "impact snapshot failed to load {edge_label} edges: {error}"
+                ))
+            })?;
+            for row in rows {
+                let source_uid = crate::read::extract_string(&row, 0)?;
+                let target_uid = crate::read::extract_string(&row, 1)?;
+                let confidence = match row.get(2) {
+                    Some(lbug::Value::Double(value)) => *value,
+                    Some(lbug::Value::Float(value)) => *value as f64,
+                    Some(lbug::Value::Int64(value)) => *value as f64,
+                    Some(lbug::Value::Null(_)) | None => {
+                        return Err(StoreError::Query(format!(
+                            "impact snapshot missing confidence on \
+                             {source_uid} -[{edge_label}]-> {target_uid}"
+                        )));
+                    }
+                    Some(value) => {
+                        return Err(StoreError::Query(format!(
+                            "impact snapshot expected numeric confidence on \
+                             {source_uid} -[{edge_label}]-> {target_uid}, got {value:?}"
+                        )));
+                    }
+                };
+                if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+                    return Err(StoreError::Query(format!(
+                        "impact snapshot invalid confidence {confidence} on \
+                         {source_uid} -[{edge_label}]-> {target_uid}"
+                    )));
+                }
+                required_uids.insert(source_uid.clone());
+                required_uids.insert(target_uid.clone());
+                snapshot_edges.push((source_uid, target_uid, edge_label.to_string(), confidence));
+            }
+        }
+
+        let point_query = format!(
+            "MATCH (s:Symbol {{uid: $uid}}) RETURN {}",
+            crate::read::SYMBOL_COLUMNS
+        );
+        let mut point_stmt = conn.prepare(&point_query).map_err(|error| {
+            StoreError::Query(format!(
+                "impact snapshot failed to prepare primary-key lookup: {error}"
+            ))
+        })?;
+        let mut required_uids: Vec<String> = required_uids.into_iter().collect();
+        required_uids.sort();
+        let mut symbols_by_uid = HashMap::with_capacity(required_uids.len());
+        for uid in required_uids {
+            let trusted = {
+                let mut rows = conn
+                    .execute(
+                        &mut point_stmt,
+                        vec![("uid", lbug::Value::String(uid.clone()))],
+                    )
+                    .map_err(|error| {
+                        StoreError::Query(format!(
+                            "impact snapshot primary-key lookup failed for {uid}: {error}"
+                        ))
+                    })?;
+                let row = rows.next().ok_or_else(|| {
+                    StoreError::Query(format!(
+                        "impact snapshot primary-key lookup returned no row for {uid}"
+                    ))
+                })?;
+                let trusted = crate::read::row_to_symbol(&row)?;
+                if rows.next().is_some() {
+                    return Err(StoreError::Query(format!(
+                        "impact snapshot primary-key lookup returned duplicate rows for {uid}"
+                    )));
+                }
+                trusted
+            };
+            if trusted.uid != uid {
+                return Err(StoreError::Query(format!(
+                    "impact snapshot primary-key mismatch: requested {uid}, received {}",
+                    trusted.uid
+                )));
+            }
+            if symbols_by_uid.insert(uid.clone(), trusted).is_some() {
+                return Err(StoreError::Query(format!(
+                    "impact snapshot duplicate symbol primary key: {uid}"
+                )));
+            }
+        }
+
+        let mut callers_by_target: HashMap<String, HashMap<String, Vec<SnapshotCaller>>> =
+            HashMap::new();
+        for (source_uid, target_uid, edge_type, confidence) in snapshot_edges {
+            let caller = symbols_by_uid.get(&source_uid).ok_or_else(|| {
+                StoreError::Query(format!(
+                    "impact snapshot edge references missing source symbol: {source_uid}"
+                ))
+            })?;
+            if !symbols_by_uid.contains_key(&target_uid) {
+                return Err(StoreError::Query(format!(
+                    "impact snapshot edge references missing target symbol: {target_uid}"
+                )));
+            }
+            callers_by_target
+                .entry(target_uid)
+                .or_default()
+                .entry(edge_type)
+                .or_default()
+                .push(SnapshotCaller {
+                    uid: caller.uid.clone(),
+                    confidence,
+                });
+        }
+
+        Ok(ImpactSnapshot {
+            symbols_by_uid,
+            callers_by_target,
+        })
+    }
+
     /// Find all symbols that directly or transitively call/import/extend/implement `target_uid`.
     ///
     /// Performs confidence-weighted BFS up to `max_depth` levels following incoming
@@ -437,120 +805,26 @@ impl GraphStore {
         allowed_symbols: Option<&HashSet<String>>,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
-        // Whether the shallow data tier is actually in play for this walk.
-        let data_active = data_max_depth > 0 && !data.is_empty();
-
-        // Precompute the combined slice once (structural ++ data) so per-node
-        // expansion just picks structural-only vs combined by depth.
-        let combined: Vec<EdgeType> = if data_active {
-            structural
-                .iter()
-                .copied()
-                .chain(data.iter().copied())
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Track the best impact score seen so far for each node.
-        let mut scores: HashMap<String, f64> = HashMap::new();
-        scores.insert(target_uid.to_string(), 1.0);
-
-        // Queue entries: (uid, depth)
-        let mut queue: VecDeque<(String, u32)> = VecDeque::new();
-        queue.push_back((target_uid.to_string(), 0));
-
-        // Store result nodes keyed by uid so we can update scores if a
-        // better path is found.
-        let mut result_map: HashMap<String, ImpactNode> = HashMap::new();
-
-        // Honesty flags: whether the walk left part of the impact set unseen.
-        let mut truncated_by_threshold = false;
-        let mut truncated_by_depth = false;
-
         // nw-065: one connection and one prepared statement per edge type for
         // the WHOLE traversal. Previously each visited node created a
         // connection and re-prepared every statement, which dominated
         // traversal cost. Prepare the union of structural+data edges; the
         // per-depth edge slice still selects which are actually followed.
-        let prepare_set: &[EdgeType] = if data_active { &combined } else { structural };
+        let plan = ImpactEdgePlan::new(structural, data, data_max_depth);
         let conn = self.conn()?;
-        let mut stmts = Self::prepare_caller_stmts(&conn, prepare_set);
-
-        while let Some((current_uid, depth)) = queue.pop_front() {
-            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
-                // The shared cancel flag is a bare bool and can't carry a
-                // reason, so the leaf always reports `Timeout` (see
-                // `CancelReason`).
-                return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
-            }
-            if depth >= max_depth {
-                // A frontier node reached the depth boundary unexpanded;
-                // deeper dependents may exist beyond the returned set.
-                truncated_by_depth = true;
-                continue;
-            }
-
-            let parent_score = scores.get(&current_uid).copied().unwrap_or(0.0);
-
-            // Follow the structural set always; fold in the shallow data tier
-            // only while still under its depth cap.
-            let edges: &[EdgeType] = if data_active && depth < data_max_depth {
-                &combined
-            } else {
-                structural
-            };
-            let callers = Self::direct_callers_prepared(
-                &conn,
-                &mut stmts,
-                &current_uid,
-                min_confidence,
-                edges,
-            );
-
-            for row in callers {
-                // Skip the seed node itself.
-                if row.uid == target_uid {
-                    continue;
-                }
-                if allowed_symbols.is_some_and(|allowed| !allowed.contains(&row.uid)) {
-                    continue;
-                }
-
-                let candidate_score = parent_score * row.confidence as f64;
-
-                // Prune paths that fall below the impact threshold.
-                if candidate_score < min_score {
-                    truncated_by_threshold = true;
-                    continue;
-                }
-
-                let prev_score = scores.get(&row.uid).copied().unwrap_or(0.0);
-
-                if candidate_score > prev_score {
-                    scores.insert(row.uid.clone(), candidate_score);
-
-                    let node = ImpactNode {
-                        uid: row.uid.clone(),
-                        name: row.name,
-                        file_path: row.file_path,
-                        start_line: row.start_line,
-                        edge_type: row.edge_type,
-                        confidence: row.confidence,
-                        depth: depth + 1,
-                        impact_score: candidate_score,
-                    };
-                    result_map.insert(row.uid.clone(), node);
-
-                    // Re-enqueue so downstream nodes can pick up the
-                    // improved score. This is safe because scores only
-                    // increase (like Dijkstra with max instead of min).
-                    queue.push_back((row.uid, depth + 1));
-                }
-            }
-        }
-
-        let mut results: Vec<ImpactNode> = result_map.into_values().collect();
+        let mut stmts = Self::prepare_caller_stmts(&conn, plan.prepare_set());
+        let mut result = run_impact_walk(
+            target_uid,
+            max_depth,
+            min_confidence,
+            &plan,
+            min_score,
+            allowed_symbols,
+            cancel,
+            |uid, min_confidence, edges| {
+                Self::direct_callers_prepared(&conn, &mut stmts, uid, min_confidence, edges)
+            },
+        )?;
 
         // Repair display fields from PRIMARY-KEY point lookups.
         //
@@ -563,11 +837,11 @@ impl GraphStore {
         // through the PK-driven batch lookup so no consumer of impact results
         // (blast radius, affected tests, flow trace) can surface corrupted
         // symbol names. One batched query per traversal.
-        if !results.is_empty() {
-            let uids: Vec<&str> = results.iter().map(|n| n.uid.as_str()).collect();
+        if !result.nodes.is_empty() {
+            let uids: Vec<&str> = result.nodes.iter().map(|node| node.uid.as_str()).collect();
             match self.batch_lookup_symbols(&uids) {
                 Ok(map) => {
-                    for node in results.iter_mut() {
+                    for node in &mut result.nodes {
                         if let Some(sym) = map.get(&node.uid) {
                             node.name = sym.name.clone();
                             node.file_path = sym.file_path.clone();
@@ -582,28 +856,7 @@ impl GraphStore {
                 }
             }
         }
-        // Sort by impact_score descending; break ties by uid for determinism.
-        results.sort_by(|a, b| {
-            b.impact_score
-                .partial_cmp(&a.impact_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.uid.cmp(&b.uid))
-        });
-
-        // Reflect the union actually available to traverse: structural + data
-        // when the shallow tier is in play, structural-only otherwise.
-        let edge_types = if data_active {
-            combined
-        } else {
-            structural.to_vec()
-        };
-
-        Ok(ImpactResult {
-            nodes: results,
-            truncated_by_threshold,
-            truncated_by_depth,
-            edge_types,
-        })
+        Ok(result)
     }
 
     /// Internal: fetch all direct callers of `uid` across
@@ -2128,6 +2381,185 @@ mod tests {
                 "structural chain must traverse to full depth; missing {s}, got: {uids:?}"
             );
         }
+    }
+
+    /// A reverse-adjacency snapshot is not eligible to replace the live
+    /// traversal unless a known-nonempty mixed graph produces the exact same
+    /// ordered payload, including score bits and honesty flags.
+    #[test]
+    fn impact_snapshot_is_byte_equivalent_for_a_known_nonempty_graph() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in [
+            "target",
+            "slow",
+            "fast",
+            "diamond",
+            "downstream",
+            "reader",
+            "deep-reader",
+            "pruned",
+        ] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+
+        let edge =
+            |source: &str, target: &str, edge_type: EdgeType, confidence: f32| ResolvedEdge {
+                source_uid: source.to_string(),
+                target_uid: target.to_string(),
+                edge_type,
+                confidence,
+                link_type: None,
+                evidence: Vec::new(),
+            };
+        for resolved in [
+            edge("slow", "target", EdgeType::Calls, 0.4),
+            edge("fast", "target", EdgeType::Imports, 0.9),
+            edge("diamond", "slow", EdgeType::Calls, 0.95),
+            edge("diamond", "fast", EdgeType::Extends, 0.6),
+            edge("downstream", "diamond", EdgeType::Calls, 0.8),
+            // Close a cycle back to the seed. The seed must never appear in
+            // its own impact result.
+            edge("target", "downstream", EdgeType::Calls, 0.7),
+            edge("reader", "target", EdgeType::Uses, 0.85),
+            // data_max_depth=1 must keep this second data hop out.
+            edge("deep-reader", "reader", EdgeType::Uses, 0.9),
+            // The default cumulative threshold must prune this caller.
+            edge("pruned", "target", EdgeType::Calls, 0.05),
+        ] {
+            store.insert_edge(&resolved).unwrap();
+        }
+
+        let live = store
+            .impact_with_data_edges("target", 4, 0.0, 1, None)
+            .unwrap();
+        let live_uids: Vec<&str> = live.nodes.iter().map(|node| node.uid.as_str()).collect();
+        assert_eq!(
+            live_uids,
+            vec!["fast", "reader", "diamond", "downstream", "slow"],
+            "the equivalence fixture must stay nonempty and exercise the better diamond path"
+        );
+        assert!(live.truncated_by_threshold);
+        assert!(!live.truncated_by_depth);
+        let diamond = live
+            .nodes
+            .iter()
+            .find(|node| node.uid == "diamond")
+            .unwrap();
+        assert_eq!(
+            diamond.impact_score.to_bits(),
+            (0.9_f32 as f64 * 0.6_f32 as f64).to_bits(),
+            "the maximum-confidence path through fast must win"
+        );
+
+        let snapshot = store.load_impact_snapshot().unwrap();
+        let from_snapshot = snapshot
+            .impact_with_data_edges("target", 4, 0.0, 1, None)
+            .unwrap();
+
+        let as_bytes = |result: &super::ImpactResult| {
+            let nodes: Vec<_> = result
+                .nodes
+                .iter()
+                .map(|node| {
+                    serde_json::json!([
+                        node.uid,
+                        node.name,
+                        node.file_path,
+                        node.start_line,
+                        node.edge_type,
+                        node.confidence.to_bits(),
+                        node.depth,
+                        node.impact_score.to_bits(),
+                    ])
+                })
+                .collect();
+            let edge_types: Vec<_> = result
+                .edge_types
+                .iter()
+                .map(|edge| edge.rel_table_name())
+                .collect();
+            serde_json::to_vec(&serde_json::json!({
+                "nodes": nodes,
+                "truncated_by_threshold": result.truncated_by_threshold,
+                "truncated_by_depth": result.truncated_by_depth,
+                "edge_types": edge_types,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            as_bytes(&from_snapshot),
+            as_bytes(&live),
+            "the snapshot traversal must be byte-equivalent before it can replace the live path"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_rejects_out_of_range_confidence() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["caller", "target"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 1.5,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let error = store
+            .load_impact_snapshot()
+            .expect_err("invalid confidence must fail the whole snapshot");
+        assert!(
+            error.to_string().contains("invalid confidence 1.5"),
+            "the failure must identify the invalid confidence, got: {error}"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_rejects_null_confidence() {
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["caller", "target"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        let conn = store.conn().unwrap();
+        conn.query(
+            "MATCH (source:Symbol {uid: 'caller'}), (target:Symbol {uid: 'target'}) \
+             CREATE (source)-[:CALLS {confidence: NULL, evidence: ''}]->(target)",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store
+            .load_impact_snapshot()
+            .expect_err("missing confidence must fail the whole snapshot");
+        assert!(
+            error.to_string().contains("confidence"),
+            "the failure must identify the missing confidence, got: {error}"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_rejects_missing_impact_edge_table() {
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        conn.query("DROP TABLE CALLS").unwrap();
+        drop(conn);
+
+        let error = store
+            .load_impact_snapshot()
+            .expect_err("a missing impact edge table must fail the whole snapshot");
+        assert!(
+            error.to_string().contains("CALLS"),
+            "the failure must identify the missing edge table, got: {error}"
+        );
     }
 
     // ── cycle termination ───────────────────────────────────────────────
