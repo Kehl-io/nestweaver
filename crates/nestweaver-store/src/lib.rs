@@ -36,6 +36,7 @@ pub use tantivy_index::{
 };
 pub use traverse::{
     DEFAULT_IMPACT_THRESHOLD, IMPACT_EDGE_TYPES, ImpactEdge, ImpactNode, ImpactResult,
+    ImpactSnapshot,
 };
 pub use write::{
     DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteRepoCascadeOutcome,
