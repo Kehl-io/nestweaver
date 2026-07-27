@@ -1040,6 +1040,150 @@ mod tests {
     }
 
     #[test]
+    fn delete_note_cascade_removes_fragments_from_either_ownership_signal() {
+        use nestweaver_schema::{Heading, Note, NoteKind, Section, Vault};
+        let store = test_store();
+
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:partial-note".to_string(),
+                name: "partial-note".to_string(),
+                root_path: "/partial-note".to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:partial-note".to_string(),
+                vault_uid: "vlt:partial-note".to_string(),
+                file_path: "partial.md".to_string(),
+                title: "Partial".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "note-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:unrelated".to_string(),
+                vault_uid: "vlt:partial-note".to_string(),
+                file_path: "unrelated.md".to_string(),
+                title: "Unrelated".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "unrelated-note-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: "head:partial-note".to_string(),
+                note_uid: "note:partial-note".to_string(),
+                level: 1,
+                text: "Partial".to_string(),
+                slug: "partial".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: "heading-hash".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: "head:edge-owned-note".to_string(),
+                note_uid: "note:wrong-owner".to_string(),
+                level: 1,
+                text: "Edge owned".to_string(),
+                slug: "edge-owned".to_string(),
+                start_line: 3,
+                end_line: 3,
+                content_hash: "edge-heading-hash".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: "head:unrelated".to_string(),
+                note_uid: "note:unrelated".to_string(),
+                level: 1,
+                text: "Unrelated".to_string(),
+                slug: "unrelated".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: "unrelated-heading-hash".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:partial-note".to_string(),
+                note_uid: "note:partial-note".to_string(),
+                heading_uid: Some("head:partial-note".to_string()),
+                start_line: 2,
+                end_line: 2,
+                text_hash: "section-hash".to_string(),
+                text_content: "partial body".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:edge-owned-note".to_string(),
+                note_uid: "note:wrong-owner".to_string(),
+                heading_uid: Some("head:edge-owned-note".to_string()),
+                start_line: 4,
+                end_line: 4,
+                text_hash: "edge-section-hash".to_string(),
+                text_content: "edge-owned body".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:unrelated".to_string(),
+                note_uid: "note:unrelated".to_string(),
+                heading_uid: Some("head:unrelated".to_string()),
+                start_line: 2,
+                end_line: 2,
+                text_hash: "unrelated-section-hash".to_string(),
+                text_content: "unrelated body".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_note_heading_edges(&[
+                ("note:partial-note", "head:edge-owned-note"),
+                ("note:unrelated", "head:unrelated"),
+            ])
+            .unwrap();
+        store
+            .batch_insert_note_section_edges(&[
+                ("note:partial-note", "sec:edge-owned-note"),
+                ("note:unrelated", "sec:unrelated"),
+            ])
+            .unwrap();
+
+        store.delete_note_cascade("note:partial-note").unwrap();
+
+        assert_eq!(store.count_notes().unwrap(), 1);
+        assert_eq!(store.count_headings().unwrap(), 1);
+        assert_eq!(store.count_sections().unwrap(), 1);
+        assert_eq!(store.list_vaults(None).unwrap().len(), 1);
+    }
+
+    #[test]
     fn delete_note_cascade_is_a_noop_for_missing_uid() {
         let store = test_store();
         store.delete_note_cascade("note:does:not:exist").unwrap();
@@ -1837,6 +1981,161 @@ mod tests {
         assert_eq!(store.count_tags().unwrap(), 0);
         // Vault node itself should be gone — list_vaults returns nothing.
         assert_eq!(store.list_vaults(None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_vault_cascade_removes_fragments_from_either_ownership_signal() {
+        use nestweaver_schema::{Heading, Note, NoteKind, Section, Vault};
+        let store = test_store();
+
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:partial-vault".to_string(),
+                name: "partial-vault".to_string(),
+                root_path: "/partial-vault".to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:unrelated-vault".to_string(),
+                name: "unrelated-vault".to_string(),
+                root_path: "/unrelated-vault".to_string(),
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:partial-vault".to_string(),
+                vault_uid: "vlt:partial-vault".to_string(),
+                file_path: "partial.md".to_string(),
+                title: "Partial".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "note-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:unrelated-vault".to_string(),
+                vault_uid: "vlt:unrelated-vault".to_string(),
+                file_path: "unrelated.md".to_string(),
+                title: "Unrelated".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "unrelated-note-hash".to_string(),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: "head:partial-vault".to_string(),
+                note_uid: "note:partial-vault".to_string(),
+                level: 1,
+                text: "Partial".to_string(),
+                slug: "partial".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: "heading-hash".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: "head:edge-owned-vault".to_string(),
+                note_uid: "note:wrong-owner".to_string(),
+                level: 1,
+                text: "Edge owned".to_string(),
+                slug: "edge-owned".to_string(),
+                start_line: 3,
+                end_line: 3,
+                content_hash: "edge-heading-hash".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: "head:unrelated-vault".to_string(),
+                note_uid: "note:unrelated-vault".to_string(),
+                level: 1,
+                text: "Unrelated".to_string(),
+                slug: "unrelated".to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: "unrelated-heading-hash".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:partial-vault".to_string(),
+                note_uid: "note:partial-vault".to_string(),
+                heading_uid: Some("head:partial-vault".to_string()),
+                start_line: 2,
+                end_line: 2,
+                text_hash: "section-hash".to_string(),
+                text_content: "partial body".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:edge-owned-vault".to_string(),
+                note_uid: "note:wrong-owner".to_string(),
+                heading_uid: Some("head:edge-owned-vault".to_string()),
+                start_line: 4,
+                end_line: 4,
+                text_hash: "edge-section-hash".to_string(),
+                text_content: "edge-owned body".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:unrelated-vault".to_string(),
+                note_uid: "note:unrelated-vault".to_string(),
+                heading_uid: Some("head:unrelated-vault".to_string()),
+                start_line: 2,
+                end_line: 2,
+                text_hash: "unrelated-section-hash".to_string(),
+                text_content: "unrelated body".to_string(),
+                word_count: 2,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store
+            .batch_insert_note_heading_edges(&[
+                ("note:partial-vault", "head:edge-owned-vault"),
+                ("note:unrelated-vault", "head:unrelated-vault"),
+            ])
+            .unwrap();
+        store
+            .batch_insert_note_section_edges(&[
+                ("note:partial-vault", "sec:edge-owned-vault"),
+                ("note:unrelated-vault", "sec:unrelated-vault"),
+            ])
+            .unwrap();
+
+        let deleted = store.delete_vault_cascade("vlt:partial-vault").unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(store.count_notes().unwrap(), 1);
+        assert_eq!(store.count_headings().unwrap(), 1);
+        assert_eq!(store.count_sections().unwrap(), 1);
+        let vaults = store.list_vaults(None).unwrap();
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0].uid, "vlt:unrelated-vault");
     }
 
     #[test]
