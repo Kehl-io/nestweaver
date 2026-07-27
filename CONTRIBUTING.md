@@ -77,7 +77,7 @@ docs(cli): improve --help text for impact command
 ### Setup
 
 ```sh
-# Clone and build
+# Clone and install native build prerequisites (see INSTALL.md for each OS)
 git clone https://github.com/Kehl-io/nestweaver.git
 cd nestweaver
 cargo build
@@ -86,6 +86,11 @@ cargo build
 pre-commit install
 pre-commit install --hook-type commit-msg
 ```
+
+Keep `.cargo/config.toml` in place. It forces the reviewed Ladybug dependency
+to build from its immutable source pin; the initial native build can take
+several minutes. See [INSTALL.md](INSTALL.md#build-from-source) for CMake, C++,
+OpenSSL, zstd, `pkg-config`, and Protocol Buffers prerequisites.
 
 ### Check suite
 

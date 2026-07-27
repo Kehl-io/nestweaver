@@ -1,0 +1,5 @@
+[env]
+# The temporary lbug wrapper pin contains the reviewed Ladybug source as an
+# immutable submodule. Always compile that source so Cargo cannot substitute an
+# unrelated prebuilt archive while the upstream release is pending.
+LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }

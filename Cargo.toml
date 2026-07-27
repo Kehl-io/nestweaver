@@ -159,3 +159,9 @@ test = false
 name = "index_benchmarks"
 harness = false
 test = false
+
+# Temporary source override for the filtered multi-segment string-scan fix.
+# Remove this patch after the upstream fix is released in an lbug version that
+# passes NestWeaver's storage regression suite.
+[patch.crates-io]
+lbug = { git = "https://github.com/kory-io/ladybug-rust.git", rev = "8992183ff8de526e8a852be8a97ad04b412f56ed" }
