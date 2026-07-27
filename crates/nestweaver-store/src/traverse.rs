@@ -195,11 +195,11 @@ struct SnapshotCaller {
 
 /// An immutable reverse-adjacency view of the symbol graph.
 ///
-/// This is an equivalence candidate for impact traversal, not the default
-/// implementation. Building it fails closed if a scan cannot be reconciled
-/// with primary-key symbol lookups or if an edge has invalid confidence. The
-/// live database traversal remains selected until real-graph golden coverage
-/// proves this path byte-equivalent at scale.
+/// GraphStore impact entry points use this as their clean-generation default.
+/// Building it fails closed if a scan cannot be reconciled with primary-key
+/// symbol lookups or if an edge has invalid confidence. A generation-keyed,
+/// single-flight cache amortizes construction; dirty or raced publications
+/// retain the live database traversal for that request.
 #[derive(Debug, Clone)]
 pub struct ImpactSnapshot {
     symbols_by_uid: HashMap<String, nestweaver_schema::Symbol>,
@@ -269,14 +269,40 @@ impl ImpactSnapshot {
         data_max_depth: u32,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<ImpactResult, StoreError> {
-        let plan = ImpactEdgePlan::new(IMPACT_EDGE_TYPES, IMPACT_DATA_EDGE_TYPES, data_max_depth);
+        self.impact_bfs(
+            target_uid,
+            max_depth,
+            min_confidence,
+            IMPACT_EDGE_TYPES,
+            IMPACT_DATA_EDGE_TYPES,
+            data_max_depth,
+            DEFAULT_IMPACT_THRESHOLD,
+            None,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn impact_bfs(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        structural: &[EdgeType],
+        data: &[EdgeType],
+        data_max_depth: u32,
+        min_score: f64,
+        allowed_symbols: Option<&HashSet<String>>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        let plan = ImpactEdgePlan::new(structural, data, data_max_depth);
         run_impact_walk(
             target_uid,
             max_depth,
             min_confidence,
             &plan,
-            DEFAULT_IMPACT_THRESHOLD,
-            None,
+            min_score,
+            allowed_symbols,
             cancel,
             |uid, min_confidence, edges| self.direct_callers(uid, min_confidence, edges),
         )
@@ -445,14 +471,24 @@ impl GraphStore {
     /// # Performance
     ///
     /// Snapshot construction still scales with the full impact-edge endpoint
-    /// set and can be expensive on large graphs. It must remain off hot paths
-    /// until a generation-keyed cache passes the real-graph golden-output and
-    /// latency gates.
+    /// set and can be expensive on large graphs. The default impact entry
+    /// points therefore construct it at most once per clean graph generation.
+    /// This raw builder remains public for validation and explicit snapshots.
     pub fn load_impact_snapshot(&self) -> Result<ImpactSnapshot, StoreError> {
+        self.load_impact_snapshot_cancellable(None)
+    }
+
+    fn load_impact_snapshot_cancellable(
+        &self,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactSnapshot, StoreError> {
         let conn = self.conn()?;
         let mut snapshot_edges = Vec::new();
         let mut required_uids = HashSet::new();
         for edge_type in IMPACT_EDGE_TYPES.iter().chain(IMPACT_DATA_EDGE_TYPES) {
+            if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
+            }
             let edge_label = edge_type.rel_table_name();
             let query = format!(
                 "MATCH (source:Symbol)-[edge:{edge_label}]->(target:Symbol) \
@@ -464,6 +500,9 @@ impl GraphStore {
                 ))
             })?;
             for row in rows {
+                if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                    return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
+                }
                 let source_uid = crate::read::extract_string(&row, 0)?;
                 let target_uid = crate::read::extract_string(&row, 1)?;
                 let confidence = match row.get(2) {
@@ -535,6 +574,105 @@ impl GraphStore {
             symbols_by_uid,
             callers_by_target,
         })
+    }
+
+    fn cached_impact_snapshot(
+        &self,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Option<std::sync::Arc<ImpactSnapshot>>, StoreError> {
+        self.cached_impact_snapshot_with_loader(cancel, || {
+            self.load_impact_snapshot_cancellable(cancel)
+        })
+    }
+
+    fn cached_impact_snapshot_with_loader(
+        &self,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        loader: impl FnOnce() -> Result<ImpactSnapshot, StoreError>,
+    ) -> Result<Option<std::sync::Arc<ImpactSnapshot>>, StoreError> {
+        let cancelled =
+            || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        if cancelled() {
+            return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
+        }
+
+        // Acquire before checking the cache so concurrent first-touch callers
+        // queue here, then observe the one snapshot published by the elected
+        // loader instead of issuing duplicate full edge-table scans.
+        let _fill = loop {
+            match self.impact_snapshot_compute_lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if cancelled() {
+                        return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
+                    }
+                    // Snapshot construction takes seconds on production-sized
+                    // graphs. Polling at a small interval keeps query
+                    // cancellation responsive without spinning a core.
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        };
+        if cancelled() {
+            return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
+        }
+
+        let query_generation = {
+            // Cache-hit validation and index publication transitions share this
+            // barrier, making the decision linearizable with dirty-marker and
+            // generation changes.
+            let _publication = self
+                .pagerank_compute_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let generation = self.graph_generation();
+            if self.is_index_publication_dirty() {
+                return Ok(None);
+            }
+            if let Some(snapshot) = self
+                .impact_snapshot_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .filter(|(cached_generation, _)| *cached_generation == generation)
+                .map(|(_, snapshot)| std::sync::Arc::clone(snapshot))
+            {
+                return Ok(Some(snapshot));
+            }
+            generation
+        };
+
+        let candidate = std::sync::Arc::new(loader()?);
+        if cancelled() {
+            return Err(StoreError::Cancelled(crate::error::CancelReason::Timeout));
+        }
+
+        let _publication = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current_generation = self.graph_generation();
+        if self.is_index_publication_dirty() || current_generation != query_generation {
+            // The graph changed while the snapshot loaded. Never publish or
+            // serve a candidate that cannot be proven current; the caller keeps
+            // the existing live traversal for this raced request.
+            return Ok(None);
+        }
+
+        let mut cached = self
+            .impact_snapshot_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(snapshot) = cached
+            .as_ref()
+            .filter(|(generation, _)| *generation == current_generation)
+            .map(|(_, snapshot)| std::sync::Arc::clone(snapshot))
+        {
+            return Ok(Some(snapshot));
+        }
+        *cached = Some((current_generation, std::sync::Arc::clone(&candidate)));
+        Ok(Some(candidate))
     }
 
     /// Find all symbols that directly or transitively call/import/extend/implement `target_uid`.
@@ -757,6 +895,58 @@ impl GraphStore {
     /// disable score pruning.
     #[allow(clippy::too_many_arguments)]
     fn impact_bfs(
+        &self,
+        target_uid: &str,
+        max_depth: u32,
+        min_confidence: f32,
+        structural: &[EdgeType],
+        data: &[EdgeType],
+        data_max_depth: u32,
+        min_score: f64,
+        allowed_symbols: Option<&HashSet<String>>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<ImpactResult, StoreError> {
+        match self.cached_impact_snapshot(cancel) {
+            Ok(Some(snapshot)) => {
+                return snapshot.impact_bfs(
+                    target_uid,
+                    max_depth,
+                    min_confidence,
+                    structural,
+                    data,
+                    data_max_depth,
+                    min_score,
+                    allowed_symbols,
+                    cancel,
+                );
+            }
+            Ok(None) => {}
+            Err(error @ StoreError::Cancelled(_)) => return Err(error),
+            Err(_) => {
+                // The snapshot is an optimization. A malformed full-symbol
+                // projection or other construction-only failure must not
+                // remove callers that the established live traversal can
+                // still read safely.
+                tracing::warn!(
+                    "impact snapshot construction failed; using live traversal for this request"
+                );
+            }
+        }
+        self.impact_bfs_live(
+            target_uid,
+            max_depth,
+            min_confidence,
+            structural,
+            data,
+            data_max_depth,
+            min_score,
+            allowed_symbols,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn impact_bfs_live(
         &self,
         target_uid: &str,
         max_depth: u32,
@@ -1272,6 +1462,7 @@ impl GraphStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
 
     use nestweaver_schema::{Symbol, SymbolKind, Visibility};
@@ -2395,7 +2586,17 @@ mod tests {
         }
 
         let live = store
-            .impact_with_data_edges("target", 4, 0.0, 1, None)
+            .impact_bfs_live(
+                "target",
+                4,
+                0.0,
+                super::IMPACT_EDGE_TYPES,
+                super::IMPACT_DATA_EDGE_TYPES,
+                1,
+                super::DEFAULT_IMPACT_THRESHOLD,
+                None,
+                None,
+            )
             .unwrap();
         let live_uids: Vec<&str> = live.nodes.iter().map(|node| node.uid.as_str()).collect();
         assert_eq!(
@@ -2416,8 +2617,7 @@ mod tests {
             "the maximum-confidence path through fast must win"
         );
 
-        let snapshot = store.load_impact_snapshot().unwrap();
-        let from_snapshot = snapshot
+        let from_snapshot = store
             .impact_with_data_edges("target", 4, 0.0, 1, None)
             .unwrap();
 
@@ -2455,6 +2655,424 @@ mod tests {
             as_bytes(&from_snapshot),
             as_bytes(&live),
             "the snapshot traversal must be byte-equivalent before it can replace the live path"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_cache_reuses_one_arc_within_a_generation() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["caller", "target"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.95,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let first = store
+            .cached_impact_snapshot(None)
+            .unwrap()
+            .expect("a clean generation must be cacheable");
+        let second = store
+            .cached_impact_snapshot(None)
+            .unwrap()
+            .expect("the clean cache must remain available");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeated impact queries in one generation must reuse the exact snapshot"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_cache_invalidates_on_generation_change() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["first", "second", "target"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "first".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.95,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        let before = store
+            .cached_impact_snapshot(None)
+            .unwrap()
+            .expect("the initial generation must be cacheable");
+
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "second".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        store.bump_graph_generation();
+
+        let after = store
+            .cached_impact_snapshot(None)
+            .unwrap()
+            .expect("the new clean generation must be cacheable");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a generation change must replace, never reuse, the prior snapshot"
+        );
+        let result = after
+            .impact_with_data_edges("target", 1, 0.0, 0, None)
+            .unwrap();
+        assert_eq!(
+            result
+                .nodes
+                .iter()
+                .map(|node| node.uid.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["first", "second"]),
+            "the replacement snapshot must include graph changes from the new generation"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_cache_discards_a_candidate_when_generation_changes_during_load() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let result = store
+            .cached_impact_snapshot_with_loader(None, || {
+                let candidate = store.load_impact_snapshot()?;
+                store.bump_graph_generation();
+                Ok(candidate)
+            })
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "a candidate built across a generation change must not be served"
+        );
+        assert!(
+            store.impact_snapshot_cache.lock().unwrap().is_none(),
+            "a raced candidate must not be published"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_cache_single_flights_concurrent_first_touch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let start = Arc::new(Barrier::new(9));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            let loads = Arc::clone(&loads);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                store
+                    .cached_impact_snapshot_with_loader(None, || {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        store.load_impact_snapshot()
+                    })
+                    .unwrap()
+                    .expect("a clean generation must publish a snapshot")
+            }));
+        }
+
+        start.wait();
+        let snapshots: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "concurrent first-touch queries must perform one snapshot construction"
+        );
+        assert!(
+            snapshots
+                .iter()
+                .skip(1)
+                .all(|snapshot| Arc::ptr_eq(&snapshots[0], snapshot)),
+            "every waiter must receive the one published snapshot"
+        );
+    }
+
+    #[test]
+    fn impact_snapshot_single_flight_wait_is_cancellable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let load_started = Arc::new(Barrier::new(2));
+        let release_loader = Arc::new(Barrier::new(2));
+        let builder = {
+            let store = Arc::clone(&store);
+            let load_started = Arc::clone(&load_started);
+            let release_loader = Arc::clone(&release_loader);
+            std::thread::spawn(move || {
+                store
+                    .cached_impact_snapshot_with_loader(None, || {
+                        load_started.wait();
+                        release_loader.wait();
+                        store.load_impact_snapshot()
+                    })
+                    .unwrap()
+            })
+        };
+        load_started.wait();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter = {
+            let store = Arc::clone(&store);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let result = store.cached_impact_snapshot_with_loader(Some(&cancel), || {
+                    panic!("a single-flight waiter must never invoke a second loader")
+                });
+                result_tx
+                    .send(result.map(|snapshot| snapshot.is_some()))
+                    .unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(25));
+        cancel.store(true, Ordering::Relaxed);
+        let result_before_release = result_rx.recv_timeout(Duration::from_millis(250));
+
+        release_loader.wait();
+        builder.join().unwrap();
+        waiter.join().unwrap();
+
+        assert!(
+            matches!(
+                result_before_release,
+                Ok(Err(crate::error::StoreError::Cancelled(
+                    crate::error::CancelReason::Timeout
+                )))
+            ),
+            "a cancelled waiter must return before the active loader is released; got \
+             {result_before_release:?}"
+        );
+    }
+
+    #[test]
+    fn impact_query_populates_the_generation_keyed_snapshot_cache() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["caller", "target"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.95,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        assert!(store.impact_snapshot_cache.lock().unwrap().is_none());
+
+        let first = store.impact("target", 1, 0.0).unwrap();
+        let cached = store
+            .impact_snapshot_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+            .expect("the first clean impact query must publish its snapshot");
+        let second = store.impact("target", 1, 0.0).unwrap();
+        let reused = store
+            .impact_snapshot_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+            .expect("the cached snapshot must remain published");
+
+        assert_eq!(
+            first
+                .iter()
+                .map(|node| node.uid.as_str())
+                .collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|node| node.uid.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            Arc::ptr_eq(&cached, &reused),
+            "the second impact query must reuse the first query's snapshot"
+        );
+    }
+
+    #[test]
+    fn impact_query_falls_back_to_live_when_snapshot_construction_fails() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        let mut caller = make_symbol("caller", "caller");
+        caller.signature = "fn caller()\0".to_string();
+        store.insert_symbol(&caller).unwrap();
+        store
+            .insert_symbol(&make_symbol("target", "target"))
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "caller".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.95,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(
+            store.load_impact_snapshot().is_err(),
+            "the malformed full-symbol projection must exercise the cache failure path"
+        );
+        let result = store.impact("target", 1, 0.0).unwrap();
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|node| node.uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["caller"],
+            "cache construction failure must preserve live traversal results"
+        );
+        assert!(
+            store.impact_snapshot_cache.lock().unwrap().is_none(),
+            "a failed snapshot must not be published"
+        );
+    }
+
+    #[test]
+    fn impact_query_never_serves_cached_adjacency_while_publication_is_dirty() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let marker_path = std::path::PathBuf::from(format!("{}.index-dirty", db_path.display()));
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        for uid in ["first", "second", "target"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "first".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.95,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        store.impact("target", 1, 0.0).unwrap();
+        let old_snapshot = store
+            .impact_snapshot_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+            .unwrap();
+
+        let publication = store.acquire_index_publication_lease().unwrap();
+        store.with_index_publication_rank_barrier(|| {
+            std::fs::write(&marker_path, b"dirty").unwrap();
+            publication.reserve_generation().unwrap();
+        });
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "second".to_string(),
+                target_uid: "target".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let dirty_result = store.impact("target", 1, 0.0).unwrap();
+        assert_eq!(
+            dirty_result
+                .iter()
+                .map(|node| node.uid.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["first", "second"]),
+            "a dirty-window query must use the live graph, not stale cached adjacency"
+        );
+        assert!(
+            store.impact_snapshot_cache.lock().unwrap().is_none(),
+            "publication invalidation must release the old snapshot before graph writes"
+        );
+
+        store.with_index_publication_rank_barrier(|| {
+            publication.publish_clean_generation().unwrap();
+            std::fs::remove_file(&marker_path).unwrap();
+            publication.complete_generation().unwrap();
+        });
+        publication.release().unwrap();
+
+        store.impact("target", 1, 0.0).unwrap();
+        let current_snapshot = store
+            .impact_snapshot_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&old_snapshot, &current_snapshot),
+            "the first clean query after publication must replace the old generation"
+        );
+    }
+
+    #[test]
+    fn cancelled_impact_snapshot_load_publishes_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = GraphStore::in_memory().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = store
+            .cached_impact_snapshot_with_loader(Some(&cancel), || {
+                cancel.store(true, Ordering::Relaxed);
+                store.load_impact_snapshot()
+            })
+            .expect_err("a cancelled first load must fail");
+
+        assert!(matches!(
+            error,
+            crate::error::StoreError::Cancelled(crate::error::CancelReason::Timeout)
+        ));
+        assert!(
+            store.impact_snapshot_cache.lock().unwrap().is_none(),
+            "a cancelled candidate must never enter the cache"
         );
     }
 
@@ -2497,6 +3115,54 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "loading {SYMBOL_COUNT} endpoint symbols took {elapsed:?}; \
              the snapshot must not issue one query per UID"
+        );
+    }
+
+    #[test]
+    fn cached_impact_traversal_is_subsecond_for_thousands_of_nodes() {
+        use std::time::{Duration, Instant};
+
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+
+        const SYMBOL_COUNT: usize = 2_048;
+
+        let store = GraphStore::in_memory().unwrap();
+        let symbols: Vec<_> = (0..SYMBOL_COUNT)
+            .map(|index| {
+                let uid = format!("cached-impact-{index:04}");
+                make_symbol(&uid, &uid)
+            })
+            .collect();
+        store.batch_insert_symbols(&symbols).unwrap();
+        let edges: Vec<_> = symbols
+            .windows(2)
+            .map(|pair| ResolvedEdge {
+                source_uid: pair[0].uid.clone(),
+                target_uid: pair[1].uid.clone(),
+                edge_type: EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .collect();
+        store.batch_insert_edges(&edges).unwrap();
+        let target = symbols.last().unwrap().uid.as_str();
+
+        let warm = store
+            .impact_with_flags_and_threshold(target, SYMBOL_COUNT as u32, 0.0, 0.0, None)
+            .unwrap();
+        assert_eq!(warm.nodes.len(), SYMBOL_COUNT - 1);
+
+        let started = Instant::now();
+        let cached = store
+            .impact_with_flags_and_threshold(target, SYMBOL_COUNT as u32, 0.0, 0.0, None)
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(cached.nodes.len(), SYMBOL_COUNT - 1);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cached traversal across {SYMBOL_COUNT} nodes took {elapsed:?}"
         );
     }
 
