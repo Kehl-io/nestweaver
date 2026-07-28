@@ -236,10 +236,16 @@ pub fn resolve_references_with_context(
             continue;
         }
 
-        let source_symbols = match file_symbols.get(file_path.as_str()) {
-            Some(syms) if !syms.is_empty() => *syms,
-            _ => continue,
-        };
+        // A file with no symbols has nothing that could enclose an import, so
+        // skip it before doing any per-import work. The symbol list itself is
+        // no longer read here: since nw-103 this pass attributes an edge only
+        // to a genuine enclosing symbol, never to the file's first declaration.
+        if file_symbols
+            .get(file_path.as_str())
+            .is_none_or(|syms| syms.is_empty())
+        {
+            continue;
+        }
 
         let source_sorted_syms: &[&RawSymbol] = match file_sorted_symbols.get(file_path.as_str()) {
             Some(syms) if !syms.is_empty() => syms.as_slice(),
@@ -264,10 +270,18 @@ pub fn resolve_references_with_context(
                 })
                 .map(|r| r.start_line);
 
-            // Use enclosing symbol at import line, or fall back to first symbol in file.
-            let source_sym = import_line
-                .and_then(|line| find_enclosing_symbol(source_sorted_syms, line))
-                .or_else(|| source_symbols.first());
+            // Attribute a named-import edge only when the import genuinely sits
+            // INSIDE a symbol — e.g. a dynamic `import()` in a function body.
+            //
+            // A top-level import has no enclosing symbol. Falling back to the
+            // file's first declaration (nw-103) made that arbitrary symbol look
+            // like the file's dependency hub: this pass then fans out to every
+            // non-private symbol in the target file, so a 3-reference,
+            // never-exported string constant acquired 830 out-edges and ranked
+            // #5 in a 158k-symbol graph. Pass 3a already emits a file-level
+            // proxy edge per import, so connectivity does not depend on this.
+            let source_sym =
+                import_line.and_then(|line| find_enclosing_symbol(source_sorted_syms, line));
 
             let source_uid = match source_sym {
                 Some(sym) => symbol_uid(repo_uid, file_path, &sym.name, sym.start_line),
@@ -842,10 +856,21 @@ mod tests {
         );
     }
 
+    /// A top-level import yields ONE file-level proxy edge, not one per
+    /// exported symbol in the target.
+    ///
+    /// This test previously asserted two edges — one to every export — which is
+    /// the fan-out that nw-103 removed. Attributing a top-level import to a
+    /// *symbol* is a category error: the import belongs to the file, and the
+    /// symbol Pass 3b picked was simply whichever happened to be declared
+    /// first. That is how a never-exported string constant ended up with 830
+    /// out-edges. Pass 3a keeps the file-level edge so connectivity survives.
+    ///
+    /// Genuine per-symbol import attribution — linking only the symbols that
+    /// actually reference the imported binding — is tracked separately; it
+    /// needs reference matching this pass does not do.
     #[test]
-    fn creates_imports_edges_from_import_graph() {
-        // main.js imports helper.js — should create IMPORTS edges
-        // to all exported symbols in helper.js
+    fn top_level_import_creates_one_file_level_proxy_edge() {
         let files = vec![
             (
                 "src/main.js".to_string(),
@@ -866,8 +891,9 @@ mod tests {
             .collect();
         assert_eq!(
             import_edges.len(),
-            2,
-            "should create IMPORTS edges to both exported symbols; got: {import_edges:?}"
+            1,
+            "a top-level import should yield exactly one file-level proxy edge, \
+             not one per export (nw-103 fan-out); got: {import_edges:?}"
         );
 
         let expected_confidence = confidence_score(MatchType::ImportResolved, Language::JavaScript);
@@ -881,6 +907,57 @@ mod tests {
                 "IMPORTS target should be resolved"
             );
         }
+    }
+
+    /// nw-103: a top-level import must not turn the file's first declaration
+    /// into a dependency hub.
+    ///
+    /// Imports sit above every declaration, so `find_enclosing_symbol` finds
+    /// nothing and Pass 3b fell back to `source_symbols.first()` — then fanned
+    /// out to every non-private symbol in each imported file. On the real graph
+    /// that gave `const ROSTER_STORAGE_KEY = "..."` — 3 references, never
+    /// exported — 830 out-edges and the #5 hub slot of a 158k-symbol graph.
+    #[test]
+    fn top_level_import_does_not_make_the_first_declaration_a_hub() {
+        // Mirrors the real shape: a constant declared immediately after the
+        // import block, then the function that actually uses the import.
+        let files = vec![
+            (
+                "src/view.ts".to_string(),
+                vec![make_symbol("STORAGE_KEY", 3), make_symbol("renderView", 20)],
+                vec![make_ref("./types", ReferenceKind::Import, 1)],
+            ),
+            (
+                "src/types.ts".to_string(),
+                vec![
+                    make_symbol("Alpha", 1),
+                    make_symbol("Beta", 10),
+                    make_symbol("Gamma", 20),
+                    make_symbol("Delta", 30),
+                ],
+                vec![],
+            ),
+        ];
+
+        let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+
+        // symbol_uid hashes the name, so the UID does NOT contain the literal
+        // identifier — filtering on `.contains("STORAGE_KEY")` matches nothing
+        // and makes this test pass vacuously. Compute the real UID instead.
+        let storage_key_uid = symbol_uid("repo:test:abc", "src/view.ts", "STORAGE_KEY", 3);
+        let from_storage_key: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Imports && e.source_uid == storage_key_uid)
+            .collect();
+
+        assert!(
+            from_storage_key.len() <= 1,
+            "STORAGE_KEY is declared after the import block and must not inherit \
+             the file's imports; at most a single file-level proxy edge is \
+             acceptable. Got {} IMPORTS edges: {:#?}",
+            from_storage_key.len(),
+            from_storage_key
+        );
     }
 
     #[test]
