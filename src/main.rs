@@ -3322,7 +3322,10 @@ fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange])
 
     // Coverage caveat: reported impact is a floor when the walk was cut short or
     // a referenced repo isn't indexed.
-    if result.coverage.traversal_truncated || !result.coverage.repos_not_indexed.is_empty() {
+    if result.coverage.traversal_truncated
+        || !result.coverage.repos_not_indexed.is_empty()
+        || !result.blind_spots.is_empty()
+    {
         let mut notes = Vec::new();
         if result.coverage.traversal_truncated {
             notes.push("traversal truncated".to_string());
@@ -3332,6 +3335,21 @@ fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange])
                 "{} repo(s) not indexed",
                 result.coverage.repos_not_indexed.len()
             ));
+        }
+        // The JSON carries `coverage.blind_spots` — categories of edge the
+        // static walk cannot see at all (dynamic dispatch, reflection, ...).
+        // Text omitted them, so a reviewer had no way to know which whole
+        // classes of dependency were never considered.
+        if !result.blind_spots.is_empty() {
+            // BlindSpot serializes kebab-case; render it the same way so text
+            // and --json name the same categories.
+            let spots: Vec<String> = result
+                .blind_spots
+                .iter()
+                .filter_map(|s| serde_json::to_value(s).ok())
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            notes.push(format!("blind spots: {}", spots.join(", ")));
         }
         println!("  note: {} — reported impact is a floor", notes.join(", "));
     }
@@ -7389,7 +7407,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&res)?);
                     } else if res.results.is_empty() {
-                        println!("No matches for '{pattern}'.");
+                        // nw-097/nw-111: the caveat notes below live in the
+                        // non-empty branch, so the ONE case where truncation matters
+                        // most — zero results because the budget ran out — printed a
+                        // flat "No matches", an actively false claim. On the real
+                        // 5.6 GB brain DB `regex-search NestWeaver --max-millis 5`
+                        // returns nothing while thousands of matches exist.
+                        if res.truncated {
+                            println!(
+                                "No matches for '{pattern}' WITHIN THE SEARCH BUDGET — the scan was cut \
+                         short, so matches may exist beyond the scanned range. Raise \
+                         --max-millis, or run `index --with-trigrams` to make this fast."
+                            );
+                        } else {
+                            println!("No matches for '{pattern}'.");
+                        }
+                        if res.stale_index {
+                            print_stale_index_note();
+                        }
                     } else {
                         println!("Found {} match(es) for '{pattern}':", res.results.len());
                         for m in &res.results {
@@ -7423,7 +7458,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
             } else if res.results.is_empty() {
-                println!("No matches for '{pattern}'.");
+                // nw-097/nw-111: the caveat notes below live in the
+                // non-empty branch, so the ONE case where truncation matters
+                // most — zero results because the budget ran out — printed a
+                // flat "No matches", an actively false claim. On the real
+                // 5.6 GB brain DB `regex-search NestWeaver --max-millis 5`
+                // returns nothing while thousands of matches exist.
+                if res.truncated {
+                    println!(
+                        "No matches for '{pattern}' WITHIN THE SEARCH BUDGET — the scan was cut \
+                         short, so matches may exist beyond the scanned range. Raise \
+                         --max-millis, or run `index --with-trigrams` to make this fast."
+                    );
+                } else {
+                    println!("No matches for '{pattern}'.");
+                }
+                if res.stale_index {
+                    print_stale_index_note();
+                }
             } else {
                 println!("Found {} match(es) for '{pattern}':", res.results.len());
                 for m in &res.results {
@@ -13688,7 +13740,17 @@ fn run_brain(
                     if links.is_empty() {
                         println!("No broken or ambiguous wikilinks found.");
                     } else {
-                        println!("Broken / ambiguous wikilinks ({}):", links.len());
+                        // nw-097 class: the daemon reports `total`; this path
+                        // printed only how many it chose to show, so 50 of 778
+                        // read as "778 does not exist". The direct path below
+                        // already renders "N of total" — match it.
+                        let total = value.get("total").and_then(|v| v.as_u64());
+                        match total {
+                            Some(tot) if tot > links.len() as u64 => {
+                                println!("Broken / ambiguous wikilinks ({} of {tot}):", links.len())
+                            }
+                            _ => println!("Broken / ambiguous wikilinks ({}):", links.len()),
+                        }
                         for l in &links {
                             println!(
                                 "  [[{}]] in {} (confidence {:.2})",
@@ -13781,7 +13843,15 @@ fn run_brain(
                         if orphans.is_empty() {
                             println!("No orphan documents found.");
                         } else {
-                            println!("Orphan documents ({}):", orphans.len());
+                            // nw-097 class: daemon carries `total`; printing
+                            // only the shown count hid 607 orphans behind 50.
+                            let total = value.get("total").and_then(|v| v.as_u64());
+                            match total {
+                                Some(tot) if tot > orphans.len() as u64 => {
+                                    println!("Orphan documents ({} of {tot}):", orphans.len())
+                                }
+                                _ => println!("Orphan documents ({}):", orphans.len()),
+                            }
                             for o in &orphans {
                                 println!("  {} — {}", o.title, o.file_path);
                             }
