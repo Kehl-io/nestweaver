@@ -121,6 +121,231 @@ pub struct WatcherRegistration {
     handle: nestweaver_engine::ShutdownHandle,
 }
 
+#[derive(Debug, Clone)]
+struct EmbeddingRuntimeStatus {
+    state: String,
+    backend: String,
+    requested_device: String,
+    selected_device: String,
+    model_id: String,
+    error: String,
+    metal_compiled: bool,
+    fallback_used: bool,
+}
+
+#[derive(Clone)]
+enum EmbeddingRuntimeSnapshot {
+    Unavailable {
+        status: EmbeddingRuntimeStatus,
+    },
+    Ready {
+        status: EmbeddingRuntimeStatus,
+        model: Arc<dyn nestweaver_engine::EmbedQueryFn>,
+    },
+}
+
+impl EmbeddingRuntimeSnapshot {
+    fn status(&self) -> &EmbeddingRuntimeStatus {
+        match self {
+            Self::Unavailable { status } | Self::Ready { status, .. } => status,
+        }
+    }
+
+    fn model(&self) -> Option<Arc<dyn nestweaver_engine::EmbedQueryFn>> {
+        match self {
+            Self::Unavailable { .. } => None,
+            Self::Ready { model, .. } => Some(model.clone()),
+        }
+    }
+}
+
+struct EmbeddingRuntime {
+    snapshot: std::sync::RwLock<EmbeddingRuntimeSnapshot>,
+}
+
+impl EmbeddingRuntime {
+    fn unavailable(status: EmbeddingRuntimeStatus) -> Self {
+        assert_ne!(status.state, "ready");
+        Self {
+            snapshot: std::sync::RwLock::new(EmbeddingRuntimeSnapshot::Unavailable { status }),
+        }
+    }
+
+    fn snapshot(
+        &self,
+    ) -> (
+        EmbeddingRuntimeStatus,
+        Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>,
+    ) {
+        let snapshot = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
+        (snapshot.status().clone(), snapshot.model())
+    }
+
+    fn status(&self) -> EmbeddingRuntimeStatus {
+        self.snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .status()
+            .clone()
+    }
+
+    fn current_model(&self) -> Option<Arc<dyn nestweaver_engine::EmbedQueryFn>> {
+        self.snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .model()
+    }
+
+    fn publish_unavailable(&self, status: EmbeddingRuntimeStatus) {
+        assert_ne!(status.state, "ready");
+        *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) =
+            EmbeddingRuntimeSnapshot::Unavailable { status };
+    }
+
+    fn publish_ready(
+        &self,
+        status: EmbeddingRuntimeStatus,
+        model: Arc<dyn nestweaver_engine::EmbedQueryFn>,
+    ) {
+        assert_eq!(status.state, "ready");
+        *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) =
+            EmbeddingRuntimeSnapshot::Ready { status, model };
+    }
+}
+
+impl nestweaver_engine::EmbedModelProvider for EmbeddingRuntime {
+    fn current_model(&self) -> Option<Arc<dyn nestweaver_engine::EmbedQueryFn>> {
+        EmbeddingRuntime::current_model(self)
+    }
+}
+
+#[cfg(any(feature = "embed", test))]
+#[derive(Debug, Clone, Copy)]
+struct EmbeddingProbeMetadata {
+    backend: &'static str,
+    selected_device: &'static str,
+    vector_dimension: usize,
+}
+
+fn initial_embedding_status(
+    cfg: &nestweaver_engine::config::EmbeddingConfig,
+    stored_model_id: Option<&str>,
+    embedding_compiled: bool,
+    metal_compiled: bool,
+) -> EmbeddingRuntimeStatus {
+    let backend = if cfg.external_endpoint.is_some() {
+        "external"
+    } else {
+        "local"
+    };
+    let requested_device = match cfg.accelerator {
+        nestweaver_engine::config::EmbeddingAccelerator::Auto => "auto",
+        nestweaver_engine::config::EmbeddingAccelerator::Metal => "metal",
+        nestweaver_engine::config::EmbeddingAccelerator::Cpu => "cpu",
+    };
+    let model_id = stored_model_id
+        .filter(|model_id| !model_id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if backend == "external" {
+                cfg.external_model
+                    .clone()
+                    .unwrap_or_else(|| "text-embedding-3-small".to_string())
+            } else {
+                cfg.model_id.clone()
+            }
+        });
+    EmbeddingRuntimeStatus {
+        state: if embedding_compiled {
+            "loading".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        backend: backend.to_string(),
+        requested_device: requested_device.to_string(),
+        selected_device: String::new(),
+        model_id,
+        error: String::new(),
+        metal_compiled,
+        fallback_used: false,
+    }
+}
+
+#[cfg(any(feature = "embed", test))]
+fn finalize_embedding_status(
+    mut status: EmbeddingRuntimeStatus,
+    stored_dimension: Option<usize>,
+    result: Result<EmbeddingProbeMetadata, String>,
+) -> EmbeddingRuntimeStatus {
+    match result {
+        Ok(metadata) => {
+            if let Some(stored_dimension) = stored_dimension
+                && stored_dimension != metadata.vector_dimension
+            {
+                status.state = "failed".to_string();
+                status.error = format!(
+                    "embedding model dimension ({}) does not match stored embeddings ({}); \
+                     run `nestweaver embed --force` to re-embed",
+                    metadata.vector_dimension, stored_dimension
+                );
+                status.selected_device.clear();
+                return status;
+            }
+            status.state = "ready".to_string();
+            status.backend = metadata.backend.to_string();
+            status.selected_device = if metadata.backend == "local" {
+                metadata.selected_device.to_string()
+            } else {
+                String::new()
+            };
+            status.error.clear();
+        }
+        Err(error) => {
+            status.state = "failed".to_string();
+            status.selected_device.clear();
+            status.error = error;
+        }
+    }
+    status
+}
+
+fn embedding_status_proto(status: &EmbeddingRuntimeStatus) -> nestweaver_proto::EmbeddingStatus {
+    nestweaver_proto::EmbeddingStatus {
+        state: status.state.clone(),
+        backend: status.backend.clone(),
+        requested_device: status.requested_device.clone(),
+        selected_device: status.selected_device.clone(),
+        model_id: status.model_id.clone(),
+        error: status.error.clone(),
+        metal_compiled: status.metal_compiled,
+        fallback_used: status.fallback_used,
+    }
+}
+
+fn embedding_status_json(status: &EmbeddingRuntimeStatus) -> serde_json::Value {
+    serde_json::json!({
+        "state": status.state,
+        "backend": status.backend,
+        "requested_device": status.requested_device,
+        "selected_device": status.selected_device,
+        "model_id": status.model_id,
+        "error": status.error,
+        "metal_compiled": status.metal_compiled,
+        "fallback_used": status.fallback_used,
+    })
+}
+
+fn daemon_metal_compiled() -> bool {
+    #[cfg(feature = "embed")]
+    {
+        nestweaver_embed::metal_compiled()
+    }
+    #[cfg(not(feature = "embed"))]
+    {
+        false
+    }
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
@@ -154,9 +379,9 @@ pub struct DaemonState {
     /// source that resolves every identity to `VisibleRepos::All`. Mirrors the
     /// MCP-HTTP boundary.
     pub permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
-    /// Lazily-loaded embedding model for semantic search. Populated by a
-    /// background task when the `embed` feature is enabled.
-    pub embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+    /// Embedding readiness and the exact usable model as one immutable
+    /// snapshot. A handler can never observe `ready` without that model.
+    embedding_runtime: Arc<EmbeddingRuntime>,
     /// Serializes write RPCs so only one runs at a time (KùzuDB allows a
     /// single write transaction).
     pub write_mutex: Arc<tokio::sync::Mutex<()>>,
@@ -417,12 +642,9 @@ impl DaemonService {
         let tool_name = tool_name.to_string();
         let args_json = args_json.to_string();
 
-        // Read the embed model Arc outside the blocking thread, then drop
-        // the RwLock guard before any further awaits.
-        let embed_arc = {
-            let guard = self.state.embed_model.read().await;
-            guard.clone()
-        };
+        // Clone one atomic readiness/model snapshot before entering the
+        // blocking dispatch thread.
+        let embed_arc = self.state.embedding_runtime.current_model();
 
         let tool_name_for_log = tool_name.clone();
 
@@ -608,12 +830,9 @@ impl DaemonService {
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
 
-        // Read the embed model Arc outside the blocking thread, then drop
-        // the RwLock guard before any further awaits.
-        let embed_arc = {
-            let guard = self.state.embed_model.read().await;
-            guard.clone()
-        };
+        // Clone one atomic readiness/model snapshot before entering the
+        // blocking dispatch thread.
+        let embed_arc = self.state.embedding_runtime.current_model();
 
         let tool_name_for_log = tool_name.clone();
 
@@ -708,17 +927,21 @@ impl DaemonService {
     /// the correct single-writer discipline.
     #[cfg(feature = "embed")]
     fn make_embed_on_change(
-        embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        embedding_runtime: Arc<EmbeddingRuntime>,
         store: Arc<nestweaver_store::GraphStore>,
     ) -> Option<Box<dyn Fn() + Send>> {
-        Self::make_embed_on_change_with(embed_model, store, Self::EMBED_ON_CHANGE_MIN_INTERVAL)
+        Self::make_embed_on_change_with(
+            embedding_runtime,
+            store,
+            Self::EMBED_ON_CHANGE_MIN_INTERVAL,
+        )
     }
 
     /// [`Self::make_embed_on_change`] with an injectable debounce interval
     /// (tests use `Duration::ZERO` to exercise every pass).
     #[cfg(feature = "embed")]
     fn make_embed_on_change_with(
-        embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        embedding_runtime: Arc<EmbeddingRuntime>,
         store: Arc<nestweaver_store::GraphStore>,
         min_interval: std::time::Duration,
     ) -> Option<Box<dyn Fn() + Send>> {
@@ -740,12 +963,7 @@ impl DaemonService {
                 }
                 st.last_pass = Some(std::time::Instant::now());
             }
-            // Peek at the model without blocking async code — we are already
-            // in a blocking thread (the watcher thread, inside spawn_blocking).
-            let model = {
-                let guard = embed_model.blocking_read();
-                guard.clone()
-            };
+            let model = embedding_runtime.current_model();
             let Some(model) = model else { return };
 
             let mut attempted = 0u32;
@@ -754,7 +972,11 @@ impl DaemonService {
 
             // Symbols
             if let Ok(symbols) = store.list_all_symbols() {
-                for sym in symbols.iter().filter(|s| s.embedding.is_none()).take(limit) {
+                for sym in symbols
+                    .iter()
+                    .filter(|s| !store.has_embedding(&s.uid))
+                    .take(limit)
+                {
                     let text = nestweaver_embed::preprocess::symbol_embed_text(
                         &sym.kind.to_string(),
                         &sym.name,
@@ -788,7 +1010,7 @@ impl DaemonService {
             {
                 for note in notes
                     .iter()
-                    .filter(|n| n.embedding.is_none())
+                    .filter(|n| !store.has_embedding(&n.uid))
                     .take(remaining)
                 {
                     let text = nestweaver_embed::preprocess::note_embed_text(&note.title, None);
@@ -814,7 +1036,7 @@ impl DaemonService {
             {
                 for heading in headings
                     .iter()
-                    .filter(|h| h.embedding.is_none())
+                    .filter(|h| !store.has_embedding(&h.uid))
                     .take(remaining)
                 {
                     let text = nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
@@ -864,7 +1086,7 @@ impl DaemonService {
 
     #[cfg(not(feature = "embed"))]
     fn make_embed_on_change(
-        _embed_model: Arc<tokio::sync::RwLock<Option<Arc<dyn nestweaver_engine::EmbedQueryFn>>>>,
+        _embedding_runtime: Arc<EmbeddingRuntime>,
         _store: Arc<nestweaver_store::GraphStore>,
     ) -> Option<Box<dyn Fn() + Send>> {
         None
@@ -2304,6 +2526,80 @@ fn run_remove_vault_with_projection(
     )
 }
 
+#[derive(Clone, Copy)]
+struct EmbeddingScopes {
+    symbols: bool,
+    notes: bool,
+    headings: bool,
+}
+
+fn embedding_scopes(scope: &str) -> Result<EmbeddingScopes, Status> {
+    let scopes = EmbeddingScopes {
+        symbols: scope == "all" || scope == "symbols",
+        notes: scope == "all" || scope == "notes",
+        headings: scope == "all" || scope == "headings",
+    };
+    if !scopes.symbols && !scopes.notes && !scopes.headings {
+        return Err(Status::invalid_argument(format!(
+            "unknown scope '{scope}': expected one of: all, symbols, notes, headings"
+        )));
+    }
+    Ok(scopes)
+}
+
+fn embedding_is_eligible(store: &GraphStore, uid: &str, force: bool) -> bool {
+    force || !store.has_embedding(uid)
+}
+
+fn embedding_store_status(operation: &str, error: anyhow::Error) -> Status {
+    tracing::error!(operation, "embedding eligibility query failed: {error:#}");
+    Status::internal(format!("failed to inspect embedding {operation}"))
+}
+
+fn plan_embeddings(store: &GraphStore, scope: &str, force: bool) -> Result<EmbedResponse, Status> {
+    let scopes = embedding_scopes(scope)?;
+    let mut scoped = 0u64;
+    let mut eligible = 0u64;
+
+    if scopes.symbols {
+        let symbols = store
+            .list_all_symbols()
+            .map_err(|error| embedding_store_status("symbols", error.into()))?;
+        scoped += symbols.len() as u64;
+        eligible += symbols
+            .iter()
+            .filter(|symbol| embedding_is_eligible(store, &symbol.uid, force))
+            .count() as u64;
+    }
+    if scopes.notes {
+        let notes = store
+            .list_notes(None)
+            .map_err(|error| embedding_store_status("notes", error.into()))?;
+        scoped += notes.len() as u64;
+        eligible += notes
+            .iter()
+            .filter(|note| embedding_is_eligible(store, &note.uid, force))
+            .count() as u64;
+    }
+    if scopes.headings {
+        let headings = store
+            .list_all_headings()
+            .map_err(|error| embedding_store_status("headings", error.into()))?;
+        scoped += headings.len() as u64;
+        eligible += headings
+            .iter()
+            .filter(|heading| embedding_is_eligible(store, &heading.uid, force))
+            .count() as u64;
+    }
+
+    Ok(EmbedResponse {
+        scoped,
+        eligible,
+        skipped: scoped.saturating_sub(eligible),
+        ..EmbedResponse::default()
+    })
+}
+
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -2554,8 +2850,10 @@ impl NestWeaverDaemon for DaemonService {
         let write_lock = self.state.write_mutex.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
-        let on_change =
-            Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
+        let on_change = Self::make_embed_on_change(
+            self.state.embedding_runtime.clone(),
+            self.state.store.clone(),
+        );
 
         tokio::task::spawn_blocking(move || {
             let _write_lock = write_lock.blocking_lock();
@@ -2645,8 +2943,10 @@ impl NestWeaverDaemon for DaemonService {
         let write_lock = self.state.write_mutex.clone();
         let state = self.state.clone();
         let store = self.state.store.clone();
-        let on_change =
-            Self::make_embed_on_change(self.state.embed_model.clone(), self.state.store.clone());
+        let on_change = Self::make_embed_on_change(
+            self.state.embedding_runtime.clone(),
+            self.state.store.clone(),
+        );
 
         tokio::task::spawn_blocking(move || {
             let _write_lock = write_lock.blocking_lock();
@@ -3910,6 +4210,10 @@ impl NestWeaverDaemon for DaemonService {
             returned_matches,
             total_matches_relation,
             truncated,
+            // `brain_search` is keyword/BM25-only; it must not claim a
+            // semantic leg was requested or degraded.
+            semantic_applied: false,
+            degraded_components: Vec::new(),
         }))
     }
 
@@ -3984,8 +4288,26 @@ impl NestWeaverDaemon for DaemonService {
             .await?;
         let result_json = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("failed to serialize result: {e}")))?;
+        let semantic_applied = value
+            .get("semantic_applied")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let degraded_components = value
+            .get("degraded_components")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        Ok(Response::new(BrainContextResponse { result_json }))
+        Ok(Response::new(BrainContextResponse {
+            result_json,
+            semantic_applied,
+            degraded_components,
+        }))
     }
 
     async fn get_project_context(
@@ -4165,6 +4487,7 @@ impl NestWeaverDaemon for DaemonService {
             String::new()
         };
         let queue_depth = self.state.indexing_queue_depth.load(Ordering::Relaxed) as i32;
+        let embedding_status = embedding_status_proto(&self.state.embedding_runtime.status());
 
         Ok(Response::new(BrainStatusResponse {
             vault_count: value
@@ -4191,6 +4514,7 @@ impl NestWeaverDaemon for DaemonService {
             indexing_active,
             indexing_repo,
             queue_depth,
+            embedding_status: Some(embedding_status),
         }))
     }
 
@@ -4246,6 +4570,8 @@ impl NestWeaverDaemon for DaemonService {
             }
             value["queue_depth"] =
                 serde_json::json!(self.state.indexing_queue_depth.load(Ordering::Relaxed));
+            let embedding_status = self.state.embedding_runtime.status();
+            value["embedding_status"] = embedding_status_json(&embedding_status);
             if let Ok(s) = serde_json::to_string(&value) {
                 json_resp.result_json = s;
             }
@@ -5077,6 +5403,23 @@ impl NestWeaverDaemon for DaemonService {
     // ── Embedding ───────────────────────────────────────────────────
 
     #[allow(clippy::result_large_err)]
+    async fn plan_embed(
+        &self,
+        request: Request<EmbedRequest>,
+    ) -> Result<Response<EmbedResponse>, Status> {
+        let _write_lock = self.state.write_mutex.lock().await;
+        let _guard = ConnectionGuard::read(&self.state);
+        let request = request.into_inner();
+        let store = self.state.store.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            plan_embeddings(&store, &request.scope, request.force)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("embed plan task panicked: {error}")))??;
+        Ok(Response::new(response))
+    }
+
+    #[allow(clippy::result_large_err)]
     async fn embed(
         &self,
         request: Request<EmbedRequest>,
@@ -5092,7 +5435,7 @@ impl NestWeaverDaemon for DaemonService {
         #[cfg(not(feature = "embed"))]
         {
             let _ = request;
-            return Err(Status::unavailable(
+            return Err(Status::failed_precondition(
                 "embedding is not available — the daemon was built without the `embed` feature",
             ));
         }
@@ -5108,25 +5451,21 @@ impl NestWeaverDaemon for DaemonService {
                 req.batch_size as usize
             };
 
-            let do_symbols = scope == "all" || scope == "symbols";
-            let do_notes = scope == "all" || scope == "notes";
-            let do_headings = scope == "all" || scope == "headings";
+            let scopes = embedding_scopes(&scope)?;
+            let do_symbols = scopes.symbols;
+            let do_notes = scopes.notes;
+            let do_headings = scopes.headings;
 
-            if !do_symbols && !do_notes && !do_headings {
-                return Err(Status::invalid_argument(format!(
-                    "unknown scope '{scope}': expected one of: all, symbols, notes, headings"
-                )));
-            }
-
-            let model = {
-                let guard = self.state.embed_model.read().await;
-                guard.clone()
-            };
-
+            let (status, model) = self.state.embedding_runtime.snapshot();
             let Some(model) = model else {
-                return Err(Status::unavailable(
-                    "embedding model is not loaded — it may still be initializing",
-                ));
+                return Err(Status::failed_precondition(if status.error.is_empty() {
+                    format!("embedding is not ready (state: {})", status.state)
+                } else {
+                    format!(
+                        "embedding is not ready (state: {}): {}",
+                        status.state, status.error
+                    )
+                }));
             };
 
             let store = self.state.store.clone();
@@ -5135,17 +5474,23 @@ impl NestWeaverDaemon for DaemonService {
                 let mut succeeded = 0u32;
                 let mut failed = 0u32;
                 let mut rejected = 0u32;
+                let mut scoped = 0u64;
+                let mut eligible = 0u64;
 
                 // Each embed run may legitimately force-switch the model once;
                 // re-arm the once-per-run clear guard on this long-lived index.
                 store.reset_embedding_force_guard();
 
-                if do_symbols && let Ok(symbols) = store.list_all_symbols() {
-                    let to_embed: Vec<_> = if force {
-                        symbols.iter().collect()
-                    } else {
-                        symbols.iter().filter(|s| s.embedding.is_none()).collect()
-                    };
+                if do_symbols {
+                    let symbols = store
+                        .list_all_symbols()
+                        .map_err(|error| embedding_store_status("symbols", error.into()))?;
+                    scoped += symbols.len() as u64;
+                    let to_embed: Vec<_> = symbols
+                        .iter()
+                        .filter(|symbol| embedding_is_eligible(&store, &symbol.uid, force))
+                        .collect();
+                    eligible += to_embed.len() as u64;
                     for chunk in to_embed.chunks(batch_size) {
                         for sym in chunk {
                             let text = nestweaver_embed::preprocess::symbol_embed_text(
@@ -5170,12 +5515,16 @@ impl NestWeaverDaemon for DaemonService {
                     }
                 }
 
-                if do_notes && let Ok(notes) = store.list_notes(None) {
-                    let to_embed: Vec<_> = if force {
-                        notes.iter().collect()
-                    } else {
-                        notes.iter().filter(|n| n.embedding.is_none()).collect()
-                    };
+                if do_notes {
+                    let notes = store
+                        .list_notes(None)
+                        .map_err(|error| embedding_store_status("notes", error.into()))?;
+                    scoped += notes.len() as u64;
+                    let to_embed: Vec<_> = notes
+                        .iter()
+                        .filter(|note| embedding_is_eligible(&store, &note.uid, force))
+                        .collect();
+                    eligible += to_embed.len() as u64;
                     for chunk in to_embed.chunks(batch_size) {
                         for note in chunk {
                             let text =
@@ -5197,12 +5546,16 @@ impl NestWeaverDaemon for DaemonService {
                     }
                 }
 
-                if do_headings && let Ok(headings) = store.list_all_headings() {
-                    let to_embed: Vec<_> = if force {
-                        headings.iter().collect()
-                    } else {
-                        headings.iter().filter(|h| h.embedding.is_none()).collect()
-                    };
+                if do_headings {
+                    let headings = store
+                        .list_all_headings()
+                        .map_err(|error| embedding_store_status("headings", error.into()))?;
+                    scoped += headings.len() as u64;
+                    let to_embed: Vec<_> = headings
+                        .iter()
+                        .filter(|heading| embedding_is_eligible(&store, &heading.uid, force))
+                        .collect();
+                    eligible += to_embed.len() as u64;
                     for chunk in to_embed.chunks(batch_size) {
                         for heading in chunk {
                             let text =
@@ -5235,6 +5588,9 @@ impl NestWeaverDaemon for DaemonService {
                     succeeded,
                     failed,
                     rejected,
+                    scoped,
+                    eligible,
+                    skipped: scoped.saturating_sub(eligible),
                 })
             })
             .await
@@ -5501,6 +5857,7 @@ const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
     "ListReposJson",
     "ListServicesJson",
     "ListVaultsJson",
+    "PlanEmbed",
     "PrImpactJson",
     "QueryExtensions",
     "ReadSymbols",
@@ -5717,9 +6074,9 @@ fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
 
 /// Claim the exclusive per-instance lock — the pidfile flock that makes an
 /// `instance_id` single-owner on this host — and return the pidfile handle
-/// whose lifetime holds the lock (dropping it releases the lock). `None` only
-/// in a daemonize child that proves the inherited daemonize2 pidfile belongs to
-/// its own PID.
+/// whose lifetime holds the lock (dropping it releases the lock). On non-macOS,
+/// `None` identifies the daemonized child that proves it inherited the
+/// launcher's pidfile lock.
 ///
 /// Acquired **before** snapshot materialization so a duplicate replica started
 /// with the identical `--db` (hence identical `instance_id` and
@@ -5728,19 +6085,22 @@ fn replica_working_dir(db_path: &Path, instance_id: &str) -> PathBuf {
 /// same pidfile hold independent open-file descriptions, so `flock(LOCK_EX)`
 /// from a second process fails even though the first holder is also us-shaped.
 fn claim_instance_lock(instance_id: &str) -> Result<Option<std::fs::File>, anyhow::Error> {
-    // daemonize2 acquired this flock before forking and the child inherited
-    // its open file description. Opening the pidfile again would conflict with
-    // that inherited lock. The launcher marks only the real daemonize child;
-    // matching the file's PID prevents an inherited/user-set environment value
-    // from disabling duplicate-daemon exclusion for a normal `daemon run`.
-    let inherited_daemonize_lock = std::env::var("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD").as_deref()
-        == Ok("1")
-        && std::fs::read_to_string(lifecycle::pidfile_path(instance_id))
-            .ok()
-            .and_then(|pid| pid.trim().parse::<u32>().ok())
-            == Some(std::process::id());
-    if inherited_daemonize_lock {
-        return Ok(None);
+    #[cfg(not(target_os = "macos"))]
+    {
+        // daemonize2 acquired this flock before forking and the child inherited
+        // its open file description. Opening the pidfile again would conflict
+        // with that inherited lock. The launcher marks only the real daemonize
+        // child; matching the file's PID prevents an inherited/user-set value
+        // from disabling exclusion for a normal foreground server.
+        let inherited_daemonize_lock =
+            std::env::var("NESTWEAVER_DAEMON_PIDFILE_LOCK_HELD").as_deref() == Ok("1")
+                && std::fs::read_to_string(lifecycle::pidfile_path(instance_id))
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<u32>().ok())
+                    == Some(std::process::id());
+        if inherited_daemonize_lock {
+            return Ok(None);
+        }
     }
     // The pidfile lives in the per-instance runtime dir (created on demand).
     Ok(Some(claim_pidfile_lock(&lifecycle::pidfile_path(
@@ -5990,54 +6350,432 @@ mod depth_clamp_tests {
     }
 }
 
-/// Load the embedding model into `state.embed_model`. MUST be called on the daemon's main
-/// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
-/// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
-/// thread (there it silently falls back to CPU). Called AFTER the UDS server is spawned so a
-/// cold-cache download can't delay the socket bind; the download is bounded by a 180s prefetch
-/// timeout so it can't hang. During the load, non-semantic RPCs are served normally and
-/// semantic search returns "model not loaded" until it completes.
-///
-/// Gated `not(test)` like its call site: unit-test servers run on tokio worker threads, which
-/// can never satisfy the main-thread requirement, and with the call site compiled out this fn
-/// would be dead code under `--all-targets`.
-#[cfg(all(feature = "embed", not(test)))]
-async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
-    #[cfg(target_os = "macos")]
-    {
-        // MTLCompilerService is only reachable from the process main thread;
-        // loading elsewhere silently falls back to CPU embeddings.
-        let on_main = unsafe { libc::pthread_main_np() } != 0;
-        debug_assert!(
-            on_main,
-            "load_embedding_model must run on the main (block_on) thread"
-        );
-        if !on_main {
-            tracing::warn!(
-                "embedding model loading off the main thread; Metal GPU will be unavailable"
-            );
+#[cfg(test)]
+mod embedding_status_tests {
+    use super::*;
+    use nestweaver_engine::config::{EmbeddingAccelerator, EmbeddingConfig};
+
+    fn config(accelerator: EmbeddingAccelerator, external: bool) -> EmbeddingConfig {
+        EmbeddingConfig {
+            accelerator,
+            external_endpoint: external.then(|| "http://127.0.0.1:9".to_string()),
+            external_model: external.then(|| "external-model".to_string()),
+            ..Default::default()
         }
     }
-    let mut cfg = state
+
+    #[test]
+    fn loading_and_disabled_statuses_are_explicit() {
+        let loading = initial_embedding_status(
+            &config(EmbeddingAccelerator::Auto, false),
+            Some("stored-model"),
+            true,
+            true,
+        );
+        assert_eq!(loading.state, "loading");
+        assert_eq!(loading.backend, "local");
+        assert_eq!(loading.requested_device, "auto");
+        assert_eq!(loading.selected_device, "");
+        assert_eq!(loading.model_id, "stored-model");
+        assert!(loading.metal_compiled);
+        assert!(!loading.fallback_used);
+
+        let disabled = initial_embedding_status(
+            &config(EmbeddingAccelerator::Cpu, false),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(disabled.state, "disabled");
+        assert_eq!(disabled.selected_device, "");
+        assert!(!disabled.fallback_used);
+    }
+
+    #[test]
+    fn ready_local_status_reports_the_selected_device_without_fallback() {
+        for (selected, requested) in [
+            ("metal", EmbeddingAccelerator::Metal),
+            ("cpu", EmbeddingAccelerator::Cpu),
+        ] {
+            let initial = initial_embedding_status(
+                &config(requested, false),
+                None,
+                true,
+                selected == "metal",
+            );
+            let ready = finalize_embedding_status(
+                initial,
+                Some(384),
+                Ok(EmbeddingProbeMetadata {
+                    backend: "local",
+                    selected_device: selected,
+                    vector_dimension: 384,
+                }),
+            );
+            assert_eq!(ready.state, "ready");
+            assert_eq!(ready.selected_device, selected);
+            assert!(ready.error.is_empty());
+            assert!(!ready.fallback_used);
+        }
+    }
+
+    #[test]
+    fn failed_local_external_and_dimension_states_are_actionable() {
+        let metal = initial_embedding_status(
+            &config(EmbeddingAccelerator::Metal, false),
+            None,
+            true,
+            true,
+        );
+        let metal_failed =
+            finalize_embedding_status(metal, None, Err("Metal device unavailable".to_string()));
+        assert_eq!(metal_failed.state, "failed");
+        assert!(metal_failed.error.contains("Metal"));
+        assert_eq!(metal_failed.selected_device, "");
+
+        let external =
+            initial_embedding_status(&config(EmbeddingAccelerator::Auto, true), None, true, true);
+        let external_failed =
+            finalize_embedding_status(external, None, Err("external endpoint refused".to_string()));
+        assert_eq!(external_failed.state, "failed");
+        assert_eq!(external_failed.backend, "external");
+        assert_eq!(external_failed.selected_device, "");
+
+        let cpu =
+            initial_embedding_status(&config(EmbeddingAccelerator::Cpu, false), None, true, false);
+        let mismatch = finalize_embedding_status(
+            cpu,
+            Some(768),
+            Ok(EmbeddingProbeMetadata {
+                backend: "local",
+                selected_device: "cpu",
+                vector_dimension: 384,
+            }),
+        );
+        assert_eq!(mismatch.state, "failed");
+        assert!(mismatch.error.contains("384"));
+        assert!(mismatch.error.contains("768"));
+        assert_eq!(mismatch.selected_device, "");
+        assert!(!mismatch.fallback_used);
+    }
+}
+
+#[cfg(all(test, feature = "embed"))]
+mod embedding_load_config_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+    use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+    use std::path::Path;
+    use tokenizers::Tokenizer;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    fn write_complete_hf_cache(cache_dir: &Path) -> nestweaver_embed::ModelArtifacts {
+        const CONFIG_JSON: &str = r#"{
+            "vocab_size": 3,
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "intermediate_size": 8,
+            "hidden_act": "gelu",
+            "hidden_dropout_prob": 0.0,
+            "max_position_embeddings": 8,
+            "type_vocab_size": 2,
+            "initializer_range": 0.02,
+            "layer_norm_eps": 0.000000000001,
+            "pad_token_id": 0,
+            "position_embedding_type": "absolute",
+            "use_cache": false,
+            "classifier_dropout": null,
+            "model_type": "bert"
+        }"#;
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let repo_dir = cache_dir.join("models--test-owner--test-model");
+        let snapshot_dir = repo_dir.join("snapshots").join(commit);
+        std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
+        std::fs::create_dir_all(&snapshot_dir).expect("create snapshot");
+        std::fs::write(repo_dir.join("refs").join("main"), commit).expect("write ref");
+        let artifacts = nestweaver_embed::ModelArtifacts {
+            config: snapshot_dir.join("config.json"),
+            tokenizer: snapshot_dir.join("tokenizer.json"),
+            weights: snapshot_dir.join("model.safetensors"),
+        };
+
+        std::fs::write(&artifacts.config, CONFIG_JSON).expect("write model config");
+        let config: BertConfig = serde_json::from_str(CONFIG_JSON).expect("parse model config");
+        let varmap = VarMap::new();
+        let builder = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        BertModel::load(builder, &config).expect("initialize tiny BERT fixture");
+        varmap
+            .save(&artifacts.weights)
+            .expect("write model weights");
+
+        let vocab = [
+            ("[PAD]".to_string(), 0_u32),
+            ("[UNK]".to_string(), 1_u32),
+            ("test".to_string(), 2_u32),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer_model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("build tokenizer model");
+        let mut tokenizer = Tokenizer::new(tokenizer_model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .save(&artifacts.tokenizer, false)
+            .expect("write tokenizer");
+
+        artifacts
+    }
+
+    #[test]
+    fn daemon_accelerator_maps_each_policy() {
+        assert_eq!(
+            daemon_embedding_device_policy(nestweaver_engine::config::EmbeddingAccelerator::Auto),
+            nestweaver_embed::DevicePolicy::Auto
+        );
+        assert_eq!(
+            daemon_embedding_device_policy(nestweaver_engine::config::EmbeddingAccelerator::Metal),
+            nestweaver_embed::DevicePolicy::Metal
+        );
+        assert_eq!(
+            daemon_embedding_device_policy(nestweaver_engine::config::EmbeddingAccelerator::Cpu),
+            nestweaver_embed::DevicePolicy::Cpu
+        );
+    }
+
+    #[test]
+    fn stored_model_identity_targets_the_active_backend() {
+        let cache_dir = std::path::PathBuf::from("/tmp/nestweaver-embed-test");
+        let local = nestweaver_engine::config::EmbeddingConfig::default();
+        let local_config = embedding_load_config(&local, cache_dir.clone(), Some("stored-local"));
+        assert_eq!(local_config.model_id, "stored-local");
+        assert_eq!(local_config.external_model, None);
+
+        let external = nestweaver_engine::config::EmbeddingConfig {
+            external_endpoint: Some("http://127.0.0.1:11434/v1".to_string()),
+            external_model: Some("configured-external".to_string()),
+            ..Default::default()
+        };
+        let external_config = embedding_load_config(&external, cache_dir, Some("stored-external"));
+        assert_eq!(external_config.model_id, external.model_id);
+        assert_eq!(
+            external_config.external_model.as_deref(),
+            Some("stored-external")
+        );
+    }
+
+    #[test]
+    fn daemon_embedding_startup_constructs_cached_model_offline() {
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        write_complete_hf_cache(cache.path());
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: cache.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+
+        let model = load_daemon_embedding_backend_with(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+        )
+        .expect("daemon startup must construct a complete configured-cache model offline");
+
+        assert_eq!(
+            model.backend_kind(),
+            nestweaver_embed::EmbeddingBackendKind::Local
+        );
+        assert_eq!(model.device_kind(), Some(nestweaver_embed::DeviceKind::Cpu));
+        assert_eq!(model.known_dimension(), Some(4));
+        let embeddings = model.embed(&["test"]).expect("embed with loaded fixture");
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), 4);
+        assert!(embeddings[0].iter().all(|value| value.is_finite()));
+    }
+}
+
+#[cfg(feature = "embed")]
+fn daemon_embedding_device_policy(
+    accelerator: nestweaver_engine::config::EmbeddingAccelerator,
+) -> nestweaver_embed::DevicePolicy {
+    match accelerator {
+        nestweaver_engine::config::EmbeddingAccelerator::Auto => {
+            nestweaver_embed::DevicePolicy::Auto
+        }
+        nestweaver_engine::config::EmbeddingAccelerator::Metal => {
+            nestweaver_embed::DevicePolicy::Metal
+        }
+        nestweaver_engine::config::EmbeddingAccelerator::Cpu => nestweaver_embed::DevicePolicy::Cpu,
+    }
+}
+
+#[cfg(feature = "embed")]
+fn load_daemon_embedding_backend_with<T, Load>(
+    config: &nestweaver_embed::EmbedConfig,
+    policy: nestweaver_embed::DevicePolicy,
+    load: Load,
+) -> anyhow::Result<T>
+where
+    Load: FnOnce(
+        &nestweaver_embed::EmbedConfig,
+        nestweaver_embed::DevicePolicy,
+        nestweaver_embed::ArtifactMode,
+    ) -> anyhow::Result<T>,
+{
+    load(config, policy, nestweaver_embed::ArtifactMode::CacheOnly)
+}
+
+#[cfg(feature = "embed")]
+fn embedding_load_config(
+    cfg: &nestweaver_engine::config::EmbeddingConfig,
+    cache_dir: std::path::PathBuf,
+    stored_model_id: Option<&str>,
+) -> nestweaver_embed::EmbedConfig {
+    let stored_model_id = stored_model_id.filter(|model_id| !model_id.is_empty());
+    let (model_id, external_model) = if cfg.external_endpoint.is_some() {
+        (
+            cfg.model_id.clone(),
+            stored_model_id
+                .map(ToOwned::to_owned)
+                .or_else(|| cfg.external_model.clone()),
+        )
+    } else {
+        (
+            stored_model_id
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| cfg.model_id.clone()),
+            cfg.external_model.clone(),
+        )
+    };
+
+    nestweaver_embed::EmbedConfig {
+        model_id,
+        cache_dir,
+        external_endpoint: cfg.external_endpoint.clone(),
+        external_model,
+    }
+}
+
+#[cfg(feature = "embed")]
+fn probe_embedding_model(
+    model: &nestweaver_embed::EmbedModel,
+) -> Result<EmbeddingProbeMetadata, String> {
+    let backend = match model.backend_kind() {
+        nestweaver_embed::EmbeddingBackendKind::Local => "local",
+        nestweaver_embed::EmbeddingBackendKind::External => "external",
+    };
+    let selected_device = match model.device_kind() {
+        Some(nestweaver_embed::DeviceKind::Metal) => "metal",
+        Some(nestweaver_embed::DeviceKind::Cpu) => "cpu",
+        None => "",
+    };
+    model
+        .embed_query("NestWeaver embedding readiness probe")
+        .and_then(|vector| {
+            anyhow::ensure!(
+                !vector.is_empty(),
+                "readiness probe returned an empty vector"
+            );
+            anyhow::ensure!(
+                vector.iter().all(|value| value.is_finite()),
+                "readiness probe returned a non-finite vector"
+            );
+            Ok(EmbeddingProbeMetadata {
+                backend,
+                selected_device,
+                vector_dimension: vector.len(),
+            })
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// External embedding uses `reqwest::blocking`; execute that probe on Tokio's
+/// blocking pool so constructing/dropping its private runtime never happens
+/// inside an async worker. Local probing remains inline at the caller's
+/// main-thread control point because Candle Metal requires it.
+#[cfg(feature = "embed")]
+async fn probe_loaded_embedding_model(
+    model: nestweaver_embed::EmbedModel,
+) -> Result<(nestweaver_embed::EmbedModel, EmbeddingProbeMetadata), String> {
+    match model.backend_kind() {
+        nestweaver_embed::EmbeddingBackendKind::External => {
+            tokio::task::spawn_blocking(move || {
+                let metadata = probe_embedding_model(&model)?;
+                Ok::<_, String>((model, metadata))
+            })
+            .await
+            .map_err(|error| format!("external readiness probe task failed: {error}"))?
+        }
+        nestweaver_embed::EmbeddingBackendKind::Local => {
+            let metadata = probe_embedding_model(&model)?;
+            Ok((model, metadata))
+        }
+    }
+}
+
+/// Load the embedding model into `state.embedding_runtime`. MUST be called on the daemon's main
+/// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
+/// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
+/// thread. Called AFTER the UDS server is spawned. Local model artifacts are resolved strictly
+/// from the configured cache, so daemon startup never initiates a network download. During the
+/// load, non-semantic RPCs are served normally and semantic search returns "model not loaded"
+/// until it completes.
+///
+/// The production call site is gated `not(test)`. The function remains testable so the external
+/// path can be exercised under Tokio; only the local backend has the main-thread requirement.
+#[cfg(feature = "embed")]
+async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
+    let cfg = state
         .instance_cfg
         .as_ref()
         .map(|c| c.embedding.clone())
         .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    if cfg.external_endpoint.is_none() {
+        // MTLCompilerService is only reachable from the process main thread;
+        // loading elsewhere silently falls back to CPU embeddings. External
+        // models do not touch Metal and are deliberately exempt so their
+        // blocking HTTP probe can be tested/driven from an async runtime.
+        let on_main = unsafe { libc::pthread_main_np() } != 0;
+        debug_assert!(
+            on_main,
+            "local load_embedding_model must run on the main (block_on) thread"
+        );
+        if !on_main {
+            tracing::warn!(
+                "local embedding model loading off the main thread; Metal GPU will be unavailable"
+            );
+        }
+    }
     // The DB records which model generated the stored embeddings (set on embed). Load THAT
     // model regardless of the compiled default or config — it must match the stored vectors,
     // or semantic search is disabled on a dimension mismatch. This lets the shipped default
     // stay light while a given instance uses whatever it was actually embedded with.
-    if let Ok(Some((stored_model_id, _))) = state.store.get_embedding_metadata()
-        && !stored_model_id.is_empty()
-    {
-        if stored_model_id != cfg.model_id {
+    let stored_model_id = state
+        .store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(model_id, _)| model_id);
+    if let Some(stored_model_id) = stored_model_id.as_deref() {
+        let configured_model = if cfg.external_endpoint.is_some() {
+            cfg.external_model.as_deref().unwrap_or_default()
+        } else {
+            &cfg.model_id
+        };
+        if stored_model_id != configured_model {
             tracing::info!(
                 stored = %stored_model_id,
-                configured = %cfg.model_id,
+                configured = %configured_model,
                 "Loading the embedding model recorded in the DB (matches stored embeddings)"
             );
         }
-        cfg.model_id = stored_model_id;
     }
     // Expand tilde in cache_dir using the home directory.
     let cache_dir = if cfg.cache_dir.starts_with("~/") {
@@ -6049,68 +6787,56 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     } else {
         std::path::PathBuf::from(&cfg.cache_dir)
     };
-    let config = nestweaver_embed::EmbedConfig {
-        model_id: cfg.model_id.clone(),
-        cache_dir,
-        external_endpoint: cfg.external_endpoint.clone(),
-        external_model: cfg.external_model.clone(),
-    };
-    // Bound the (cold-cache) model DOWNLOAD so a slow/unreachable HuggingFace can't hang the
-    // load. On a warm cache this is instant; only the local-model path downloads.
-    //
-    // NOTE on cancellation: when the 180s timeout fires, the `spawn_blocking` download keeps
-    // running detached — hf-hub's blocking (ureq) `repo.get` exposes no abort hook, and the
-    // dominant cost is a single indivisible `model.safetensors` GET, so there is no useful
-    // point to inject a cooperative check. Accepted: the daemon's wait is bounded by this
-    // timeout plus the shutdown `select!` around the caller; the orphaned thread only writes
-    // into the HF cache dir and exits on its own when the transfer finishes or errors.
-    let loaded = if config.external_endpoint.is_some() {
-        Some(nestweaver_embed::EmbedModel::load(&config))
-    } else {
-        let model_id = config.model_id.clone();
-        let prefetch =
-            tokio::task::spawn_blocking(move || nestweaver_embed::local::prefetch_model(&model_id));
-        match tokio::time::timeout(std::time::Duration::from_secs(180), prefetch).await {
-            Ok(Ok(Ok(()))) => Some(nestweaver_embed::EmbedModel::load(&config)),
-            _ => {
-                tracing::warn!(
-                    "embedding model download timed out or failed — semantic search disabled \
-                     until the daemon restarts with the model available"
-                );
-                None
-            }
-        }
-    };
+    let policy = daemon_embedding_device_policy(cfg.accelerator);
+    let config = embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
+    let loaded = load_daemon_embedding_backend_with(
+        &config,
+        policy,
+        nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+    );
     match loaded {
-        Some(Ok(model)) => {
-            tracing::info!(dim = model.dimension(), "Embedding model loaded");
-            // Only the LOCAL model's dimension is comparable to the stored index.
-            // With an external endpoint, queries are embedded by the remote model
-            // (whatever dimension built the index), so the local dim is irrelevant
-            // — comparing it would falsely disable semantic search for every
-            // remote-embedded index. Any real remote/index dimension mismatch is
-            // handled gracefully at query time by the cosine length guard.
-            if !model.uses_external_endpoint()
-                && let Some(stored_dim) = state.store.embedding_index_dimension()
-                && stored_dim != model.dimension()
-            {
-                tracing::warn!(
-                    model_dim = model.dimension(),
-                    stored_dim,
-                    "Embedding model dimension ({}) does not match stored embeddings ({}). \
-                     Semantic search will be disabled. Re-run `nestweaver embed --force` to re-embed.",
-                    model.dimension(),
-                    stored_dim
+        Ok(model) => match probe_loaded_embedding_model(model).await {
+            Ok((model, probe)) => {
+                let status = finalize_embedding_status(
+                    state.embedding_runtime.status(),
+                    state.store.embedding_index_dimension(),
+                    Ok(probe),
                 );
-            } else {
-                *state.embed_model.write().await = Some(std::sync::Arc::new(model)
-                    as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>);
+                if status.state == "ready" {
+                    let backend = status.backend.clone();
+                    let selected_device = status.selected_device.clone();
+                    state.embedding_runtime.publish_ready(
+                        status,
+                        std::sync::Arc::new(model)
+                            as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>,
+                    );
+                    tracing::info!(backend, device = selected_device, "Embedding model ready");
+                } else {
+                    let error = status.error.clone();
+                    state.embedding_runtime.publish_unavailable(status);
+                    tracing::warn!("Embedding model failed readiness: {error}");
+                }
             }
-        }
-        Some(Err(e)) => {
+            Err(error) => {
+                let status = finalize_embedding_status(
+                    state.embedding_runtime.status(),
+                    state.store.embedding_index_dimension(),
+                    Err(error),
+                );
+                let error = status.error.clone();
+                state.embedding_runtime.publish_unavailable(status);
+                tracing::warn!("Embedding model failed readiness: {error}");
+            }
+        },
+        Err(e) => {
+            let status = finalize_embedding_status(
+                state.embedding_runtime.status(),
+                state.store.embedding_index_dimension(),
+                Err(format!("{e:#}")),
+            );
+            state.embedding_runtime.publish_unavailable(status);
             tracing::warn!("Failed to load embedding model: {e}");
         }
-        None => {}
     }
 }
 
@@ -6388,6 +7114,21 @@ pub async fn run_server(
 
     // Build the per-repo authz policy ONCE, before the state is assembled.
     let permission_source = build_daemon_permission_source(instance_cfg.as_ref());
+    let embedding_cfg = instance_cfg
+        .as_ref()
+        .map(|config| config.embedding.clone())
+        .unwrap_or_default();
+    let stored_embedding_model = store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(model_id, _)| model_id);
+    let embedding_status = initial_embedding_status(
+        &embedding_cfg,
+        stored_embedding_model.as_deref(),
+        cfg!(feature = "embed"),
+        daemon_metal_compiled(),
+    );
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
@@ -6406,7 +7147,7 @@ pub async fn run_server(
         next_watcher_id: std::sync::atomic::AtomicU64::new(0),
         instance_cfg,
         permission_source,
-        embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+        embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(embedding_status)),
         write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         server_mode: is_server_mode,
         indexing_active: Arc::new(AtomicBool::new(false)),
@@ -6609,8 +7350,11 @@ pub async fn run_server(
                     state.server_mode,
                 )
             };
-            // Share the daemon's embed model so HTTP dispatch has parity with gRPC.
-            s.embed_model = state.embed_model.clone();
+            // Share the daemon's atomic readiness/model provider so HTTP and
+            // gRPC observe the same exact published model.
+            s.embed_model_provider =
+                Some(state.embedding_runtime.clone()
+                    as Arc<dyn nestweaver_engine::EmbedModelProvider>);
             // A read-only replica must reject mutating MCP tools before dispatch,
             // just as the gRPC ReadOnlyGuard rejects mutating RPCs.
             s.read_only = read_only;
@@ -7661,7 +8405,8 @@ pub async fn run_server(
     // Spawn the UDS gRPC server so the socket binds and accepts immediately, THEN load the
     // embedding model on this (main) thread concurrently — non-semantic RPCs are served during
     // the load, and semantic search returns "model not loaded" until it completes. candle needs
-    // the main thread for Metal, and this keeps a cold-cache download from delaying the bind.
+    // the main thread for Metal, and this keeps cache resolution and model construction from
+    // delaying the bind.
     let uds_serve = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(uds_svc)
@@ -7670,9 +8415,8 @@ pub async fn run_server(
             }),
     );
 
-    // Race the load against shutdown: a `daemon stop` during a cold-cache model download must
-    // not park the main flow inside the 180s prefetch (which would defer cleanup and risk a
-    // SIGKILL + stale socket). If shutdown fires first, abandon the load and proceed to drain.
+    // Keep shutdown and model loading in the same control point. If shutdown wins before the
+    // synchronous model-construction phase begins, abandon the load and proceed to drain.
     //
     // `not(test)`: the load asserts it runs on the PROCESS main thread
     // (`pthread_main_np`, Metal shader compilation) — a guarantee the test
@@ -12147,6 +12891,28 @@ mod startup_helper_tests {
         }
     }
 
+    #[cfg(feature = "embed")]
+    fn ready_test_embedding_runtime(
+        model: Arc<dyn nestweaver_engine::EmbedQueryFn>,
+    ) -> Arc<EmbeddingRuntime> {
+        let mut status = initial_embedding_status(
+            &nestweaver_engine::config::EmbeddingConfig::default(),
+            None,
+            true,
+            daemon_metal_compiled(),
+        );
+        status.state = "ready".to_string();
+        status.selected_device = "cpu".to_string();
+        let runtime = Arc::new(EmbeddingRuntime::unavailable(initial_embedding_status(
+            &nestweaver_engine::config::EmbeddingConfig::default(),
+            None,
+            true,
+            daemon_metal_compiled(),
+        )));
+        runtime.publish_ready(status, model);
+        runtime
+    }
+
     /// The watcher's embed-on-change callback must perform its `add_embedding`
     /// writes under the write gate the watcher thread holds (`write_mutex` +
     /// `ConnectionGuard::write`), not on a detached fire-and-forget task that
@@ -12203,9 +12969,9 @@ mod startup_helper_tests {
             observed_writes: observed_writes.clone(),
             done: std::sync::Mutex::new(Some(done_tx)),
         }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
-        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+        let embedding_runtime = ready_test_embedding_runtime(probe);
 
-        let cb = DaemonService::make_embed_on_change(embed_model, store.clone())
+        let cb = DaemonService::make_embed_on_change(embedding_runtime, store.clone())
             .expect("embed callback should be present when a model is loaded");
 
         // Mirror the watcher thread: hold write_mutex + bump active_writes for
@@ -12285,14 +13051,91 @@ mod startup_helper_tests {
             .unwrap();
     }
 
+    #[cfg(feature = "embed")]
+    fn insert_unembedded_nodes_for_every_scope(store: &GraphStore, suffix: &str) -> [String; 3] {
+        use nestweaver_schema::{Heading, Note, NoteKind};
+
+        let symbol_uid = format!("sym-{suffix}");
+        let note_uid = format!("note-{suffix}");
+        let heading_uid = format!("heading-{suffix}");
+        insert_unembedded_symbol(store, &symbol_uid);
+        store
+            .insert_note(&Note {
+                uid: note_uid.clone(),
+                vault_uid: "vault-1".to_string(),
+                file_path: format!("notes/{suffix}.md"),
+                title: suffix.to_string(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: format!("note-hash-{suffix}"),
+                frontmatter: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: heading_uid.clone(),
+                note_uid: note_uid.clone(),
+                level: 1,
+                text: suffix.to_string(),
+                slug: suffix.to_string(),
+                start_line: 1,
+                end_line: 1,
+                content_hash: format!("heading-hash-{suffix}"),
+                embedding: None,
+            })
+            .unwrap();
+
+        [symbol_uid, note_uid, heading_uid]
+    }
+
     /// Invoke the callback on a blocking thread — it uses
-    /// `embed_model.blocking_read()`, which panics in an async context
-    /// (mirrors how the watcher thread calls it).
+    /// the callback is synchronous (mirrors how the watcher thread calls it).
     #[cfg(feature = "embed")]
     async fn run_embed_cb(cb: Arc<std::sync::Mutex<Box<dyn Fn() + Send>>>) {
         tokio::task::spawn_blocking(move || (cb.lock().unwrap())())
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_embed_skips_sidecar_embeddings_for_every_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&dir.path().join("brain.lbug")).unwrap());
+        let uids = insert_unembedded_nodes_for_every_scope(&store, "watcher-incremental");
+        for uid in &uids {
+            assert!(
+                store.add_embedding(uid, vec![0.1, 0.2, 0.3]),
+                "fixture embedding should be accepted for {uid}"
+            );
+            assert!(store.has_embedding(uid));
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let probe = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1_f32, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let callback = Arc::new(std::sync::Mutex::new(
+            DaemonService::make_embed_on_change_with(
+                ready_test_embedding_runtime(probe),
+                store,
+                std::time::Duration::ZERO,
+            )
+            .expect("embed callback should be present when a model is loaded"),
+        ));
+
+        run_embed_cb(callback).await;
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "watcher embedding must consult the sidecar index, not graph-row fields"
+        );
     }
 
     /// Regression (re-embedding stalls the watcher, #perf): back-to-back
@@ -12311,11 +13154,11 @@ mod startup_helper_tests {
             calls: calls.clone(),
             vector: vec![0.1_f32, 0.2, 0.3],
         }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
-        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+        let embedding_runtime = ready_test_embedding_runtime(probe);
 
         let cb = Arc::new(std::sync::Mutex::new(
             DaemonService::make_embed_on_change_with(
-                embed_model,
+                embedding_runtime,
                 store,
                 std::time::Duration::from_secs(3600),
             )
@@ -12354,11 +13197,11 @@ mod startup_helper_tests {
             calls: calls.clone(),
             vector: vec![0.1_f32, 0.2, 0.3],
         }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
-        let embed_model = Arc::new(tokio::sync::RwLock::new(Some(probe)));
+        let embedding_runtime = ready_test_embedding_runtime(probe);
 
         let cb = Arc::new(std::sync::Mutex::new(
             DaemonService::make_embed_on_change_with(
-                embed_model,
+                embedding_runtime,
                 store,
                 std::time::Duration::ZERO, // every pass runs
             )
@@ -12500,7 +13343,12 @@ mod startup_helper_tests {
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             permission_source: build_daemon_permission_source(None),
-            embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(initial_embedding_status(
+                &nestweaver_engine::config::EmbeddingConfig::default(),
+                None,
+                cfg!(feature = "embed"),
+                daemon_metal_compiled(),
+            ))),
             write_mutex: Arc::new(tokio::sync::Mutex::new(())),
             server_mode: false,
             read_only: false,
@@ -12540,7 +13388,12 @@ mod startup_helper_tests {
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             permission_source,
-            embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(initial_embedding_status(
+                &nestweaver_engine::config::EmbeddingConfig::default(),
+                None,
+                cfg!(feature = "embed"),
+                daemon_metal_compiled(),
+            ))),
             write_mutex: Arc::new(tokio::sync::Mutex::new(())),
             server_mode: false,
             read_only: false,
@@ -12555,6 +13408,349 @@ mod startup_helper_tests {
             worker_handle: std::sync::Mutex::new(None),
             ui_server: std::sync::Mutex::new(None),
         })
+    }
+
+    #[tokio::test]
+    async fn embedding_status_is_exposed_by_typed_and_json_status_rpcs() {
+        let state = test_state_with_writer();
+        state
+            .embedding_runtime
+            .publish_unavailable(EmbeddingRuntimeStatus {
+                state: "failed".to_string(),
+                backend: "local".to_string(),
+                requested_device: "metal".to_string(),
+                selected_device: String::new(),
+                model_id: "test-model".to_string(),
+                error: "Metal runtime probe failed".to_string(),
+                metal_compiled: true,
+                fallback_used: false,
+            });
+        let service = DaemonService::new(state);
+
+        let typed = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("typed brain status")
+            .into_inner()
+            .embedding_status
+            .expect("structured embedding status");
+        assert_eq!(typed.state, "failed");
+        assert_eq!(typed.requested_device, "metal");
+        assert_eq!(typed.selected_device, "");
+        assert!(typed.error.contains("Metal"));
+        assert!(!typed.fallback_used);
+
+        let json = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".to_string(),
+            }))
+            .await
+            .expect("JSON brain status")
+            .into_inner();
+        let value: serde_json::Value =
+            serde_json::from_str(&json.result_json).expect("valid status JSON");
+        assert_eq!(value["embedding_status"]["state"], "failed");
+        assert_eq!(value["embedding_status"]["requested_device"], "metal");
+        assert_eq!(value["embedding_status"]["selected_device"], "");
+        assert_eq!(value["embedding_status"]["fallback_used"], false);
+    }
+
+    #[tokio::test]
+    async fn embedding_status_blocks_embed_rpc_until_ready() {
+        let state = test_state_with_writer();
+        let expected_state = state.embedding_runtime.status().state;
+        let service = DaemonService::new(state);
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 0,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+
+        let error = service
+            .embed(request)
+            .await
+            .expect_err("an unavailable embedding model must block embedding");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains(&expected_state)
+                || error.message().contains("without the `embed` feature"),
+            "error should identify the structured readiness failure: {error}"
+        );
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn embed_plan_reports_all_missing_nodes_as_eligible() {
+        let state = test_state_with_writer();
+        insert_unembedded_nodes_for_every_scope(&state.store, "plan-missing");
+        let service = DaemonService::new(state);
+
+        let response = service
+            .plan_embed(Request::new(EmbedRequest {
+                scope: "all".to_string(),
+                force: false,
+                batch_size: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.scoped, 3);
+        assert_eq!(response.eligible, 3);
+        assert_eq!(response.skipped, 0);
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn embed_plan_skips_nodes_present_in_the_sidecar() {
+        let state = test_state_with_writer();
+        let uids = insert_unembedded_nodes_for_every_scope(&state.store, "plan-sidecar");
+        for uid in &uids {
+            assert!(state.store.add_embedding(uid, vec![0.1, 0.2, 0.3]));
+        }
+        let service = DaemonService::new(state);
+
+        let response = service
+            .plan_embed(Request::new(EmbedRequest {
+                scope: "all".to_string(),
+                force: false,
+                batch_size: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.scoped, 3);
+        assert_eq!(response.eligible, 0);
+        assert_eq!(response.skipped, 3);
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn forced_embed_plan_keeps_sidecar_nodes_eligible() {
+        let state = test_state_with_writer();
+        let uids = insert_unembedded_nodes_for_every_scope(&state.store, "plan-force");
+        for uid in &uids {
+            assert!(state.store.add_embedding(uid, vec![0.1, 0.2, 0.3]));
+        }
+        let service = DaemonService::new(state);
+
+        let response = service
+            .plan_embed(Request::new(EmbedRequest {
+                scope: "all".to_string(),
+                force: true,
+                batch_size: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.scoped, 3);
+        assert_eq!(response.eligible, 3);
+        assert_eq!(response.skipped, 0);
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn embed_plan_rejects_an_unknown_scope() {
+        let service = DaemonService::new(test_state_with_writer());
+
+        let status = service
+            .plan_embed(Request::new(EmbedRequest {
+                scope: "unknown".to_string(),
+                force: false,
+                batch_size: 0,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("unknown scope 'unknown'"));
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_embed_rpc_skips_sidecar_embeddings_for_every_scope() {
+        let mut state = test_state_with_writer();
+        let uids = insert_unembedded_nodes_for_every_scope(&state.store, "rpc-incremental");
+        for uid in &uids {
+            assert!(
+                state.store.add_embedding(uid, vec![0.1, 0.2, 0.3]),
+                "fixture embedding should be accepted for {uid}"
+            );
+            assert!(state.store.has_embedding(uid));
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let model = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        Arc::get_mut(&mut state)
+            .expect("test owns the only state Arc")
+            .embedding_runtime = ready_test_embedding_runtime(model);
+        let service = DaemonService::new(state);
+
+        let mut request = Request::new(EmbedRequest {
+            scope: "all".to_string(),
+            force: false,
+            batch_size: 1,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let response = service.embed(request).await.unwrap().into_inner();
+
+        assert_eq!(response.succeeded, 0);
+        assert_eq!(response.failed, 0);
+        assert_eq!(response.rejected, 0);
+        assert_eq!(response.scoped, 3);
+        assert_eq!(response.eligible, 0);
+        assert_eq!(response.skipped, 3);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "incremental embedding must consult the sidecar index, not graph-row fields"
+        );
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unavailable_external_probe_keeps_daemon_healthy_and_failed() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "external-probe-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+
+[embedding]
+external_endpoint = {endpoint:?}
+external_model = "unavailable-test-model"
+"#
+        ))
+        .unwrap();
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.instance_cfg = Some(Arc::new(config.clone()));
+        state_mut
+            .embedding_runtime
+            .publish_unavailable(initial_embedding_status(
+                &config.embedding,
+                None,
+                true,
+                daemon_metal_compiled(),
+            ));
+
+        tokio::time::timeout(Duration::from_secs(5), load_embedding_model(&state))
+            .await
+            .expect("unavailable local endpoint must fail promptly without panicking");
+
+        let (status, model) = state.embedding_runtime.snapshot();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.backend, "external");
+        assert_eq!(status.model_id, "unavailable-test-model");
+        assert!(!status.error.is_empty());
+        assert!(!status.fallback_used);
+        assert!(model.is_none(), "failed probe must not publish a model");
+
+        // The daemon state remains usable after the failed probe.
+        let typed = DaemonService::new(state)
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("status handler must remain healthy")
+            .into_inner()
+            .embedding_status
+            .expect("structured embedding status");
+        assert_eq!(typed.state, "failed");
+        assert!(!typed.fallback_used);
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_handler_never_observes_ready_without_exact_model() {
+        let state = test_state_with_writer();
+        insert_unembedded_symbol(&state.store, "sym-atomic-handler");
+        let calls = Arc::new(AtomicU32::new(0));
+        let model = Arc::new(CountingEmbed {
+            calls: calls.clone(),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let mut loading = state.embedding_runtime.status();
+        loading.state = "loading".to_string();
+        loading.error.clear();
+        let mut ready = loading.clone();
+        ready.state = "ready".to_string();
+        ready.selected_device = "cpu".to_string();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let handler_runtime = state.embedding_runtime.clone();
+        let writer_runtime = state.embedding_runtime.clone();
+        let writer_model = model.clone();
+        let writer_stop = stop.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            while !writer_stop.load(Ordering::Acquire) {
+                writer_runtime.publish_unavailable(loading.clone());
+                std::thread::yield_now();
+                writer_runtime.publish_ready(ready.clone(), writer_model.clone());
+                std::thread::yield_now();
+            }
+        });
+        let service = DaemonService::new(state);
+
+        for _ in 0..32 {
+            let mut request = Request::new(EmbedRequest {
+                scope: "symbols".to_string(),
+                force: true,
+                batch_size: 1,
+            });
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            if let Err(error) = service.embed(request).await {
+                assert!(
+                    !error.message().contains("state: ready"),
+                    "handler observed impossible ready-without-model snapshot: {error}"
+                );
+            }
+        }
+
+        stop.store(true, Ordering::Release);
+        writer.await.unwrap();
+        let mut final_ready = handler_runtime.status();
+        final_ready.state = "ready".to_string();
+        final_ready.selected_device = "cpu".to_string();
+        handler_runtime.publish_ready(final_ready, model);
+        let mut final_request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: true,
+            batch_size: 1,
+        });
+        final_request
+            .extensions_mut()
+            .insert(crate::auth::IsAdmin(true));
+        service
+            .embed(final_request)
+            .await
+            .expect("published ready snapshot must use its exact model");
+        assert!(
+            calls.load(Ordering::Relaxed) > 0,
+            "ready snapshots must route work through the exact published model"
+        );
     }
 
     #[tokio::test]
@@ -13067,6 +14263,7 @@ mod startup_helper_tests {
             "ListVaultsJson",
             "MaterializeProjects",
             "MergeInstance",
+            "PlanEmbed",
             "PrImpactJson",
             "PruneStale",
             "PurgeInstance",

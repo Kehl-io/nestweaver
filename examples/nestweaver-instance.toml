@@ -24,6 +24,8 @@ backend = "local"
 path = "~/.local/share/nestweaver/acme/workspace"
 
 [inference]
+# Required connection settings for the remote inference subsystem. This is
+# separate from the semantic-search subsystem configured in [embedding] below.
 endpoint = "http://localhost:11434"
 embedding_model = "nomic-embed-text"
 summary_model = "qwen2.5-coder:7b"
@@ -31,21 +33,36 @@ summary_model = "qwen2.5-coder:7b"
 # NESTWEAVER_EMBED_API_KEY environment variable — it is sent as a bearer token and
 # is NEVER written to config, the graph, or a snapshot. Omit it for local Ollama.
 
-# Local semantic-search model + retrieval fusion weights (separate from the
-# external [inference] endpoint above). Optional — sensible defaults apply.
-# [embedding]
-# model_id = "sentence-transformers/all-MiniLM-L6-v2"  # the model a DB is embedded with is recorded + auto-loaded
-# weight_ppr = 0.40      # graph structure (Personalized PageRank)
-# weight_bm25 = 0.25     # text match
-# weight_semantic = 0.35 # embedding similarity
+# [embedding] is independently configured local/external semantic search plus
+# retrieval fusion. Its defaults apply when omitted; it does not inherit values
+# from [inference]. An external endpoint is authoritative: failures are returned
+# directly and never fall back to a local model.
+[embedding]
+model_id = "sentence-transformers/all-MiniLM-L6-v2"
+cache_dir = "~/.cache/nestweaver/models"
+# auto: Metal in a Metal-enabled build; CPU only when Metal is not compiled.
+#       A Metal failure is reported; auto does not retry on CPU.
+# metal: require compiled Metal plus successful device and full inference probes;
+#        a failure is reported and CPU is never selected.
+# cpu: always select CPU and never probe Metal.
+accelerator = "auto"
+# Daemon startup is cache-only and never downloads model files. If the cache is
+# empty, stop the daemon and run:
+# nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>
+weight_ppr = 0.40      # graph structure (Personalized PageRank)
+weight_bm25 = 0.25     # text match
+weight_semantic = 0.35 # embedding similarity
 
 [git]
 credential_method = "gh"
 
 # ── Repositories ──────────────────────────────────────────────────────────
+# `url` is required. `name` is optional, and `type` is optional: `code` is the
+# default; use `vault` for Markdown repositories.
 
 [[repos]]
 url = "https://github.com/acme/web-client"
+name = "web-client"
 
 [[repos]]
 url = "https://github.com/acme/api-service"

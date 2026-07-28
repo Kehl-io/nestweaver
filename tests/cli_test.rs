@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use assert_cmd::assert::OutputAssertExt;
 use nestweaver_engine::sidecar_path;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::process::Command as StdCommand;
 
@@ -40,6 +41,812 @@ fn cli_help_lists_commands() {
         .stdout(contains("symbol"))
         .stdout(contains("search"))
         .stdout(contains("impact"));
+}
+
+#[test]
+fn config_validate_accepts_minimal_fixture() {
+    let config_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/minimal-instance.toml");
+    let output = nestweaver_cmd()
+        .args(["config", "validate"])
+        .arg(&config_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["valid"], true);
+    assert_eq!(result["path"], config_path.display().to_string());
+    assert_eq!(result["instance_id"], "minimal-example");
+    assert_eq!(result["repo_count"], 0);
+}
+
+#[test]
+fn config_validate_rejects_obsolete_instance_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("obsolete-instance.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[instance]
+name = "obsolete-example"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/nestweaver/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/nestweaver/workspace"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[[repos]]
+path = "/tmp/nestweaver/repo"
+"#,
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .args(["config", "validate"])
+        .arg(&config_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(result["valid"], false);
+    assert_eq!(result["path"], config_path.display().to_string());
+    let error = result["error"].as_str().unwrap();
+    assert!(error.contains("[instance]"), "error: {error}");
+    assert!(error.contains("instance_id"), "error: {error}");
+    assert!(error.contains("[[repos]]"), "error: {error}");
+    assert!(error.contains("url"), "error: {error}");
+    assert!(error.contains("path"), "error: {error}");
+}
+
+#[test]
+fn config_validate_has_no_filesystem_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("instance.toml");
+    let db_path = dir.path().join("graph.lbug");
+    let snapshot_path = dir.path().join("snapshots");
+    let workspace_path = dir.path().join("workspace");
+    let missing_repo = dir.path().join("missing-repo");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "side-effect-check"
+db = "{}"
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+[[repos]]
+url = "{}"
+"#,
+            toml_basic_string(&db_path),
+            toml_basic_string(&snapshot_path),
+            toml_basic_string(&workspace_path),
+            toml_basic_string(&missing_repo),
+        ),
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .args(["config", "validate"])
+        .arg(&config_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut entries = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(entries, vec![std::ffi::OsString::from("instance.toml")]);
+}
+
+#[test]
+fn installation_docs_only_claim_live_channels() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut docs = vec![
+        "INSTALL.md",
+        "README.md",
+        "docs/guide/instance-config.md",
+        "docs/server-mode.md",
+        "docs/architecture/project-brain.md",
+        "CLAUDE.md",
+        "npm/README.md",
+        "npm/install.js",
+        "npm/bin/nestweaver",
+    ];
+    if repo_root.join("smithery.yaml").exists() {
+        docs.push("smithery.yaml");
+    }
+    let unsupported_commands = [
+        "npm install -g @kehl-io/nestweaver",
+        "npm install @kehl-io/nestweaver",
+        "cargo install nestweaver",
+        "brew install nestweaver",
+        "npx @kehl-io/nestweaver",
+        "npm exec @kehl-io/nestweaver",
+    ];
+
+    for relative_path in docs {
+        let contents = std::fs::read_to_string(repo_root.join(relative_path))
+            .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
+        for command in unsupported_commands {
+            assert!(
+                !contents.contains(command),
+                "{relative_path} advertises unavailable installation command `{command}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn ladybug_hotfix_dependency_is_immutable_and_built_from_source() {
+    const LBUG_RUST_FORK: &str = "https://github.com/kory-io/ladybug-rust.git";
+    const LBUG_RUST_REV: &str = "8992183ff8de526e8a852be8a97ad04b412f56ed";
+
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(repo_root.join("Cargo.toml")).unwrap();
+    let lockfile = std::fs::read_to_string(repo_root.join("Cargo.lock")).unwrap();
+    let cargo_config = std::fs::read_to_string(repo_root.join(".cargo/config.toml")).unwrap();
+    let installation = std::fs::read_to_string(repo_root.join("INSTALL.md")).unwrap();
+    let ci_workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let release_workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let dockerfile = std::fs::read_to_string(repo_root.join("Dockerfile")).unwrap();
+    let dockerignore = std::fs::read_to_string(repo_root.join(".dockerignore")).unwrap();
+
+    assert!(
+        manifest.contains("[patch.crates-io]"),
+        "the temporary lbug fork must be a workspace-level crates.io patch"
+    );
+    assert!(
+        manifest.contains(&format!(
+            "lbug = {{ git = \"{LBUG_RUST_FORK}\", rev = \"{LBUG_RUST_REV}\" }}"
+        )),
+        "Cargo.toml must pin the reviewed lbug wrapper commit"
+    );
+    assert!(
+        lockfile.contains(&format!(
+            "source = \"git+{LBUG_RUST_FORK}?rev={LBUG_RUST_REV}#{LBUG_RUST_REV}\""
+        )),
+        "Cargo.lock must resolve lbug to the exact reviewed wrapper commit"
+    );
+    assert!(
+        cargo_config.contains("LBUG_BUILD_FROM_SOURCE = { value = \"1\", force = true }"),
+        "workspace builds must compile the pinned Ladybug submodule instead of downloading a prebuilt archive"
+    );
+    for (workflow_name, workflow) in [
+        ("ci.yml", ci_workflow.as_str()),
+        ("release-please.yml", release_workflow.as_str()),
+    ] {
+        assert!(
+            !workflow.contains(" > .cargo/config.toml"),
+            "{workflow_name} must not overwrite the workspace source-build configuration"
+        );
+    }
+    for native_dependency in [
+        "cmake",
+        "g++",
+        "libssl-dev",
+        "libzstd-dev",
+        "pkg-config",
+        "protobuf-compiler",
+    ] {
+        assert!(
+            dockerfile.contains(native_dependency),
+            "Dockerfile must install Ladybug source-build dependency `{native_dependency}`"
+        );
+    }
+    assert!(
+        !dockerignore.lines().any(|line| line.trim() == ".cargo/"),
+        "the Docker build context must include the workspace source-build configuration"
+    );
+    assert!(
+        dockerfile.contains("cargo build --locked --release --bin nestweaver"),
+        "the Docker image must resolve the reviewed dependency lockfile without updating it"
+    );
+    for required_provenance in [
+        LBUG_RUST_REV,
+        "9e221866e08371d380c8bd91f7bc98d101ebf723",
+        "https://github.com/LadybugDB/ladybug/pull/737",
+        ".cargo/config.toml",
+        "LBUG_BUILD_FROM_SOURCE=1",
+    ] {
+        assert!(
+            installation.contains(required_provenance),
+            "INSTALL.md must document Ladybug provenance and source-build requirement `{required_provenance}`"
+        );
+    }
+}
+
+#[test]
+fn embedding_docs_match_runtime_contract() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let documentation = [
+        ("README.md", "README.md"),
+        ("instance config guide", "docs/guide/instance-config.md"),
+        ("server mode guide", "docs/server-mode.md"),
+        (
+            "annotated instance config",
+            "examples/nestweaver-instance.toml",
+        ),
+    ]
+    .map(|(label, relative_path)| {
+        let contents = std::fs::read_to_string(repo_root.join(relative_path))
+            .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
+        (label, contents)
+    });
+
+    let combined = documentation
+        .iter()
+        .map(|(_, contents)| contents.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let combined_lowercase = combined.to_lowercase();
+
+    for obsolete_claim in [
+        "cpu fallback",
+        "fallback to cpu",
+        "downloads automatically",
+        "daemon's main thread",
+        "external-to-local fallback",
+    ] {
+        assert!(
+            !combined_lowercase.contains(obsolete_claim),
+            "embedding docs contain obsolete claim `{obsolete_claim}`"
+        );
+    }
+
+    for required_contract in [
+        "Metal in a Metal-enabled build; CPU only when Metal is not compiled",
+        "A Metal failure is reported; `auto` does not retry on CPU",
+        "`metal`",
+        "`cpu`",
+        "Daemon startup is cache-only",
+        "nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>",
+        "nestweaver diagnostics capabilities --json",
+        "nestweaver daemon --db <path> status",
+        "nestweaver brain status --db <path> --json",
+        "nestweaver daemon --db \"$DB\" start --config \"$CONFIG\"",
+        "nestweaver embed --db \"$DB\" --local --model-id \"$MODEL\" --cache-dir \"$CACHE\" --force",
+        "`requested_device`",
+        "`selected_device`",
+        "`fallback_used`",
+        "`degraded_components`",
+    ] {
+        assert!(
+            combined.contains(required_contract),
+            "embedding docs are missing runtime contract `{required_contract}`"
+        );
+    }
+
+    let required_by_document: &[(&str, &[&str])] = &[
+        (
+            "README.md",
+            &[
+                "**Device policy.**",
+                "**Model selection and cache.**",
+                "**External embedding endpoints.**",
+                "**Readiness and diagnostics.**",
+                "CONFIG=/absolute/path/to/nestweaver-instance.toml",
+            ],
+        ),
+        (
+            "instance config guide",
+            &[
+                "Device policies for the local backend are exact:",
+                "An external endpoint is authoritative.",
+                "Do not omit `--local`",
+                "Switching from an external backend to a local model",
+            ],
+        ),
+        (
+            "server mode guide",
+            &[
+                "### Embedding backend and readiness",
+                "### Embedding or semantic retrieval unavailable",
+                "`metal_compiled = false`",
+                "`selected_device = \"\"`",
+                "--cache-dir \"$CACHE\" --force",
+            ],
+        ),
+    ];
+    for (label, required_claims) in required_by_document {
+        let contents = documentation
+            .iter()
+            .find_map(|(candidate, contents)| (candidate == label).then_some(contents))
+            .unwrap_or_else(|| panic!("{label} must be part of the documentation contract"));
+        for required_claim in *required_claims {
+            assert!(
+                contents.contains(required_claim),
+                "{label} is missing `{required_claim}`"
+            );
+        }
+    }
+
+    let example = documentation
+        .iter()
+        .find_map(|(label, contents)| (*label == "annotated instance config").then_some(contents))
+        .expect("annotated instance config must be part of the documentation contract");
+    for required_example_claim in [
+        "accelerator = \"auto\"",
+        "# auto:",
+        "# metal:",
+        "# cpu:",
+        "# Daemon startup is cache-only",
+    ] {
+        assert!(
+            example.contains(required_example_claim),
+            "annotated instance config is missing `{required_example_claim}`"
+        );
+    }
+}
+
+fn workflow_step<'a>(workflow: &'a str, name: &str) -> &'a str {
+    let marker = format!("      - name: {name}\n");
+    let start = workflow
+        .find(&marker)
+        .unwrap_or_else(|| panic!("workflow is missing step `{name}`"));
+    let remainder = &workflow[start + marker.len()..];
+    remainder
+        .split("\n      - ")
+        .next()
+        .expect("step body must be present")
+}
+
+fn release_matrix(workflow: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let marker = "      matrix:\n        include:\n";
+    let matrix = workflow
+        .split_once(marker)
+        .expect("release workflow must define an include matrix")
+        .1
+        .split_once("\n    steps:\n")
+        .expect("release matrix must be followed by build steps")
+        .0;
+    let mut entries = Vec::new();
+    let mut current: Option<(String, Option<String>, Option<String>)> = None;
+
+    for line in matrix.lines().map(str::trim) {
+        if let Some(target) = line.strip_prefix("- target: ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some((target.trim_matches(['"', '\'']).to_string(), None, None));
+        } else if let Some(os) = line.strip_prefix("os: ") {
+            current.as_mut().expect("os must follow target").1 =
+                Some(os.trim_matches(['"', '\'']).to_string());
+        } else if let Some(features) = line.strip_prefix("features: ") {
+            current.as_mut().expect("features must follow target").2 =
+                Some(features.trim_matches(['"', '\'']).to_string());
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+#[test]
+fn release_workflow_matrix_assigns_metal_only_to_apple_targets() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let entries = release_matrix(&workflow);
+    let actual = entries
+        .iter()
+        .cloned()
+        .map(|(target, os, features)| (target, (os, features)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let expected = std::collections::BTreeMap::from([
+        (
+            "aarch64-apple-darwin".to_string(),
+            (Some("macos-latest".to_string()), Some("metal".to_string())),
+        ),
+        (
+            "aarch64-unknown-linux-gnu".to_string(),
+            (Some("ubuntu-24.04-arm".to_string()), Some(String::new())),
+        ),
+        (
+            "x86_64-apple-darwin".to_string(),
+            (
+                Some("macos-15-intel".to_string()),
+                Some("metal".to_string()),
+            ),
+        ),
+        (
+            "x86_64-unknown-linux-gnu".to_string(),
+            (Some("ubuntu-latest".to_string()), Some(String::new())),
+        ),
+    ]);
+
+    assert_eq!(
+        entries.len(),
+        actual.len(),
+        "release matrix must not contain duplicate targets"
+    );
+    assert_eq!(
+        actual, expected,
+        "release target/os/features contract drifted"
+    );
+}
+
+#[test]
+fn release_workflow_build_quotes_target_and_conditionally_enables_features() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let step = workflow_step(&workflow, "Build binary");
+
+    for required in [
+        "TARGET: ${{ matrix.target }}",
+        "FEATURES: ${{ matrix.features }}",
+        "if [ -n \"$FEATURES\" ]; then",
+        "cargo build --locked --release --target \"$TARGET\" --features \"$FEATURES\"",
+        "cargo build --locked --release --target \"$TARGET\"",
+    ] {
+        assert!(
+            step.contains(required),
+            "Build binary must contain `{required}`\nstep:\n{step}"
+        );
+    }
+}
+
+#[test]
+fn release_workflow_stages_openssl_outside_build_script_out_dir() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let step = workflow_step(&workflow, "Build target OpenSSL");
+
+    assert!(
+        !step.contains("OPENSSL_INSTALL=\"$(find"),
+        "OpenSSL exports must not reference openssl-sys's self-deleting OUT_DIR\nstep:\n{step}"
+    );
+    for required in [
+        "TARGET: ${{ matrix.target }}",
+        "cargo build --locked --release --target \"$TARGET\" -p openssl-sys",
+        "OPENSSL_SOURCE=\"$(find \"target/$TARGET/release/build\"",
+        "OPENSSL_INSTALL=\"$RUNNER_TEMP/nestweaver-openssl/$TARGET\"",
+        "mkdir -p \"$OPENSSL_INSTALL\"",
+        "cp -R \"$OPENSSL_SOURCE/.\" \"$OPENSSL_INSTALL/\"",
+        "test -f \"$OPENSSL_INSTALL/lib/libssl.a\"",
+        "test -f \"$OPENSSL_INSTALL/lib/libcrypto.a\"",
+        "test -f \"$OPENSSL_INSTALL/include/openssl/ssl.h\"",
+        "test -f \"$OPENSSL_INSTALL/include/openssl/opensslconf.h\"",
+        "echo \"OPENSSL_DIR=$OPENSSL_INSTALL\"",
+        "echo \"OPENSSL_ROOT_DIR=$OPENSSL_INSTALL\"",
+        "echo \"OPENSSL_LIB_DIR=$OPENSSL_INSTALL/lib\"",
+        "echo \"OPENSSL_INCLUDE_DIR=$OPENSSL_INSTALL/include\"",
+        "echo \"CMAKE_PREFIX_PATH=$OPENSSL_INSTALL\"",
+    ] {
+        assert!(
+            step.contains(required),
+            "OpenSSL staging must contain `{required}`\nstep:\n{step}"
+        );
+    }
+}
+
+#[test]
+fn release_workflow_native_apple_verifies_metal_capability_and_artifact() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let verify_binary = workflow_step(&workflow, "Verify release binary");
+
+    for preserved in [
+        "x86_64-apple-darwin) echo \"$FILE_INFO\" | grep -q 'x86_64'",
+        "aarch64-apple-darwin) echo \"$FILE_INFO\" | grep -Eq 'arm64|ARM64'",
+        "otool -L \"$BIN\"",
+        "release binary has a non-system OpenSSL dependency",
+    ] {
+        assert!(
+            verify_binary.contains(preserved),
+            "release artifact validation must preserve `{preserved}`"
+        );
+    }
+
+    let capability = workflow_step(&workflow, "Verify Apple Metal capability");
+    for required in [
+        "if: runner.os == 'macOS'",
+        "TARGET: ${{ matrix.target }}",
+        "BIN=\"target/$TARGET/release/nestweaver\"",
+        "CAPABILITIES=\"$(\"$BIN\" diagnostics capabilities --json)\"",
+        "jq -e '.metal_compiled == true' <<< \"$CAPABILITIES\"",
+    ] {
+        assert!(
+            capability.contains(required),
+            "Apple capability step must contain `{required}`\nstep:\n{capability}"
+        );
+    }
+}
+
+#[test]
+fn ci_runs_release_workflow_contract_when_release_definition_changes() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let rust_filter = workflow
+        .split_once("            rust:\n")
+        .expect("CI must define the Rust change filter")
+        .1
+        .split_once("            frontend:\n")
+        .expect("Rust filter must precede the frontend filter")
+        .0;
+
+    assert!(
+        rust_filter.contains("- '.github/workflows/release-please.yml'"),
+        "changing release-please.yml must select the Rust test job"
+    );
+    assert!(
+        workflow.contains("cargo test --locked --workspace"),
+        "selected Rust changes must execute the workspace tests containing this contract"
+    );
+}
+
+#[test]
+fn ci_runs_for_staging_pull_requests() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        workflow.contains("  pull_request:\n    branches: [main, staging]"),
+        "feature-to-staging pull requests must run the same CI gate as main"
+    );
+}
+
+#[test]
+fn ci_metal_smoke_is_required_and_narrowly_routed_to_apple_hardware_changes() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let filters = workflow
+        .split_once("          filters: |\n")
+        .expect("CI must define path filters")
+        .1
+        .split_once("\n\n  fmt:")
+        .expect("change filters must precede CI jobs")
+        .0;
+    let metal_filter = filters
+        .split_once("            metal:\n")
+        .expect("CI must define a Metal smoke-test change filter")
+        .1
+        .split_once("            frontend:\n")
+        .expect("Metal filter must precede the frontend filter")
+        .0;
+
+    for selected_path in [
+        "crates/nestweaver-embed/**",
+        "crates/nestweaver-daemon/src/lifecycle.rs",
+        "crates/nestweaver-daemon/src/launchd.rs",
+        "crates/nestweaver-daemon/src/server.rs",
+        "crates/nestweaver-daemon/Cargo.toml",
+        "crates/nestweaver-client/src/autostart.rs",
+        "src/main.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release-please.yml",
+        "tests/metal_smoke.rs",
+    ] {
+        assert!(
+            metal_filter.contains(&format!("- '{selected_path}'")),
+            "Metal filter must select `{selected_path}`\nfilter:\n{metal_filter}"
+        );
+    }
+    assert!(
+        !metal_filter.contains("'**/*.rs'"),
+        "Metal smoke must not run for every Rust change"
+    );
+
+    let job = workflow
+        .split_once("\n  metal-smoke:\n")
+        .expect("CI must define a metal-smoke job")
+        .1
+        .split_once("\n  fmt:\n")
+        .expect("metal-smoke must be a top-level job")
+        .0;
+    for required in [
+        "needs: changes",
+        "if: needs.changes.outputs.metal == 'true'",
+        "runs-on: macos-latest",
+        "test \"$(uname -m)\" = \"arm64\"",
+    ] {
+        assert!(
+            job.contains(required),
+            "metal-smoke job must contain `{required}`\njob:\n{job}"
+        );
+    }
+    assert!(
+        !job.contains("continue-on-error: true"),
+        "Metal smoke is a required gate, not an informational job"
+    );
+}
+
+#[test]
+fn ci_metal_smoke_gates_offline_cold_and_warm_daemon_inference() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    let job = workflow
+        .split_once("\n  metal-smoke:\n")
+        .expect("CI must define a metal-smoke job")
+        .1
+        .split_once("\n  fmt:\n")
+        .expect("metal-smoke must be a top-level job")
+        .0;
+
+    let cache_setup = workflow_step(job, "Populate model cache on CPU");
+    for required in [
+        "--no-daemon",
+        "--accelerator cpu",
+        "--cache-dir \"$MODEL_CACHE\"",
+        "--db \"$SETUP_DB\"",
+    ] {
+        assert!(
+            cache_setup.contains(required),
+            "network-enabled cache setup must contain `{required}`\nstep:\n{cache_setup}"
+        );
+    }
+
+    let cache_contract = workflow_step(job, "Verify daemon cache-only contract");
+    assert!(
+        cache_contract.contains("daemon_embedding_startup_constructs_cached_model_offline"),
+        "the hardware gate must execute the focused CacheOnly daemon contract"
+    );
+
+    let path_setup = workflow_step(job, "Configure isolated smoke paths");
+    for required in [
+        "RUNTIME_DIR=\"$HOME/.local/state/nestweaver/$INSTANCE_ID\"",
+        "echo \"RUNTIME_DIR=$RUNTIME_DIR\"",
+    ] {
+        assert!(
+            path_setup.contains(required),
+            "path setup must export the exact per-instance runtime directory via `{required}`"
+        );
+    }
+
+    let preflight = workflow_step(job, "Assert clean daemon preconditions");
+    assert!(
+        preflight.contains("apple_hardware::cold_daemon_preconditions_are_clean"),
+        "the cold gate must select exactly the module-qualified precondition test"
+    );
+
+    let cold = workflow_step(job, "Cold Metal daemon inference");
+    for required in [
+        "index --repo testdata/js --db \"$TARGET_DB\" --config \"$TARGET_CONFIG\"",
+        "requested_device == \"metal\"",
+        "selected_device == \"metal\"",
+        "fallback_used == false",
+        "embed --db \"$TARGET_DB\" --scope symbols --force",
+        "Embedding via daemon",
+        "launchctl print",
+        "test -f \"$PLIST_PATH\"",
+    ] {
+        assert!(
+            cold.contains(required),
+            "cold inference must contain `{required}`\nstep:\n{cold}"
+        );
+    }
+    assert!(
+        !cold.contains("--no-daemon"),
+        "the cold gate must exercise normal client autostart"
+    );
+
+    let warm = workflow_step(job, "Restart and repeat warm Metal inference");
+    for required in [
+        "daemon --db \"$TARGET_DB\" stop",
+        "brain status --db \"$TARGET_DB\" --config \"$TARGET_CONFIG\" --json",
+        "requested_device == \"metal\"",
+        "selected_device == \"metal\"",
+        "fallback_used == false",
+        "embed --db \"$TARGET_DB\" --scope symbols --force",
+        "Embedding via daemon",
+        "launchctl print",
+        "test -f \"$PLIST_PATH\"",
+    ] {
+        assert!(
+            warm.contains(required),
+            "warm inference must contain `{required}`\nstep:\n{warm}"
+        );
+    }
+
+    let hardware = workflow_step(job, "Verify cache-only Metal vector");
+    assert!(
+        hardware.contains("apple_hardware::metal_embedding_is_finite_normalized_and_uses_metal"),
+        "the direct vector check must select exactly the module-qualified Metal test"
+    );
+
+    let evidence = workflow_step(job, "Collect Metal smoke evidence");
+    for required in [
+        "if: failure()",
+        "diagnostics capabilities --json",
+        "daemon.log",
+    ] {
+        assert!(
+            evidence.contains(required),
+            "failure evidence must contain `{required}`\nstep:\n{evidence}"
+        );
+    }
+    let upload = workflow_step(job, "Upload Metal smoke evidence");
+    for required in [
+        "if: failure()",
+        "actions/upload-artifact@",
+        "metal-smoke-evidence",
+    ] {
+        assert!(
+            upload.contains(required),
+            "failure upload must contain `{required}`\nstep:\n{upload}"
+        );
+    }
+
+    let cleanup = workflow_step(job, "Clean up isolated Metal daemon");
+    for required in [
+        "daemon_stopped=false",
+        "daemon_stopped=true",
+        "[ -n \"${INSTANCE_ID:-}\" ]",
+        "[ \"${RUNTIME_DIR:-}\" = \"$HOME/.local/state/nestweaver/$INSTANCE_ID\" ]",
+        "\"$HOME/.local/state/nestweaver/\"?*",
+        "rm -rf -- \"$RUNTIME_DIR\"",
+    ] {
+        assert!(
+            cleanup.contains(required),
+            "cleanup must remove only the stopped instance's scoped runtime directory via \
+             `{required}`\nstep:\n{cleanup}"
+        );
+    }
+    let stop_position = cleanup
+        .find("target/release/nestweaver daemon --db \"$TARGET_DB\" stop")
+        .unwrap();
+    let runtime_remove_position = cleanup.find("rm -rf -- \"$RUNTIME_DIR\"").unwrap();
+    assert!(
+        stop_position < runtime_remove_position,
+        "the exact per-instance runtime directory may be removed only after the scoped daemon stop"
+    );
+
+    let setup_position = job.find("- name: Populate model cache on CPU").unwrap();
+    let cold_position = job.find("- name: Cold Metal daemon inference").unwrap();
+    let direct_position = job.find("- name: Verify cache-only Metal vector").unwrap();
+    assert!(
+        setup_position < cold_position && cold_position < direct_position,
+        "CPU cache population must precede the daemon's first Metal operation, and direct Metal \
+         verification must run only afterward"
+    );
 }
 
 #[test]
@@ -1327,7 +2134,8 @@ fn cli_daemon_run_server_help() {
         .stdout(contains("--tls-key"))
         .stdout(contains("--auth-token"))
         .stdout(contains("--admin-token"))
-        .stdout(contains("--port-file"));
+        .stdout(contains("--port-file"))
+        .stdout(predicates::str::contains("--idle-timeout").not());
 }
 
 #[test]
@@ -2479,5 +3287,110 @@ fn cli_abort_migration_corrupt_journal_force_discards() {
     assert!(
         !journal_path.exists(),
         "--force must remove the corrupt journal"
+    );
+}
+
+// ── release help-text contract ───────────────────────────────────────────
+// The unit guard in src/main.rs proves every command and visible arg carries
+// *some* help string. These assert that the specific commands shipped in this
+// release describe what they actually do, which a presence check cannot.
+
+#[test]
+fn cli_help_documents_the_commands_shipped_in_this_release() {
+    // (argv, substring the help must contain)
+    let cases: &[(&[&str], &str)] = &[
+        (&["config", "validate", "--help"], "without creating files"),
+        (&["diagnostics", "capabilities", "--help"], "metal"),
+        (&["instance", "abort-migration", "--help"], "journal"),
+        (&["embed", "--help"], "--force"),
+    ];
+
+    for (args, expected) in cases {
+        let output = nestweaver_cmd()
+            .args(*args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run `{}`: {e}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "`nestweaver {}` exited {:?}: {}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        assert!(
+            help.contains(&expected.to_lowercase()),
+            "`nestweaver {}` help does not mention {expected:?}. Full help:\n{help}",
+            args.join(" ")
+        );
+    }
+}
+
+/// Every direct CLI invocation in the test suite must pin its daemon routing.
+///
+/// CI exports `NESTWEAVER_NO_DAEMON=1` for the whole job while local runs do
+/// not, so an invocation that neither sets nor clears it takes a different code
+/// path on each — which is how the embed-preflight test passed locally and
+/// failed only on CI.
+///
+/// This checks each binary-invocation chain individually, not merely whether
+/// the file mentions the variable somewhere: the file that carried the bug
+/// already pinned routing on 28 other invocations.
+///
+/// Scoped to invocations that pass `--db`, since daemon routing is only
+/// selected for local-database commands — a `server status --url ...` call
+/// talks to a remote server over HTTP and has no routing to pin.
+#[test]
+fn every_cli_invocation_pins_its_daemon_routing() {
+    let suite_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut unpinned = Vec::new();
+
+    for entry in std::fs::read_dir(&suite_dir).expect("read tests/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let src = std::fs::read_to_string(&path).expect("read test source");
+
+        // Build the constructor token at runtime so this scanner does not
+        // match its own source when it scans tests/cli_test.rs.
+        let needle = format!("CARGO_BIN_EXE_{}", "nestweaver");
+        for (idx, _) in src.match_indices(needle.as_str()) {
+            // Skip mentions inside comments (docs, not invocations).
+            let line_start = src[..idx].rfind('\n').map_or(0, |i| i + 1);
+            if src[line_start..idx].trim_start().starts_with("//") {
+                continue;
+            }
+            // The builder chain runs from the constructor to whichever
+            // terminal call executes it.
+            let rest = &src[idx..];
+            let end = [
+                "\n        .output()",
+                "\n        .status()",
+                "\n        .assert()",
+            ]
+            .iter()
+            .filter_map(|t| rest.find(t))
+            .min()
+            .unwrap_or_else(|| rest.len().min(1200));
+            let chain = &rest[..end];
+            // Only local-database commands select a daemon route.
+            if !chain.contains("\"--db\"") {
+                continue;
+            }
+            if !chain.contains("NESTWEAVER_NO_DAEMON") {
+                let line = src[..idx].matches('\n').count() + 1;
+                unpinned.push(format!("{name}:{line}"));
+            }
+        }
+    }
+
+    unpinned.sort();
+    assert!(
+        unpinned.is_empty(),
+        "these CLI invocations do not pin daemon routing — set \
+         .env(\"NESTWEAVER_NO_DAEMON\", \"1\") for the direct path, or \
+         .env_remove(\"NESTWEAVER_NO_DAEMON\") for the daemon path: {unpinned:?}"
     );
 }

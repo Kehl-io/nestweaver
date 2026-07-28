@@ -108,13 +108,15 @@ signal-hook = "0.4"
 nestweaver-daemon = { workspace = true }
 nestweaver-client = { workspace = true }
 nestweaver-proto = { workspace = true }
-daemonize2 = "0.7"
 libc = "0.2"
 sha2 = { workspace = true }
 hex = "0.4"
 tonic.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 nestweaver-embed = { workspace = true, optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+daemonize2 = "0.7"
 
 [features]
 default = ["embed"]
@@ -135,6 +137,7 @@ criterion = { version = "0.8", default-features = false }
 nestweaver-daemon = { workspace = true }
 nestweaver-proto = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 libc = "0.2"
 blake3 = { workspace = true }
@@ -157,3 +160,9 @@ test = false
 name = "index_benchmarks"
 harness = false
 test = false
+
+# Temporary source override for the filtered multi-segment string-scan fix.
+# Remove this patch after the upstream fix is released in an lbug version that
+# passes NestWeaver's storage regression suite.
+[patch.crates-io]
+lbug = { git = "https://github.com/kory-io/ladybug-rust.git", rev = "8992183ff8de526e8a852be8a97ad04b412f56ed" }

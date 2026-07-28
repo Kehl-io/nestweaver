@@ -5,16 +5,65 @@ pub mod preprocess;
 use std::path::PathBuf;
 
 use anyhow::Result;
+pub use local::{ArtifactMode, MissingModelArtifactError, ModelArtifacts, resolve_model_artifacts};
+
+/// Requested device-selection policy for the local embedding backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DevicePolicy {
+    #[default]
+    Auto,
+    Metal,
+    Cpu,
+}
+
+/// Device selected for a loaded local embedding backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Metal,
+    Cpu,
+}
+
+/// Embedding backend used by an [`EmbedModel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingBackendKind {
+    Local,
+    External,
+}
 
 /// Check if Metal GPU acceleration is available on this machine.
 pub fn is_metal_available() -> bool {
+    probe_metal_runtime().is_ok()
+}
+
+/// Whether this embedding crate was compiled with Candle's Metal backend.
+pub const fn metal_compiled() -> bool {
+    cfg!(feature = "metal")
+}
+
+/// Run a tiny Metal compute/readback probe without loading model artifacts.
+///
+/// Creating a Metal device alone does not prove kernels can compile and
+/// execute. The affine operation forces a real GPU kernel and `to_vec1`
+/// synchronizes/readbacks its result.
+pub fn probe_metal_runtime() -> Result<()> {
     #[cfg(feature = "metal")]
     {
-        std::panic::catch_unwind(|| candle_core::Device::new_metal(0).is_ok()).unwrap_or(false)
+        std::panic::catch_unwind(|| -> Result<()> {
+            let device = candle_core::Device::new_metal(0)?;
+            let input = candle_core::Tensor::from_slice(&[1.0_f32, 2.0], 2, &device)?;
+            let output = input.affine(2.0, 1.0)?;
+            let values = output.to_vec1::<f32>()?;
+            anyhow::ensure!(
+                values == [3.0_f32, 5.0],
+                "Metal compute/readback returned unexpected values: {values:?}"
+            );
+            Ok(())
+        })
+        .map_err(|_| anyhow::anyhow!("Metal runtime probe panicked"))?
     }
     #[cfg(not(feature = "metal"))]
     {
-        false
+        anyhow::bail!("Metal support was not compiled into this binary")
     }
 }
 
@@ -57,51 +106,99 @@ fn default_cache_dir() -> PathBuf {
 }
 
 pub struct EmbedModel {
-    local: local::LocalModel,
+    backend: EmbedBackend,
     config: EmbedConfig,
 }
 
+enum EmbedBackend {
+    Local(Box<local::LocalModel>),
+    External,
+}
+
 impl EmbedModel {
+    /// Load using the default automatic device-selection policy.
     pub fn load(config: &EmbedConfig) -> Result<Self> {
-        let local = local::LocalModel::load(config)?;
+        Self::load_with_policy(config, DevicePolicy::Auto)
+    }
+
+    /// Load with an explicit device-selection policy for the local backend.
+    /// The policy is ignored by an external backend, which never loads local
+    /// inference as a fallback.
+    pub fn load_with_policy(config: &EmbedConfig, policy: DevicePolicy) -> Result<Self> {
+        Self::load_with_policy_and_artifact_mode(config, policy, ArtifactMode::DownloadMissing)
+    }
+
+    /// Load with explicit device and artifact-resolution policies.
+    pub fn load_with_policy_and_artifact_mode(
+        config: &EmbedConfig,
+        policy: DevicePolicy,
+        mode: ArtifactMode,
+    ) -> Result<Self> {
+        let backend = if config.external_endpoint.is_some() {
+            EmbedBackend::External
+        } else {
+            EmbedBackend::Local(Box::new(
+                local::LocalModel::load_with_policy_and_artifact_mode(config, policy, mode)?,
+            ))
+        };
         Ok(Self {
-            local,
+            backend,
             config: config.clone(),
         })
     }
 
-    /// Dimension of the LOCAL fallback model. NOTE: when an external endpoint is
-    /// configured, actual vectors come from the remote model via `embed()`, whose
-    /// dimension may differ — callers must not treat this as the effective query
-    /// dimension in that case (see `uses_external_endpoint`).
+    /// Embedding dimension, preserving the original public API. External
+    /// backends have no trustworthy dimension at load time and return `0`.
     pub fn dimension(&self) -> usize {
-        self.local.dimension()
+        self.known_dimension().unwrap_or(0)
     }
 
-    /// Whether this model produces vectors via a configured external endpoint
-    /// (remote model) rather than the local fallback. When true, `dimension()`
-    /// (the local dim) is NOT the effective query dimension.
+    /// Dimension known at model-load time. External services do not provide a
+    /// trustworthy dimension until they return an embedding.
+    pub fn known_dimension(&self) -> Option<usize> {
+        match &self.backend {
+            EmbedBackend::Local(model) => Some(model.dimension()),
+            EmbedBackend::External => None,
+        }
+    }
+
+    /// Whether this model produces vectors via a configured external endpoint.
     pub fn uses_external_endpoint(&self) -> bool {
-        self.config.external_endpoint.is_some()
+        self.backend_kind() == EmbeddingBackendKind::External
+    }
+
+    pub fn backend_kind(&self) -> EmbeddingBackendKind {
+        match self.backend {
+            EmbedBackend::Local(_) => EmbeddingBackendKind::Local,
+            EmbedBackend::External => EmbeddingBackendKind::External,
+        }
+    }
+
+    /// Selected local device, if this model has a local backend.
+    pub fn device_kind(&self) -> Option<DeviceKind> {
+        match &self.backend {
+            EmbedBackend::Local(model) => Some(model.device_kind()),
+            EmbedBackend::External => None,
+        }
     }
 
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if let Some(ref endpoint) = self.config.external_endpoint {
-            let model = self
-                .config
-                .external_model
-                .as_deref()
-                .unwrap_or("text-embedding-3-small");
-            match external::embed_via_api(endpoint, model, texts) {
-                Ok(embeddings) => return Ok(embeddings),
-                Err(e) => {
-                    tracing::warn!(
-                        "External embedding API failed, falling back to local model: {e}"
-                    );
-                }
+        match &self.backend {
+            EmbedBackend::Local(model) => model.embed(texts),
+            EmbedBackend::External => {
+                let endpoint = self
+                    .config
+                    .external_endpoint
+                    .as_deref()
+                    .expect("external backend requires an endpoint");
+                let model = self
+                    .config
+                    .external_model
+                    .as_deref()
+                    .unwrap_or("text-embedding-3-small");
+                external::embed_via_api(endpoint, model, texts)
             }
         }
-        self.local.embed(texts)
     }
 
     pub fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
@@ -110,5 +207,61 @@ impl EmbedModel {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("embed returned empty results"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metal_capability_distinguishes_compile_support_from_runtime_probe() {
+        assert_eq!(metal_compiled(), cfg!(feature = "metal"));
+        if !metal_compiled() {
+            let error = probe_metal_runtime()
+                .expect_err("a build without Metal must not report a successful runtime probe");
+            assert!(error.to_string().contains("not compiled"));
+        }
+    }
+
+    #[test]
+    fn external_failure_does_not_load_local() {
+        let config = EmbedConfig {
+            model_id: "definitely-not-a-local-model".to_string(),
+            cache_dir: std::env::temp_dir().join("nestweaver-empty-embedding-cache"),
+            external_endpoint: Some("http://127.0.0.1:9".to_string()),
+            external_model: Some("test-embedding-model".to_string()),
+        };
+
+        let model = EmbedModel::load_with_policy(&config, DevicePolicy::Cpu)
+            .expect("external backend must load without a local model or cache");
+        assert_eq!(model.backend_kind(), EmbeddingBackendKind::External);
+        assert_eq!(model.device_kind(), None);
+        assert_eq!(model.dimension(), 0);
+        assert_eq!(model.known_dimension(), None);
+
+        let err = model
+            .embed(&["query"])
+            .expect_err("a closed external endpoint must return its error");
+        assert!(err.to_string().contains("embedding API"));
+    }
+
+    #[test]
+    fn external_backend_never_resolves_local_artifacts() {
+        let config = EmbedConfig {
+            model_id: "definitely-not-a-local-model".to_string(),
+            cache_dir: std::env::temp_dir().join("nestweaver-missing-external-artifact-cache"),
+            external_endpoint: Some("http://127.0.0.1:9".to_string()),
+            external_model: Some("test-embedding-model".to_string()),
+        };
+
+        let model = EmbedModel::load_with_policy_and_artifact_mode(
+            &config,
+            DevicePolicy::Cpu,
+            ArtifactMode::CacheOnly,
+        )
+        .expect("external backend must not inspect the local artifact cache");
+
+        assert_eq!(model.backend_kind(), EmbeddingBackendKind::External);
     }
 }

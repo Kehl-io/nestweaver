@@ -3650,8 +3650,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "lbug"
 version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf427c75bcdc5768ba41933235e14dbfbf7fe9b14e6ad079d8174d6a2bd7d77c"
+source = "git+https://github.com/kory-io/ladybug-rust.git?rev=8992183ff8de526e8a852be8a97ad04b412f56ed#8992183ff8de526e8a852be8a97ad04b412f56ed"
 dependencies = [
  "cmake",
  "cxx",
@@ -4105,6 +4104,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tonic",
+ "tonic-prost",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4148,6 +4148,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
  "dirs",
  "futures",
  "governor",
@@ -4169,6 +4172,7 @@ dependencies = [
  "sha2 0.11.0",
  "subtle",
  "tempfile",
+ "tokenizers 0.23.1",
  "tokio",
  "tokio-rustls",
  "tokio-rustls-acme",

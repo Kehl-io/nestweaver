@@ -34,8 +34,7 @@ fn daemon_cmd() -> Command {
     let mut cmd = Command::cargo_bin("nestweaver").unwrap();
     cmd.env_remove("NESTWEAVER_NO_DAEMON");
     cmd.env_remove("NESTWEAVER_ALLOW_NO_DAEMON");
-    // Use fork-based daemon in tests — launchd agents don't work
-    // reliably in the cargo test environment.
+    #[cfg(not(target_os = "macos"))]
     cmd.env("NESTWEAVER_DAEMON_FORK", "1");
     cmd
 }
@@ -250,8 +249,9 @@ fn run_direct(db_path: &Path, args: &[&str]) -> Output {
 fn run_via_daemon(db_path: &Path, args: &[&str]) -> Output {
     let mut cmd = StdCommand::new(bin_path());
     cmd.env_remove("NESTWEAVER_NO_DAEMON")
-        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
-        .env("NESTWEAVER_DAEMON_FORK", "1");
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON");
+    #[cfg(not(target_os = "macos"))]
+    cmd.env("NESTWEAVER_DAEMON_FORK", "1");
     cmd.args(args)
         .arg("--db")
         .arg(db_path.display().to_string());

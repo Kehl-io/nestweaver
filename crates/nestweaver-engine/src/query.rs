@@ -20,6 +20,13 @@ pub trait EmbedQueryFn: Send + Sync {
     fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>>;
 }
 
+/// Supplies the current embedding model from a runtime-owned readiness
+/// snapshot. Daemon transports use this indirection so every handler observes
+/// the model published atomically with its readiness state.
+pub trait EmbedModelProvider: Send + Sync {
+    fn current_model(&self) -> Option<std::sync::Arc<dyn EmbedQueryFn>>;
+}
+
 #[cfg(feature = "embed")]
 impl EmbedQueryFn for nestweaver_embed::EmbedModel {
     fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
@@ -632,6 +639,8 @@ mod promote_tests {
             connected: vec![symbol("sym:handler")],
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         };
         let members: HashSet<String> = ["note:prd".to_string(), "note:status".to_string()]
             .into_iter()
@@ -659,6 +668,8 @@ mod promote_tests {
             connected: vec![note("note:prd"), symbol("sym:handler")],
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         };
         let members: HashSet<String> = ["note:prd".to_string()].into_iter().collect();
 
@@ -695,6 +706,8 @@ mod promote_tests {
             connected: vec![note("note:overview")],
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         };
         let members: HashSet<String> = ["sym:foo".to_string(), "sym:bar".to_string()]
             .into_iter()
@@ -724,6 +737,8 @@ mod promote_tests {
             connected: vec![symbol("sym:foo")],
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         };
         let members: HashSet<String> = ["sym:foo".to_string()].into_iter().collect();
 
@@ -1084,6 +1099,14 @@ pub struct BrainContextResult {
     /// default (PRF-off) output is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expansion_terms: Vec<String>,
+    /// Whether the requested semantic leg embedded the query and completed
+    /// vector search successfully.
+    #[serde(default)]
+    pub semantic_applied: bool,
+    /// Retrieval components that were requested but unavailable. The graph,
+    /// PPR, and BM25 legs remain usable when semantic retrieval degrades.
+    #[serde(default)]
+    pub degraded_components: Vec<String>,
 }
 
 /// Surface a project's curated member notes into the rendered `connected`
@@ -1301,6 +1324,17 @@ pub fn build_brain_context_hybrid(
     )
 }
 
+fn ensure_brain_context_not_cancelled(
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), anyhow::Error> {
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
+            nestweaver_store::CancelReason::Timeout,
+        )));
+    }
+    Ok(())
+}
+
 /// Like `build_brain_context_hybrid` but also accepts a taxonomy alias map
 /// (from `load_alias_sidecar`) for vault-defined name canonicalization.
 ///
@@ -1499,6 +1533,8 @@ pub fn build_brain_context_hybrid_with_aliases(
     // injected as PPR seeds (always-blend) so the walk explores semantically
     // relevant neighborhoods even when the textual seeds miss them. The full
     // hit list is passed to weighted_score_fuse as the semantic signal.
+    let semantic_requested = config.weight_semantic > 0.0;
+    let mut semantic_applied = false;
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();
     if let Some(model) = embed_model
         && config.weight_semantic > 0.0
@@ -1508,7 +1544,14 @@ pub fn build_brain_context_hybrid_with_aliases(
         && store_has_embeddings(store)
     {
         let query_text = inputs.join(" ");
-        if let Ok(query_emb) = model.embed_query(&query_text) {
+        ensure_brain_context_not_cancelled(cancel)?;
+        let query_embedding = model.embed_query(&query_text);
+        // Inference is a synchronous, potentially long-running boundary. A
+        // timeout/disconnect can arrive while it is blocked, including on an
+        // inference error. Preserve cancellation as an incomplete query rather
+        // than degrading that error into a cacheable semantic miss.
+        ensure_brain_context_not_cancelled(cancel)?;
+        if let Ok(query_emb) = query_embedding {
             match crate::vector_search::vector_knn_all_cancellable(
                 store,
                 &query_emb,
@@ -1516,6 +1559,7 @@ pub fn build_brain_context_hybrid_with_aliases(
                 cancel,
             ) {
                 Ok(hits) => {
+                    semantic_applied = true;
                     if config.always_blend_semantic {
                         for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
                             if !seed_uids.contains(uid) {
@@ -1605,11 +1649,20 @@ pub fn build_brain_context_hybrid_with_aliases(
         }
     }
 
+    // Cover cancellation after inference/vector work but before the completed
+    // result crosses the engine boundary into single-flight/cache publication.
+    ensure_brain_context_not_cancelled(cancel)?;
     Ok(BrainContextResult {
         seeds,
         connected,
         unresolved_seeds: unresolved,
         expansion_terms,
+        semantic_applied,
+        degraded_components: if semantic_requested && !semantic_applied {
+            vec!["semantic".to_string()]
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -2942,6 +2995,8 @@ mod dedup_heading_section_tests {
             connected,
             unresolved_seeds: vec![],
             expansion_terms: vec![],
+            semantic_applied: false,
+            degraded_components: vec![],
         }
     }
 
@@ -3180,6 +3235,13 @@ mod semantic_leg_tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
+    struct WrongDimensionEmbed;
+    struct FailingEmbed;
+    struct BlockingFailingEmbed {
+        inference_started: std::sync::Arc<std::sync::Barrier>,
+        cancellation_published: std::sync::Arc<std::sync::Barrier>,
+    }
+
     impl CountingEmbed {
         fn call_count(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
@@ -3190,6 +3252,26 @@ mod semantic_leg_tests {
         fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(vec![0.0; 4])
+        }
+    }
+
+    impl EmbedQueryFn for WrongDimensionEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+    }
+
+    impl EmbedQueryFn for FailingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("probe inference failed")
+        }
+    }
+
+    impl EmbedQueryFn for BlockingFailingEmbed {
+        fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.inference_started.wait();
+            self.cancellation_published.wait();
+            anyhow::bail!("inference failed after cancellation")
         }
     }
 
@@ -3219,9 +3301,13 @@ mod semantic_leg_tests {
         store
     }
 
-    fn run_context(store: &GraphStore, model: &CountingEmbed) {
+    fn run_context(
+        store: &GraphStore,
+        model: Option<&dyn EmbedQueryFn>,
+        weight_semantic: f64,
+    ) -> super::BrainContextResult {
         let config = HybridSearchConfig {
-            weight_semantic: 0.35,
+            weight_semantic,
             ..HybridSearchConfig::default()
         };
         build_brain_context_hybrid_with_aliases(
@@ -3232,10 +3318,10 @@ mod semantic_leg_tests {
             &std::collections::HashMap::new(),
             None,
             None,
-            Some(model),
+            model,
             None,
         )
-        .expect("brain_context must succeed");
+        .expect("brain_context must preserve graph results")
     }
 
     #[test]
@@ -3247,13 +3333,15 @@ mod semantic_leg_tests {
         assert_eq!(store.embedding_count(), 0);
         let model = CountingEmbed { calls: 0.into() };
 
-        run_context(&store, &model);
+        let result = run_context(&store, Some(&model), 0.35);
 
         assert_eq!(
             model.call_count(),
             0,
             "no embedding vectors in the DB → the semantic leg must not run the BERT embed"
         );
+        assert!(!result.semantic_applied);
+        assert_eq!(result.degraded_components, ["semantic"]);
     }
 
     #[test]
@@ -3263,12 +3351,122 @@ mod semantic_leg_tests {
         assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
         let model = CountingEmbed { calls: 0.into() };
 
-        run_context(&store, &model);
+        let result = run_context(&store, Some(&model), 0.35);
 
         assert_eq!(
             model.call_count(),
             1,
             "embedding vectors present → the semantic leg must embed the query"
         );
+        assert!(result.semantic_applied);
+        assert!(result.degraded_components.is_empty());
+    }
+
+    #[test]
+    fn requested_semantic_leg_degrades_when_model_is_not_ready() {
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+
+        let result = run_context(&store, None, 0.35);
+
+        assert!(!result.semantic_applied);
+        assert_eq!(result.degraded_components, ["semantic"]);
+        assert!(
+            !result.seeds.is_empty() || !result.connected.is_empty(),
+            "graph/PPR results must survive"
+        );
+    }
+
+    #[test]
+    fn requested_semantic_leg_degrades_when_inference_fails() {
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+
+        let result = run_context(&store, Some(&FailingEmbed), 0.35);
+
+        assert!(!result.semantic_applied);
+        assert_eq!(result.degraded_components, ["semantic"]);
+        assert!(
+            !result.seeds.is_empty() || !result.connected.is_empty(),
+            "graph/PPR results must survive"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_failed_inference_is_not_degraded_to_success() {
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![0.0; 4]));
+        let inference_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let cancellation_published = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let model = BlockingFailingEmbed {
+            inference_started: inference_started.clone(),
+            cancellation_published: cancellation_published.clone(),
+        };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_from_worker = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            inference_started.wait();
+            cancel_from_worker.store(true, std::sync::atomic::Ordering::Release);
+            cancellation_published.wait();
+        });
+        let config = HybridSearchConfig {
+            weight_semantic: 0.35,
+            ..HybridSearchConfig::default()
+        };
+
+        let err = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["Payment".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(&model),
+            Some(&cancel),
+        )
+        .expect_err("cancellation during failed inference must remain a cancellation error");
+        canceller.join().unwrap();
+
+        assert!(
+            err.downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(nestweaver_store::StoreError::is_cancelled),
+            "expected StoreError::Cancelled, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn zero_semantic_weight_is_not_reported_as_degraded() {
+        let store = store_with_symbol();
+
+        let result = run_context(&store, None, 0.0);
+
+        assert!(!result.semantic_applied);
+        assert!(result.degraded_components.is_empty());
+    }
+
+    #[test]
+    fn wrong_dimension_query_embedding_cannot_create_semantic_seeds() {
+        let store = store_with_symbol();
+        assert!(store.add_embedding("sym:payment", vec![1.0, 0.0, 0.0, 0.0]));
+        let config = HybridSearchConfig {
+            weight_semantic: 0.35,
+            ..HybridSearchConfig::default()
+        };
+
+        let err = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["not-a-real-seed".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(&WrongDimensionEmbed),
+            None,
+        )
+        .expect_err("wrong-dimensional query vectors must not inject semantic seeds");
+
+        assert!(format!("{err:#}").contains("No seeds resolved"));
     }
 }

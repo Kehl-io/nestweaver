@@ -288,6 +288,10 @@ pub struct EmbeddingConfig {
     /// Default: `"~/.cache/nestweaver/models"`.
     #[serde(default = "default_embedding_cache_dir")]
     pub cache_dir: String,
+    /// Accelerator used by the local embedding backend. Default: automatically
+    /// select Metal when compiled with Metal support, otherwise CPU.
+    #[serde(default)]
+    pub accelerator: EmbeddingAccelerator,
     /// Optional HTTP endpoint for an external embedding service (e.g. Ollama,
     /// OpenAI-compatible). When set, the local model is not loaded.
     pub external_endpoint: Option<String>,
@@ -313,6 +317,16 @@ pub struct EmbeddingConfig {
     /// Candidate pool size for the semantic ANN search. Default 200.
     #[serde(default = "default_semantic_search_limit")]
     pub semantic_search_limit: usize,
+}
+
+/// Device-selection policy for the local embedding backend.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingAccelerator {
+    #[default]
+    Auto,
+    Metal,
+    Cpu,
 }
 
 /// The default local embedding model, canonical for the whole workspace.
@@ -356,6 +370,7 @@ impl Default for EmbeddingConfig {
         Self {
             model_id: default_model_id(),
             cache_dir: default_embedding_cache_dir(),
+            accelerator: EmbeddingAccelerator::Auto,
             external_endpoint: None,
             external_model: None,
             weight_ppr: default_weight_ppr(),
@@ -750,6 +765,41 @@ pub fn validate_instance_id(instance_id: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn reject_obsolete_instance_shape(s: &str) -> Result<(), anyhow::Error> {
+    let document: toml::Value = toml::from_str(s)?;
+    let Some(table) = document.as_table() else {
+        return Ok(());
+    };
+
+    let mut issues = Vec::new();
+    if table.contains_key("instance") {
+        issues.push(
+            "obsolete [instance] table; replace `[instance] name = \"...\"` with the \
+             top-level `instance_id = \"...\"` field",
+        );
+    }
+    let repo_uses_path = table
+        .get("repos")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|repos| {
+            repos.iter().any(|repo| {
+                repo.as_table()
+                    .is_some_and(|repo| repo.contains_key("path"))
+            })
+        });
+    if repo_uses_path {
+        issues.push("obsolete `[[repos]].path`; each `[[repos]]` entry requires `url = \"...\"`");
+    }
+
+    if !issues.is_empty() {
+        anyhow::bail!(
+            "unsupported instance configuration shape: {}",
+            issues.join("; ")
+        );
+    }
+    Ok(())
+}
+
 impl InstanceConfig {
     /// The DB path declared by this instance, if any.
     pub fn db_path(&self) -> Option<std::path::PathBuf> {
@@ -758,6 +808,7 @@ impl InstanceConfig {
 
     /// Parse an `InstanceConfig` from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, anyhow::Error> {
+        reject_obsolete_instance_shape(s)?;
         let mut config: Self = toml::from_str(s)?;
         // nw-052: reject an instance_id containing a colon (or other uid
         // delimiters) up front — it flows into `repo:<instance>:<hash>` /
@@ -1077,6 +1128,19 @@ url = "https://github.com/example/repo"
 "#;
 
     #[test]
+    fn shipped_instance_configs_parse() {
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for relative_path in [
+            "examples/minimal-instance.toml",
+            "examples/nestweaver-instance.toml",
+            "instance.toml",
+        ] {
+            InstanceConfig::from_file(&repository_root.join(relative_path))
+                .unwrap_or_else(|err| panic!("{relative_path} must parse: {err}"));
+        }
+    }
+
+    #[test]
     fn shipped_docker_instance_toml_is_valid() {
         // The instance.toml committed at the repo root is mounted by
         // docker-compose. It must parse and validate or the container fails to
@@ -1104,6 +1168,35 @@ url = "https://github.com/example/repo"
         assert_eq!(cfg.repos.len(), 1);
         assert_eq!(cfg.repos[0].url, "https://github.com/example/repo");
         assert!(cfg.schema_extensions.is_none());
+    }
+
+    #[test]
+    fn embedding_accelerator_defaults_to_auto() {
+        let cfg = InstanceConfig::from_toml_str(MINIMAL_TOML).expect("should parse");
+
+        assert_eq!(cfg.embedding.accelerator, EmbeddingAccelerator::Auto);
+    }
+
+    #[test]
+    fn embedding_accelerator_accepts_metal_and_cpu() {
+        for (value, expected) in [
+            ("metal", EmbeddingAccelerator::Metal),
+            ("cpu", EmbeddingAccelerator::Cpu),
+        ] {
+            let toml = format!("{MINIMAL_TOML}\n[embedding]\naccelerator = {value:?}\n");
+            let cfg = InstanceConfig::from_toml_str(&toml).expect("accelerator must parse");
+
+            assert_eq!(cfg.embedding.accelerator, expected);
+        }
+    }
+
+    #[test]
+    fn embedding_accelerator_rejects_unknown_values() {
+        let toml = format!("{MINIMAL_TOML}\n[embedding]\naccelerator = \"cuda\"\n");
+        let err = InstanceConfig::from_toml_str(&toml)
+            .expect_err("unsupported accelerator must be rejected");
+
+        assert!(err.to_string().contains("accelerator"));
     }
 
     // Configured instance IDs are daemon write defaults, so empty values and

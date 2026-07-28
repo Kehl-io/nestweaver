@@ -1,9 +1,9 @@
 # Build stage
 FROM rust:1.96-trixie AS builder
 WORKDIR /build
-RUN apt-get update && apt-get install -y libssl-dev pkg-config protobuf-compiler && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" cargo build --release --bin nestweaver
+RUN RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" cargo build --locked --release --bin nestweaver
 
 # Runtime stage
 FROM debian:trixie-slim

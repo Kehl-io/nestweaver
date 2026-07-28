@@ -16,6 +16,7 @@ NestWeaver's server mode turns a single daemon into a centralized code intellige
 
 ```bash
 nestweaver daemon --db ./brain.lbug run \
+  --config ./nestweaver-instance.toml \
   --server \
   --bind 0.0.0.0:9378 \
   --auth-token "$NESTWEAVER_AUTH_TOKEN" \
@@ -56,6 +57,45 @@ workers = 8
 min_poll = "45s"
 max_poll = "8h"
 ```
+
+### Embedding backend and readiness
+
+The daemon uses `[embedding]` from the instance config. Local device selection
+has three exact policies:
+
+| `accelerator` | Behavior |
+|---------------|----------|
+| `auto` | Metal in a Metal-enabled build; CPU only when Metal is not compiled. A Metal failure is reported; `auto` does not retry on CPU. |
+| `metal` | Requires compiled Metal support plus successful device creation and full model inference. It never selects CPU. |
+| `cpu` | Selects CPU directly and never probes Metal. |
+
+An `external_endpoint` is authoritative and never switches to a local model
+after a failure. Daemon startup is cache-only: it does not contact Hugging Face
+or download missing local model files. Populate the configured cache while the
+daemon is stopped with
+`nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>`.
+
+On macOS, `daemon start` and client autostart register a launchd agent that owns
+the foreground daemon process. An explicit `daemon run --server` remains in the
+invoking foreground. Neither path forks or self-daemonizes. A bound socket is
+not embedding readiness. The daemon publishes `state = "ready"` only after the
+selected backend completes a real inference probe with a non-empty, finite
+vector of the expected dimension. Non-semantic requests remain available while
+embedding is loading or failed.
+
+Inspect both binary capability and per-daemon runtime state:
+
+```sh
+nestweaver diagnostics capabilities --json
+nestweaver daemon --db <path> status
+nestweaver brain status --db <path> --json
+```
+
+Runtime status includes `state`, `backend`, `requested_device`,
+`selected_device`, `model_id`, `error`, `metal_compiled`, and `fallback_used`.
+For a ready local backend, `selected_device` is `metal` or `cpu` and
+`fallback_used` remains `false`. A ready external backend has an empty
+`selected_device` because it has no local device.
 
 ---
 
@@ -174,11 +214,12 @@ When TLS is enabled:
 
 ## Repo Configuration
 
-Repos are declared in the instance config. The server clones them as blobless bare repos (~90% smaller than full clones) and indexes them automatically.
+Repos are declared in the instance config. The server clones them as blobless bare repos (~90% smaller than full clones) and indexes them automatically. Each `[[repos]]` entry requires `url`; `name` is an optional display alias, and `type` is optional (`code` is the default, `vault` indexes Markdown).
 
 ```toml
 [[repos]]
 url = "https://github.com/acme/api-service"
+name = "api"             # optional display alias
 
 [[repos]]
 url = "https://github.com/acme/web-client"
@@ -792,6 +833,33 @@ curl -v http://nestweaver.internal:9379/webhook
 # Check the admin queue for failed jobs
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
   http://localhost:9379/admin/api/dead-letter
+```
+
+### Embedding or semantic retrieval unavailable
+
+First inspect `nestweaver diagnostics capabilities --json` and
+`nestweaver daemon --db <path> status`.
+
+| Observation | Meaning | Corrective action |
+|-------------|---------|-------------------|
+| `metal_compiled = false` | This binary does not contain the Metal backend. With `auto`, CPU is selected; explicit `metal` fails. | Install a Metal-enabled macOS release archive or rebuild with `cargo install --locked --path . --features metal`. |
+| `selected_device = ""` | Expected for an external backend. For a local backend it means state is not ready. | Check `backend`, `state`, and `error`; do not infer a device until local state is `ready`. |
+| Error reports a missing model cache artifact | The cache-only daemon found no required model file in the configured cache. | Stop the daemon, run `nestweaver embed --db <path> --local --model-id <id> --cache-dir <path>` with the same model/cache, then restart with `--config <path>` and recheck status. |
+| External endpoint readiness or request failure | The configured external backend is unavailable; no local model is attempted. | Restore the endpoint/credentials. To switch local, remove the external config, stop the daemon, direct-local re-embed with `--force`, then restart with the same `--config`. |
+| Response contains `"semantic"` in `degraded_components` | Semantic retrieval was requested but the model was not ready, inference failed, or the DB has no embeddings. | Inspect embedding status and populate/fix the model or embeddings. Graph, PPR, and BM25 results remain available; `semantic_applied` is `false`. |
+
+For an explicit external-to-local switch:
+
+```sh
+CONFIG=/absolute/path/to/nestweaver-instance.toml
+DB=/absolute/path/to/brain.lbug
+MODEL=sentence-transformers/all-MiniLM-L6-v2
+CACHE="$HOME/.cache/nestweaver/models"
+# First remove external_endpoint/external_model from "$CONFIG".
+nestweaver daemon --db "$DB" stop
+nestweaver embed --db "$DB" --local --model-id "$MODEL" --cache-dir "$CACHE" --force
+nestweaver daemon --db "$DB" start --config "$CONFIG"
+nestweaver brain status --db "$DB" --json
 ```
 
 ### High query latency

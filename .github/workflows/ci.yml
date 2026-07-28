@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, staging]
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      metal: ${{ steps.filter.outputs.metal }}
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
       - uses: actions/checkout@v7
@@ -35,8 +36,254 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/release-please.yml'
+              - 'examples/**'
+              - 'instance.toml'
+              - 'INSTALL.md'
+              - 'README.md'
+              - 'CLAUDE.md'
+              - 'docs/**'
+              - 'npm/**'
+              - 'smithery.yaml'
+            metal:
+              - 'crates/nestweaver-embed/**'
+              - 'crates/nestweaver-daemon/src/lifecycle.rs'
+              - 'crates/nestweaver-daemon/src/launchd.rs'
+              - 'crates/nestweaver-daemon/src/server.rs'
+              - 'crates/nestweaver-daemon/Cargo.toml'
+              - 'crates/nestweaver-client/src/autostart.rs'
+              - 'src/main.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release-please.yml'
+              - 'tests/metal_smoke.rs'
             frontend:
               - 'crates/nestweaver-web/frontend/**'
+
+  metal-smoke:
+    name: Cold Metal daemon smoke
+    needs: changes
+    if: needs.changes.outputs.metal == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.3"
+      NESTWEAVER_METAL_SMOKE_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
+    steps:
+      - name: Verify native Apple Silicon runner
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: metal-smoke
+      - name: Install build dependencies
+        run: brew install protobuf
+      - name: Build Metal-enabled CLI
+        run: cargo build --locked --release --features metal
+      - name: Verify daemon cache-only contract
+        run: |
+          cargo test --locked --release -p nestweaver-daemon --features embed \
+            daemon_embedding_startup_constructs_cached_model_offline
+      - name: Configure isolated smoke paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          SMOKE_KEY="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          TARGET_ROOT="$HOME/Library/Caches/io.kehl.nestweaver-metal-smoke/$SMOKE_KEY"
+          SETUP_ROOT="$RUNNER_TEMP/nestweaver-metal-cache-$SMOKE_KEY"
+          TARGET_DB="$TARGET_ROOT/brain.lbug"
+          TARGET_CONFIG="$TARGET_ROOT/instance.toml"
+          SETUP_DB="$SETUP_ROOT/cache-seed.lbug"
+          MODEL_CACHE="$SETUP_ROOT/model-cache"
+          OUTPUT_DIR="$RUNNER_TEMP/nestweaver-metal-evidence-$SMOKE_KEY"
+          mkdir -p "$TARGET_ROOT" "$SETUP_ROOT"
+          CANONICAL_DB="$(cd "$TARGET_ROOT" && pwd -P)/brain.lbug"
+          INSTANCE_ID="$(printf '%s' "$CANONICAL_DB" | shasum -a 256 | cut -c1-8)"
+          RUNTIME_DIR="$HOME/.local/state/nestweaver/$INSTANCE_ID"
+          {
+            echo "TARGET_ROOT=$TARGET_ROOT"
+            echo "SETUP_ROOT=$SETUP_ROOT"
+            echo "TARGET_DB=$TARGET_DB"
+            echo "TARGET_CONFIG=$TARGET_CONFIG"
+            echo "SETUP_DB=$SETUP_DB"
+            echo "MODEL_CACHE=$MODEL_CACHE"
+            echo "OUTPUT_DIR=$OUTPUT_DIR"
+            echo "INSTANCE_ID=$INSTANCE_ID"
+            echo "RUNTIME_DIR=$RUNTIME_DIR"
+            echo "PLIST_PATH=$HOME/Library/LaunchAgents/io.kehl.nestweaver.$INSTANCE_ID.plist"
+            echo "NESTWEAVER_METAL_SMOKE_DB=$TARGET_DB"
+            echo "NESTWEAVER_METAL_SMOKE_OUTPUT_DIR=$OUTPUT_DIR"
+            echo "NESTWEAVER_METAL_SMOKE_CACHE_DIR=$MODEL_CACHE"
+          } >> "$GITHUB_ENV"
+      - name: Populate model cache on CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/nestweaver"
+          "$BIN" --no-daemon --no-embed index \
+            --repo testdata/js --db "$SETUP_DB"
+          "$BIN" --no-daemon embed --local --accelerator cpu \
+            --cache-dir "$MODEL_CACHE" --db "$SETUP_DB" \
+            --scope symbols --force
+          find "$MODEL_CACHE" -type f -print0 |
+            sort -z |
+            xargs -0 shasum -a 256 > "$SETUP_ROOT/cache-before.sha256"
+          chmod -R a-w "$MODEL_CACHE"
+      - name: Assert clean daemon preconditions
+        run: |
+          cargo test --locked --release --features metal --test metal_smoke \
+            apple_hardware::cold_daemon_preconditions_are_clean \
+            -- --ignored --exact --nocapture
+      - name: Write explicit Metal instance config
+        shell: bash
+        run: |
+          {
+            printf 'instance_id = "metal-smoke"\n\n'
+            printf '[snapshot_storage]\nbackend = "local"\npath = "%s/snapshots"\n\n' "$TARGET_ROOT"
+            printf '[workspace]\nbackend = "local"\npath = "%s/workspace"\n\n' "$TARGET_ROOT"
+            printf '[inference]\nendpoint = "http://127.0.0.1:9"\n'
+            printf 'embedding_model = "unused"\nsummary_model = "unused"\n\n'
+            printf '[embedding]\nmodel_id = "%s"\n' "$NESTWEAVER_METAL_SMOKE_MODEL_ID"
+            printf 'accelerator = "metal"\ncache_dir = "%s"\n\n' "$MODEL_CACHE"
+            printf '[git]\ncredential_method = "gh"\n'
+          } > "$TARGET_CONFIG"
+          ./target/release/nestweaver config validate "$TARGET_CONFIG"
+      - name: Cold Metal daemon inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/nestweaver"
+          mkdir -p "$OUTPUT_DIR"
+          "$BIN" index --repo testdata/js --db "$TARGET_DB" --config "$TARGET_CONFIG" \
+            >"$OUTPUT_DIR/cold-index.stdout" 2>"$OUTPUT_DIR/cold-index.stderr"
+
+          ready=false
+          for _ in $(seq 1 60); do
+            if "$BIN" brain status --db "$TARGET_DB" --config "$TARGET_CONFIG" --json \
+              >"$OUTPUT_DIR/cold-status.json" 2>"$OUTPUT_DIR/cold-status.stderr" &&
+              jq -e '
+                .embedding_status.state == "ready" and
+                .embedding_status.requested_device == "metal" and
+                .embedding_status.selected_device == "metal" and
+                .embedding_status.fallback_used == false
+              ' "$OUTPUT_DIR/cold-status.json" >/dev/null; then
+              ready=true
+              break
+            fi
+            if jq -e '.embedding_status.state == "failed"' \
+              "$OUTPUT_DIR/cold-status.json" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          test -f "$PLIST_PATH"
+          launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
+            >"$OUTPUT_DIR/cold-launchd.txt"
+          "$BIN" embed --db "$TARGET_DB" --scope symbols --force --stats \
+            >"$OUTPUT_DIR/cold-embed.stdout" 2>"$OUTPUT_DIR/cold-embed.stderr"
+          grep -q "Embedding via daemon" "$OUTPUT_DIR/cold-embed.stderr"
+      - name: Restart and repeat warm Metal inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/nestweaver"
+          "$BIN" daemon --db "$TARGET_DB" stop \
+            >"$OUTPUT_DIR/stop.stdout" 2>"$OUTPUT_DIR/stop.stderr"
+
+          ready=false
+          for _ in $(seq 1 60); do
+            if "$BIN" brain status --db "$TARGET_DB" --config "$TARGET_CONFIG" --json \
+              >"$OUTPUT_DIR/warm-status.json" 2>"$OUTPUT_DIR/warm-status.stderr" &&
+              jq -e '
+                .embedding_status.state == "ready" and
+                .embedding_status.requested_device == "metal" and
+                .embedding_status.selected_device == "metal" and
+                .embedding_status.fallback_used == false
+              ' "$OUTPUT_DIR/warm-status.json" >/dev/null; then
+              ready=true
+              break
+            fi
+            if jq -e '.embedding_status.state == "failed"' \
+              "$OUTPUT_DIR/warm-status.json" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          test -f "$PLIST_PATH"
+          launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
+            >"$OUTPUT_DIR/warm-launchd.txt"
+          "$BIN" embed --db "$TARGET_DB" --scope symbols --force --stats \
+            >"$OUTPUT_DIR/warm-embed.stdout" 2>"$OUTPUT_DIR/warm-embed.stderr"
+          grep -q "Embedding via daemon" "$OUTPUT_DIR/warm-embed.stderr"
+      - name: Verify cache-only Metal vector
+        run: |
+          cargo test --locked --release --features metal --test metal_smoke \
+            apple_hardware::metal_embedding_is_finite_normalized_and_uses_metal \
+            -- --ignored --exact --nocapture
+          find "$MODEL_CACHE" -type f -print0 |
+            sort -z |
+            xargs -0 shasum -a 256 > "$SETUP_ROOT/cache-after.sha256"
+          diff -u "$SETUP_ROOT/cache-before.sha256" "$SETUP_ROOT/cache-after.sha256"
+      - name: Collect Metal smoke evidence
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          BIN="$PWD/target/release/nestweaver"
+          "$BIN" diagnostics capabilities --json \
+            >"$OUTPUT_DIR/capabilities.json" 2>"$OUTPUT_DIR/capabilities.stderr" || true
+          "$BIN" daemon --db "$TARGET_DB" status \
+            >"$OUTPUT_DIR/daemon-status.txt" 2>"$OUTPUT_DIR/daemon-status.stderr" || true
+          DAEMON_LOG="$RUNTIME_DIR/daemon.log"
+          if [ -f "$DAEMON_LOG" ]; then
+            cp "$DAEMON_LOG" "$OUTPUT_DIR/daemon.log"
+          fi
+          launchctl print "gui/$(id -u)/io.kehl.nestweaver.$INSTANCE_ID" \
+            >"$OUTPUT_DIR/launchd.txt" 2>&1 || true
+      - name: Upload Metal smoke evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: metal-smoke-evidence
+          path: ${{ runner.temp }}/nestweaver-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}-metal-smoke
+          if-no-files-found: error
+      - name: Clean up isolated Metal daemon
+        if: always()
+        shell: bash
+        run: |
+          daemon_stopped=false
+          if [ -n "${TARGET_DB:-}" ] && [ -x target/release/nestweaver ]; then
+            if target/release/nestweaver daemon --db "$TARGET_DB" stop; then
+              daemon_stopped=true
+            fi
+          fi
+          if [ "$daemon_stopped" = true ] &&
+            [ -n "${INSTANCE_ID:-}" ] &&
+            [ "${RUNTIME_DIR:-}" = "$HOME/.local/state/nestweaver/$INSTANCE_ID" ]; then
+            case "$RUNTIME_DIR" in
+              "$HOME/.local/state/nestweaver/"?*) rm -rf -- "$RUNTIME_DIR" ;;
+            esac
+          fi
+          if [ -n "${MODEL_CACHE:-}" ] && [ -d "$MODEL_CACHE" ]; then
+            chmod -R u+w "$MODEL_CACHE" || true
+          fi
+          case "${TARGET_ROOT:-}" in
+            "$HOME/Library/Caches/io.kehl.nestweaver-metal-smoke/"*)
+              rm -rf -- "$TARGET_ROOT"
+              ;;
+          esac
+          case "${SETUP_ROOT:-}" in
+            "$RUNNER_TEMP/nestweaver-metal-cache-"*) rm -rf -- "$SETUP_ROOT" ;;
+          esac
+          case "${OUTPUT_DIR:-}" in
+            "$RUNNER_TEMP/nestweaver-metal-evidence-"*) rm -rf -- "$OUTPUT_DIR" ;;
+          esac
 
   fmt:
     name: Rustfmt
@@ -78,8 +325,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -103,6 +349,10 @@ jobs:
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
           cargo build --locked -p nestweaver-store 2>/dev/null || true
           sleep 2
+      - name: Build CLI
+        run: cargo build --locked
+      - name: Validate canonical instance config
+        run: cargo run --locked -- config validate examples/minimal-instance.toml
       - name: Tests
         # --workspace is REQUIRED: the root manifest is both [package] and
         # [workspace], so `cargo test` without it runs ONLY the root package's
@@ -134,8 +384,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -182,8 +431,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -246,8 +494,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -297,8 +544,65 @@ jobs:
       # (which compiles it from source on every run, ~3 min).
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
+      # No `|| true`. This check is displayed as "Security Audit" on every pull
+      # request in a public repo, which reads as an enforced supply-chain gate —
+      # suppressing the exit code made that a false claim. Verified clean on
+      # 2026-07-27: 834 dependencies, 0 vulnerabilities, 2 allowed warnings
+      # (RUSTSEC-2024-0436 paste unmaintained, RUSTSEC-2026-0202 cxx unsound),
+      # neither of which fails cargo-audit's default policy.
+      #
+      # When this does fail: triage the advisory, and if it must be accepted,
+      # record it in audit.toml with a justification and a review date rather
+      # than restoring a blanket suppression.
       - name: Run audit
-        run: cargo audit || true
+        run: cargo audit
+
+  secret-scan:
+    name: Secret Scan
+    # Deliberately NOT gated on needs.changes: a credential can be committed in
+    # any file type, including ones no language filter matches.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history. This repo is public, so a secret that was committed and
+          # later removed is still disclosed and still needs rotating — scanning
+          # only the tip would miss exactly the case that matters most.
+          fetch-depth: 0
+      # Install the binary directly rather than gitleaks-action: the marketplace
+      # action requires a GITLEAKS_LICENSE for organization-owned repos, which
+      # would make this gate fail for reasons unrelated to the code.
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          VERSION=8.30.1
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Verify the config actually loads rules
+        # A gitleaks config with no [extend] block and only an [allowlist]
+        # silently loads zero detectors and reports "no leaks found" on
+        # everything — this repo shipped exactly that config, unused, for
+        # months. Prove the scanner is live before trusting a clean result.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/gl-probe
+          # Assemble the probe token at runtime. Writing it as a literal would
+          # commit a credential-shaped string into the repo, which this very
+          # scanner then flags on every subsequent run. Split, neither half
+          # matches a rule.
+          PROBE_PREFIX='ghp_'
+          PROBE_BODY='016C7B1D2E3F4a5b6c7d8e9f0A1B2C3D4E5F'
+          printf 'token = "%s%s"\n' "$PROBE_PREFIX" "$PROBE_BODY" > /tmp/gl-probe/probe.txt
+          if gitleaks detect --source /tmp/gl-probe --config .gitleaks.toml --no-git --redact; then
+            echo "::error::gitleaks did not detect a planted credential — the config is not loading rules"
+            exit 1
+          fi
+          echo "config verified: planted credential was detected"
+      - name: Scan repository history
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --verbose
 
   e2e:
     name: E2E Tests
@@ -330,8 +634,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Configure linker for lbug+tantivy zstd coexistence
         run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+          printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition", "-C", "link-arg=-fuse-ld=mold"]\n' >> .cargo/config.toml
       - name: Install frontend dependencies
         working-directory: crates/nestweaver-web/frontend
         run: npm ci
