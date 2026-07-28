@@ -337,7 +337,7 @@ jobs:
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -393,7 +393,7 @@ jobs:
           RUSTC_VER=$(rustc --version | awk '{print $2}')
           echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
       - name: Cache native build outputs (lbug C++, OpenSSL)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -443,7 +443,7 @@ jobs:
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -506,7 +506,7 @@ jobs:
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -649,7 +649,7 @@ jobs:
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/**/build/lbug-*/out
