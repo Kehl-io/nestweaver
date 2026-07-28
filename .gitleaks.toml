@@ -6,9 +6,9 @@
 # long as it existed before 2026-07-27. Never remove it.
 #
 # Verify after any edit by planting a detectable secret and confirming a
-# non-zero exit:
-# Assemble the token from parts — writing a credential-shaped literal here
-# would commit a finding that this scanner then reports forever:
+# non-zero exit. Assemble the token from parts — a credential-shaped literal
+# committed here becomes a finding this scanner then reports on every run,
+# forever. That happened once already; do not write it as one string:
 #   printf 'token = "%s%s"\n' 'ghp_' '016C7B1D2E3F4a5b6c7d8e9f0A1B2C3D4E5F' > ./probe.txt
 #   gitleaks detect --source . --config .gitleaks.toml --no-git --redact; echo $?
 #   rm ./probe.txt
