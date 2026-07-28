@@ -1,6 +1,27 @@
+# Gitleaks configuration.
+#
+# IMPORTANT: the `[extend]` block is load-bearing. A config with only an
+# `[allowlist]` section and no rules loads zero detectors and reports
+# "no leaks found" for any input — which is exactly what this file did for as
+# long as it existed before 2026-07-27. Never remove it.
+#
+# Verify after any edit by planting a detectable secret and confirming a
+# non-zero exit. Assemble the token from parts — a credential-shaped literal
+# committed here becomes a finding this scanner then reports on every run,
+# forever. That happened once already; do not write it as one string:
+#   printf 'token = "%s%s"\n' 'ghp_' '016C7B1D2E3F4a5b6c7d8e9f0A1B2C3D4E5F' > ./probe.txt
+#   gitleaks detect --source . --config .gitleaks.toml --no-git --redact; echo $?
+#   rm ./probe.txt
+#
+# Do NOT probe with `AKIAIOSFODNN7EXAMPLE` — the default ruleset allowlists it
+# as AWS's published example value, so it returns "no leaks found" even when
+# the config is working perfectly, and reads as a broken scanner.
+[extend]
+useDefault = true
+
 [allowlist]
 description = "Global allowlist"
 paths = [
     '''target/''',
-    '''.git/''',
+    '''\.git/''',
 ]

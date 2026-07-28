@@ -327,9 +327,11 @@ containing it is available, use this source-build path.
 | `setup` | Auto-detect and configure AI tools (16 supported). Use `--force` to regenerate customized files |
 | `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md, claude-md) |
 | `completions` | Generate shell completions (bash, zsh, fish, powershell) |
-| `embed` | Generate vector embeddings for symbols, notes, and headings using a local model (Metal-accelerated) or external API |
+| `embed` | Generate vector embeddings for symbols, notes, and headings using a local model (Metal-accelerated) or external API. Reports an eligibility plan before embedding and exits successfully without loading the model when nothing is eligible; `--force` re-embeds everything |
 | `pull` | Pull a snapshot from a remote storage backend |
-| `instance` | Manage instance configuration |
+| `config validate` | Validate an instance config without creating files or contacting services (`--json` for a machine-readable result) |
+| `diagnostics capabilities` | Report embedding and Metal compile/runtime capabilities, including whether Metal was selected or fell back (`--json`) |
+| `instance` | Manage instance configuration. `abort-migration` clears a wedged migration journal so the daemon can boot |
 | `snapshot` | Manage graph snapshots (build, verify, push) |
 | `backup` | Backup and restore the NestWeaver database |
 | `list-repos` | List all indexed repositories |

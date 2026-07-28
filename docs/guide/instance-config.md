@@ -517,6 +517,37 @@ nestweaver list-links --config ./nestweaver-instance.toml
 nestweaver list-features --config ./nestweaver-instance.toml
 ```
 
+## Storage engine tuning (advanced)
+
+Write-capable database opens use a hardened engine configuration. The defaults
+are chosen for safety, not throughput, and **the thread bound is a correctness
+setting, not a performance one**.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `NESTWEAVER_LBUG_MAX_THREADS` | `1` | Engine thread-pool size (`0` = library auto). |
+| `NESTWEAVER_LBUG_BUFFER_POOL_BYTES` | auto | Buffer pool size in bytes. A larger pool avoids eviction when the working set fits. |
+| `NESTWEAVER_LBUG_AUTO_CHECKPOINT` | on | Set `0`/`false`/`off` to defer automatic checkpoints. |
+
+> **Raising `NESTWEAVER_LBUG_MAX_THREADS` re-opens a known crash window.**
+> The storage engine's optimistic page read has no reader pinning on native
+> builds, so an eviction racing a concurrent read is an unguarded SIGSEGV. The
+> race requires concurrency inside the engine; capping the pool at `1` is what
+> removes it, and `1` is the only value that fully eliminates it. This crash is
+> what began a reported incident in which a vault went from 752 notes to 1 —
+> recovered only because the write-ahead log had not yet checkpointed.
+>
+> Read-only opens keep full parallelism and are unaffected. The measured cost
+> of the cap on the write path was negligible (index throughput 55 s vs 58 s;
+> bulk load is already single-threaded), so raise it only if you have measured
+> a real query-latency cost on your own workload, and accept the crash risk
+> knowingly.
+
+Deferring auto-checkpoints reduces exposure to a separate upstream defect: the
+string-corruption trigger needs several checkpoint-separated segments, so
+deferring during a bulk load makes it less likely. Corruption is detected and
+reported rather than silently returned in either case.
+
 ## Daemon, watcher, and MCP server coexistence
 
 All write operations route through the daemon process, which holds the single
