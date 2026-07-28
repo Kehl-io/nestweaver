@@ -544,8 +544,18 @@ jobs:
       # (which compiles it from source on every run, ~3 min).
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
+      # No `|| true`. This check is displayed as "Security Audit" on every pull
+      # request in a public repo, which reads as an enforced supply-chain gate —
+      # suppressing the exit code made that a false claim. Verified clean on
+      # 2026-07-27: 834 dependencies, 0 vulnerabilities, 2 allowed warnings
+      # (RUSTSEC-2024-0436 paste unmaintained, RUSTSEC-2026-0202 cxx unsound),
+      # neither of which fails cargo-audit's default policy.
+      #
+      # When this does fail: triage the advisory, and if it must be accepted,
+      # record it in audit.toml with a justification and a review date rather
+      # than restoring a blanket suppression.
       - name: Run audit
-        run: cargo audit || true
+        run: cargo audit
 
   secret-scan:
     name: Secret Scan
