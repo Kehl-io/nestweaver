@@ -156,6 +156,24 @@ local backend after an external load, readiness, or request failure. Fix the
 endpoint, or follow the forced re-embedding procedure below to switch to a local
 backend.
 
+#### Daemon embedding preflight
+
+For the normal daemon route, `nestweaver embed --db <path>` first reports an
+embedding plan: the number of nodes in scope, the number eligible to embed, and
+the number already present in the authoritative embedding sidecar. With the
+default incremental behavior, sidecar entries are skipped; `--force` makes every
+scoped node eligible. If the plan has no eligible nodes, the command succeeds
+without loading the embedding model.
+
+The plan is a point-in-time observation. Files indexed after the plan are
+handled by a later embed or the daemon's incremental watcher. If the command
+reports that the daemon does not support preflight after installing an updated
+binary, restart that daemon for the same database:
+
+```sh
+nestweaver daemon --db <path> restart
+```
+
 Daemon startup is cache-only. It does not contact Hugging Face or download
 missing model files. To populate a new cache, stop the daemon (which owns the DB
 write lock) and run the direct local command. Its required form is

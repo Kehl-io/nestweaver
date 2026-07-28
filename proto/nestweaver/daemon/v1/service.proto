@@ -410,6 +410,12 @@ message EmbedResponse {
   // Embeddings rejected by the dimension guard (model mismatch), as opposed
   // to `failed` (the model errored). Zero from pre-2.2.1 daemons.
   uint32 rejected = 3;
+  // Nodes present in the requested scope when eligibility was evaluated.
+  uint64 scoped = 4;
+  // Nodes selected for embedding after applying `force` and sidecar state.
+  uint64 eligible = 5;
+  // Scoped nodes omitted because their authoritative sidecar embedding exists.
+  uint64 skipped = 6;
 }
 
 // ─── Impact Analysis (Phase 4) ──────────────────────────────────────
@@ -542,6 +548,7 @@ service NestWeaverDaemon {
   rpc ReindexSearch(ReindexSearchRequest) returns (ReindexSearchResponse);
 
   // Embedding
+  rpc PlanEmbed(EmbedRequest) returns (EmbedResponse);
   rpc Embed(EmbedRequest) returns (EmbedResponse);
 
   // Write RPCs

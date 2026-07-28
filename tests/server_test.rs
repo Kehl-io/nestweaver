@@ -16,10 +16,12 @@ use nestweaver_client::hybrid::{
 use nestweaver_client::upstream::UpstreamHandle;
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 use nestweaver_proto::{
-    BackupRequest, BrainSearchRequest, BrainStatusRequest, JsonRequest, RepoStatesRequest,
+    BackupRequest, BrainSearchRequest, BrainStatusRequest, EmbedRequest, EmbedResponse,
+    JsonRequest, RepoStatesRequest,
 };
 use serde_json::{Value, json};
 use sha2::Sha256;
+use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::{Certificate, ClientTlsConfig};
 
 /// Create a minimal git repo with a JS file for indexing.
@@ -256,6 +258,132 @@ async fn server_tcp_brain_status() {
         status.repo_count >= 1,
         "expected at least 1 repo, got {}",
         status.repo_count
+    );
+}
+
+#[tokio::test]
+async fn server_exposes_read_only_embed_plan_rpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let guard = helpers::server_guard::ServerGuard::start(&db_path);
+    let channel = tonic::transport::Channel::from_shared(guard.grpc_addr())
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to TCP gRPC server");
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.expect("gRPC channel must be ready");
+    let response: Result<tonic::Response<EmbedResponse>, tonic::Status> = grpc
+        .unary(
+            tonic::Request::new(EmbedRequest {
+                scope: "all".to_string(),
+                force: false,
+                batch_size: 0,
+            }),
+            PathAndQuery::from_static("/nestweaver.daemon.v1.NestWeaverDaemon/PlanEmbed"),
+            tonic_prost::ProstCodec::default(),
+        )
+        .await;
+
+    assert!(
+        response.is_ok(),
+        "PlanEmbed must be available before committing to a long embed run: {response:?}"
+    );
+}
+
+#[test]
+fn cli_embed_reports_a_noop_plan_without_loading_the_embedding_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let repo_dir = dir.path().join("repo");
+    write_test_repo(&repo_dir);
+    index_repo(&repo_dir, &db_path);
+
+    // Seed every indexed node in the authoritative sidecar before the daemon
+    // starts. A no-op plan must return without requiring a ready model.
+    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
+    let mut uids: Vec<_> = store
+        .list_all_symbols()
+        .unwrap()
+        .into_iter()
+        .map(|symbol| symbol.uid)
+        .collect();
+    uids.extend(
+        store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.uid),
+    );
+    uids.extend(
+        store
+            .list_all_headings()
+            .unwrap()
+            .into_iter()
+            .map(|heading| heading.uid),
+    );
+    assert!(
+        !uids.is_empty(),
+        "fixture must index at least one embeddable node"
+    );
+    for uid in uids {
+        assert!(store.add_embedding(&uid, vec![0.1, 0.2, 0.3]));
+    }
+    store.flush_embedding_index().unwrap();
+    drop(store);
+
+    let _guard = helpers::server_guard::ServerGuard::start(&db_path);
+    // The preflight is a daemon RPC, so this must exercise the daemon route.
+    // CI exports NESTWEAVER_NO_DAEMON=1 for the whole test job, which
+    // `resolve_use_daemon` honors under GITHUB_ACTIONS — the CLI would then take
+    // the direct path and collide with the write lock the guard's daemon holds.
+    // Clear the bypass for this child so the route is the same everywhere
+    // (same idiom as `daemon_cmd` in tests/parity_test.rs).
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .args(["embed", "--db", &db_path.display().to_string()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "embed no-op failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Embedding plan: 0 eligible,"),
+        "missing preflight counts: {stderr}"
+    );
+    assert!(
+        stderr.contains("No embedding work required; every scoped node already has an authoritative sidecar embedding."),
+        "missing no-op outcome: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Embedding via daemon"),
+        "a no-op plan must not load the embedding runtime: {stderr}"
     );
 }
 
