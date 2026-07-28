@@ -5353,7 +5353,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
 fn tool_schema_brain_remove_source() -> Value {
     json!({
         "name": "brain_remove_source",
-        "description": "Remove an indexed code repository or markdown vault from the brain graph permanently.\n\nGuidelines:\n- Accepts repo name, vault name, filesystem path, file:// URL, or UID\n- Auto-detects whether the target is a repo or vault\n- To re-index (not remove), use brain_add_source instead\n\nLimitations:\n- Removal is permanent — the source must be re-indexed with brain_add_source to restore\n- Ambiguous targets (matching multiple sources) require a UID to disambiguate",
+        "description": "Remove an indexed code repository or markdown vault from the brain graph permanently.\n\nGuidelines:\n- Accepts repo name, vault name, filesystem path, file:// URL, or UID\n- Auto-detects whether the target is a repo or vault\n- To re-index (not remove), use brain_add_source instead\n\nReading the response:\n- `committed: true` means the removal HAPPENED and is durable. If `reconciliation_warnings` is also non-empty, some post-commit bookkeeping step failed — the removal still succeeded. Do NOT retry as though nothing happened, and do not take corrective action against the removed data; re-run only to retry the bookkeeping.\n- `committed: false` means nothing was removed.\n\nLimitations:\n- Removal is permanent — the source must be re-indexed with brain_add_source to restore\n- Ambiguous targets (matching multiple sources) require a UID to disambiguate",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5535,7 +5535,7 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
 fn tool_schema_prune_stale() -> Value {
     json!({
         "name": "prune_stale",
-        "description": "Remove all indexed repos and vaults whose source directories no longer exist on disk. No parameters required.\n\nGuidelines:\n- Use after moving, renaming, or deleting project directories\n- Returns the list of removed repos and vaults\n\nLimitations:\n- Only checks filesystem existence, not content staleness (use stale_check for that)\n- Cannot undo — removed sources must be re-indexed with brain_add_source",
+        "description": "Remove all indexed repos and vaults whose source directories no longer exist on disk. No parameters required.\n\nGuidelines:\n- Use after moving, renaming, or deleting project directories\n- Returns the list of removed repos and vaults\n\nReading the response:\n- `committed: true` means the prune HAPPENED and is durable. If `reconciliation_warnings` is also non-empty, some post-commit bookkeeping step failed — the prune still succeeded. Do NOT retry as though nothing happened; re-run only to retry the bookkeeping.\n- `committed: false` means nothing was pruned.\n\nLimitations:\n- Only checks filesystem existence, not content staleness (use stale_check for that)\n- Cannot undo — removed sources must be re-indexed with brain_add_source",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -12262,5 +12262,45 @@ mod stale_check_tool_tests {
         let result = tool_stale_check(&store).expect("stale check");
         assert_eq!(result["any_stale"], false, "{result}");
         assert_eq!(result["repos"][0]["status"], "ok", "{result}");
+    }
+}
+
+#[cfg(test)]
+mod destructive_tool_contract_tests {
+    use super::*;
+
+    /// Destructive tools must document the committed/warnings contract.
+    ///
+    /// nw-091: these mutations commit first and then run fallible post-commit
+    /// reconciliation, so a response can carry `committed: true` alongside
+    /// warnings. The whole point of that contract is that a caller can tell
+    /// "it happened, with bookkeeping warnings" from "nothing happened" — an
+    /// agent that only reads the tool description would otherwise see warnings,
+    /// conclude the operation failed, and take corrective action against data
+    /// that is already gone. That is the exact incident nw-091 came from, so
+    /// the description carries the same weight as the response field.
+    #[test]
+    fn destructive_tools_document_the_committed_contract() {
+        const DESTRUCTIVE: &[&str] = &["brain_remove_source", "prune_stale"];
+
+        let schemas = all_tool_schemas();
+        for name in DESTRUCTIVE {
+            let schema = schemas
+                .iter()
+                .find(|s| s["name"] == *name)
+                .unwrap_or_else(|| panic!("tool `{name}` is missing from all_tool_schemas()"));
+            let description = schema["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("tool `{name}` has no description"));
+
+            for required in ["committed", "reconciliation_warnings"] {
+                assert!(
+                    description.contains(required),
+                    "`{name}` description does not explain `{required}`. A caller that cannot \
+                     distinguish a committed-with-warnings result from a no-op will take \
+                     corrective action against data that is already gone (nw-091).\n\n{description}"
+                );
+            }
+        }
     }
 }
