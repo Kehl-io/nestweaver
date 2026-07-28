@@ -354,7 +354,15 @@ fn cli_embed_reports_a_noop_plan_without_loading_the_embedding_runtime() {
     drop(store);
 
     let _guard = helpers::server_guard::ServerGuard::start(&db_path);
+    // The preflight is a daemon RPC, so this must exercise the daemon route.
+    // CI exports NESTWEAVER_NO_DAEMON=1 for the whole test job, which
+    // `resolve_use_daemon` honors under GITHUB_ACTIONS — the CLI would then take
+    // the direct path and collide with the write lock the guard's daemon holds.
+    // Clear the bypass for this child so the route is the same everywhere
+    // (same idiom as `daemon_cmd` in tests/parity_test.rs).
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
         .args(["embed", "--db", &db_path.display().to_string()])
         .output()
         .unwrap();
