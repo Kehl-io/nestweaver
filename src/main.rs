@@ -8342,11 +8342,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .get("truncated_by_depth")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        // nw-110: the daemon caps rows with `.take(limit)` and
+                        // reports both `total` and `returned`, but result-set
+                        // capping sets NEITHER truncated_by_* flag — those
+                        // describe traversal pruning. Reading only those flags
+                        // let a 50-of-495 answer print as a bare array of 50:
+                        // a floor presented as the whole set.
+                        let total = value.get("total").and_then(|v| v.as_u64());
+                        let returned = value.get("returned").and_then(|v| v.as_u64());
+                        let capped = matches!((total, returned), (Some(t), Some(r)) if r < t);
                         let payload = value
                             .get("impact_nodes")
                             .cloned()
                             .unwrap_or_else(|| value.clone());
-                        if truncated_by_threshold || truncated_by_depth {
+                        if capped {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "nodes": payload,
+                                    "total": total,
+                                    "returned": returned,
+                                    "truncated": true,
+                                    "truncated_by_threshold": truncated_by_threshold,
+                                    "truncated_by_depth": truncated_by_depth,
+                                    "note": format!(
+                                        "showing {} of {} impacted node(s) — reported impact is a \
+                                         floor; raise --limit or pass --min-score 0 for the full set",
+                                        returned.unwrap_or(0),
+                                        total.unwrap_or(0)
+                                    ),
+                                }))?
+                            );
+                        } else if truncated_by_threshold || truncated_by_depth {
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&serde_json::json!({
@@ -8378,8 +8405,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 println!("No impact found for '{name_or_uid}'.");
                             }
                         } else {
+                            // nw-110: say "50 of 495" when the daemon capped the
+                            // set, never a bare "50 nodes" — the latter reads as
+                            // the complete answer.
+                            let total = value.get("total").and_then(|v| v.as_u64());
                             if !out.quiet {
-                                println!("Impact of '{name_or_uid}' ({} nodes):", count);
+                                match total {
+                                    Some(t) if t > count as u64 => println!(
+                                        "Impact of '{name_or_uid}' ({count} of {t} nodes):"
+                                    ),
+                                    _ => println!("Impact of '{name_or_uid}' ({count} nodes):"),
+                                }
                             }
                             for n in &nodes {
                                 if out.verbose {
