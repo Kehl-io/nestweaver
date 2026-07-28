@@ -14359,6 +14359,113 @@ fn render_brain_search_response(
 }
 
 #[cfg(test)]
+mod cli_help_contract_tests {
+    use super::*;
+
+    /// Stack size for the CLI-tree tests.
+    ///
+    /// `Cli::command()` alone overflows a test thread's default 2 MiB stack:
+    /// the derive-generated builder nests one frame per command/arg and this
+    /// CLI's definition is very large. The binary itself is fine (the main
+    /// thread gets 8 MiB), so this is a test-harness constraint, not a runtime
+    /// bug. Run the tree work on an explicitly-sized thread rather than relying
+    /// on a `RUST_MIN_STACK` that CI would have to remember to set.
+    const CLI_TREE_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+    fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(CLI_TREE_STACK_BYTES)
+            .spawn(f)
+            .expect("spawn CLI-tree thread")
+            .join()
+            .expect("CLI-tree thread panicked")
+    }
+
+    /// Walk the whole clap tree, returning (help gaps, commands seen, args seen).
+    ///
+    /// Iterative rather than recursive so tree depth does not compound the
+    /// already-tight stack budget.
+    fn walk_cli(root: &clap::Command) -> (Vec<String>, usize, usize) {
+        let mut gaps = Vec::new();
+        let mut commands = 0usize;
+        let mut args = 0usize;
+        let mut queue: Vec<(&clap::Command, String)> = vec![(root, String::new())];
+
+        while let Some((cmd, path)) = queue.pop() {
+            commands += 1;
+            let here = if path.is_empty() {
+                cmd.get_name().to_string()
+            } else {
+                format!("{path} {}", cmd.get_name())
+            };
+
+            if cmd.get_about().is_none() && cmd.get_long_about().is_none() {
+                gaps.push(format!("command `{here}` has no about text"));
+            }
+
+            for arg in cmd.get_arguments() {
+                // Hidden args are deliberately absent from --help (e.g. the
+                // daemon's internal --idle-exit-seconds), so they carry no
+                // documentation debt.
+                if arg.is_hide_set() {
+                    continue;
+                }
+                args += 1;
+                if arg.get_help().is_none() && arg.get_long_help().is_none() {
+                    gaps.push(format!("`{here}` arg `{}` has no help", arg.get_id()));
+                }
+            }
+
+            for sub in cmd.get_subcommands() {
+                queue.push((sub, here.clone()));
+            }
+        }
+
+        gaps.sort();
+        (gaps, commands, args)
+    }
+
+    /// Every command and every visible argument must carry help text.
+    ///
+    /// `--help` is the only documentation most users ever read. A subcommand or
+    /// flag that ships without an `about`/`help` string is invisible there, and
+    /// the gap is silent — nothing else in the build complains. This walks the
+    /// entire tree so the guard cannot be outgrown by new commands.
+    #[test]
+    fn every_command_and_arg_has_help_text() {
+        let (gaps, commands, args) = on_big_stack(|| {
+            let cmd = Cli::command();
+            walk_cli(&cmd)
+        });
+
+        // A walk that silently visited nothing would report zero gaps and read
+        // exactly like a clean bill of health. Floors well below the real
+        // counts, so they catch a broken walk without churning on every new
+        // command.
+        assert!(
+            commands >= 30 && args >= 100,
+            "CLI walk looks vacuous — only {commands} command(s) and {args} arg(s) visited; \
+             the guard is not actually inspecting the tree"
+        );
+
+        assert!(
+            gaps.is_empty(),
+            "{} command(s)/arg(s) ship without help text:\n{}",
+            gaps.len(),
+            gaps.join("\n")
+        );
+    }
+
+    /// clap's own internal consistency check (duplicate names, conflicting
+    /// short flags, invalid defaults). It panics on a malformed definition,
+    /// which is otherwise only discovered at runtime by whoever runs the command.
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        on_big_stack(|| Cli::command().debug_assert());
+    }
+}
+
+#[cfg(test)]
 mod brain_search_renderer_tests {
     use super::*;
 

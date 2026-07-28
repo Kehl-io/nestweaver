@@ -3289,3 +3289,108 @@ fn cli_abort_migration_corrupt_journal_force_discards() {
         "--force must remove the corrupt journal"
     );
 }
+
+// ── release help-text contract ───────────────────────────────────────────
+// The unit guard in src/main.rs proves every command and visible arg carries
+// *some* help string. These assert that the specific commands shipped in this
+// release describe what they actually do, which a presence check cannot.
+
+#[test]
+fn cli_help_documents_the_commands_shipped_in_this_release() {
+    // (argv, substring the help must contain)
+    let cases: &[(&[&str], &str)] = &[
+        (&["config", "validate", "--help"], "without creating files"),
+        (&["diagnostics", "capabilities", "--help"], "metal"),
+        (&["instance", "abort-migration", "--help"], "journal"),
+        (&["embed", "--help"], "--force"),
+    ];
+
+    for (args, expected) in cases {
+        let output = nestweaver_cmd()
+            .args(*args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run `{}`: {e}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "`nestweaver {}` exited {:?}: {}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        assert!(
+            help.contains(&expected.to_lowercase()),
+            "`nestweaver {}` help does not mention {expected:?}. Full help:\n{help}",
+            args.join(" ")
+        );
+    }
+}
+
+/// Every direct CLI invocation in the test suite must pin its daemon routing.
+///
+/// CI exports `NESTWEAVER_NO_DAEMON=1` for the whole job while local runs do
+/// not, so an invocation that neither sets nor clears it takes a different code
+/// path on each — which is how the embed-preflight test passed locally and
+/// failed only on CI.
+///
+/// This checks each binary-invocation chain individually, not merely whether
+/// the file mentions the variable somewhere: the file that carried the bug
+/// already pinned routing on 28 other invocations.
+///
+/// Scoped to invocations that pass `--db`, since daemon routing is only
+/// selected for local-database commands — a `server status --url ...` call
+/// talks to a remote server over HTTP and has no routing to pin.
+#[test]
+fn every_cli_invocation_pins_its_daemon_routing() {
+    let suite_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut unpinned = Vec::new();
+
+    for entry in std::fs::read_dir(&suite_dir).expect("read tests/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let src = std::fs::read_to_string(&path).expect("read test source");
+
+        // Build the constructor token at runtime so this scanner does not
+        // match its own source when it scans tests/cli_test.rs.
+        let needle = format!("CARGO_BIN_EXE_{}", "nestweaver");
+        for (idx, _) in src.match_indices(needle.as_str()) {
+            // Skip mentions inside comments (docs, not invocations).
+            let line_start = src[..idx].rfind('\n').map_or(0, |i| i + 1);
+            if src[line_start..idx].trim_start().starts_with("//") {
+                continue;
+            }
+            // The builder chain runs from the constructor to whichever
+            // terminal call executes it.
+            let rest = &src[idx..];
+            let end = [
+                "\n        .output()",
+                "\n        .status()",
+                "\n        .assert()",
+            ]
+            .iter()
+            .filter_map(|t| rest.find(t))
+            .min()
+            .unwrap_or_else(|| rest.len().min(1200));
+            let chain = &rest[..end];
+            // Only local-database commands select a daemon route.
+            if !chain.contains("\"--db\"") {
+                continue;
+            }
+            if !chain.contains("NESTWEAVER_NO_DAEMON") {
+                let line = src[..idx].matches('\n').count() + 1;
+                unpinned.push(format!("{name}:{line}"));
+            }
+        }
+    }
+
+    unpinned.sort();
+    assert!(
+        unpinned.is_empty(),
+        "these CLI invocations do not pin daemon routing — set \
+         .env(\"NESTWEAVER_NO_DAEMON\", \"1\") for the direct path, or \
+         .env_remove(\"NESTWEAVER_NO_DAEMON\") for the daemon path: {unpinned:?}"
+    );
+}

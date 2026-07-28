@@ -429,7 +429,12 @@ async fn server_transport_parity() {
         .into_inner();
 
     // ── UDS query via CLI (daemon is running, CLI routes through UDS) ─
+    // Clear the bypass: CI exports NESTWEAVER_NO_DAEMON=1 job-wide, which would
+    // send this down the direct path and quietly stop exercising UDS routing —
+    // the assertion would still pass, testing the wrong thing.
     let cli_output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
         .args([
             "brain",
             "status",
