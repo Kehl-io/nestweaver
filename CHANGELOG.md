@@ -40,6 +40,42 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [2.7.0](https://github.com/Kehl-io/nestweaver/compare/v2.6.3...v2.7.0) (2026-07-28)
+
+
+### Features
+
+* add instance config validation command ([ef1bb40](https://github.com/Kehl-io/nestweaver/commit/ef1bb40f5e856996ae3a30213ce90b1e0689b854))
+* **daemon:** add embedding preflight ([#189](https://github.com/Kehl-io/nestweaver/issues/189)) ([635d13d](https://github.com/Kehl-io/nestweaver/commit/635d13da5f794616872c52b2dcdb3e322caa6585))
+* make embedding device selection explicit ([7c99573](https://github.com/Kehl-io/nestweaver/commit/7c99573146eaecce1ee79c6e8d8f26d955924a2e))
+* report embedding device and readiness ([48d7a11](https://github.com/Kehl-io/nestweaver/commit/48d7a1103a537dfb94a6d4b779e399e43a632b71))
+
+
+### Bug Fixes
+
+* avoid fork daemonization on macOS ([1658e3f](https://github.com/Kehl-io/nestweaver/commit/1658e3f9e3ed8e4635edc4640d82c61990a8f5ca))
+* **daemon:** honor embedding sidecar in incremental runs ([92dafe4](https://github.com/Kehl-io/nestweaver/commit/92dafe4371d2070d5e9a9306f571e189acfd6a03))
+* **daemon:** make incremental embedding idempotent ([#188](https://github.com/Kehl-io/nestweaver/issues/188)) ([eaaa43c](https://github.com/Kehl-io/nestweaver/commit/eaaa43cb494d22aa563980505dafa362b582cdbb))
+* **deps:** pin Ladybug filtered scan correction ([a0afec2](https://github.com/Kehl-io/nestweaver/commit/a0afec260b613e0d63f1b954ee66657faf6c1bc6))
+* **embed:** honor cache remediation and fail fast ([ca9ad5d](https://github.com/Kehl-io/nestweaver/commit/ca9ad5dafd34752d910fa00228b45d5bcae4d5c8))
+* **embed:** quote cache remediation arguments ([5640210](https://github.com/Kehl-io/nestweaver/commit/56402106d7fb67c5473039e4dd03b29c35696ac5))
+* **embed:** resolve artifacts through configured cache ([5bc0ba3](https://github.com/Kehl-io/nestweaver/commit/5bc0ba32ca1d77093062a8f182be9ef227447466))
+* harden embedding readiness publication ([8474cf1](https://github.com/Kehl-io/nestweaver/commit/8474cf1149ff27bc640083af6a7c14edc8413818))
+* harden macOS daemon startup ([dee89de](https://github.com/Kehl-io/nestweaver/commit/dee89de0690ac0ea96457884765b6a0c13518ff7))
+* honor follower cancellation in single flight ([9b5c0df](https://github.com/Kehl-io/nestweaver/commit/9b5c0dfe62a8cf1a05a96734aee7325b573f0521))
+* preserve embedding compatibility ([e94dbe9](https://github.com/Kehl-io/nestweaver/commit/e94dbe9ab6de2b805aaae5ef9c8c6276eb067723))
+* preserve local embed API ([0ab8a27](https://github.com/Kehl-io/nestweaver/commit/0ab8a27fdacc1ce4513ce57a6046e252a33eaa39))
+* satisfy embedding clippy lints ([7973065](https://github.com/Kehl-io/nestweaver/commit/79730651c22b0c23a45ebbad23c87b44ec76df28))
+* select CPU for auto without Metal ([f061283](https://github.com/Kehl-io/nestweaver/commit/f0612830cdb976f6799ddc1cdf156f5bb61b339a))
+* **store:** cascade orphaned note fragments ([934b108](https://github.com/Kehl-io/nestweaver/commit/934b108cc90870e636d308b0279f4f0b6361d2ae))
+
+
+### Performance Improvements
+
+* **store:** add impact snapshot equivalence foundation ([7d759d8](https://github.com/Kehl-io/nestweaver/commit/7d759d87317e4910c96869a026c0898df3f30064))
+* **store:** bulk-load impact snapshot endpoints ([4625a34](https://github.com/Kehl-io/nestweaver/commit/4625a34bcdaeb3d59130cbe9b1038ed9a15dff22))
+* **store:** cache impact snapshots by generation ([b21abf6](https://github.com/Kehl-io/nestweaver/commit/b21abf6c854d64056e3f6137d0e2adbe95ae86cc))
+
 ## [2.6.3](https://github.com/Kehl-io/nestweaver/compare/v2.6.2...v2.6.3) (2026-07-25)
 
 
