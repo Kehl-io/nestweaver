@@ -419,6 +419,24 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    /// Return the authoritative embedding eligibility snapshot for a scope.
+    pub async fn plan_embed(
+        &mut self,
+        scope: &str,
+        force: bool,
+    ) -> Result<nestweaver_proto::EmbedResponse> {
+        let resp = self
+            .inner
+            .plan_embed(nestweaver_proto::EmbedRequest {
+                scope: scope.to_string(),
+                force,
+                batch_size: 0,
+            })
+            .await
+            .context("plan_embed RPC failed")?;
+        Ok(resp.into_inner())
+    }
+
     /// Run bulk embedding on the daemon using its configured embedding backend.
     pub async fn embed(
         &mut self,

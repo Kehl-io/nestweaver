@@ -14673,11 +14673,11 @@ fn run_embed(
     let path = db.unwrap_or(&default);
     let local_model_id = local_embedding_model_id(model_id);
 
-    // ── Try the daemon path first (configured embedding backend) ───────────
+    // ── Daemon path (configured embedding backend) ─────────────────────────
     // Only use daemon for local-model embedding (no --endpoint, no --local) AND
     // when the daemon is enabled. Under --no-daemon / NESTWEAVER_NO_DAEMON=1 we must
     // NOT touch the daemon: connecting auto-starts one, whose held DB lock then
-    // breaks the direct fallback with a confusing "could not set lock" error (and
+    // breaks the direct path with a confusing "could not set lock" error (and
     // leaks the daemon). Skip straight to the in-process path instead.
     if use_daemon && endpoint.is_none() && !local {
         // The daemon embeds with the model recorded in the database (or the
@@ -14709,6 +14709,35 @@ fn run_embed(
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         match rt.block_on(nestweaver_client::DaemonClient::connect(path, None)) {
             Ok(mut client) => {
+                match rt.block_on(client.plan_embed(scope, force)) {
+                    Ok(plan) => {
+                        eprintln!(
+                            "Embedding plan: {} eligible, {} already embedded, {} scoped node(s).",
+                            plan.eligible, plan.skipped, plan.scoped
+                        );
+                        if plan.eligible == 0 {
+                            eprintln!(
+                                "No embedding work required; every scoped node already has an authoritative sidecar embedding."
+                            );
+                            return Ok(EXIT_SUCCESS);
+                        }
+                    }
+                    Err(error) => {
+                        // A same-version daemon from before PlanEmbed can survive a binary
+                        // upgrade. Keep the legacy route usable, but make the lost preflight
+                        // visible and tell the operator how to enable it.
+                        if daemon_lacks_embedding_preflight(&error) {
+                            eprintln!(
+                                "Daemon does not support embedding preflight; restart it with \
+                                 `nestweaver daemon --db {} restart` to enable eligibility reporting.",
+                                path.display()
+                            );
+                        } else {
+                            return Err(error).context("daemon embedding preflight failed");
+                        }
+                    }
+                }
+
                 eprintln!("Embedding via daemon (configured backend)…");
                 match rt.block_on(client.embed(scope, force, batch_size as u32)) {
                     Ok(resp) => {
@@ -14723,16 +14752,21 @@ fn run_embed(
                         if stats {
                             eprintln!(
                                 "Embed stats: {} succeeded, {} failed, \
-                                 {} rejected (dim mismatch), {:.2}s elapsed",
+                                 {} rejected (dim mismatch), {} eligible, \
+                                 {} already embedded, {} scoped node(s), {:.2}s elapsed",
                                 resp.succeeded,
                                 resp.failed,
                                 resp.rejected,
+                                resp.eligible,
+                                resp.skipped,
+                                resp.scoped,
                                 elapsed.as_secs_f64()
                             );
                         } else {
                             eprintln!(
-                                "Done: {} embedding(s) generated, {} error(s).",
-                                resp.succeeded, resp.failed
+                                "Done: {} embedding(s) generated, {} error(s); \
+                                 {} already embedded out of {} scoped node(s).",
+                                resp.succeeded, resp.failed, resp.skipped, resp.scoped
                             );
                         }
                         return if resp.failed > 0 || resp.rejected > 0 {
@@ -14742,18 +14776,26 @@ fn run_embed(
                         };
                     }
                     Err(e) => {
-                        eprintln!("Daemon embed failed ({e:#}), falling back to direct DB path…");
+                        return Err(e).context("daemon embed failed");
                     }
                 }
             }
-            Err(_) => {
-                eprintln!("Daemon not available, using direct DB path…");
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to connect to daemon for {}; start it with \
+                         'nestweaver daemon --db {} start' or use --no-daemon \
+                         (requires NESTWEAVER_NO_DAEMON=1)",
+                        path.display(),
+                        path.display()
+                    )
+                });
             }
         }
     }
 
-    // ── Fallback: direct DB access ──────────────────────────────
-    // Only allowed when the daemon path was not attempted (--local or --endpoint)
+    // ── Direct DB access ──────────────────────────────────────────
+    // Only allowed when the daemon path was not selected (--local or --endpoint)
     // or when the daemon is explicitly disabled (--no-daemon / NESTWEAVER_NO_DAEMON=1).
     if use_daemon && endpoint.is_none() && !local {
         anyhow::bail!(
@@ -15170,6 +15212,12 @@ fn run_embed(
     } else {
         Ok(EXIT_SUCCESS)
     }
+}
+
+fn daemon_lacks_embedding_preflight(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == tonic::Code::Unimplemented)
 }
 
 /// Resolve a `--repo` filter (display name or literal UID) to a repo UID.
@@ -18609,6 +18657,22 @@ mod cli_bounds_tests {
 #[cfg(all(test, feature = "embed"))]
 mod embed_accelerator_cli_tests {
     use super::*;
+
+    #[test]
+    fn preflight_unimplemented_status_is_recognized_through_context() {
+        let error = anyhow::Error::new(tonic::Status::unimplemented("PlanEmbed"))
+            .context("plan_embed RPC failed");
+
+        assert!(daemon_lacks_embedding_preflight(&error));
+    }
+
+    #[test]
+    fn preflight_other_statuses_are_not_treated_as_legacy_daemons() {
+        let error = anyhow::Error::new(tonic::Status::failed_precondition("model unavailable"))
+            .context("plan_embed RPC failed");
+
+        assert!(!daemon_lacks_embedding_preflight(&error));
+    }
 
     #[test]
     fn daemon_route_ignores_external_metadata_without_local_model_override() {

@@ -2526,6 +2526,80 @@ fn run_remove_vault_with_projection(
     )
 }
 
+#[derive(Clone, Copy)]
+struct EmbeddingScopes {
+    symbols: bool,
+    notes: bool,
+    headings: bool,
+}
+
+fn embedding_scopes(scope: &str) -> Result<EmbeddingScopes, Status> {
+    let scopes = EmbeddingScopes {
+        symbols: scope == "all" || scope == "symbols",
+        notes: scope == "all" || scope == "notes",
+        headings: scope == "all" || scope == "headings",
+    };
+    if !scopes.symbols && !scopes.notes && !scopes.headings {
+        return Err(Status::invalid_argument(format!(
+            "unknown scope '{scope}': expected one of: all, symbols, notes, headings"
+        )));
+    }
+    Ok(scopes)
+}
+
+fn embedding_is_eligible(store: &GraphStore, uid: &str, force: bool) -> bool {
+    force || !store.has_embedding(uid)
+}
+
+fn embedding_store_status(operation: &str, error: anyhow::Error) -> Status {
+    tracing::error!(operation, "embedding eligibility query failed: {error:#}");
+    Status::internal(format!("failed to inspect embedding {operation}"))
+}
+
+fn plan_embeddings(store: &GraphStore, scope: &str, force: bool) -> Result<EmbedResponse, Status> {
+    let scopes = embedding_scopes(scope)?;
+    let mut scoped = 0u64;
+    let mut eligible = 0u64;
+
+    if scopes.symbols {
+        let symbols = store
+            .list_all_symbols()
+            .map_err(|error| embedding_store_status("symbols", error.into()))?;
+        scoped += symbols.len() as u64;
+        eligible += symbols
+            .iter()
+            .filter(|symbol| embedding_is_eligible(store, &symbol.uid, force))
+            .count() as u64;
+    }
+    if scopes.notes {
+        let notes = store
+            .list_notes(None)
+            .map_err(|error| embedding_store_status("notes", error.into()))?;
+        scoped += notes.len() as u64;
+        eligible += notes
+            .iter()
+            .filter(|note| embedding_is_eligible(store, &note.uid, force))
+            .count() as u64;
+    }
+    if scopes.headings {
+        let headings = store
+            .list_all_headings()
+            .map_err(|error| embedding_store_status("headings", error.into()))?;
+        scoped += headings.len() as u64;
+        eligible += headings
+            .iter()
+            .filter(|heading| embedding_is_eligible(store, &heading.uid, force))
+            .count() as u64;
+    }
+
+    Ok(EmbedResponse {
+        scoped,
+        eligible,
+        skipped: scoped.saturating_sub(eligible),
+        ..EmbedResponse::default()
+    })
+}
+
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -5329,6 +5403,23 @@ impl NestWeaverDaemon for DaemonService {
     // ── Embedding ───────────────────────────────────────────────────
 
     #[allow(clippy::result_large_err)]
+    async fn plan_embed(
+        &self,
+        request: Request<EmbedRequest>,
+    ) -> Result<Response<EmbedResponse>, Status> {
+        let _write_lock = self.state.write_mutex.lock().await;
+        let _guard = ConnectionGuard::read(&self.state);
+        let request = request.into_inner();
+        let store = self.state.store.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            plan_embeddings(&store, &request.scope, request.force)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("embed plan task panicked: {error}")))??;
+        Ok(Response::new(response))
+    }
+
+    #[allow(clippy::result_large_err)]
     async fn embed(
         &self,
         request: Request<EmbedRequest>,
@@ -5360,15 +5451,10 @@ impl NestWeaverDaemon for DaemonService {
                 req.batch_size as usize
             };
 
-            let do_symbols = scope == "all" || scope == "symbols";
-            let do_notes = scope == "all" || scope == "notes";
-            let do_headings = scope == "all" || scope == "headings";
-
-            if !do_symbols && !do_notes && !do_headings {
-                return Err(Status::invalid_argument(format!(
-                    "unknown scope '{scope}': expected one of: all, symbols, notes, headings"
-                )));
-            }
+            let scopes = embedding_scopes(&scope)?;
+            let do_symbols = scopes.symbols;
+            let do_notes = scopes.notes;
+            let do_headings = scopes.headings;
 
             let (status, model) = self.state.embedding_runtime.snapshot();
             let Some(model) = model else {
@@ -5388,20 +5474,23 @@ impl NestWeaverDaemon for DaemonService {
                 let mut succeeded = 0u32;
                 let mut failed = 0u32;
                 let mut rejected = 0u32;
+                let mut scoped = 0u64;
+                let mut eligible = 0u64;
 
                 // Each embed run may legitimately force-switch the model once;
                 // re-arm the once-per-run clear guard on this long-lived index.
                 store.reset_embedding_force_guard();
 
-                if do_symbols && let Ok(symbols) = store.list_all_symbols() {
-                    let to_embed: Vec<_> = if force {
-                        symbols.iter().collect()
-                    } else {
-                        symbols
-                            .iter()
-                            .filter(|s| !store.has_embedding(&s.uid))
-                            .collect()
-                    };
+                if do_symbols {
+                    let symbols = store
+                        .list_all_symbols()
+                        .map_err(|error| embedding_store_status("symbols", error.into()))?;
+                    scoped += symbols.len() as u64;
+                    let to_embed: Vec<_> = symbols
+                        .iter()
+                        .filter(|symbol| embedding_is_eligible(&store, &symbol.uid, force))
+                        .collect();
+                    eligible += to_embed.len() as u64;
                     for chunk in to_embed.chunks(batch_size) {
                         for sym in chunk {
                             let text = nestweaver_embed::preprocess::symbol_embed_text(
@@ -5426,15 +5515,16 @@ impl NestWeaverDaemon for DaemonService {
                     }
                 }
 
-                if do_notes && let Ok(notes) = store.list_notes(None) {
-                    let to_embed: Vec<_> = if force {
-                        notes.iter().collect()
-                    } else {
-                        notes
-                            .iter()
-                            .filter(|n| !store.has_embedding(&n.uid))
-                            .collect()
-                    };
+                if do_notes {
+                    let notes = store
+                        .list_notes(None)
+                        .map_err(|error| embedding_store_status("notes", error.into()))?;
+                    scoped += notes.len() as u64;
+                    let to_embed: Vec<_> = notes
+                        .iter()
+                        .filter(|note| embedding_is_eligible(&store, &note.uid, force))
+                        .collect();
+                    eligible += to_embed.len() as u64;
                     for chunk in to_embed.chunks(batch_size) {
                         for note in chunk {
                             let text =
@@ -5456,15 +5546,16 @@ impl NestWeaverDaemon for DaemonService {
                     }
                 }
 
-                if do_headings && let Ok(headings) = store.list_all_headings() {
-                    let to_embed: Vec<_> = if force {
-                        headings.iter().collect()
-                    } else {
-                        headings
-                            .iter()
-                            .filter(|h| !store.has_embedding(&h.uid))
-                            .collect()
-                    };
+                if do_headings {
+                    let headings = store
+                        .list_all_headings()
+                        .map_err(|error| embedding_store_status("headings", error.into()))?;
+                    scoped += headings.len() as u64;
+                    let to_embed: Vec<_> = headings
+                        .iter()
+                        .filter(|heading| embedding_is_eligible(&store, &heading.uid, force))
+                        .collect();
+                    eligible += to_embed.len() as u64;
                     for chunk in to_embed.chunks(batch_size) {
                         for heading in chunk {
                             let text =
@@ -5497,6 +5588,9 @@ impl NestWeaverDaemon for DaemonService {
                     succeeded,
                     failed,
                     rejected,
+                    scoped,
+                    eligible,
+                    skipped: scoped.saturating_sub(eligible),
                 })
             })
             .await
@@ -5763,6 +5857,7 @@ const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
     "ListReposJson",
     "ListServicesJson",
     "ListVaultsJson",
+    "PlanEmbed",
     "PrImpactJson",
     "QueryExtensions",
     "ReadSymbols",
@@ -13386,6 +13481,96 @@ mod startup_helper_tests {
     }
 
     #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn embed_plan_reports_all_missing_nodes_as_eligible() {
+        let state = test_state_with_writer();
+        insert_unembedded_nodes_for_every_scope(&state.store, "plan-missing");
+        let service = DaemonService::new(state);
+
+        let response = service
+            .plan_embed(Request::new(EmbedRequest {
+                scope: "all".to_string(),
+                force: false,
+                batch_size: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.scoped, 3);
+        assert_eq!(response.eligible, 3);
+        assert_eq!(response.skipped, 0);
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn embed_plan_skips_nodes_present_in_the_sidecar() {
+        let state = test_state_with_writer();
+        let uids = insert_unembedded_nodes_for_every_scope(&state.store, "plan-sidecar");
+        for uid in &uids {
+            assert!(state.store.add_embedding(uid, vec![0.1, 0.2, 0.3]));
+        }
+        let service = DaemonService::new(state);
+
+        let response = service
+            .plan_embed(Request::new(EmbedRequest {
+                scope: "all".to_string(),
+                force: false,
+                batch_size: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.scoped, 3);
+        assert_eq!(response.eligible, 0);
+        assert_eq!(response.skipped, 3);
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn forced_embed_plan_keeps_sidecar_nodes_eligible() {
+        let state = test_state_with_writer();
+        let uids = insert_unembedded_nodes_for_every_scope(&state.store, "plan-force");
+        for uid in &uids {
+            assert!(state.store.add_embedding(uid, vec![0.1, 0.2, 0.3]));
+        }
+        let service = DaemonService::new(state);
+
+        let response = service
+            .plan_embed(Request::new(EmbedRequest {
+                scope: "all".to_string(),
+                force: true,
+                batch_size: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.scoped, 3);
+        assert_eq!(response.eligible, 3);
+        assert_eq!(response.skipped, 0);
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn embed_plan_rejects_an_unknown_scope() {
+        let service = DaemonService::new(test_state_with_writer());
+
+        let status = service
+            .plan_embed(Request::new(EmbedRequest {
+                scope: "unknown".to_string(),
+                force: false,
+                batch_size: 0,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("unknown scope 'unknown'"));
+    }
+
+    #[cfg(feature = "embed")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incremental_embed_rpc_skips_sidecar_embeddings_for_every_scope() {
         let mut state = test_state_with_writer();
@@ -13419,6 +13604,9 @@ mod startup_helper_tests {
         assert_eq!(response.succeeded, 0);
         assert_eq!(response.failed, 0);
         assert_eq!(response.rejected, 0);
+        assert_eq!(response.scoped, 3);
+        assert_eq!(response.eligible, 0);
+        assert_eq!(response.skipped, 3);
         assert_eq!(
             calls.load(Ordering::Relaxed),
             0,
@@ -14075,6 +14263,7 @@ external_model = "unavailable-test-model"
             "ListVaultsJson",
             "MaterializeProjects",
             "MergeInstance",
+            "PlanEmbed",
             "PrImpactJson",
             "PruneStale",
             "PurgeInstance",
