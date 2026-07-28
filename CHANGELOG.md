@@ -55,7 +55,6 @@
 
 * avoid fork daemonization on macOS ([1658e3f](https://github.com/Kehl-io/nestweaver/commit/1658e3f9e3ed8e4635edc4640d82c61990a8f5ca))
 * **daemon:** honor embedding sidecar in incremental runs ([92dafe4](https://github.com/Kehl-io/nestweaver/commit/92dafe4371d2070d5e9a9306f571e189acfd6a03))
-* **daemon:** make incremental embedding idempotent ([eaaa43c](https://github.com/Kehl-io/nestweaver/commit/eaaa43cb494d22aa563980505dafa362b582cdbb))
 * **daemon:** make incremental embedding idempotent ([#188](https://github.com/Kehl-io/nestweaver/issues/188)) ([eaaa43c](https://github.com/Kehl-io/nestweaver/commit/eaaa43cb494d22aa563980505dafa362b582cdbb))
 * **deps:** pin Ladybug filtered scan correction ([a0afec2](https://github.com/Kehl-io/nestweaver/commit/a0afec260b613e0d63f1b954ee66657faf6c1bc6))
 * **embed:** honor cache remediation and fail fast ([ca9ad5d](https://github.com/Kehl-io/nestweaver/commit/ca9ad5dafd34752d910fa00228b45d5bcae4d5c8))
@@ -73,12 +72,9 @@
 
 ### Performance Improvements
 
-* **store:** add impact snapshot equivalence foundation ([0a9513a](https://github.com/Kehl-io/nestweaver/commit/0a9513a9041afe0755e91e7309dcee637278e3ce))
 * **store:** add impact snapshot equivalence foundation ([7d759d8](https://github.com/Kehl-io/nestweaver/commit/7d759d87317e4910c96869a026c0898df3f30064))
-* **store:** bulk-load impact snapshot endpoints ([f3900c6](https://github.com/Kehl-io/nestweaver/commit/f3900c66af239c8fe8416ecd3464576637a88053))
 * **store:** bulk-load impact snapshot endpoints ([4625a34](https://github.com/Kehl-io/nestweaver/commit/4625a34bcdaeb3d59130cbe9b1038ed9a15dff22))
 * **store:** cache impact snapshots by generation ([b21abf6](https://github.com/Kehl-io/nestweaver/commit/b21abf6c854d64056e3f6137d0e2adbe95ae86cc))
-* **store:** cache impact snapshots by graph generation ([5d95b8e](https://github.com/Kehl-io/nestweaver/commit/5d95b8e8097d3a11406d1dc2fdf6d6e743c52952))
 
 ## [2.6.3](https://github.com/Kehl-io/nestweaver/compare/v2.6.2...v2.6.3) (2026-07-25)
 
