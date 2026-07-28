@@ -6865,6 +6865,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 print_tier("Tier 1 (direct)", &result.tier_1);
                 print_tier("Tier 2 (caller's tests)", &result.tier_2);
                 print_tier("Tier 3 (transitive)", &result.tier_3);
+
+                // nw-107: the JSON path reports `status`, `notifications` and
+                // `recommendation`; text printed only the generic disclaimer.
+                // A developer saw a clean "0 tests affected" with no sign the
+                // selection was degraded and that the tool ITSELF recommends a
+                // full suite — the exact "no tests found is NOT safe-to-skip"
+                // failure the disclaimer exists to prevent.
+                let status_label = result.status.label();
+                if status_label != "complete" {
+                    println!("Status: {status_label} — selection is incomplete.");
+                }
+                for n in &result.notifications {
+                    println!("Warning: {}", n.message);
+                }
+                if result.recommendation == "run-full-suite" {
+                    println!(
+                        "Recommendation: RUN THE FULL SUITE — this selection is not safe to rely on."
+                    );
+                }
+
                 println!("Note: {}", result.disclaimer);
             }
 
