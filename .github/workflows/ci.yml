@@ -547,6 +547,53 @@ jobs:
       - name: Run audit
         run: cargo audit || true
 
+  secret-scan:
+    name: Secret Scan
+    # Deliberately NOT gated on needs.changes: a credential can be committed in
+    # any file type, including ones no language filter matches.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history. This repo is public, so a secret that was committed and
+          # later removed is still disclosed and still needs rotating — scanning
+          # only the tip would miss exactly the case that matters most.
+          fetch-depth: 0
+      # Install the binary directly rather than gitleaks-action: the marketplace
+      # action requires a GITLEAKS_LICENSE for organization-owned repos, which
+      # would make this gate fail for reasons unrelated to the code.
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          VERSION=8.30.1
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Verify the config actually loads rules
+        # A gitleaks config with no [extend] block and only an [allowlist]
+        # silently loads zero detectors and reports "no leaks found" on
+        # everything — this repo shipped exactly that config, unused, for
+        # months. Prove the scanner is live before trusting a clean result.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/gl-probe
+          # Assemble the probe token at runtime. Writing it as a literal would
+          # commit a credential-shaped string into the repo, which this very
+          # scanner then flags on every subsequent run. Split, neither half
+          # matches a rule.
+          PROBE_PREFIX='ghp_'
+          PROBE_BODY='016C7B1D2E3F4a5b6c7d8e9f0A1B2C3D4E5F'
+          printf 'token = "%s%s"\n' "$PROBE_PREFIX" "$PROBE_BODY" > /tmp/gl-probe/probe.txt
+          if gitleaks detect --source /tmp/gl-probe --config .gitleaks.toml --no-git --redact; then
+            echo "::error::gitleaks did not detect a planted credential — the config is not loading rules"
+            exit 1
+          fi
+          echo "config verified: planted credential was detected"
+      - name: Scan repository history
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --verbose
+
   e2e:
     name: E2E Tests
     needs: changes
