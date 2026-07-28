@@ -3394,3 +3394,151 @@ fn every_cli_invocation_pins_its_daemon_routing() {
          .env_remove(\"NESTWEAVER_NO_DAEMON\") for the daemon path: {unpinned:?}"
     );
 }
+
+// ── text/JSON honesty parity ─────────────────────────────────────────────
+//
+// The engine computes caveats correctly; the failures this guards against are
+// text renderers that DROP them. Six separate findings in the v2.7.0 CLI sweep
+// were this one defect (nw-097, nw-107, nw-110, nw-111), so the class needs an
+// enforced contract rather than six point fixes.
+//
+// The rule: if --json reports a caveat, the human output must say so too.
+// A caller reading a terminal must not be told less than a caller parsing JSON.
+
+/// Build a throwaway indexed repo and return (tempdir, db path).
+fn honesty_fixture() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/lib.js"),
+        "export function alpha() { return beta(); }\nexport function beta() { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/lib.test.js"),
+        "import { alpha } from './lib';\ntest('alpha', () => { alpha(); });\n",
+    )
+    .unwrap();
+
+    let db = dir.path().join("honesty.lbug").display().to_string();
+    nestweaver_cmd()
+        .args(["index", "--repo", &repo.display().to_string(), "--db", &db])
+        .assert()
+        .success();
+    (dir, db)
+}
+
+/// `affected-tests` must not print a clean zero while privately recommending a
+/// full suite (nw-107).
+#[test]
+fn affected_tests_text_surfaces_status_warning_and_recommendation() {
+    let (_dir, db) = honesty_fixture();
+
+    // A path that resolves to no indexed symbols — the analysis is degraded,
+    // and the JSON path says so.
+    let args = ["affected-tests", "--files", "zzz/not/real.js", "--db", &db];
+
+    let json_out = nestweaver_cmd().args(args).arg("--json").output().unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_out.stdout).expect("affected-tests --json must be valid JSON");
+
+    // Only assert parity when the JSON actually reports a caveat; if the
+    // analysis came back complete there is nothing for text to surface, and a
+    // test that asserted otherwise would be testing the fixture, not the code.
+    let status = json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if status == "complete" {
+        return;
+    }
+
+    let text_out = nestweaver_cmd().args(args).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&text_out.stdout),
+        String::from_utf8_lossy(&text_out.stderr)
+    )
+    .to_lowercase();
+
+    assert!(
+        text.contains(status),
+        "--json reported status {status:?} but the text output never mentions it. \
+         A developer sees a clean result while the tool privately knows the \
+         selection is incomplete.\n\n{text}"
+    );
+
+    if let Some(rec) = json.get("recommendation").and_then(|v| v.as_str())
+        && rec == "run-full-suite"
+    {
+        assert!(
+            text.contains("full suite"),
+            "--json recommends running the full suite; the text output must say so — \
+             this is the command where the cost of silence is skipped tests.\n\n{text}"
+        );
+    }
+
+    if let Some(notes) = json.get("notifications").and_then(|v| v.as_array())
+        && !notes.is_empty()
+    {
+        assert!(
+            text.contains("warning") || text.contains("not assessed"),
+            "--json carries {} notification(s) that text never shows.\n\n{text}",
+            notes.len()
+        );
+    }
+}
+
+/// `regex-search` must not report "No matches" when it merely ran out of budget
+/// (nw-097, nw-111). A genuine empty result must still read cleanly.
+#[test]
+fn regex_search_text_distinguishes_no_matches_from_budget_exhaustion() {
+    let (_dir, db) = honesty_fixture();
+
+    // Genuine miss: a pattern that truly is not present.
+    let miss = nestweaver_cmd()
+        .args([
+            "regex-search",
+            "zzqq_definitely_absent_pattern_41",
+            "--db",
+            &db,
+            "--max-millis",
+            "60000",
+        ])
+        .output()
+        .unwrap();
+    let miss_text = String::from_utf8_lossy(&miss.stdout).to_lowercase();
+    assert!(
+        miss_text.contains("no matches"),
+        "a genuine miss should still read as a plain no-match: {miss_text}"
+    );
+    assert!(
+        !miss_text.contains("budget"),
+        "a genuine miss must NOT warn about the budget — crying wolf on every \
+         empty result is how a real truncation warning gets ignored: {miss_text}"
+    );
+
+    // Budget exhaustion: assert parity only if the engine actually reports it,
+    // since a tiny fixture may complete within any budget.
+    let args = ["regex-search", "alpha", "--db", &db, "--max-millis", "1"];
+    let json_out = nestweaver_cmd().args(args).arg("--json").output().unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_out.stdout).expect("regex-search --json must be valid JSON");
+    let truncated = json
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let empty = json
+        .get("results")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| a.is_empty());
+    if !(truncated && empty) {
+        return;
+    }
+
+    let text_out = nestweaver_cmd().args(args).output().unwrap();
+    let text = String::from_utf8_lossy(&text_out.stdout).to_lowercase();
+    assert!(
+        text.contains("budget") || text.contains("cut short") || text.contains("truncat"),
+        "--json reported truncated:true with zero results, but text printed a bare \
+         no-match — an actively false claim that matches do not exist.\n\n{text}"
+    );
+}
