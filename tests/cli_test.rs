@@ -3542,3 +3542,40 @@ fn regex_search_text_distinguishes_no_matches_from_budget_exhaustion() {
          no-match — an actively false claim that matches do not exist.\n\n{text}"
     );
 }
+
+/// A read-only command must never report success for a database that isn't there.
+///
+/// nw-106: `list-projects` swallowed the store-open error on the daemon path and
+/// returned `{"materialized": []}` at exit 0, so a missing database was
+/// indistinguishable from "no projects defined" — and text mode suggested adding
+/// `[[projects]]` to a config, an actively wrong remedy. A CI gate or agent reads
+/// "zero projects" and proceeds on a false premise.
+#[test]
+fn list_projects_fails_on_a_missing_database() {
+    let missing = "/nonexistent/dir/definitely-not-here.lbug";
+
+    for extra in [vec![], vec!["--json"]] {
+        let output = nestweaver_cmd()
+            .args(["list-projects", "--db", missing])
+            .args(&extra)
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "list-projects must exit non-zero for a missing --db (mode {extra:?}); \
+             17 of 18 comparable commands already do"
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        assert!(
+            stderr.contains("not found") || stderr.contains("db_not_found"),
+            "the error must name the real problem — a missing database — rather than \
+             leaking a raw store error or suggesting a config change: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("materialized"),
+            "no result payload should be emitted for a database that does not exist"
+        );
+    }
+}

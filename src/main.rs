@@ -8697,9 +8697,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::ListProjects { json, db, config } => {
+            // nw-106: read-only command — fail `db_not_found` on a missing --db
+            // before any daemon/store connect. Without this the daemon path
+            // swallowed the open error and returned an empty list at exit 0, so
+            // a missing database was indistinguishable from "no projects
+            // defined" — and the text path suggested adding [[projects]] to a
+            // config, an actively wrong remedy. 17 of 18 comparable commands
+            // already exit 1 here; this was the outlier.
+            let resolved_db = db.clone().unwrap_or_else(default_db_path);
+            require_existing_db(&resolved_db)?;
+
             // ── daemon guard ──────────────────────────────────────
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let db_path = resolved_db.clone();
                 let args = serde_json::json!({});
                 try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)
                     .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
