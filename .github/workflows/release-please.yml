@@ -152,7 +152,7 @@ jobs:
         # Keyed on package versions (not Cargo.lock) so the cache survives
         # release lockfile churn; per-target since the build matrix crosses
         # os/arch.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/**/build/lbug-*/out
