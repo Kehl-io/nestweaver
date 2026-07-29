@@ -592,6 +592,30 @@ fn scan_crash_reports_in(directories: &[PathBuf], supported: bool) -> CrashRecur
     scan
 }
 
+/// One-line verdict for a `broken-links` entry.
+///
+/// A sub-1.0 confidence means the link matched at a lower resolver tier, not
+/// that it is wrong. Printing only the number let a same-folder match (0.95)
+/// and a link pointing at nothing (0.0) read identically (nw-100).
+fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
+    match &link.resolved_target_uid {
+        Some(uid) => format!("resolves to {uid}"),
+        None => "UNRESOLVED — no such note".to_string(),
+    }
+}
+
+/// Summarise how many entries are genuinely broken versus merely resolved at a
+/// lower tier, so the headline count cannot be read as "all of these are
+/// broken".
+fn print_link_classification(links: &[nestweaver_engine::BrokenLink]) {
+    let unresolved = links.iter().filter(|l| l.is_unresolved()).count();
+    let resolved = links.len() - unresolved;
+    println!(
+        "  {unresolved} unresolved (genuinely broken), {resolved} resolved at a lower \
+         confidence tier (same-folder or filename-stem match — not broken)"
+    );
+}
+
 fn capability_diagnostics_value(
     embedding_compiled: bool,
     metal_compiled: bool,
@@ -14032,10 +14056,14 @@ fn run_brain(
                             }
                             _ => println!("Broken / ambiguous wikilinks ({}):", links.len()),
                         }
+                        print_link_classification(&links);
                         for l in &links {
                             println!(
-                                "  [[{}]] in {} (confidence {:.2})",
-                                l.wikilink_text, l.source_path, l.confidence
+                                "  [[{}]] in {} (confidence {:.2}) — {}",
+                                l.wikilink_text,
+                                l.source_path,
+                                l.confidence,
+                                describe_link_resolution(l)
                             );
                             if !l.suggested_target_uids.is_empty() {
                                 println!("    suggested: {}", l.suggested_target_uids.join(", "));
@@ -14063,10 +14091,14 @@ fn run_brain(
                 println!("No broken or ambiguous wikilinks found.");
             } else {
                 println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
+                print_link_classification(&links);
                 for l in &links {
                     println!(
-                        "  [[{}]] in {} (confidence {:.2})",
-                        l.wikilink_text, l.source_path, l.confidence
+                        "  [[{}]] in {} (confidence {:.2}) — {}",
+                        l.wikilink_text,
+                        l.source_path,
+                        l.confidence,
+                        describe_link_resolution(l)
                     );
                     if !l.suggested_target_uids.is_empty() {
                         println!("    suggested: {}", l.suggested_target_uids.join(", "));
@@ -14396,6 +14428,10 @@ fn run_brain(
                     println!("  total notes:      {}", stats.total_notes);
                     println!("  total wikilinks:  {}", stats.total_wikilinks);
                     println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                    println!(
+                        "  low-confidence (resolved, not broken): {}",
+                        stats.low_confidence_wikilinks
+                    );
                     println!("  orphans:          {}", stats.orphans);
                     println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
                     if !stats.top_tags.is_empty() {
@@ -14426,6 +14462,10 @@ fn run_brain(
                 println!("  total notes:      {}", stats.total_notes);
                 println!("  total wikilinks:  {}", stats.total_wikilinks);
                 println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                println!(
+                    "  low-confidence (resolved, not broken): {}",
+                    stats.low_confidence_wikilinks
+                );
                 println!("  orphans:          {}", stats.orphans);
                 println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
                 if !stats.top_tags.is_empty() {
