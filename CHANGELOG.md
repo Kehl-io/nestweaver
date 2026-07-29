@@ -40,6 +40,16 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [2.7.1](https://github.com/Kehl-io/nestweaver/compare/v2.7.0...v2.7.1) (2026-07-29)
+
+
+### Bug Fixes
+
+* **blast-radius:** a truncated traversal must not report status Complete ([#198](https://github.com/Kehl-io/nestweaver/issues/198)) ([687b4a5](https://github.com/Kehl-io/nestweaver/commit/687b4a58ed61a6b4a8e76e4d25f80a556ede0bca))
+* **cli:** surface honesty fields the text renderers were dropping, and enforce parity ([#196](https://github.com/Kehl-io/nestweaver/issues/196)) ([83349ea](https://github.com/Kehl-io/nestweaver/commit/83349eae6a537cac9080a55b0741869fb8f5b632))
+* import edge fan-out corrupting hub ranking, and impact presenting a capped set as complete ([#195](https://github.com/Kehl-io/nestweaver/issues/195)) ([3f06f08](https://github.com/Kehl-io/nestweaver/commit/3f06f0885fb30b558020150507645ac9d9f7cb60))
+* **list-projects:** fail on a missing database instead of reporting zero projects ([#197](https://github.com/Kehl-io/nestweaver/issues/197)) ([a6fa945](https://github.com/Kehl-io/nestweaver/commit/a6fa9452f9fd1c2feed5ce503990c57811e5d2c1))
+
 ## [2.7.0](https://github.com/Kehl-io/nestweaver/compare/v2.6.3...v2.7.0) (2026-07-28)
 
 
