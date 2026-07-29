@@ -655,6 +655,93 @@ fn print_link_classification(links: &[nestweaver_engine::BrokenLink]) {
     );
 }
 
+/// Render a `dead-code` result as text from its JSON payload.
+///
+/// BOTH the direct and daemon paths render through this, so the two cannot
+/// drift. The daemon branch used to `println!` the RPC response verbatim with
+/// no `if json` guard, which meant the OUTPUT FORMAT depended on whether a
+/// daemon happened to be running rather than on the flag — `dead-code` printed
+/// text standalone and JSON once the daemon was up (nw-108). Driving both from
+/// the same payload makes parity structural rather than something to remember.
+fn render_dead_code_text(payload: &serde_json::Value) {
+    let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = num("total_symbols");
+    let matching = num("matching_count");
+    let excluded = num("excluded_count");
+
+    let excluded_note = || {
+        if excluded > 0 {
+            println!("({excluded} type-only/declaration symbols excluded from analysis)");
+        }
+    };
+
+    if matching == 0 {
+        println!("No dead code detected ({total} symbols, all reachable from entry points).");
+        excluded_note();
+        return;
+    }
+
+    println!(
+        "Dead code analysis: {} of {total} symbols ({:.1}%) unreachable from entry points\n",
+        num("unreachable_count"),
+        payload
+            .get("dead_percentage")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+    );
+    excluded_note();
+
+    let returned = num("returned");
+    let min_conf = payload
+        .get("min_confidence")
+        .and_then(|v| v.as_str())
+        .unwrap_or("low");
+    if min_conf != "low" {
+        println!("Showing {returned} symbol(s) with confidence >= {min_conf}\n");
+    }
+    if payload
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        println!("(showing first {returned} of {matching} — pass --limit to change)\n");
+    }
+
+    // Group by file path, matching the direct path's BTreeMap ordering.
+    let mut by_file: std::collections::BTreeMap<&str, Vec<&serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for sym in payload
+        .get("unreachable_symbols")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let file = sym.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        by_file.entry(file).or_default().push(sym);
+    }
+    for (file, syms) in &by_file {
+        println!("{file}:");
+        for sym in syms {
+            let field = |k: &str| sym.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            // Lowercase the confidence: the two paths serialise it
+            // differently — the direct payload carries the serde variant
+            // name ("Medium") while the daemon returns "medium" — and the
+            // historical text output used the Display impl, which is
+            // lowercase. Normalising here keeps the rendered text stable and
+            // identical across modes. The underlying JSON inconsistency is a
+            // separate defect.
+            println!(
+                "  {} ({}) [{}] confidence={}",
+                field("name"),
+                field("kind"),
+                field("visibility"),
+                field("confidence").to_lowercase(),
+            );
+        }
+        println!();
+    }
+}
+
 fn capability_diagnostics_value(
     embedding_compiled: bool,
     metal_compiled: bool,
@@ -6621,7 +6708,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["limit"] = serde_json::json!(n);
                 }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args) {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        render_dead_code_text(&value);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -6658,97 +6749,44 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => filtered,
             };
 
+            #[derive(serde::Serialize)]
+            struct DeadCodeJson<'a> {
+                total_symbols: usize,
+                reachable_symbols: usize,
+                unreachable_count: usize,
+                matching_count: usize,
+                returned: usize,
+                truncated: bool,
+                excluded_count: usize,
+                dead_percentage: f64,
+                min_confidence: String,
+                unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
+            }
+            // Count contract (same as the dead_code MCP tool):
+            // `unreachable_count` is the UNFILTERED total, consistent with
+            // total_symbols/reachable_symbols/dead_percentage;
+            // `matching_count` is the post-min-confidence count.
+            //
+            // Built unconditionally so the text path renders from the SAME
+            // payload the JSON path prints, and from the same payload the
+            // daemon returns (nw-108).
+            let payload = serde_json::to_value(DeadCodeJson {
+                total_symbols: result.total_symbols,
+                reachable_symbols: result.reachable_symbols,
+                unreachable_count: result.unreachable_symbols.len(),
+                matching_count: filtered_count,
+                returned: shown.len(),
+                truncated,
+                excluded_count: result.excluded_count,
+                dead_percentage: result.dead_percentage,
+                min_confidence: min_conf.to_string(),
+                unreachable_symbols: shown,
+            })?;
+
             if json {
-                #[derive(serde::Serialize)]
-                struct DeadCodeJson<'a> {
-                    total_symbols: usize,
-                    reachable_symbols: usize,
-                    unreachable_count: usize,
-                    matching_count: usize,
-                    returned: usize,
-                    truncated: bool,
-                    excluded_count: usize,
-                    dead_percentage: f64,
-                    min_confidence: String,
-                    unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
-                }
-                // Count contract (same as the dead_code MCP tool):
-                // `unreachable_count` is the UNFILTERED total, consistent with
-                // total_symbols/reachable_symbols/dead_percentage;
-                // `matching_count` is the post-min-confidence count.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&DeadCodeJson {
-                        total_symbols: result.total_symbols,
-                        reachable_symbols: result.reachable_symbols,
-                        unreachable_count: result.unreachable_symbols.len(),
-                        matching_count: filtered_count,
-                        returned: shown.len(),
-                        truncated,
-                        excluded_count: result.excluded_count,
-                        dead_percentage: result.dead_percentage,
-                        min_confidence: min_conf.to_string(),
-                        unreachable_symbols: shown,
-                    })?
-                );
-            } else if filtered_count == 0 {
-                println!(
-                    "No dead code detected ({} symbols, all reachable from entry points).",
-                    result.total_symbols
-                );
-                if result.excluded_count > 0 {
-                    println!(
-                        "({} type-only/declaration symbols excluded from analysis)",
-                        result.excluded_count
-                    );
-                }
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                println!(
-                    "Dead code analysis: {} of {} symbols ({:.1}%) unreachable from entry points\n",
-                    result.unreachable_symbols.len(),
-                    result.total_symbols,
-                    result.dead_percentage,
-                );
-                if result.excluded_count > 0 {
-                    println!(
-                        "({} type-only/declaration symbols excluded from analysis)",
-                        result.excluded_count
-                    );
-                }
-                if min_conf != DeadCodeConfidence::Low {
-                    println!(
-                        "Showing {} symbol(s) with confidence >= {}\n",
-                        shown.len(),
-                        min_conf
-                    );
-                }
-                if truncated {
-                    println!(
-                        "(showing first {} of {} — pass --limit to change)\n",
-                        shown.len(),
-                        filtered_count
-                    );
-                }
-
-                // Group by file path.
-                let mut by_file: std::collections::BTreeMap<
-                    &str,
-                    Vec<&nestweaver_engine::UnreachableSymbol>,
-                > = std::collections::BTreeMap::new();
-                for sym in &shown {
-                    by_file.entry(&sym.file_path).or_default().push(sym);
-                }
-
-                for (file, syms) in &by_file {
-                    println!("{}:", file);
-                    for sym in syms {
-                        println!(
-                            "  {} ({}) [{}] confidence={}",
-                            sym.name, sym.kind, sym.visibility, sym.confidence,
-                        );
-                    }
-                    println!();
-                }
+                render_dead_code_text(&payload);
             }
 
             let stats = format!(

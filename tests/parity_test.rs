@@ -450,6 +450,35 @@ fn parity_affected_tests_direct_vs_daemon() {
     );
 }
 
+/// nw-108: `dead-code`'s daemon branch printed the RPC response verbatim with
+/// no `if json` guard, so the OUTPUT FORMAT depended on whether a daemon
+/// happened to be running rather than on the flag — text standalone, JSON once
+/// the daemon was up. The text renderer was never missing; it was simply not
+/// reached. This is the nw-097 divergence family, and the reason it survived is
+/// that `dead-code` was not in this file.
+///
+/// Scoped to HUMAN mode deliberately. `--json` still diverges between the two
+/// paths for reasons that predate this fix and would change a published
+/// contract to resolve: the daemon wraps its payload in `_meta`, and it
+/// lowercases the confidence ("medium") while the direct payload carries the
+/// serde variant name ("Medium"). Both are real and tracked separately; neither
+/// is the format flip this test exists to catch. Asserting json parity here
+/// would couple this regression guard to that unrelated decision.
+#[test]
+fn parity_dead_code_human_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    let args: &[&str] = &["dead-code", "--limit", "5"];
+
+    // Direct mode first — the daemon is not started yet and may hold the lock.
+    let direct = run_direct(&fixture.db_path, args);
+
+    let _guard = DaemonGuard::new(&fixture.db_path);
+    start_daemon(&fixture.db_path);
+    let daemon = run_via_daemon(&fixture.db_path, args);
+
+    assert_parity("dead-code", "human", &direct, &daemon);
+}
+
 /// `stale-check` is a freshness gate: it exits 1 when the index is
 /// stale. The fixture here is freshly indexed (not stale), but regardless we
 /// only assert stdout equality and equal exit codes across modes — never
