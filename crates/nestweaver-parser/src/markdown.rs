@@ -743,26 +743,32 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
     for (sec_idx, sec) in sections.iter().enumerate() {
         let stripped = strip_code(&sec.text);
         for (line_offset, line_text) in stripped.lines().enumerate() {
-            let bytes = line_text.as_bytes();
-            let mut i = 0usize;
-            while i < bytes.len() {
-                let is_boundary =
-                    i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'(' | b'[' | b',' | b';');
-                if bytes[i] == b'#' && is_boundary {
-                    let start = i + 1;
-                    let mut j = start;
-                    while j < bytes.len() {
-                        let c = bytes[j];
-                        if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'/' {
-                            j += 1;
+            // Scan by CHARACTER, not by byte. Testing each byte with
+            // `is_ascii_alphanumeric` stopped at the first non-ASCII byte, so
+            // `#café` indexed as `caf` and `#日本語` was dropped outright — its
+            // first character is non-ASCII, so the name came out empty. Obsidian
+            // supports non-ASCII tags, and a truncated stem can collide with an
+            // unrelated real tag (nw-116).
+            let mut prev: Option<char> = None;
+            let mut chars = line_text.char_indices().peekable();
+            while let Some((idx, ch)) = chars.next() {
+                let is_boundary = match prev {
+                    None => true,
+                    Some(p) => matches!(p, ' ' | '\t' | '(' | '[' | ',' | ';'),
+                };
+                if ch == '#' && is_boundary {
+                    let start = idx + ch.len_utf8();
+                    let mut end = start;
+                    while let Some(&(j, c)) = chars.peek() {
+                        if c.is_alphanumeric() || c == '-' || c == '_' || c == '/' {
+                            end = j + c.len_utf8();
+                            chars.next();
                         } else {
                             break;
                         }
                     }
-                    if j > start {
-                        let name = std::str::from_utf8(&bytes[start..j])
-                            .unwrap_or("")
-                            .to_lowercase();
+                    if end > start {
+                        let name = line_text[start..end].to_lowercase();
                         // Skip bare `#` (no name), pure-numeric tags like #1 (often markdown
                         // issue refs), and trailing-hyphen artefacts.
                         if !name.is_empty() && name.chars().any(|c| c.is_alphabetic()) {
@@ -773,11 +779,11 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
                                 line: sec.start_line + line_offset as u32,
                             });
                         }
-                        i = j;
+                        prev = line_text[start..end].chars().next_back();
                         continue;
                     }
                 }
-                i += 1;
+                prev = Some(ch);
             }
         }
     }
@@ -1333,11 +1339,57 @@ top 2 body
     /// a line that contains non-ASCII elsewhere must still be found at the
     /// right line — the byte rewrite used to shift every following offset.
     ///
-    /// This deliberately does NOT assert that `#café` yields `café`: the tag
-    /// scanner accepts only `is_ascii_alphanumeric` plus `-_/`, so it truncates
-    /// at the first non-ASCII byte and returns `caf`. That is a separate
-    /// limitation from the encoding defect, unchanged by this fix, and tracked
-    /// on its own.
+    /// Non-ASCII tag names are covered separately by
+    /// `inline_tags_accept_non_ascii_names`.
+    /// nw-116: Obsidian supports non-ASCII tags, but the scanner tested each
+    /// byte with `is_ascii_alphanumeric`, so it stopped at the first non-ASCII
+    /// byte: `#café` indexed as `caf` and `#niño` as `ni`. That silently splits
+    /// a tag namespace, and the truncated stems can collide with unrelated real
+    /// tags.
+    #[test]
+    fn inline_tags_accept_non_ascii_names() {
+        let src = "# n\n\nTagged #café and #niño and #日本語 and #arch/décision here.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let names: Vec<&str> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"café"), "tags were: {names:?}");
+        assert!(names.contains(&"niño"), "tags were: {names:?}");
+        assert!(names.contains(&"日本語"), "tags were: {names:?}");
+        assert!(names.contains(&"arch/décision"), "tags were: {names:?}");
+        assert!(
+            !names.contains(&"caf"),
+            "the truncated stem must be gone, not merely joined: {names:?}"
+        );
+    }
+
+    /// The widened charset must not start swallowing ordinary punctuation that
+    /// ends a tag — otherwise `#tag.` or `#tag, next` would absorb the trailing
+    /// mark and mint a tag nobody wrote.
+    #[test]
+    fn inline_tags_still_stop_at_punctuation_and_whitespace() {
+        let src = "# n\n\nSee #alpha, #beta. And #gamma; plus #delta! End #ré.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let names: Vec<&str> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        for expected in ["alpha", "beta", "gamma", "delta", "ré"] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+    }
+
+    /// Widening the charset must not start minting tags from prose. The real
+    /// vault contains page and issue ranges written with an EN DASH — `#185–187`,
+    /// `#36–37` — and those are not tags. The en dash (U+2013) is punctuation,
+    /// not a hyphen-minus, so it must terminate the name, and the resulting
+    /// digits-only stem must still be dropped by the numeric filter.
+    #[test]
+    fn en_dash_ranges_from_prose_are_not_tags() {
+        let src = "# n\n\nSee pp. #185–187 and #36–37; also #11–12.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let names: Vec<&str> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.is_empty(),
+            "numeric ranges must not become tags: {names:?}"
+        );
+    }
+
     #[test]
     fn inline_tags_survive_non_ascii_on_the_same_line() {
         let src = "# n\n\nRésumé notes — tagged #design and #arch/decision here.\n";
