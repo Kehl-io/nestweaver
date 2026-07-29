@@ -117,7 +117,10 @@ pub enum AnalysisStatus {
 
 impl AnalysisStatus {
     /// Lowercase label for embedding in the human summary string.
-    fn label(self) -> &'static str {
+    ///
+    /// Public so CLI text renderers can surface the status verbatim rather than
+    /// re-deriving the mapping (nw-107).
+    pub fn label(self) -> &'static str {
         match self {
             AnalysisStatus::Complete => "complete",
             AnalysisStatus::Partial => "partial",
