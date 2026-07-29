@@ -365,10 +365,238 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
     }
 }
 
+// ── nw-073: lbug optimisticRead crash recurrence ──────────────────────────────
+//
+// nw-073 ships MITIGATED, not fixed. Write-capable opens bound the lbug engine
+// thread pool to remove the concurrency the eviction-vs-read race needs, but
+// that rests on an analysis of a crash which was never reproduced locally — and
+// nothing in the product could tell you whether the race was still firing.
+// This scan is that signal, and it is worth more than the root-cause fix,
+// because it says whether the root cause still matters.
+
+/// Stack frame identifying the nw-073 fault.
+const LBUG_CRASH_FRAME: &str = "optimisticRead";
+
+/// Process-name fragment selecting reports that belong to this product.
+const CRASH_REPORT_PROCESS: &str = "nestweaver";
+
+/// `PATH`-style override for the directories scanned; also the test hook.
+const CRASH_REPORT_DIRS_ENV: &str = "NESTWEAVER_CRASH_REPORT_DIRS";
+
+/// Cap on bytes read from any single report.
+const CRASH_REPORT_READ_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// True when `file_name` names a macOS *crash* report rather than a resource
+/// diagnostic.
+///
+/// This distinction is the whole correctness of the check. Both kinds live in
+/// the same directories, but `.diag` files (including `*.cpu_resource.diag`)
+/// are assembled from periodic stack samples of a *running, healthy* process.
+/// On the machine this was developed against, 13 of them contain
+/// `optimisticRead` purely because it is a hot read path during indexing.
+/// Matching those would report a use-after-free every time indexing ran warm —
+/// worse than no check at all, because it would be confidently wrong.
+fn is_crash_report_file(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.ends_with(".ips") || lower.ends_with(".crash")
+}
+
+/// True when the file is a crash report belonging to this product.
+fn is_candidate_crash_report(file_name: &str) -> bool {
+    is_crash_report_file(file_name)
+        && file_name
+            .to_ascii_lowercase()
+            .contains(CRASH_REPORT_PROCESS)
+}
+
+/// True when a crash report carries the nw-073 signature.
+fn crash_report_matches_signature(file_name: &str, contents: &str) -> bool {
+    is_candidate_crash_report(file_name) && contents.contains(LBUG_CRASH_FRAME)
+}
+
+/// Outcome of a crash-report sweep.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CrashRecurrenceScan {
+    /// Whether a scan was attempted at all on this platform.
+    supported: bool,
+    /// Directories successfully opened.
+    directories_read: usize,
+    /// Directories or reports that exist but could not be read.
+    unreadable: Vec<String>,
+    /// Candidate reports whose contents were checked.
+    reports_examined: usize,
+    /// Reports carrying the signature.
+    matched_reports: Vec<String>,
+}
+
+impl CrashRecurrenceScan {
+    /// The scan's own honesty about what it saw.
+    ///
+    /// `unavailable` and `scanned` are deliberately distinct: a caller must be
+    /// able to tell "no crashes" from "could not look". Reporting a zero for
+    /// the latter is the nw-062 defect — a caller cannot distinguish an absence
+    /// of findings from an absence of data.
+    fn status(&self) -> &'static str {
+        if !self.supported {
+            "unsupported"
+        } else if self.directories_read == 0 {
+            "unavailable"
+        } else if !self.unreadable.is_empty() {
+            "partial"
+        } else {
+            "scanned"
+        }
+    }
+
+    /// A count is only meaningful once at least one directory was read.
+    fn has_count(&self) -> bool {
+        self.directories_read > 0
+    }
+}
+
+/// Human-readable summary of what the scan does and does not establish.
+fn crash_recurrence_note(scan: &CrashRecurrenceScan) -> String {
+    match scan.status() {
+        "unsupported" => format!(
+            "crash-report scanning is implemented for macOS only; set {CRASH_REPORT_DIRS_ENV} to scan explicit directories"
+        ),
+        "unavailable" => format!(
+            "no crash-report directory could be read, so recurrence is UNKNOWN — this is not a clean bill of health; set {CRASH_REPORT_DIRS_ENV} to point at readable directories"
+        ),
+        _ if !scan.matched_reports.is_empty() => format!(
+            "nw-073 IS STILL FIRING — {} crash report(s) carry the {LBUG_CRASH_FRAME} signature; the thread-pool mitigation is not holding and the root-cause fix (BM_MALLOC reader pinning) is required",
+            scan.matched_reports.len()
+        ),
+        "partial" => format!(
+            "no matching crash reports in {} directories, but {} could not be read — this zero is not exhaustive",
+            scan.directories_read,
+            scan.unreadable.len()
+        ),
+        _ => format!(
+            "no crash reports carry the {LBUG_CRASH_FRAME} signature across {} directories ({} candidate report(s) examined); the mitigation appears to be holding",
+            scan.directories_read, scan.reports_examined
+        ),
+    }
+}
+
+fn crash_recurrence_value(scan: &CrashRecurrenceScan) -> serde_json::Value {
+    serde_json::json!({
+        "backlog_id": "nw-073",
+        "signature": format!("lbug::storage::BufferManager::{LBUG_CRASH_FRAME}"),
+        "status": scan.status(),
+        // Null rather than 0 when nothing was scanned: a zero here would be a
+        // claim the scan never earned.
+        "crash_reports_matched": if scan.has_count() {
+            serde_json::json!(scan.matched_reports.len())
+        } else {
+            serde_json::Value::Null
+        },
+        "matched_reports": scan.matched_reports,
+        "reports_examined": scan.reports_examined,
+        "directories_read": scan.directories_read,
+        "unreadable": scan.unreadable,
+        "note": crash_recurrence_note(scan),
+    })
+}
+
+/// Directories to sweep, and whether sweeping is supported here.
+fn crash_report_directories() -> (Vec<PathBuf>, bool) {
+    if let Some(raw) = std::env::var_os(CRASH_REPORT_DIRS_ENV) {
+        let dirs: Vec<PathBuf> = std::env::split_paths(&raw)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        if !dirs.is_empty() {
+            return (dirs, true);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut dirs = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            dirs.push(home.join("Library/Logs/DiagnosticReports"));
+            dirs.push(home.join("Library/Logs/DiagnosticReports/Retired"));
+        }
+        // The SYSTEM directory matters as much as the per-user one. The original
+        // nw-073 investigation checked only `~/Library`, found nothing, and
+        // recorded "no crash logs on this machine" — while every nestweaver
+        // report on that Mac was sitting in `/Library`.
+        dirs.push(PathBuf::from("/Library/Logs/DiagnosticReports"));
+        dirs.push(PathBuf::from("/Library/Logs/DiagnosticReports/Retired"));
+        (dirs, true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (Vec::new(), false)
+    }
+}
+
+/// Read a report, capped, tolerating non-UTF-8 bytes.
+fn read_crash_report(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    std::fs::File::open(path)?
+        .take(CRASH_REPORT_READ_LIMIT)
+        .read_to_end(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn scan_crash_recurrence() -> CrashRecurrenceScan {
+    let (directories, supported) = crash_report_directories();
+    scan_crash_reports_in(&directories, supported)
+}
+
+fn scan_crash_reports_in(directories: &[PathBuf], supported: bool) -> CrashRecurrenceScan {
+    let mut scan = CrashRecurrenceScan {
+        supported,
+        ..Default::default()
+    };
+
+    for directory in directories {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // A missing directory contributes no evidence but is not a
+                // fault (`Retired/` often does not exist). A directory that
+                // exists and cannot be read is a fault, and must not be
+                // silently folded into a clean result.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    scan.unreadable
+                        .push(format!("{}: {error}", directory.display()));
+                }
+                continue;
+            }
+        };
+        scan.directories_read += 1;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_candidate_crash_report(&name) {
+                continue;
+            }
+            scan.reports_examined += 1;
+            match read_crash_report(&entry.path()) {
+                Ok(contents) if crash_report_matches_signature(&name, &contents) => {
+                    scan.matched_reports.push(name);
+                }
+                Ok(_) => {}
+                Err(error) => scan
+                    .unreadable
+                    .push(format!("{}: {error}", entry.path().display())),
+            }
+        }
+    }
+
+    scan.matched_reports.sort();
+    scan
+}
+
 fn capability_diagnostics_value(
     embedding_compiled: bool,
     metal_compiled: bool,
     runtime_probe: Result<(), String>,
+    crash_recurrence: serde_json::Value,
 ) -> serde_json::Value {
     let (metal_runtime_available, metal_runtime_error) = match runtime_probe {
         Ok(()) => (true, None),
@@ -379,16 +607,19 @@ fn capability_diagnostics_value(
         "metal_compiled": metal_compiled,
         "metal_runtime_available": metal_runtime_available,
         "metal_runtime_error": metal_runtime_error,
+        "crash_recurrence": crash_recurrence,
     })
 }
 
 fn current_capability_diagnostics() -> serde_json::Value {
+    let crash_recurrence = crash_recurrence_value(&scan_crash_recurrence());
     #[cfg(feature = "embed")]
     {
         capability_diagnostics_value(
             true,
             nestweaver_embed::metal_compiled(),
             nestweaver_embed::probe_metal_runtime().map_err(|error| format!("{error:#}")),
+            crash_recurrence,
         )
     }
     #[cfg(not(feature = "embed"))]
@@ -397,6 +628,7 @@ fn current_capability_diagnostics() -> serde_json::Value {
             false,
             false,
             Err("embedding support was not compiled into this binary".to_string()),
+            crash_recurrence,
         )
     }
 }
@@ -10662,6 +10894,45 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(error) = capabilities["metal_runtime_error"].as_str() {
                     println!("  Runtime probe error: {error}");
                 }
+
+                // Parity contract: if --json reports a caveat, the human output
+                // must say so too.
+                let crash = &capabilities["crash_recurrence"];
+                println!("  Crash recurrence (nw-073):");
+                println!(
+                    "    Signature: {}",
+                    crash["signature"].as_str().unwrap_or("unknown")
+                );
+                println!(
+                    "    Status:    {}",
+                    crash["status"].as_str().unwrap_or("unknown")
+                );
+                match crash["crash_reports_matched"].as_u64() {
+                    Some(matched) => println!(
+                        "    Matched:   {matched} of {} candidate report(s) across {} directories",
+                        crash["reports_examined"], crash["directories_read"]
+                    ),
+                    None => println!("    Matched:   unknown (nothing was scanned)"),
+                }
+                for report in crash["matched_reports"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                {
+                    println!("      - {report}");
+                }
+                for problem in crash["unreadable"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                {
+                    println!("    Unreadable: {problem}");
+                }
+                if let Some(note) = crash["note"].as_str() {
+                    println!("    {note}");
+                }
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -18630,6 +18901,7 @@ mod diagnostics_cli_tests {
             true,
             true,
             Err("Metal compute/readback failed".to_string()),
+            crash_recurrence_value(&CrashRecurrenceScan::default()),
         );
         assert_eq!(value["embedding_compiled"], true);
         assert_eq!(value["metal_compiled"], true);
@@ -18638,6 +18910,161 @@ mod diagnostics_cli_tests {
             value["metal_runtime_error"],
             "Metal compute/readback failed"
         );
+    }
+
+    // ── nw-073 crash-recurrence detection ────────────────────────────────
+
+    /// The defect this guards against is the reason the check is worth having.
+    /// `*.cpu_resource.diag` reports are stack samples of a HEALTHY process and
+    /// routinely contain `optimisticRead`, because it is a hot read path. If
+    /// they counted, the tool would announce a use-after-free on every warm
+    /// index run.
+    #[test]
+    fn resource_diagnostics_are_not_crash_reports() {
+        let sampled_frame = "6   lbug::storage::BufferManager::optimisticRead(...)";
+
+        for benign in [
+            "nestweaver_2026-07-25-111137_Host.cpu_resource.diag",
+            "nestweaver_2026-07-27-062200_Host.diag",
+            "nestweaver_2026-07-24-153529_Host.wakeups_resource.diag",
+        ] {
+            assert!(
+                !is_crash_report_file(benign),
+                "{benign} is a resource diagnostic, not a crash"
+            );
+            assert!(
+                !crash_report_matches_signature(benign, sampled_frame),
+                "{benign} must not match even though it samples the frame"
+            );
+        }
+
+        for crash in [
+            "nestweaver-2026-07-25-111137.ips",
+            "nestweaver_2026-07-25-111137_Host.crash",
+        ] {
+            assert!(is_crash_report_file(crash), "{crash} is a crash report");
+        }
+    }
+
+    #[test]
+    fn signature_match_requires_both_the_process_and_the_frame() {
+        let frame = "lbug::storage::BufferManager::optimisticRead";
+
+        assert!(crash_report_matches_signature("nestweaver-1.ips", frame));
+        // Another process crashing in lbug is not our recurrence signal.
+        assert!(!crash_report_matches_signature(
+            "spotlightknowledged.ips",
+            frame
+        ));
+        // Our process crashing elsewhere is a different bug.
+        assert!(!crash_report_matches_signature(
+            "nestweaver-1.ips",
+            "core::panicking::panic_bounds_check"
+        ));
+    }
+
+    /// A scan that could not read anything must not report zero. This is the
+    /// nw-062 defect: a caller cannot distinguish "no findings" from "no data".
+    #[test]
+    fn an_unreadable_scan_reports_unknown_rather_than_zero() {
+        let scan = CrashRecurrenceScan {
+            supported: true,
+            directories_read: 0,
+            ..Default::default()
+        };
+        let value = crash_recurrence_value(&scan);
+
+        assert_eq!(value["status"], "unavailable");
+        assert!(
+            value["crash_reports_matched"].is_null(),
+            "an unscanned run must not claim a count"
+        );
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("UNKNOWN"),
+            "the note must not read as a clean bill of health"
+        );
+    }
+
+    #[test]
+    fn a_partial_scan_does_not_present_its_zero_as_exhaustive() {
+        let scan = CrashRecurrenceScan {
+            supported: true,
+            directories_read: 2,
+            unreadable: vec!["/Library/Logs/DiagnosticReports: denied".to_string()],
+            reports_examined: 4,
+            ..Default::default()
+        };
+        let value = crash_recurrence_value(&scan);
+
+        assert_eq!(value["status"], "partial");
+        assert_eq!(value["crash_reports_matched"], 0);
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not exhaustive")
+        );
+    }
+
+    #[test]
+    fn a_clean_scan_says_the_mitigation_is_holding() {
+        let scan = CrashRecurrenceScan {
+            supported: true,
+            directories_read: 4,
+            reports_examined: 0,
+            ..Default::default()
+        };
+        let value = crash_recurrence_value(&scan);
+
+        assert_eq!(value["status"], "scanned");
+        assert_eq!(value["crash_reports_matched"], 0);
+    }
+
+    #[test]
+    fn a_matched_scan_calls_the_mitigation_out_as_failing() {
+        let scan = CrashRecurrenceScan {
+            supported: true,
+            directories_read: 4,
+            reports_examined: 3,
+            matched_reports: vec!["nestweaver-2026-07-28.ips".to_string()],
+            ..Default::default()
+        };
+        let value = crash_recurrence_value(&scan);
+
+        assert_eq!(value["status"], "scanned");
+        assert_eq!(value["crash_reports_matched"], 1);
+        let note = value["note"].as_str().unwrap_or_default();
+        assert!(note.contains("STILL FIRING"), "note was: {note}");
+    }
+
+    /// End-to-end over a fixture directory, via the documented override. This
+    /// is the only test that exercises the filesystem sweep itself.
+    #[test]
+    fn the_sweep_separates_crash_reports_from_resource_diagnostics_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let frame = "lbug::storage::BufferManager::optimisticRead(FileHandle&)";
+
+        std::fs::write(dir.path().join("nestweaver-2026-07-28.ips"), frame).expect("write crash");
+        std::fs::write(
+            dir.path()
+                .join("nestweaver_2026-07-28_Host.cpu_resource.diag"),
+            frame,
+        )
+        .expect("write diag");
+        std::fs::write(dir.path().join("otherproc-2026-07-28.ips"), frame).expect("write other");
+
+        let scan = scan_crash_reports_in(&[dir.path().to_path_buf()], true);
+
+        assert_eq!(scan.status(), "scanned");
+        assert_eq!(scan.directories_read, 1);
+        assert_eq!(
+            scan.reports_examined, 1,
+            "only the nestweaver .ips is a candidate"
+        );
+        assert_eq!(scan.matched_reports, vec!["nestweaver-2026-07-28.ips"]);
     }
 
     #[test]
