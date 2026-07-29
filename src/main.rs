@@ -16345,8 +16345,11 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                     "Merged '{from}' -> '{to}': {} vault(s), {} repo(s), {} project(s)",
                     result.vaults_reparented, result.repos_reparented, result.projects_reparented
                 );
-                for d in &result.discarded_vaults {
-                    eprintln!("Note: {d}");
+                if !result.discarded_vaults.is_empty() {
+                    eprintln!(
+                        "{}",
+                        merge_discarded_vault_guidance(&result.discarded_vaults, &to)
+                    );
                 }
                 if !result.repos_needing_reindex.is_empty() {
                     eprintln!("{}", merge_reindex_guidance(&result.repos_needing_reindex));
@@ -16387,6 +16390,30 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
     }
 }
 
+/// Guidance for vaults whose notes were discarded by a merge collision.
+///
+/// When two instances hold a vault at the same root, the one with fewer notes
+/// loses and its notes are dropped. That was reported as a bare
+/// `Note: <root> (N notes discarded)` with no remedy — a line that states data
+/// loss and stops. Notes are re-derivable from the files on disk, so say how
+/// (nw-112).
+fn merge_discarded_vault_guidance(discarded: &[String], to_instance: &str) -> String {
+    let mut guidance = String::from(
+        "\nNOTE: a vault collision discarded notes from the losing vault.\n\
+         Those notes are re-derivable from the files on disk — re-index each root \
+         below under the target instance to restore them:\n",
+    );
+    for entry in discarded {
+        guidance.push_str("  ");
+        guidance.push_str(entry);
+        guidance.push('\n');
+    }
+    guidance.push_str(&format!(
+        "  nestweaver brain refresh <root> --instance {to_instance}"
+    ));
+    guidance
+}
+
 fn merge_reindex_guidance(repos: &[String]) -> String {
     let mut guidance = String::from(
         "\nNOTE: source repo graph rows were removed during merge.\n\
@@ -16405,6 +16432,26 @@ fn merge_reindex_guidance(repos: &[String]) -> String {
 #[cfg(test)]
 mod merge_instance_guidance_tests {
     use super::*;
+
+    /// nw-112: a discarded-vault line must carry a remedy, not just announce
+    /// data loss. The notes are re-derivable from disk, so the guidance names
+    /// the refresh command and the target instance.
+    #[test]
+    fn discarded_vault_guidance_names_the_refresh_and_target_instance() {
+        let guidance = merge_discarded_vault_guidance(
+            &["/Users/me/brain (945 notes discarded)".to_string()],
+            "kory-brain",
+        );
+        assert!(guidance.contains("945 notes discarded"));
+        assert!(
+            guidance.contains("brain refresh"),
+            "must name the remedy: {guidance}"
+        );
+        assert!(
+            guidance.contains("--instance kory-brain"),
+            "must name the target instance so the refresh does not create a second vault: {guidance}"
+        );
+    }
 
     #[test]
     fn reindex_guidance_describes_removed_then_recreated_graph_rows() {
