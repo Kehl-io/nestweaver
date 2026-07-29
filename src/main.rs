@@ -3322,7 +3322,10 @@ fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange])
 
     // Coverage caveat: reported impact is a floor when the walk was cut short or
     // a referenced repo isn't indexed.
-    if result.coverage.traversal_truncated || !result.coverage.repos_not_indexed.is_empty() {
+    if result.coverage.traversal_truncated
+        || !result.coverage.repos_not_indexed.is_empty()
+        || !result.blind_spots.is_empty()
+    {
         let mut notes = Vec::new();
         if result.coverage.traversal_truncated {
             notes.push("traversal truncated".to_string());
@@ -3332,6 +3335,21 @@ fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange])
                 "{} repo(s) not indexed",
                 result.coverage.repos_not_indexed.len()
             ));
+        }
+        // The JSON carries `coverage.blind_spots` — categories of edge the
+        // static walk cannot see at all (dynamic dispatch, reflection, ...).
+        // Text omitted them, so a reviewer had no way to know which whole
+        // classes of dependency were never considered.
+        if !result.blind_spots.is_empty() {
+            // BlindSpot serializes kebab-case; render it the same way so text
+            // and --json name the same categories.
+            let spots: Vec<String> = result
+                .blind_spots
+                .iter()
+                .filter_map(|s| serde_json::to_value(s).ok())
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            notes.push(format!("blind spots: {}", spots.join(", ")));
         }
         println!("  note: {} — reported impact is a floor", notes.join(", "));
     }
@@ -6865,6 +6883,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 print_tier("Tier 1 (direct)", &result.tier_1);
                 print_tier("Tier 2 (caller's tests)", &result.tier_2);
                 print_tier("Tier 3 (transitive)", &result.tier_3);
+
+                // nw-107: the JSON path reports `status`, `notifications` and
+                // `recommendation`; text printed only the generic disclaimer.
+                // A developer saw a clean "0 tests affected" with no sign the
+                // selection was degraded and that the tool ITSELF recommends a
+                // full suite — the exact "no tests found is NOT safe-to-skip"
+                // failure the disclaimer exists to prevent.
+                let status_label = result.status.label();
+                if status_label != "complete" {
+                    println!("Status: {status_label} — selection is incomplete.");
+                }
+                for n in &result.notifications {
+                    println!("Warning: {}", n.message);
+                }
+                if result.recommendation == "run-full-suite" {
+                    println!(
+                        "Recommendation: RUN THE FULL SUITE — this selection is not safe to rely on."
+                    );
+                }
+
                 println!("Note: {}", result.disclaimer);
             }
 
@@ -7369,7 +7407,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&res)?);
                     } else if res.results.is_empty() {
-                        println!("No matches for '{pattern}'.");
+                        // nw-097/nw-111: the caveat notes below live in the
+                        // non-empty branch, so the ONE case where truncation matters
+                        // most — zero results because the budget ran out — printed a
+                        // flat "No matches", an actively false claim. On the real
+                        // 5.6 GB brain DB `regex-search NestWeaver --max-millis 5`
+                        // returns nothing while thousands of matches exist.
+                        if res.truncated {
+                            println!(
+                                "No matches for '{pattern}' WITHIN THE SEARCH BUDGET — the scan was cut \
+                         short, so matches may exist beyond the scanned range. Raise \
+                         --max-millis, or run `index --with-trigrams` to make this fast."
+                            );
+                        } else {
+                            println!("No matches for '{pattern}'.");
+                        }
+                        if res.stale_index {
+                            print_stale_index_note();
+                        }
                     } else {
                         println!("Found {} match(es) for '{pattern}':", res.results.len());
                         for m in &res.results {
@@ -7403,7 +7458,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
             } else if res.results.is_empty() {
-                println!("No matches for '{pattern}'.");
+                // nw-097/nw-111: the caveat notes below live in the
+                // non-empty branch, so the ONE case where truncation matters
+                // most — zero results because the budget ran out — printed a
+                // flat "No matches", an actively false claim. On the real
+                // 5.6 GB brain DB `regex-search NestWeaver --max-millis 5`
+                // returns nothing while thousands of matches exist.
+                if res.truncated {
+                    println!(
+                        "No matches for '{pattern}' WITHIN THE SEARCH BUDGET — the scan was cut \
+                         short, so matches may exist beyond the scanned range. Raise \
+                         --max-millis, or run `index --with-trigrams` to make this fast."
+                    );
+                } else {
+                    println!("No matches for '{pattern}'.");
+                }
+                if res.stale_index {
+                    print_stale_index_note();
+                }
             } else {
                 println!("Found {} match(es) for '{pattern}':", res.results.len());
                 for m in &res.results {
@@ -8342,11 +8414,38 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .get("truncated_by_depth")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        // nw-110: the daemon caps rows with `.take(limit)` and
+                        // reports both `total` and `returned`, but result-set
+                        // capping sets NEITHER truncated_by_* flag — those
+                        // describe traversal pruning. Reading only those flags
+                        // let a 50-of-495 answer print as a bare array of 50:
+                        // a floor presented as the whole set.
+                        let total = value.get("total").and_then(|v| v.as_u64());
+                        let returned = value.get("returned").and_then(|v| v.as_u64());
+                        let capped = matches!((total, returned), (Some(t), Some(r)) if r < t);
                         let payload = value
                             .get("impact_nodes")
                             .cloned()
                             .unwrap_or_else(|| value.clone());
-                        if truncated_by_threshold || truncated_by_depth {
+                        if capped {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "nodes": payload,
+                                    "total": total,
+                                    "returned": returned,
+                                    "truncated": true,
+                                    "truncated_by_threshold": truncated_by_threshold,
+                                    "truncated_by_depth": truncated_by_depth,
+                                    "note": format!(
+                                        "showing {} of {} impacted node(s) — reported impact is a \
+                                         floor; raise --limit or pass --min-score 0 for the full set",
+                                        returned.unwrap_or(0),
+                                        total.unwrap_or(0)
+                                    ),
+                                }))?
+                            );
+                        } else if truncated_by_threshold || truncated_by_depth {
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&serde_json::json!({
@@ -8378,8 +8477,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 println!("No impact found for '{name_or_uid}'.");
                             }
                         } else {
+                            // nw-110: say "50 of 495" when the daemon capped the
+                            // set, never a bare "50 nodes" — the latter reads as
+                            // the complete answer.
+                            let total = value.get("total").and_then(|v| v.as_u64());
                             if !out.quiet {
-                                println!("Impact of '{name_or_uid}' ({} nodes):", count);
+                                match total {
+                                    Some(t) if t > count as u64 => println!(
+                                        "Impact of '{name_or_uid}' ({count} of {t} nodes):"
+                                    ),
+                                    _ => println!("Impact of '{name_or_uid}' ({count} nodes):"),
+                                }
                             }
                             for n in &nodes {
                                 if out.verbose {
@@ -8589,9 +8697,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::ListProjects { json, db, config } => {
+            // nw-106: read-only command — fail `db_not_found` on a missing --db
+            // before any daemon/store connect. Without this the daemon path
+            // swallowed the open error and returned an empty list at exit 0, so
+            // a missing database was indistinguishable from "no projects
+            // defined" — and the text path suggested adding [[projects]] to a
+            // config, an actively wrong remedy. 17 of 18 comparable commands
+            // already exit 1 here; this was the outlier.
+            let resolved_db = db.clone().unwrap_or_else(default_db_path);
+            require_existing_db(&resolved_db)?;
+
             // ── daemon guard ──────────────────────────────────────
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
+                let db_path = resolved_db.clone();
                 let args = serde_json::json!({});
                 try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)
                     .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
@@ -13632,7 +13750,17 @@ fn run_brain(
                     if links.is_empty() {
                         println!("No broken or ambiguous wikilinks found.");
                     } else {
-                        println!("Broken / ambiguous wikilinks ({}):", links.len());
+                        // nw-097 class: the daemon reports `total`; this path
+                        // printed only how many it chose to show, so 50 of 778
+                        // read as "778 does not exist". The direct path below
+                        // already renders "N of total" — match it.
+                        let total = value.get("total").and_then(|v| v.as_u64());
+                        match total {
+                            Some(tot) if tot > links.len() as u64 => {
+                                println!("Broken / ambiguous wikilinks ({} of {tot}):", links.len())
+                            }
+                            _ => println!("Broken / ambiguous wikilinks ({}):", links.len()),
+                        }
                         for l in &links {
                             println!(
                                 "  [[{}]] in {} (confidence {:.2})",
@@ -13725,7 +13853,15 @@ fn run_brain(
                         if orphans.is_empty() {
                             println!("No orphan documents found.");
                         } else {
-                            println!("Orphan documents ({}):", orphans.len());
+                            // nw-097 class: daemon carries `total`; printing
+                            // only the shown count hid 607 orphans behind 50.
+                            let total = value.get("total").and_then(|v| v.as_u64());
+                            match total {
+                                Some(tot) if tot > orphans.len() as u64 => {
+                                    println!("Orphan documents ({} of {tot}):", orphans.len())
+                                }
+                                _ => println!("Orphan documents ({}):", orphans.len()),
+                            }
                             for o in &orphans {
                                 println!("  {} — {}", o.title, o.file_path);
                             }

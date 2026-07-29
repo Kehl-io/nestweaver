@@ -117,7 +117,10 @@ pub enum AnalysisStatus {
 
 impl AnalysisStatus {
     /// Lowercase label for embedding in the human summary string.
-    fn label(self) -> &'static str {
+    ///
+    /// Public so CLI text renderers can surface the status verbatim rather than
+    /// re-deriving the mapping (nw-107).
+    pub fn label(self) -> &'static str {
         match self {
             AnalysisStatus::Complete => "complete",
             AnalysisStatus::Partial => "partial",
@@ -804,6 +807,23 @@ pub fn analyze_blast_radius(
     };
 
     let risk_level = compute_risk_level(total_affected, clusters_touched, high_centrality);
+
+    // nw-105: a truncated traversal must not report as Complete.
+    //
+    // The truncation flags are accumulated at :598, long before this point, but
+    // `status` was left at Complete — so `derive_gate_state` below returned Ok
+    // for a run that simultaneously reported coverage.traversal_truncated and a
+    // depth-truncated blind spot. A merge gate consuming gate_state read "ok"
+    // for an analysis that never finished.
+    //
+    // Fixed here rather than inside derive_gate_state: that function's rule is
+    // already correct and stating it twice would let the two copies drift, and
+    // more importantly `status` itself is consumed by the summary line, the MCP
+    // envelope and pr-impact. Downgrading only from Complete so a run already
+    // Degraded or Failed is never upgraded.
+    if (truncated_by_threshold || truncated_by_depth) && status == AnalysisStatus::Complete {
+        status = AnalysisStatus::Partial;
+    }
 
     let summary = render_blast_summary(
         changed_symbols.len(),
@@ -2220,6 +2240,25 @@ mod tests {
             result.blind_spots.contains(&BlindSpot::DepthTruncated),
             "a depth-capped traversal must flag DepthTruncated, got: {:?}",
             result.blind_spots
+        );
+
+        // nw-105: the same run must not simultaneously claim it completed.
+        // Before the fix, coverage.traversal_truncated and the DepthTruncated
+        // blind spot were both set while status stayed Complete, so
+        // derive_gate_state returned Ok — a merge gate read "safe" for an
+        // analysis that never finished.
+        assert_ne!(
+            result.status,
+            AnalysisStatus::Complete,
+            "a truncated traversal must not report status Complete — it did not complete"
+        );
+        assert_eq!(
+            result.gate_state,
+            GateState::DegradedUnknown,
+            "a truncated traversal must gate as degraded-unknown, never ok; \
+             got status {:?} / gate {:?}",
+            result.status,
+            result.gate_state
         );
         assert!(
             !result
