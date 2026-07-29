@@ -696,27 +696,39 @@ fn strip_code(text: &str) -> String {
             continue;
         }
         // Strip inline code spans: replace `...` with spaces of equal length.
-        let bytes = line.as_bytes();
+        //
+        // Operate on `str`, never on raw bytes. This loop used to copy the line
+        // through with `buf.push(bytes[i] as char)`, and `u8 as char` maps a
+        // byte to the code point of the same value — Latin-1 decoding. Pushing
+        // that into a UTF-8 `String` re-encoded it, so an em dash `e2 80 94`
+        // came back out as `c3 a2 c2 80 c2 94` and every wikilink or tag
+        // containing non-ASCII was silently corrupted (nw-099).
+        //
+        // Backticks are ASCII, so every index `find` returns is on a character
+        // boundary and the slices below are safe.
         let mut buf = String::with_capacity(line.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'`' {
-                // Find matching backtick on same line.
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j] != b'`' {
-                    j += 1;
-                }
-                if j < bytes.len() {
-                    for _ in i..=j {
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            buf.push_str(&rest[..open]);
+            let after_open = &rest[open + 1..];
+            match after_open.find('`') {
+                Some(close) => {
+                    // Blank the span, both backticks included, one space per
+                    // CHARACTER so column positions survive multi-byte text.
+                    let span_end = open + 1 + close + 1;
+                    for _ in rest[open..span_end].chars() {
                         buf.push(' ');
                     }
-                    i = j + 1;
-                    continue;
+                    rest = &rest[span_end..];
+                }
+                None => {
+                    // Unmatched backtick: keep it literally and carry on.
+                    buf.push('`');
+                    rest = after_open;
                 }
             }
-            buf.push(bytes[i] as char);
-            i += 1;
         }
+        buf.push_str(rest);
         out.push_str(&buf);
         out.push('\n');
     }
@@ -1277,6 +1289,73 @@ top 2 body
         let note = parse_markdown("x.md", src).unwrap();
         // All three should be dropped (empty target).
         assert_eq!(note.wikilinks.len(), 0);
+    }
+
+    /// nw-099: non-ASCII in a wikilink target must survive `strip_code`.
+    ///
+    /// `strip_code` used to rebuild each line with `buf.push(bytes[i] as char)`.
+    /// In Rust `u8 as char` maps a byte to the code point of the same value —
+    /// that is Latin-1 decoding — and pushing it into a UTF-8 `String`
+    /// re-encodes it. An em dash `e2 80 94` came back out as
+    /// `c3 a2 c2 80 c2 94`, one UTF-8 sequence per original byte.
+    ///
+    /// The link then resolves to nothing, so this silently severed real links
+    /// between real notes. Headings and titles were unaffected because only
+    /// wikilink and inline-tag scanning route through `strip_code`.
+    #[test]
+    fn wikilink_targets_preserve_non_ascii() {
+        let src = "# n\n\nSee [[Spike 1 — Byte Path Findings]] for detail.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        assert_eq!(note.wikilinks.len(), 1);
+        assert_eq!(note.wikilinks[0].target, "Spike 1 — Byte Path Findings");
+        assert_eq!(
+            note.wikilinks[0].target.as_bytes(),
+            "Spike 1 — Byte Path Findings".as_bytes(),
+            "em dash must stay as e2 80 94, not double-encode to c3 a2 c2 80 c2 94"
+        );
+    }
+
+    /// The same corruption hit aliases and anchors, which also come from the
+    /// stripped line, and a broader sweep of scripts than the em dash alone.
+    #[test]
+    fn wikilink_alias_and_anchor_preserve_non_ascii() {
+        let src = "# n\n\n[[Café#Menü|Crème brûlée]] and [[日本語ノート]] and [[naïve — test]]\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        assert_eq!(note.wikilinks.len(), 3);
+        assert_eq!(note.wikilinks[0].target, "Café");
+        assert_eq!(note.wikilinks[0].heading_anchor.as_deref(), Some("Menü"));
+        assert_eq!(note.wikilinks[0].display.as_deref(), Some("Crème brûlée"));
+        assert_eq!(note.wikilinks[1].target, "日本語ノート");
+        assert_eq!(note.wikilinks[2].target, "naïve — test");
+    }
+
+    /// `strip_code` is shared with the inline-tag scanner, so a tag sitting on
+    /// a line that contains non-ASCII elsewhere must still be found at the
+    /// right line — the byte rewrite used to shift every following offset.
+    ///
+    /// This deliberately does NOT assert that `#café` yields `café`: the tag
+    /// scanner accepts only `is_ascii_alphanumeric` plus `-_/`, so it truncates
+    /// at the first non-ASCII byte and returns `caf`. That is a separate
+    /// limitation from the encoding defect, unchanged by this fix, and tracked
+    /// on its own.
+    #[test]
+    fn inline_tags_survive_non_ascii_on_the_same_line() {
+        let src = "# n\n\nRésumé notes — tagged #design and #arch/decision here.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let names: Vec<&str> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"design"), "tags were: {names:?}");
+        assert!(names.contains(&"arch/decision"), "tags were: {names:?}");
+    }
+
+    /// The fix must not weaken code stripping: a wikilink inside an inline code
+    /// span on a line that also contains non-ASCII must still be ignored, and
+    /// the real link on that line must still be found.
+    #[test]
+    fn non_ascii_line_still_strips_inline_code() {
+        let src = "# n\n\nRésumé `[[not a link]]` but [[Real — Link]] counts.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        assert_eq!(note.wikilinks.len(), 1);
+        assert_eq!(note.wikilinks[0].target, "Real — Link");
     }
 
     // ── Tags ────────────────────────────────────────────────────────────────
