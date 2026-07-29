@@ -456,6 +456,54 @@ fn parity_affected_tests_direct_vs_daemon() {
 /// the daemon was up. The text renderer was never missing; it was simply not
 /// reached. This is the nw-097 divergence family, and the reason it survived is
 /// that `dead-code` was not in this file.
+/// Replace generated bundle IDs with a fixed placeholder.
+///
+/// `investigate` mints a fresh `bndl_<hex>` per invocation, so its stdout is
+/// never byte-identical across two runs — comparing raw bytes would test the ID
+/// generator, not the renderer.
+fn redact_bundle_ids(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut rest: &str = &text;
+    while let Some(pos) = rest.find("bndl_") {
+        out.push_str(&rest[..pos]);
+        out.push_str("bndl_<redacted>");
+        let after = &rest[pos + "bndl_".len()..];
+        let end = after
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// nw-108: `investigate` carried the identical defect to `dead-code` — its
+/// daemon branch printed the RPC response verbatim, so the format followed
+/// process state rather than the flag.
+#[test]
+fn parity_investigate_human_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    let args: &[&str] = &["investigate", "alpha"];
+
+    let direct = run_direct(&fixture.db_path, args);
+
+    let _guard = DaemonGuard::new(&fixture.db_path);
+    start_daemon(&fixture.db_path);
+    let daemon = run_via_daemon(&fixture.db_path, args);
+
+    assert_eq!(
+        direct.status.code(),
+        daemon.status.code(),
+        "investigate (human): exit code diverged"
+    );
+    assert_eq!(
+        redact_bundle_ids(&direct.stdout),
+        redact_bundle_ids(&daemon.stdout),
+        "investigate (human): stdout diverged between direct and daemon mode"
+    );
+}
+
 ///
 /// Scoped to HUMAN mode deliberately. `--json` still diverges between the two
 /// paths for reasons that predate this fix and would change a published

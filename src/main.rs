@@ -663,6 +663,97 @@ fn print_link_classification(links: &[nestweaver_engine::BrokenLink]) {
 /// daemon happened to be running rather than on the flag — `dead-code` printed
 /// text standalone and JSON once the daemon was up (nw-108). Driving both from
 /// the same payload makes parity structural rather than something to remember.
+/// Render an `investigate` bundle as text from its JSON payload.
+///
+/// Shared by the direct and daemon paths for the same reason as
+/// [`render_dead_code_text`]: the daemon branch printed its response verbatim,
+/// so the output format tracked whether a daemon was running instead of the
+/// `--json` flag (nw-108).
+fn render_investigate_text(payload: &serde_json::Value) {
+    let text = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let entries: Vec<&serde_json::Value> = payload
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let domains: Vec<&serde_json::Value> = payload
+        .get("domains")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let more_available = payload
+        .get("more_available")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    println!(
+        "Bundle: {}  (query: {:?})",
+        text(payload, "bundle_id"),
+        text(payload, "query")
+    );
+    println!(
+        "{} domain(s), {} entr{}{}",
+        domains.len(),
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        if more_available > 0 {
+            format!(" ({more_available} more available — raise --token-budget)")
+        } else {
+            String::new()
+        }
+    );
+
+    for d in &domains {
+        println!("\n[{}]", text(d, "label"));
+        let entry_point = text(d, "entry_point");
+        for member in d
+            .get("members")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let asset_id = member.as_str().unwrap_or_default();
+            let Some(e) = entries
+                .iter()
+                .find(|e| e.get("asset_id").and_then(|v| v.as_str()) == Some(asset_id))
+            else {
+                continue;
+            };
+            let marker = if asset_id == entry_point { "*" } else { " " };
+            println!(
+                "  {marker} {}  {} ({})  {}",
+                asset_id,
+                text(e, "title"),
+                text(e, "kind"),
+                text(e, "location")
+            );
+            if let Some(summary) = e.get("summary").and_then(|v| v.as_str()) {
+                let truncated = if !e.get("inline_body").is_none_or(|v| v.is_null())
+                    && !e
+                        .get("body_complete")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true)
+                {
+                    " [truncated]"
+                } else {
+                    ""
+                };
+                println!("      {summary}{truncated}");
+            }
+        }
+    }
+
+    println!(
+        "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
+        text(payload, "bundle_id")
+    );
+}
+
 fn render_dead_code_text(payload: &serde_json::Value) {
     let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let total = num("total_symbols");
@@ -9497,7 +9588,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        render_investigate_text(&value);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -9517,56 +9612,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(token_budget),
                 None,
             )?;
+            // Built unconditionally so text and JSON render from the SAME
+            // payload, and so the daemon path can reuse the renderer (nw-108).
+            let payload = serde_json::to_value(&result)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                println!("Bundle: {}  (query: {:?})", result.bundle_id, result.query);
-                println!(
-                    "{} domain(s), {} entr{}{}",
-                    result.domains.len(),
-                    result.entries.len(),
-                    if result.entries.len() == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    },
-                    if result.more_available > 0 {
-                        format!(
-                            " ({} more available — raise --token-budget)",
-                            result.more_available
-                        )
-                    } else {
-                        String::new()
-                    }
-                );
-                for d in &result.domains {
-                    println!("\n[{}]", d.label);
-                    for asset_id in &d.members {
-                        if let Some(e) = result.entries.iter().find(|e| &e.asset_id == asset_id) {
-                            let marker = if e.asset_id == d.entry_point {
-                                "*"
-                            } else {
-                                " "
-                            };
-                            println!(
-                                "  {marker} {}  {} ({})  {}",
-                                e.asset_id, e.title, e.kind, e.location
-                            );
-                            if let Some(s) = &e.summary {
-                                let truncated = if e.inline_body.is_some() && !e.body_complete {
-                                    " [truncated]"
-                                } else {
-                                    ""
-                                };
-                                println!("      {s}{truncated}");
-                            }
-                        }
-                    }
-                }
-                println!(
-                    "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
-                    result.bundle_id
-                );
+                render_investigate_text(&payload);
             }
             Ok((EXIT_SUCCESS, None))
         }
