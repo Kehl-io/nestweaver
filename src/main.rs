@@ -4081,6 +4081,21 @@ fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig, fo
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
+    // Absent file → the canonical `db_not_found` diagnostic, at the one place
+    // every read-only open funnels through.
+    //
+    // `open_read_only` reports a missing database as "Cannot create an empty
+    // database under READ ONLY mode", which mentions creating something the
+    // caller never asked to create, and which the error mapper cannot
+    // recognise — its heuristic wants "failed to open database" AND "no such
+    // file". So a dozen read commands leaked that raw store error with no
+    // remedy while list-repos/hubs/stale-check, which call
+    // `require_existing_db` first, reported it properly (nw-108).
+    //
+    // Guarding here fixes every read path at once instead of repeating the
+    // check at each call site. The explicit `require_existing_db` calls stay:
+    // they run BEFORE a daemon can be autostarted, which this cannot.
+    require_existing_db(path)?;
     let store = GraphStore::open_read_only(path).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("Corrupted wal") || msg.contains("Could not set lock") {
@@ -17955,6 +17970,40 @@ mod hybrid_cli_tests {
                 "root": "/repo",
             })
         );
+    }
+
+    /// nw-108 (4): EVERY read-only open must produce the `db_not_found`
+    /// diagnostic on a missing database, not just the commands that happen to
+    /// call `require_existing_db` first.
+    ///
+    /// `open_read_only` reports a missing file as "Cannot create an empty
+    /// database under READ ONLY mode" — it names a creation the caller never
+    /// requested, and the error mapper cannot recognise it (its heuristic wants
+    /// "failed to open database" AND "no such file"). A dozen read commands
+    /// leaked that raw text with no remedy. Guarding inside `open_store` covers
+    /// all 57 read-only call sites at once.
+    #[test]
+    fn open_store_reports_db_not_found_rather_than_the_raw_store_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.lbug");
+
+        let err = match open_store(Some(&missing)) {
+            Ok(_) => panic!("a missing db must not open"),
+            Err(e) => e,
+        };
+        let rendered = format!("{:?}", into_diagnostic(err));
+
+        assert!(
+            rendered.contains("db_not_found"),
+            "expected the db_not_found diagnostic, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Cannot create an empty database"),
+            "the raw store error must not leak — it names a creation the caller \
+             never asked for: {rendered}"
+        );
+        // Opening read-only must not have materialised anything.
+        assert!(!missing.exists());
     }
 
     /// nw-087: a nonexistent --db must fail with the db_not_found
