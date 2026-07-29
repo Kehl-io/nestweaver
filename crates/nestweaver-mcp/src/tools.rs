@@ -3372,7 +3372,7 @@ fn tool_schema_brain_search() -> Value {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum results to return. Default 20. Set lower for focused lookups, higher for broad discovery.",
+                    "description": "Maximum results PER KIND, not in total. Default 20. Notes and code symbols are capped separately, so a query matching both can return up to 2x this value — budget accordingly and read returned_matches for the true count. Set lower for focused lookups, higher for broad discovery.",
                     "default": 20,
                     "minimum": 1,
                     "maximum": 1000
@@ -4590,6 +4590,25 @@ mod brain_search_total_contract_tests {
         let description = schema["description"].as_str().unwrap();
         assert!(description.contains("total_matches_relation"));
         assert!(description.contains("returned_matches"));
+
+        // nw-101: the `limit` property itself must disclose that the cap is
+        // per-kind. The tool description said so while this said "Maximum
+        // results to return", and a caller reading the field they are actually
+        // setting was told a total cap that does not exist — `--limit 3` on a
+        // mixed query returns 6. The per-kind cap is deliberate (symbols carry
+        // a fixed 0.5 score against BM25 notes scoring 15+, so a merged cap
+        // would evict every symbol), so the contract is what needs correcting.
+        let limit_doc = schema["inputSchema"]["properties"]["limit"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            limit_doc.contains("PER KIND"),
+            "the limit field must state it is per-kind, not a total: {limit_doc}"
+        );
+        assert!(
+            limit_doc.contains("2x"),
+            "it must state the consequence — up to 2x limit rows: {limit_doc}"
+        );
         assert!(
             schema["inputSchema"]["properties"]["response_format"]["description"]
                 .as_str()

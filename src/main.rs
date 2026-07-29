@@ -592,6 +592,45 @@ fn scan_crash_reports_in(directories: &[PathBuf], supported: bool) -> CrashRecur
     scan
 }
 
+/// The closed set of node kinds accepted by `--kinds`.
+const NODE_KINDS: [&str; 3] = ["Section", "Note", "Symbol"];
+
+/// Parse and validate a `--kinds` token against [`NODE_KINDS`].
+///
+/// Matching stays case-insensitive, but an unknown token is now rejected
+/// instead of silently dropped. `--kinds Bogus` used to return zero matches at
+/// exit 0, so a typo was indistinguishable from a real empty result (nw-108).
+fn parse_node_kind(value: &str) -> Result<String, String> {
+    NODE_KINDS
+        .iter()
+        .find(|k| k.eq_ignore_ascii_case(value))
+        .map(|k| (*k).to_string())
+        .ok_or_else(|| format!("must be one of {}", NODE_KINDS.join(", ")))
+}
+
+/// Parse a float documented as `[0.0-1.0]` and enforce that range.
+///
+/// Every INTEGER range in the CLI is enforced by clap, but the floats were
+/// unguarded: `--confidence 5.0` was accepted at exit 0 and returned an empty
+/// result with no explanation, which reads exactly like "nothing depends on
+/// this symbol" (nw-108).
+fn parse_unit_interval_f32(value: &str) -> Result<f32, String> {
+    let parsed: f32 = value.parse().map_err(|_| "must be a number".to_string())?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("must be in 0.0..=1.0".to_string());
+    }
+    Ok(parsed)
+}
+
+/// `f64` counterpart of [`parse_unit_interval_f32`].
+fn parse_unit_interval_f64(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value.parse().map_err(|_| "must be a number".to_string())?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("must be in 0.0..=1.0".to_string());
+    }
+    Ok(parsed)
+}
+
 /// One-line verdict for a `broken-links` entry.
 ///
 /// A sub-1.0 confidence means the link matched at a lower resolver tier, not
@@ -911,6 +950,7 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
+            value_parser = parse_node_kind,
             help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
         )]
         kinds: Option<Vec<String>>,
@@ -952,6 +992,7 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
+            value_parser = parse_node_kind,
             help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
         )]
         kinds: Option<Vec<String>>,
@@ -985,11 +1026,13 @@ enum Commands {
         #[arg(
             long,
             default_value = "0.0",
+            value_parser = parse_unit_interval_f32,
             help = "Minimum edge confidence [0.0-1.0]"
         )]
         confidence: f32,
         #[arg(
             long,
+            value_parser = parse_unit_interval_f64,
             help = "Minimum impact score for including a dependent [0.0-1.0] (default: 0.10; pass 0 to disable score pruning and get the full traversal)"
         )]
         min_score: Option<f64>,
@@ -2629,7 +2672,7 @@ enum BrainCommands {
         #[arg(
             long,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
-            help = "Maximum results (1-1000; default: 20, or [limits].default_result_limit from config; matches the MCP brain_search schema)"
+            help = "Maximum results PER KIND (1-1000; default: 20, or [limits].default_result_limit from config; matches the MCP brain_search schema). Notes and code symbols are capped separately, so a query matching both can return up to 2x this value; `returned_matches` always reports the true total"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -19341,6 +19384,21 @@ mod cli_bounds_tests {
                         &["0"],
                         &["1", "20"],
                     ),
+                    // nw-108: the FLOAT ranges were the gap. Every integer
+                    // range above was already enforced by clap, but
+                    // `--confidence 5.0` and `--min-score 9.9` parsed happily
+                    // and returned an empty result at exit 0 — indistinguishable
+                    // from "nothing depends on this symbol".
+                    (
+                        &["nestweaver", "impact", "sym", "--confidence"],
+                        &["-0.1", "1.1", "5.0", "nan", "abc"],
+                        &["0", "0.0", "0.5", "1", "1.0"],
+                    ),
+                    (
+                        &["nestweaver", "impact", "sym", "--min-score"],
+                        &["-0.1", "1.1", "9.9", "inf", "abc"],
+                        &["0", "0.0", "0.1", "1", "1.0"],
+                    ),
                 ];
                 for (prefix, bad, good) in cases {
                     for v in *bad {
@@ -19355,6 +19413,42 @@ mod cli_bounds_tests {
                         let mut argv = prefix.to_vec();
                         argv.push(v);
                         assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
+                    }
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// nw-108: `--kinds` documents a closed set but silently dropped unknown
+    /// tokens, so `--kinds Bogus` returned zero matches at exit 0 and a typo
+    /// looked exactly like a real empty result. Case-insensitive matching is
+    /// preserved — only unknown values are now rejected.
+    #[test]
+    fn kinds_flag_rejects_values_outside_the_documented_set() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                for prefix in [
+                    ["nestweaver", "count-patterns", "pat", "--kinds"],
+                    ["nestweaver", "regex-search", "pat", "--kinds"],
+                ] {
+                    for bad in ["Bogus", "Sections", "note,Bogus", ""] {
+                        let mut argv = prefix.to_vec();
+                        argv.push(bad);
+                        assert!(
+                            Cli::try_parse_from(&argv).is_err(),
+                            "{argv:?} must be rejected — a typo must not read as an empty result"
+                        );
+                    }
+                    for good in ["Section", "note", "SYMBOL", "Note,Symbol"] {
+                        let mut argv = prefix.to_vec();
+                        argv.push(good);
+                        assert!(
+                            Cli::try_parse_from(&argv).is_ok(),
+                            "{argv:?} must parse — matching stays case-insensitive"
+                        );
                     }
                 }
             })
