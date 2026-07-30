@@ -1495,6 +1495,109 @@ mod tests {
         }
     }
 
+    /// nw-111: the callee traversal must REPORT which edge reached each callee.
+    ///
+    /// It spans CALLS, IMPORTS and CROSS_REPO_LINK, and the last is an inferred
+    /// link between repos rather than an observed call. Collapsing them to a bare
+    /// symbol list meant `flow_trace` presented fabricated cross-language
+    /// execution paths as real ones — tracing a Rust function returned JavaScript
+    /// symbols from unrelated repos as its callees, with nothing in the payload
+    /// to tell them apart. `impact` has always returned the edge type; this is the
+    /// callee-side parity.
+    #[test]
+    fn callee_traversal_reports_the_edge_type_that_reached_each_callee() {
+        use nestweaver_schema::{CrossRepoLinkType, EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["root", "real_callee", "remote_guess"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+
+        // An observed call...
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "root".to_string(),
+                target_uid: "real_callee".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        // ...and an INFERRED cross-repo link, which is not a call at all.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "root".to_string(),
+                target_uid: "remote_guess".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let callees = store.callees_with_edge_types_of("root").unwrap();
+        let by_uid: std::collections::HashMap<&str, &str> = callees
+            .iter()
+            .map(|(sym, et)| (sym.uid.as_str(), et.as_str()))
+            .collect();
+
+        assert_eq!(
+            by_uid.get("real_callee"),
+            Some(&"CALLS"),
+            "an observed call must be labelled CALLS; got {by_uid:?}"
+        );
+        assert_eq!(
+            by_uid.get("remote_guess"),
+            Some(&"CROSS_REPO_LINK"),
+            "a cross-repo hypothesis must be labelled, not presented as a call; got {by_uid:?}"
+        );
+
+        // The unlabelled helper still returns both, so existing callers are
+        // unaffected — this adds information rather than removing any.
+        let plain = store.callees_of("root").unwrap();
+        assert_eq!(plain.len(), 2, "callees_of must be unchanged in coverage");
+    }
+
+    /// A callee reachable by BOTH a real call and a cross-repo link must be
+    /// reported as the stronger CALLS, not downgraded to a guess.
+    #[test]
+    fn a_callee_reachable_two_ways_reports_the_strongest_edge() {
+        use nestweaver_schema::{CrossRepoLinkType, EdgeType, ResolvedEdge};
+
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["root", "shared"] {
+            store.insert_symbol(&make_symbol(uid, uid)).unwrap();
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "root".to_string(),
+                target_uid: "shared".to_string(),
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.9,
+                link_type: Some(CrossRepoLinkType::SharedImport),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "root".to_string(),
+                target_uid: "shared".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let callees = store.callees_with_edge_types_of("root").unwrap();
+        assert_eq!(callees.len(), 1, "de-duplicated by symbol: {callees:?}");
+        assert_eq!(
+            callees[0].1, "CALLS",
+            "strongest evidence wins: {callees:?}"
+        );
+    }
+
     /// Impact analysis must follow CROSS_REPO_LINK edges so that callers in
     /// other repos (modeled as cross-repo links in a unified multi-repo graph)
     /// are reported. Regression guard for cross-boundary intelligence: without

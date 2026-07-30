@@ -6095,7 +6095,7 @@ fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
 fn tool_schema_flow_trace() -> Value {
     json!({
         "name": "flow_trace",
-        "description": "Trace forward execution flow from a symbol: what it calls, what those call, and so on. Returns a tree of callees.\n\nGuidelines:\n- Best for tracing from entry points (main, request handlers) to understand execution paths\n- Cycles are detected and pruned; use max_depth to control tree depth (default 10)\n- Classes are auto-expanded to their methods since classes have no direct CALLS edges\n\nLimitations:\n- For reverse dependencies ('what calls this?') use brain_impact instead\n- For general structural context use brain_context",
+        "description": "Trace forward execution flow from a symbol: what it calls, what those call, and so on. Returns a tree of callees.\n\nGuidelines:\n- Best for tracing from entry points (main, request handlers) to understand execution paths\n- Every child carries `edge_type`: CALLS and IMPORTS are observed in code, CROSS_REPO_LINK is an INFERRED cross-repo link. A CROSS_REPO_LINK child is NOT an observed call — filter it out when you need a real execution path\n- Cycles are detected and pruned; use max_depth to control tree depth (default 10)\n- Classes are auto-expanded to their methods since classes have no direct CALLS edges\n\nLimitations:\n- For reverse dependencies ('what calls this?') use brain_impact instead\n- For general structural context use brain_context",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6274,14 +6274,14 @@ fn build_flow_tree(
     let mut children = Vec::new();
 
     if depth < opts.max_depth
-        && let Ok(callees) = store.callees_of(uid)
+        && let Ok(callees) = store.callees_with_edge_types_of(uid)
     {
-        for callee in &callees {
+        for (callee, edge_type) in &callees {
             if visited.contains(&callee.uid) {
                 continue;
             }
             visited.insert(callee.uid.clone());
-            let child = build_flow_tree(
+            let mut child = build_flow_tree(
                 store,
                 &callee.uid,
                 &callee.name,
@@ -6290,11 +6290,25 @@ fn build_flow_tree(
                 visited,
                 opts,
             )?;
+            // Label the edge that reached this node. The traversal spans CALLS,
+            // IMPORTS and CROSS_REPO_LINK, and the last is an INFERRED link
+            // between repos — following it as a call produced fabricated
+            // execution paths (a Rust function appearing to call JavaScript
+            // symbols in unrelated repos). Without this field they were
+            // indistinguishable from real calls, on the flagship "what does this
+            // call" surface. `impact` has always labelled its edges; this brings
+            // flow_trace to parity (nw-111).
+            if let Some(obj) = child.as_object_mut() {
+                obj.insert("edge_type".to_string(), json!(edge_type));
+            }
             children.push(child);
         }
     }
 
     if opts.concise {
+        // The label ships in concise mode too: a caller scanning a compact tree
+        // is exactly the one who cannot afford to mistake a cross-repo guess for
+        // a call.
         Ok(json!({
             "name": name,
             "children": children,
