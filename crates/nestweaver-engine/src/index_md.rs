@@ -1570,14 +1570,35 @@ impl<'a> WikilinkLookup<'a> {
             return ResolveOutcome::Unresolved;
         }
 
-        // Priority 1: path match.
-        if key.contains('/')
-            && let Some(&uid) = self.by_path.get(&key)
-        {
-            return ResolveOutcome::Resolved(vec![ResolveCandidate {
-                note_uid: uid.to_string(),
-                confidence: 1.0,
-            }]);
+        // Priority 1: path match — vault-relative first, then relative to the
+        // SOURCE's folder.
+        //
+        // `by_path` is keyed on full vault-relative paths, so only the first
+        // form ever matched. But `[[plans/Phase B Execution Index]]` written in
+        // `Workspaces/Orbit/_Overview.md` is Obsidian's RELATIVE-path syntax and
+        // means `Workspaces/Orbit/plans/Phase B Execution Index.md`. Every
+        // path-qualified link in the vault therefore resolved to nothing — 45 of
+        // them, all reported at confidence 0.0 (nw-100).
+        //
+        // Both forms are exact, unambiguous single-key lookups, so both score
+        // 1.0 and priority ordering is preserved.
+        if key.contains('/') {
+            if let Some(&uid) = self.by_path.get(&key) {
+                return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                    note_uid: uid.to_string(),
+                    confidence: 1.0,
+                }]);
+            }
+            if !source_folder.is_empty() {
+                // `by_path` keys are lowercased; `folder` is stored raw.
+                let scoped = format!("{}/{key}", source_folder.replace('\\', "/").to_lowercase());
+                if let Some(&uid) = self.by_path.get(&scoped) {
+                    return ResolveOutcome::Resolved(vec![ResolveCandidate {
+                        note_uid: uid.to_string(),
+                        confidence: 1.0,
+                    }]);
+                }
+            }
         }
 
         // Priority 2: unique title match.
@@ -2145,6 +2166,64 @@ sub b body
     }
 
     // ── Pass-2 wikilink/tag tests ─────────────────────────────────────────
+
+    /// nw-100: a path-qualified wikilink is Obsidian's RELATIVE-path syntax and
+    /// must resolve.
+    ///
+    /// `by_path` is keyed on full vault-relative paths, so priority 1 only ever
+    /// tried the bare target. `[[plans/Target]]` written in
+    /// `Workspaces/Orbit/_Overview.md` means
+    /// `Workspaces/Orbit/plans/Target.md`, which never matched — so every
+    /// path-qualified link in the vault resolved to nothing (45 of them, all
+    /// reported at confidence 0.0).
+    #[test]
+    fn resolves_a_path_relative_to_the_source_folder() {
+        let (_dir, root) = make_vault(&[
+            (
+                "Workspaces/Orbit/_Overview.md",
+                "# Overview\n\nSee [[plans/Phase B Execution Index]].\n",
+            ),
+            (
+                "Workspaces/Orbit/plans/Phase B Execution Index.md",
+                "# Phase B Execution Index\n\nbody\n",
+            ),
+        ]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(
+            result.wikilinks_resolved, 1,
+            "a source-folder-relative path must resolve"
+        );
+        assert_eq!(result.wikilinks_unresolved, 0);
+    }
+
+    /// A full vault-relative path must keep working — that was the only form
+    /// priority 1 ever handled.
+    #[test]
+    fn resolves_a_full_vault_relative_path() {
+        let (_dir, root) = make_vault(&[
+            (
+                "notes/index.md",
+                "# Index\n\nSee [[Workspaces/Orbit/plans/Target]].\n",
+            ),
+            ("Workspaces/Orbit/plans/Target.md", "# Target\n\nbody\n"),
+        ]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 1);
+        assert_eq!(result.wikilinks_unresolved, 0);
+    }
+
+    /// A path-qualified link that matches nothing must still be unresolved —
+    /// the folder-relative attempt must not start inventing matches.
+    #[test]
+    fn a_path_qualified_link_to_nowhere_stays_unresolved() {
+        let (_dir, root) = make_vault(&[(
+            "Workspaces/Orbit/_Overview.md",
+            "# Overview\n\nSee [[plans/Does Not Exist]].\n",
+        )]);
+        let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.wikilinks_resolved, 0);
+        assert_eq!(result.wikilinks_unresolved, 1);
+    }
 
     #[test]
     fn resolves_unique_title_wikilink() {
