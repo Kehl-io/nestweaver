@@ -191,6 +191,231 @@ fn openapi_contracts(spec: &openapiv3::OpenAPI) -> Vec<SpecContract> {
     out
 }
 
+/// Convert a protobuf RPC name to the Rust method identifier tonic generates.
+///
+/// tonic derives server-trait method names through `prost_build::ident::to_snake`,
+/// which delegates to `heck`'s snake_case and then sanitizes Rust keywords. Both
+/// steps matter, and a hand-rolled "insert `_` before each capital" does NOT
+/// reproduce either:
+///
+/// heck's documented word boundary is "if an uppercase character is followed by
+/// lowercase letters, a boundary is just prior to it; consecutive uppercase
+/// characters are one word, except the last joins the next word when followed by
+/// lowercase". So `XMLHttpRequest` segments `XML|Http|Request` ->
+/// `xml_http_request`, where the naive rule yields `x_m_l_http_request`.
+/// prost's own test suite asserts exactly this case.
+///
+/// Keyword collisions are then sanitized: most become `r#ident` (`Type` ->
+/// `r#type`), while `_`, `super`, `self`, `Self`, `extern` and `crate` get a
+/// trailing underscore. [`grpc_rpc_rust_idents`] returns every acceptable form.
+pub(crate) fn grpc_rpc_to_rust_method(rpc_name: &str) -> String {
+    let chars: Vec<char> = rpc_name.chars().collect();
+    let mut out = String::with_capacity(rpc_name.len() + 4);
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            let prev_is_lower_or_digit = chars[i - 1].is_lowercase() || chars[i - 1].is_numeric();
+            let next_is_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+            if prev_is_lower_or_digit || next_is_lower {
+                out.push('_');
+            }
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+/// A gRPC RPC implemented in Rust: the declared contract UID plus the symbol
+/// implementing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcImplMatch {
+    /// UID of the contract DECLARED by the proto, adopted verbatim.
+    pub contract_uid: String,
+    /// UID of the implementing symbol.
+    pub symbol_uid: String,
+}
+
+/// Link declared gRPC contracts to their Rust/tonic implementations.
+///
+/// Deliberately matches implementations AGAINST declared contracts rather than
+/// minting contract UIDs from Rust source. The proto package
+/// (`nestweaver.daemon.v1`) appears nowhere in the Rust file, so any UID built
+/// from the implementation would be a guess that has to coincide with what
+/// `parse_proto` produced. Adopting the declared UID makes the edge point at a
+/// contract that provably exists — which is the acceptance criterion for this
+/// bug: confirm the edge appears, not merely that a drift count dropped.
+///
+/// This mirrors the approach published for microservice endpoint coverage:
+/// extract implemented endpoints statically, then compare against the declared
+/// set (arXiv 2308.09257).
+///
+/// The match key is a documented tonic guarantee: a `service Greeter` generates
+/// a trait named `Greeter`, implemented as `impl Greeter for MyService`, with
+/// methods snake_cased by prost. So an `impl <Service> for _` block whose method
+/// names convert back to the service's RPC names is that service's server
+/// implementation.
+///
+/// `declared` maps a contract UID to its `<package>.<Service>/<Rpc>` operation.
+/// `symbols` are `(symbol_uid, name, start_line)` for one file.
+pub fn detect_grpc_impls(
+    source: &str,
+    declared: &[(String, String)],
+    symbols: &[(String, String, u32)],
+) -> Vec<GrpcImplMatch> {
+    if declared.is_empty() || symbols.is_empty() {
+        return Vec::new();
+    }
+
+    // Which trait does each line fall inside? Only `impl <Trait> for <Type>`
+    // blocks matter, and tonic's is always a trait impl.
+    let impl_blocks = rust_trait_impl_blocks(source);
+    if impl_blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (contract_uid, operation) in declared {
+        // "<package>.<Service>/<Rpc>" — the service is the last dot-segment
+        // before the slash.
+        let Some((qualified_service, rpc)) = operation.rsplit_once('/') else {
+            continue;
+        };
+        let service = qualified_service
+            .rsplit_once('.')
+            .map_or(qualified_service, |(_, s)| s);
+        if service.is_empty() || rpc.is_empty() {
+            continue;
+        }
+        let accepted = grpc_rpc_rust_idents(rpc);
+
+        for (symbol_uid, name, line) in symbols {
+            if !accepted.iter().any(|candidate| candidate == name) {
+                continue;
+            }
+            // The method must sit inside `impl <Service> for _`. Without this a
+            // free function that merely shares a name would be linked.
+            let inside = impl_blocks.iter().any(|(trait_name, start, end)| {
+                trait_name == service && *line >= *start && *line <= *end
+            });
+            if inside {
+                out.push(GrpcImplMatch {
+                    contract_uid: contract_uid.clone(),
+                    symbol_uid: symbol_uid.clone(),
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Locate `impl <Trait> for <Type>` blocks as `(trait_name, start_line,
+/// end_line)`, 1-based inclusive.
+///
+/// Brace-depth scanning rather than a parser: the engine has the file as text
+/// here, and `detect_handlers` already recovers class-level context the same way.
+/// Inherent impls (`impl Foo {`) are skipped — a tonic server implementation is
+/// always a trait impl.
+fn rust_trait_impl_blocks(source: &str) -> Vec<(String, u32, u32)> {
+    let mut out = Vec::new();
+    let mut open: Option<(String, u32, i32)> = None;
+
+    for (idx, raw) in source.lines().enumerate() {
+        let line_no = idx as u32 + 1;
+        let line = raw.split("//").next().unwrap_or(raw);
+
+        if open.is_none()
+            && let Some(trait_name) = parse_trait_impl_header(line)
+        {
+            let depth = brace_delta(line);
+            open = Some((trait_name, line_no, depth.max(0)));
+            // A single-line `impl T for U {}` closes immediately.
+            if depth <= 0
+                && let Some((name, start, _)) = open.take()
+            {
+                out.push((name, start, line_no));
+            }
+            continue;
+        }
+
+        if let Some((_, _, depth)) = open.as_mut() {
+            *depth += brace_delta(line);
+            if *depth <= 0
+                && let Some((name, start, _)) = open.take()
+            {
+                out.push((name, start, line_no));
+            }
+        }
+    }
+
+    // Unterminated block (truncated file): treat it as running to the end.
+    if let Some((name, start, _)) = open {
+        out.push((name, start, source.lines().count() as u32));
+    }
+    out
+}
+
+/// Extract the trait name from an `impl [<generics>] <Trait> for <Type>` header.
+fn parse_trait_impl_header(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("impl")?;
+    // Require a boundary so `implementation_note` is not read as `impl`.
+    if !rest.starts_with([' ', '<']) {
+        return None;
+    }
+    let (before_for, _after) = rest.split_once(" for ")?;
+    // Drop any generic parameter list directly after `impl`.
+    let mut candidate = before_for.trim();
+    if candidate.starts_with('<')
+        && let Some(close) = matching_angle(candidate)
+    {
+        candidate = candidate[close + 1..].trim();
+    }
+    // Strip the trait's own generic arguments and any path qualification.
+    let candidate = candidate.split('<').next().unwrap_or(candidate).trim();
+    let candidate = candidate.rsplit("::").next().unwrap_or(candidate).trim();
+    if candidate.is_empty() || !candidate.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+/// Index of the `>` closing a generic list that starts at index 0.
+fn matching_angle(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn brace_delta(line: &str) -> i32 {
+    line.chars().fold(0, |acc, c| match c {
+        '{' => acc + 1,
+        '}' => acc - 1,
+        _ => acc,
+    })
+}
+
+/// Every Rust identifier tonic could plausibly generate for `rpc_name`.
+///
+/// Comparing against a small candidate set is simpler and safer than trying to
+/// invert prost's sanitization: a parsed `foo_` is genuinely ambiguous between
+/// "sanitized keyword" and "a method actually named foo_", and accepting both
+/// costs nothing because the service and RPC still have to match.
+pub(crate) fn grpc_rpc_rust_idents(rpc_name: &str) -> Vec<String> {
+    let base = grpc_rpc_to_rust_method(rpc_name);
+    vec![format!("r#{base}"), format!("{base}_"), base]
+}
+
 fn parse_proto(path: &str, source: &str) -> Vec<SpecContract> {
     let fd = match protox_parse::parse(path, source) {
         Ok(fd) => fd,
@@ -1414,6 +1639,170 @@ paths:
             uids.contains(&"contract:http:GET:/v1/users/{}".to_string()),
             "param slot must normalize; uids: {uids:?}"
         );
+    }
+
+    const TONIC_SOURCE: &str = r#"
+use crate::proto::nest_weaver_daemon_server::NestWeaverDaemon;
+
+fn health_check() {}
+
+#[tonic::async_trait]
+impl NestWeaverDaemon for DaemonService {
+    async fn health_check(&self, req: Request<()>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
+    async fn index_repo(&self, req: Request<()>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+}
+
+impl SomethingElse for DaemonService {
+    async fn shutdown(&self) {}
+}
+"#;
+
+    fn decl(uid: &str, op: &str) -> (String, String) {
+        (uid.to_string(), op.to_string())
+    }
+
+    /// The core linkage: a declared RPC whose snake_case method sits inside
+    /// `impl <Service> for _` is that contract's implementation, and the edge
+    /// adopts the DECLARED uid rather than minting one from Rust.
+    #[test]
+    fn links_declared_grpc_contracts_to_their_tonic_impl() {
+        let declared = vec![
+            decl(
+                "contract:grpc:nestweaver.daemon.v1.NestWeaverDaemon/HealthCheck",
+                "nestweaver.daemon.v1.NestWeaverDaemon/HealthCheck",
+            ),
+            decl(
+                "contract:grpc:nestweaver.daemon.v1.NestWeaverDaemon/IndexRepo",
+                "nestweaver.daemon.v1.NestWeaverDaemon/IndexRepo",
+            ),
+        ];
+        // (uid, name, line) — the free fn at line 4 shares a name with the RPC.
+        let symbols = vec![
+            ("sym:free".to_string(), "health_check".to_string(), 4),
+            ("sym:hc".to_string(), "health_check".to_string(), 8),
+            ("sym:ir".to_string(), "index_repo".to_string(), 12),
+        ];
+
+        let got = detect_grpc_impls(TONIC_SOURCE, &declared, &symbols);
+
+        assert_eq!(got.len(), 2, "both declared RPCs must link: {got:?}");
+        let hc = got
+            .iter()
+            .find(|m| m.contract_uid.ends_with("/HealthCheck"))
+            .expect("HealthCheck must link");
+        assert_eq!(
+            hc.symbol_uid, "sym:hc",
+            "must pick the method INSIDE the trait impl, not the free fn"
+        );
+    }
+
+    /// A declared RPC with no implementation must stay unlinked, or the fix would
+    /// suppress the real drift it exists to report.
+    #[test]
+    fn a_declared_rpc_with_no_impl_is_not_linked() {
+        let declared = vec![decl(
+            "contract:grpc:nestweaver.daemon.v1.NestWeaverDaemon/NotImplemented",
+            "nestweaver.daemon.v1.NestWeaverDaemon/NotImplemented",
+        )];
+        let symbols = vec![("sym:hc".to_string(), "health_check".to_string(), 8)];
+        assert!(detect_grpc_impls(TONIC_SOURCE, &declared, &symbols).is_empty());
+    }
+
+    /// A method in a DIFFERENT trait must not satisfy the contract, even when the
+    /// name converts correctly.
+    #[test]
+    fn a_method_in_another_trait_does_not_satisfy_the_contract() {
+        let declared = vec![decl(
+            "contract:grpc:nestweaver.daemon.v1.NestWeaverDaemon/Shutdown",
+            "nestweaver.daemon.v1.NestWeaverDaemon/Shutdown",
+        )];
+        // `shutdown` exists, but inside `impl SomethingElse for DaemonService`.
+        let symbols = vec![("sym:sd".to_string(), "shutdown".to_string(), 17)];
+        assert!(
+            detect_grpc_impls(TONIC_SOURCE, &declared, &symbols).is_empty(),
+            "wrong trait must not link"
+        );
+    }
+
+    #[test]
+    fn trait_impl_blocks_are_located_with_their_line_ranges() {
+        let blocks = rust_trait_impl_blocks(TONIC_SOURCE);
+        let names: Vec<&str> = blocks.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains(&"NestWeaverDaemon"), "{blocks:?}");
+        assert!(names.contains(&"SomethingElse"), "{blocks:?}");
+    }
+
+    /// Header parsing must survive generics and path qualification, and must not
+    /// mistake an inherent impl for a trait impl.
+    #[test]
+    fn trait_impl_header_parsing_handles_generics_and_paths() {
+        assert_eq!(
+            parse_trait_impl_header("impl NestWeaverDaemon for DaemonService {").as_deref(),
+            Some("NestWeaverDaemon")
+        );
+        assert_eq!(
+            parse_trait_impl_header("impl<T: Send> proto::Greeter<T> for MyService {").as_deref(),
+            Some("Greeter")
+        );
+        // Inherent impl — no trait, nothing to link.
+        assert_eq!(parse_trait_impl_header("impl DaemonService {"), None);
+        // Must not read `implementation` as `impl`.
+        assert_eq!(parse_trait_impl_header("implementation_note for x {"), None);
+    }
+
+    /// The acronym cases are the whole reason this is not a hand-rolled
+    /// "insert `_` before each capital".
+    ///
+    /// prost's `to_snake` delegates to heck, whose documented boundary treats a
+    /// run of capitals as ONE word except that the last joins the next word when
+    /// followed by lowercase. prost's own suite asserts
+    /// `to_snake("XMLHttpRequest") == "xml_http_request"`; the naive rule yields
+    /// `x_m_l_http_request` and would silently fail to match every acronym-bearing
+    /// RPC. This repo's own 75 RPCs contain no acronyms, so it cannot catch the
+    /// difference — hence these cases.
+    #[test]
+    fn rpc_names_convert_the_way_prost_and_heck_do() {
+        let cases = [
+            ("HealthCheck", "health_check"),
+            ("Shutdown", "shutdown"),
+            ("IndexRepo", "index_repo"),
+            // Acronyms: a run of capitals is one word.
+            ("XMLHttpRequest", "xml_http_request"),
+            ("GetHTTPStatus", "get_http_status"),
+            ("ExportSARIF", "export_sarif"),
+            ("GetURL", "get_url"),
+            // Digits do not start a new word on their own.
+            ("IndexV2", "index_v2"),
+            ("BlastRadiusV10", "blast_radius_v10"),
+            // Already-lowercase and single words survive unchanged.
+            ("backup", "backup"),
+        ];
+        for (rpc, expected) in cases {
+            assert_eq!(
+                grpc_rpc_to_rust_method(rpc),
+                expected,
+                "{rpc} must convert like heck does"
+            );
+        }
+    }
+
+    /// prost sanitizes keyword collisions, so the matcher accepts every form it
+    /// could emit. None of this repo's RPCs collide, which is exactly why this
+    /// needs a test rather than a happy-path check.
+    #[test]
+    fn keyword_rpcs_accept_prosts_sanitized_forms() {
+        let idents = grpc_rpc_rust_idents("Type");
+        assert!(idents.contains(&"r#type".to_string()), "{idents:?}");
+        assert!(idents.contains(&"type".to_string()), "{idents:?}");
+        assert!(idents.contains(&"type_".to_string()), "{idents:?}");
+
+        // A non-keyword still yields its plain form.
+        assert!(grpc_rpc_rust_idents("HealthCheck").contains(&"health_check".to_string()));
     }
 
     #[test]
