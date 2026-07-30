@@ -95,22 +95,80 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
 
 /// Rank note UIDs by how well their title matches `text` (case-insensitive
 /// substring either direction, with exact match first). Returns at most `max`.
+/// Collapse a link target or note key to a comparable form: lowercase, with
+/// every run of non-alphanumeric characters reduced to a single space.
+///
+/// Lets `blast-radius-production-grade` match a note whose stem is written
+/// `Blast Radius Production Grade` without resorting to fuzzy distance.
+fn normalize_key(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.extend(ch.to_lowercase());
+        } else {
+            pending_space = true;
+        }
+    }
+    out
+}
+
+/// The filename stem of a note's path, lowercased.
+fn note_stem(file_path: &str) -> String {
+    std::path::Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+/// Rank note UIDs by how well their TITLE or FILENAME STEM matches `text`.
+///
+/// Stems matter because Obsidian wikilinks target filenames, and the resolver
+/// keys on stems too (its priority 3/3b). This function looked only at titles,
+/// so it stayed silent on the one case where a suggestion is most valuable: a
+/// target that matches a filename stem shared by SEVERAL notes. The resolver
+/// requires a unique stem and so declines to pick, leaving the link unresolved —
+/// and with no suggestion, the caller was told nothing at all despite both
+/// candidates being known (nw-100).
+///
+/// Deliberately exact-or-substring, with no edit-distance fuzzing. On the real
+/// vault most unresolved links point at targets that do not exist anywhere —
+/// backlog IDs that are YAML entries rather than notes, and notes since deleted.
+/// Fuzzy matching would manufacture a confident-looking suggestion for every one
+/// of them, which is worse than returning none.
 fn suggest_targets(text: &str, notes: &[NoteLite], max: usize, source_uid: &str) -> Vec<String> {
     let needle = text.trim().to_lowercase();
     if needle.is_empty() {
         return vec![];
     }
+    let needle_norm = normalize_key(&needle);
+
     let mut scored: Vec<(u8, &NoteLite)> = Vec::new();
     for n in notes {
         if n.uid == source_uid {
             continue;
         }
         let title = n.title.to_lowercase();
-        let score = if title == needle {
+        let stem = note_stem(&n.file_path);
+
+        // Exact on either key, raw or normalized.
+        let exact = title == needle
+            || stem == needle
+            || (!needle_norm.is_empty()
+                && (normalize_key(&title) == needle_norm || normalize_key(&stem) == needle_norm));
+
+        let score = if exact {
             3
-        } else if title.contains(&needle) {
+        } else if title.contains(&needle) || (!stem.is_empty() && stem.contains(&needle)) {
             2
-        } else if needle.contains(&title) && !title.is_empty() {
+        } else if (!title.is_empty() && needle.contains(&title))
+            || (!stem.is_empty() && needle.contains(&stem))
+        {
             1
         } else {
             0
@@ -119,7 +177,13 @@ fn suggest_targets(text: &str, notes: &[NoteLite], max: usize, source_uid: &str)
             scored.push((score, n));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(&b.1.title)));
+    // Deterministic order: score, then title, then uid — the uid tiebreak keeps
+    // two notes sharing a stem AND a title from ordering arbitrarily.
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.title.cmp(&b.1.title))
+            .then_with(|| a.1.uid.cmp(&b.1.uid))
+    });
     scored
         .into_iter()
         .take(max)
@@ -602,6 +666,86 @@ mod tests {
             stats.low_confidence_wikilinks >= 1,
             "the lower-tier resolution must still be reported, just not as broken"
         );
+    }
+
+    fn note_lite(uid: &str, title: &str, file_path: &str) -> NoteLite {
+        NoteLite {
+            uid: uid.to_string(),
+            title: title.to_string(),
+            file_path: file_path.to_string(),
+            vault_uid: "vault:test".to_string(),
+            pagerank_score: 0.0,
+        }
+    }
+
+    /// nw-100: the case where a suggestion is worth most.
+    ///
+    /// Two notes share the filename stem `blast-radius-production-grade`, so the
+    /// resolver's stem tier requires uniqueness and declines to pick — the link
+    /// is correctly unresolved. But both candidates are known, and the
+    /// title-only suggester returned NOTHING because neither title resembles the
+    /// stem. A human could disambiguate instantly if shown them.
+    #[test]
+    fn suggests_both_notes_that_share_a_filename_stem() {
+        let notes = vec![
+            note_lite(
+                "note:backlog",
+                "Blast Radius → production-grade for enterprise code review",
+                "Workspaces/NestWeaver/backlog/blast-radius-production-grade.md",
+            ),
+            note_lite(
+                "note:prd",
+                "Blast Radius → Production-Grade — PRD",
+                "Workspaces/NestWeaver/notes/2026-07/prd/blast-radius-production-grade.md",
+            ),
+            note_lite("note:other", "Unrelated", "misc/unrelated.md"),
+        ];
+
+        let got = suggest_targets("blast-radius-production-grade", &notes, 5, "note:src");
+
+        assert!(got.contains(&"note:backlog".to_string()), "got: {got:?}");
+        assert!(got.contains(&"note:prd".to_string()), "got: {got:?}");
+        assert!(
+            !got.contains(&"note:other".to_string()),
+            "must not drag in unrelated notes: {got:?}"
+        );
+    }
+
+    /// Separator style must not matter: a hyphenated target should match a note
+    /// whose stem uses spaces, and vice versa.
+    #[test]
+    fn suggestion_matching_ignores_separator_style() {
+        let notes = vec![note_lite(
+            "note:a",
+            "Some Other Title",
+            "notes/Phase B Execution Index.md",
+        )];
+        let got = suggest_targets("phase-b-execution-index", &notes, 5, "note:src");
+        assert_eq!(got, vec!["note:a".to_string()], "got: {got:?}");
+    }
+
+    /// The restraint matters as much as the recall. Most unresolved links on the
+    /// real vault point at targets that exist NOWHERE — backlog IDs that are YAML
+    /// entries rather than notes, and notes since deleted. Returning a
+    /// confident-looking guess for those is worse than returning none, so there
+    /// is deliberately no edit-distance fuzzing.
+    #[test]
+    fn a_target_that_exists_nowhere_gets_no_suggestion() {
+        let notes = vec![
+            note_lite(
+                "note:a",
+                "Daemon Architecture",
+                "notes/daemon-architecture.md",
+            ),
+            note_lite("note:b", "Release Process", "notes/release-process.md"),
+        ];
+        for absent in ["nw-092", "server-mode-phase1-transport", "zzz"] {
+            let got = suggest_targets(absent, &notes, 5, "note:src");
+            assert!(
+                got.is_empty(),
+                "{absent:?} exists nowhere — a guess is worse than nothing, got: {got:?}"
+            );
+        }
     }
 
     /// nw-100: never advise fixing a link by pointing it at its own source.

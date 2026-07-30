@@ -3051,8 +3051,17 @@ enum BrainCommands {
         )]
         prefer_instance: Option<String>,
     },
-    /// List wikilinks whose target is ambiguous or low-confidence
-    /// (confidence < 1.0), with suggested target notes for each.
+    /// List wikilinks that resolved below full confidence or not at all.
+    ///
+    /// Suggestions are offered WHERE CANDIDATES EXIST, which is not every entry:
+    /// a link whose target exists nowhere in the vault — a deleted note, or an ID
+    /// that is a backlog entry rather than a note — has nothing to suggest, and
+    /// an empty list is the honest answer. The old wording promised "suggested
+    /// target notes for each" and so read as a defect whenever the list was
+    /// empty (nw-100).
+    ///
+    /// Check `resolved_target_uid` to tell a link that RESOLVED at a lower tier
+    /// from one that points at nothing.
     BrokenLinks {
         #[arg(long, default_value = "5", help = "Max suggested targets per link")]
         max_suggestions: usize,
