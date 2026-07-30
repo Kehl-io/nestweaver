@@ -3,6 +3,25 @@
 ## Unreleased
 
 
+### Upgrade Notes
+
+* **Re-index your repositories after upgrading.** The import-edge fan-out fix
+  (nw-103) changed how edges are *written*, not how they are read, so it runs at
+  index time and cannot repair edges already in your database. Until a repo is
+  re-indexed, `hubs`, `bridges`, `summary --level hub` and PageRank keep
+  returning the pre-fix ranking for it — on a real 34-repo graph the upgraded
+  binary still reported the exact corrupted ranking from the bug report, and
+  re-indexing a single repo removed all of its artefacts from the top 10.
+
+  ```sh
+  nestweaver index --repo /path/to/each/repo
+  ```
+
+  You do not have to guess whether this affects you: `hubs` and `bridges` now
+  report on stderr when a database contains repos indexed by an older resolver,
+  and stay quiet once everything is current. Vault (`brain refresh`) data is
+  unaffected — this applies to code repositories only.
+
 ### Bug Fixes
 
 * **search:** `regex-search`/`count-patterns` — fix trigram pre-filter correctness for alternation patterns; detect a stale trigram index and fall back to a full scan (`stale_index: true` in JSON, note in text output; remedy: re-run `index --with-trigrams`); bound `--limit` to 1–10000 and `--max-millis` to 1–600000
