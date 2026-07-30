@@ -355,13 +355,20 @@ fn wait_for_socket_watching(
         return Ok(());
     }
 
+    // Do NOT offer `--no-daemon` here. It is a CI-only escape hatch that
+    // bypasses the single-writer lock, and `resolve_use_daemon` refuses it
+    // outside CI anyway — so the suggestion was both unusable and, if forced,
+    // exactly the WAL-corruption risk the daemon exists to prevent (nw-125).
+    // A slow boot is the common cause, so name the knob that actually helps.
     bail!(
         "daemon socket at {} did not accept connections within {:.1}s.\n\
          Check the daemon logs for errors: {}\n\
-         If another process holds the database lock, stop it or use --no-daemon.",
+         If it is simply slow to boot, raise {}; if another process holds the \
+         database lock, stop that process.",
         sock.display(),
         timeout.as_secs_f64(),
-        log_hint_for_socket(sock)
+        log_hint_for_socket(sock),
+        DAEMON_BOOT_TIMEOUT_ENV
     );
 }
 

@@ -2840,7 +2840,26 @@ where
         bump_generation_after_write,
     );
     match (graph_result, finalization) {
-        (Ok(result), Ok(())) => Ok(result),
+        (Ok(result), Ok(())) => {
+            // nw-124: stamp WHICH resolver produced this repo's edges. Some
+            // resolver fixes change edge shape rather than query behaviour
+            // (nw-103's import fan-out), so upgrading the binary leaves already
+            // indexed repos wrong and nothing said so. Recorded only on a fully
+            // successful, finalized index — a failed run must not claim the
+            // repo is current. Best-effort: a sidecar write failure must never
+            // fail an index that already committed.
+            if let Some(db_path) = store.db_path()
+                && let Err(e) = crate::resolver_generation::record(db_path, &r_uid)
+            {
+                tracing::warn!(
+                    repo = %r_uid,
+                    error = %e,
+                    "indexed successfully but could not record the resolver generation; \
+                     ranking staleness for this repo will be over-reported"
+                );
+            }
+            Ok(result)
+        }
         (Ok(_), Err(finalization)) => Err(finalization.into()),
         (Err(primary), Ok(())) => Err(primary),
         (Err(primary), Err(finalization)) => {
