@@ -1798,11 +1798,42 @@ impl GraphStore {
     /// Follows CALLS, IMPORTS, and CROSS_REPO_LINK edges so that
     /// `flow_trace` can traverse function calls, import relationships,
     /// and cross-repo boundaries.
+    ///
+    /// Prefer [`callees_with_edge_types_of`](Self::callees_with_edge_types_of)
+    /// for anything user-facing: this drops the edge type, and a CROSS_REPO_LINK
+    /// is a cross-repo HYPOTHESIS, not an observed call.
     pub fn callees_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
+        Ok(self
+            .callees_with_edge_types_of(uid)?
+            .into_iter()
+            .map(|(sym, _)| sym)
+            .collect())
+    }
+
+    /// As [`callees_of`](Self::callees_of), but keeps the edge type that reached
+    /// each callee.
+    ///
+    /// The traversal spans three very different relationships, and collapsing
+    /// them was the defect: a CROSS_REPO_LINK is an INFERRED link between repos,
+    /// so following it as though it were a call produced fabricated execution
+    /// paths — tracing a Rust function returned JavaScript symbols from unrelated
+    /// repos as its callees. Because the edge type was discarded here,
+    /// `flow_trace` could not label them and a consumer had no way to tell a real
+    /// call from a cross-repo guess. `impact` already returns the edge type for
+    /// exactly this reason (nw-111).
+    ///
+    /// Returned in edge-type priority order, and de-duplicated by symbol, so a
+    /// callee reachable by both CALLS and CROSS_REPO_LINK is reported as the
+    /// stronger CALLS.
+    pub fn callees_with_edge_types_of(
+        &self,
+        uid: &str,
+    ) -> Result<Vec<(Symbol, String)>, StoreError> {
         let conn = self.conn()?;
         let cols = SYMBOL_COLUMNS.replace("s.", "t.");
+        // Order matters: strongest evidence first, so the de-dup below keeps it.
         let edge_types = ["CALLS", "IMPORTS", "CROSS_REPO_LINK"];
-        let mut all: Vec<Symbol> = Vec::new();
+        let mut all: Vec<(Symbol, String)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for et in &edge_types {
             let q = format!("MATCH (s:Symbol {{uid: $uid}})-[:{et}]->(t:Symbol) RETURN {cols}");
@@ -1815,7 +1846,7 @@ impl GraphStore {
             for row in result {
                 let sym = row_to_symbol(&row)?;
                 if seen.insert(sym.uid.clone()) {
-                    all.push(sym);
+                    all.push((sym, (*et).to_string()));
                 }
             }
         }
