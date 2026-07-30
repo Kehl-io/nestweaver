@@ -10624,6 +10624,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
             let socket = nestweaver_daemon::socket_path(&instance_id);
             let log_file = nestweaver_daemon::log_path(&instance_id);
+            // `log_file` is the real stderr sink (it goes in the plist and gets
+            // opened for redirect below). It is NOT what an operator should be
+            // told to read: tracing writes to `daemon.log.<date>` alongside it,
+            // so every human-facing pointer uses the hint instead. See nw-118.
+            let log_hint = nestweaver_daemon::log_hint(&instance_id);
 
             match action {
                 DaemonAction::Start {
@@ -10738,7 +10743,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     .display()
                             );
                             eprintln!("  Socket: {}", socket.display());
-                            eprintln!("  Log:    {}", log_file.display());
+                            eprintln!("  Log:    {log_hint}");
 
                             // Poll connect_existing + health_check
                             // (wait_healthy never auto-starts) instead of the
@@ -10764,9 +10769,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     // still turn into a healthy daemon.
                                     eprintln!(
                                         "Daemon is still booting under launchd; check \
-                                         `nestweaver daemon --db {} status` and the log at {}",
+                                         `nestweaver daemon --db {} status` and the logs at {}",
                                         db_path.display(),
-                                        log_file.display()
+                                        log_hint
                                     );
                                     return Ok((EXIT_SUCCESS, None));
                                 }
@@ -10928,7 +10933,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         eprintln!("  PID file: {}", pidfile.display());
                         eprintln!("  Socket:   {}", socket.display());
-                        eprintln!("  Log:      {}", log_file.display());
+                        eprintln!("  Log:      {log_hint}");
 
                         let daemonize = daemonize2::Daemonize::new()
                             .pid_file(&pidfile)
@@ -10981,9 +10986,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 if !parent.first_child_exit_status.success() {
                                     eprintln!(
                                         "Error: daemon failed to start (boot exit status {}). \
-                                         Check the log: {}",
+                                         Check the logs: {}",
                                         parent.first_child_exit_status,
-                                        log_file.display()
+                                        log_hint
                                     );
                                     std::process::exit(EXIT_ERROR);
                                 }
@@ -10994,8 +10999,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                                 eprintln!(
                                     "Error: daemon did not start accepting connections within \
-                                     10s — it may have died during boot. Check the log: {}",
-                                    log_file.display()
+                                     10s — it may have died during boot. Check the logs: {}",
+                                    log_hint
                                 );
                                 std::process::exit(EXIT_ERROR);
                             }
@@ -11220,7 +11225,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
-                        println!("  Log:    {}", log_file.display());
+                        println!("  Log:    {log_hint}");
                         print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -11235,7 +11240,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("Daemon is running (PID {pid})");
                             println!("  DB:     {}", db_path.display());
                             println!("  Socket: {}", socket.display());
-                            println!("  Log:    {}", log_file.display());
+                            println!("  Log:    {log_hint}");
                             print_daemon_embedding_status(&db_path);
                         } else {
                             println!(
@@ -11253,7 +11258,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("Daemon is running (PID {pid}, serving socket)");
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
-                        println!("  Log:    {}", log_file.display());
+                        println!("  Log:    {log_hint}");
                         print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }

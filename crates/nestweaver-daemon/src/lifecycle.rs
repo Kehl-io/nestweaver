@@ -204,6 +204,25 @@ pub fn log_path(instance_id: &str) -> PathBuf {
     log_dir(instance_id).join("daemon.log")
 }
 
+/// Operator-facing pointer to where daemon diagnostics actually live.
+///
+/// Two writers put daemon output in [`log_dir`], and they do NOT overlap:
+/// launchd redirects the process's stderr to the undated `daemon.log`, while
+/// the tracing subscriber uses a daily rolling appender that writes structured
+/// records to `daemon.log.<YYYY-MM-DD>`. Boot timing, and every
+/// `tracing::error!` emitted by a failing startup, land only in the dated file.
+///
+/// Pointing a stuck operator at `log_path` alone therefore names the one file
+/// guaranteed not to hold the tracing error they are looking for, which is the
+/// dead end this hint exists to avoid.
+pub fn log_hint(instance_id: &str) -> String {
+    format!(
+        "{} — `daemon.log` is stderr; `daemon.log.<date>` has the structured \
+         boot timing and errors",
+        log_dir(instance_id).display()
+    )
+}
+
 /// Launchd service label for the given instance.
 pub fn launchd_label(instance_id: &str) -> String {
     format!("io.kehl.nestweaver.{instance_id}")
@@ -542,5 +561,22 @@ mod tests {
     fn log_path_ends_with_daemon_log() {
         let lp = log_path("test1234");
         assert!(lp.ends_with("daemon.log"));
+    }
+
+    /// The boot-failure messages used to hand operators `log_path` alone. That
+    /// is the launchd stderr file; the tracing subscriber's daily rolling
+    /// appender writes boot timing and startup errors to `daemon.log.<date>`
+    /// instead, so the named file never contained the error being hunted.
+    #[test]
+    fn log_hint_names_the_dated_tracing_file_not_just_stderr() {
+        let hint = log_hint("test1234");
+        assert!(
+            hint.contains("daemon.log.<date>"),
+            "hint must point at the dated tracing file: {hint}"
+        );
+        assert!(
+            hint.contains(&log_dir("test1234").display().to_string()),
+            "hint must name the directory holding both files: {hint}"
+        );
     }
 }
