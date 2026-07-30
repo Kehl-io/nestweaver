@@ -950,8 +950,30 @@ pub fn analyze_blast_radius(
             Some(edges) => {
                 let changed_set: HashSet<&str> =
                     changed_files.iter().filter_map(|p| p.to_str()).collect();
+
+                // Qualify by repo. The sidecar now carries every indexed repo's
+                // pairs rather than only the last one written, and its paths are
+                // repo-RELATIVE — so without this a `CHANGELOG.md` in one repo
+                // would match a `CHANGELOG.md` in another and invent a coupling
+                // that does not exist (nw-062).
+                //
+                // `scope_uids` are the repos the changed symbols belong to;
+                // `Repo.root_path` is what the miner stamped on each pair. A repo
+                // with no root_path (server-side bare clone) contributes nothing
+                // here, and unattributed legacy rows match nothing — both cases
+                // fall through to the `cochange-no-coverage` disclosure below
+                // rather than guessing.
+                let scope_roots: HashSet<String> = scope_uids
+                    .iter()
+                    .filter_map(|uid| store.lookup_repo(uid).ok().flatten())
+                    .filter_map(|repo| repo.root_path)
+                    .collect();
                 let mut seen: HashSet<(String, String)> = HashSet::new();
                 for e in &edges {
+                    // Only pairs mined from a repo actually in scope.
+                    if !e.repo.is_empty() && !scope_roots.contains(&e.repo) {
+                        continue;
+                    }
                     let (coupled, changed) = if changed_set.contains(e.file_a.as_str())
                         && !changed_set.contains(e.file_b.as_str())
                     {
@@ -995,6 +1017,7 @@ pub fn analyze_blast_radius(
                 // "no history was mined for it".
                 let mined: HashSet<&str> = edges
                     .iter()
+                    .filter(|e| e.repo.is_empty() || scope_roots.contains(&e.repo))
                     .flat_map(|e| [e.file_a.as_str(), e.file_b.as_str()])
                     .collect();
                 let unmined: Vec<&str> = changed_set
@@ -2559,6 +2582,7 @@ mod tests {
         let db = dir.path().join("scratch.lbug");
         std::fs::write(&db, b"").expect("touch db");
         let edges = vec![CoChangeEdge {
+            repo: String::new(),
             file_a: "src/billing.rs".into(),
             file_b: "src/invoice_templates.sql".into(),
             cochange_count: 9,
@@ -2607,6 +2631,7 @@ mod tests {
 
         // History mined from a DIFFERENT repo than the file being analysed.
         let edges = vec![CoChangeEdge {
+            repo: String::new(),
             file_a: "crates/nestweaver-store/build.rs".into(),
             file_b: "crates/nestweaver-store/Cargo.toml".into(),
             cochange_count: 6,
@@ -2651,6 +2676,7 @@ mod tests {
         let db = dir.path().join("scratch.lbug");
         std::fs::write(&db, b"").expect("touch db");
         let edges = vec![CoChangeEdge {
+            repo: String::new(),
             file_a: "src/billing.rs".into(),
             file_b: "src/invoice_templates.sql".into(),
             cochange_count: 9,
