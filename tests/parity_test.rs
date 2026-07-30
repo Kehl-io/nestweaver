@@ -527,6 +527,35 @@ fn parity_dead_code_human_direct_vs_daemon() {
     assert_parity("dead-code", "human", &direct, &daemon);
 }
 
+/// nw-111 (5): `blast-radius` and `flow-trace` are the product's headline
+/// capabilities and existed only as MCP tools — absent from the CLI, which is the
+/// discovery surface. They are thin wrappers over the SAME
+/// `nestweaver_mcp::tools::dispatch` the daemon runs, so both modes must agree.
+///
+/// Covered from the outset rather than added after a divergence is reported:
+/// `dead-code` and `investigate` both shipped emitting JSON or text depending on
+/// whether a daemon happened to be running, and survived because they were not in
+/// this file (nw-108).
+#[test]
+fn parity_blast_radius_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "blast-radius",
+        &["blast-radius", "--files", CHANGED_FILES, "--depth", "2"],
+    );
+}
+
+#[test]
+fn parity_flow_trace_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "flow-trace",
+        &["flow-trace", "alpha", "--max-depth", "2"],
+    );
+}
+
 /// `stale-check` is a freshness gate: it exits 1 when the index is
 /// stale. The fixture here is freshly indexed (not stale), but regardless we
 /// only assert stdout equality and equal exit codes across modes — never

@@ -754,6 +754,141 @@ fn render_investigate_text(payload: &serde_json::Value) {
     );
 }
 
+/// Attach the local-scope provenance the federation layer adds on the daemon
+/// path, so `--json` has ONE shape regardless of whether a daemon is running.
+///
+/// Same divergence as nw-117: `_meta` is added by federation, which only runs in
+/// daemon mode, so a direct result was a different shape rather than a different
+/// value. The direct path is genuinely local scope and can say so truthfully.
+fn attach_local_meta(payload: &mut serde_json::Value) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("_meta").or_insert_with(|| {
+            serde_json::json!({
+                "scope": "local",
+                "sources": ["local"],
+                "stale_repos": [],
+            })
+        });
+    }
+}
+
+/// Render a `blast-radius` result as text from its JSON payload.
+///
+/// Both the direct and daemon paths render through this, so the two cannot
+/// drift — the rule established when `dead-code` and `investigate` were found
+/// emitting JSON or text depending on whether a daemon happened to be running
+/// (nw-108).
+fn render_blast_radius_text(payload: &serde_json::Value) {
+    let s = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let n = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // The payload's key is `risk`, not `risk_level` — worth stating, because
+    // guessing it rendered a blank risk with no error at all.
+    println!(
+        "Blast radius: {} affected symbol(s), risk {}",
+        n("affected_symbol_count"),
+        s("risk")
+    );
+    let summary = s("summary");
+    if !summary.is_empty() {
+        println!("  {summary}");
+    }
+    // The trust contract comes FIRST. A caller who reads only the first lines
+    // must not walk away with a risk level whose run never completed.
+    println!("  status:     {}", s("status"));
+    println!("  gate_state: {}", s("gate_state"));
+
+    for note in payload
+        .get("notifications")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let level = note.get("level").and_then(|v| v.as_str()).unwrap_or("note");
+        let msg = note.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        println!("  [{level}] {msg}");
+    }
+
+    let blind: Vec<&str> = payload
+        .get("blind_spots")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if !blind.is_empty() {
+        println!("  blind spots: {}", blind.join(", "));
+    }
+
+    let symbols = payload
+        .get("affected_symbols")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if symbols.is_empty() {
+        println!("\nNo affected symbols reported.");
+        return;
+    }
+    println!();
+    for sym in &symbols {
+        let g = |k: &str| sym.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let score = sym
+            .get("impact_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        println!(
+            "  {:<40} {} (score {:.2})",
+            g("name"),
+            g("file_path"),
+            score
+        );
+    }
+}
+
+/// Render a `flow-trace` tree as text from its JSON payload.
+///
+/// `edge_type` is printed on every child. CROSS_REPO_LINK is an INFERRED
+/// cross-repo link rather than an observed call, and omitting the label is what
+/// let fabricated cross-language execution paths read as real ones (nw-111).
+fn render_flow_trace_text(payload: &serde_json::Value) {
+    fn walk(node: &serde_json::Value, depth: usize) {
+        let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let edge = node.get("edge_type").and_then(|v| v.as_str());
+        let path = node.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        let indent = "  ".repeat(depth + 1);
+        match edge {
+            Some(e) => println!("{indent}{name}  [{e}]  {path}"),
+            None => println!("{indent}{name}  {path}"),
+        }
+        for child in node
+            .get("children")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            walk(child, depth + 1);
+        }
+    }
+
+    let root_name = payload
+        .get("root_name")
+        .or_else(|| payload.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    println!("Flow trace from '{root_name}':");
+
+    // A class root expands to one tree per method.
+    if let Some(trees) = payload.get("method_trees").and_then(|v| v.as_array()) {
+        for tree in trees {
+            walk(tree, 0);
+        }
+        return;
+    }
+    if let Some(tree) = payload.get("tree") {
+        walk(tree, 0);
+    } else {
+        walk(payload, 0);
+    }
+}
+
 fn render_dead_code_text(payload: &serde_json::Value) {
     let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let total = num("total_symbols");
@@ -2065,6 +2200,82 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+    },
+
+    /// Assess blast radius for a set of changed files
+    ///
+    /// Maps files to symbols, traces reverse dependencies, and returns affected
+    /// symbols with a risk level and an explicit trust contract. Read
+    /// `gate_state` and `status` before trusting a green result: a run that did
+    /// not complete is `degraded-unknown`, never `risk-flagged`.
+    #[command(
+        after_help = "Examples:\n  nestweaver blast-radius --files src/auth.rs\n  nestweaver blast-radius --files a.rs --files b.rs --depth 5 --json"
+    )]
+    BlastRadius {
+        #[arg(
+            long = "files",
+            required = true,
+            help = "Changed file paths, repo-relative (repeat the flag for several)"
+        )]
+        files: Vec<String>,
+        #[arg(
+            long,
+            default_value = "3",
+            value_parser = clap::value_parser!(u32).range(1..=15),
+            help = "Maximum traversal depth (1-15; matches the MCP blast_radius schema)"
+        )]
+        depth: u32,
+        #[arg(long, help = "Restrict analysis to this repo")]
+        repo: Option<String>,
+        #[arg(
+            long,
+            help = "Also follow data-dependence edges (type refs, field access) — higher recall, noisier"
+        )]
+        include_data_edges: bool,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10000),
+            help = "Cap affected symbols returned, most-impactful first (1-10000)"
+        )]
+        limit: Option<usize>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to an instance config file")]
+        config: Option<PathBuf>,
+    },
+
+    /// Trace forward execution flow from a symbol — what it calls, and what those call
+    ///
+    /// Every child carries `edge_type`. CALLS and IMPORTS are observed in code;
+    /// CROSS_REPO_LINK is an INFERRED cross-repo link and is NOT an observed
+    /// call — filter it out when you need a real execution path.
+    #[command(
+        after_help = "Examples:\n  nestweaver flow-trace handleRequest\n  nestweaver flow-trace \"sym:repo:...:abc:42\" --max-depth 3 --json"
+    )]
+    FlowTrace {
+        #[arg(help = "Symbol name or full UID to trace from")]
+        symbol: String,
+        #[arg(
+            long,
+            default_value = "10",
+            value_parser = clap::value_parser!(u32).range(1..=15),
+            help = "Maximum tree depth (1-15; matches the MCP flow_trace schema)"
+        )]
+        max_depth: u32,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to an instance config file")]
+        config: Option<PathBuf>,
     },
 
     /// Export the code graph to an external format
@@ -6886,6 +7097,106 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             use_daemon,
         )
         .map(|c| (c, None)),
+
+        Commands::BlastRadius {
+            files,
+            depth,
+            repo,
+            include_data_edges,
+            limit,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+
+            let mut args = serde_json::json!({
+                "changed_files": files,
+                "max_depth": depth,
+                "include_data_edges": include_data_edges,
+            });
+            if let Some(ref r) = repo {
+                args["repo"] = serde_json::json!(r);
+            }
+            if let Some(n) = limit {
+                args["limit"] = serde_json::json!(n);
+            }
+
+            // Daemon first, then the SAME tool the daemon would have run. Both
+            // paths therefore produce one payload and render through one
+            // function, so the output format follows --json rather than whether
+            // a daemon happens to be running (nw-108).
+            let payload = match try_hybrid_json_rpc(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "blast_radius",
+                args.clone(),
+            ) {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    // The MCP server sets this before dispatching; without it the
+                    // tool cannot locate the co-change sidecar and silently drops
+                    // the `cochange-unavailable` disclosure, so the direct path
+                    // would answer with LESS honesty than the daemon (nw-062).
+                    nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+                    let mut value =
+                        nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)?;
+                    attach_local_meta(&mut value);
+                    value
+                }
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                render_blast_radius_text(&payload);
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::FlowTrace {
+            symbol,
+            max_depth,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+
+            let args = serde_json::json!({
+                "symbol": symbol,
+                "max_depth": max_depth,
+            });
+
+            let payload = match try_hybrid_json_rpc(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "flow_trace",
+                args.clone(),
+            ) {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+                    let mut value =
+                        nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)?;
+                    attach_local_meta(&mut value);
+                    value
+                }
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                render_flow_trace_text(&payload);
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
 
         Commands::DeadCode {
             min_confidence,
