@@ -15,7 +15,15 @@ use serde::Serialize;
 use crate::manifest::ManifestInfo;
 
 /// Confidence that a symbol is truly dead code.
+///
+/// Serialised lowercase to match [`Display`](std::fmt::Display), the daemon's
+/// own payload, and the `--min-confidence` values a caller passes in. The
+/// derived representation was the PascalCase variant name, so `dead-code --json`
+/// answered "Medium" direct and "medium" through the daemon for the same run —
+/// the same field disagreeing with itself depending on whether a daemon happened
+/// to be running (nw-117).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DeadCodeConfidence {
     /// Public symbol in a potentially library crate — could be used externally.
     Low,

@@ -655,6 +655,87 @@ fn print_link_classification(links: &[nestweaver_engine::BrokenLink]) {
     );
 }
 
+/// Provenance for a result computed WITHOUT the daemon.
+///
+/// The federation layer attaches `_meta` (scope, sources, stale_repos) on the
+/// daemon path only, so `--json` returned a different SHAPE depending on whether
+/// a daemon happened to be running. The direct path is genuinely local scope, so
+/// it can state the same thing truthfully rather than omitting the field
+/// (nw-117).
+fn local_result_meta() -> serde_json::Value {
+    serde_json::json!({
+        "scope": "local",
+        "sources": ["local"],
+        "stale_repos": [],
+    })
+}
+
+/// The single JSON shape `impact` emits, for every outcome.
+///
+/// `impact --json` previously returned three incompatible shapes: a bare node
+/// array for a complete walk, an object when the traversal was pruned, and a
+/// bare CANDIDATE array when the symbol name was ambiguous. The last is the
+/// dangerous one — it is structurally indistinguishable from a successful
+/// result, so a mistyped name returned four "impacted symbols" that were
+/// actually four candidates. Only the exit code disambiguated, which is
+/// invisible to anything consuming piped JSON.
+///
+/// Every other surface here already returns an envelope (`blast_radius`,
+/// `dead-code`, `broken-links`, `contracts drift`); `impact` was the outlier.
+/// `status` is the discriminator a consumer branches on (nw-111).
+fn impact_json_ok(
+    symbol: &str,
+    nodes: serde_json::Value,
+    truncated_by_threshold: bool,
+    truncated_by_depth: bool,
+    total: Option<u64>,
+    returned: Option<u64>,
+    note: Option<String>,
+) -> serde_json::Value {
+    let capped = matches!((total, returned), (Some(t), Some(r)) if r < t);
+    let mut payload = serde_json::json!({
+        "status": "ok",
+        "symbol": symbol,
+        "nodes": nodes,
+        "truncated": truncated_by_threshold || truncated_by_depth || capped,
+        "truncated_by_threshold": truncated_by_threshold,
+        "truncated_by_depth": truncated_by_depth,
+    });
+    if let Some(obj) = payload.as_object_mut() {
+        if let Some(t) = total {
+            obj.insert("total".to_string(), serde_json::json!(t));
+        }
+        if let Some(r) = returned {
+            obj.insert("returned".to_string(), serde_json::json!(r));
+        }
+        if let Some(note) = note {
+            obj.insert("note".to_string(), serde_json::json!(note));
+        }
+    }
+    payload
+}
+
+/// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
+/// mistaken for a result set.
+fn impact_json_ambiguous(symbol: &str, candidates: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ambiguous",
+        "symbol": symbol,
+        "candidates": candidates,
+        "note": "the symbol name matched multiple symbols; no impact was computed. \
+                 Disambiguate with --repo <name> or pass a full UID",
+    })
+}
+
+fn impact_json_not_found(symbol: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "not_found",
+        "symbol": symbol,
+        "error": "not found",
+        "name": symbol,
+    })
+}
+
 /// Render a `dead-code` result as text from its JSON payload.
 ///
 /// BOTH the direct and daemon paths render through this, so the two cannot
@@ -6963,7 +7044,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Built unconditionally so the text path renders from the SAME
             // payload the JSON path prints, and from the same payload the
             // daemon returns (nw-108).
-            let payload = serde_json::to_value(DeadCodeJson {
+            let mut payload = serde_json::to_value(DeadCodeJson {
                 total_symbols: result.total_symbols,
                 reachable_symbols: result.reachable_symbols,
                 unreachable_count: result.unreachable_symbols.len(),
@@ -6975,6 +7056,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 min_confidence: min_conf.to_string(),
                 unreachable_symbols: shown,
             })?;
+            // Match the daemon's envelope so `--json` has one shape regardless
+            // of whether a daemon is running (nw-117).
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("_meta".to_string(), local_result_meta());
+            }
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -8884,13 +8970,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     match value.get("status").and_then(|v| v.as_str()) {
                         Some("not_found") => {
                             if json {
-                                // nw-086: identical --json shape as the direct path.
                                 println!(
                                     "{}",
-                                    serde_json::to_string_pretty(&serde_json::json!({
-                                        "error": "not found",
-                                        "name": name_or_uid,
-                                    }))?
+                                    serde_json::to_string_pretty(&impact_json_not_found(
+                                        &name_or_uid
+                                    ))?
                                 );
                             } else if !out.quiet {
                                 println!("No symbol found: '{name_or_uid}'.");
@@ -8899,12 +8983,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         Some("ambiguous") => {
                             if json {
-                                // nw-086: bare candidates array, matching the direct path.
                                 let cands = value
                                     .get("candidates")
                                     .cloned()
                                     .unwrap_or_else(|| serde_json::json!([]));
-                                println!("{}", serde_json::to_string_pretty(&cands)?);
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&impact_json_ambiguous(
+                                        &name_or_uid,
+                                        cands
+                                    ))?
+                                );
                             } else if !out.quiet {
                                 println!("Ambiguous symbol '{name_or_uid}' — multiple matches:");
                                 if let Some(cands) =
@@ -8957,37 +9046,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .get("impact_nodes")
                             .cloned()
                             .unwrap_or_else(|| value.clone());
-                        if capped {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "nodes": payload,
-                                    "total": total,
-                                    "returned": returned,
-                                    "truncated": true,
-                                    "truncated_by_threshold": truncated_by_threshold,
-                                    "truncated_by_depth": truncated_by_depth,
-                                    "note": format!(
-                                        "showing {} of {} impacted node(s) — reported impact is a \
-                                         floor; raise --limit or pass --min-score 0 for the full set",
-                                        returned.unwrap_or(0),
-                                        total.unwrap_or(0)
-                                    ),
-                                }))?
-                            );
-                        } else if truncated_by_threshold || truncated_by_depth {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "nodes": payload,
-                                    "truncated_by_threshold": truncated_by_threshold,
-                                    "truncated_by_depth": truncated_by_depth,
-                                    "note": value.get("note").cloned().unwrap_or(serde_json::Value::Null),
-                                }))?
-                            );
+                        // One envelope for every outcome — a complete walk, a
+                        // pruned traversal and a capped result set all carry the
+                        // same keys, so a consumer parses one shape (nw-111).
+                        let note = if capped {
+                            Some(format!(
+                                "showing {} of {} impacted node(s) — reported impact is a \
+                                 floor; raise --limit or pass --min-score 0 for the full set",
+                                returned.unwrap_or(0),
+                                total.unwrap_or(0)
+                            ))
                         } else {
-                            println!("{}", serde_json::to_string_pretty(&payload)?);
-                        }
+                            value
+                                .get("note")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&impact_json_ok(
+                                &name_or_uid,
+                                payload,
+                                truncated_by_threshold,
+                                truncated_by_depth,
+                                total,
+                                returned,
+                                note,
+                            ))?
+                        );
                     } else if let Some(arr) = value.get("impact_nodes") {
                         #[derive(serde::Deserialize)]
                         struct DaemonImpactNode {
@@ -9075,39 +9161,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let count = nodes.len();
                     let truncated = result.truncated_by_threshold || result.truncated_by_depth;
 
-                    if json && !truncated {
-                        // nw-086: bare node array (matches the daemon path's --json
-                        // shape) — but ONLY for a complete walk; see below.
-                        #[derive(serde::Serialize)]
-                        struct ImpactNodeJson {
-                            uid: String,
-                            name: String,
-                            file_path: String,
-                            start_line: u32,
-                            edge_type: String,
-                            confidence: f32,
-                            depth: u32,
-                        }
-                        let json_nodes: Vec<_> = nodes
-                            .iter()
-                            .map(|n| ImpactNodeJson {
-                                uid: n.uid.clone(),
-                                name: n.name.clone(),
-                                file_path: n.file_path.clone(),
-                                start_line: n.start_line,
-                                edge_type: n.edge_type.clone(),
-                                confidence: n.confidence,
-                                depth: n.depth,
-                            })
-                            .collect();
-                        println!("{}", serde_json::to_string_pretty(&json_nodes)?);
-                    } else if json {
-                        // Truncated walk: a bare array would read as a complete
-                        // answer, so emit an honest object instead (like
-                        // blast_radius's blind_spots) — `nodes` plus the
-                        // truncation flags and a human-readable caveat.
-                        let note = impact_truncation_note(&result, threshold, depth);
-                        eprintln!("note: {note}");
+                    if json {
+                        // One envelope whether or not the walk was pruned. The
+                        // shape used to change with the outcome, so a consumer
+                        // had to branch on the JSON type before it could read
+                        // anything (nw-111).
                         #[derive(serde::Serialize)]
                         struct ImpactNodeJson<'a> {
                             uid: &'a str,
@@ -9130,14 +9188,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 depth: n.depth,
                             })
                             .collect();
+                        let note = truncated.then(|| {
+                            let note = impact_truncation_note(&result, threshold, depth);
+                            eprintln!("note: {note}");
+                            note
+                        });
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "nodes": json_nodes,
-                                "truncated_by_threshold": result.truncated_by_threshold,
-                                "truncated_by_depth": result.truncated_by_depth,
-                                "note": note,
-                            }))?
+                            serde_json::to_string_pretty(&impact_json_ok(
+                                &name_or_uid,
+                                serde_json::to_value(&json_nodes)?,
+                                result.truncated_by_threshold,
+                                result.truncated_by_depth,
+                                None,
+                                None,
+                                note,
+                            ))?
                         );
                     } else if nodes.is_empty() {
                         if !out.quiet {
@@ -9192,16 +9258,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
                 ResolveResult::NotFound => {
-                    // nw-086: under --json, emit a JSON error object (matching the
-                    // `symbol` command and the daemon path) instead of only a
+                    // nw-086: under --json, emit a JSON object instead of only a
                     // plain-text stderr line a --json consumer can't parse.
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "error": "not found",
-                                "name": name_or_uid,
-                            }))?
+                            serde_json::to_string_pretty(&impact_json_not_found(&name_or_uid))?
                         );
                     } else {
                         eprintln!("Symbol '{name_or_uid}' not found.");
@@ -9210,7 +9272,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 ResolveResult::Ambiguous(candidates) => {
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&candidates)?);
+                        // Carries `candidates`, never `nodes` — a bare array here
+                        // was indistinguishable from a result set, so a mistyped
+                        // name looked like a successful impact query (nw-111).
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&impact_json_ambiguous(
+                                &name_or_uid,
+                                serde_json::to_value(&candidates)?
+                            ))?
+                        );
                     } else {
                         eprintln!(
                             "Ambiguous: '{}' matches {} symbols:",

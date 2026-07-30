@@ -505,26 +505,20 @@ fn parity_investigate_human_direct_vs_daemon() {
 }
 
 ///
-/// Scoped to HUMAN mode deliberately. `--json` still diverges between the two
-/// paths for reasons that predate this fix and would change a published
-/// contract to resolve: the daemon wraps its payload in `_meta`, and it
-/// lowercases the confidence ("medium") while the direct payload carries the
-/// serde variant name ("Medium"). Both are real and tracked separately; neither
-/// is the format flip this test exists to catch. Asserting json parity here
-/// would couple this regression guard to that unrelated decision.
+/// Now covers `--json` too. It was scoped to human-only because the payloads
+/// genuinely diverged: the daemon wrapped its result in `_meta` while the direct
+/// path omitted it, and the confidence serialised as "medium" through the daemon
+/// but "Medium" direct — the same field disagreeing with itself depending on
+/// whether a daemon was running. Both are fixed (nw-117), so json parity is the
+/// acceptance test for that fix.
 #[test]
-fn parity_dead_code_human_direct_vs_daemon() {
+fn parity_dead_code_direct_vs_daemon() {
     let fixture = setup_fixture();
-    let args: &[&str] = &["dead-code", "--limit", "5"];
-
-    // Direct mode first — the daemon is not started yet and may hold the lock.
-    let direct = run_direct(&fixture.db_path, args);
-
-    let _guard = DaemonGuard::new(&fixture.db_path);
-    start_daemon(&fixture.db_path);
-    let daemon = run_via_daemon(&fixture.db_path, args);
-
-    assert_parity("dead-code", "human", &direct, &daemon);
+    check_parity(
+        &fixture.db_path,
+        "dead-code",
+        &["dead-code", "--limit", "5"],
+    );
 }
 
 /// `stale-check` is a freshness gate: it exits 1 when the index is
