@@ -11862,6 +11862,7 @@ mod blast_radius_visibility_tests {
         std::fs::write(&db_path, b"").unwrap();
         save_cochange_sidecar(
             &[CoChangeEdge {
+                repo: String::new(),
                 file_a: "src/api.rs".to_string(),
                 file_b: "hidden/private.sql".to_string(),
                 cochange_count: 8675309,
