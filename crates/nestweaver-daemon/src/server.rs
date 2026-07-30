@@ -6944,6 +6944,14 @@ pub async fn run_server(
 
     // Open the graph store: read-only for a snapshot replica, read-write
     // otherwise (the daemon is the sole DB owner).
+    // Time the pre-bind phases. A client gives the daemon a bounded window to
+    // bind its socket, and when that expired the only evidence was a single
+    // "[daemon] starting" line — nothing said WHERE the time went, so the cause
+    // had to be guessed at. It is not the embedding model: that loads long after
+    // the socket is serving (see `load_embedding_model` below). Opening the
+    // database is the dominant pre-bind cost, so measure it (nw-114).
+    let boot_started = std::time::Instant::now();
+
     let store = if read_only {
         GraphStore::open_read_only(&db_path).with_context(|| {
             format!("failed to open snapshot read-only at {}", db_path.display())
@@ -6962,6 +6970,7 @@ pub async fn run_server(
             }
         }
     };
+    let store_open_ms = boot_started.elapsed().as_millis() as u64;
 
     // Load sidecars (PageRank, interaction scores).
     nestweaver_engine::migrate_sidecar(&db_path, "pagerank.json", ".pagerank.json");
@@ -7305,6 +7314,14 @@ pub async fn run_server(
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
+    // The line a stalled-boot investigation actually needs: how long the client
+    // had to wait, and how much of it was the database open.
+    tracing::info!(
+        boot_ms = boot_started.elapsed().as_millis() as u64,
+        store_open_ms = store_open_ms,
+        socket = %sock_path.display(),
+        "socket bound and accepting connections"
+    );
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
 
     // Create scheduler command channel. The sender goes into AdminState
