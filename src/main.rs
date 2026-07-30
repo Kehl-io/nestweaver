@@ -3610,6 +3610,84 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
 /// rule shared by `brain watch`/`brain add`/`brain refresh` and the top-level
 /// `watch`, so no path silently stamps symbols under the literal `"default"`
 /// when a `--config` names an instance.
+/// Existing vault registrations whose root path equals `root`, as
+/// `(instance_id, vault_uid)`.
+///
+/// Read through the same daemon-or-direct path `brain status` uses. A DB that
+/// does not exist yet yields an empty list rather than an error: the first
+/// refresh of a brand-new database is a legitimate create.
+fn vault_registrations_for_root(
+    use_daemon: bool,
+    db_path: &Path,
+    config: Option<&Path>,
+    root: &Path,
+) -> Vec<(String, String)> {
+    let root_str = root.to_string_lossy().to_string();
+    let matches_root = |candidate: &str| candidate == root_str;
+
+    if let Some(value) = try_hybrid_json_rpc(
+        use_daemon,
+        db_path,
+        config,
+        "brain_status",
+        serde_json::json!({}),
+    ) {
+        return value
+            .get("vaults")
+            .and_then(|v| v.as_array())
+            .map(|vaults| {
+                vaults
+                    .iter()
+                    .filter(|v| {
+                        v.get("root_path")
+                            .and_then(|p| p.as_str())
+                            .is_some_and(matches_root)
+                    })
+                    .filter_map(|v| {
+                        Some((
+                            v.get("instance_id")?.as_str()?.to_string(),
+                            v.get("uid")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    // Direct fallback. A missing database is not an error here.
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    match open_store(Some(db_path)) {
+        Ok(store) => store
+            .list_vaults(None)
+            .map(|vaults| {
+                vaults
+                    .into_iter()
+                    .filter(|v| matches_root(&v.root_path))
+                    .map(|v| (v.instance_id, v.uid))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::debug!("vault_registrations_for_root: store read skipped: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// The instance the caller EXPLICITLY asked for, if any.
+///
+/// [`resolve_instance_id`] collapses "unspecified" into `"default"`, which is
+/// what let a refresh silently fork a vault: the caller expressed no intent and
+/// got a brand-new registration under a literal `default` instance (nw-098).
+/// This keeps the distinction.
+fn explicit_instance_id(flag: Option<&str>, config: Option<&Path>) -> Option<String> {
+    flag.filter(|f| !f.is_empty())
+        .map(|f| f.to_string())
+        .or_else(|| load_instance_config_opt(config).map(|c| c.instance_id))
+}
+
 fn resolve_instance_id(flag: Option<String>, config: Option<&Path>) -> anyhow::Result<String> {
     // nw-047: treat an empty `--instance ""` as unset (not a literal empty
     // instance) so it falls through to the config's `instance_id` / "default".
@@ -13264,14 +13342,82 @@ fn run_brain(
                     .unwrap_or("vault")
                     .to_string()
             });
-            // nw-019: --instance flag > config's instance_id > "default"
-            // (mirrors `brain add`/`brain watch`; fixes vaults being tagged
-            // under the literal "default" instead of the config's instance).
-            let instance_id = resolve_instance_id(instance, config.as_deref())?;
             let extra_patterns = parse_ignore_flag(&ignore);
+            let canonical = abs_for_daemon(&path);
+
+            // nw-098: resolve the instance from any EXISTING registration for this
+            // root before falling back to flag > config > "default".
+            //
+            // `resolve_instance_id` alone made a refresh with no `--instance`
+            // land on the literal "default" and register a SECOND vault for a
+            // root already registered under another instance. The root hash is
+            // identical in both UIDs, so the tool had everything it needed to
+            // know it was the same vault, and forked it anyway: note counts
+            // became the SUM and `brain search` started returning duplicate
+            // rows. The command documented in this repo's own CLAUDE.md did
+            // this.
+            let existing =
+                vault_registrations_for_root(use_daemon, &db_path, config.as_deref(), &canonical);
+            let explicit = explicit_instance_id(instance.as_deref(), config.as_deref());
+            let instance_id = match existing.as_slice() {
+                // Nothing registered here yet — a genuine create.
+                [] => resolve_instance_id(instance, config.as_deref())?,
+                [(registered, uid)] => match &explicit {
+                    // An explicit instance that disagrees with the registration
+                    // is a mistake, not an instruction to fork. Name both and
+                    // refuse.
+                    Some(asked) if asked != registered => {
+                        eprintln!(
+                            "Error: {} is already registered under instance '{registered}' ({uid}), \n\
+                             but --instance/--config asked for '{asked}'.\n\
+                             Refusing to create a second vault for the same root — that splits \n\
+                             note counts and makes `brain search` return duplicate rows.\n\
+                             help: re-run with --instance {registered} to refresh it in place, \n\
+                             or use a different root path.",
+                            canonical.display()
+                        );
+                        return Ok((EXIT_ERROR, None));
+                    }
+                    // Adopt the registration. This is the case the bug broke:
+                    // the caller expressed no intent, so refresh what is there.
+                    _ => registered.clone(),
+                },
+                // Already forked (this is the nw-098 damage state). An
+                // explicit instance that names one of them is actionable;
+                // anything else would be a guess that compounds the fork.
+                many => {
+                    let names = many
+                        .iter()
+                        .map(|(inst, _)| inst.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match &explicit {
+                        Some(asked) if many.iter().any(|(inst, _)| inst == asked) => asked.clone(),
+                        Some(asked) => {
+                            eprintln!(
+                                "Error: {} is registered under {} instances ({names}), and \
+                                 --instance/--config asked for '{asked}', which is not one of them.\n\
+                                 help: pass --instance with one of: {names}",
+                                canonical.display(),
+                                many.len()
+                            );
+                            return Ok((EXIT_ERROR, None));
+                        }
+                        None => {
+                            eprintln!(
+                                "Error: {} is registered under {} instances ({names}).\n\
+                                 Refusing to guess which to refresh.\n\
+                                 help: pass --instance with one of: {names}",
+                                canonical.display(),
+                                many.len()
+                            );
+                            return Ok((EXIT_ERROR, None));
+                        }
+                    }
+                }
+            };
 
             // Compute vault UID for recording last_indexed_at.
-            let canonical = abs_for_daemon(&path);
             let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
 
             if use_daemon && since.is_none() {
@@ -16427,6 +16573,45 @@ fn merge_reindex_guidance(repos: &[String]) -> String {
     guidance.push_str("  nestweaver index --repo <path> --force\n");
     guidance.push_str("  nestweaver materialize-projects --config <instance.toml>");
     guidance
+}
+
+#[cfg(test)]
+mod refresh_instance_resolution_tests {
+    use super::*;
+
+    /// nw-098: with no `--instance` and no config, the caller expressed no
+    /// intent — so `resolve_instance_id` yields the literal "default", which is
+    /// exactly what forked a vault already registered elsewhere. The refresh arm
+    /// must therefore consult the registration rather than trust this value, and
+    /// `explicit_instance_id` is what lets it tell the two apart.
+    #[test]
+    fn no_flag_and_no_config_is_not_an_explicit_instance() {
+        assert_eq!(explicit_instance_id(None, None), None);
+        // An empty --instance is treated as unset, matching resolve_instance_id.
+        assert_eq!(explicit_instance_id(Some(""), None), None);
+        // Meanwhile the resolver still reports "default" — the value that made
+        // the fork silent.
+        assert_eq!(resolve_instance_id(None, None).unwrap(), "default");
+    }
+
+    #[test]
+    fn an_explicit_flag_is_reported_as_explicit() {
+        assert_eq!(
+            explicit_instance_id(Some("kory-brain"), None).as_deref(),
+            Some("kory-brain")
+        );
+    }
+
+    /// A database that does not exist yet must report no registrations rather
+    /// than erroring: the first refresh of a new DB is a legitimate create.
+    #[test]
+    fn a_missing_database_reports_no_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.lbug");
+        let root = dir.path().join("vault");
+        let found = vault_registrations_for_root(false, &missing, None, &root);
+        assert!(found.is_empty(), "got: {found:?}");
+    }
 }
 
 #[cfg(test)]
