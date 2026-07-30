@@ -1981,8 +1981,31 @@ pub fn reconcile_extension_liveness(
     let Some(mut extensions) = load_extensions_strict(&path)? else {
         return Ok(0);
     };
-    let live = graph.live_graph_node_uids()?;
-    let protected = protected_migration_source_uids(db_path)?;
+
+    // nw-119: `live_graph_node_uids` enumerates every node in the graph, and it
+    // runs synchronously before the daemon binds its socket. Measured on a
+    // 5.6 GB production graph it cost 41.6s of a 53.9s boot — 77% of the time a
+    // client spends waiting, and the reason boot repeatedly blew past the
+    // timeout raised by nw-114. The existing early-out only fires when the
+    // sidecar is ABSENT, so a 2 KB extensions file was paying for a full-graph
+    // scan on every start.
+    //
+    // The scan is only ever consulted for keys where
+    // `is_shared_finalizer_graph_uid` holds: the retain below keeps every other
+    // key unconditionally via its first clause. So when no key qualifies, the
+    // result is identical to doing nothing, and skipping the walk is an
+    // equivalence rather than an approximation. Falls through to the same
+    // durable directory sync the `removed == 0` path performs.
+    let needs_liveness_scan = extensions.keys().any(|uid| is_shared_finalizer_graph_uid(uid));
+    let (live, protected) = if needs_liveness_scan {
+        (
+            graph.live_graph_node_uids()?,
+            protected_migration_source_uids(db_path)?,
+        )
+    } else {
+        (Default::default(), Default::default())
+    };
+
     let before = extensions.len();
     extensions.retain(|uid, _| {
         !is_shared_finalizer_graph_uid(uid) || live.contains(uid) || protected.contains(uid)
@@ -2238,6 +2261,58 @@ fn sidecar_path(db_path: &Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// nw-119: the boot-time liveness reconcile skips the full-graph walk when
+    /// no extension key is a shared-finalizer UID. That skip must be an
+    /// EQUIVALENCE, not an approximation — the retain clause keeps every
+    /// non-shared key unconditionally, so a scan could not have removed them.
+    ///
+    /// Guarding the predicate directly: if this ever starts reporting true for
+    /// ordinary application keys, the optimisation would begin skipping a scan
+    /// that matters.
+    #[test]
+    fn only_shared_finalizer_uids_can_ever_be_removed_by_a_liveness_scan() {
+        // Opaque application metadata — must survive a restart even with no
+        // matching graph node, so a liveness scan is irrelevant to it.
+        assert!(!is_shared_finalizer_graph_uid("proj:anything"));
+        assert!(!is_shared_finalizer_graph_uid("note:vlt:unrelated:abc:def"));
+        assert!(!is_shared_finalizer_graph_uid("not-a-uid"));
+        assert!(!is_shared_finalizer_graph_uid(""));
+    }
+
+    /// The skip is decided purely by the sidecar's own keys, so a database with
+    /// only opaque keys never pays for the graph walk that cost 41.6s of a
+    /// 53.9s daemon boot on the production graph.
+    #[test]
+    fn liveness_scan_is_skipped_when_no_key_is_a_shared_finalizer_uid() {
+        let mut extensions: ExtensionStore = Default::default();
+        extensions.insert("proj:alpha".to_string(), Default::default());
+        extensions.insert("note:vlt:other:aaa:bbb".to_string(), Default::default());
+
+        let needs = extensions
+            .keys()
+            .any(|uid| is_shared_finalizer_graph_uid(uid));
+        assert!(
+            !needs,
+            "a sidecar of purely opaque keys must not trigger a full-graph walk"
+        );
+
+        // And every one of them is retained regardless of liveness, which is
+        // why skipping the walk cannot change the outcome.
+        let live: std::collections::BTreeSet<String> = Default::default();
+        let protected: std::collections::BTreeSet<String> = Default::default();
+        let before = extensions.len();
+        extensions.retain(|uid, _| {
+            !is_shared_finalizer_graph_uid(uid)
+                || live.contains(uid)
+                || protected.contains(uid)
+        });
+        assert_eq!(
+            extensions.len(),
+            before,
+            "no key may be dropped when the scan is skipped"
+        );
+    }
 
     fn test_pending_handoff(operation_id: &str, source_uid: &str) -> PendingExtensionHandoff {
         PendingExtensionHandoff {

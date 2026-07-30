@@ -7198,6 +7198,15 @@ pub async fn run_server(
         ui_server: std::sync::Mutex::new(None),
     });
 
+    // nw-119: two instrumentation passes narrowed the unattributed boot time to
+    // the span between the Tantivy open and the bind — 253s of a 268s boot,
+    // with no log output in it at all. Config load, permission source and the
+    // embedding probe measured 0-210ms, so the cost is here: these reconcile
+    // passes walk extension state against a 5.6 GB graph, synchronously, before
+    // the socket is allowed to bind. Measure rather than assume — the previous
+    // two hypotheses (store open, then the 13 MB pagerank sidecar) were both
+    // wrong.
+    let reconcile_started = std::time::Instant::now();
     if !read_only {
         recover_pending_instance_extension_migration(&state).with_context(|| {
             format!(
@@ -7220,6 +7229,8 @@ pub async fn run_server(
                 )
             })?;
     }
+
+    let extension_reconcile_ms = reconcile_started.elapsed().as_millis() as u64;
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
     // hits the cache instead of spending ~350ms rebuilding from the DB.
@@ -7359,6 +7370,7 @@ pub async fn run_server(
         tantivy_open_ms = tantivy_open_ms,
         permission_source_ms = permission_source_ms,
         embedding_probe_ms = embedding_probe_ms,
+        extension_reconcile_ms = extension_reconcile_ms,
         unattributed_ms = boot_ms.saturating_sub(
             store_open_ms
                 + pagerank_load_ms
@@ -7366,6 +7378,7 @@ pub async fn run_server(
                 + tantivy_open_ms
                 + permission_source_ms
                 + embedding_probe_ms
+                + extension_reconcile_ms
         ),
         socket = %sock_path.display(),
         "socket bound and accepting connections"
