@@ -251,6 +251,10 @@ impl RepoDeletionSnapshot {
     }
 }
 
+/// One recorded unresolved wikilink:
+/// `(uid, source_note_uid, source_path, source_title, wikilink_text)`.
+pub type UnresolvedWikilinkRecord = (String, String, String, String, String);
+
 /// A vault whose notes were discarded during a collision in instance merge.
 /// When two instances have vaults at the same root_path, the vault with
 /// fewer notes loses and its notes are cascade-deleted.
@@ -1969,7 +1973,7 @@ impl GraphStore {
     /// `(uid, source_note_uid, source_path, source_title, wikilink_text)`.
     pub fn batch_insert_unresolved_wikilinks(
         &self,
-        records: &[(String, String, String, String, String)],
+        records: &[UnresolvedWikilinkRecord],
     ) -> Result<(), StoreError> {
         if records.is_empty() {
             return Ok(());
@@ -1978,6 +1982,20 @@ impl GraphStore {
         // per statement otherwise, which is what made the per-row insert take
         // ~ms/link. Prepared statements are reused across the batch.
         let conn = self.begin_transaction()?;
+        Self::batch_insert_unresolved_wikilinks_on(&conn, records)?;
+        self.commit_transaction(&conn)?;
+        Ok(())
+    }
+
+    /// Insert unresolved wikilinks on a caller-provided connection, so a larger
+    /// transaction (e.g. `reparent_vault`) can batch them with its other work.
+    pub fn batch_insert_unresolved_wikilinks_on(
+        conn: &lbug::Connection<'_>,
+        records: &[UnresolvedWikilinkRecord],
+    ) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
         let mut del = conn
             .prepare("MATCH (u:UnresolvedWikilink {uid: $uid}) DETACH DELETE u")
             .map_err(|e| StoreError::Query(format!("prepare delete unresolved: {e}")))?;
@@ -2002,7 +2020,6 @@ impl GraphStore {
             )
             .map_err(|e| StoreError::Query(format!("create unresolved: {e}")))?;
         }
-        self.commit_transaction(&conn)?;
         Ok(())
     }
 
@@ -4949,6 +4966,86 @@ impl GraphStore {
     ///
     /// Uses the LadybugDB-compatible DETACH DELETE + re-CREATE pattern
     /// since SET is not supported for property updates.
+    /// Read wikilink edges that ORIGINATE in `vault_uid`, as
+    /// `(section_uid, target_uid, confidence, display)`.
+    ///
+    /// `rel` is the relationship name and `dst` the destination pattern, so one
+    /// helper serves both WIKILINK_TO_NOTE and WIKILINK_TO_HEADING. Best-effort:
+    /// a missing table yields an empty vec rather than an error, matching how
+    /// the cascade treats these tables.
+    fn wikilink_edges_for_vault(
+        &self,
+        vault_uid: &str,
+        rel: &str,
+        dst: &str,
+    ) -> Result<Vec<(String, String, f32, String)>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (n:Note {{vault_uid: $vid}})-[:NOTE_HAS_SECTION]->(s:Section)-[r:{rel}]->({dst}) \
+             RETURN s.uid, dst.uid, r.confidence, r.display"
+        );
+        let mut stmt = match conn.prepare(&q) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                tracing::trace!("wikilink_edges_for_vault: prepare {rel} skipped: {e}");
+                return Ok(Vec::new());
+            }
+        };
+        let result = match conn.execute(
+            &mut stmt,
+            vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::trace!("wikilink_edges_for_vault: execute {rel} skipped: {e}");
+                return Ok(Vec::new());
+            }
+        };
+        Ok(result
+            .filter_map(|row| {
+                Some((
+                    crate::read::extract_string(&row, 0).ok()?,
+                    crate::read::extract_string(&row, 1).ok()?,
+                    row.get(2)
+                        .and_then(|v| match v {
+                            lbug::Value::Double(d) => Some(*d as f32),
+                            lbug::Value::Float(f) => Some(*f),
+                            _ => None,
+                        })
+                        .unwrap_or(0.0),
+                    crate::read::extract_string(&row, 3).unwrap_or_default(),
+                ))
+            })
+            .collect())
+    }
+
+    /// Read every UnresolvedWikilink row as
+    /// `(uid, source_note_uid, source_path, source_title, wikilink_text)`.
+    /// Callers filter by source note. Best-effort on a missing table.
+    fn all_unresolved_wikilinks(&self) -> Result<Vec<UnresolvedWikilinkRecord>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (u:UnresolvedWikilink) \
+                 RETURN u.uid, u.source_note_uid, u.source_path, u.source_title, u.wikilink_text";
+        let result = match conn.query(q) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::trace!("all_unresolved_wikilinks skipped: {e}");
+                return Ok(Vec::new());
+            }
+        };
+        Ok(result
+            .filter_map(|row| {
+                Some((
+                    crate::read::extract_string(&row, 0).ok()?,
+                    crate::read::extract_string(&row, 1).ok()?,
+                    crate::read::extract_string(&row, 2).unwrap_or_default(),
+                    crate::read::extract_string(&row, 3).unwrap_or_default(),
+                    crate::read::extract_string(&row, 4).unwrap_or_default(),
+                ))
+            })
+            .collect())
+    }
+
     pub fn reparent_vault(
         &self,
         old_vault_uid: &str,
@@ -5051,6 +5148,36 @@ impl GraphStore {
                     .map(|huid| (huid.as_str(), s.uid.as_str()))
             })
             .collect();
+        // Capture the wikilink graph before the cascade destroys it (nw-112).
+        //
+        // Every other child and edge above is captured and re-inserted, but
+        // wikilinks were not — so `instance merge` reparented a vault and
+        // silently wiped the note-to-note link graph, 2,067 edges to 0 on the
+        // real brain, while reporting success. Backlinks, broken-link detection
+        // and the graph view all went empty with no warning.
+        //
+        // Edges are keyed on section/note/heading UIDs, none of which change
+        // here, so restoring them verbatim is sufficient. A link whose TARGET
+        // lives in another vault is preserved too: that node is untouched by
+        // this cascade.
+        let wikilink_to_note: Vec<(String, String, f32, String)> =
+            self.wikilink_edges_for_vault(old_vault_uid, "WIKILINK_TO_NOTE", "dst:Note")?;
+        let wikilink_to_heading: Vec<(String, String, f32, String)> =
+            self.wikilink_edges_for_vault(old_vault_uid, "WIKILINK_TO_HEADING", "dst:Heading")?;
+
+        // `delete_vault_cascade` removes UnresolvedWikilink rows whose source
+        // note belongs to this vault (its step 5), so they need restoring as
+        // well or `broken-links` comes back empty after a merge.
+        // UIDs are unchanged by reparenting (only vault_uid moves), so the
+        // reparented list identifies the same notes.
+        let note_uid_set: std::collections::HashSet<&str> =
+            reparented_notes.iter().map(|n| n.uid.as_str()).collect();
+        let unresolved: Vec<UnresolvedWikilinkRecord> = self
+            .all_unresolved_wikilinks()?
+            .into_iter()
+            .filter(|(_, source_note_uid, _, _, _)| note_uid_set.contains(source_note_uid.as_str()))
+            .collect();
+
         let reparented_tags: Vec<Tag> = tags
             .into_iter()
             .map(|t| Tag {
@@ -5107,6 +5234,28 @@ impl GraphStore {
         if !st_edges.is_empty() {
             Self::batch_insert_section_tag_edges_on(conn, &st_edges)?;
         }
+
+        // 9. Restore the wikilink graph. Runs last: the edges reference
+        //    sections, notes and headings, all of which are back in place by
+        //    now (nw-112).
+        let wl_note: Vec<(&str, &str, f32, &str)> = wikilink_to_note
+            .iter()
+            .map(|(src, dst, conf, disp)| (src.as_str(), dst.as_str(), *conf, disp.as_str()))
+            .collect();
+        if !wl_note.is_empty() {
+            Self::batch_insert_wikilink_to_note_edges_on(conn, &wl_note)?;
+        }
+        let wl_heading: Vec<(&str, &str, f32, &str)> = wikilink_to_heading
+            .iter()
+            .map(|(src, dst, conf, disp)| (src.as_str(), dst.as_str(), *conf, disp.as_str()))
+            .collect();
+        if !wl_heading.is_empty() {
+            Self::batch_insert_wikilink_to_heading_edges_on(conn, &wl_heading)?;
+        }
+        if !unresolved.is_empty() {
+            Self::batch_insert_unresolved_wikilinks_on(conn, &unresolved)?;
+        }
+
         self.commit_transaction(&txn)?;
 
         Ok(result)
@@ -6402,6 +6551,92 @@ mod tests {
                 name: "one".to_string(),
             })
             .unwrap();
+    }
+
+    /// nw-112: a merge must CONSERVE the wikilink graph.
+    ///
+    /// `reparent_vault` captures notes, headings, sections, tags and their edges
+    /// before the cascade delete, then re-inserts them — but it never captured
+    /// wikilink edges, so the cascade destroyed them and nothing put them back.
+    /// On the real brain this took wikilinks 2,067 -> 0 while the command
+    /// printed success and exited 0: backlinks, broken-link detection and the
+    /// graph view all went silently empty.
+    #[test]
+    fn merge_conserves_the_wikilink_graph() {
+        let store = GraphStore::in_memory().expect("store");
+
+        let vault_uid = "vlt:old:aaaa";
+        store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "brain".to_string(),
+                root_path: "/brain".to_string(),
+                instance_id: "old".to_string(),
+            })
+            .unwrap();
+
+        // Two notes, each with one section, and a wikilink from A's section to B.
+        for (n, title) in [("a", "Alpha"), ("b", "Beta")] {
+            store
+                .insert_note(&Note {
+                    uid: format!("note:{vault_uid}:{n}"),
+                    vault_uid: vault_uid.to_string(),
+                    file_path: format!("{n}.md"),
+                    title: title.to_string(),
+                    note_kind: nestweaver_schema::NoteKind::General,
+                    word_count: 1,
+                    content_hash: n.to_string(),
+                    frontmatter: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+            store
+                .insert_section(&Section {
+                    uid: format!("sec:{vault_uid}:{n}"),
+                    note_uid: format!("note:{vault_uid}:{n}"),
+                    heading_uid: None,
+                    start_line: 1,
+                    end_line: 2,
+                    text_hash: n.to_string(),
+                    text_content: format!("body {n}"),
+                    word_count: 2,
+                    pagerank_score: None,
+                })
+                .unwrap();
+            let note_uid = format!("note:{vault_uid}:{n}");
+            let sec_uid = format!("sec:{vault_uid}:{n}");
+            store
+                .batch_insert_note_section_edges(&[(note_uid.as_str(), sec_uid.as_str())])
+                .unwrap();
+            store
+                .batch_insert_vault_note_edges(&[(vault_uid, note_uid.as_str())])
+                .unwrap();
+        }
+
+        let src_sec = format!("sec:{vault_uid}:a");
+        let dst_note = format!("note:{vault_uid}:b");
+        store
+            .batch_insert_wikilink_to_note_edges(&[(
+                src_sec.as_str(),
+                dst_note.as_str(),
+                1.0f32,
+                "Beta",
+            )])
+            .unwrap();
+
+        let before = store.count_wikilink_edges().unwrap();
+        assert_eq!(before, 1, "fixture must start with a wikilink");
+
+        store.merge_instance_ids("old", "new").unwrap();
+
+        let after = store.count_wikilink_edges().unwrap();
+        assert_eq!(
+            after, before,
+            "merge destroyed the wikilink graph: {before} -> {after}"
+        );
     }
 
     #[test]
