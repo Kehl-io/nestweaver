@@ -907,6 +907,15 @@ fn extract_md_links(body: &str, sections: &[RawSection]) -> Vec<RawWikilink> {
             if !path_part.ends_with(".md") {
                 continue;
             }
+            // ...and only to files IN THE VAULT. An external URL can end in
+            // `.md` too — `https://github.com/org/repo/blob/main/notes/x.md`
+            // passed this filter, became a wikilink target, and then resolved to
+            // nothing forever, so `broken-links` reported it as broken on every
+            // run with no possible fix (nw-100). A scheme means it is not a
+            // vault path.
+            if path_part.contains("://") || path_part.starts_with("//") {
+                continue;
+            }
             let target = path_part.to_string();
             let line = data.sourcepos.start.line as u32;
 
@@ -1518,6 +1527,28 @@ top 2 body
     }
 
     // ── Markdown link (.md) detection ────────────────────────────────────────
+
+    /// nw-100: an EXTERNAL url ending in `.md` is not a vault link.
+    ///
+    /// These passed the `.md` filter, became wikilink targets, and were then
+    /// reported broken on every run — permanently, since nothing in the vault
+    /// could ever satisfy them. Real example from the vault:
+    /// `https://github.com/Kehl-io/orbit/blob/main/docs/releases/v0.2.0-recovery.md`.
+    #[test]
+    fn external_urls_ending_in_md_are_not_wikilinks() {
+        let src = "# n\n\nSee [recovery](https://github.com/o/r/blob/main/docs/x.md) and \
+                   [local](notes/y.md).\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let targets: Vec<&str> = note.wikilinks.iter().map(|w| w.target.as_str()).collect();
+        assert!(
+            targets.contains(&"notes/y.md"),
+            "the in-vault link must still be captured: {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t.contains("://")),
+            "an external url must not become a wikilink: {targets:?}"
+        );
+    }
 
     #[test]
     fn detects_md_link_as_wikilink() {
