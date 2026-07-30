@@ -50,6 +50,25 @@ pub struct ReadSymbolsResult {
     /// UIDs dropped because the token budget was exhausted.
     pub dropped: Vec<String>,
     pub truncated: bool,
+    /// Set when the FIRST symbol alone exceeded `token_budget`.
+    ///
+    /// One symbol is always returned, because an empty answer to "read this
+    /// symbol" is useless. That guarantee is deliberate — but it was kept
+    /// silently, with `truncated: false`, so a caller asking for 1 token
+    /// received ~6,700 and had no way to know the budget had been ignored
+    /// (nw-111). The guarantee stays; the silence does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_exceeded_by_first_symbol: Option<BudgetOverrun>,
+}
+
+/// How far the mandatory first symbol overran the requested budget.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetOverrun {
+    /// The budget the caller asked for.
+    pub requested_tokens: usize,
+    /// Estimated tokens actually returned for that first symbol.
+    pub returned_tokens: usize,
+    pub note: String,
 }
 
 /// Read lines `start..=end` (1-based, inclusive) from `file_path` via the reader.
@@ -152,6 +171,24 @@ pub fn read_symbols(
             result.truncated = true;
             continue;
         }
+        // The first symbol is exempt from the budget so the caller never gets an
+        // empty answer — but say so rather than reporting a clean result that
+        // silently blew the budget.
+        if let Some(budget) = token_budget
+            && result.symbols.is_empty()
+            && cost > budget
+        {
+            result.truncated = true;
+            result.budget_exceeded_by_first_symbol = Some(BudgetOverrun {
+                requested_tokens: budget,
+                returned_tokens: cost,
+                note: format!(
+                    "the first symbol alone costs ~{cost} tokens, over the requested \
+                     budget of {budget}; it is returned whole because an empty result \
+                     answers nothing, so this response EXCEEDS the budget"
+                ),
+            });
+        }
         used += cost;
         result.symbols.push(SymbolWindow {
             uid: sym.uid,
@@ -188,6 +225,63 @@ mod tests {
         let (_r, store) =
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
         (dir, src, store)
+    }
+
+    /// nw-111 (3): a budget too small for even one symbol must be DISCLOSED.
+    ///
+    /// The first symbol is deliberately exempt so the caller never receives an
+    /// empty answer to "read this symbol". But that exemption was silent: a
+    /// 1-token request returned the whole body with `truncated: false`, and the
+    /// reported output was byte-identical at budgets of 1, 50, 500, 5000 and
+    /// 16000. The guarantee is kept; the silence is not.
+    #[test]
+    fn a_budget_smaller_than_the_first_symbol_is_disclosed() {
+        let (_dir, src, store) = test_repo();
+        let reader = FilesystemReader::new(&src);
+
+        let res = read_symbols(&store, &["greet".to_string()], &reader, 0, Some(1));
+
+        assert_eq!(
+            res.symbols.len(),
+            1,
+            "the first symbol is still returned — an empty result answers nothing"
+        );
+        assert!(
+            res.truncated,
+            "a response that exceeds the requested budget is not a clean result"
+        );
+        let overrun = res
+            .budget_exceeded_by_first_symbol
+            .as_ref()
+            .expect("the overrun must be reported");
+        assert_eq!(overrun.requested_tokens, 1);
+        assert!(
+            overrun.returned_tokens > 1,
+            "must state what was actually returned: {overrun:?}"
+        );
+        assert!(
+            overrun.note.contains("EXCEEDS"),
+            "the note must say plainly that the budget was exceeded: {}",
+            overrun.note
+        );
+    }
+
+    /// A budget that comfortably fits must stay clean — a disclosure that always
+    /// fires is one callers learn to ignore.
+    #[test]
+    fn a_sufficient_budget_reports_no_overrun() {
+        let (_dir, src, store) = test_repo();
+        let reader = FilesystemReader::new(&src);
+
+        let res = read_symbols(&store, &["greet".to_string()], &reader, 0, Some(10_000));
+
+        assert_eq!(res.symbols.len(), 1);
+        assert!(!res.truncated, "nothing was dropped or overrun");
+        assert!(
+            res.budget_exceeded_by_first_symbol.is_none(),
+            "must not cry wolf: {:?}",
+            res.budget_exceeded_by_first_symbol
+        );
     }
 
     #[test]
