@@ -59,6 +59,41 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [3.0.0](https://github.com/Kehl-io/nestweaver/compare/v2.7.1...v3.0.0) (2026-07-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cli:** one JSON envelope for impact, and dead-code parity across paths ([#218](https://github.com/Kehl-io/nestweaver/issues/218))
+
+### Features
+
+* **cli:** add blast-radius and flow-trace subcommands ([#219](https://github.com/Kehl-io/nestweaver/issues/219)) ([1133382](https://github.com/Kehl-io/nestweaver/commit/1133382c8a63afbdbe8d821a1c156e41e165f0f6))
+* **cli:** detect nw-073 crash recurrence in diagnostics capabilities ([#200](https://github.com/Kehl-io/nestweaver/issues/200)) ([72b47d2](https://github.com/Kehl-io/nestweaver/commit/72b47d295d6193433eab231b6db6bd7c5c49de9c))
+
+
+### Bug Fixes
+
+* **client:** wait for a booting daemon, fail fast on a dead one ([#210](https://github.com/Kehl-io/nestweaver/issues/210)) ([7d82ac7](https://github.com/Kehl-io/nestweaver/commit/7d82ac71d0c6f17055b57ea4df1b4054e57e5a16))
+* **cli:** make dead-code and investigate output format depend on the flag, not the daemon ([#208](https://github.com/Kehl-io/nestweaver/issues/208)) ([dbcbbcb](https://github.com/Kehl-io/nestweaver/commit/dbcbbcba3f862d47e0fb873c158c4e974fe98290))
+* **cli:** make search limit honest and enforce float/enum flag contracts ([#206](https://github.com/Kehl-io/nestweaver/issues/206)) ([3981f48](https://github.com/Kehl-io/nestweaver/commit/3981f48a4bd134da0ee98b3e0a5602de01865564))
+* **cli:** one JSON envelope for impact, and dead-code parity across paths ([#218](https://github.com/Kehl-io/nestweaver/issues/218)) ([85b8146](https://github.com/Kehl-io/nestweaver/commit/85b81463e00a74f095cebddaa42ada65c9e80846))
+* **cli:** report db_not_found from every read-only open, not just some ([#209](https://github.com/Kehl-io/nestweaver/issues/209)) ([81039bb](https://github.com/Kehl-io/nestweaver/commit/81039bb87251a674239b7b6ec5511491d1cce620))
+* **cli:** resolve brain refresh against the existing vault registration ([#212](https://github.com/Kehl-io/nestweaver/issues/212)) ([e21a2f7](https://github.com/Kehl-io/nestweaver/commit/e21a2f7b8b5c040cc64f3e2198173ad976b8ecbe))
+* **daemon:** log boot timing so a stalled start is diagnosable ([#221](https://github.com/Kehl-io/nestweaver/issues/221)) ([1b2d32c](https://github.com/Kehl-io/nestweaver/commit/1b2d32c383c91372245b7e756d7fa2ee7655f753))
+* **engine:** disclose when read_symbols exceeds the requested token budget ([#217](https://github.com/Kehl-io/nestweaver/issues/217)) ([9871af2](https://github.com/Kehl-io/nestweaver/commit/9871af233cee97a31fff32a005d31b5801b7395b))
+* **engine:** disclose when the co-change sidecar does not cover a changed file ([#201](https://github.com/Kehl-io/nestweaver/issues/201)) ([82723b8](https://github.com/Kehl-io/nestweaver/commit/82723b858caf9000cc90b9773a1215c92108d495))
+* **engine:** link declared gRPC contracts to their Rust/tonic implementations ([#215](https://github.com/Kehl-io/nestweaver/issues/215)) ([cee6a2e](https://github.com/Kehl-io/nestweaver/commit/cee6a2ecfff0de21c8d351b43a23011c87c85ca7))
+* **engine:** repo-qualify the co-change sidecar instead of overwriting it ([#220](https://github.com/Kehl-io/nestweaver/issues/220)) ([4133a16](https://github.com/Kehl-io/nestweaver/commit/4133a167e9401ec316955ac85f8a6a39e92f1e69))
+* **engine:** resolve path-qualified wikilinks, and stop indexing external urls ([#213](https://github.com/Kehl-io/nestweaver/issues/213)) ([3904efb](https://github.com/Kehl-io/nestweaver/commit/3904efb79561da41182e9cd95502b2837b159e58))
+* **engine:** stop reporting resolved wikilinks as broken ([#205](https://github.com/Kehl-io/nestweaver/issues/205)) ([84ae503](https://github.com/Kehl-io/nestweaver/commit/84ae5030d743f51069e6b6bff971c15a0f36fc32))
+* **engine:** suggest broken-link targets by filename stem, and stop over-promising ([#214](https://github.com/Kehl-io/nestweaver/issues/214)) ([987064c](https://github.com/Kehl-io/nestweaver/commit/987064cb01c5bbd2aa0380e4a7feb819965fcd53))
+* **parser:** accept non-ASCII inline tag names ([#207](https://github.com/Kehl-io/nestweaver/issues/207)) ([a389fe1](https://github.com/Kehl-io/nestweaver/commit/a389fe10d814726ac1080612933d313eee8d72b1))
+* **parser:** stop double-encoding non-ASCII in wikilinks and tags ([#204](https://github.com/Kehl-io/nestweaver/issues/204)) ([1d257dc](https://github.com/Kehl-io/nestweaver/commit/1d257dc0c7bc03908ce783b7d6a1b89105e5cafc))
+* **store:** conserve the wikilink graph across an instance merge ([#211](https://github.com/Kehl-io/nestweaver/issues/211)) ([53ff548](https://github.com/Kehl-io/nestweaver/commit/53ff54872eb809ecdb5def69afe44368becb8054))
+* **store:** label the edge type flow_trace followed to each callee ([#216](https://github.com/Kehl-io/nestweaver/issues/216)) ([2ba732d](https://github.com/Kehl-io/nestweaver/commit/2ba732df05c85b3e8962985d8842d97a52df2649))
+* v2.7.2 regression hardening — 16 defects fixed ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+
 ## [2.7.1](https://github.com/Kehl-io/nestweaver/compare/v2.7.0...v2.7.1) (2026-07-29)
 
 
