@@ -1531,6 +1531,78 @@ mod tests {
         );
     }
 
+    /// nw-061, corrected: a 2-node graph scoring 0.5/0.5 is NOT edge-blindness.
+    ///
+    /// The item reported `{a: 0.5, b: 0.5}` for a single `b -> a` edge and
+    /// concluded "the ranking loader's edge queries see no rows". Measured, the
+    /// loader returns `incoming=[[(1, 1.0)], [(0, 0.3)]]` with
+    /// `out_weight=[0.3, 1.0]` — the forward CALLS edge at 1.0 AND a reverse
+    /// edge at 0.3. Both are present.
+    ///
+    /// PageRank normalises each contribution by the source's total out-weight,
+    /// so `a`'s single 0.3 out-edge divided by `out_weight[a]` of 0.3 is 1.0 —
+    /// exactly what `b`'s 1.0/1.0 gives. On a TWO-node graph that makes the
+    /// system perfectly symmetric, and 0.5/0.5 is the correct fixed point. The
+    /// asymmetry only survives when a node's out-weight differs from the weight
+    /// of the edge being followed, which needs a third node.
+    #[test]
+    fn two_node_graph_is_symmetric_after_out_degree_normalisation() {
+        let store = test_store();
+        store.insert_symbol(&make_symbol("a", "fn_a")).unwrap();
+        store.insert_symbol(&make_symbol("b", "fn_b")).unwrap();
+        store.insert_edge(&make_calls_edge("b", "a")).unwrap();
+
+        let (uids, _idx, incoming, out_weight) = store
+            .load_ppr_graph(&GraphScope::code_only(), None)
+            .unwrap();
+        assert_eq!(uids.len(), 2);
+        assert!(
+            incoming.iter().all(|v| !v.is_empty()),
+            "both directions must be loaded — an empty side WOULD be the \
+             edge-blindness nw-061 suspected: {incoming:?}"
+        );
+        assert!(
+            out_weight.iter().all(|&w| w > 0.0),
+            "neither node is dangling once the reverse edge exists: {out_weight:?}"
+        );
+    }
+
+    /// The real guard against edge-blindness, and the one nw-061 asked for.
+    ///
+    /// If the ranking loader ever stopped seeing edges, every node would be
+    /// dangling, scores would go uniform, and this assertion fails. It needs
+    /// three or more nodes precisely because of the two-node symmetry above.
+    #[test]
+    fn pagerank_is_edge_sensitive_hub_outranks_leaf() {
+        let store = test_store();
+        for uid in ["hub", "leaf", "x", "y"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("x", "hub")).unwrap();
+        store.insert_edge(&make_calls_edge("y", "hub")).unwrap();
+        store.insert_edge(&make_calls_edge("leaf", "hub")).unwrap();
+
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let ranked = store.symbols_by_pagerank(None).unwrap();
+        let score_of = |uid: &str| -> f64 {
+            ranked
+                .iter()
+                .find(|s| s.uid == uid)
+                .and_then(|s| s.pagerank_score)
+                .unwrap_or(0.0)
+        };
+        let (hub, leaf) = (score_of("hub"), score_of("leaf"));
+        assert!(
+            hub > leaf,
+            "a node with three inbound calls must outrank one with none; \
+             equal scores mean ranking has gone edge-blind (hub={hub:.4} leaf={leaf:.4})"
+        );
+    }
+
     #[test]
     fn highly_called_symbol_ranks_higher() {
         // A->C, B->C, D->C — C has three incoming, should rank highest.
