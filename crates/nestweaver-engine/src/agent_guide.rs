@@ -906,8 +906,34 @@ pub fn generate_claude_md_with_rules(
     out.push_str("- `brain_context` — PPR-ranked structural context from symbol seeds\n");
     out.push_str("- `brain_impact` — blast radius before modifying code\n");
     out.push_str("- `brain_search` — full-text search across code and notes\n");
+    out.push_str("- `blast_radius` — assess a set of CHANGED FILES, with a trust contract\n");
+    out.push_str("- `flow_trace` — trace forward execution flow from a symbol\n");
     out.push_str("- `project_context` — project-scoped notes and symbols\n");
     out.push_str("- `detect_changes` — assess risk after changes\n");
+
+    // These tools report how much they actually established. An agent that
+    // ignores those fields will present a partial or unanchored answer as a
+    // complete one, which is the failure mode the fields exist to prevent —
+    // so the guide has to say so explicitly rather than assume it is read.
+    out.push_str("\n### Read the trust fields before trusting a result\n\n");
+    out.push_str(
+        "- `status` / `gate_state` — a run that did not complete is `partial` / \
+         `degraded-unknown`, never `ok`. Do not report it as a clean result.\n",
+    );
+    out.push_str(
+        "- `truncated` (with `truncated_by_depth` / `truncated_by_threshold`) — an \
+         empty or short result may be a budget limit, not an absence. `total` is \
+         `null` when genuinely unknown; it is not zero.\n",
+    );
+    out.push_str(
+        "- `semantic_applied` / `degraded_components` — retrieval that fell back to \
+         lexical ranking orders results differently. Say so rather than implying \
+         relevance you did not get.\n",
+    );
+    out.push_str(
+        "- `notifications` / `note` — read them. A caveat like `cochange-no-coverage` \
+         means an empty list is unmined history, not evidence of no coupling.\n",
+    );
 
     Ok(out)
 }
@@ -1200,6 +1226,18 @@ mod tests {
         assert!(output.contains("brain_search"));
         assert!(output.contains("project_context"));
         assert!(output.contains("detect_changes"));
+        // The flagship analysis tools and the trust contract must reach every
+        // generated guide — an agent that never learns to read `gate_state`
+        // will present a degraded result as a clean one.
+        assert!(
+            output.contains("blast_radius"),
+            "guide must list blast_radius"
+        );
+        assert!(output.contains("flow_trace"), "guide must list flow_trace");
+        assert!(
+            output.contains("gate_state"),
+            "guide must tell agents to read the trust fields"
+        );
     }
 
     fn make_symbol(uid: &str, name: &str, file_path: &str) -> nestweaver_schema::Symbol {
