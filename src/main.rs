@@ -949,6 +949,20 @@ fn render_investigate_text(payload: &serde_json::Value) {
             String::new()
         }
     );
+    // nw-120: the daemon ranks with its warm embedding model; the direct path
+    // has none, so the SAME query returns a different ordering. Say which one
+    // produced this map rather than letting the ranking imply a quality it did
+    // not have.
+    if payload
+        .get("semantic_applied")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|applied| !applied)
+    {
+        println!(
+            "  note: semantic retrieval unavailable — ranking is lexical (BM25) only, \
+             so ordering differs from a daemon-served run."
+        );
+    }
 
     for d in &domains {
         println!("\n[{}]", text(d, "label"));
