@@ -3210,6 +3210,14 @@ fn tool_brain_context(
         resp["unresolved_seeds"] = json!(result.unresolved_seeds);
     }
 
+    // nw-102: how many of `seeds` are semantic nearest-neighbour guesses rather
+    // than resolutions of the query. Without this the daemon path could not
+    // distinguish them and reported every guess as "resolved" — the same
+    // response then claimed a seed both resolved AND unresolved.
+    if result.semantic_seed_count > 0 {
+        resp["semantic_seed_count"] = json!(result.semantic_seed_count);
+    }
+
     // Feature F7: surface the PRF-mined expansion terms for auditing. Only
     // present when PRF was enabled and mined at least one term.
     if !result.expansion_terms.is_empty() {

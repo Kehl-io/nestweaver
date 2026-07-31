@@ -15561,13 +15561,41 @@ fn print_clusters_output(
     Ok(())
 }
 
+/// Header line for `brain context` seeds.
+///
+/// nw-102: `seeds` mixes nodes resolved from the query text with nearest
+/// neighbours injected by the semantic leg, and counting both as "resolved"
+/// made the output contradict itself — a nonsense query printed
+/// `Seeds (5 resolved)` while the same response listed that query under
+/// `Unresolved seeds (1)`. Reports PROVENANCE, not quality: a phrase like
+/// "blast radius" fails a direct lookup against the symbol `blast_radius` yet
+/// its semantic hits are excellent, so labelling them guesses would understate
+/// them exactly as counting them as direct matches overstated them.
+fn seed_header(total_seeds: usize, semantic_seeds: usize) -> String {
+    let matched = total_seeds.saturating_sub(semantic_seeds);
+    if semantic_seeds > 0 {
+        format!("Seeds ({matched} matched directly, {semantic_seeds} via semantic search):")
+    } else {
+        format!("Seeds ({matched} resolved):")
+    }
+}
+
 fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {
     // Feature F7: show PRF-mined expansion terms for auditing.
     if !result.expansion_terms.is_empty() {
         println!("PRF expansion terms: {}", result.expansion_terms.join(", "));
         println!();
     }
-    println!("Seeds ({} resolved):", result.seeds.len());
+    // nw-102: `seeds` mixes two different things — nodes actually resolved from
+    // the query, and nearest-neighbour guesses injected by the semantic leg,
+    // which vector KNN returns regardless of how distant they are. Counting
+    // both as "resolved" made the output contradict itself: a nonsense query
+    // printed `Seeds (5 resolved)` while ALSO listing that same query under
+    // `Unresolved seeds (1)`. Report the two separately.
+    println!(
+        "{}",
+        seed_header(result.seeds.len(), result.semantic_seed_count)
+    );
     for n in &result.seeds {
         if n.location.is_empty() {
             println!("  {}  [{}]", n.title, n.kind);
@@ -15581,6 +15609,17 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
         println!("Unresolved seeds ({}):", result.unresolved_seeds.len());
         for s in &result.unresolved_seeds {
             println!("  {s}");
+        }
+        if result.seeds.len() == result.semantic_seed_count && result.semantic_seed_count > 0 {
+            // State HOW the seeds were found, not how good they are. A phrase
+            // like "blast radius" fails a direct lookup against the symbol
+            // `blast_radius` yet its semantic hits are excellent, so calling
+            // them guesses would understate them just as counting them as
+            // direct matches overstated them.
+            println!(
+                "  note: no seed matched the query text directly; the seeds above \
+                 came from semantic similarity."
+            );
         }
     }
 
@@ -18930,6 +18969,36 @@ mod hybrid_cli_tests {
         let present = dir.path().join("present.lbug");
         std::fs::write(&present, b"").unwrap();
         assert!(require_existing_db(&present).is_ok());
+    }
+
+    /// nw-102: a seed injected by the semantic leg must never be counted as
+    /// "resolved". Counting them together let one response claim a query both
+    /// resolved AND unresolved at the same time.
+    #[test]
+    fn seed_header_never_counts_semantic_hits_as_resolved() {
+        // The reported case: nothing matched, five nearest neighbours injected.
+        let h = seed_header(5, 5);
+        assert!(h.contains("0 matched directly"), "{h}");
+        assert!(h.contains("5 via semantic search"), "{h}");
+        assert!(
+            !h.contains("5 resolved"),
+            "must not report semantic guesses as resolved: {h}"
+        );
+
+        // Genuine direct matches, no semantic leg.
+        assert_eq!(seed_header(3, 0), "Seeds (3 resolved):");
+
+        // Mixed: two direct, three semantic.
+        let m = seed_header(5, 3);
+        assert!(m.contains("2 matched directly") && m.contains("3 via semantic search"), "{m}");
+    }
+
+    /// Defensive: the counts arrive from a daemon response, so a malformed or
+    /// older payload must not underflow the subtraction.
+    #[test]
+    fn seed_header_does_not_underflow_on_inconsistent_counts() {
+        let h = seed_header(2, 9);
+        assert!(h.contains("0 matched directly"), "{h}");
     }
 
     /// nw-123: the impact envelope's key set must not depend on which
