@@ -1659,15 +1659,25 @@ impl GraphStore {
         // target kind (Note vs Heading).
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS WIKILINK_TO_NOTE(\
-                FROM Section TO Note, confidence FLOAT, display STRING)",
+                FROM Section TO Note, confidence FLOAT, display STRING, target STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS WIKILINK_TO_HEADING(\
-                FROM Section TO Heading, confidence FLOAT, display STRING)",
+                FROM Section TO Heading, confidence FLOAT, display STRING, target STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        // Migration: `display` alone cannot answer both questions a wikilink is
+        // asked. For a piped link `[[Home|workspace]]` the BACKLINKS view wants
+        // the visible text ("workspace") while BROKEN-LINKS wants the link
+        // target ("Home") — reporting the alias there rendered `[[workspace]]`,
+        // a string that appears nowhere in the vault (nw-122). Carry both.
+        // Empty string means "written before this column existed"; readers fall
+        // back to `display`, which is what those rows have always held.
+        let _ = conn.query("ALTER TABLE WIKILINK_TO_NOTE ADD target STRING DEFAULT ''");
+        let _ = conn.query("ALTER TABLE WIKILINK_TO_HEADING ADD target STRING DEFAULT ''");
 
         // ── F11 memory-bank: typed Note→Note relationships ─────────────────
         // Explicit, semantically-typed knowledge edges derived from frontmatter

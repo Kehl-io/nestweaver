@@ -1801,8 +1801,8 @@ mod tests {
         // Wikilinks: A→B and C→B. B is the hub.
         store
             .batch_insert_wikilink_to_note_edges(&[
-                ("sec:note:a", "note:b", 1.0, "B"),
-                ("sec:note:c", "note:b", 1.0, "B"),
+                ("sec:note:a", "note:b", 1.0, "B", "B"),
+                ("sec:note:c", "note:b", 1.0, "B", "B"),
             ])
             .unwrap();
 
@@ -2534,8 +2534,8 @@ mod tests {
             // Wikilink from filler section -> popular_x and popular_y
             store
                 .batch_insert_wikilink_to_note_edges(&[
-                    (&sec_uid, "note:popular_x", 1.0, "Popular X"),
-                    (&sec_uid, "note:popular_y", 1.0, "Popular Y"),
+                    (&sec_uid, "note:popular_x", 1.0, "Popular X", "Popular X"),
+                    (&sec_uid, "note:popular_y", 1.0, "Popular Y", "Popular Y"),
                 ])
                 .unwrap();
         }

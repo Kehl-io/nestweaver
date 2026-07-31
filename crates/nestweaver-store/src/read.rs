@@ -2416,7 +2416,9 @@ impl GraphStore {
         // 1. Low-confidence / ambiguous resolved links.
         let q = "MATCH (src:Note)-[:NOTE_HAS_SECTION]->(:Section)-[r:WIKILINK_TO_NOTE]->(dst:Note) \
                  WHERE r.confidence < 1.0 \
-                 RETURN src.uid, src.file_path, src.title, r.display, r.confidence, dst.uid";
+                 RETURN src.uid, src.file_path, src.title, \
+                 CASE WHEN r.target = '' THEN r.display ELSE r.target END, \
+                 r.confidence, dst.uid";
         match conn.query(q) {
             Ok(result) => {
                 for row in result {

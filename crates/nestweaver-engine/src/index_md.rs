@@ -665,8 +665,12 @@ fn reinsert_single_note(
         }
         map
     };
-    let mut wl_note_edges: Vec<(String, String, f32, String)> = Vec::new();
-    let mut wl_head_edges: Vec<(String, String, f32, String)> = Vec::new();
+    // nw-122: carry BOTH the visible text and the link target. Backlinks want
+    // the alias a reader sees; broken-links wants the target resolution acted
+    // on. Reporting the alias there rendered `[[workspace]]` for
+    // `[[Home|workspace]]` — a link that appears nowhere in the vault.
+    let mut wl_note_edges: Vec<(String, String, f32, String, String)> = Vec::new();
+    let mut wl_head_edges: Vec<(String, String, f32, String, String)> = Vec::new();
     // Unresolved links collected for a single batched insert — a per-row insert
     // here made a single note with many missing-target links hang the watcher.
     let mut unresolved: Vec<(String, String, String, String, String)> = Vec::new();
@@ -707,6 +711,7 @@ fn reinsert_single_note(
                         h.uid.clone(),
                         conf,
                         display.clone(),
+                        wl.target.clone(),
                     ));
                     continue;
                 }
@@ -716,6 +721,7 @@ fn reinsert_single_note(
                 target.clone(),
                 conf,
                 display.clone(),
+                wl.target.clone(),
             ));
         }
     }
@@ -727,16 +733,16 @@ fn reinsert_single_note(
             tracing::warn!("failed to record unresolved wikilinks: {e}");
         }
     }
-    let wl_note_refs: Vec<(&str, &str, f32, &str)> = wl_note_edges
+    let wl_note_refs: Vec<(&str, &str, f32, &str, &str)> = wl_note_edges
         .iter()
-        .map(|(s, n, c, d)| (s.as_str(), n.as_str(), *c, d.as_str()))
+        .map(|(s, n, c, d, t)| (s.as_str(), n.as_str(), *c, d.as_str(), t.as_str()))
         .collect();
     store
         .batch_insert_wikilink_to_note_edges(&wl_note_refs)
         .context("batch_insert_wikilink_to_note_edges")?;
-    let wl_head_refs: Vec<(&str, &str, f32, &str)> = wl_head_edges
+    let wl_head_refs: Vec<(&str, &str, f32, &str, &str)> = wl_head_edges
         .iter()
-        .map(|(s, h, c, d)| (s.as_str(), h.as_str(), *c, d.as_str()))
+        .map(|(s, h, c, d, t)| (s.as_str(), h.as_str(), *c, d.as_str(), t.as_str()))
         .collect();
     store
         .batch_insert_wikilink_to_heading_edges(&wl_head_refs)
@@ -1199,8 +1205,9 @@ where
     // Wikilink resolution: build lookup indices once, then 5-priority match.
     let lookup = WikilinkLookup::build(&note_contexts);
 
-    let mut wikilink_to_note: Vec<(String, String, f32, String)> = Vec::new();
-    let mut wikilink_to_heading: Vec<(String, String, f32, String)> = Vec::new();
+    // nw-122: (section, target_node, confidence, display_text, link_target).
+    let mut wikilink_to_note: Vec<(String, String, f32, String, String)> = Vec::new();
+    let mut wikilink_to_heading: Vec<(String, String, f32, String, String)> = Vec::new();
     let mut wikilinks_unresolved: usize = 0;
     // (uid, source_note_uid, source_path, source_title, wikilink_text)
     let mut unresolved_records: Vec<(String, String, String, String, String)> = Vec::new();
@@ -1229,6 +1236,7 @@ where
                                     h_uid,
                                     conf_per,
                                     display.clone(),
+                                    wl.target.clone(),
                                 ));
                                 continue;
                             }
@@ -1239,6 +1247,7 @@ where
                             cand.note_uid.clone(),
                             conf_per,
                             display.clone(),
+                            wl.target.clone(),
                         ));
                     }
                 }
@@ -1302,13 +1311,13 @@ where
             .iter()
             .map(|(s, t)| (s.as_str(), t.as_str()))
             .collect();
-        let wl_note_refs: Vec<(&str, &str, f32, &str)> = wikilink_to_note
+        let wl_note_refs: Vec<(&str, &str, f32, &str, &str)> = wikilink_to_note
             .iter()
-            .map(|(s, n, c, d)| (s.as_str(), n.as_str(), *c, d.as_str()))
+            .map(|(s, n, c, d, t)| (s.as_str(), n.as_str(), *c, d.as_str(), t.as_str()))
             .collect();
-        let wl_head_refs: Vec<(&str, &str, f32, &str)> = wikilink_to_heading
+        let wl_head_refs: Vec<(&str, &str, f32, &str, &str)> = wikilink_to_heading
             .iter()
-            .map(|(s, h, c, d)| (s.as_str(), h.as_str(), *c, d.as_str()))
+            .map(|(s, h, c, d, t)| (s.as_str(), h.as_str(), *c, d.as_str(), t.as_str()))
             .collect();
 
         store

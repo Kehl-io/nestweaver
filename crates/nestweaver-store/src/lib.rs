@@ -516,6 +516,85 @@ mod tests {
         assert_eq!(found.name, "fn_3");
     }
 
+    /// nw-122: `broken_wikilinks` must report the link TARGET, not the visible
+    /// alias. For `[[Home|workspace]]` it used to report "workspace" — a string
+    /// that appears nowhere in the vault, so grepping for the reported link
+    /// found nothing.
+    ///
+    /// Rows written before the `target` column existed have an empty target and
+    /// MUST fall back to `display`, which is exactly what they have always held.
+    /// Without that fallback an upgrade would blank the text on every
+    /// pre-existing broken link.
+    #[test]
+    fn broken_wikilinks_reports_target_and_falls_back_to_display_pre_migration() {
+        let store = GraphStore::in_memory().unwrap();
+        let vault = Vault {
+            uid: "vlt:t:1".into(),
+            name: "t".into(),
+            root_path: "/t".into(),
+            instance_id: "t".into(),
+        };
+        store.insert_vault(&vault).unwrap();
+
+        let mk_note = |uid: &str, title: &str| nestweaver_schema::Note {
+            uid: uid.to_string(),
+            vault_uid: vault.uid.clone(),
+            file_path: format!("{title}.md"),
+            title: title.to_string(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 1,
+            content_hash: String::new(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        let src = mk_note("note:src", "Source");
+        let dst = mk_note("note:dst", "Home");
+        store.insert_note(&src).unwrap();
+        store.insert_note(&dst).unwrap();
+
+        let sec = nestweaver_schema::Section {
+            uid: "sec:src:1".into(),
+            note_uid: src.uid.clone(),
+            heading_uid: None,
+            start_line: 1,
+            end_line: 2,
+            text_hash: String::new(),
+            text_content: "x".into(),
+            word_count: 1,
+            pagerank_score: None,
+        };
+        store.insert_section(&sec).unwrap();
+        store
+            .batch_insert_note_section_edges(&[(src.uid.as_str(), sec.uid.as_str())])
+            .unwrap();
+
+        // A piped link: visible text "workspace", target "Home". Confidence < 1
+        // so it lands in the broken/low-confidence report.
+        store
+            .batch_insert_wikilink_to_note_edges(&[(
+                sec.uid.as_str(),
+                dst.uid.as_str(),
+                0.9,
+                "workspace",
+                "Home",
+            )])
+            .unwrap();
+
+        let rows = store.broken_wikilinks().unwrap();
+        let texts: Vec<&str> = rows.iter().map(|r| r.wikilink_text.as_str()).collect();
+        assert!(
+            texts.contains(&"Home"),
+            "must report the link target, got {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"workspace"),
+            "must not report the display alias as the link: {texts:?}"
+        );
+    }
+
     #[test]
     fn insert_repo_file_and_symbol_edges() {
         let store = test_store();
@@ -1756,8 +1835,8 @@ mod tests {
         let note_section_edges: Vec<(&str, &str)> = vec![("note:bvw:n1", "sec:bvw:s1")];
         let heading_section_edges: Vec<(&str, &str)> = vec![("hdg:bvw:h1", "sec:bvw:s1")];
         let note_tag_edges: Vec<(&str, &str)> = vec![("note:bvw:n1", "tag:bvw:rust")];
-        let wikilink_to_note_edges: Vec<(&str, &str, f32, &str)> =
-            vec![("sec:bvw:s1", "note:bvw:n2", 1.0, "Note Two")];
+        let wikilink_to_note_edges: Vec<(&str, &str, f32, &str, &str)> =
+            vec![("sec:bvw:s1", "note:bvw:n2", 1.0, "Note Two", "Note Two")];
 
         store
             .bulk_vault_write(
