@@ -257,6 +257,46 @@ mod index_progress_tracker_tests {
         ));
     }
 
+    /// nw-127: a timeout must reach the caller as a REPORTED error naming the
+    /// cause, not as a truncated stream.
+    ///
+    /// The daemon's watchdog used to set its cancel flag and say nothing, so the
+    /// client saw the stream simply end and rendered "index progress stream
+    /// ended before completion" — indistinguishable from a crash, and shown as a
+    /// failure for an index that was still running and went on to SUCCEED.
+    /// Emitting a terminal `Phase::Error` is what turns that into an explanation.
+    #[test]
+    fn a_timeout_reported_in_band_beats_a_truncated_stream() {
+        // What the watchdog does now.
+        let mut reported = IndexProgressTracker::default();
+        reported
+            .observe(&progress(Phase::Writing, "still writing"))
+            .unwrap();
+        reported
+            .observe(&progress(
+                Phase::Error,
+                "index exceeded the 1800s timeout and cancellation was requested",
+            ))
+            .unwrap();
+        let err = reported.finish().unwrap_err();
+        match err {
+            IndexProgressError::Reported { message } => {
+                assert!(message.contains("timeout"), "{message}");
+            }
+            other => panic!("expected a reported error naming the timeout, got {other:?}"),
+        }
+
+        // What it did before: the same run, with the terminal event missing.
+        let mut silent = IndexProgressTracker::default();
+        silent
+            .observe(&progress(Phase::Writing, "still writing"))
+            .unwrap();
+        assert!(
+            matches!(silent.finish().unwrap_err(), IndexProgressError::Truncated { .. }),
+            "without the terminal event the caller can only report a truncated stream"
+        );
+    }
+
     #[test]
     fn any_event_after_a_terminal_event_is_rejected() {
         for terminal in [Phase::Done, Phase::Error] {
