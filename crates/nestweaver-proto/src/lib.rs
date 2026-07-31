@@ -292,7 +292,10 @@ mod index_progress_tracker_tests {
             .observe(&progress(Phase::Writing, "still writing"))
             .unwrap();
         assert!(
-            matches!(silent.finish().unwrap_err(), IndexProgressError::Truncated { .. }),
+            matches!(
+                silent.finish().unwrap_err(),
+                IndexProgressError::Truncated { .. }
+            ),
             "without the terminal event the caller can only report a truncated stream"
         );
     }

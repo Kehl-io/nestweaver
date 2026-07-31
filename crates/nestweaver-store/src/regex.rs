@@ -130,8 +130,7 @@ pub struct RegexSearchResult {
 ///
 /// A search that ran out of scan budget before matching anything has NOT
 /// established that no matches exist, and must not be presented as if it had.
-pub const SCAN_BUDGET_NOTE: &str =
-    "Pattern matched no candidates within the scan budget. Results may exist beyond \
+pub const SCAN_BUDGET_NOTE: &str = "Pattern matched no candidates within the scan budget. Results may exist beyond \
      the scanned range.";
 
 impl RegexSearchResult {

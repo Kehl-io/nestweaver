@@ -384,7 +384,9 @@ fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let quarantined = PathBuf::from(format!("{}.wal.orphaned-{stamp}", path.display()));
-    std::fs::rename(&wal, &quarantined).ok().map(|()| quarantined)
+    std::fs::rename(&wal, &quarantined)
+        .ok()
+        .map(|()| quarantined)
 }
 
 /// Open an lbug database, auto-recovering once from crash debris that would
@@ -494,7 +496,9 @@ impl GraphStore {
     /// Open an existing database in read-only mode. Allows concurrent access
     /// while another process (e.g. the web UI) holds the write lock.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, false, || lbug::SystemConfig::default().read_only(true))?;
+        let db = open_lbug_with_recovery(path, false, || {
+            lbug::SystemConfig::default().read_only(true)
+        })?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -1879,7 +1883,10 @@ mod tests {
 
         let moved = quarantine_orphaned_wal(&db).expect("orphaned wal must be quarantined");
 
-        assert!(!dir.path().join("brain.lbug.wal").exists(), "wal moved aside");
+        assert!(
+            !dir.path().join("brain.lbug.wal").exists(),
+            "wal moved aside"
+        );
         assert!(moved.exists(), "quarantined copy must still exist");
         assert_eq!(
             std::fs::read(&moved).unwrap(),

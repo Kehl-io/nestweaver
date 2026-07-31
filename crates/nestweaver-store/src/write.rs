@@ -5254,7 +5254,13 @@ impl GraphStore {
         let wl_note: Vec<(&str, &str, f32, &str, &str)> = wikilink_to_note
             .iter()
             .map(|(src, dst, conf, disp, tgt)| {
-                (src.as_str(), dst.as_str(), *conf, disp.as_str(), tgt.as_str())
+                (
+                    src.as_str(),
+                    dst.as_str(),
+                    *conf,
+                    disp.as_str(),
+                    tgt.as_str(),
+                )
             })
             .collect();
         if !wl_note.is_empty() {
@@ -5263,7 +5269,13 @@ impl GraphStore {
         let wl_heading: Vec<(&str, &str, f32, &str, &str)> = wikilink_to_heading
             .iter()
             .map(|(src, dst, conf, disp, tgt)| {
-                (src.as_str(), dst.as_str(), *conf, disp.as_str(), tgt.as_str())
+                (
+                    src.as_str(),
+                    dst.as_str(),
+                    *conf,
+                    disp.as_str(),
+                    tgt.as_str(),
+                )
             })
             .collect();
         if !wl_heading.is_empty() {

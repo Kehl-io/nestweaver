@@ -11186,8 +11186,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     eprintln!(
                                         "Error: daemon failed to start (boot exit status {}). \
                                          Check the logs: {}",
-                                        parent.first_child_exit_status,
-                                        log_hint
+                                        parent.first_child_exit_status, log_hint
                                     );
                                     std::process::exit(EXIT_ERROR);
                                 }
@@ -19004,7 +19003,10 @@ mod hybrid_cli_tests {
 
         // Mixed: two direct, three semantic.
         let m = seed_header(5, 3);
-        assert!(m.contains("2 matched directly") && m.contains("3 via semantic search"), "{m}");
+        assert!(
+            m.contains("2 matched directly") && m.contains("3 via semantic search"),
+            "{m}"
+        );
     }
 
     /// Defensive: the counts arrive from a daemon response, so a malformed or
