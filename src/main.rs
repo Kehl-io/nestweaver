@@ -161,6 +161,41 @@ enum CliDiagnostic {
     )]
     EmptyDatabase,
 
+    /// The database file is present but could not be opened. NEVER conflate
+    /// this with `db_not_found`: suggesting `index --repo` at a path that
+    /// already holds a database invites the user to write over their own data
+    /// (nw-126). The underlying store error is carried through verbatim
+    /// because it is the only thing that says WHY.
+    #[error("Database exists but could not be opened: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_unavailable),
+        help(
+            "{cause}\nThe database file is present, so do NOT run `index` at this path.\n\
+             If a daemon or other process holds it, stop it with \
+             `nestweaver daemon --db {path} stop`."
+        )
+    )]
+    DatabaseUnavailable { path: String, cause: String },
+
+    /// A crashed daemon leaves an unreplayed write-ahead log. Replay needs
+    /// read-write access, so the read-only path can never perform it and the
+    /// generic "could not open" message sends the user nowhere (nw-126).
+    #[error("Database has an unreplayed write-ahead log: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_wal_unreplayed),
+        help(
+            "{cause}\nThis usually follows a daemon crash. Replay requires read-write \
+             access:\n  nestweaver daemon --db {path} start\n\
+             If that also fails, move {wal} aside and retry — it is replayed or \
+             discarded on the next read-write open, and the database itself is intact."
+        )
+    )]
+    DatabaseWalUnreplayed {
+        path: String,
+        wal: String,
+        cause: String,
+    },
+
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
     General { message: String },
@@ -178,6 +213,28 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // ... No such file or directory" mentions a .lbug path and a missing
     // file, but mapping it to db_not_found produces the circular help text
     // "Run `nestweaver index` to create a database" — while running index.
+    // nw-126: a crashed daemon leaves an unreplayed WAL. The store says so
+    // precisely ("Couldn't replay shadow pages under read-only mode. Please
+    // re-open the database with read-write mode...") but that fell through to
+    // the bare `nestweaver::error` rendering, which states the problem and no
+    // remedy — and the advice it does give cannot be followed on the path that
+    // emitted it, since a read-only open can never perform the replay.
+    if lower.contains("shadow pages") || (lower.contains("replay") && lower.contains("read-only")) {
+        let path = message
+            .split("at ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .unwrap_or("./nestweaver.lbug")
+            .trim()
+            .to_string();
+        return CliDiagnostic::DatabaseWalUnreplayed {
+            wal: format!("{path}.wal"),
+            path,
+            cause: message,
+        }
+        .into();
+    }
+
     if lower.contains("database not found")
         || (lower.contains("failed to open database") && lower.contains("no such file"))
     {
@@ -190,7 +247,45 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
             .unwrap_or("./nestweaver.lbug")
             .trim()
             .to_string();
-        return CliDiagnostic::DatabaseNotFound { path }.into();
+
+        // nw-126: these are TEXT heuristics, and text lies. The daemon's
+        // "failed to open database with write access at <path>; another
+        // process may hold the write lock" matched here and rendered a live
+        // 5.6 GB database as "not found", with help telling the user to
+        // `index` a new one over the top of it. Ask the filesystem instead of
+        // trusting the substring: if the file is really there, this is an
+        // availability failure, not a missing database, and the remedy is the
+        // opposite of creating one.
+        //
+        // Trim the path defensively — the same heuristics can capture trailing
+        // context clauses ("<path>; another process may...").
+        let candidate = path
+            .split(';')
+            .next()
+            .unwrap_or(&path)
+            .trim()
+            .trim_end_matches(['.', ','])
+            .to_string();
+        let on_disk = std::path::Path::new(&candidate);
+        if on_disk.exists() {
+            let wal = format!("{candidate}.wal");
+            if std::path::Path::new(&wal).exists() {
+                return CliDiagnostic::DatabaseWalUnreplayed {
+                    path: candidate,
+                    wal,
+                    cause: message,
+                }
+                .into();
+            }
+            return CliDiagnostic::DatabaseUnavailable {
+                path: candidate,
+                cause: message,
+            }
+            .into();
+        }
+        // Report the trimmed path here too, so a message that appended a
+        // context clause does not surface it as part of the filename.
+        return CliDiagnostic::DatabaseNotFound { path: candidate }.into();
     }
 
     if lower.contains("path") && lower.contains("does not exist")
@@ -365,10 +460,775 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
     }
 }
 
+// ── nw-073: lbug optimisticRead crash recurrence ──────────────────────────────
+//
+// nw-073 ships MITIGATED, not fixed. Write-capable opens bound the lbug engine
+// thread pool to remove the concurrency the eviction-vs-read race needs, but
+// that rests on an analysis of a crash which was never reproduced locally — and
+// nothing in the product could tell you whether the race was still firing.
+// This scan is that signal, and it is worth more than the root-cause fix,
+// because it says whether the root cause still matters.
+
+/// Stack frame identifying the nw-073 fault.
+const LBUG_CRASH_FRAME: &str = "optimisticRead";
+
+/// Process-name fragment selecting reports that belong to this product.
+const CRASH_REPORT_PROCESS: &str = "nestweaver";
+
+/// `PATH`-style override for the directories scanned; also the test hook.
+const CRASH_REPORT_DIRS_ENV: &str = "NESTWEAVER_CRASH_REPORT_DIRS";
+
+/// Cap on bytes read from any single report.
+const CRASH_REPORT_READ_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// True when `file_name` names a macOS *crash* report rather than a resource
+/// diagnostic.
+///
+/// This distinction is the whole correctness of the check. Both kinds live in
+/// the same directories, but `.diag` files (including `*.cpu_resource.diag`)
+/// are assembled from periodic stack samples of a *running, healthy* process.
+/// On the machine this was developed against, 13 of them contain
+/// `optimisticRead` purely because it is a hot read path during indexing.
+/// Matching those would report a use-after-free every time indexing ran warm —
+/// worse than no check at all, because it would be confidently wrong.
+fn is_crash_report_file(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.ends_with(".ips") || lower.ends_with(".crash")
+}
+
+/// True when the file is a crash report belonging to this product.
+fn is_candidate_crash_report(file_name: &str) -> bool {
+    is_crash_report_file(file_name)
+        && file_name
+            .to_ascii_lowercase()
+            .contains(CRASH_REPORT_PROCESS)
+}
+
+/// True when a crash report carries the nw-073 signature.
+fn crash_report_matches_signature(file_name: &str, contents: &str) -> bool {
+    is_candidate_crash_report(file_name) && contents.contains(LBUG_CRASH_FRAME)
+}
+
+/// Outcome of a crash-report sweep.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CrashRecurrenceScan {
+    /// Whether a scan was attempted at all on this platform.
+    supported: bool,
+    /// Directories successfully opened.
+    directories_read: usize,
+    /// Directories or reports that exist but could not be read.
+    unreadable: Vec<String>,
+    /// Candidate reports whose contents were checked.
+    reports_examined: usize,
+    /// Reports carrying the signature.
+    matched_reports: Vec<String>,
+}
+
+impl CrashRecurrenceScan {
+    /// The scan's own honesty about what it saw.
+    ///
+    /// `unavailable` and `scanned` are deliberately distinct: a caller must be
+    /// able to tell "no crashes" from "could not look". Reporting a zero for
+    /// the latter is the nw-062 defect — a caller cannot distinguish an absence
+    /// of findings from an absence of data.
+    fn status(&self) -> &'static str {
+        if !self.supported {
+            "unsupported"
+        } else if self.directories_read == 0 {
+            "unavailable"
+        } else if !self.unreadable.is_empty() {
+            "partial"
+        } else {
+            "scanned"
+        }
+    }
+
+    /// A count is only meaningful once at least one directory was read.
+    fn has_count(&self) -> bool {
+        self.directories_read > 0
+    }
+}
+
+/// Human-readable summary of what the scan does and does not establish.
+fn crash_recurrence_note(scan: &CrashRecurrenceScan) -> String {
+    match scan.status() {
+        "unsupported" => format!(
+            "crash-report scanning is implemented for macOS only; set {CRASH_REPORT_DIRS_ENV} to scan explicit directories"
+        ),
+        "unavailable" => format!(
+            "no crash-report directory could be read, so recurrence is UNKNOWN — this is not a clean bill of health; set {CRASH_REPORT_DIRS_ENV} to point at readable directories"
+        ),
+        _ if !scan.matched_reports.is_empty() => format!(
+            "nw-073 IS STILL FIRING — {} crash report(s) carry the {LBUG_CRASH_FRAME} signature; the thread-pool mitigation is not holding and the root-cause fix (BM_MALLOC reader pinning) is required",
+            scan.matched_reports.len()
+        ),
+        "partial" => format!(
+            "no matching crash reports in {} directories, but {} could not be read — this zero is not exhaustive",
+            scan.directories_read,
+            scan.unreadable.len()
+        ),
+        _ => format!(
+            "no crash reports carry the {LBUG_CRASH_FRAME} signature across {} directories ({} candidate report(s) examined); the mitigation appears to be holding",
+            scan.directories_read, scan.reports_examined
+        ),
+    }
+}
+
+fn crash_recurrence_value(scan: &CrashRecurrenceScan) -> serde_json::Value {
+    serde_json::json!({
+        "backlog_id": "nw-073",
+        "signature": format!("lbug::storage::BufferManager::{LBUG_CRASH_FRAME}"),
+        "status": scan.status(),
+        // Null rather than 0 when nothing was scanned: a zero here would be a
+        // claim the scan never earned.
+        "crash_reports_matched": if scan.has_count() {
+            serde_json::json!(scan.matched_reports.len())
+        } else {
+            serde_json::Value::Null
+        },
+        "matched_reports": scan.matched_reports,
+        "reports_examined": scan.reports_examined,
+        "directories_read": scan.directories_read,
+        "unreadable": scan.unreadable,
+        "note": crash_recurrence_note(scan),
+    })
+}
+
+/// Directories to sweep, and whether sweeping is supported here.
+fn crash_report_directories() -> (Vec<PathBuf>, bool) {
+    if let Some(raw) = std::env::var_os(CRASH_REPORT_DIRS_ENV) {
+        let dirs: Vec<PathBuf> = std::env::split_paths(&raw)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        if !dirs.is_empty() {
+            return (dirs, true);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut dirs = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            dirs.push(home.join("Library/Logs/DiagnosticReports"));
+            dirs.push(home.join("Library/Logs/DiagnosticReports/Retired"));
+        }
+        // The SYSTEM directory matters as much as the per-user one. The original
+        // nw-073 investigation checked only `~/Library`, found nothing, and
+        // recorded "no crash logs on this machine" — while every nestweaver
+        // report on that Mac was sitting in `/Library`.
+        dirs.push(PathBuf::from("/Library/Logs/DiagnosticReports"));
+        dirs.push(PathBuf::from("/Library/Logs/DiagnosticReports/Retired"));
+        (dirs, true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (Vec::new(), false)
+    }
+}
+
+/// Read a report, capped, tolerating non-UTF-8 bytes.
+fn read_crash_report(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    std::fs::File::open(path)?
+        .take(CRASH_REPORT_READ_LIMIT)
+        .read_to_end(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn scan_crash_recurrence() -> CrashRecurrenceScan {
+    let (directories, supported) = crash_report_directories();
+    scan_crash_reports_in(&directories, supported)
+}
+
+fn scan_crash_reports_in(directories: &[PathBuf], supported: bool) -> CrashRecurrenceScan {
+    let mut scan = CrashRecurrenceScan {
+        supported,
+        ..Default::default()
+    };
+
+    for directory in directories {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // A missing directory contributes no evidence but is not a
+                // fault (`Retired/` often does not exist). A directory that
+                // exists and cannot be read is a fault, and must not be
+                // silently folded into a clean result.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    scan.unreadable
+                        .push(format!("{}: {error}", directory.display()));
+                }
+                continue;
+            }
+        };
+        scan.directories_read += 1;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_candidate_crash_report(&name) {
+                continue;
+            }
+            scan.reports_examined += 1;
+            match read_crash_report(&entry.path()) {
+                Ok(contents) if crash_report_matches_signature(&name, &contents) => {
+                    scan.matched_reports.push(name);
+                }
+                Ok(_) => {}
+                Err(error) => scan
+                    .unreadable
+                    .push(format!("{}: {error}", entry.path().display())),
+            }
+        }
+    }
+
+    scan.matched_reports.sort();
+    scan
+}
+
+/// The closed set of node kinds accepted by `--kinds`.
+const NODE_KINDS: [&str; 3] = ["Section", "Note", "Symbol"];
+
+/// Parse and validate a `--kinds` token against [`NODE_KINDS`].
+///
+/// Matching stays case-insensitive, but an unknown token is now rejected
+/// instead of silently dropped. `--kinds Bogus` used to return zero matches at
+/// exit 0, so a typo was indistinguishable from a real empty result (nw-108).
+fn parse_node_kind(value: &str) -> Result<String, String> {
+    NODE_KINDS
+        .iter()
+        .find(|k| k.eq_ignore_ascii_case(value))
+        .map(|k| (*k).to_string())
+        .ok_or_else(|| format!("must be one of {}", NODE_KINDS.join(", ")))
+}
+
+/// Parse a float documented as `[0.0-1.0]` and enforce that range.
+///
+/// Every INTEGER range in the CLI is enforced by clap, but the floats were
+/// unguarded: `--confidence 5.0` was accepted at exit 0 and returned an empty
+/// result with no explanation, which reads exactly like "nothing depends on
+/// this symbol" (nw-108).
+fn parse_unit_interval_f32(value: &str) -> Result<f32, String> {
+    let parsed: f32 = value.parse().map_err(|_| "must be a number".to_string())?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("must be in 0.0..=1.0".to_string());
+    }
+    Ok(parsed)
+}
+
+/// `f64` counterpart of [`parse_unit_interval_f32`].
+fn parse_unit_interval_f64(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value.parse().map_err(|_| "must be a number".to_string())?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("must be in 0.0..=1.0".to_string());
+    }
+    Ok(parsed)
+}
+
+/// One-line verdict for a `broken-links` entry.
+///
+/// A sub-1.0 confidence means the link matched at a lower resolver tier, not
+/// that it is wrong. Printing only the number let a same-folder match (0.95)
+/// and a link pointing at nothing (0.0) read identically (nw-100).
+fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
+    match &link.resolved_target_uid {
+        Some(uid) => format!("resolves to {uid}"),
+        None => "UNRESOLVED — no such note".to_string(),
+    }
+}
+
+/// Summarise how many entries are genuinely broken versus merely resolved at a
+/// lower tier, so the headline count cannot be read as "all of these are
+/// broken".
+fn print_link_classification(links: &[nestweaver_engine::BrokenLink]) {
+    let unresolved = links.iter().filter(|l| l.is_unresolved()).count();
+    let resolved = links.len() - unresolved;
+    println!(
+        "  {unresolved} unresolved (genuinely broken), {resolved} resolved at a lower \
+         confidence tier (same-folder or filename-stem match — not broken)"
+    );
+}
+
+/// Provenance for a result computed WITHOUT the daemon.
+///
+/// The federation layer attaches `_meta` (scope, sources, stale_repos) on the
+/// daemon path only, so `--json` returned a different SHAPE depending on whether
+/// a daemon happened to be running. The direct path is genuinely local scope, so
+/// it can state the same thing truthfully rather than omitting the field
+/// (nw-117).
+fn local_result_meta() -> serde_json::Value {
+    serde_json::json!({
+        "scope": "local",
+        "sources": ["local"],
+        "stale_repos": [],
+    })
+}
+
+/// The single JSON shape `impact` emits, for every outcome.
+///
+/// `impact --json` previously returned three incompatible shapes: a bare node
+/// array for a complete walk, an object when the traversal was pruned, and a
+/// bare CANDIDATE array when the symbol name was ambiguous. The last is the
+/// dangerous one — it is structurally indistinguishable from a successful
+/// result, so a mistyped name returned four "impacted symbols" that were
+/// actually four candidates. Only the exit code disambiguated, which is
+/// invisible to anything consuming piped JSON.
+///
+/// Every other surface here already returns an envelope (`blast_radius`,
+/// `dead-code`, `broken-links`, `contracts drift`); `impact` was the outlier.
+/// `status` is the discriminator a consumer branches on (nw-111).
+fn impact_json_ok(
+    symbol: &str,
+    nodes: serde_json::Value,
+    truncated_by_threshold: bool,
+    truncated_by_depth: bool,
+    total: Option<u64>,
+    returned: Option<u64>,
+    note: Option<String>,
+) -> serde_json::Value {
+    let capped = matches!((total, returned), (Some(t), Some(r)) if r < t);
+    // Resolve before the payload borrows `nodes` (nw-123).
+    let returned = returned.unwrap_or_else(|| nodes_len(&nodes));
+    let mut payload = serde_json::json!({
+        "status": "ok",
+        "symbol": symbol,
+        "nodes": nodes,
+        "truncated": truncated_by_threshold || truncated_by_depth || capped,
+        "truncated_by_threshold": truncated_by_threshold,
+        "truncated_by_depth": truncated_by_depth,
+    });
+    if let Some(obj) = payload.as_object_mut() {
+        // nw-123: `total` and `returned` used to be inserted only when the
+        // caller knew them, so the key SET varied by code path — the
+        // depth-truncated envelope carried them and the threshold-truncated one
+        // did not, leaving a consumer with `undefined` in exactly the case
+        // where the result is incomplete and the counts matter most. A stable
+        // schema is the whole point of this envelope, so both keys are always
+        // present.
+        //
+        // `returned` is never guessed: it is the length of the array we are
+        // actually returning. `total` is `null` when genuinely unknown rather
+        // than being backfilled from `returned`, which would assert
+        // completeness we did not establish (same rule as nw-073's null count).
+        obj.insert("returned".to_string(), serde_json::json!(returned));
+        obj.insert(
+            "total".to_string(),
+            match total {
+                Some(t) => serde_json::json!(t),
+                None => serde_json::Value::Null,
+            },
+        );
+        if let Some(note) = note {
+            obj.insert("note".to_string(), serde_json::json!(note));
+        }
+    }
+    payload
+}
+
+/// Length of a JSON node collection, for envelopes that must report what they
+/// actually returned rather than what the caller happened to know.
+fn nodes_len(nodes: &serde_json::Value) -> u64 {
+    nodes.as_array().map(|a| a.len() as u64).unwrap_or(0)
+}
+
+/// Warn when a ranking is computed over edges built by a superseded resolver.
+///
+/// nw-124: a fix that changes persisted edge SHAPE (nw-103's import fan-out)
+/// cannot correct data already written. Upgrading therefore leaves `hubs`,
+/// `bridges` and PageRank confidently wrong for every repo not yet re-indexed,
+/// and previously nothing disclosed it. Emitted on stderr so `--json` consumers
+/// are told without the payload changing shape.
+fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore, db_path: &std::path::Path) {
+    let Ok(repos) = store.list_repos(None) else {
+        return;
+    };
+    let uids: Vec<String> = repos.into_iter().map(|r| r.uid).collect();
+    if uids.is_empty() {
+        return;
+    }
+    if let Some(note) = nestweaver_engine::resolver_generation::staleness_note(db_path, &uids) {
+        eprintln!("warning: {note}");
+    }
+}
+
+/// Daemon-path counterpart to [`warn_stale_resolver_rankings`].
+///
+/// The daemon owns the store, so this path has no handle to enumerate repos
+/// and cannot report an exact stale count. It can still catch the case that
+/// matters most — and is the common one on upgrade — where the sidecar does not
+/// exist at all, meaning EVERY repo's edges predate the fix. Without this the
+/// warning would only ever appear on the direct path, which is the path users
+/// are told not to use.
+fn warn_stale_resolver_rankings_no_store(db_path: &std::path::Path) {
+    let sidecar = nestweaver_engine::sidecar_path(
+        db_path,
+        nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+    );
+    if sidecar.exists() {
+        return;
+    }
+    eprintln!(
+        "warning: no resolver generation is recorded for this database, so every repo \
+         was indexed before the nw-103 import-fan-out fix — hub, bridge and PageRank \
+         rankings are NOT corrected by upgrading alone. Re-index each repo \
+         (`nestweaver index --repo <path>`) to get accurate rankings."
+    );
+}
+
+/// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
+/// mistaken for a result set.
+fn impact_json_ambiguous(symbol: &str, candidates: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ambiguous",
+        "symbol": symbol,
+        "candidates": candidates,
+        "note": "the symbol name matched multiple symbols; no impact was computed. \
+                 Disambiguate with --repo <name> or pass a full UID",
+    })
+}
+
+fn impact_json_not_found(symbol: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "not_found",
+        "symbol": symbol,
+        "error": "not found",
+        "name": symbol,
+    })
+}
+
+/// Render a `dead-code` result as text from its JSON payload.
+///
+/// BOTH the direct and daemon paths render through this, so the two cannot
+/// drift. The daemon branch used to `println!` the RPC response verbatim with
+/// no `if json` guard, which meant the OUTPUT FORMAT depended on whether a
+/// daemon happened to be running rather than on the flag — `dead-code` printed
+/// text standalone and JSON once the daemon was up (nw-108). Driving both from
+/// the same payload makes parity structural rather than something to remember.
+/// Render an `investigate` bundle as text from its JSON payload.
+///
+/// Shared by the direct and daemon paths for the same reason as
+/// [`render_dead_code_text`]: the daemon branch printed its response verbatim,
+/// so the output format tracked whether a daemon was running instead of the
+/// `--json` flag (nw-108).
+fn render_investigate_text(payload: &serde_json::Value) {
+    let text = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let entries: Vec<&serde_json::Value> = payload
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let domains: Vec<&serde_json::Value> = payload
+        .get("domains")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let more_available = payload
+        .get("more_available")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    println!(
+        "Bundle: {}  (query: {:?})",
+        text(payload, "bundle_id"),
+        text(payload, "query")
+    );
+    println!(
+        "{} domain(s), {} entr{}{}",
+        domains.len(),
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        if more_available > 0 {
+            format!(" ({more_available} more available — raise --token-budget)")
+        } else {
+            String::new()
+        }
+    );
+    // nw-120: the daemon ranks with its warm embedding model; the direct path
+    // has none, so the SAME query returns a different ordering. Say which one
+    // produced this map rather than letting the ranking imply a quality it did
+    // not have.
+    if payload
+        .get("semantic_applied")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|applied| !applied)
+    {
+        println!(
+            "  note: semantic retrieval unavailable — ranking is lexical (BM25) only, \
+             so ordering differs from a daemon-served run."
+        );
+    }
+
+    for d in &domains {
+        println!("\n[{}]", text(d, "label"));
+        let entry_point = text(d, "entry_point");
+        for member in d
+            .get("members")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let asset_id = member.as_str().unwrap_or_default();
+            let Some(e) = entries
+                .iter()
+                .find(|e| e.get("asset_id").and_then(|v| v.as_str()) == Some(asset_id))
+            else {
+                continue;
+            };
+            let marker = if asset_id == entry_point { "*" } else { " " };
+            println!(
+                "  {marker} {}  {} ({})  {}",
+                asset_id,
+                text(e, "title"),
+                text(e, "kind"),
+                text(e, "location")
+            );
+            if let Some(summary) = e.get("summary").and_then(|v| v.as_str()) {
+                let truncated = if !e.get("inline_body").is_none_or(|v| v.is_null())
+                    && !e
+                        .get("body_complete")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true)
+                {
+                    " [truncated]"
+                } else {
+                    ""
+                };
+                println!("      {summary}{truncated}");
+            }
+        }
+    }
+
+    println!(
+        "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
+        text(payload, "bundle_id")
+    );
+}
+
+/// Attach the local-scope provenance the federation layer adds on the daemon
+/// path, so `--json` has ONE shape regardless of whether a daemon is running.
+///
+/// Same divergence as nw-117: `_meta` is added by federation, which only runs in
+/// daemon mode, so a direct result was a different shape rather than a different
+/// value. The direct path is genuinely local scope and can say so truthfully.
+fn attach_local_meta(payload: &mut serde_json::Value) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("_meta").or_insert_with(|| {
+            serde_json::json!({
+                "scope": "local",
+                "sources": ["local"],
+                "stale_repos": [],
+            })
+        });
+    }
+}
+
+/// Render a `blast-radius` result as text from its JSON payload.
+///
+/// Both the direct and daemon paths render through this, so the two cannot
+/// drift — the rule established when `dead-code` and `investigate` were found
+/// emitting JSON or text depending on whether a daemon happened to be running
+/// (nw-108).
+fn render_blast_radius_text(payload: &serde_json::Value) {
+    let s = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let n = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // The payload's key is `risk`, not `risk_level` — worth stating, because
+    // guessing it rendered a blank risk with no error at all.
+    println!(
+        "Blast radius: {} affected symbol(s), risk {}",
+        n("affected_symbol_count"),
+        s("risk")
+    );
+    let summary = s("summary");
+    if !summary.is_empty() {
+        println!("  {summary}");
+    }
+    // The trust contract comes FIRST. A caller who reads only the first lines
+    // must not walk away with a risk level whose run never completed.
+    println!("  status:     {}", s("status"));
+    println!("  gate_state: {}", s("gate_state"));
+
+    for note in payload
+        .get("notifications")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let level = note.get("level").and_then(|v| v.as_str()).unwrap_or("note");
+        let msg = note.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        println!("  [{level}] {msg}");
+    }
+
+    let blind: Vec<&str> = payload
+        .get("blind_spots")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if !blind.is_empty() {
+        println!("  blind spots: {}", blind.join(", "));
+    }
+
+    let symbols = payload
+        .get("affected_symbols")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if symbols.is_empty() {
+        println!("\nNo affected symbols reported.");
+        return;
+    }
+    println!();
+    for sym in &symbols {
+        let g = |k: &str| sym.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let score = sym
+            .get("impact_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        println!(
+            "  {:<40} {} (score {:.2})",
+            g("name"),
+            g("file_path"),
+            score
+        );
+    }
+}
+
+/// Render a `flow-trace` tree as text from its JSON payload.
+///
+/// `edge_type` is printed on every child. CROSS_REPO_LINK is an INFERRED
+/// cross-repo link rather than an observed call, and omitting the label is what
+/// let fabricated cross-language execution paths read as real ones (nw-111).
+fn render_flow_trace_text(payload: &serde_json::Value) {
+    fn walk(node: &serde_json::Value, depth: usize) {
+        let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let edge = node.get("edge_type").and_then(|v| v.as_str());
+        let path = node.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        let indent = "  ".repeat(depth + 1);
+        match edge {
+            Some(e) => println!("{indent}{name}  [{e}]  {path}"),
+            None => println!("{indent}{name}  {path}"),
+        }
+        for child in node
+            .get("children")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            walk(child, depth + 1);
+        }
+    }
+
+    let root_name = payload
+        .get("root_name")
+        .or_else(|| payload.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    println!("Flow trace from '{root_name}':");
+
+    // A class root expands to one tree per method.
+    if let Some(trees) = payload.get("method_trees").and_then(|v| v.as_array()) {
+        for tree in trees {
+            walk(tree, 0);
+        }
+        return;
+    }
+    if let Some(tree) = payload.get("tree") {
+        walk(tree, 0);
+    } else {
+        walk(payload, 0);
+    }
+}
+
+fn render_dead_code_text(payload: &serde_json::Value) {
+    let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = num("total_symbols");
+    let matching = num("matching_count");
+    let excluded = num("excluded_count");
+
+    let excluded_note = || {
+        if excluded > 0 {
+            println!("({excluded} type-only/declaration symbols excluded from analysis)");
+        }
+    };
+
+    if matching == 0 {
+        println!("No dead code detected ({total} symbols, all reachable from entry points).");
+        excluded_note();
+        return;
+    }
+
+    println!(
+        "Dead code analysis: {} of {total} symbols ({:.1}%) unreachable from entry points\n",
+        num("unreachable_count"),
+        payload
+            .get("dead_percentage")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+    );
+    excluded_note();
+
+    let returned = num("returned");
+    let min_conf = payload
+        .get("min_confidence")
+        .and_then(|v| v.as_str())
+        .unwrap_or("low");
+    if min_conf != "low" {
+        println!("Showing {returned} symbol(s) with confidence >= {min_conf}\n");
+    }
+    if payload
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        println!("(showing first {returned} of {matching} — pass --limit to change)\n");
+    }
+
+    // Group by file path, matching the direct path's BTreeMap ordering.
+    let mut by_file: std::collections::BTreeMap<&str, Vec<&serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for sym in payload
+        .get("unreachable_symbols")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let file = sym.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        by_file.entry(file).or_default().push(sym);
+    }
+    for (file, syms) in &by_file {
+        println!("{file}:");
+        for sym in syms {
+            let field = |k: &str| sym.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            // Lowercase the confidence: the two paths serialise it
+            // differently — the direct payload carries the serde variant
+            // name ("Medium") while the daemon returns "medium" — and the
+            // historical text output used the Display impl, which is
+            // lowercase. Normalising here keeps the rendered text stable and
+            // identical across modes. The underlying JSON inconsistency is a
+            // separate defect.
+            println!(
+                "  {} ({}) [{}] confidence={}",
+                field("name"),
+                field("kind"),
+                field("visibility"),
+                field("confidence").to_lowercase(),
+            );
+        }
+        println!();
+    }
+}
+
 fn capability_diagnostics_value(
     embedding_compiled: bool,
     metal_compiled: bool,
     runtime_probe: Result<(), String>,
+    crash_recurrence: serde_json::Value,
 ) -> serde_json::Value {
     let (metal_runtime_available, metal_runtime_error) = match runtime_probe {
         Ok(()) => (true, None),
@@ -379,16 +1239,19 @@ fn capability_diagnostics_value(
         "metal_compiled": metal_compiled,
         "metal_runtime_available": metal_runtime_available,
         "metal_runtime_error": metal_runtime_error,
+        "crash_recurrence": crash_recurrence,
     })
 }
 
 fn current_capability_diagnostics() -> serde_json::Value {
+    let crash_recurrence = crash_recurrence_value(&scan_crash_recurrence());
     #[cfg(feature = "embed")]
     {
         capability_diagnostics_value(
             true,
             nestweaver_embed::metal_compiled(),
             nestweaver_embed::probe_metal_runtime().map_err(|error| format!("{error:#}")),
+            crash_recurrence,
         )
     }
     #[cfg(not(feature = "embed"))]
@@ -397,6 +1260,7 @@ fn current_capability_diagnostics() -> serde_json::Value {
             false,
             false,
             Err("embedding support was not compiled into this binary".to_string()),
+            crash_recurrence,
         )
     }
 }
@@ -655,6 +1519,7 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
+            value_parser = parse_node_kind,
             help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
         )]
         kinds: Option<Vec<String>>,
@@ -696,6 +1561,7 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
+            value_parser = parse_node_kind,
             help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
         )]
         kinds: Option<Vec<String>>,
@@ -729,11 +1595,13 @@ enum Commands {
         #[arg(
             long,
             default_value = "0.0",
+            value_parser = parse_unit_interval_f32,
             help = "Minimum edge confidence [0.0-1.0]"
         )]
         confidence: f32,
         #[arg(
             long,
+            value_parser = parse_unit_interval_f64,
             help = "Minimum impact score for including a dependent [0.0-1.0] (default: 0.10; pass 0 to disable score pruning and get the full traversal)"
         )]
         min_score: Option<f64>,
@@ -1590,6 +2458,82 @@ enum Commands {
         db: Option<PathBuf>,
     },
 
+    /// Assess blast radius for a set of changed files
+    ///
+    /// Maps files to symbols, traces reverse dependencies, and returns affected
+    /// symbols with a risk level and an explicit trust contract. Read
+    /// `gate_state` and `status` before trusting a green result: a run that did
+    /// not complete is `degraded-unknown`, never `risk-flagged`.
+    #[command(
+        after_help = "Examples:\n  nestweaver blast-radius --files src/auth.rs\n  nestweaver blast-radius --files a.rs --files b.rs --depth 5 --json"
+    )]
+    BlastRadius {
+        #[arg(
+            long = "files",
+            required = true,
+            help = "Changed file paths, repo-relative (repeat the flag for several)"
+        )]
+        files: Vec<String>,
+        #[arg(
+            long,
+            default_value = "3",
+            value_parser = clap::value_parser!(u32).range(1..=15),
+            help = "Maximum traversal depth (1-15; matches the MCP blast_radius schema)"
+        )]
+        depth: u32,
+        #[arg(long, help = "Restrict analysis to this repo")]
+        repo: Option<String>,
+        #[arg(
+            long,
+            help = "Also follow data-dependence edges (type refs, field access) — higher recall, noisier"
+        )]
+        include_data_edges: bool,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10000),
+            help = "Cap affected symbols returned, most-impactful first (1-10000)"
+        )]
+        limit: Option<usize>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to an instance config file")]
+        config: Option<PathBuf>,
+    },
+
+    /// Trace forward execution flow from a symbol — what it calls, and what those call
+    ///
+    /// Every child carries `edge_type`. CALLS and IMPORTS are observed in code;
+    /// CROSS_REPO_LINK is an INFERRED cross-repo link and is NOT an observed
+    /// call — filter it out when you need a real execution path.
+    #[command(
+        after_help = "Examples:\n  nestweaver flow-trace handleRequest\n  nestweaver flow-trace \"sym:repo:...:abc:42\" --max-depth 3 --json"
+    )]
+    FlowTrace {
+        #[arg(help = "Symbol name or full UID to trace from")]
+        symbol: String,
+        #[arg(
+            long,
+            default_value = "10",
+            value_parser = clap::value_parser!(u32).range(1..=15),
+            help = "Maximum tree depth (1-15; matches the MCP flow_trace schema)"
+        )]
+        max_depth: u32,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to an instance config file")]
+        config: Option<PathBuf>,
+    },
+
     /// Export the code graph to an external format
     ///
     /// Supports Cypher (Neo4j), GraphML (Gephi/yEd), Mermaid flowchart, and
@@ -2373,7 +3317,7 @@ enum BrainCommands {
         #[arg(
             long,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
-            help = "Maximum results (1-1000; default: 20, or [limits].default_result_limit from config; matches the MCP brain_search schema)"
+            help = "Maximum results PER KIND (1-1000; default: 20, or [limits].default_result_limit from config; matches the MCP brain_search schema). Notes and code symbols are capped separately, so a query matching both can return up to 2x this value; `returned_matches` always reports the true total"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -2574,8 +3518,17 @@ enum BrainCommands {
         )]
         prefer_instance: Option<String>,
     },
-    /// List wikilinks whose target is ambiguous or low-confidence
-    /// (confidence < 1.0), with suggested target notes for each.
+    /// List wikilinks that resolved below full confidence or not at all.
+    ///
+    /// Suggestions are offered WHERE CANDIDATES EXIST, which is not every entry:
+    /// a link whose target exists nowhere in the vault — a deleted note, or an ID
+    /// that is a backlog entry rather than a note — has nothing to suggest, and
+    /// an empty list is the honest answer. The old wording promised "suggested
+    /// target notes for each" and so read as a defect whenever the list was
+    /// empty (nw-100).
+    ///
+    /// Check `resolved_target_uid` to tell a link that RESOLVED at a lower tier
+    /// from one that points at nothing.
     BrokenLinks {
         #[arg(long, default_value = "5", help = "Max suggested targets per link")]
         max_suggestions: usize,
@@ -3133,6 +4086,84 @@ fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::In
 /// rule shared by `brain watch`/`brain add`/`brain refresh` and the top-level
 /// `watch`, so no path silently stamps symbols under the literal `"default"`
 /// when a `--config` names an instance.
+/// Existing vault registrations whose root path equals `root`, as
+/// `(instance_id, vault_uid)`.
+///
+/// Read through the same daemon-or-direct path `brain status` uses. A DB that
+/// does not exist yet yields an empty list rather than an error: the first
+/// refresh of a brand-new database is a legitimate create.
+fn vault_registrations_for_root(
+    use_daemon: bool,
+    db_path: &Path,
+    config: Option<&Path>,
+    root: &Path,
+) -> Vec<(String, String)> {
+    let root_str = root.to_string_lossy().to_string();
+    let matches_root = |candidate: &str| candidate == root_str;
+
+    if let Some(value) = try_hybrid_json_rpc(
+        use_daemon,
+        db_path,
+        config,
+        "brain_status",
+        serde_json::json!({}),
+    ) {
+        return value
+            .get("vaults")
+            .and_then(|v| v.as_array())
+            .map(|vaults| {
+                vaults
+                    .iter()
+                    .filter(|v| {
+                        v.get("root_path")
+                            .and_then(|p| p.as_str())
+                            .is_some_and(matches_root)
+                    })
+                    .filter_map(|v| {
+                        Some((
+                            v.get("instance_id")?.as_str()?.to_string(),
+                            v.get("uid")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    // Direct fallback. A missing database is not an error here.
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    match open_store(Some(db_path)) {
+        Ok(store) => store
+            .list_vaults(None)
+            .map(|vaults| {
+                vaults
+                    .into_iter()
+                    .filter(|v| matches_root(&v.root_path))
+                    .map(|v| (v.instance_id, v.uid))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::debug!("vault_registrations_for_root: store read skipped: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// The instance the caller EXPLICITLY asked for, if any.
+///
+/// [`resolve_instance_id`] collapses "unspecified" into `"default"`, which is
+/// what let a refresh silently fork a vault: the caller expressed no intent and
+/// got a brand-new registration under a literal `default` instance (nw-098).
+/// This keeps the distinction.
+fn explicit_instance_id(flag: Option<&str>, config: Option<&Path>) -> Option<String> {
+    flag.filter(|f| !f.is_empty())
+        .map(|f| f.to_string())
+        .or_else(|| load_instance_config_opt(config).map(|c| c.instance_id))
+}
+
 fn resolve_instance_id(flag: Option<String>, config: Option<&Path>) -> anyhow::Result<String> {
     // nw-047: treat an empty `--instance ""` as unset (not a literal empty
     // instance) so it falls through to the config's `instance_id` / "default".
@@ -3604,6 +4635,21 @@ fn maybe_run_auto_setup(db_path: &Path, repo_root: &Path, out: &OutputConfig, fo
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
     let path = db.unwrap_or(&default);
+    // Absent file → the canonical `db_not_found` diagnostic, at the one place
+    // every read-only open funnels through.
+    //
+    // `open_read_only` reports a missing database as "Cannot create an empty
+    // database under READ ONLY mode", which mentions creating something the
+    // caller never asked to create, and which the error mapper cannot
+    // recognise — its heuristic wants "failed to open database" AND "no such
+    // file". So a dozen read commands leaked that raw store error with no
+    // remedy while list-repos/hubs/stale-check, which call
+    // `require_existing_db` first, reported it properly (nw-108).
+    //
+    // Guarding here fixes every read path at once instead of repeating the
+    // check at each call site. The explicit `require_existing_db` calls stay:
+    // they run BEFORE a daemon can be autostarted, which this cannot.
+    require_existing_db(path)?;
     let store = GraphStore::open_read_only(path).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("Corrupted wal") || msg.contains("Could not set lock") {
@@ -5671,6 +6717,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     );
                                 }
                             }
+                            // nw-124: the daemon serves this path, so the
+                            // disclosure has to live here too — otherwise it
+                            // only ever fires on the direct path users are
+                            // told not to use.
+                            warn_stale_resolver_rankings_no_store(&db_path);
                             let stats = format!(
                                 "{} hubs in {} (via hybrid)",
                                 value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -5696,6 +6747,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Ok(Some(clustering)) = load_clusters(&db_path) {
                 attach_cluster_ids(&mut hubs, &clustering);
             }
+
+            // nw-124: hub ranking is precisely what nw-103's import fan-out
+            // corrupted, and the fix cannot repair edges already on disk. On
+            // this machine the FIXED binary still returned the bug report's
+            // exact ranking until the repo was re-indexed. Say so rather than
+            // presenting stale numbers as current. Written to stderr so it
+            // reaches the user in --json mode too, without altering the
+            // documented bare-array payload.
+            warn_stale_resolver_rankings(&store, &db_path);
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&hubs)?);
@@ -5774,6 +6834,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             );
                         }
                     }
+                    // nw-124: bridges are downstream of the same import
+                    // fan-out nw-103 fixed, so they carry the same staleness.
+                    warn_stale_resolver_rankings_no_store(&db_path);
                     let stats = format!(
                         "{} bridges in {} (via daemon)",
                         bridges.len(),
@@ -5787,6 +6850,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             out.status("Computing betweenness centrality...");
             let mut bridges = find_bridge_nodes(&store, top)?;
+            warn_stale_resolver_rankings(&store, &db_path);
 
             // Attach community connection info if clustering sidecar exists.
             if let Ok(Some(clustering)) = load_clusters(&db_path) {
@@ -6015,6 +7079,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
+            // nw-075: `--json` deliberately bypasses the daemon (its tool
+            // truncates member lists at 20), and this direct path never
+            // consulted the sidecar — so `clusters --json` recomputed on EVERY
+            // invocation while `--help` promises "cached in a sidecar ...
+            // subsequent invocations are instant", and the TEXT path really did
+            // cache via the daemon. Two output modes disagreeing about whether a
+            // cache exists, with the docs siding with the one that didn't.
+            //
+            // Reuse is gated on the resolution MATCHING, because the sidecar
+            // holds whichever resolution was computed last: serving a cache
+            // built at a different resolution would answer a question the caller
+            // did not ask. With an explicit --resolution the check needs no
+            // store at all, which is the fully-instant case the help describes.
+            if let Ok(Some(cached)) = load_clusters(&db_path)
+                && let Some(requested) = resolution
+                && (cached.resolution - requested).abs() < f64::EPSILON
+            {
+                out.status(&format!(
+                    "Using cached clusters (resolution={requested}) from sidecar."
+                ));
+                print_clusters_output(&cached, json)?;
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             // Compute and save inside a block so the store is dropped
             // before any output. LadybugDB's connection finaliser can
             // trigger a panic during WAL checkpoint; wrapping in
@@ -6049,26 +7137,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 o
             };
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&output)?);
-            } else if output.communities.is_empty() {
-                println!("No communities detected (graph may be empty or fully disconnected).");
-            } else {
-                println!(
-                    "Clusters ({}, modularity={:.4}):\n",
-                    output.communities.len(),
-                    output.modularity
-                );
-                for c in &output.communities {
-                    println!(
-                        "  [{:>3}] {} ({} members, cohesion={:.2})",
-                        c.id, c.name, c.member_count, c.cohesion
-                    );
-                    for f in &c.key_files {
-                        println!("        {f}");
-                    }
-                }
-            }
+            print_clusters_output(&output, json)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -6308,6 +7377,106 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         )
         .map(|c| (c, None)),
 
+        Commands::BlastRadius {
+            files,
+            depth,
+            repo,
+            include_data_edges,
+            limit,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+
+            let mut args = serde_json::json!({
+                "changed_files": files,
+                "max_depth": depth,
+                "include_data_edges": include_data_edges,
+            });
+            if let Some(ref r) = repo {
+                args["repo"] = serde_json::json!(r);
+            }
+            if let Some(n) = limit {
+                args["limit"] = serde_json::json!(n);
+            }
+
+            // Daemon first, then the SAME tool the daemon would have run. Both
+            // paths therefore produce one payload and render through one
+            // function, so the output format follows --json rather than whether
+            // a daemon happens to be running (nw-108).
+            let payload = match try_hybrid_json_rpc(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "blast_radius",
+                args.clone(),
+            ) {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    // The MCP server sets this before dispatching; without it the
+                    // tool cannot locate the co-change sidecar and silently drops
+                    // the `cochange-unavailable` disclosure, so the direct path
+                    // would answer with LESS honesty than the daemon (nw-062).
+                    nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+                    let mut value =
+                        nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)?;
+                    attach_local_meta(&mut value);
+                    value
+                }
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                render_blast_radius_text(&payload);
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
+        Commands::FlowTrace {
+            symbol,
+            max_depth,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+
+            let args = serde_json::json!({
+                "symbol": symbol,
+                "max_depth": max_depth,
+            });
+
+            let payload = match try_hybrid_json_rpc(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "flow_trace",
+                args.clone(),
+            ) {
+                Some(value) => value,
+                None => {
+                    let store = open_store(Some(&db_path))?;
+                    nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+                    let mut value =
+                        nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)?;
+                    attach_local_meta(&mut value);
+                    value
+                }
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                render_flow_trace_text(&payload);
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
+
         Commands::DeadCode {
             min_confidence,
             json,
@@ -6322,7 +7491,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["limit"] = serde_json::json!(n);
                 }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args) {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        render_dead_code_text(&value);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -6359,97 +7532,49 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 None => filtered,
             };
 
+            #[derive(serde::Serialize)]
+            struct DeadCodeJson<'a> {
+                total_symbols: usize,
+                reachable_symbols: usize,
+                unreachable_count: usize,
+                matching_count: usize,
+                returned: usize,
+                truncated: bool,
+                excluded_count: usize,
+                dead_percentage: f64,
+                min_confidence: String,
+                unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
+            }
+            // Count contract (same as the dead_code MCP tool):
+            // `unreachable_count` is the UNFILTERED total, consistent with
+            // total_symbols/reachable_symbols/dead_percentage;
+            // `matching_count` is the post-min-confidence count.
+            //
+            // Built unconditionally so the text path renders from the SAME
+            // payload the JSON path prints, and from the same payload the
+            // daemon returns (nw-108).
+            let mut payload = serde_json::to_value(DeadCodeJson {
+                total_symbols: result.total_symbols,
+                reachable_symbols: result.reachable_symbols,
+                unreachable_count: result.unreachable_symbols.len(),
+                matching_count: filtered_count,
+                returned: shown.len(),
+                truncated,
+                excluded_count: result.excluded_count,
+                dead_percentage: result.dead_percentage,
+                min_confidence: min_conf.to_string(),
+                unreachable_symbols: shown,
+            })?;
+            // Match the daemon's envelope so `--json` has one shape regardless
+            // of whether a daemon is running (nw-117).
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("_meta".to_string(), local_result_meta());
+            }
+
             if json {
-                #[derive(serde::Serialize)]
-                struct DeadCodeJson<'a> {
-                    total_symbols: usize,
-                    reachable_symbols: usize,
-                    unreachable_count: usize,
-                    matching_count: usize,
-                    returned: usize,
-                    truncated: bool,
-                    excluded_count: usize,
-                    dead_percentage: f64,
-                    min_confidence: String,
-                    unreachable_symbols: Vec<&'a nestweaver_engine::UnreachableSymbol>,
-                }
-                // Count contract (same as the dead_code MCP tool):
-                // `unreachable_count` is the UNFILTERED total, consistent with
-                // total_symbols/reachable_symbols/dead_percentage;
-                // `matching_count` is the post-min-confidence count.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&DeadCodeJson {
-                        total_symbols: result.total_symbols,
-                        reachable_symbols: result.reachable_symbols,
-                        unreachable_count: result.unreachable_symbols.len(),
-                        matching_count: filtered_count,
-                        returned: shown.len(),
-                        truncated,
-                        excluded_count: result.excluded_count,
-                        dead_percentage: result.dead_percentage,
-                        min_confidence: min_conf.to_string(),
-                        unreachable_symbols: shown,
-                    })?
-                );
-            } else if filtered_count == 0 {
-                println!(
-                    "No dead code detected ({} symbols, all reachable from entry points).",
-                    result.total_symbols
-                );
-                if result.excluded_count > 0 {
-                    println!(
-                        "({} type-only/declaration symbols excluded from analysis)",
-                        result.excluded_count
-                    );
-                }
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                println!(
-                    "Dead code analysis: {} of {} symbols ({:.1}%) unreachable from entry points\n",
-                    result.unreachable_symbols.len(),
-                    result.total_symbols,
-                    result.dead_percentage,
-                );
-                if result.excluded_count > 0 {
-                    println!(
-                        "({} type-only/declaration symbols excluded from analysis)",
-                        result.excluded_count
-                    );
-                }
-                if min_conf != DeadCodeConfidence::Low {
-                    println!(
-                        "Showing {} symbol(s) with confidence >= {}\n",
-                        shown.len(),
-                        min_conf
-                    );
-                }
-                if truncated {
-                    println!(
-                        "(showing first {} of {} — pass --limit to change)\n",
-                        shown.len(),
-                        filtered_count
-                    );
-                }
-
-                // Group by file path.
-                let mut by_file: std::collections::BTreeMap<
-                    &str,
-                    Vec<&nestweaver_engine::UnreachableSymbol>,
-                > = std::collections::BTreeMap::new();
-                for sym in &shown {
-                    by_file.entry(&sym.file_path).or_default().push(sym);
-                }
-
-                for (file, syms) in &by_file {
-                    println!("{}:", file);
-                    for sym in syms {
-                        println!(
-                            "  {} ({}) [{}] confidence={}",
-                            sym.name, sym.kind, sym.visibility, sym.confidence,
-                        );
-                    }
-                    println!();
-                }
+                render_dead_code_text(&payload);
             }
 
             let stats = format!(
@@ -7402,6 +8527,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 truncated: false,
                                 scanned_fallback: false,
                                 stale_index: false,
+                                note: None,
                             }
                         });
                     if json {
@@ -8354,13 +9480,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     match value.get("status").and_then(|v| v.as_str()) {
                         Some("not_found") => {
                             if json {
-                                // nw-086: identical --json shape as the direct path.
                                 println!(
                                     "{}",
-                                    serde_json::to_string_pretty(&serde_json::json!({
-                                        "error": "not found",
-                                        "name": name_or_uid,
-                                    }))?
+                                    serde_json::to_string_pretty(&impact_json_not_found(
+                                        &name_or_uid
+                                    ))?
                                 );
                             } else if !out.quiet {
                                 println!("No symbol found: '{name_or_uid}'.");
@@ -8369,12 +9493,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         Some("ambiguous") => {
                             if json {
-                                // nw-086: bare candidates array, matching the direct path.
                                 let cands = value
                                     .get("candidates")
                                     .cloned()
                                     .unwrap_or_else(|| serde_json::json!([]));
-                                println!("{}", serde_json::to_string_pretty(&cands)?);
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&impact_json_ambiguous(
+                                        &name_or_uid,
+                                        cands
+                                    ))?
+                                );
                             } else if !out.quiet {
                                 println!("Ambiguous symbol '{name_or_uid}' — multiple matches:");
                                 if let Some(cands) =
@@ -8427,37 +9556,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .get("impact_nodes")
                             .cloned()
                             .unwrap_or_else(|| value.clone());
-                        if capped {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "nodes": payload,
-                                    "total": total,
-                                    "returned": returned,
-                                    "truncated": true,
-                                    "truncated_by_threshold": truncated_by_threshold,
-                                    "truncated_by_depth": truncated_by_depth,
-                                    "note": format!(
-                                        "showing {} of {} impacted node(s) — reported impact is a \
-                                         floor; raise --limit or pass --min-score 0 for the full set",
-                                        returned.unwrap_or(0),
-                                        total.unwrap_or(0)
-                                    ),
-                                }))?
-                            );
-                        } else if truncated_by_threshold || truncated_by_depth {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "nodes": payload,
-                                    "truncated_by_threshold": truncated_by_threshold,
-                                    "truncated_by_depth": truncated_by_depth,
-                                    "note": value.get("note").cloned().unwrap_or(serde_json::Value::Null),
-                                }))?
-                            );
+                        // One envelope for every outcome — a complete walk, a
+                        // pruned traversal and a capped result set all carry the
+                        // same keys, so a consumer parses one shape (nw-111).
+                        let note = if capped {
+                            Some(format!(
+                                "showing {} of {} impacted node(s) — reported impact is a \
+                                 floor; raise --limit or pass --min-score 0 for the full set",
+                                returned.unwrap_or(0),
+                                total.unwrap_or(0)
+                            ))
                         } else {
-                            println!("{}", serde_json::to_string_pretty(&payload)?);
-                        }
+                            value
+                                .get("note")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&impact_json_ok(
+                                &name_or_uid,
+                                payload,
+                                truncated_by_threshold,
+                                truncated_by_depth,
+                                total,
+                                returned,
+                                note,
+                            ))?
+                        );
                     } else if let Some(arr) = value.get("impact_nodes") {
                         #[derive(serde::Deserialize)]
                         struct DaemonImpactNode {
@@ -8545,39 +9671,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     let count = nodes.len();
                     let truncated = result.truncated_by_threshold || result.truncated_by_depth;
 
-                    if json && !truncated {
-                        // nw-086: bare node array (matches the daemon path's --json
-                        // shape) — but ONLY for a complete walk; see below.
-                        #[derive(serde::Serialize)]
-                        struct ImpactNodeJson {
-                            uid: String,
-                            name: String,
-                            file_path: String,
-                            start_line: u32,
-                            edge_type: String,
-                            confidence: f32,
-                            depth: u32,
-                        }
-                        let json_nodes: Vec<_> = nodes
-                            .iter()
-                            .map(|n| ImpactNodeJson {
-                                uid: n.uid.clone(),
-                                name: n.name.clone(),
-                                file_path: n.file_path.clone(),
-                                start_line: n.start_line,
-                                edge_type: n.edge_type.clone(),
-                                confidence: n.confidence,
-                                depth: n.depth,
-                            })
-                            .collect();
-                        println!("{}", serde_json::to_string_pretty(&json_nodes)?);
-                    } else if json {
-                        // Truncated walk: a bare array would read as a complete
-                        // answer, so emit an honest object instead (like
-                        // blast_radius's blind_spots) — `nodes` plus the
-                        // truncation flags and a human-readable caveat.
-                        let note = impact_truncation_note(&result, threshold, depth);
-                        eprintln!("note: {note}");
+                    if json {
+                        // One envelope whether or not the walk was pruned. The
+                        // shape used to change with the outcome, so a consumer
+                        // had to branch on the JSON type before it could read
+                        // anything (nw-111).
                         #[derive(serde::Serialize)]
                         struct ImpactNodeJson<'a> {
                             uid: &'a str,
@@ -8600,14 +9698,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 depth: n.depth,
                             })
                             .collect();
+                        let note = truncated.then(|| {
+                            let note = impact_truncation_note(&result, threshold, depth);
+                            eprintln!("note: {note}");
+                            note
+                        });
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "nodes": json_nodes,
-                                "truncated_by_threshold": result.truncated_by_threshold,
-                                "truncated_by_depth": result.truncated_by_depth,
-                                "note": note,
-                            }))?
+                            serde_json::to_string_pretty(&impact_json_ok(
+                                &name_or_uid,
+                                serde_json::to_value(&json_nodes)?,
+                                result.truncated_by_threshold,
+                                result.truncated_by_depth,
+                                None,
+                                None,
+                                note,
+                            ))?
                         );
                     } else if nodes.is_empty() {
                         if !out.quiet {
@@ -8662,16 +9768,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, Some(stats)))
                 }
                 ResolveResult::NotFound => {
-                    // nw-086: under --json, emit a JSON error object (matching the
-                    // `symbol` command and the daemon path) instead of only a
+                    // nw-086: under --json, emit a JSON object instead of only a
                     // plain-text stderr line a --json consumer can't parse.
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "error": "not found",
-                                "name": name_or_uid,
-                            }))?
+                            serde_json::to_string_pretty(&impact_json_not_found(&name_or_uid))?
                         );
                     } else {
                         eprintln!("Symbol '{name_or_uid}' not found.");
@@ -8680,7 +9782,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 ResolveResult::Ambiguous(candidates) => {
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&candidates)?);
+                        // Carries `candidates`, never `nodes` — a bare array here
+                        // was indistinguishable from a result set, so a mistyped
+                        // name looked like a successful impact query (nw-111).
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&impact_json_ambiguous(
+                                &name_or_uid,
+                                serde_json::to_value(&candidates)?
+                            ))?
+                        );
                     } else {
                         eprintln!(
                             "Ambiguous: '{}' matches {} symbols:",
@@ -9160,7 +10271,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        render_investigate_text(&value);
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -9180,56 +10295,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(token_budget),
                 None,
             )?;
+            // Built unconditionally so text and JSON render from the SAME
+            // payload, and so the daemon path can reuse the renderer (nw-108).
+            let payload = serde_json::to_value(&result)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                println!("Bundle: {}  (query: {:?})", result.bundle_id, result.query);
-                println!(
-                    "{} domain(s), {} entr{}{}",
-                    result.domains.len(),
-                    result.entries.len(),
-                    if result.entries.len() == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    },
-                    if result.more_available > 0 {
-                        format!(
-                            " ({} more available — raise --token-budget)",
-                            result.more_available
-                        )
-                    } else {
-                        String::new()
-                    }
-                );
-                for d in &result.domains {
-                    println!("\n[{}]", d.label);
-                    for asset_id in &d.members {
-                        if let Some(e) = result.entries.iter().find(|e| &e.asset_id == asset_id) {
-                            let marker = if e.asset_id == d.entry_point {
-                                "*"
-                            } else {
-                                " "
-                            };
-                            println!(
-                                "  {marker} {}  {} ({})  {}",
-                                e.asset_id, e.title, e.kind, e.location
-                            );
-                            if let Some(s) = &e.summary {
-                                let truncated = if e.inline_body.is_some() && !e.body_complete {
-                                    " [truncated]"
-                                } else {
-                                    ""
-                                };
-                                println!("      {s}{truncated}");
-                            }
-                        }
-                    }
-                }
-                println!(
-                    "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
-                    result.bundle_id
-                );
+                render_investigate_text(&payload);
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -9751,6 +10823,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
             let socket = nestweaver_daemon::socket_path(&instance_id);
             let log_file = nestweaver_daemon::log_path(&instance_id);
+            // `log_file` is the real stderr sink (it goes in the plist and gets
+            // opened for redirect below). It is NOT what an operator should be
+            // told to read: tracing writes to `daemon.log.<date>` alongside it,
+            // so every human-facing pointer uses the hint instead. See nw-118.
+            let log_hint = nestweaver_daemon::log_hint(&instance_id);
 
             match action {
                 DaemonAction::Start {
@@ -9865,7 +10942,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     .display()
                             );
                             eprintln!("  Socket: {}", socket.display());
-                            eprintln!("  Log:    {}", log_file.display());
+                            eprintln!("  Log:    {log_hint}");
 
                             // Poll connect_existing + health_check
                             // (wait_healthy never auto-starts) instead of the
@@ -9891,9 +10968,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     // still turn into a healthy daemon.
                                     eprintln!(
                                         "Daemon is still booting under launchd; check \
-                                         `nestweaver daemon --db {} status` and the log at {}",
+                                         `nestweaver daemon --db {} status` and the logs at {}",
                                         db_path.display(),
-                                        log_file.display()
+                                        log_hint
                                     );
                                     return Ok((EXIT_SUCCESS, None));
                                 }
@@ -10055,7 +11132,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         eprintln!("  PID file: {}", pidfile.display());
                         eprintln!("  Socket:   {}", socket.display());
-                        eprintln!("  Log:      {}", log_file.display());
+                        eprintln!("  Log:      {log_hint}");
 
                         let daemonize = daemonize2::Daemonize::new()
                             .pid_file(&pidfile)
@@ -10108,9 +11185,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 if !parent.first_child_exit_status.success() {
                                     eprintln!(
                                         "Error: daemon failed to start (boot exit status {}). \
-                                         Check the log: {}",
-                                        parent.first_child_exit_status,
-                                        log_file.display()
+                                         Check the logs: {}",
+                                        parent.first_child_exit_status, log_hint
                                     );
                                     std::process::exit(EXIT_ERROR);
                                 }
@@ -10121,8 +11197,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                                 eprintln!(
                                     "Error: daemon did not start accepting connections within \
-                                     10s — it may have died during boot. Check the log: {}",
-                                    log_file.display()
+                                     10s — it may have died during boot. Check the logs: {}",
+                                    log_hint
                                 );
                                 std::process::exit(EXIT_ERROR);
                             }
@@ -10347,7 +11423,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
-                        println!("  Log:    {}", log_file.display());
+                        println!("  Log:    {log_hint}");
                         print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -10362,7 +11438,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("Daemon is running (PID {pid})");
                             println!("  DB:     {}", db_path.display());
                             println!("  Socket: {}", socket.display());
-                            println!("  Log:    {}", log_file.display());
+                            println!("  Log:    {log_hint}");
                             print_daemon_embedding_status(&db_path);
                         } else {
                             println!(
@@ -10380,7 +11456,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("Daemon is running (PID {pid}, serving socket)");
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
-                        println!("  Log:    {}", log_file.display());
+                        println!("  Log:    {log_hint}");
                         print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -10661,6 +11737,45 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
                 if let Some(error) = capabilities["metal_runtime_error"].as_str() {
                     println!("  Runtime probe error: {error}");
+                }
+
+                // Parity contract: if --json reports a caveat, the human output
+                // must say so too.
+                let crash = &capabilities["crash_recurrence"];
+                println!("  Crash recurrence (nw-073):");
+                println!(
+                    "    Signature: {}",
+                    crash["signature"].as_str().unwrap_or("unknown")
+                );
+                println!(
+                    "    Status:    {}",
+                    crash["status"].as_str().unwrap_or("unknown")
+                );
+                match crash["crash_reports_matched"].as_u64() {
+                    Some(matched) => println!(
+                        "    Matched:   {matched} of {} candidate report(s) across {} directories",
+                        crash["reports_examined"], crash["directories_read"]
+                    ),
+                    None => println!("    Matched:   unknown (nothing was scanned)"),
+                }
+                for report in crash["matched_reports"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                {
+                    println!("      - {report}");
+                }
+                for problem in crash["unreadable"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                {
+                    println!("    Unreadable: {problem}");
+                }
+                if let Some(note) = crash["note"].as_str() {
+                    println!("    {note}");
                 }
             }
             Ok((EXIT_SUCCESS, None))
@@ -11457,13 +12572,59 @@ fn try_hybrid_json_rpc(
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {
-        Ok(mut hybrid) => rt.block_on(hybrid.query(rpc_name, &args)).ok(),
-        Err(_) => rt
-            .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
-                config, &start_dir, rpc_name, &args,
-            ))
-            .ok(),
+        Ok(mut hybrid) => match rt.block_on(hybrid.query(rpc_name, &args)) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
+                None
+            }
+        },
+        Err(e) => {
+            let upstream = rt
+                .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+                    config, &start_dir, rpc_name, &args,
+                ))
+                .ok();
+            if upstream.is_none() {
+                warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
+            }
+            upstream
+        }
     }
+}
+
+/// Disclose that a command could not be served by the daemon and is about to be
+/// answered by the direct path instead.
+///
+/// nw-125: this fallback was completely silent — exit 0, nothing on stderr, a
+/// result that looks authoritative. Meanwhile asking for the same bypass
+/// explicitly is REFUSED, with a warning about WAL corruption and a demand for
+/// `NESTWEAVER_ALLOW_NO_DAEMON=1`. The tool policed a deliberate request while
+/// doing the same thing unprompted whenever the daemon was slow or down.
+///
+/// That matters beyond consistency: the direct path is not equivalent. It
+/// returns different rankings for `investigate` (nw-120), omits the embedding
+/// block from `brain status` (nw-121), and — the case that produced nw-126 —
+/// opens read-only, so it cannot replay a crashed daemon's WAL and converts a
+/// self-healing outage into a hard failure.
+///
+/// Warn once per process: a single command can route several RPCs through here,
+/// and repeating the paragraph per call would train the user to ignore it.
+fn warn_daemon_bypassed(db_path: &std::path::Path, rpc_name: &str, cause: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "Warning: the daemon could not serve `{rpc_name}` for {} — answering from the \
+         direct path instead.\n  cause: {cause}\n  \
+         Results may differ from the daemon's, and writes are not protected by the \
+         daemon's single-writer lock. Start it with `nestweaver daemon --db {} start`, \
+         or raise NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS if it is simply slow to boot.",
+        db_path.display(),
+        db_path.display()
+    );
 }
 
 /// Unwrap the `{ "results": [...], "_meta": {...} }` envelope that the hybrid
@@ -12255,6 +13416,20 @@ fn run_brain(
                 println!("  Tags:      {tag_count}");
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
+                // nw-121: the daemon prints an `Embedding:` block here and this
+                // path printed nothing at all — same command, same database,
+                // silently different answer. An omitted section reads as "no
+                // such concept", so a user could not tell that semantic
+                // retrieval state was simply unknown. Embedding state is
+                // RUNTIME state owned by the daemon (model actually loaded,
+                // device actually selected), so this path genuinely cannot
+                // report it — but saying so is not the same as saying nothing.
+                println!("Embedding:");
+                println!(
+                    "  State:            unknown (runtime state is held by the daemon; \
+                     start it with `nestweaver daemon --db {} start`)",
+                    db_path.display()
+                );
                 // Interaction tracking is opt-in (enabled via `mcp
                 // --track-interactions`). InteractionTracker::new touches
                 // the sidecar at startup so we can distinguish three states:
@@ -12821,14 +13996,82 @@ fn run_brain(
                     .unwrap_or("vault")
                     .to_string()
             });
-            // nw-019: --instance flag > config's instance_id > "default"
-            // (mirrors `brain add`/`brain watch`; fixes vaults being tagged
-            // under the literal "default" instead of the config's instance).
-            let instance_id = resolve_instance_id(instance, config.as_deref())?;
             let extra_patterns = parse_ignore_flag(&ignore);
+            let canonical = abs_for_daemon(&path);
+
+            // nw-098: resolve the instance from any EXISTING registration for this
+            // root before falling back to flag > config > "default".
+            //
+            // `resolve_instance_id` alone made a refresh with no `--instance`
+            // land on the literal "default" and register a SECOND vault for a
+            // root already registered under another instance. The root hash is
+            // identical in both UIDs, so the tool had everything it needed to
+            // know it was the same vault, and forked it anyway: note counts
+            // became the SUM and `brain search` started returning duplicate
+            // rows. The command documented in this repo's own CLAUDE.md did
+            // this.
+            let existing =
+                vault_registrations_for_root(use_daemon, &db_path, config.as_deref(), &canonical);
+            let explicit = explicit_instance_id(instance.as_deref(), config.as_deref());
+            let instance_id = match existing.as_slice() {
+                // Nothing registered here yet — a genuine create.
+                [] => resolve_instance_id(instance, config.as_deref())?,
+                [(registered, uid)] => match &explicit {
+                    // An explicit instance that disagrees with the registration
+                    // is a mistake, not an instruction to fork. Name both and
+                    // refuse.
+                    Some(asked) if asked != registered => {
+                        eprintln!(
+                            "Error: {} is already registered under instance '{registered}' ({uid}), \n\
+                             but --instance/--config asked for '{asked}'.\n\
+                             Refusing to create a second vault for the same root — that splits \n\
+                             note counts and makes `brain search` return duplicate rows.\n\
+                             help: re-run with --instance {registered} to refresh it in place, \n\
+                             or use a different root path.",
+                            canonical.display()
+                        );
+                        return Ok((EXIT_ERROR, None));
+                    }
+                    // Adopt the registration. This is the case the bug broke:
+                    // the caller expressed no intent, so refresh what is there.
+                    _ => registered.clone(),
+                },
+                // Already forked (this is the nw-098 damage state). An
+                // explicit instance that names one of them is actionable;
+                // anything else would be a guess that compounds the fork.
+                many => {
+                    let names = many
+                        .iter()
+                        .map(|(inst, _)| inst.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match &explicit {
+                        Some(asked) if many.iter().any(|(inst, _)| inst == asked) => asked.clone(),
+                        Some(asked) => {
+                            eprintln!(
+                                "Error: {} is registered under {} instances ({names}), and \
+                                 --instance/--config asked for '{asked}', which is not one of them.\n\
+                                 help: pass --instance with one of: {names}",
+                                canonical.display(),
+                                many.len()
+                            );
+                            return Ok((EXIT_ERROR, None));
+                        }
+                        None => {
+                            eprintln!(
+                                "Error: {} is registered under {} instances ({names}).\n\
+                                 Refusing to guess which to refresh.\n\
+                                 help: pass --instance with one of: {names}",
+                                canonical.display(),
+                                many.len()
+                            );
+                            return Ok((EXIT_ERROR, None));
+                        }
+                    }
+                }
+            };
 
             // Compute vault UID for recording last_indexed_at.
-            let canonical = abs_for_daemon(&path);
             let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
 
             if use_daemon && since.is_none() {
@@ -13761,10 +15004,14 @@ fn run_brain(
                             }
                             _ => println!("Broken / ambiguous wikilinks ({}):", links.len()),
                         }
+                        print_link_classification(&links);
                         for l in &links {
                             println!(
-                                "  [[{}]] in {} (confidence {:.2})",
-                                l.wikilink_text, l.source_path, l.confidence
+                                "  [[{}]] in {} (confidence {:.2}) — {}",
+                                l.wikilink_text,
+                                l.source_path,
+                                l.confidence,
+                                describe_link_resolution(l)
                             );
                             if !l.suggested_target_uids.is_empty() {
                                 println!("    suggested: {}", l.suggested_target_uids.join(", "));
@@ -13792,10 +15039,14 @@ fn run_brain(
                 println!("No broken or ambiguous wikilinks found.");
             } else {
                 println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
+                print_link_classification(&links);
                 for l in &links {
                     println!(
-                        "  [[{}]] in {} (confidence {:.2})",
-                        l.wikilink_text, l.source_path, l.confidence
+                        "  [[{}]] in {} (confidence {:.2}) — {}",
+                        l.wikilink_text,
+                        l.source_path,
+                        l.confidence,
+                        describe_link_resolution(l)
                     );
                     if !l.suggested_target_uids.is_empty() {
                         println!("    suggested: {}", l.suggested_target_uids.join(", "));
@@ -14125,6 +15376,10 @@ fn run_brain(
                     println!("  total notes:      {}", stats.total_notes);
                     println!("  total wikilinks:  {}", stats.total_wikilinks);
                     println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                    println!(
+                        "  low-confidence (resolved, not broken): {}",
+                        stats.low_confidence_wikilinks
+                    );
                     println!("  orphans:          {}", stats.orphans);
                     println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
                     if !stats.top_tags.is_empty() {
@@ -14155,6 +15410,10 @@ fn run_brain(
                 println!("  total notes:      {}", stats.total_notes);
                 println!("  total wikilinks:  {}", stats.total_wikilinks);
                 println!("  broken wikilinks: {}", stats.broken_wikilinks);
+                println!(
+                    "  low-confidence (resolved, not broken): {}",
+                    stats.low_confidence_wikilinks
+                );
                 println!("  orphans:          {}", stats.orphans);
                 println!("  avg out-degree:   {:.2}", stats.avg_outdegree);
                 if !stats.top_tags.is_empty() {
@@ -14284,13 +15543,72 @@ fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
     (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
 }
 
+/// Render a `clusters` result in either mode.
+///
+/// Shared so the cached and freshly-computed paths cannot drift (nw-075): the
+/// whole point of serving a cache is that the caller cannot tell the difference.
+fn print_clusters_output(
+    output: &nestweaver_engine::ClusteringOutput,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(output)?);
+    } else if output.communities.is_empty() {
+        println!("No communities detected (graph may be empty or fully disconnected).");
+    } else {
+        println!(
+            "Clusters ({}, modularity={:.4}):\n",
+            output.communities.len(),
+            output.modularity
+        );
+        for c in &output.communities {
+            println!(
+                "  [{:>3}] {} ({} members, cohesion={:.2})",
+                c.id, c.name, c.member_count, c.cohesion
+            );
+            for f in &c.key_files {
+                println!("        {f}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Header line for `brain context` seeds.
+///
+/// nw-102: `seeds` mixes nodes resolved from the query text with nearest
+/// neighbours injected by the semantic leg, and counting both as "resolved"
+/// made the output contradict itself — a nonsense query printed
+/// `Seeds (5 resolved)` while the same response listed that query under
+/// `Unresolved seeds (1)`. Reports PROVENANCE, not quality: a phrase like
+/// "blast radius" fails a direct lookup against the symbol `blast_radius` yet
+/// its semantic hits are excellent, so labelling them guesses would understate
+/// them exactly as counting them as direct matches overstated them.
+fn seed_header(total_seeds: usize, semantic_seeds: usize) -> String {
+    let matched = total_seeds.saturating_sub(semantic_seeds);
+    if semantic_seeds > 0 {
+        format!("Seeds ({matched} matched directly, {semantic_seeds} via semantic search):")
+    } else {
+        format!("Seeds ({matched} resolved):")
+    }
+}
+
 fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {
     // Feature F7: show PRF-mined expansion terms for auditing.
     if !result.expansion_terms.is_empty() {
         println!("PRF expansion terms: {}", result.expansion_terms.join(", "));
         println!();
     }
-    println!("Seeds ({} resolved):", result.seeds.len());
+    // nw-102: `seeds` mixes two different things — nodes actually resolved from
+    // the query, and nearest-neighbour guesses injected by the semantic leg,
+    // which vector KNN returns regardless of how distant they are. Counting
+    // both as "resolved" made the output contradict itself: a nonsense query
+    // printed `Seeds (5 resolved)` while ALSO listing that same query under
+    // `Unresolved seeds (1)`. Report the two separately.
+    println!(
+        "{}",
+        seed_header(result.seeds.len(), result.semantic_seed_count)
+    );
     for n in &result.seeds {
         if n.location.is_empty() {
             println!("  {}  [{}]", n.title, n.kind);
@@ -14304,6 +15622,17 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
         println!("Unresolved seeds ({}):", result.unresolved_seeds.len());
         for s in &result.unresolved_seeds {
             println!("  {s}");
+        }
+        if result.seeds.len() == result.semantic_seed_count && result.semantic_seed_count > 0 {
+            // State HOW the seeds were found, not how good they are. A phrase
+            // like "blast radius" fails a direct lookup against the symbol
+            // `blast_radius` yet its semantic hits are excellent, so calling
+            // them guesses would understate them just as counting them as
+            // direct matches overstated them.
+            println!(
+                "  note: no seed matched the query text directly; the seeds above \
+                 came from semantic similarity."
+            );
         }
     }
 
@@ -15886,8 +17215,11 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
                     "Merged '{from}' -> '{to}': {} vault(s), {} repo(s), {} project(s)",
                     result.vaults_reparented, result.repos_reparented, result.projects_reparented
                 );
-                for d in &result.discarded_vaults {
-                    eprintln!("Note: {d}");
+                if !result.discarded_vaults.is_empty() {
+                    eprintln!(
+                        "{}",
+                        merge_discarded_vault_guidance(&result.discarded_vaults, &to)
+                    );
                 }
                 if !result.repos_needing_reindex.is_empty() {
                     eprintln!("{}", merge_reindex_guidance(&result.repos_needing_reindex));
@@ -15928,6 +17260,30 @@ fn run_instance(command: InstanceCommands) -> anyhow::Result<i32> {
     }
 }
 
+/// Guidance for vaults whose notes were discarded by a merge collision.
+///
+/// When two instances hold a vault at the same root, the one with fewer notes
+/// loses and its notes are dropped. That was reported as a bare
+/// `Note: <root> (N notes discarded)` with no remedy — a line that states data
+/// loss and stops. Notes are re-derivable from the files on disk, so say how
+/// (nw-112).
+fn merge_discarded_vault_guidance(discarded: &[String], to_instance: &str) -> String {
+    let mut guidance = String::from(
+        "\nNOTE: a vault collision discarded notes from the losing vault.\n\
+         Those notes are re-derivable from the files on disk — re-index each root \
+         below under the target instance to restore them:\n",
+    );
+    for entry in discarded {
+        guidance.push_str("  ");
+        guidance.push_str(entry);
+        guidance.push('\n');
+    }
+    guidance.push_str(&format!(
+        "  nestweaver brain refresh <root> --instance {to_instance}"
+    ));
+    guidance
+}
+
 fn merge_reindex_guidance(repos: &[String]) -> String {
     let mut guidance = String::from(
         "\nNOTE: source repo graph rows were removed during merge.\n\
@@ -15944,8 +17300,67 @@ fn merge_reindex_guidance(repos: &[String]) -> String {
 }
 
 #[cfg(test)]
+mod refresh_instance_resolution_tests {
+    use super::*;
+
+    /// nw-098: with no `--instance` and no config, the caller expressed no
+    /// intent — so `resolve_instance_id` yields the literal "default", which is
+    /// exactly what forked a vault already registered elsewhere. The refresh arm
+    /// must therefore consult the registration rather than trust this value, and
+    /// `explicit_instance_id` is what lets it tell the two apart.
+    #[test]
+    fn no_flag_and_no_config_is_not_an_explicit_instance() {
+        assert_eq!(explicit_instance_id(None, None), None);
+        // An empty --instance is treated as unset, matching resolve_instance_id.
+        assert_eq!(explicit_instance_id(Some(""), None), None);
+        // Meanwhile the resolver still reports "default" — the value that made
+        // the fork silent.
+        assert_eq!(resolve_instance_id(None, None).unwrap(), "default");
+    }
+
+    #[test]
+    fn an_explicit_flag_is_reported_as_explicit() {
+        assert_eq!(
+            explicit_instance_id(Some("kory-brain"), None).as_deref(),
+            Some("kory-brain")
+        );
+    }
+
+    /// A database that does not exist yet must report no registrations rather
+    /// than erroring: the first refresh of a new DB is a legitimate create.
+    #[test]
+    fn a_missing_database_reports_no_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.lbug");
+        let root = dir.path().join("vault");
+        let found = vault_registrations_for_root(false, &missing, None, &root);
+        assert!(found.is_empty(), "got: {found:?}");
+    }
+}
+
+#[cfg(test)]
 mod merge_instance_guidance_tests {
     use super::*;
+
+    /// nw-112: a discarded-vault line must carry a remedy, not just announce
+    /// data loss. The notes are re-derivable from disk, so the guidance names
+    /// the refresh command and the target instance.
+    #[test]
+    fn discarded_vault_guidance_names_the_refresh_and_target_instance() {
+        let guidance = merge_discarded_vault_guidance(
+            &["/Users/me/brain (945 notes discarded)".to_string()],
+            "kory-brain",
+        );
+        assert!(guidance.contains("945 notes discarded"));
+        assert!(
+            guidance.contains("brain refresh"),
+            "must name the remedy: {guidance}"
+        );
+        assert!(
+            guidance.contains("--instance kory-brain"),
+            "must name the target instance so the refresh does not create a second vault: {guidance}"
+        );
+    }
 
     #[test]
     fn reindex_guidance_describes_removed_then_recreated_graph_rows() {
@@ -17513,6 +18928,40 @@ mod hybrid_cli_tests {
         );
     }
 
+    /// nw-108 (4): EVERY read-only open must produce the `db_not_found`
+    /// diagnostic on a missing database, not just the commands that happen to
+    /// call `require_existing_db` first.
+    ///
+    /// `open_read_only` reports a missing file as "Cannot create an empty
+    /// database under READ ONLY mode" — it names a creation the caller never
+    /// requested, and the error mapper cannot recognise it (its heuristic wants
+    /// "failed to open database" AND "no such file"). A dozen read commands
+    /// leaked that raw text with no remedy. Guarding inside `open_store` covers
+    /// all 57 read-only call sites at once.
+    #[test]
+    fn open_store_reports_db_not_found_rather_than_the_raw_store_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.lbug");
+
+        let err = match open_store(Some(&missing)) {
+            Ok(_) => panic!("a missing db must not open"),
+            Err(e) => e,
+        };
+        let rendered = format!("{:?}", into_diagnostic(err));
+
+        assert!(
+            rendered.contains("db_not_found"),
+            "expected the db_not_found diagnostic, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Cannot create an empty database"),
+            "the raw store error must not leak — it names a creation the caller \
+             never asked for: {rendered}"
+        );
+        // Opening read-only must not have materialised anything.
+        assert!(!missing.exists());
+    }
+
     /// nw-087: a nonexistent --db must fail with the db_not_found
     /// diagnostic (exit 1), not silently create/spawn anything.
     #[test]
@@ -17533,6 +18982,166 @@ mod hybrid_cli_tests {
         let present = dir.path().join("present.lbug");
         std::fs::write(&present, b"").unwrap();
         assert!(require_existing_db(&present).is_ok());
+    }
+
+    /// nw-102: a seed injected by the semantic leg must never be counted as
+    /// "resolved". Counting them together let one response claim a query both
+    /// resolved AND unresolved at the same time.
+    #[test]
+    fn seed_header_never_counts_semantic_hits_as_resolved() {
+        // The reported case: nothing matched, five nearest neighbours injected.
+        let h = seed_header(5, 5);
+        assert!(h.contains("0 matched directly"), "{h}");
+        assert!(h.contains("5 via semantic search"), "{h}");
+        assert!(
+            !h.contains("5 resolved"),
+            "must not report semantic guesses as resolved: {h}"
+        );
+
+        // Genuine direct matches, no semantic leg.
+        assert_eq!(seed_header(3, 0), "Seeds (3 resolved):");
+
+        // Mixed: two direct, three semantic.
+        let m = seed_header(5, 3);
+        assert!(
+            m.contains("2 matched directly") && m.contains("3 via semantic search"),
+            "{m}"
+        );
+    }
+
+    /// Defensive: the counts arrive from a daemon response, so a malformed or
+    /// older payload must not underflow the subtraction.
+    #[test]
+    fn seed_header_does_not_underflow_on_inconsistent_counts() {
+        let h = seed_header(2, 9);
+        assert!(h.contains("0 matched directly"), "{h}");
+    }
+
+    /// nw-123: the impact envelope's key set must not depend on which
+    /// truncation path ran. `--depth 1` carried `returned`/`total`;
+    /// `--min-score 0.9` silently dropped them while still returning 3 nodes,
+    /// so a consumer got `undefined` precisely when the result was incomplete.
+    #[test]
+    fn impact_envelope_key_set_is_identical_across_truncation_paths() {
+        let nodes = serde_json::json!([{"name": "a"}, {"name": "b"}, {"name": "c"}]);
+
+        let by_depth = impact_json_ok("s", nodes.clone(), false, true, Some(9), Some(3), None);
+        // The threshold path is the one that used to omit the counts.
+        let by_threshold = impact_json_ok("s", nodes.clone(), true, false, None, None, None);
+
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(&by_depth),
+            keys(&by_threshold),
+            "envelope keys must not vary by truncation path"
+        );
+
+        for env in [&by_depth, &by_threshold] {
+            assert!(env.get("returned").is_some(), "returned must always exist");
+            assert!(env.get("total").is_some(), "total must always exist");
+        }
+
+        // `returned` reflects what was actually returned, even when the caller
+        // did not supply it.
+        assert_eq!(by_threshold["returned"], serde_json::json!(3));
+        // An unknown total is null — never backfilled from `returned`, which
+        // would assert a completeness that was not established.
+        assert!(
+            by_threshold["total"].is_null(),
+            "unknown total must be null, not a fabricated count: {by_threshold}"
+        );
+        assert_eq!(by_depth["total"], serde_json::json!(9));
+    }
+
+    /// nw-126: the incident message, verbatim. A SIGKILLed daemon left a stale
+    /// WAL; the daemon's open failure was text-matched into `db_not_found` and
+    /// rendered a live 5.6 GB database as "Database not found", with help
+    /// telling the user to `index` a new one AT THAT PATH. Following it would
+    /// have destroyed data that was fully recoverable — the entire outage was
+    /// one stale 42-byte file.
+    ///
+    /// The guard is to consult the filesystem rather than the error text.
+    #[test]
+    fn existing_database_is_never_diagnosed_as_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not empty").unwrap();
+
+        let err = anyhow::anyhow!(
+            "failed to open database with write access at {}; another process \
+             may hold the write lock: database error: no such file",
+            db.display()
+        );
+        let rendered = format!("{:?}", into_diagnostic(err));
+
+        assert!(
+            !rendered.contains("db_not_found"),
+            "a database that EXISTS must never be reported as not found: {rendered}"
+        );
+        assert!(
+            !rendered.contains("to create a database"),
+            "must never advise creating a database where one already exists — \
+             that is the data-destroying suggestion: {rendered}"
+        );
+        assert!(
+            rendered.contains("db_unavailable") || rendered.contains("db_wal_unreplayed"),
+            "expected an availability diagnostic, got: {rendered}"
+        );
+    }
+
+    /// nw-126: with a stale `.wal` present the diagnostic must name it and give
+    /// the read-write remedy, since replay is impossible on the read-only path
+    /// that usually reports the failure.
+    #[test]
+    fn stale_wal_is_named_with_a_read_write_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"data").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"stale").unwrap();
+
+        let err = anyhow::anyhow!(
+            "failed to open database with write access at {}; another process \
+             may hold the write lock: no such file",
+            db.display()
+        );
+        let rendered = format!("{:?}", into_diagnostic(err));
+
+        assert!(
+            rendered.contains("db_wal_unreplayed"),
+            "a present .wal must be diagnosed specifically: {rendered}"
+        );
+        assert!(
+            rendered.contains("daemon") && rendered.contains("start"),
+            "the remedy must be the read-write open that can actually replay: {rendered}"
+        );
+    }
+
+    /// nw-126: the read-only path's own words. `open_read_only` reports
+    /// "Couldn't replay shadow pages under read-only mode. Please re-open the
+    /// database with read-write mode" — a correct diagnosis whose advice that
+    /// path structurally cannot follow. It previously fell through to a bare
+    /// `nestweaver::error` with no remedy at all.
+    #[test]
+    fn shadow_page_replay_failure_gets_an_actionable_diagnostic() {
+        let err = anyhow::anyhow!(
+            "failed to open database at /tmp/x/brain.lbug: database error: Runtime \
+             exception: Couldn't replay shadow pages under read-only mode. Please \
+             re-open the database with read-write mode to replay shadow pages."
+        );
+        let rendered = format!("{:?}", into_diagnostic(err));
+
+        assert!(
+            rendered.contains("db_wal_unreplayed"),
+            "expected the WAL diagnostic, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("to create a database"),
+            "must not advise creating a database: {rendered}"
+        );
     }
 
     /// A create-path store error ("open/create store at
@@ -18630,6 +20239,7 @@ mod diagnostics_cli_tests {
             true,
             true,
             Err("Metal compute/readback failed".to_string()),
+            crash_recurrence_value(&CrashRecurrenceScan::default()),
         );
         assert_eq!(value["embedding_compiled"], true);
         assert_eq!(value["metal_compiled"], true);
@@ -18638,6 +20248,161 @@ mod diagnostics_cli_tests {
             value["metal_runtime_error"],
             "Metal compute/readback failed"
         );
+    }
+
+    // ── nw-073 crash-recurrence detection ────────────────────────────────
+
+    /// The defect this guards against is the reason the check is worth having.
+    /// `*.cpu_resource.diag` reports are stack samples of a HEALTHY process and
+    /// routinely contain `optimisticRead`, because it is a hot read path. If
+    /// they counted, the tool would announce a use-after-free on every warm
+    /// index run.
+    #[test]
+    fn resource_diagnostics_are_not_crash_reports() {
+        let sampled_frame = "6   lbug::storage::BufferManager::optimisticRead(...)";
+
+        for benign in [
+            "nestweaver_2026-07-25-111137_Host.cpu_resource.diag",
+            "nestweaver_2026-07-27-062200_Host.diag",
+            "nestweaver_2026-07-24-153529_Host.wakeups_resource.diag",
+        ] {
+            assert!(
+                !is_crash_report_file(benign),
+                "{benign} is a resource diagnostic, not a crash"
+            );
+            assert!(
+                !crash_report_matches_signature(benign, sampled_frame),
+                "{benign} must not match even though it samples the frame"
+            );
+        }
+
+        for crash in [
+            "nestweaver-2026-07-25-111137.ips",
+            "nestweaver_2026-07-25-111137_Host.crash",
+        ] {
+            assert!(is_crash_report_file(crash), "{crash} is a crash report");
+        }
+    }
+
+    #[test]
+    fn signature_match_requires_both_the_process_and_the_frame() {
+        let frame = "lbug::storage::BufferManager::optimisticRead";
+
+        assert!(crash_report_matches_signature("nestweaver-1.ips", frame));
+        // Another process crashing in lbug is not our recurrence signal.
+        assert!(!crash_report_matches_signature(
+            "spotlightknowledged.ips",
+            frame
+        ));
+        // Our process crashing elsewhere is a different bug.
+        assert!(!crash_report_matches_signature(
+            "nestweaver-1.ips",
+            "core::panicking::panic_bounds_check"
+        ));
+    }
+
+    /// A scan that could not read anything must not report zero. This is the
+    /// nw-062 defect: a caller cannot distinguish "no findings" from "no data".
+    #[test]
+    fn an_unreadable_scan_reports_unknown_rather_than_zero() {
+        let scan = CrashRecurrenceScan {
+            supported: true,
+            directories_read: 0,
+            ..Default::default()
+        };
+        let value = crash_recurrence_value(&scan);
+
+        assert_eq!(value["status"], "unavailable");
+        assert!(
+            value["crash_reports_matched"].is_null(),
+            "an unscanned run must not claim a count"
+        );
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("UNKNOWN"),
+            "the note must not read as a clean bill of health"
+        );
+    }
+
+    #[test]
+    fn a_partial_scan_does_not_present_its_zero_as_exhaustive() {
+        let scan = CrashRecurrenceScan {
+            supported: true,
+            directories_read: 2,
+            unreadable: vec!["/Library/Logs/DiagnosticReports: denied".to_string()],
+            reports_examined: 4,
+            ..Default::default()
+        };
+        let value = crash_recurrence_value(&scan);
+
+        assert_eq!(value["status"], "partial");
+        assert_eq!(value["crash_reports_matched"], 0);
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not exhaustive")
+        );
+    }
+
+    #[test]
+    fn a_clean_scan_says_the_mitigation_is_holding() {
+        let scan = CrashRecurrenceScan {
+            supported: true,
+            directories_read: 4,
+            reports_examined: 0,
+            ..Default::default()
+        };
+        let value = crash_recurrence_value(&scan);
+
+        assert_eq!(value["status"], "scanned");
+        assert_eq!(value["crash_reports_matched"], 0);
+    }
+
+    #[test]
+    fn a_matched_scan_calls_the_mitigation_out_as_failing() {
+        let scan = CrashRecurrenceScan {
+            supported: true,
+            directories_read: 4,
+            reports_examined: 3,
+            matched_reports: vec!["nestweaver-2026-07-28.ips".to_string()],
+            ..Default::default()
+        };
+        let value = crash_recurrence_value(&scan);
+
+        assert_eq!(value["status"], "scanned");
+        assert_eq!(value["crash_reports_matched"], 1);
+        let note = value["note"].as_str().unwrap_or_default();
+        assert!(note.contains("STILL FIRING"), "note was: {note}");
+    }
+
+    /// End-to-end over a fixture directory, via the documented override. This
+    /// is the only test that exercises the filesystem sweep itself.
+    #[test]
+    fn the_sweep_separates_crash_reports_from_resource_diagnostics_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let frame = "lbug::storage::BufferManager::optimisticRead(FileHandle&)";
+
+        std::fs::write(dir.path().join("nestweaver-2026-07-28.ips"), frame).expect("write crash");
+        std::fs::write(
+            dir.path()
+                .join("nestweaver_2026-07-28_Host.cpu_resource.diag"),
+            frame,
+        )
+        .expect("write diag");
+        std::fs::write(dir.path().join("otherproc-2026-07-28.ips"), frame).expect("write other");
+
+        let scan = scan_crash_reports_in(&[dir.path().to_path_buf()], true);
+
+        assert_eq!(scan.status(), "scanned");
+        assert_eq!(scan.directories_read, 1);
+        assert_eq!(
+            scan.reports_examined, 1,
+            "only the nestweaver .ips is a candidate"
+        );
+        assert_eq!(scan.matched_reports, vec!["nestweaver-2026-07-28.ips"]);
     }
 
     #[test]
@@ -18874,6 +20639,21 @@ mod cli_bounds_tests {
                         &["0"],
                         &["1", "20"],
                     ),
+                    // nw-108: the FLOAT ranges were the gap. Every integer
+                    // range above was already enforced by clap, but
+                    // `--confidence 5.0` and `--min-score 9.9` parsed happily
+                    // and returned an empty result at exit 0 — indistinguishable
+                    // from "nothing depends on this symbol".
+                    (
+                        &["nestweaver", "impact", "sym", "--confidence"],
+                        &["-0.1", "1.1", "5.0", "nan", "abc"],
+                        &["0", "0.0", "0.5", "1", "1.0"],
+                    ),
+                    (
+                        &["nestweaver", "impact", "sym", "--min-score"],
+                        &["-0.1", "1.1", "9.9", "inf", "abc"],
+                        &["0", "0.0", "0.1", "1", "1.0"],
+                    ),
                 ];
                 for (prefix, bad, good) in cases {
                     for v in *bad {
@@ -18888,6 +20668,42 @@ mod cli_bounds_tests {
                         let mut argv = prefix.to_vec();
                         argv.push(v);
                         assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} must parse");
+                    }
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// nw-108: `--kinds` documents a closed set but silently dropped unknown
+    /// tokens, so `--kinds Bogus` returned zero matches at exit 0 and a typo
+    /// looked exactly like a real empty result. Case-insensitive matching is
+    /// preserved — only unknown values are now rejected.
+    #[test]
+    fn kinds_flag_rejects_values_outside_the_documented_set() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                for prefix in [
+                    ["nestweaver", "count-patterns", "pat", "--kinds"],
+                    ["nestweaver", "regex-search", "pat", "--kinds"],
+                ] {
+                    for bad in ["Bogus", "Sections", "note,Bogus", ""] {
+                        let mut argv = prefix.to_vec();
+                        argv.push(bad);
+                        assert!(
+                            Cli::try_parse_from(&argv).is_err(),
+                            "{argv:?} must be rejected — a typo must not read as an empty result"
+                        );
+                    }
+                    for good in ["Section", "note", "SYMBOL", "Note,Symbol"] {
+                        let mut argv = prefix.to_vec();
+                        argv.push(good);
+                        assert!(
+                            Cli::try_parse_from(&argv).is_ok(),
+                            "{argv:?} must parse — matching stays case-insensitive"
+                        );
                     }
                 }
             })

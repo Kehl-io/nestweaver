@@ -1666,10 +1666,16 @@ fn cli_impact_on_empty_db_exits_not_found() {
 }
 
 #[test]
-fn cli_impact_json_is_array_and_notfound_is_object() {
-    // nw-086: `impact --json` must emit a bare node ARRAY on success and a JSON
-    // error OBJECT on not-found (never a plain-text-only stderr line), so a
-    // --json consumer can always parse the output.
+fn cli_impact_json_is_one_envelope_for_every_outcome() {
+    // nw-086 required a bare node ARRAY on success and an error OBJECT on
+    // not-found. nw-111 REPLACES that contract: the shape used to change with the
+    // outcome, and the ambiguous case returned a bare CANDIDATE array that was
+    // structurally indistinguishable from a result set — a mistyped name looked
+    // like a successful impact query, with only the exit code to tell them apart.
+    //
+    // Every outcome now returns one envelope discriminated by `status`. What
+    // nw-086 actually cared about — that a --json consumer can always parse the
+    // output — is preserved and strengthened.
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.lbug");
     let repo_dir = dir.path().join("repo");
@@ -1690,7 +1696,7 @@ fn cli_impact_json_is_array_and_notfound_is_object() {
         .assert()
         .success();
 
-    // Found → bare array (a calls b, so impact(b) is non-empty).
+    // Found → envelope with status "ok" (a calls b, so impact(b) is non-empty).
     let out = nestweaver_cmd()
         .args([
             "impact",
@@ -1703,9 +1709,14 @@ fn cli_impact_json_is_array_and_notfound_is_object() {
         .unwrap();
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("impact --json (found) must be valid JSON");
+    assert_eq!(
+        v.get("status").and_then(|s| s.as_str()),
+        Some("ok"),
+        "impact --json (found) must be a status:ok envelope, got: {v}"
+    );
     assert!(
-        v.is_array(),
-        "impact --json (found) must be a bare array, got: {v}"
+        v.get("nodes").is_some_and(|n| n.is_array()),
+        "the envelope must carry a nodes array, got: {v}"
     );
 
     // Not-found → JSON object with an `error` field, exit 2.
@@ -1725,6 +1736,15 @@ fn cli_impact_json_is_array_and_notfound_is_object() {
     assert!(
         v.get("error").is_some(),
         "not-found --json must carry an error field, got: {v}"
+    );
+    assert_eq!(
+        v.get("status").and_then(|s| s.as_str()),
+        Some("not_found"),
+        "not-found must be discriminated by status, got: {v}"
+    );
+    assert!(
+        v.get("nodes").is_none(),
+        "a not-found envelope must not carry nodes, got: {v}"
     );
 }
 

@@ -1542,6 +1542,9 @@ fn infer_cross_repo_call_edges(
         .collect();
     let mut edges = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // name -> store hits, memoised for this call (nw-127).
+    let mut name_lookup_cache: std::collections::HashMap<String, Vec<nestweaver_schema::Symbol>> =
+        std::collections::HashMap::new();
     for (rel_path, symbols, references, _) in parsed_files {
         // Names this file imports — corroborates a same-named cross-repo call.
         let imported_names: std::collections::HashSet<&str> = references
@@ -1570,15 +1573,31 @@ fn infer_cross_repo_call_edges(
             );
 
             // Collect eligible cross-repo candidates, then apply the ubiquity cap.
-            let candidates: Vec<_> = store
-                .lookup_symbols_by_name(&reference.name)
-                .map_err(|e| anyhow::anyhow!(e))?
-                .into_iter()
+            //
+            // nw-127: this is one store round-trip PER CALL SITE, and call names
+            // repeat heavily across a repo, so the same name was looked up
+            // thousands of times per run. The store is not mutated inside this
+            // loop (symbol writes happen earlier in the phase), so memoising the
+            // lookup for the duration of the call is a pure win.
+            let by_name = match name_lookup_cache.get(reference.name.as_str()) {
+                Some(hits) => hits,
+                None => {
+                    let hits = store
+                        .lookup_symbols_by_name(&reference.name)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    name_lookup_cache
+                        .entry(reference.name.clone())
+                        .or_insert(hits)
+                }
+            };
+            let candidates: Vec<_> = by_name
+                .iter()
                 .filter(|t| {
                     t.repo_uid != current_repo_uid
                         && t.uid != source_uid
                         && t.visibility != Visibility::Private
                 })
+                .cloned()
                 .collect();
             if candidates.is_empty() || candidates.len() > MAX_CROSS_REPO_NAME_CANDIDATES {
                 continue;
@@ -2604,8 +2623,23 @@ where
             .batch_insert_edges(&insertable_edges)
             .context("batch_insert_edges (resolved)")?;
 
-        let inferred_cross_repo_edges =
-            infer_cross_repo_call_edges(store, &r_uid, &parsed_files_for_resolver)?;
+        // nw-127: this walks EVERY parsed file — including unchanged ones, which
+        // are deliberately fed to the resolver — and issues a store lookup per
+        // call site. It ran unconditionally, so an index with zero changed files
+        // still paid for it: 57 minutes on a 755-file repo against a 130k-symbol
+        // graph, which is what pushed large repos past the 1800s ceiling and made
+        // them report failure for work that had actually succeeded.
+        //
+        // When nothing changed, this repo's call sites are identical to the last
+        // run and the edges it would infer are already in the database, so the
+        // whole pass is recomputing a known answer. Skipping matches what
+        // `skip_resolution` already does for ordinary resolution one block above,
+        // and for the same reason.
+        let inferred_cross_repo_edges = if skip_resolution {
+            Vec::new()
+        } else {
+            infer_cross_repo_call_edges(store, &r_uid, &parsed_files_for_resolver)?
+        };
         if !inferred_cross_repo_edges.is_empty() {
             edges_count += inferred_cross_repo_edges.len();
             store
@@ -2715,7 +2749,14 @@ where
         // Best-effort: a malformed spec or unexpected store error here must not
         // fail the whole index. Contracts are hypotheses layered on top of the
         // code graph.
-        if let Err(e) = derive_contracts(store, reader, &r_uid, &spec_files, &handler_files) {
+        if let Err(e) = derive_contracts(
+            store,
+            reader,
+            &r_uid,
+            &spec_files,
+            &handler_files,
+            &all_symbols,
+        ) {
             tracing::warn!("contract derivation failed (non-fatal): {e}");
         }
         tracing::info!(
@@ -2833,7 +2874,26 @@ where
         bump_generation_after_write,
     );
     match (graph_result, finalization) {
-        (Ok(result), Ok(())) => Ok(result),
+        (Ok(result), Ok(())) => {
+            // nw-124: stamp WHICH resolver produced this repo's edges. Some
+            // resolver fixes change edge shape rather than query behaviour
+            // (nw-103's import fan-out), so upgrading the binary leaves already
+            // indexed repos wrong and nothing said so. Recorded only on a fully
+            // successful, finalized index — a failed run must not claim the
+            // repo is current. Best-effort: a sidecar write failure must never
+            // fail an index that already committed.
+            if let Some(db_path) = store.db_path()
+                && let Err(e) = crate::resolver_generation::record(db_path, &r_uid)
+            {
+                tracing::warn!(
+                    repo = %r_uid,
+                    error = %e,
+                    "indexed successfully but could not record the resolver generation; \
+                     ranking staleness for this repo will be over-reported"
+                );
+            }
+            Ok(result)
+        }
         (Ok(_), Err(finalization)) => Err(finalization.into()),
         (Err(primary), Ok(())) => Err(primary),
         (Err(primary), Err(finalization)) => {
@@ -2865,6 +2925,7 @@ fn derive_contracts(
     r_uid: &str,
     spec_files: &[PathBuf],
     handler_files: &[HandlerFileData],
+    all_symbols: &[nestweaver_schema::Symbol],
 ) -> Result<(), anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
     use std::collections::HashSet;
@@ -2875,6 +2936,8 @@ fn derive_contracts(
     // 1. Declared contracts from specs.
     let mut all_contracts: Vec<nestweaver_schema::Contract> = Vec::new();
     let mut declared_uids: HashSet<String> = HashSet::new();
+    // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
+    let mut declared_grpc: Vec<(String, String)> = Vec::new();
     let repo_path = reader.root();
     for spec_path in spec_files {
         let rel = spec_path
@@ -2890,7 +2953,15 @@ fn derive_contracts(
             }
         };
         for sc in crate::contracts::parse_spec_file(&rel, &source) {
+            // Keep gRPC operations so implementations can be matched against the
+            // DECLARED contract rather than minting a UID from source (nw-104).
+            let grpc_operation = (sc.kind == "grpc")
+                .then(|| sc.operation_id.clone())
+                .flatten();
             let contract = sc.into_contract(r_uid, &rel, 1.0);
+            if let Some(operation) = grpc_operation {
+                declared_grpc.push((contract.uid.clone(), operation));
+            }
             declared_uids.insert(contract.uid.clone());
             all_contracts.push(contract);
         }
@@ -2929,6 +3000,60 @@ fn derive_contracts(
                     evidence: Vec::new(),
                 });
             }
+        }
+    }
+
+    // 3b. gRPC: link declared contracts to their Rust/tonic implementations
+    //     (nw-104).
+    //
+    // This does NOT go through `detect_handlers`. That path needs a framework
+    // hint, which `detect_frameworks` never produces for Rust, which in turn
+    // means no `HandlerFileData` is built — three gates that all had to be
+    // opened to reach a detector that also did not exist. Matching declared
+    // contracts against symbols here needs none of them, and the edge adopts the
+    // DECLARED uid so it provably points at a real contract.
+    if !declared_grpc.is_empty() {
+        // Group symbols by file so each candidate file is read once.
+        let mut by_file: std::collections::BTreeMap<&str, Vec<(String, String, u32)>> =
+            std::collections::BTreeMap::new();
+        for sym in all_symbols {
+            by_file.entry(sym.file_path.as_str()).or_default().push((
+                sym.uid.clone(),
+                sym.name.clone(),
+                sym.start_line,
+            ));
+        }
+
+        let mut linked = 0usize;
+        for (rel_path, symbols) in by_file {
+            // Cheap pre-filter: a tonic server implementation is a trait impl, so
+            // a file with no `impl ` at all cannot contain one. Avoids reading
+            // every source file in the repo.
+            let Ok(source) = reader.read_file(Path::new(rel_path)) else {
+                continue;
+            };
+            if !source.contains("impl ") {
+                continue;
+            }
+            for m in crate::contracts::detect_grpc_impls(&source, &declared_grpc, &symbols) {
+                edges.push(ResolvedEdge {
+                    source_uid: m.symbol_uid,
+                    target_uid: m.contract_uid,
+                    edge_type: EdgeType::ImplementsContract,
+                    // Exact service AND method match against a declared contract.
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: Vec::new(),
+                });
+                linked += 1;
+            }
+        }
+        if linked > 0 {
+            tracing::debug!(
+                linked,
+                declared = declared_grpc.len(),
+                "linked gRPC contracts to tonic implementations"
+            );
         }
     }
 
@@ -4989,6 +5114,69 @@ function hello(name) { return "Hello " + name; }
         assert!(
             implemented.contains(&"contract:http:POST:/v1/approvals".to_string()),
             "expected IMPLEMENTS_CONTRACT edge; implemented: {implemented:?}"
+        );
+    }
+
+    /// nw-104: a declared gRPC contract must link to its Rust/tonic
+    /// implementation.
+    ///
+    /// `contracts drift` reported 75 declared RPCs as unimplemented on this very
+    /// repo while every one of them was implemented, because nothing ever emitted
+    /// an IMPLEMENTS_CONTRACT edge for gRPC. The acceptance criterion for the bug
+    /// is that the EDGE appears — not merely that a drift count fell — so this
+    /// asserts the edge and that unimplemented RPCs still show as drift.
+    #[test]
+    fn grpc_proto_links_to_its_tonic_implementation() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("service.proto"),
+            "syntax = \"proto3\";\n\
+             package demo.v1;\n\
+             service Greeter {\n  \
+             rpc SayHello (Empty) returns (Empty);\n  \
+             rpc GetHTTPStatus (Empty) returns (Empty);\n  \
+             rpc NeverBuilt (Empty) returns (Empty);\n\
+             }\n\
+             message Empty {}\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("server.rs"),
+            "#[tonic::async_trait]\n\
+             impl Greeter for MyService {\n    \
+             async fn say_hello(&self) {}\n    \
+             async fn get_http_status(&self) {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let contracts = store.list_contracts(None).unwrap();
+        let uids: Vec<&String> = contracts.iter().map(|c| &c.uid).collect();
+        assert!(
+            uids.iter()
+                .any(|u| u.as_str() == "contract:grpc:demo.v1.Greeter/SayHello"),
+            "expected the declared gRPC contract; got {uids:?}"
+        );
+
+        let implemented = store.list_implemented_contract_uids().unwrap();
+        assert!(
+            implemented.contains(&"contract:grpc:demo.v1.Greeter/SayHello".to_string()),
+            "expected IMPLEMENTS_CONTRACT edge for SayHello; implemented: {implemented:?}"
+        );
+        // The acronym case, which a naive snake_case would have missed.
+        assert!(
+            implemented.contains(&"contract:grpc:demo.v1.Greeter/GetHTTPStatus".to_string()),
+            "GetHTTPStatus -> get_http_status must link; implemented: {implemented:?}"
+        );
+        // A declared RPC with no impl must STILL be drift.
+        assert!(
+            !implemented.contains(&"contract:grpc:demo.v1.Greeter/NeverBuilt".to_string()),
+            "an unimplemented RPC must remain drift; implemented: {implemented:?}"
         );
     }
 

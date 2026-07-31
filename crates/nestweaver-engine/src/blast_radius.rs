@@ -950,8 +950,30 @@ pub fn analyze_blast_radius(
             Some(edges) => {
                 let changed_set: HashSet<&str> =
                     changed_files.iter().filter_map(|p| p.to_str()).collect();
+
+                // Qualify by repo. The sidecar now carries every indexed repo's
+                // pairs rather than only the last one written, and its paths are
+                // repo-RELATIVE — so without this a `CHANGELOG.md` in one repo
+                // would match a `CHANGELOG.md` in another and invent a coupling
+                // that does not exist (nw-062).
+                //
+                // `scope_uids` are the repos the changed symbols belong to;
+                // `Repo.root_path` is what the miner stamped on each pair. A repo
+                // with no root_path (server-side bare clone) contributes nothing
+                // here, and unattributed legacy rows match nothing — both cases
+                // fall through to the `cochange-no-coverage` disclosure below
+                // rather than guessing.
+                let scope_roots: HashSet<String> = scope_uids
+                    .iter()
+                    .filter_map(|uid| store.lookup_repo(uid).ok().flatten())
+                    .filter_map(|repo| repo.root_path)
+                    .collect();
                 let mut seen: HashSet<(String, String)> = HashSet::new();
                 for e in &edges {
+                    // Only pairs mined from a repo actually in scope.
+                    if !e.repo.is_empty() && !scope_roots.contains(&e.repo) {
+                        continue;
+                    }
                     let (coupled, changed) = if changed_set.contains(e.file_a.as_str())
                         && !changed_set.contains(e.file_b.as_str())
                     {
@@ -984,6 +1006,39 @@ pub fn analyze_blast_radius(
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| a.file.cmp(&b.file))
                 });
+
+                // A loaded sidecar is not the same as a sidecar that covers
+                // THESE files (nw-062). It is written per indexed repo and
+                // blind-overwritten, so in a multi-repo database it holds one
+                // repo's history — every other repo takes this branch, matches
+                // nothing, and would otherwise return an empty list with no
+                // disclosure at all. An empty result must not be readable as
+                // "this file has no historical coupling" when the truth is
+                // "no history was mined for it".
+                let mined: HashSet<&str> = edges
+                    .iter()
+                    .filter(|e| e.repo.is_empty() || scope_roots.contains(&e.repo))
+                    .flat_map(|e| [e.file_a.as_str(), e.file_b.as_str()])
+                    .collect();
+                let unmined: Vec<&str> = changed_set
+                    .iter()
+                    .copied()
+                    .filter(|path| !mined.contains(path))
+                    .collect();
+                if !unmined.is_empty() {
+                    notifications.push(Notification {
+                        level: NotificationLevel::Note,
+                        message: format!(
+                            "{} of {} changed file(s) do not appear in the co-change sidecar, so \
+                             an empty co-change result for them cannot be distinguished from \
+                             unmined history — the sidecar covers the most recently indexed repo \
+                             only, so files from other repos in this database are not represented",
+                            unmined.len(),
+                            changed_set.len()
+                        ),
+                        descriptor: "cochange-no-coverage".to_string(),
+                    });
+                }
             }
             None => {
                 notifications.push(Notification {
@@ -2527,6 +2582,7 @@ mod tests {
         let db = dir.path().join("scratch.lbug");
         std::fs::write(&db, b"").expect("touch db");
         let edges = vec![CoChangeEdge {
+            repo: String::new(),
             file_a: "src/billing.rs".into(),
             file_b: "src/invoice_templates.sql".into(),
             cochange_count: 9,
@@ -2553,6 +2609,102 @@ mod tests {
         assert_eq!(c.cochange_count, 9);
         assert!((c.confidence - 0.69).abs() < 1e-6);
         assert!(c.note.contains("no static edge"));
+    }
+
+    /// nw-062: the sidecar exists but holds another repo's history. This is the
+    /// 33-of-34 case on the real multi-repo database — the run took the "loaded"
+    /// branch, matched nothing, and disclosed nothing, so a caller could not
+    /// tell "no coupling" from "no data".
+    #[test]
+    fn a_sidecar_that_does_not_cover_the_changed_file_is_disclosed() {
+        use crate::cochange::{CoChangeEdge, save_cochange_sidecar};
+        let store = GraphStore::in_memory().expect("store");
+        insert_minimal_symbol(
+            &store,
+            "sym:view",
+            "WorkflowsView",
+            "src/app/WorkflowsView.tsx",
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("scratch.lbug");
+        std::fs::write(&db, b"").expect("touch db");
+
+        // History mined from a DIFFERENT repo than the file being analysed.
+        let edges = vec![CoChangeEdge {
+            repo: String::new(),
+            file_a: "crates/nestweaver-store/build.rs".into(),
+            file_b: "crates/nestweaver-store/Cargo.toml".into(),
+            cochange_count: 6,
+            total_commits_a: 10,
+            total_commits_b: 10,
+            confidence: 0.60,
+        }];
+        save_cochange_sidecar(&edges, &crate::sidecar_path(&db, ".cochange.json"))
+            .expect("save sidecar");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/app/WorkflowsView.tsx")],
+            &BlastRadiusOptions::default(),
+            None,
+            Some(&db),
+        )
+        .expect("analyze");
+
+        assert!(result.cochanged_files.is_empty());
+        assert!(
+            result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "cochange-no-coverage"),
+            "a sidecar with no history for this file must be disclosed: {:?}",
+            result.notifications
+        );
+        // Advisory tier: absence never degrades the run.
+        assert_eq!(result.status, AnalysisStatus::Complete);
+    }
+
+    /// The complement: when the sidecar DOES cover the changed file, an empty or
+    /// populated result is trustworthy and must not carry the caveat — a note
+    /// that always fires teaches callers to ignore it.
+    #[test]
+    fn a_covered_file_does_not_carry_the_no_coverage_caveat() {
+        use crate::cochange::{CoChangeEdge, save_cochange_sidecar};
+        let store = GraphStore::in_memory().expect("store");
+        insert_minimal_symbol(&store, "sym:bill", "compute_total", "src/billing.rs");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("scratch.lbug");
+        std::fs::write(&db, b"").expect("touch db");
+        let edges = vec![CoChangeEdge {
+            repo: String::new(),
+            file_a: "src/billing.rs".into(),
+            file_b: "src/invoice_templates.sql".into(),
+            cochange_count: 9,
+            total_commits_a: 12,
+            total_commits_b: 10,
+            confidence: 0.69,
+        }];
+        save_cochange_sidecar(&edges, &crate::sidecar_path(&db, ".cochange.json"))
+            .expect("save sidecar");
+
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("src/billing.rs")],
+            &BlastRadiusOptions::default(),
+            None,
+            Some(&db),
+        )
+        .expect("analyze");
+
+        assert_eq!(result.cochanged_files.len(), 1);
+        assert!(
+            !result
+                .notifications
+                .iter()
+                .any(|n| n.descriptor == "cochange-no-coverage"),
+            "a covered file must not be told its history is missing: {:?}",
+            result.notifications
+        );
     }
 
     #[test]

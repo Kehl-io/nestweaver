@@ -111,12 +111,22 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
         return Ok(sock);
     }
 
+    // Whatever PID the pidfile names right now belongs to a daemon that is
+    // already gone (we only reach here when nothing holds the lock). Capture it
+    // so the readiness wait does not mistake it for the daemon we are about to
+    // spawn.
+    let stale_pid = read_pid(&pidfile);
+
     // Spawn the daemon as a detached child.
     spawn_daemon(db_path, config_path)?;
 
     // Poll until the socket accepts connections, then release the spawn-lock so the next
     // waiter's re-check observes a ready daemon instead of spawning another.
-    let waited = wait_for_socket(&sock);
+    //
+    // Watch the pidfile here: this is the one path where the daemon we are
+    // waiting on was just spawned by us, so a process that has already exited
+    // means it will never bind and there is nothing to wait for.
+    let waited = wait_for_socket_watching(&sock, Some(&pidfile), stale_pid);
     unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
     waited?;
 
@@ -240,20 +250,101 @@ fn socket_accepts_connections(sock: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(sock).is_ok()
 }
 
+/// Override for how long a client waits for a daemon to bind its socket.
+pub const DAEMON_BOOT_TIMEOUT_ENV: &str = "NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS";
+
+/// Default ceiling for daemon boot.
+///
+/// This was 5s, which is too tight for a legitimate cold start: a
+/// Metal-enabled daemon compiles shaders and loads the embed model before it
+/// binds, and a large database opens sidecars first. The result was a FALSE
+/// failure — the daemon was booting normally and the client gave up on it. That
+/// flake cost three releases a manual CI re-run (nw-114).
+///
+/// A longer ceiling alone would trade one problem for another: a genuinely dead
+/// daemon would take this long to report. [`wait_for_socket_watching`] resolves
+/// that by watching process liveness, so the ceiling only applies while the
+/// daemon is actually alive and working.
+const DEFAULT_DAEMON_BOOT_TIMEOUT_SECS: u64 = 30;
+
+/// Resolve the boot ceiling, clamped to 1..=600s. An unparseable or
+/// out-of-range value falls back to the default rather than failing the
+/// command — this is a patience knob, not a correctness input.
+fn daemon_boot_timeout() -> Duration {
+    std::env::var(DAEMON_BOOT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| (1..=600).contains(secs))
+        .map_or_else(
+            || Duration::from_secs(DEFAULT_DAEMON_BOOT_TIMEOUT_SECS),
+            Duration::from_secs,
+        )
+}
+
 /// Poll for the socket to accept connections with exponential backoff.
 ///
-/// Initial delay: 50ms, max delay: 500ms, total timeout: 5s.
-/// Larger databases need more time to open the DB, load sidecars,
-/// and bind the socket.
+/// Initial delay: 50ms, max delay: 500ms. See
+/// [`DEFAULT_DAEMON_BOOT_TIMEOUT_SECS`] for the ceiling.
 fn wait_for_socket(sock: &Path) -> Result<()> {
+    wait_for_socket_watching(sock, None, None)
+}
+
+/// As [`wait_for_socket`], but bails as soon as the daemon we are waiting on is
+/// known to have exited.
+///
+/// Waiting out the full ceiling only makes sense while the daemon is alive and
+/// still working. If the pidfile names a process that has exited, it will never
+/// bind and further waiting only delays the report.
+///
+/// `ignore_pid` is the PID the pidfile held BEFORE we spawned, and it must be
+/// skipped. After a crash the stale pidfile still names the DEAD previous
+/// daemon until the new one overwrites it, so treating any dead PID as failure
+/// aborts the very restart we just requested — which is exactly what broke
+/// `daemon_crash_recovery`. A pidfile that cannot be read yet is likewise not
+/// treated as death: a freshly spawned daemon writes it asynchronously.
+/// Where to send an operator whose daemon failed to bind `sock`.
+///
+/// The instance id is recovered from the socket's parent directory name, which
+/// is the only identifier available at this point in the failure path.
+fn log_hint_for_socket(sock: &Path) -> String {
+    let instance_id = sock
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().replace("nestweaver-", ""))
+        .unwrap_or_else(|| "default".to_string());
+    nestweaver_daemon::lifecycle::log_hint(&instance_id)
+}
+
+fn wait_for_socket_watching(
+    sock: &Path,
+    pidfile: Option<&Path>,
+    ignore_pid: Option<i32>,
+) -> Result<()> {
     let start = Instant::now();
-    let timeout = Duration::from_secs(5);
+    let timeout = daemon_boot_timeout();
     let mut delay = Duration::from_millis(50);
     let max_delay = Duration::from_millis(500);
 
     while start.elapsed() < timeout {
         if socket_accepts_connections(sock) {
             return Ok(());
+        }
+        if let Some(path) = pidfile
+            && let Some(pid) = read_pid(path)
+            && Some(pid) != ignore_pid
+            && !is_process_alive(pid)
+        {
+            // Re-check the socket once: the daemon may have bound and exited
+            // between our last poll and this liveness check.
+            if socket_accepts_connections(sock) {
+                return Ok(());
+            }
+            bail!(
+                "daemon process {pid} exited before binding {}.\n\
+                 Check the daemon logs for errors: {}",
+                sock.display(),
+                log_hint_for_socket(sock)
+            );
         }
         std::thread::sleep(delay);
         delay = (delay * 2).min(max_delay);
@@ -264,20 +355,20 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // Do NOT offer `--no-daemon` here. It is a CI-only escape hatch that
+    // bypasses the single-writer lock, and `resolve_use_daemon` refuses it
+    // outside CI anyway — so the suggestion was both unusable and, if forced,
+    // exactly the WAL-corruption risk the daemon exists to prevent (nw-125).
+    // A slow boot is the common cause, so name the knob that actually helps.
     bail!(
         "daemon socket at {} did not accept connections within {:.1}s.\n\
-         Check the daemon log for errors: {}\n\
-         If another process holds the database lock, stop it or use --no-daemon.",
+         Check the daemon logs for errors: {}\n\
+         If it is simply slow to boot, raise {}; if another process holds the \
+         database lock, stop that process.",
         sock.display(),
         timeout.as_secs_f64(),
-        nestweaver_daemon::lifecycle::log_path(
-            &sock
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().replace("nestweaver-", ""))
-                .unwrap_or_else(|| "default".to_string())
-        )
-        .display()
+        log_hint_for_socket(sock),
+        DAEMON_BOOT_TIMEOUT_ENV
     );
 }
 
@@ -326,6 +417,102 @@ mod tests {
             ]
             .map(std::ffi::OsString::from)
         );
+    }
+
+    /// nw-114: a daemon that has already exited must be reported immediately,
+    /// not waited out to the full boot ceiling. Without the liveness check,
+    /// raising the ceiling from 5s to 30s would have made every genuine
+    /// start-up failure six times slower to report.
+    #[test]
+    fn wait_bails_at_once_when_the_daemon_pid_is_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let pidfile = dir.path().join("daemon.pid");
+
+        // PID 1 is always alive; we need one that is certainly not. A freshly
+        // reaped high PID is unreliable, so use an out-of-range value: kill(0)
+        // reports ESRCH for it, which is exactly "no such process".
+        std::fs::write(&pidfile, "2147483647").unwrap();
+
+        let start = Instant::now();
+        let result = wait_for_socket_watching(&socket, Some(&pidfile), None);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a dead daemon must not be waited out");
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains("exited before binding"),
+            "the error must say the process died, not just time out: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must fail fast, took {elapsed:?}"
+        );
+    }
+
+    /// A STALE pid from a crashed previous daemon must not abort the restart.
+    ///
+    /// This is the regression `daemon_crash_recovery` caught: after a crash the
+    /// pidfile still names the dead previous daemon until the new one overwrites
+    /// it, so treating any dead PID as failure kills the very restart we just
+    /// requested.
+    #[test]
+    fn wait_ignores_the_stale_pid_it_was_told_to_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let pidfile = dir.path().join("daemon.pid");
+
+        // The pidfile still names a dead daemon from before the restart.
+        let stale = 2147483647;
+        std::fs::write(&pidfile, stale.to_string()).unwrap();
+
+        // A "new daemon" binds shortly after, as a real restart would.
+        let server_socket = socket.clone();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let listener = UnixListener::bind(&server_socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if listener.accept().is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let result = wait_for_socket_watching(&socket, Some(&pidfile), Some(stale));
+        server.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "a stale pid must not abort the restart: {:#}",
+            result.unwrap_err()
+        );
+    }
+
+    /// The ceiling is env-overridable so CI and constrained machines can extend
+    /// it without a rebuild. Out-of-range and unparseable values fall back to
+    /// the default — this is a patience knob, not a correctness input.
+    #[test]
+    fn boot_timeout_honours_the_env_override_and_rejects_nonsense() {
+        let default = Duration::from_secs(DEFAULT_DAEMON_BOOT_TIMEOUT_SECS);
+
+        // SAFETY: single-threaded test; the override is read only here.
+        unsafe { std::env::set_var(DAEMON_BOOT_TIMEOUT_ENV, "45") };
+        assert_eq!(daemon_boot_timeout(), Duration::from_secs(45));
+
+        for nonsense in ["0", "601", "abc", "", "-5"] {
+            unsafe { std::env::set_var(DAEMON_BOOT_TIMEOUT_ENV, nonsense) };
+            assert_eq!(
+                daemon_boot_timeout(),
+                default,
+                "{nonsense:?} must fall back to the default"
+            );
+        }
+
+        unsafe { std::env::remove_var(DAEMON_BOOT_TIMEOUT_ENV) };
+        assert_eq!(daemon_boot_timeout(), default);
     }
 
     #[test]

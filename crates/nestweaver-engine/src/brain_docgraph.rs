@@ -27,7 +27,15 @@ pub const DEFAULT_ORPHAN_ALLOWLIST: &[&str] = &[
 
 // ── 1. broken links ──────────────────────────────────────────────────────────
 
-/// A broken (low-confidence) wikilink with suggested resolution targets.
+/// A wikilink that resolved at less than full confidence, or not at all.
+///
+/// `resolved_target_uid` is the difference between the two, and it matters:
+/// confidence encodes WHICH RESOLVER TIER matched, not how likely the link is
+/// to be wrong. A same-folder match scores 0.95 and a unique global
+/// filename-stem match scores 0.90 — both are unique, unambiguous resolutions,
+/// and the latter is exactly how Obsidian resolves a bare `[[Note]]`. Reporting
+/// those as "broken" alongside links that point at nothing told callers that
+/// three quarters of a healthy vault was broken (nw-100).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokenLink {
     pub source_uid: String,
@@ -35,11 +43,25 @@ pub struct BrokenLink {
     pub wikilink_text: String,
     pub confidence: f32,
     pub suggested_target_uids: Vec<String>,
+    /// The note this link actually points at, when it resolved. `None` means
+    /// no target exists — the only case that is genuinely broken.
+    pub resolved_target_uid: Option<String>,
 }
 
-/// Find wikilink edges whose target resolution is suspect (confidence < 1.0),
-/// pairing each with up to `max_suggestions` candidate note UIDs whose title
-/// fuzzily matches the link text (substring / token overlap).
+impl BrokenLink {
+    /// True when the link points at no note at all.
+    pub fn is_unresolved(&self) -> bool {
+        self.resolved_target_uid.is_none()
+    }
+}
+
+/// Find wikilinks that resolved below full confidence OR not at all, pairing
+/// each with up to `max_suggestions` candidate note UIDs whose title fuzzily
+/// matches the link text (substring / token overlap).
+///
+/// Callers wanting genuinely-broken links must filter on
+/// [`BrokenLink::is_unresolved`] — a sub-1.0 confidence means "matched at a
+/// lower resolver tier", not "wrong". See [`BrokenLink`].
 pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<BrokenLink>> {
     let rows: Vec<BrokenWikilinkRow> = store.broken_wikilinks().map_err(|e| anyhow::anyhow!(e))?;
     if rows.is_empty() {
@@ -51,13 +73,21 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        let suggestions = suggest_targets(&r.wikilink_text, &notes, max_suggestions);
+        // Never suggest the note the link is written in. A date-stamped log
+        // linking to a date-stamped note matched itself on substring, so the
+        // advice read "fix this broken link by linking to itself" (nw-100).
+        let suggestions = suggest_targets(&r.wikilink_text, &notes, max_suggestions, &r.source_uid);
         out.push(BrokenLink {
             source_uid: r.source_uid,
             source_path: r.source_path,
             wikilink_text: r.wikilink_text,
             confidence: r.confidence,
             suggested_target_uids: suggestions,
+            resolved_target_uid: if r.current_target_uid.is_empty() {
+                None
+            } else {
+                Some(r.current_target_uid)
+            },
         });
     }
     Ok(out)
@@ -65,19 +95,80 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
 
 /// Rank note UIDs by how well their title matches `text` (case-insensitive
 /// substring either direction, with exact match first). Returns at most `max`.
-fn suggest_targets(text: &str, notes: &[NoteLite], max: usize) -> Vec<String> {
+/// Collapse a link target or note key to a comparable form: lowercase, with
+/// every run of non-alphanumeric characters reduced to a single space.
+///
+/// Lets `blast-radius-production-grade` match a note whose stem is written
+/// `Blast Radius Production Grade` without resorting to fuzzy distance.
+fn normalize_key(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.extend(ch.to_lowercase());
+        } else {
+            pending_space = true;
+        }
+    }
+    out
+}
+
+/// The filename stem of a note's path, lowercased.
+fn note_stem(file_path: &str) -> String {
+    std::path::Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+/// Rank note UIDs by how well their TITLE or FILENAME STEM matches `text`.
+///
+/// Stems matter because Obsidian wikilinks target filenames, and the resolver
+/// keys on stems too (its priority 3/3b). This function looked only at titles,
+/// so it stayed silent on the one case where a suggestion is most valuable: a
+/// target that matches a filename stem shared by SEVERAL notes. The resolver
+/// requires a unique stem and so declines to pick, leaving the link unresolved —
+/// and with no suggestion, the caller was told nothing at all despite both
+/// candidates being known (nw-100).
+///
+/// Deliberately exact-or-substring, with no edit-distance fuzzing. On the real
+/// vault most unresolved links point at targets that do not exist anywhere —
+/// backlog IDs that are YAML entries rather than notes, and notes since deleted.
+/// Fuzzy matching would manufacture a confident-looking suggestion for every one
+/// of them, which is worse than returning none.
+fn suggest_targets(text: &str, notes: &[NoteLite], max: usize, source_uid: &str) -> Vec<String> {
     let needle = text.trim().to_lowercase();
     if needle.is_empty() {
         return vec![];
     }
+    let needle_norm = normalize_key(&needle);
+
     let mut scored: Vec<(u8, &NoteLite)> = Vec::new();
     for n in notes {
+        if n.uid == source_uid {
+            continue;
+        }
         let title = n.title.to_lowercase();
-        let score = if title == needle {
+        let stem = note_stem(&n.file_path);
+
+        // Exact on either key, raw or normalized.
+        let exact = title == needle
+            || stem == needle
+            || (!needle_norm.is_empty()
+                && (normalize_key(&title) == needle_norm || normalize_key(&stem) == needle_norm));
+
+        let score = if exact {
             3
-        } else if title.contains(&needle) {
+        } else if title.contains(&needle) || (!stem.is_empty() && stem.contains(&needle)) {
             2
-        } else if needle.contains(&title) && !title.is_empty() {
+        } else if (!title.is_empty() && needle.contains(&title))
+            || (!stem.is_empty() && needle.contains(&stem))
+        {
             1
         } else {
             0
@@ -86,7 +177,13 @@ fn suggest_targets(text: &str, notes: &[NoteLite], max: usize) -> Vec<String> {
             scored.push((score, n));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(&b.1.title)));
+    // Deterministic order: score, then title, then uid — the uid tiebreak keeps
+    // two notes sharing a stem AND a title from ordering arbitrarily.
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.title.cmp(&b.1.title))
+            .then_with(|| a.1.uid.cmp(&b.1.uid))
+    });
     scored
         .into_iter()
         .take(max)
@@ -374,7 +471,13 @@ pub struct TagCount {
 pub struct DocStats {
     pub total_notes: usize,
     pub total_wikilinks: usize,
+    /// Links that point at no note at all. This is the vault-health number.
     pub broken_wikilinks: usize,
+    /// Links that DID resolve, but below full confidence — a same-folder or
+    /// unique filename-stem match rather than a path or unique-title match.
+    /// Counted separately because folding them into `broken_wikilinks` reported
+    /// 75% of a healthy vault as broken when the real figure was 11% (nw-100).
+    pub low_confidence_wikilinks: usize,
     pub orphans: usize,
     pub avg_outdegree: f64,
     pub top_tags: Vec<TagCount>,
@@ -388,7 +491,9 @@ pub fn doc_stats(store: &GraphStore, top_tags_limit: usize) -> Result<DocStats> 
     let total_wikilinks = store
         .count_wikilink_edges()
         .map_err(|e| anyhow::anyhow!(e))?;
-    let broken = broken_links(store, 0)?.len();
+    let suspect = broken_links(store, 0)?;
+    let broken = suspect.iter().filter(|l| l.is_unresolved()).count();
+    let low_confidence = suspect.len() - broken;
     let orphans = orphan_documents(store, None, None, &[])?.len();
 
     // avg_outdegree: note-level wikilink edges / total notes.
@@ -429,6 +534,7 @@ pub fn doc_stats(store: &GraphStore, top_tags_limit: usize) -> Result<DocStats> 
         total_notes,
         total_wikilinks,
         broken_wikilinks: broken,
+        low_confidence_wikilinks: low_confidence,
         orphans,
         avg_outdegree,
         top_tags,
@@ -506,6 +612,167 @@ mod tests {
             !dup.suggested_target_uids.is_empty(),
             "expected suggested targets for [[Dup]]"
         );
+    }
+
+    /// nw-100: a link that resolved at a lower tier is NOT broken.
+    ///
+    /// `[[Sibling]]` in `folder/a.md` resolves to `folder/Sibling.md` by
+    /// same-folder match at confidence 0.95 — a unique, unambiguous target, and
+    /// how Obsidian itself resolves a bare link. It must carry a
+    /// `resolved_target_uid`, and `doc_stats` must not count it as broken.
+    #[test]
+    fn a_lower_tier_resolution_is_not_broken() {
+        let (_dir, root) = make_vault(&[
+            (
+                "folder/a.md",
+                "# A\n\nSee [[Sibling]] and [[Nowhere At All]].\n",
+            ),
+            ("folder/Sibling.md", "# Different Title Entirely\n\nhi\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let links = broken_links(&store, 5).unwrap();
+
+        let sibling = links
+            .iter()
+            .find(|b| b.wikilink_text.eq_ignore_ascii_case("Sibling"))
+            .expect("[[Sibling]] should appear as a sub-1.0 resolution");
+        assert!(
+            sibling.confidence < 1.0,
+            "same-folder match scores below 1.0"
+        );
+        assert!(
+            !sibling.is_unresolved(),
+            "it resolved — it must carry a target, not read as broken: {sibling:?}"
+        );
+        assert!(sibling.resolved_target_uid.is_some());
+
+        let nowhere = links
+            .iter()
+            .find(|b| b.wikilink_text.eq_ignore_ascii_case("Nowhere At All"))
+            .expect("the dangling link should appear");
+        assert!(
+            nowhere.is_unresolved(),
+            "a link to nothing is the only genuinely broken case"
+        );
+
+        // The headline metric must count only the dangling one.
+        let stats = doc_stats(&store, 5).unwrap();
+        assert_eq!(
+            stats.broken_wikilinks, 1,
+            "only [[Nowhere At All]] is broken; counting the resolved one is the nw-100 defect"
+        );
+        assert!(
+            stats.low_confidence_wikilinks >= 1,
+            "the lower-tier resolution must still be reported, just not as broken"
+        );
+    }
+
+    fn note_lite(uid: &str, title: &str, file_path: &str) -> NoteLite {
+        NoteLite {
+            uid: uid.to_string(),
+            title: title.to_string(),
+            file_path: file_path.to_string(),
+            vault_uid: "vault:test".to_string(),
+            pagerank_score: 0.0,
+        }
+    }
+
+    /// nw-100: the case where a suggestion is worth most.
+    ///
+    /// Two notes share the filename stem `blast-radius-production-grade`, so the
+    /// resolver's stem tier requires uniqueness and declines to pick — the link
+    /// is correctly unresolved. But both candidates are known, and the
+    /// title-only suggester returned NOTHING because neither title resembles the
+    /// stem. A human could disambiguate instantly if shown them.
+    #[test]
+    fn suggests_both_notes_that_share_a_filename_stem() {
+        let notes = vec![
+            note_lite(
+                "note:backlog",
+                "Blast Radius → production-grade for enterprise code review",
+                "Workspaces/NestWeaver/backlog/blast-radius-production-grade.md",
+            ),
+            note_lite(
+                "note:prd",
+                "Blast Radius → Production-Grade — PRD",
+                "Workspaces/NestWeaver/notes/2026-07/prd/blast-radius-production-grade.md",
+            ),
+            note_lite("note:other", "Unrelated", "misc/unrelated.md"),
+        ];
+
+        let got = suggest_targets("blast-radius-production-grade", &notes, 5, "note:src");
+
+        assert!(got.contains(&"note:backlog".to_string()), "got: {got:?}");
+        assert!(got.contains(&"note:prd".to_string()), "got: {got:?}");
+        assert!(
+            !got.contains(&"note:other".to_string()),
+            "must not drag in unrelated notes: {got:?}"
+        );
+    }
+
+    /// Separator style must not matter: a hyphenated target should match a note
+    /// whose stem uses spaces, and vice versa.
+    #[test]
+    fn suggestion_matching_ignores_separator_style() {
+        let notes = vec![note_lite(
+            "note:a",
+            "Some Other Title",
+            "notes/Phase B Execution Index.md",
+        )];
+        let got = suggest_targets("phase-b-execution-index", &notes, 5, "note:src");
+        assert_eq!(got, vec!["note:a".to_string()], "got: {got:?}");
+    }
+
+    /// The restraint matters as much as the recall. Most unresolved links on the
+    /// real vault point at targets that exist NOWHERE — backlog IDs that are YAML
+    /// entries rather than notes, and notes since deleted. Returning a
+    /// confident-looking guess for those is worse than returning none, so there
+    /// is deliberately no edit-distance fuzzing.
+    #[test]
+    fn a_target_that_exists_nowhere_gets_no_suggestion() {
+        let notes = vec![
+            note_lite(
+                "note:a",
+                "Daemon Architecture",
+                "notes/daemon-architecture.md",
+            ),
+            note_lite("note:b", "Release Process", "notes/release-process.md"),
+        ];
+        for absent in ["nw-092", "server-mode-phase1-transport", "zzz"] {
+            let got = suggest_targets(absent, &notes, 5, "note:src");
+            assert!(
+                got.is_empty(),
+                "{absent:?} exists nowhere — a guess is worse than nothing, got: {got:?}"
+            );
+        }
+    }
+
+    /// nw-100: never advise fixing a link by pointing it at its own source.
+    #[test]
+    fn suggestions_never_include_the_source_note() {
+        let notes = vec![
+            NoteLite {
+                uid: "note:self".to_string(),
+                title: "Daily Log 2026-07-27".to_string(),
+                file_path: "_logs/2026-07-27.md".to_string(),
+                vault_uid: "vault:test".to_string(),
+                pagerank_score: 0.0,
+            },
+            NoteLite {
+                uid: "note:other".to_string(),
+                title: "Daily Log 2026-07-27 Review".to_string(),
+                file_path: "notes/review.md".to_string(),
+                vault_uid: "vault:test".to_string(),
+                pagerank_score: 0.0,
+            },
+        ];
+        let got = suggest_targets("Daily Log 2026-07-27", &notes, 5, "note:self");
+        assert!(
+            !got.contains(&"note:self".to_string()),
+            "must not suggest the source note itself, got: {got:?}"
+        );
+        assert!(got.contains(&"note:other".to_string()));
     }
 
     #[test]

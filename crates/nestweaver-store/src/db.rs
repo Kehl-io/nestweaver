@@ -351,23 +351,83 @@ fn hardened_system_config() -> lbug::SystemConfig {
     cfg
 }
 
+/// A `SIGKILL`ed daemon can leave `<db>.wal` behind with NO `<db>.shadow`
+/// alongside it. lbug's read-write open then fails with an IO exception naming
+/// the absent shadow file, and because that text ends in "No such file or
+/// directory" the CLI's diagnostic heuristic read it as a MISSING DATABASE and
+/// told the user to create one over the top of their data (nw-126).
+///
+/// This is a different shape from [`is_stale_checkpoint_error`], which matches
+/// a checkpoint mismatch rather than an orphaned log, so the existing recovery
+/// arm never fired.
+fn is_orphaned_wal_error(msg: &str) -> bool {
+    msg.contains(".shadow") && msg.to_lowercase().contains("no such file")
+}
+
+/// Move an orphaned `<db>.wal` aside so the next open can proceed.
+///
+/// Deliberately a RENAME, never a delete: a WAL can in principle hold committed
+/// work, and destroying it to fix an outage would trade one data-loss story for
+/// another. Quarantining is reversible and leaves the evidence in place.
+///
+/// Only acts on the exact orphan signature — `.wal` present AND `.shadow`
+/// absent. A `.wal` with its `.shadow` intact is a normal recoverable log and
+/// must be left for the engine to replay.
+fn quarantine_orphaned_wal(path: &Path) -> Option<PathBuf> {
+    let wal = PathBuf::from(format!("{}.wal", path.display()));
+    let shadow = PathBuf::from(format!("{}.shadow", path.display()));
+    if !wal.exists() || shadow.exists() {
+        return None;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let quarantined = PathBuf::from(format!("{}.wal.orphaned-{stamp}", path.display()));
+    std::fs::rename(&wal, &quarantined)
+        .ok()
+        .map(|()| quarantined)
+}
+
+/// Open an lbug database, auto-recovering once from crash debris that would
+/// otherwise make it permanently unopenable.
+///
+/// `read_write` gates the orphaned-WAL arm. Replay is inherently a write
+/// operation, so a read-only open must report the condition rather than mutate
+/// the directory to clear it — and a read-only caller quarantining a log out
+/// from under a live writer would be a genuine hazard.
 fn open_lbug_with_recovery(
     path: &Path,
+    read_write: bool,
     make_config: impl Fn() -> lbug::SystemConfig,
 ) -> Result<lbug::Database, StoreError> {
     match lbug::Database::new(path, make_config()) {
         Ok(db) => Ok(db),
         Err(e) => {
-            if is_stale_checkpoint_error(&e.to_string()) && remove_stale_checkpoint_sidecars(path) {
+            let msg = e.to_string();
+            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path) {
                 tracing::warn!(
                     "recovered a stale WAL checkpoint for {} (a prior crash left \
                      .wal.checkpoint/.shadow that made the DB unopenable); retrying open",
                     path.display()
                 );
-                Ok(lbug::Database::new(path, make_config())?)
-            } else {
-                Err(e.into())
+                return Ok(lbug::Database::new(path, make_config())?);
             }
+            if read_write
+                && is_orphaned_wal_error(&msg)
+                && let Some(quarantined) = quarantine_orphaned_wal(path)
+            {
+                tracing::warn!(
+                    "recovered {} from an orphaned write-ahead log left by a prior \
+                     crash (.wal present with no .shadow, which made the database \
+                     unopenable on every path); moved it to {} and retried — it was \
+                     NOT deleted",
+                    path.display(),
+                    quarantined.display()
+                );
+                return Ok(lbug::Database::new(path, make_config())?);
+            }
+            Err(e.into())
         }
     }
 }
@@ -375,7 +435,7 @@ fn open_lbug_with_recovery(
 impl GraphStore {
     /// Create a new persistent database at `path`, initialising schema tables.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, hardened_system_config)?;
+        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -406,7 +466,7 @@ impl GraphStore {
     /// Runs schema migrations to ensure any new tables/columns from newer
     /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, hardened_system_config)?;
+        let db = open_lbug_with_recovery(path, true, hardened_system_config)?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -436,7 +496,9 @@ impl GraphStore {
     /// Open an existing database in read-only mode. Allows concurrent access
     /// while another process (e.g. the web UI) holds the write lock.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let db = open_lbug_with_recovery(path, || lbug::SystemConfig::default().read_only(true))?;
+        let db = open_lbug_with_recovery(path, false, || {
+            lbug::SystemConfig::default().read_only(true)
+        })?;
         let store = GraphStore {
             db,
             pagerank_cache: Mutex::new(None),
@@ -1601,15 +1663,25 @@ impl GraphStore {
         // target kind (Note vs Heading).
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS WIKILINK_TO_NOTE(\
-                FROM Section TO Note, confidence FLOAT, display STRING)",
+                FROM Section TO Note, confidence FLOAT, display STRING, target STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS WIKILINK_TO_HEADING(\
-                FROM Section TO Heading, confidence FLOAT, display STRING)",
+                FROM Section TO Heading, confidence FLOAT, display STRING, target STRING)",
         )
         .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        // Migration: `display` alone cannot answer both questions a wikilink is
+        // asked. For a piped link `[[Home|workspace]]` the BACKLINKS view wants
+        // the visible text ("workspace") while BROKEN-LINKS wants the link
+        // target ("Home") — reporting the alias there rendered `[[workspace]]`,
+        // a string that appears nowhere in the vault (nw-122). Carry both.
+        // Empty string means "written before this column existed"; readers fall
+        // back to `display`, which is what those rows have always held.
+        let _ = conn.query("ALTER TABLE WIKILINK_TO_NOTE ADD target STRING DEFAULT ''");
+        let _ = conn.query("ALTER TABLE WIKILINK_TO_HEADING ADD target STRING DEFAULT ''");
 
         // ── F11 memory-bank: typed Note→Note relationships ─────────────────
         // Explicit, semantically-typed knowledge edges derived from frontmatter
@@ -1776,6 +1848,78 @@ mod tests {
     fn index_publication_lease_is_send_without_a_held_mutex_guard() {
         fn assert_send<T: Send>() {}
         assert_send::<IndexPublicationLease<'static>>();
+    }
+
+    /// nw-126: the signature observed on the production database after a
+    /// SIGKILLed daemon — `.wal` present, `.shadow` absent. lbug reports
+    /// "IO exception: Cannot open file <db>.shadow: No such file or directory",
+    /// which the stale-CHECKPOINT matcher cannot recognise, so nothing
+    /// recovered and every open failed.
+    #[test]
+    fn orphaned_wal_error_is_distinguished_from_a_stale_checkpoint() {
+        let orphan = "database error: IO exception: Cannot open file \
+                      /x/brain.lbug.shadow: No such file or directory";
+        assert!(is_orphaned_wal_error(orphan));
+        assert!(
+            !is_stale_checkpoint_error(orphan),
+            "the existing checkpoint matcher must NOT claim this case — that it \
+             does not is exactly why the database stayed unopenable"
+        );
+
+        let checkpoint = "wal.checkpoint header does not match";
+        assert!(is_stale_checkpoint_error(checkpoint));
+        assert!(!is_orphaned_wal_error(checkpoint));
+    }
+
+    /// The orphan is quarantined by RENAME, never deleted: a WAL can hold
+    /// committed work, and destroying it to clear an outage would swap one
+    /// data-loss story for another.
+    #[test]
+    fn orphaned_wal_is_quarantined_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"orphan-contents").unwrap();
+
+        let moved = quarantine_orphaned_wal(&db).expect("orphaned wal must be quarantined");
+
+        assert!(
+            !dir.path().join("brain.lbug.wal").exists(),
+            "wal moved aside"
+        );
+        assert!(moved.exists(), "quarantined copy must still exist");
+        assert_eq!(
+            std::fs::read(&moved).unwrap(),
+            b"orphan-contents",
+            "contents must be preserved verbatim — quarantine, not deletion"
+        );
+        assert!(db.exists(), "the database itself is untouched");
+    }
+
+    /// A `.wal` WITH its `.shadow` is a normal replayable log. Quarantining it
+    /// would discard recoverable committed work, so the guard must decline.
+    #[test]
+    fn wal_with_its_shadow_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"live").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.shadow"), b"shadow").unwrap();
+
+        assert!(
+            quarantine_orphaned_wal(&db).is_none(),
+            "a wal accompanied by its shadow must never be moved"
+        );
+        assert!(dir.path().join("brain.lbug.wal").exists());
+    }
+
+    /// No `.wal` at all is not an orphan case.
+    #[test]
+    fn absent_wal_is_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        assert!(quarantine_orphaned_wal(&db).is_none());
     }
 
     #[test]

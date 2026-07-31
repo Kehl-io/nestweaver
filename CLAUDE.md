@@ -34,6 +34,29 @@ daemon risks WAL corruption from concurrent access. If you see "database
 locked" errors, stop the daemon (`nestweaver daemon stop`) rather than using
 `--no-daemon`.
 
+## Environment variables (operator-facing)
+
+Timeouts and tuning an operator may actually need. Every one of these is named
+by an error message the tool can print, so they belong somewhere findable.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` | 30 | How long a client waits for the daemon to bind its socket. Raise it on a slow cold start; the boot-failure message names it. Boot phase timings (`boot_ms`, `store_open_ms`, `extension_reconcile_ms`, `unattributed_ms`) are logged at bind so a slow boot is diagnosable rather than guessed at. |
+| `NESTWEAVER_INDEX_TIMEOUT_SECS` | 1800 | Overall ceiling for one index. On expiry the daemon requests cancellation and reports a terminal error naming this variable. Cancellation is COOPERATIVE and only observed at the next pre-write boundary, so the index may still be finishing — check the daemon log before assuming it stopped. |
+| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | How long a shutting-down daemon drains active write RPCs. |
+| `NESTWEAVER_STOP_GRACE_SECS` | — | Grace period before a stopping daemon is escalated. |
+| `NESTWEAVER_INDEX_CPU_PERCENT` | 50 | Index CPU duty cycle, percent of one core (1–99; `0` or `>=100` disables). Also see the launchd note below. |
+| `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Opt-in required to honour `--no-daemon` / `NESTWEAVER_NO_DAEMON` outside CI. Without it the bypass is REFUSED, because it circumvents the single-writer lock. Not for normal use. |
+| `NESTWEAVER_LBUG_MAX_THREADS` | 1 | Engine thread-pool size. `1` closes the nw-073 eviction-vs-read race; raise only if you measure a query-latency cost. |
+| `NESTWEAVER_LBUG_BUFFER_POOL_BYTES` | auto | Buffer pool size. A larger pool avoids eviction when the working set fits. |
+| `NESTWEAVER_LBUG_AUTO_CHECKPOINT` | on | `0`/`false` defers auto-checkpoints; reduces the #678 corruption trigger during bulk load. |
+| `NESTWEAVER_CRASH_REPORT_DIRS` | platform | Extra directories scanned by `diagnostics capabilities` for nw-073 crash recurrence. |
+| `NESTWEAVER_GIT_CLONE_TIMEOUT_SECS` / `NESTWEAVER_GIT_NET_TIMEOUT_SECS` | — | Bounds on git clone / network operations during pull. |
+
+Server mode additionally reads `NESTWEAVER_BIND`, `NESTWEAVER_TOKEN`,
+`NESTWEAVER_ADMIN_TOKEN`, `NESTWEAVER_UPSTREAM`, and
+`NESTWEAVER_WEBHOOK_SECRET` / `NESTWEAVER_WEBHOOK_SECRET_OLD` (rotation).
+
 ## macOS App (preferred on Mac)
 
 On macOS, prefer the native `.app` bundle over the CLI daemon. It provides:
@@ -186,6 +209,7 @@ Sidecar files written alongside the database:
 - `<db>.cache` — MCP response cache (binary: MessagePack + ZSTD; falls back to legacy JSON on read)
 - `<db>.parsed_cache.bin` — Cached parse results (symbols, references, type bindings) keyed by content hash, for skipping re-parsing unchanged files
 - `<db>.resolution_deps.bin` — Per-file resolution dependency tracker for incremental cross-file resolution
+- `<db>.resolver_generation.json` — per-repo record of which resolver generation built that repo's edges. A repo with no entry predates the record and is reported as stale by `hubs`/`bridges`, because a resolver fix that changes edge SHAPE (nw-103's import fan-out) cannot repair edges already written — only re-indexing can
 
 ## Architecture
 

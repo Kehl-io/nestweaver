@@ -696,27 +696,39 @@ fn strip_code(text: &str) -> String {
             continue;
         }
         // Strip inline code spans: replace `...` with spaces of equal length.
-        let bytes = line.as_bytes();
+        //
+        // Operate on `str`, never on raw bytes. This loop used to copy the line
+        // through with `buf.push(bytes[i] as char)`, and `u8 as char` maps a
+        // byte to the code point of the same value — Latin-1 decoding. Pushing
+        // that into a UTF-8 `String` re-encoded it, so an em dash `e2 80 94`
+        // came back out as `c3 a2 c2 80 c2 94` and every wikilink or tag
+        // containing non-ASCII was silently corrupted (nw-099).
+        //
+        // Backticks are ASCII, so every index `find` returns is on a character
+        // boundary and the slices below are safe.
         let mut buf = String::with_capacity(line.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'`' {
-                // Find matching backtick on same line.
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j] != b'`' {
-                    j += 1;
-                }
-                if j < bytes.len() {
-                    for _ in i..=j {
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            buf.push_str(&rest[..open]);
+            let after_open = &rest[open + 1..];
+            match after_open.find('`') {
+                Some(close) => {
+                    // Blank the span, both backticks included, one space per
+                    // CHARACTER so column positions survive multi-byte text.
+                    let span_end = open + 1 + close + 1;
+                    for _ in rest[open..span_end].chars() {
                         buf.push(' ');
                     }
-                    i = j + 1;
-                    continue;
+                    rest = &rest[span_end..];
+                }
+                None => {
+                    // Unmatched backtick: keep it literally and carry on.
+                    buf.push('`');
+                    rest = after_open;
                 }
             }
-            buf.push(bytes[i] as char);
-            i += 1;
         }
+        buf.push_str(rest);
         out.push_str(&buf);
         out.push('\n');
     }
@@ -731,26 +743,32 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
     for (sec_idx, sec) in sections.iter().enumerate() {
         let stripped = strip_code(&sec.text);
         for (line_offset, line_text) in stripped.lines().enumerate() {
-            let bytes = line_text.as_bytes();
-            let mut i = 0usize;
-            while i < bytes.len() {
-                let is_boundary =
-                    i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'(' | b'[' | b',' | b';');
-                if bytes[i] == b'#' && is_boundary {
-                    let start = i + 1;
-                    let mut j = start;
-                    while j < bytes.len() {
-                        let c = bytes[j];
-                        if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'/' {
-                            j += 1;
+            // Scan by CHARACTER, not by byte. Testing each byte with
+            // `is_ascii_alphanumeric` stopped at the first non-ASCII byte, so
+            // `#café` indexed as `caf` and `#日本語` was dropped outright — its
+            // first character is non-ASCII, so the name came out empty. Obsidian
+            // supports non-ASCII tags, and a truncated stem can collide with an
+            // unrelated real tag (nw-116).
+            let mut prev: Option<char> = None;
+            let mut chars = line_text.char_indices().peekable();
+            while let Some((idx, ch)) = chars.next() {
+                let is_boundary = match prev {
+                    None => true,
+                    Some(p) => matches!(p, ' ' | '\t' | '(' | '[' | ',' | ';'),
+                };
+                if ch == '#' && is_boundary {
+                    let start = idx + ch.len_utf8();
+                    let mut end = start;
+                    while let Some(&(j, c)) = chars.peek() {
+                        if c.is_alphanumeric() || c == '-' || c == '_' || c == '/' {
+                            end = j + c.len_utf8();
+                            chars.next();
                         } else {
                             break;
                         }
                     }
-                    if j > start {
-                        let name = std::str::from_utf8(&bytes[start..j])
-                            .unwrap_or("")
-                            .to_lowercase();
+                    if end > start {
+                        let name = line_text[start..end].to_lowercase();
                         // Skip bare `#` (no name), pure-numeric tags like #1 (often markdown
                         // issue refs), and trailing-hyphen artefacts.
                         if !name.is_empty() && name.chars().any(|c| c.is_alphabetic()) {
@@ -761,11 +779,11 @@ fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
                                 line: sec.start_line + line_offset as u32,
                             });
                         }
-                        i = j;
+                        prev = line_text[start..end].chars().next_back();
                         continue;
                     }
                 }
-                i += 1;
+                prev = Some(ch);
             }
         }
     }
@@ -887,6 +905,15 @@ fn extract_md_links(body: &str, sections: &[RawSection]) -> Vec<RawWikilink> {
             };
             // Only care about links pointing to .md files.
             if !path_part.ends_with(".md") {
+                continue;
+            }
+            // ...and only to files IN THE VAULT. An external URL can end in
+            // `.md` too — `https://github.com/org/repo/blob/main/notes/x.md`
+            // passed this filter, became a wikilink target, and then resolved to
+            // nothing forever, so `broken-links` reported it as broken on every
+            // run with no possible fix (nw-100). A scheme means it is not a
+            // vault path.
+            if path_part.contains("://") || path_part.starts_with("//") {
                 continue;
             }
             let target = path_part.to_string();
@@ -1279,6 +1306,119 @@ top 2 body
         assert_eq!(note.wikilinks.len(), 0);
     }
 
+    /// nw-099: non-ASCII in a wikilink target must survive `strip_code`.
+    ///
+    /// `strip_code` used to rebuild each line with `buf.push(bytes[i] as char)`.
+    /// In Rust `u8 as char` maps a byte to the code point of the same value —
+    /// that is Latin-1 decoding — and pushing it into a UTF-8 `String`
+    /// re-encodes it. An em dash `e2 80 94` came back out as
+    /// `c3 a2 c2 80 c2 94`, one UTF-8 sequence per original byte.
+    ///
+    /// The link then resolves to nothing, so this silently severed real links
+    /// between real notes. Headings and titles were unaffected because only
+    /// wikilink and inline-tag scanning route through `strip_code`.
+    #[test]
+    fn wikilink_targets_preserve_non_ascii() {
+        let src = "# n\n\nSee [[Spike 1 — Byte Path Findings]] for detail.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        assert_eq!(note.wikilinks.len(), 1);
+        assert_eq!(note.wikilinks[0].target, "Spike 1 — Byte Path Findings");
+        assert_eq!(
+            note.wikilinks[0].target.as_bytes(),
+            "Spike 1 — Byte Path Findings".as_bytes(),
+            "em dash must stay as e2 80 94, not double-encode to c3 a2 c2 80 c2 94"
+        );
+    }
+
+    /// The same corruption hit aliases and anchors, which also come from the
+    /// stripped line, and a broader sweep of scripts than the em dash alone.
+    #[test]
+    fn wikilink_alias_and_anchor_preserve_non_ascii() {
+        let src = "# n\n\n[[Café#Menü|Crème brûlée]] and [[日本語ノート]] and [[naïve — test]]\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        assert_eq!(note.wikilinks.len(), 3);
+        assert_eq!(note.wikilinks[0].target, "Café");
+        assert_eq!(note.wikilinks[0].heading_anchor.as_deref(), Some("Menü"));
+        assert_eq!(note.wikilinks[0].display.as_deref(), Some("Crème brûlée"));
+        assert_eq!(note.wikilinks[1].target, "日本語ノート");
+        assert_eq!(note.wikilinks[2].target, "naïve — test");
+    }
+
+    /// `strip_code` is shared with the inline-tag scanner, so a tag sitting on
+    /// a line that contains non-ASCII elsewhere must still be found at the
+    /// right line — the byte rewrite used to shift every following offset.
+    ///
+    /// Non-ASCII tag names are covered separately by
+    /// `inline_tags_accept_non_ascii_names`.
+    /// nw-116: Obsidian supports non-ASCII tags, but the scanner tested each
+    /// byte with `is_ascii_alphanumeric`, so it stopped at the first non-ASCII
+    /// byte: `#café` indexed as `caf` and `#niño` as `ni`. That silently splits
+    /// a tag namespace, and the truncated stems can collide with unrelated real
+    /// tags.
+    #[test]
+    fn inline_tags_accept_non_ascii_names() {
+        let src = "# n\n\nTagged #café and #niño and #日本語 and #arch/décision here.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let names: Vec<&str> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"café"), "tags were: {names:?}");
+        assert!(names.contains(&"niño"), "tags were: {names:?}");
+        assert!(names.contains(&"日本語"), "tags were: {names:?}");
+        assert!(names.contains(&"arch/décision"), "tags were: {names:?}");
+        assert!(
+            !names.contains(&"caf"),
+            "the truncated stem must be gone, not merely joined: {names:?}"
+        );
+    }
+
+    /// The widened charset must not start swallowing ordinary punctuation that
+    /// ends a tag — otherwise `#tag.` or `#tag, next` would absorb the trailing
+    /// mark and mint a tag nobody wrote.
+    #[test]
+    fn inline_tags_still_stop_at_punctuation_and_whitespace() {
+        let src = "# n\n\nSee #alpha, #beta. And #gamma; plus #delta! End #ré.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let names: Vec<&str> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        for expected in ["alpha", "beta", "gamma", "delta", "ré"] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+    }
+
+    /// Widening the charset must not start minting tags from prose. The real
+    /// vault contains page and issue ranges written with an EN DASH — `#185–187`,
+    /// `#36–37` — and those are not tags. The en dash (U+2013) is punctuation,
+    /// not a hyphen-minus, so it must terminate the name, and the resulting
+    /// digits-only stem must still be dropped by the numeric filter.
+    #[test]
+    fn en_dash_ranges_from_prose_are_not_tags() {
+        let src = "# n\n\nSee pp. #185–187 and #36–37; also #11–12.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let names: Vec<&str> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.is_empty(),
+            "numeric ranges must not become tags: {names:?}"
+        );
+    }
+
+    #[test]
+    fn inline_tags_survive_non_ascii_on_the_same_line() {
+        let src = "# n\n\nRésumé notes — tagged #design and #arch/decision here.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let names: Vec<&str> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"design"), "tags were: {names:?}");
+        assert!(names.contains(&"arch/decision"), "tags were: {names:?}");
+    }
+
+    /// The fix must not weaken code stripping: a wikilink inside an inline code
+    /// span on a line that also contains non-ASCII must still be ignored, and
+    /// the real link on that line must still be found.
+    #[test]
+    fn non_ascii_line_still_strips_inline_code() {
+        let src = "# n\n\nRésumé `[[not a link]]` but [[Real — Link]] counts.\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        assert_eq!(note.wikilinks.len(), 1);
+        assert_eq!(note.wikilinks[0].target, "Real — Link");
+    }
+
     // ── Tags ────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1387,6 +1527,29 @@ top 2 body
     }
 
     // ── Markdown link (.md) detection ────────────────────────────────────────
+
+    /// nw-100: an EXTERNAL url ending in `.md` is not a vault link.
+    ///
+    /// These passed the `.md` filter, became wikilink targets, and were then
+    /// reported broken on every run — permanently, since nothing in the vault
+    /// could ever satisfy them. The shape that triggered it is a plain link to
+    /// a file in a git forge, e.g.
+    /// `https://github.com/<org>/<repo>/blob/main/docs/releases/v0.2.0.md`.
+    #[test]
+    fn external_urls_ending_in_md_are_not_wikilinks() {
+        let src = "# n\n\nSee [recovery](https://github.com/o/r/blob/main/docs/x.md) and \
+                   [local](notes/y.md).\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let targets: Vec<&str> = note.wikilinks.iter().map(|w| w.target.as_str()).collect();
+        assert!(
+            targets.contains(&"notes/y.md"),
+            "the in-vault link must still be captured: {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t.contains("://")),
+            "an external url must not become a wikilink: {targets:?}"
+        );
+    }
 
     #[test]
     fn detects_md_link_as_wikilink() {

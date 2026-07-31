@@ -143,6 +143,13 @@ to the logical name.
 - `brain add`, `brain watch`, and `brain refresh` all resolve the instance the
   same way (`--instance` flag, then the config's `instance_id`, then
   `"default"`), so a `--config`-driven workflow stays consistent on its own.
+- `brain refresh` additionally resolves from an **existing registration** for
+  that vault root, and prefers it over the `"default"` fallback (nw-098). A
+  refresh with no `--instance`/`--config` therefore refreshes the vault that is
+  already there instead of registering a second one for the same root. An
+  explicit instance that disagrees with the registration is refused, naming
+  both, rather than creating the duplicate — a split root makes note counts the
+  SUM of both vaults and `brain search` return duplicate rows.
 
 Once a database is consolidated and you always start the daemon with `--config`,
 it stays single-convention and you won't need this runbook again.

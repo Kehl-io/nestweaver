@@ -450,6 +450,106 @@ fn parity_affected_tests_direct_vs_daemon() {
     );
 }
 
+/// nw-108: `dead-code`'s daemon branch printed the RPC response verbatim with
+/// no `if json` guard, so the OUTPUT FORMAT depended on whether a daemon
+/// happened to be running rather than on the flag — text standalone, JSON once
+/// the daemon was up. The text renderer was never missing; it was simply not
+/// reached. This is the nw-097 divergence family, and the reason it survived is
+/// that `dead-code` was not in this file.
+/// Replace generated bundle IDs with a fixed placeholder.
+///
+/// `investigate` mints a fresh `bndl_<hex>` per invocation, so its stdout is
+/// never byte-identical across two runs — comparing raw bytes would test the ID
+/// generator, not the renderer.
+fn redact_bundle_ids(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut rest: &str = &text;
+    while let Some(pos) = rest.find("bndl_") {
+        out.push_str(&rest[..pos]);
+        out.push_str("bndl_<redacted>");
+        let after = &rest[pos + "bndl_".len()..];
+        let end = after
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// nw-108: `investigate` carried the identical defect to `dead-code` — its
+/// daemon branch printed the RPC response verbatim, so the format followed
+/// process state rather than the flag.
+#[test]
+fn parity_investigate_human_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    let args: &[&str] = &["investigate", "alpha"];
+
+    let direct = run_direct(&fixture.db_path, args);
+
+    let _guard = DaemonGuard::new(&fixture.db_path);
+    start_daemon(&fixture.db_path);
+    let daemon = run_via_daemon(&fixture.db_path, args);
+
+    assert_eq!(
+        direct.status.code(),
+        daemon.status.code(),
+        "investigate (human): exit code diverged"
+    );
+    assert_eq!(
+        redact_bundle_ids(&direct.stdout),
+        redact_bundle_ids(&daemon.stdout),
+        "investigate (human): stdout diverged between direct and daemon mode"
+    );
+}
+
+///
+/// Now covers `--json` too. It was scoped to human-only because the payloads
+/// genuinely diverged: the daemon wrapped its result in `_meta` while the direct
+/// path omitted it, and the confidence serialised as "medium" through the daemon
+/// but "Medium" direct — the same field disagreeing with itself depending on
+/// whether a daemon was running. Both are fixed (nw-117), so json parity is the
+/// acceptance test for that fix.
+#[test]
+fn parity_dead_code_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "dead-code",
+        &["dead-code", "--limit", "5"],
+    );
+}
+
+/// nw-111 (5): `blast-radius` and `flow-trace` are the product's headline
+/// capabilities and existed only as MCP tools — absent from the CLI, which is the
+/// discovery surface. They are thin wrappers over the SAME
+/// `nestweaver_mcp::tools::dispatch` the daemon runs, so both modes must agree.
+///
+/// Covered from the outset rather than added after a divergence is reported:
+/// `dead-code` and `investigate` both shipped emitting JSON or text depending on
+/// whether a daemon happened to be running, and survived because they were not in
+/// this file (nw-108).
+#[test]
+fn parity_blast_radius_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "blast-radius",
+        &["blast-radius", "--files", CHANGED_FILES, "--depth", "2"],
+    );
+}
+
+#[test]
+fn parity_flow_trace_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(
+        &fixture.db_path,
+        "flow-trace",
+        &["flow-trace", "alpha", "--max-depth", "2"],
+    );
+}
+
 /// `stale-check` is a freshness gate: it exits 1 when the index is
 /// stale. The fixture here is freshly indexed (not stale), but regardless we
 /// only assert stdout equality and equal exit codes across modes — never
