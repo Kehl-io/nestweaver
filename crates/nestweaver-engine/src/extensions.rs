@@ -2187,9 +2187,34 @@ pub fn query_by_property<'a>(
 ) -> Vec<&'a str> {
     store
         .iter()
-        .filter(|(_, props)| props.get(key) == Some(value))
+        .filter(|(_, props)| props.get(key).is_some_and(|stored| property_matches(stored, value)))
         .map(|(uid, _)| uid.as_str())
         .collect()
+}
+
+/// Whether a stored property value satisfies a query value.
+///
+/// Exact equality, PLUS membership when the stored value is an array and the
+/// query is a scalar.
+///
+/// nw-109: exact equality alone made key+value mode useless against real data.
+/// Properties in a live sidecar are array-valued (`aliases: ["Raven","raven"]`),
+/// so the only query that could ever match was one reproducing the entire array
+/// verbatim, in order — meaning the obvious question, "which nodes have alias
+/// Raven", had no expressible form. Membership makes the mode usable without
+/// weakening exact matching: an array query still compares whole-array, so
+/// `["Raven","raven"]` matches only that exact array.
+fn property_matches(stored: &serde_json::Value, query: &serde_json::Value) -> bool {
+    if stored == query {
+        return true;
+    }
+    match (stored, query) {
+        // Scalar-in-array membership. A query that is itself an array is NOT
+        // treated as a set of alternatives — that would silently turn an exact
+        // array comparison into an any-of, which is a different question.
+        (serde_json::Value::Array(items), q) if !q.is_array() => items.iter().any(|i| i == q),
+        _ => false,
+    }
 }
 
 /// Return all properties stored for a node, or an empty map.
@@ -2261,6 +2286,61 @@ fn sidecar_path(db_path: &Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// nw-109: with every property in a real sidecar array-valued, exact-only
+    /// matching meant key+value mode returned 0 results for 100% of live data —
+    /// the obvious question ("which nodes carry alias Raven") had no expressible
+    /// form. Membership makes it answerable.
+    #[test]
+    fn scalar_query_matches_a_member_of_an_array_valued_property() {
+        let mut store: ExtensionStore = Default::default();
+        store.insert(
+            "repo:raven".to_string(),
+            [(
+                "aliases".to_string(),
+                serde_json::json!(["Raven", "raven"]),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            query_by_property(&store, "aliases", &serde_json::json!("Raven")),
+            vec!["repo:raven"]
+        );
+        assert!(query_by_property(&store, "aliases", &serde_json::json!("nope")).is_empty());
+    }
+
+    /// Exact array equality must keep working, and must stay EXACT — an array
+    /// query is one value, not a set of alternatives.
+    #[test]
+    fn array_query_still_compares_whole_array_not_any_of() {
+        let mut store: ExtensionStore = Default::default();
+        store.insert(
+            "a".to_string(),
+            [("t".to_string(), serde_json::json!(["x", "y"]))]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            query_by_property(&store, "t", &serde_json::json!(["x", "y"])),
+            vec!["a"]
+        );
+        // A subset array must NOT match: that would silently reinterpret the
+        // query as any-of, which is a different question than the caller asked.
+        assert!(query_by_property(&store, "t", &serde_json::json!(["x"])).is_empty());
+    }
+
+    /// Scalar properties are unaffected.
+    #[test]
+    fn scalar_property_still_requires_exact_equality() {
+        let mut store: ExtensionStore = Default::default();
+        store.insert(
+            "a".to_string(),
+            [("n".to_string(), serde_json::json!(7))].into_iter().collect(),
+        );
+        assert_eq!(query_by_property(&store, "n", &serde_json::json!(7)), vec!["a"]);
+        assert!(query_by_property(&store, "n", &serde_json::json!(8)).is_empty());
+    }
 
     /// nw-119: the boot-time liveness reconcile skips the full-graph walk when
     /// no extension key is a shared-finalizer UID. That skip must be an

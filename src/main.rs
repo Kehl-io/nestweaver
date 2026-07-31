@@ -7065,6 +7065,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
+            // nw-075: `--json` deliberately bypasses the daemon (its tool
+            // truncates member lists at 20), and this direct path never
+            // consulted the sidecar — so `clusters --json` recomputed on EVERY
+            // invocation while `--help` promises "cached in a sidecar ...
+            // subsequent invocations are instant", and the TEXT path really did
+            // cache via the daemon. Two output modes disagreeing about whether a
+            // cache exists, with the docs siding with the one that didn't.
+            //
+            // Reuse is gated on the resolution MATCHING, because the sidecar
+            // holds whichever resolution was computed last: serving a cache
+            // built at a different resolution would answer a question the caller
+            // did not ask. With an explicit --resolution the check needs no
+            // store at all, which is the fully-instant case the help describes.
+            if let Ok(Some(cached)) = load_clusters(&db_path)
+                && let Some(requested) = resolution
+                && (cached.resolution - requested).abs() < f64::EPSILON
+            {
+                out.status(&format!(
+                    "Using cached clusters (resolution={requested}) from sidecar."
+                ));
+                print_clusters_output(&cached, json)?;
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             // Compute and save inside a block so the store is dropped
             // before any output. LadybugDB's connection finaliser can
             // trigger a panic during WAL checkpoint; wrapping in
@@ -7099,26 +7123,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 o
             };
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&output)?);
-            } else if output.communities.is_empty() {
-                println!("No communities detected (graph may be empty or fully disconnected).");
-            } else {
-                println!(
-                    "Clusters ({}, modularity={:.4}):\n",
-                    output.communities.len(),
-                    output.modularity
-                );
-                for c in &output.communities {
-                    println!(
-                        "  [{:>3}] {} ({} members, cohesion={:.2})",
-                        c.id, c.name, c.member_count, c.cohesion
-                    );
-                    for f in &c.key_files {
-                        println!("        {f}");
-                    }
-                }
-            }
+            print_clusters_output(&output, json)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -8508,6 +8513,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 truncated: false,
                                 scanned_fallback: false,
                                 stale_index: false,
+                                note: None,
                             }
                         });
                     if json {
@@ -15522,6 +15528,37 @@ fn apply_recency_bias_cli(
 fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
     // UID + title + kind + location + relevance (~10 chars) + JSON overhead
     (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
+}
+
+/// Render a `clusters` result in either mode.
+///
+/// Shared so the cached and freshly-computed paths cannot drift (nw-075): the
+/// whole point of serving a cache is that the caller cannot tell the difference.
+fn print_clusters_output(
+    output: &nestweaver_engine::ClusteringOutput,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(output)?);
+    } else if output.communities.is_empty() {
+        println!("No communities detected (graph may be empty or fully disconnected).");
+    } else {
+        println!(
+            "Clusters ({}, modularity={:.4}):\n",
+            output.communities.len(),
+            output.modularity
+        );
+        for c in &output.communities {
+            println!(
+                "  [{:>3}] {} ({} members, cohesion={:.2})",
+                c.id, c.name, c.member_count, c.cohesion
+            );
+            for f in &c.key_files {
+                println!("        {f}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {
