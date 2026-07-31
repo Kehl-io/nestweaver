@@ -1532,8 +1532,9 @@ top 2 body
     ///
     /// These passed the `.md` filter, became wikilink targets, and were then
     /// reported broken on every run — permanently, since nothing in the vault
-    /// could ever satisfy them. Real example from the vault:
-    /// `https://github.com/Kehl-io/orbit/blob/main/docs/releases/v0.2.0-recovery.md`.
+    /// could ever satisfy them. The shape that triggered it is a plain link to
+    /// a file in a git forge, e.g.
+    /// `https://github.com/<org>/<repo>/blob/main/docs/releases/v0.2.0.md`.
     #[test]
     fn external_urls_ending_in_md_are_not_wikilinks() {
         let src = "# n\n\nSee [recovery](https://github.com/o/r/blob/main/docs/x.md) and \

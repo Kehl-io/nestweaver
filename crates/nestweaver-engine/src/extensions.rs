@@ -1996,7 +1996,9 @@ pub fn reconcile_extension_liveness(
     // result is identical to doing nothing, and skipping the walk is an
     // equivalence rather than an approximation. Falls through to the same
     // durable directory sync the `removed == 0` path performs.
-    let needs_liveness_scan = extensions.keys().any(|uid| is_shared_finalizer_graph_uid(uid));
+    let needs_liveness_scan = extensions
+        .keys()
+        .any(|uid| is_shared_finalizer_graph_uid(uid));
     let (live, protected) = if needs_liveness_scan {
         (
             graph.live_graph_node_uids()?,
@@ -2187,7 +2189,11 @@ pub fn query_by_property<'a>(
 ) -> Vec<&'a str> {
     store
         .iter()
-        .filter(|(_, props)| props.get(key).is_some_and(|stored| property_matches(stored, value)))
+        .filter(|(_, props)| {
+            props
+                .get(key)
+                .is_some_and(|stored| property_matches(stored, value))
+        })
         .map(|(uid, _)| uid.as_str())
         .collect()
 }
@@ -2198,12 +2204,12 @@ pub fn query_by_property<'a>(
 /// query is a scalar.
 ///
 /// nw-109: exact equality alone made key+value mode useless against real data.
-/// Properties in a live sidecar are array-valued (`aliases: ["Raven","raven"]`),
+/// Properties in a live sidecar are array-valued (`aliases: ["Widget","widget"]`),
 /// so the only query that could ever match was one reproducing the entire array
 /// verbatim, in order — meaning the obvious question, "which nodes have alias
-/// Raven", had no expressible form. Membership makes the mode usable without
+/// Widget", had no expressible form. Membership makes the mode usable without
 /// weakening exact matching: an array query still compares whole-array, so
-/// `["Raven","raven"]` matches only that exact array.
+/// `["Widget","widget"]` matches only that exact array.
 fn property_matches(stored: &serde_json::Value, query: &serde_json::Value) -> bool {
     if stored == query {
         return true;
@@ -2289,23 +2295,23 @@ mod tests {
 
     /// nw-109: with every property in a real sidecar array-valued, exact-only
     /// matching meant key+value mode returned 0 results for 100% of live data —
-    /// the obvious question ("which nodes carry alias Raven") had no expressible
-    /// form. Membership makes it answerable.
+    /// the obvious question ("which nodes carry alias Widget") had no
+    /// expressible form. Membership makes it answerable.
     #[test]
     fn scalar_query_matches_a_member_of_an_array_valued_property() {
         let mut store: ExtensionStore = Default::default();
         store.insert(
-            "repo:raven".to_string(),
+            "repo:widget".to_string(),
             [(
                 "aliases".to_string(),
-                serde_json::json!(["Raven", "raven"]),
+                serde_json::json!(["Widget", "widget"]),
             )]
             .into_iter()
             .collect(),
         );
         assert_eq!(
-            query_by_property(&store, "aliases", &serde_json::json!("Raven")),
-            vec!["repo:raven"]
+            query_by_property(&store, "aliases", &serde_json::json!("Widget")),
+            vec!["repo:widget"]
         );
         assert!(query_by_property(&store, "aliases", &serde_json::json!("nope")).is_empty());
     }
@@ -2336,9 +2342,14 @@ mod tests {
         let mut store: ExtensionStore = Default::default();
         store.insert(
             "a".to_string(),
-            [("n".to_string(), serde_json::json!(7))].into_iter().collect(),
+            [("n".to_string(), serde_json::json!(7))]
+                .into_iter()
+                .collect(),
         );
-        assert_eq!(query_by_property(&store, "n", &serde_json::json!(7)), vec!["a"]);
+        assert_eq!(
+            query_by_property(&store, "n", &serde_json::json!(7)),
+            vec!["a"]
+        );
         assert!(query_by_property(&store, "n", &serde_json::json!(8)).is_empty());
     }
 
@@ -2383,9 +2394,7 @@ mod tests {
         let protected: std::collections::BTreeSet<String> = Default::default();
         let before = extensions.len();
         extensions.retain(|uid, _| {
-            !is_shared_finalizer_graph_uid(uid)
-                || live.contains(uid)
-                || protected.contains(uid)
+            !is_shared_finalizer_graph_uid(uid) || live.contains(uid) || protected.contains(uid)
         });
         assert_eq!(
             extensions.len(),

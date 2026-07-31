@@ -1583,11 +1583,11 @@ impl<'a> WikilinkLookup<'a> {
         // SOURCE's folder.
         //
         // `by_path` is keyed on full vault-relative paths, so only the first
-        // form ever matched. But `[[plans/Phase B Execution Index]]` written in
-        // `Workspaces/Orbit/_Overview.md` is Obsidian's RELATIVE-path syntax and
-        // means `Workspaces/Orbit/plans/Phase B Execution Index.md`. Every
-        // path-qualified link in the vault therefore resolved to nothing — 45 of
-        // them, all reported at confidence 0.0 (nw-100).
+        // form ever matched. But `[[plans/Rollout Plan]]` written in
+        // `Workspaces/ExampleProject/_Overview.md` is Obsidian's RELATIVE-path
+        // syntax and means `Workspaces/ExampleProject/plans/Rollout Plan.md`.
+        // Every path-qualified link in the vault therefore resolved to nothing —
+        // 45 of them, all reported at confidence 0.0 (nw-100).
         //
         // Both forms are exact, unambiguous single-key lookups, so both score
         // 1.0 and priority ordering is preserved.
@@ -2181,20 +2181,20 @@ sub b body
     ///
     /// `by_path` is keyed on full vault-relative paths, so priority 1 only ever
     /// tried the bare target. `[[plans/Target]]` written in
-    /// `Workspaces/Orbit/_Overview.md` means
-    /// `Workspaces/Orbit/plans/Target.md`, which never matched — so every
-    /// path-qualified link in the vault resolved to nothing (45 of them, all
-    /// reported at confidence 0.0).
+    /// `Workspaces/ExampleProject/_Overview.md` means
+    /// `Workspaces/ExampleProject/plans/Target.md`, which never matched — so
+    /// every path-qualified link in the vault resolved to nothing (45 of them,
+    /// all reported at confidence 0.0).
     #[test]
     fn resolves_a_path_relative_to_the_source_folder() {
         let (_dir, root) = make_vault(&[
             (
-                "Workspaces/Orbit/_Overview.md",
-                "# Overview\n\nSee [[plans/Phase B Execution Index]].\n",
+                "Workspaces/ExampleProject/_Overview.md",
+                "# Overview\n\nSee [[plans/Rollout Plan]].\n",
             ),
             (
-                "Workspaces/Orbit/plans/Phase B Execution Index.md",
-                "# Phase B Execution Index\n\nbody\n",
+                "Workspaces/ExampleProject/plans/Rollout Plan.md",
+                "# Rollout Plan\n\nbody\n",
             ),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
@@ -2212,9 +2212,12 @@ sub b body
         let (_dir, root) = make_vault(&[
             (
                 "notes/index.md",
-                "# Index\n\nSee [[Workspaces/Orbit/plans/Target]].\n",
+                "# Index\n\nSee [[Workspaces/ExampleProject/plans/Target]].\n",
             ),
-            ("Workspaces/Orbit/plans/Target.md", "# Target\n\nbody\n"),
+            (
+                "Workspaces/ExampleProject/plans/Target.md",
+                "# Target\n\nbody\n",
+            ),
         ]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(result.wikilinks_resolved, 1);
@@ -2226,7 +2229,7 @@ sub b body
     #[test]
     fn a_path_qualified_link_to_nowhere_stays_unresolved() {
         let (_dir, root) = make_vault(&[(
-            "Workspaces/Orbit/_Overview.md",
+            "Workspaces/ExampleProject/_Overview.md",
             "# Overview\n\nSee [[plans/Does Not Exist]].\n",
         )]);
         let (result, _) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();

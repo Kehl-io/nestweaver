@@ -6967,7 +6967,7 @@ fn tool_schema_query_extensions() -> Value {
                     "description": "Property name to filter by (e.g. \"team_owner\", \"deprecated\"). Required when not using uid mode."
                 },
                 "value": {
-                    "description": "Value to match — any JSON value. Required when key is provided. Exact match, plus membership: a SCALAR query matches when the stored property is an array containing it (so key=\"aliases\", value=\"Raven\" matches [\"Raven\",\"raven\"]). An ARRAY query stays an exact whole-array comparison, not any-of. Pass a real JSON value, not a stringified one."
+                    "description": "Value to match — any JSON value. Required when key is provided. Exact match, plus membership: a SCALAR query matches when the stored property is an array containing it (so key=\"aliases\", value=\"Widget\" matches [\"Widget\",\"widget\"]). An ARRAY query stays an exact whole-array comparison, not any-of. Pass a real JSON value, not a stringified one."
                 },
                 "uid": {
                     "type": "string",
