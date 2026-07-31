@@ -113,6 +113,35 @@ pub struct RegexSearchResult {
     /// pattern has usable literals; always false when no index was ever built.
     #[serde(default)]
     pub stale_index: bool,
+    /// Human-readable explanation when an empty result is NOT a definitive
+    /// "no matches exist".
+    ///
+    /// nw-097: the MCP tool attached this note itself, so a CLI caller saw
+    /// `{"results": [], "truncated": true}` with nothing explaining it and
+    /// reasonably read it as "the pattern matches nothing". `truncated` alone
+    /// does not carry that meaning to a human. Living on the shared result
+    /// means every surface — CLI, MCP, daemon — reports it identically rather
+    /// than each remembering to bolt it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The note attached to an empty-but-truncated regex search.
+///
+/// A search that ran out of scan budget before matching anything has NOT
+/// established that no matches exist, and must not be presented as if it had.
+pub const SCAN_BUDGET_NOTE: &str = "Pattern matched no candidates within the scan budget. Results may exist beyond \
+     the scanned range.";
+
+impl RegexSearchResult {
+    /// Attach [`SCAN_BUDGET_NOTE`] when this result is empty only because the
+    /// scan was cut short. Idempotent, and never overwrites an existing note.
+    pub fn with_scan_budget_note(mut self) -> Self {
+        if self.results.is_empty() && self.truncated && self.note.is_none() {
+            self.note = Some(SCAN_BUDGET_NOTE.to_string());
+        }
+        self
+    }
 }
 
 /// Per-file aggregate count for `count_patterns`.
@@ -662,12 +691,15 @@ impl GraphStore {
             }
         }
 
+        // nw-097: attach the note at the source so no caller has to remember.
         Ok(RegexSearchResult {
             results,
             truncated,
             scanned_fallback,
             stale_index,
-        })
+            note: None,
+        }
+        .with_scan_budget_note())
     }
 
     /// Counts-only companion to `regex_search`. For each pattern, returns total
@@ -750,6 +782,62 @@ fn line_and_snippet(text: &str, match_start: usize) -> (u32, String) {
 
 #[cfg(test)]
 mod tests {
+    /// nw-097: an empty result that is empty only because the scan budget ran
+    /// out must SAY so. Previously the MCP tool attached this note itself, so a
+    /// CLI `--json` caller received `{"results": [], "truncated": true}` with
+    /// nothing explaining it and would reasonably read it as "no matches exist".
+    /// Attaching it on the shared result is what makes every surface agree.
+    #[test]
+    fn empty_and_truncated_carries_the_scan_budget_note() {
+        let r = RegexSearchResult {
+            results: vec![],
+            truncated: true,
+            scanned_fallback: false,
+            stale_index: false,
+            note: None,
+        }
+        .with_scan_budget_note();
+        assert_eq!(r.note.as_deref(), Some(SCAN_BUDGET_NOTE));
+    }
+
+    /// A genuinely exhaustive empty search HAS established that nothing matches,
+    /// so it must not be hedged — the note would be a false caveat.
+    #[test]
+    fn empty_but_complete_search_gets_no_note() {
+        let r = RegexSearchResult {
+            results: vec![],
+            truncated: false,
+            scanned_fallback: false,
+            stale_index: false,
+            note: None,
+        }
+        .with_scan_budget_note();
+        assert!(r.note.is_none(), "a complete empty scan must not be hedged");
+    }
+
+    /// Results present means the caller has something concrete; the budget note
+    /// is about an EMPTY result being misread.
+    #[test]
+    fn truncated_with_results_gets_no_scan_budget_note() {
+        let hit = RegexMatch {
+            uid: "sym:x".into(),
+            kind: "Symbol".into(),
+            title: "x".into(),
+            location: "a.rs".into(),
+            line: Some(1),
+            snippet: "x".into(),
+        };
+        let r = RegexSearchResult {
+            results: vec![hit],
+            truncated: true,
+            scanned_fallback: false,
+            stale_index: false,
+            note: None,
+        }
+        .with_scan_budget_note();
+        assert!(r.note.is_none());
+    }
+
     use super::*;
     use nestweaver_schema::{Note, NoteKind, Section, Symbol, SymbolKind, Visibility};
 

@@ -302,6 +302,19 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
 /// aborts the very restart we just requested — which is exactly what broke
 /// `daemon_crash_recovery`. A pidfile that cannot be read yet is likewise not
 /// treated as death: a freshly spawned daemon writes it asynchronously.
+/// Where to send an operator whose daemon failed to bind `sock`.
+///
+/// The instance id is recovered from the socket's parent directory name, which
+/// is the only identifier available at this point in the failure path.
+fn log_hint_for_socket(sock: &Path) -> String {
+    let instance_id = sock
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().replace("nestweaver-", ""))
+        .unwrap_or_else(|| "default".to_string());
+    nestweaver_daemon::lifecycle::log_hint(&instance_id)
+}
+
 fn wait_for_socket_watching(
     sock: &Path,
     pidfile: Option<&Path>,
@@ -328,16 +341,9 @@ fn wait_for_socket_watching(
             }
             bail!(
                 "daemon process {pid} exited before binding {}.\n\
-                 Check the daemon log for errors: {}",
+                 Check the daemon logs for errors: {}",
                 sock.display(),
-                nestweaver_daemon::lifecycle::log_path(
-                    &sock
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().replace("nestweaver-", ""))
-                        .unwrap_or_else(|| "default".to_string())
-                )
-                .display()
+                log_hint_for_socket(sock)
             );
         }
         std::thread::sleep(delay);
@@ -349,20 +355,20 @@ fn wait_for_socket_watching(
         return Ok(());
     }
 
+    // Do NOT offer `--no-daemon` here. It is a CI-only escape hatch that
+    // bypasses the single-writer lock, and `resolve_use_daemon` refuses it
+    // outside CI anyway — so the suggestion was both unusable and, if forced,
+    // exactly the WAL-corruption risk the daemon exists to prevent (nw-125).
+    // A slow boot is the common cause, so name the knob that actually helps.
     bail!(
         "daemon socket at {} did not accept connections within {:.1}s.\n\
-         Check the daemon log for errors: {}\n\
-         If another process holds the database lock, stop it or use --no-daemon.",
+         Check the daemon logs for errors: {}\n\
+         If it is simply slow to boot, raise {}; if another process holds the \
+         database lock, stop that process.",
         sock.display(),
         timeout.as_secs_f64(),
-        nestweaver_daemon::lifecycle::log_path(
-            &sock
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().replace("nestweaver-", ""))
-                .unwrap_or_else(|| "default".to_string())
-        )
-        .display()
+        log_hint_for_socket(sock),
+        DAEMON_BOOT_TIMEOUT_ENV
     );
 }
 

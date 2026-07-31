@@ -2167,21 +2167,10 @@ fn tool_regex_search(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     let res = store
         .regex_search(pattern, path_prefix, kinds.as_deref(), limit, max_millis)
         .map_err(|e| anyhow!("regex_search: {e}"))?;
-    let mut resp = serde_json::to_value(res)?;
-    if resp
-        .get("results")
-        .and_then(|r| r.as_array())
-        .is_some_and(|a| a.is_empty())
-        && resp
-            .get("truncated")
-            .and_then(|t| t.as_bool())
-            .unwrap_or(false)
-    {
-        resp["note"] = json!(
-            "Pattern matched no candidates within the scan budget. Results may exist beyond the scanned range."
-        );
-    }
-    Ok(resp)
+    // nw-097: the note now rides on RegexSearchResult itself, attached by the
+    // store, so the CLI and daemon paths carry it too. This tool used to bolt it
+    // on here, which is exactly why only MCP had it.
+    Ok(serde_json::to_value(res)?)
 }
 
 fn tool_schema_regex_search() -> Value {
@@ -3219,6 +3208,14 @@ fn tool_brain_context(
 
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = json!(result.unresolved_seeds);
+    }
+
+    // nw-102: how many of `seeds` are semantic nearest-neighbour guesses rather
+    // than resolutions of the query. Without this the daemon path could not
+    // distinguish them and reported every guess as "resolved" — the same
+    // response then claimed a seed both resolved AND unresolved.
+    if result.semantic_seed_count > 0 {
+        resp["semantic_seed_count"] = json!(result.semantic_seed_count);
     }
 
     // Feature F7: surface the PRF-mined expansion terms for auditing. Only
@@ -6970,7 +6967,7 @@ fn tool_schema_query_extensions() -> Value {
                     "description": "Property name to filter by (e.g. \"team_owner\", \"deprecated\"). Required when not using uid mode."
                 },
                 "value": {
-                    "description": "Value to match — any JSON value. Required when key is provided. Exact match only."
+                    "description": "Value to match — any JSON value. Required when key is provided. Exact match, plus membership: a SCALAR query matches when the stored property is an array containing it (so key=\"aliases\", value=\"Widget\" matches [\"Widget\",\"widget\"]). An ARRAY query stays an exact whole-array comparison, not any-of. Pass a real JSON value, not a stringified one."
                 },
                 "uid": {
                     "type": "string",

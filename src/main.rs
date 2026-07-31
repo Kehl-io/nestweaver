@@ -161,6 +161,41 @@ enum CliDiagnostic {
     )]
     EmptyDatabase,
 
+    /// The database file is present but could not be opened. NEVER conflate
+    /// this with `db_not_found`: suggesting `index --repo` at a path that
+    /// already holds a database invites the user to write over their own data
+    /// (nw-126). The underlying store error is carried through verbatim
+    /// because it is the only thing that says WHY.
+    #[error("Database exists but could not be opened: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_unavailable),
+        help(
+            "{cause}\nThe database file is present, so do NOT run `index` at this path.\n\
+             If a daemon or other process holds it, stop it with \
+             `nestweaver daemon --db {path} stop`."
+        )
+    )]
+    DatabaseUnavailable { path: String, cause: String },
+
+    /// A crashed daemon leaves an unreplayed write-ahead log. Replay needs
+    /// read-write access, so the read-only path can never perform it and the
+    /// generic "could not open" message sends the user nowhere (nw-126).
+    #[error("Database has an unreplayed write-ahead log: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_wal_unreplayed),
+        help(
+            "{cause}\nThis usually follows a daemon crash. Replay requires read-write \
+             access:\n  nestweaver daemon --db {path} start\n\
+             If that also fails, move {wal} aside and retry — it is replayed or \
+             discarded on the next read-write open, and the database itself is intact."
+        )
+    )]
+    DatabaseWalUnreplayed {
+        path: String,
+        wal: String,
+        cause: String,
+    },
+
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
     General { message: String },
@@ -178,6 +213,28 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // ... No such file or directory" mentions a .lbug path and a missing
     // file, but mapping it to db_not_found produces the circular help text
     // "Run `nestweaver index` to create a database" — while running index.
+    // nw-126: a crashed daemon leaves an unreplayed WAL. The store says so
+    // precisely ("Couldn't replay shadow pages under read-only mode. Please
+    // re-open the database with read-write mode...") but that fell through to
+    // the bare `nestweaver::error` rendering, which states the problem and no
+    // remedy — and the advice it does give cannot be followed on the path that
+    // emitted it, since a read-only open can never perform the replay.
+    if lower.contains("shadow pages") || (lower.contains("replay") && lower.contains("read-only")) {
+        let path = message
+            .split("at ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .unwrap_or("./nestweaver.lbug")
+            .trim()
+            .to_string();
+        return CliDiagnostic::DatabaseWalUnreplayed {
+            wal: format!("{path}.wal"),
+            path,
+            cause: message,
+        }
+        .into();
+    }
+
     if lower.contains("database not found")
         || (lower.contains("failed to open database") && lower.contains("no such file"))
     {
@@ -190,7 +247,45 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
             .unwrap_or("./nestweaver.lbug")
             .trim()
             .to_string();
-        return CliDiagnostic::DatabaseNotFound { path }.into();
+
+        // nw-126: these are TEXT heuristics, and text lies. The daemon's
+        // "failed to open database with write access at <path>; another
+        // process may hold the write lock" matched here and rendered a live
+        // 5.6 GB database as "not found", with help telling the user to
+        // `index` a new one over the top of it. Ask the filesystem instead of
+        // trusting the substring: if the file is really there, this is an
+        // availability failure, not a missing database, and the remedy is the
+        // opposite of creating one.
+        //
+        // Trim the path defensively — the same heuristics can capture trailing
+        // context clauses ("<path>; another process may...").
+        let candidate = path
+            .split(';')
+            .next()
+            .unwrap_or(&path)
+            .trim()
+            .trim_end_matches(['.', ','])
+            .to_string();
+        let on_disk = std::path::Path::new(&candidate);
+        if on_disk.exists() {
+            let wal = format!("{candidate}.wal");
+            if std::path::Path::new(&wal).exists() {
+                return CliDiagnostic::DatabaseWalUnreplayed {
+                    path: candidate,
+                    wal,
+                    cause: message,
+                }
+                .into();
+            }
+            return CliDiagnostic::DatabaseUnavailable {
+                path: candidate,
+                cause: message,
+            }
+            .into();
+        }
+        // Report the trimmed path here too, so a message that appended a
+        // context clause does not surface it as part of the filename.
+        return CliDiagnostic::DatabaseNotFound { path: candidate }.into();
     }
 
     if lower.contains("path") && lower.contains("does not exist")
@@ -693,6 +788,8 @@ fn impact_json_ok(
     note: Option<String>,
 ) -> serde_json::Value {
     let capped = matches!((total, returned), (Some(t), Some(r)) if r < t);
+    // Resolve before the payload borrows `nodes` (nw-123).
+    let returned = returned.unwrap_or_else(|| nodes_len(&nodes));
     let mut payload = serde_json::json!({
         "status": "ok",
         "symbol": symbol,
@@ -702,17 +799,81 @@ fn impact_json_ok(
         "truncated_by_depth": truncated_by_depth,
     });
     if let Some(obj) = payload.as_object_mut() {
-        if let Some(t) = total {
-            obj.insert("total".to_string(), serde_json::json!(t));
-        }
-        if let Some(r) = returned {
-            obj.insert("returned".to_string(), serde_json::json!(r));
-        }
+        // nw-123: `total` and `returned` used to be inserted only when the
+        // caller knew them, so the key SET varied by code path — the
+        // depth-truncated envelope carried them and the threshold-truncated one
+        // did not, leaving a consumer with `undefined` in exactly the case
+        // where the result is incomplete and the counts matter most. A stable
+        // schema is the whole point of this envelope, so both keys are always
+        // present.
+        //
+        // `returned` is never guessed: it is the length of the array we are
+        // actually returning. `total` is `null` when genuinely unknown rather
+        // than being backfilled from `returned`, which would assert
+        // completeness we did not establish (same rule as nw-073's null count).
+        obj.insert("returned".to_string(), serde_json::json!(returned));
+        obj.insert(
+            "total".to_string(),
+            match total {
+                Some(t) => serde_json::json!(t),
+                None => serde_json::Value::Null,
+            },
+        );
         if let Some(note) = note {
             obj.insert("note".to_string(), serde_json::json!(note));
         }
     }
     payload
+}
+
+/// Length of a JSON node collection, for envelopes that must report what they
+/// actually returned rather than what the caller happened to know.
+fn nodes_len(nodes: &serde_json::Value) -> u64 {
+    nodes.as_array().map(|a| a.len() as u64).unwrap_or(0)
+}
+
+/// Warn when a ranking is computed over edges built by a superseded resolver.
+///
+/// nw-124: a fix that changes persisted edge SHAPE (nw-103's import fan-out)
+/// cannot correct data already written. Upgrading therefore leaves `hubs`,
+/// `bridges` and PageRank confidently wrong for every repo not yet re-indexed,
+/// and previously nothing disclosed it. Emitted on stderr so `--json` consumers
+/// are told without the payload changing shape.
+fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore, db_path: &std::path::Path) {
+    let Ok(repos) = store.list_repos(None) else {
+        return;
+    };
+    let uids: Vec<String> = repos.into_iter().map(|r| r.uid).collect();
+    if uids.is_empty() {
+        return;
+    }
+    if let Some(note) = nestweaver_engine::resolver_generation::staleness_note(db_path, &uids) {
+        eprintln!("warning: {note}");
+    }
+}
+
+/// Daemon-path counterpart to [`warn_stale_resolver_rankings`].
+///
+/// The daemon owns the store, so this path has no handle to enumerate repos
+/// and cannot report an exact stale count. It can still catch the case that
+/// matters most — and is the common one on upgrade — where the sidecar does not
+/// exist at all, meaning EVERY repo's edges predate the fix. Without this the
+/// warning would only ever appear on the direct path, which is the path users
+/// are told not to use.
+fn warn_stale_resolver_rankings_no_store(db_path: &std::path::Path) {
+    let sidecar = nestweaver_engine::sidecar_path(
+        db_path,
+        nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+    );
+    if sidecar.exists() {
+        return;
+    }
+    eprintln!(
+        "warning: no resolver generation is recorded for this database, so every repo \
+         was indexed before the nw-103 import-fan-out fix — hub, bridge and PageRank \
+         rankings are NOT corrected by upgrading alone. Re-index each repo \
+         (`nestweaver index --repo <path>`) to get accurate rankings."
+    );
 }
 
 /// Ambiguous resolution — carries `candidates`, never `nodes`, so it cannot be
@@ -788,6 +949,20 @@ fn render_investigate_text(payload: &serde_json::Value) {
             String::new()
         }
     );
+    // nw-120: the daemon ranks with its warm embedding model; the direct path
+    // has none, so the SAME query returns a different ordering. Say which one
+    // produced this map rather than letting the ranking imply a quality it did
+    // not have.
+    if payload
+        .get("semantic_applied")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|applied| !applied)
+    {
+        println!(
+            "  note: semantic retrieval unavailable — ranking is lexical (BM25) only, \
+             so ordering differs from a daemon-served run."
+        );
+    }
 
     for d in &domains {
         println!("\n[{}]", text(d, "label"));
@@ -6542,6 +6717,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     );
                                 }
                             }
+                            // nw-124: the daemon serves this path, so the
+                            // disclosure has to live here too — otherwise it
+                            // only ever fires on the direct path users are
+                            // told not to use.
+                            warn_stale_resolver_rankings_no_store(&db_path);
                             let stats = format!(
                                 "{} hubs in {} (via hybrid)",
                                 value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -6567,6 +6747,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if let Ok(Some(clustering)) = load_clusters(&db_path) {
                 attach_cluster_ids(&mut hubs, &clustering);
             }
+
+            // nw-124: hub ranking is precisely what nw-103's import fan-out
+            // corrupted, and the fix cannot repair edges already on disk. On
+            // this machine the FIXED binary still returned the bug report's
+            // exact ranking until the repo was re-indexed. Say so rather than
+            // presenting stale numbers as current. Written to stderr so it
+            // reaches the user in --json mode too, without altering the
+            // documented bare-array payload.
+            warn_stale_resolver_rankings(&store, &db_path);
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&hubs)?);
@@ -6645,6 +6834,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             );
                         }
                     }
+                    // nw-124: bridges are downstream of the same import
+                    // fan-out nw-103 fixed, so they carry the same staleness.
+                    warn_stale_resolver_rankings_no_store(&db_path);
                     let stats = format!(
                         "{} bridges in {} (via daemon)",
                         bridges.len(),
@@ -6658,6 +6850,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             out.status("Computing betweenness centrality...");
             let mut bridges = find_bridge_nodes(&store, top)?;
+            warn_stale_resolver_rankings(&store, &db_path);
 
             // Attach community connection info if clustering sidecar exists.
             if let Ok(Some(clustering)) = load_clusters(&db_path) {
@@ -6886,6 +7079,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
 
+            // nw-075: `--json` deliberately bypasses the daemon (its tool
+            // truncates member lists at 20), and this direct path never
+            // consulted the sidecar — so `clusters --json` recomputed on EVERY
+            // invocation while `--help` promises "cached in a sidecar ...
+            // subsequent invocations are instant", and the TEXT path really did
+            // cache via the daemon. Two output modes disagreeing about whether a
+            // cache exists, with the docs siding with the one that didn't.
+            //
+            // Reuse is gated on the resolution MATCHING, because the sidecar
+            // holds whichever resolution was computed last: serving a cache
+            // built at a different resolution would answer a question the caller
+            // did not ask. With an explicit --resolution the check needs no
+            // store at all, which is the fully-instant case the help describes.
+            if let Ok(Some(cached)) = load_clusters(&db_path)
+                && let Some(requested) = resolution
+                && (cached.resolution - requested).abs() < f64::EPSILON
+            {
+                out.status(&format!(
+                    "Using cached clusters (resolution={requested}) from sidecar."
+                ));
+                print_clusters_output(&cached, json)?;
+                return Ok((EXIT_SUCCESS, None));
+            }
+
             // Compute and save inside a block so the store is dropped
             // before any output. LadybugDB's connection finaliser can
             // trigger a panic during WAL checkpoint; wrapping in
@@ -6920,26 +7137,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 o
             };
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&output)?);
-            } else if output.communities.is_empty() {
-                println!("No communities detected (graph may be empty or fully disconnected).");
-            } else {
-                println!(
-                    "Clusters ({}, modularity={:.4}):\n",
-                    output.communities.len(),
-                    output.modularity
-                );
-                for c in &output.communities {
-                    println!(
-                        "  [{:>3}] {} ({} members, cohesion={:.2})",
-                        c.id, c.name, c.member_count, c.cohesion
-                    );
-                    for f in &c.key_files {
-                        println!("        {f}");
-                    }
-                }
-            }
+            print_clusters_output(&output, json)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -8329,6 +8527,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 truncated: false,
                                 scanned_fallback: false,
                                 stale_index: false,
+                                note: None,
                             }
                         });
                     if json {
@@ -10624,6 +10823,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
             let socket = nestweaver_daemon::socket_path(&instance_id);
             let log_file = nestweaver_daemon::log_path(&instance_id);
+            // `log_file` is the real stderr sink (it goes in the plist and gets
+            // opened for redirect below). It is NOT what an operator should be
+            // told to read: tracing writes to `daemon.log.<date>` alongside it,
+            // so every human-facing pointer uses the hint instead. See nw-118.
+            let log_hint = nestweaver_daemon::log_hint(&instance_id);
 
             match action {
                 DaemonAction::Start {
@@ -10738,7 +10942,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     .display()
                             );
                             eprintln!("  Socket: {}", socket.display());
-                            eprintln!("  Log:    {}", log_file.display());
+                            eprintln!("  Log:    {log_hint}");
 
                             // Poll connect_existing + health_check
                             // (wait_healthy never auto-starts) instead of the
@@ -10764,9 +10968,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     // still turn into a healthy daemon.
                                     eprintln!(
                                         "Daemon is still booting under launchd; check \
-                                         `nestweaver daemon --db {} status` and the log at {}",
+                                         `nestweaver daemon --db {} status` and the logs at {}",
                                         db_path.display(),
-                                        log_file.display()
+                                        log_hint
                                     );
                                     return Ok((EXIT_SUCCESS, None));
                                 }
@@ -10928,7 +11132,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         eprintln!("  PID file: {}", pidfile.display());
                         eprintln!("  Socket:   {}", socket.display());
-                        eprintln!("  Log:      {}", log_file.display());
+                        eprintln!("  Log:      {log_hint}");
 
                         let daemonize = daemonize2::Daemonize::new()
                             .pid_file(&pidfile)
@@ -10981,9 +11185,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 if !parent.first_child_exit_status.success() {
                                     eprintln!(
                                         "Error: daemon failed to start (boot exit status {}). \
-                                         Check the log: {}",
-                                        parent.first_child_exit_status,
-                                        log_file.display()
+                                         Check the logs: {}",
+                                        parent.first_child_exit_status, log_hint
                                     );
                                     std::process::exit(EXIT_ERROR);
                                 }
@@ -10994,8 +11197,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                                 eprintln!(
                                     "Error: daemon did not start accepting connections within \
-                                     10s — it may have died during boot. Check the log: {}",
-                                    log_file.display()
+                                     10s — it may have died during boot. Check the logs: {}",
+                                    log_hint
                                 );
                                 std::process::exit(EXIT_ERROR);
                             }
@@ -11220,7 +11423,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
-                        println!("  Log:    {}", log_file.display());
+                        println!("  Log:    {log_hint}");
                         print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -11235,7 +11438,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("Daemon is running (PID {pid})");
                             println!("  DB:     {}", db_path.display());
                             println!("  Socket: {}", socket.display());
-                            println!("  Log:    {}", log_file.display());
+                            println!("  Log:    {log_hint}");
                             print_daemon_embedding_status(&db_path);
                         } else {
                             println!(
@@ -11253,7 +11456,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         println!("Daemon is running (PID {pid}, serving socket)");
                         println!("  DB:     {}", db_path.display());
                         println!("  Socket: {}", socket.display());
-                        println!("  Log:    {}", log_file.display());
+                        println!("  Log:    {log_hint}");
                         print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
@@ -12369,13 +12572,59 @@ fn try_hybrid_json_rpc(
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {
-        Ok(mut hybrid) => rt.block_on(hybrid.query(rpc_name, &args)).ok(),
-        Err(_) => rt
-            .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
-                config, &start_dir, rpc_name, &args,
-            ))
-            .ok(),
+        Ok(mut hybrid) => match rt.block_on(hybrid.query(rpc_name, &args)) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
+                None
+            }
+        },
+        Err(e) => {
+            let upstream = rt
+                .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+                    config, &start_dir, rpc_name, &args,
+                ))
+                .ok();
+            if upstream.is_none() {
+                warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
+            }
+            upstream
+        }
     }
+}
+
+/// Disclose that a command could not be served by the daemon and is about to be
+/// answered by the direct path instead.
+///
+/// nw-125: this fallback was completely silent — exit 0, nothing on stderr, a
+/// result that looks authoritative. Meanwhile asking for the same bypass
+/// explicitly is REFUSED, with a warning about WAL corruption and a demand for
+/// `NESTWEAVER_ALLOW_NO_DAEMON=1`. The tool policed a deliberate request while
+/// doing the same thing unprompted whenever the daemon was slow or down.
+///
+/// That matters beyond consistency: the direct path is not equivalent. It
+/// returns different rankings for `investigate` (nw-120), omits the embedding
+/// block from `brain status` (nw-121), and — the case that produced nw-126 —
+/// opens read-only, so it cannot replay a crashed daemon's WAL and converts a
+/// self-healing outage into a hard failure.
+///
+/// Warn once per process: a single command can route several RPCs through here,
+/// and repeating the paragraph per call would train the user to ignore it.
+fn warn_daemon_bypassed(db_path: &std::path::Path, rpc_name: &str, cause: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "Warning: the daemon could not serve `{rpc_name}` for {} — answering from the \
+         direct path instead.\n  cause: {cause}\n  \
+         Results may differ from the daemon's, and writes are not protected by the \
+         daemon's single-writer lock. Start it with `nestweaver daemon --db {} start`, \
+         or raise NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS if it is simply slow to boot.",
+        db_path.display(),
+        db_path.display()
+    );
 }
 
 /// Unwrap the `{ "results": [...], "_meta": {...} }` envelope that the hybrid
@@ -13167,6 +13416,20 @@ fn run_brain(
                 println!("  Tags:      {tag_count}");
                 println!("  Wikilinks: {wikilink_count}");
                 println!("  Repos:     {}", repos.len());
+                // nw-121: the daemon prints an `Embedding:` block here and this
+                // path printed nothing at all — same command, same database,
+                // silently different answer. An omitted section reads as "no
+                // such concept", so a user could not tell that semantic
+                // retrieval state was simply unknown. Embedding state is
+                // RUNTIME state owned by the daemon (model actually loaded,
+                // device actually selected), so this path genuinely cannot
+                // report it — but saying so is not the same as saying nothing.
+                println!("Embedding:");
+                println!(
+                    "  State:            unknown (runtime state is held by the daemon; \
+                     start it with `nestweaver daemon --db {} start`)",
+                    db_path.display()
+                );
                 // Interaction tracking is opt-in (enabled via `mcp
                 // --track-interactions`). InteractionTracker::new touches
                 // the sidecar at startup so we can distinguish three states:
@@ -15280,13 +15543,72 @@ fn render_cost_tokens(n: &nestweaver_engine::BrainNode) -> usize {
     (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
 }
 
+/// Render a `clusters` result in either mode.
+///
+/// Shared so the cached and freshly-computed paths cannot drift (nw-075): the
+/// whole point of serving a cache is that the caller cannot tell the difference.
+fn print_clusters_output(
+    output: &nestweaver_engine::ClusteringOutput,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(output)?);
+    } else if output.communities.is_empty() {
+        println!("No communities detected (graph may be empty or fully disconnected).");
+    } else {
+        println!(
+            "Clusters ({}, modularity={:.4}):\n",
+            output.communities.len(),
+            output.modularity
+        );
+        for c in &output.communities {
+            println!(
+                "  [{:>3}] {} ({} members, cohesion={:.2})",
+                c.id, c.name, c.member_count, c.cohesion
+            );
+            for f in &c.key_files {
+                println!("        {f}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Header line for `brain context` seeds.
+///
+/// nw-102: `seeds` mixes nodes resolved from the query text with nearest
+/// neighbours injected by the semantic leg, and counting both as "resolved"
+/// made the output contradict itself — a nonsense query printed
+/// `Seeds (5 resolved)` while the same response listed that query under
+/// `Unresolved seeds (1)`. Reports PROVENANCE, not quality: a phrase like
+/// "blast radius" fails a direct lookup against the symbol `blast_radius` yet
+/// its semantic hits are excellent, so labelling them guesses would understate
+/// them exactly as counting them as direct matches overstated them.
+fn seed_header(total_seeds: usize, semantic_seeds: usize) -> String {
+    let matched = total_seeds.saturating_sub(semantic_seeds);
+    if semantic_seeds > 0 {
+        format!("Seeds ({matched} matched directly, {semantic_seeds} via semantic search):")
+    } else {
+        format!("Seeds ({matched} resolved):")
+    }
+}
+
 fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budget: Option<usize>) {
     // Feature F7: show PRF-mined expansion terms for auditing.
     if !result.expansion_terms.is_empty() {
         println!("PRF expansion terms: {}", result.expansion_terms.join(", "));
         println!();
     }
-    println!("Seeds ({} resolved):", result.seeds.len());
+    // nw-102: `seeds` mixes two different things — nodes actually resolved from
+    // the query, and nearest-neighbour guesses injected by the semantic leg,
+    // which vector KNN returns regardless of how distant they are. Counting
+    // both as "resolved" made the output contradict itself: a nonsense query
+    // printed `Seeds (5 resolved)` while ALSO listing that same query under
+    // `Unresolved seeds (1)`. Report the two separately.
+    println!(
+        "{}",
+        seed_header(result.seeds.len(), result.semantic_seed_count)
+    );
     for n in &result.seeds {
         if n.location.is_empty() {
             println!("  {}  [{}]", n.title, n.kind);
@@ -15300,6 +15622,17 @@ fn print_brain_context_text(result: &BrainContextResult, cut: usize, token_budge
         println!("Unresolved seeds ({}):", result.unresolved_seeds.len());
         for s in &result.unresolved_seeds {
             println!("  {s}");
+        }
+        if result.seeds.len() == result.semantic_seed_count && result.semantic_seed_count > 0 {
+            // State HOW the seeds were found, not how good they are. A phrase
+            // like "blast radius" fails a direct lookup against the symbol
+            // `blast_radius` yet its semantic hits are excellent, so calling
+            // them guesses would understate them just as counting them as
+            // direct matches overstated them.
+            println!(
+                "  note: no seed matched the query text directly; the seeds above \
+                 came from semantic similarity."
+            );
         }
     }
 
@@ -18649,6 +18982,166 @@ mod hybrid_cli_tests {
         let present = dir.path().join("present.lbug");
         std::fs::write(&present, b"").unwrap();
         assert!(require_existing_db(&present).is_ok());
+    }
+
+    /// nw-102: a seed injected by the semantic leg must never be counted as
+    /// "resolved". Counting them together let one response claim a query both
+    /// resolved AND unresolved at the same time.
+    #[test]
+    fn seed_header_never_counts_semantic_hits_as_resolved() {
+        // The reported case: nothing matched, five nearest neighbours injected.
+        let h = seed_header(5, 5);
+        assert!(h.contains("0 matched directly"), "{h}");
+        assert!(h.contains("5 via semantic search"), "{h}");
+        assert!(
+            !h.contains("5 resolved"),
+            "must not report semantic guesses as resolved: {h}"
+        );
+
+        // Genuine direct matches, no semantic leg.
+        assert_eq!(seed_header(3, 0), "Seeds (3 resolved):");
+
+        // Mixed: two direct, three semantic.
+        let m = seed_header(5, 3);
+        assert!(
+            m.contains("2 matched directly") && m.contains("3 via semantic search"),
+            "{m}"
+        );
+    }
+
+    /// Defensive: the counts arrive from a daemon response, so a malformed or
+    /// older payload must not underflow the subtraction.
+    #[test]
+    fn seed_header_does_not_underflow_on_inconsistent_counts() {
+        let h = seed_header(2, 9);
+        assert!(h.contains("0 matched directly"), "{h}");
+    }
+
+    /// nw-123: the impact envelope's key set must not depend on which
+    /// truncation path ran. `--depth 1` carried `returned`/`total`;
+    /// `--min-score 0.9` silently dropped them while still returning 3 nodes,
+    /// so a consumer got `undefined` precisely when the result was incomplete.
+    #[test]
+    fn impact_envelope_key_set_is_identical_across_truncation_paths() {
+        let nodes = serde_json::json!([{"name": "a"}, {"name": "b"}, {"name": "c"}]);
+
+        let by_depth = impact_json_ok("s", nodes.clone(), false, true, Some(9), Some(3), None);
+        // The threshold path is the one that used to omit the counts.
+        let by_threshold = impact_json_ok("s", nodes.clone(), true, false, None, None, None);
+
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(&by_depth),
+            keys(&by_threshold),
+            "envelope keys must not vary by truncation path"
+        );
+
+        for env in [&by_depth, &by_threshold] {
+            assert!(env.get("returned").is_some(), "returned must always exist");
+            assert!(env.get("total").is_some(), "total must always exist");
+        }
+
+        // `returned` reflects what was actually returned, even when the caller
+        // did not supply it.
+        assert_eq!(by_threshold["returned"], serde_json::json!(3));
+        // An unknown total is null — never backfilled from `returned`, which
+        // would assert a completeness that was not established.
+        assert!(
+            by_threshold["total"].is_null(),
+            "unknown total must be null, not a fabricated count: {by_threshold}"
+        );
+        assert_eq!(by_depth["total"], serde_json::json!(9));
+    }
+
+    /// nw-126: the incident message, verbatim. A SIGKILLed daemon left a stale
+    /// WAL; the daemon's open failure was text-matched into `db_not_found` and
+    /// rendered a live 5.6 GB database as "Database not found", with help
+    /// telling the user to `index` a new one AT THAT PATH. Following it would
+    /// have destroyed data that was fully recoverable — the entire outage was
+    /// one stale 42-byte file.
+    ///
+    /// The guard is to consult the filesystem rather than the error text.
+    #[test]
+    fn existing_database_is_never_diagnosed_as_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"not empty").unwrap();
+
+        let err = anyhow::anyhow!(
+            "failed to open database with write access at {}; another process \
+             may hold the write lock: database error: no such file",
+            db.display()
+        );
+        let rendered = format!("{:?}", into_diagnostic(err));
+
+        assert!(
+            !rendered.contains("db_not_found"),
+            "a database that EXISTS must never be reported as not found: {rendered}"
+        );
+        assert!(
+            !rendered.contains("to create a database"),
+            "must never advise creating a database where one already exists — \
+             that is the data-destroying suggestion: {rendered}"
+        );
+        assert!(
+            rendered.contains("db_unavailable") || rendered.contains("db_wal_unreplayed"),
+            "expected an availability diagnostic, got: {rendered}"
+        );
+    }
+
+    /// nw-126: with a stale `.wal` present the diagnostic must name it and give
+    /// the read-write remedy, since replay is impossible on the read-only path
+    /// that usually reports the failure.
+    #[test]
+    fn stale_wal_is_named_with_a_read_write_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"data").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"stale").unwrap();
+
+        let err = anyhow::anyhow!(
+            "failed to open database with write access at {}; another process \
+             may hold the write lock: no such file",
+            db.display()
+        );
+        let rendered = format!("{:?}", into_diagnostic(err));
+
+        assert!(
+            rendered.contains("db_wal_unreplayed"),
+            "a present .wal must be diagnosed specifically: {rendered}"
+        );
+        assert!(
+            rendered.contains("daemon") && rendered.contains("start"),
+            "the remedy must be the read-write open that can actually replay: {rendered}"
+        );
+    }
+
+    /// nw-126: the read-only path's own words. `open_read_only` reports
+    /// "Couldn't replay shadow pages under read-only mode. Please re-open the
+    /// database with read-write mode" — a correct diagnosis whose advice that
+    /// path structurally cannot follow. It previously fell through to a bare
+    /// `nestweaver::error` with no remedy at all.
+    #[test]
+    fn shadow_page_replay_failure_gets_an_actionable_diagnostic() {
+        let err = anyhow::anyhow!(
+            "failed to open database at /tmp/x/brain.lbug: database error: Runtime \
+             exception: Couldn't replay shadow pages under read-only mode. Please \
+             re-open the database with read-write mode to replay shadow pages."
+        );
+        let rendered = format!("{:?}", into_diagnostic(err));
+
+        assert!(
+            rendered.contains("db_wal_unreplayed"),
+            "expected the WAL diagnostic, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("to create a database"),
+            "must not advise creating a database: {rendered}"
+        );
     }
 
     /// A create-path store error ("open/create store at

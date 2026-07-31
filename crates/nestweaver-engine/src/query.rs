@@ -640,6 +640,7 @@ mod promote_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_seed_count: 0,
             degraded_components: vec![],
         };
         let members: HashSet<String> = ["note:prd".to_string(), "note:status".to_string()]
@@ -669,6 +670,7 @@ mod promote_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_seed_count: 0,
             degraded_components: vec![],
         };
         let members: HashSet<String> = ["note:prd".to_string()].into_iter().collect();
@@ -707,6 +709,7 @@ mod promote_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_seed_count: 0,
             degraded_components: vec![],
         };
         let members: HashSet<String> = ["sym:foo".to_string(), "sym:bar".to_string()]
@@ -738,6 +741,7 @@ mod promote_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_seed_count: 0,
             degraded_components: vec![],
         };
         let members: HashSet<String> = ["sym:foo".to_string()].into_iter().collect();
@@ -1080,6 +1084,10 @@ pub(crate) fn truncate_body_to_chars(body: String, max_chars: usize) -> (String,
     (truncated, false)
 }
 
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrainContextResult {
     /// Resolved seed nodes. The MCP `brain_context` tool omits this field
@@ -1103,6 +1111,18 @@ pub struct BrainContextResult {
     /// vector search successfully.
     #[serde(default)]
     pub semantic_applied: bool,
+    /// How many entries in `seeds` were injected by the semantic leg rather
+    /// than resolved from the query text.
+    ///
+    /// nw-102: vector KNN always returns its k nearest neighbours regardless of
+    /// how far away they are, and those hits were pushed into `seeds`
+    /// unconditionally — the similarity score was discarded at the call site.
+    /// So a nonsense query reported "Seeds (5 resolved)" listing unrelated
+    /// symbols WHILE also listing the same query under `unresolved_seeds`,
+    /// contradicting itself. Recording the provenance lets a renderer say which
+    /// seeds were actually matched and which are nearest-neighbour guesses.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub semantic_seed_count: usize,
     /// Retrieval components that were requested but unavailable. The graph,
     /// PPR, and BM25 legs remain usable when semantic retrieval degrades.
     #[serde(default)]
@@ -1535,6 +1555,7 @@ pub fn build_brain_context_hybrid_with_aliases(
     // hit list is passed to weighted_score_fuse as the semantic signal.
     let semantic_requested = config.weight_semantic > 0.0;
     let mut semantic_applied = false;
+    let mut semantic_seed_count: usize = 0;
     let mut semantic_hits: Vec<(String, f64)> = Vec::new();
     if let Some(model) = embed_model
         && config.weight_semantic > 0.0
@@ -1564,6 +1585,9 @@ pub fn build_brain_context_hybrid_with_aliases(
                         for (uid, _score) in hits.iter().take(config.semantic_seed_limit) {
                             if !seed_uids.contains(uid) {
                                 seed_uids.push(uid.clone());
+                                // nw-102: remember these are nearest-neighbour
+                                // guesses, not resolutions of the query text.
+                                semantic_seed_count += 1;
                             }
                         }
                     }
@@ -1658,6 +1682,7 @@ pub fn build_brain_context_hybrid_with_aliases(
         unresolved_seeds: unresolved,
         expansion_terms,
         semantic_applied,
+        semantic_seed_count,
         degraded_components: if semantic_requested && !semantic_applied {
             vec!["semantic".to_string()]
         } else {
@@ -2996,6 +3021,7 @@ mod dedup_heading_section_tests {
             unresolved_seeds: vec![],
             expansion_terms: vec![],
             semantic_applied: false,
+            semantic_seed_count: 0,
             degraded_components: vec![],
         }
     }

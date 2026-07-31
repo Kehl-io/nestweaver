@@ -1542,6 +1542,9 @@ fn infer_cross_repo_call_edges(
         .collect();
     let mut edges = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // name -> store hits, memoised for this call (nw-127).
+    let mut name_lookup_cache: std::collections::HashMap<String, Vec<nestweaver_schema::Symbol>> =
+        std::collections::HashMap::new();
     for (rel_path, symbols, references, _) in parsed_files {
         // Names this file imports — corroborates a same-named cross-repo call.
         let imported_names: std::collections::HashSet<&str> = references
@@ -1570,15 +1573,31 @@ fn infer_cross_repo_call_edges(
             );
 
             // Collect eligible cross-repo candidates, then apply the ubiquity cap.
-            let candidates: Vec<_> = store
-                .lookup_symbols_by_name(&reference.name)
-                .map_err(|e| anyhow::anyhow!(e))?
-                .into_iter()
+            //
+            // nw-127: this is one store round-trip PER CALL SITE, and call names
+            // repeat heavily across a repo, so the same name was looked up
+            // thousands of times per run. The store is not mutated inside this
+            // loop (symbol writes happen earlier in the phase), so memoising the
+            // lookup for the duration of the call is a pure win.
+            let by_name = match name_lookup_cache.get(reference.name.as_str()) {
+                Some(hits) => hits,
+                None => {
+                    let hits = store
+                        .lookup_symbols_by_name(&reference.name)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    name_lookup_cache
+                        .entry(reference.name.clone())
+                        .or_insert(hits)
+                }
+            };
+            let candidates: Vec<_> = by_name
+                .iter()
                 .filter(|t| {
                     t.repo_uid != current_repo_uid
                         && t.uid != source_uid
                         && t.visibility != Visibility::Private
                 })
+                .cloned()
                 .collect();
             if candidates.is_empty() || candidates.len() > MAX_CROSS_REPO_NAME_CANDIDATES {
                 continue;
@@ -2604,8 +2623,23 @@ where
             .batch_insert_edges(&insertable_edges)
             .context("batch_insert_edges (resolved)")?;
 
-        let inferred_cross_repo_edges =
-            infer_cross_repo_call_edges(store, &r_uid, &parsed_files_for_resolver)?;
+        // nw-127: this walks EVERY parsed file — including unchanged ones, which
+        // are deliberately fed to the resolver — and issues a store lookup per
+        // call site. It ran unconditionally, so an index with zero changed files
+        // still paid for it: 57 minutes on a 755-file repo against a 130k-symbol
+        // graph, which is what pushed large repos past the 1800s ceiling and made
+        // them report failure for work that had actually succeeded.
+        //
+        // When nothing changed, this repo's call sites are identical to the last
+        // run and the edges it would infer are already in the database, so the
+        // whole pass is recomputing a known answer. Skipping matches what
+        // `skip_resolution` already does for ordinary resolution one block above,
+        // and for the same reason.
+        let inferred_cross_repo_edges = if skip_resolution {
+            Vec::new()
+        } else {
+            infer_cross_repo_call_edges(store, &r_uid, &parsed_files_for_resolver)?
+        };
         if !inferred_cross_repo_edges.is_empty() {
             edges_count += inferred_cross_repo_edges.len();
             store
@@ -2840,7 +2874,26 @@ where
         bump_generation_after_write,
     );
     match (graph_result, finalization) {
-        (Ok(result), Ok(())) => Ok(result),
+        (Ok(result), Ok(())) => {
+            // nw-124: stamp WHICH resolver produced this repo's edges. Some
+            // resolver fixes change edge shape rather than query behaviour
+            // (nw-103's import fan-out), so upgrading the binary leaves already
+            // indexed repos wrong and nothing said so. Recorded only on a fully
+            // successful, finalized index — a failed run must not claim the
+            // repo is current. Best-effort: a sidecar write failure must never
+            // fail an index that already committed.
+            if let Some(db_path) = store.db_path()
+                && let Err(e) = crate::resolver_generation::record(db_path, &r_uid)
+            {
+                tracing::warn!(
+                    repo = %r_uid,
+                    error = %e,
+                    "indexed successfully but could not record the resolver generation; \
+                     ranking staleness for this repo will be over-reported"
+                );
+            }
+            Ok(result)
+        }
         (Ok(_), Err(finalization)) => Err(finalization.into()),
         (Err(primary), Ok(())) => Err(primary),
         (Err(primary), Err(finalization)) => {

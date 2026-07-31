@@ -988,8 +988,9 @@ fn reinsert_note(
 
     // ── Wikilinks (per-file: resolve against the pre-built title lookup) ─
     let mut wl_resolved = 0usize;
-    let mut wl_note_edges: Vec<(String, String, f32, String)> = Vec::new();
-    let mut wl_head_edges: Vec<(String, String, f32, String)> = Vec::new();
+    // nw-122: carry the link target alongside the display alias.
+    let mut wl_note_edges: Vec<(String, String, f32, String, String)> = Vec::new();
+    let mut wl_head_edges: Vec<(String, String, f32, String, String)> = Vec::new();
 
     for wl in &parsed.wikilinks {
         if wl.section_idx >= section_uids.len() {
@@ -1014,6 +1015,7 @@ fn reinsert_note(
                         h.uid.clone(),
                         conf,
                         display.clone(),
+                        wl.target.clone(),
                     ));
                     wl_resolved += 1;
                     continue;
@@ -1024,19 +1026,20 @@ fn reinsert_note(
                 target.clone(),
                 conf,
                 display.clone(),
+                wl.target.clone(),
             ));
             wl_resolved += 1;
         }
     }
 
-    let wl_note_refs: Vec<(&str, &str, f32, &str)> = wl_note_edges
+    let wl_note_refs: Vec<(&str, &str, f32, &str, &str)> = wl_note_edges
         .iter()
-        .map(|(s, n, c, d)| (s.as_str(), n.as_str(), *c, d.as_str()))
+        .map(|(s, n, c, d, t)| (s.as_str(), n.as_str(), *c, d.as_str(), t.as_str()))
         .collect();
     store.batch_insert_wikilink_to_note_edges(&wl_note_refs)?;
-    let wl_head_refs: Vec<(&str, &str, f32, &str)> = wl_head_edges
+    let wl_head_refs: Vec<(&str, &str, f32, &str, &str)> = wl_head_edges
         .iter()
-        .map(|(s, h, c, d)| (s.as_str(), h.as_str(), *c, d.as_str()))
+        .map(|(s, h, c, d, t)| (s.as_str(), h.as_str(), *c, d.as_str(), t.as_str()))
         .collect();
     store.batch_insert_wikilink_to_heading_edges(&wl_head_refs)?;
 

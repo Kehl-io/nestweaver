@@ -255,6 +255,13 @@ impl RepoDeletionSnapshot {
 /// `(uid, source_note_uid, source_path, source_title, wikilink_text)`.
 pub type UnresolvedWikilinkRecord = (String, String, String, String, String);
 
+/// One captured wikilink edge: `(source_section_uid, target_node_uid,
+/// confidence, display_text, link_target)`.
+///
+/// `display_text` is what a reader sees, `link_target` is what resolution acted
+/// on; for `[[Home|workspace]]` those are "workspace" and "Home" (nw-122).
+pub type WikilinkEdgeRecord = (String, String, f32, String, String);
+
 /// A vault whose notes were discarded during a collision in instance merge.
 /// When two instances have vaults at the same root_path, the vault with
 /// fewer notes loses and its notes are cascade-deleted.
@@ -1193,8 +1200,8 @@ impl GraphStore {
         tags: &[Tag],
         note_tag_edges: &[(&str, &str)],
         section_tag_edges: &[(&str, &str)],
-        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
-        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
         Self::bulk_vault_write_on(
@@ -1236,8 +1243,8 @@ impl GraphStore {
         tags: &[Tag],
         note_tag_edges: &[(&str, &str)],
         section_tag_edges: &[(&str, &str)],
-        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
-        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<(), StoreError> {
         // Insert node tables first so edge MATCH clauses find their endpoints.
         Self::batch_insert_notes_on(conn, notes)?;
@@ -1293,8 +1300,8 @@ impl GraphStore {
         tags: &[Tag],
         note_tag_edges: &[(&str, &str)],
         section_tag_edges: &[(&str, &str)],
-        wikilink_to_note_edges: &[(&str, &str, f32, &str)],
-        wikilink_to_heading_edges: &[(&str, &str, f32, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<usize, StoreError> {
         let conn = self.begin_transaction()?;
 
@@ -2104,7 +2111,7 @@ impl GraphStore {
 
     pub fn batch_insert_wikilink_to_note_edges(
         &self,
-        edges: &[(&str, &str, f32, &str)],
+        edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
         Self::batch_insert_wikilink_to_note_edges_on(&conn, edges)
@@ -2113,15 +2120,15 @@ impl GraphStore {
     /// Insert wikilink-to-note edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_wikilink_to_note_edges_on(
         conn: &lbug::Connection<'_>,
-        edges: &[(&str, &str, f32, &str)],
+        edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Section {uid: $sid}), (n:Note {uid: $nid}) \
-                 CREATE (s)-[:WIKILINK_TO_NOTE {confidence: $conf, display: $disp}]->(n)",
+                 CREATE (s)-[:WIKILINK_TO_NOTE {confidence: $conf, display: $disp, target: $tgt}]->(n)",
             )
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for (sec_uid, note_uid, conf, display) in edges {
+        for (sec_uid, note_uid, conf, display, target) in edges {
             conn.execute(
                 &mut stmt,
                 vec![
@@ -2129,6 +2136,7 @@ impl GraphStore {
                     ("nid", lbug::Value::String(note_uid.to_string())),
                     ("conf", lbug::Value::Double(*conf as f64)),
                     ("disp", lbug::Value::String(display.to_string())),
+                    ("tgt", lbug::Value::String(target.to_string())),
                 ],
             )
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
@@ -2138,7 +2146,7 @@ impl GraphStore {
 
     pub fn batch_insert_wikilink_to_heading_edges(
         &self,
-        edges: &[(&str, &str, f32, &str)],
+        edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
         Self::batch_insert_wikilink_to_heading_edges_on(&conn, edges)
@@ -2147,15 +2155,15 @@ impl GraphStore {
     /// Insert wikilink-to-heading edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_wikilink_to_heading_edges_on(
         conn: &lbug::Connection<'_>,
-        edges: &[(&str, &str, f32, &str)],
+        edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (s:Section {uid: $sid}), (h:Heading {uid: $hid}) \
-                 CREATE (s)-[:WIKILINK_TO_HEADING {confidence: $conf, display: $disp}]->(h)",
+                 CREATE (s)-[:WIKILINK_TO_HEADING {confidence: $conf, display: $disp, target: $tgt}]->(h)",
             )
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        for (sec_uid, head_uid, conf, display) in edges {
+        for (sec_uid, head_uid, conf, display, target) in edges {
             conn.execute(
                 &mut stmt,
                 vec![
@@ -2163,6 +2171,7 @@ impl GraphStore {
                     ("hid", lbug::Value::String(head_uid.to_string())),
                     ("conf", lbug::Value::Double(*conf as f64)),
                     ("disp", lbug::Value::String(display.to_string())),
+                    ("tgt", lbug::Value::String(target.to_string())),
                 ],
             )
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
@@ -4978,11 +4987,11 @@ impl GraphStore {
         vault_uid: &str,
         rel: &str,
         dst: &str,
-    ) -> Result<Vec<(String, String, f32, String)>, StoreError> {
+    ) -> Result<Vec<WikilinkEdgeRecord>, StoreError> {
         let conn = self.conn()?;
         let q = format!(
             "MATCH (n:Note {{vault_uid: $vid}})-[:NOTE_HAS_SECTION]->(s:Section)-[r:{rel}]->({dst}) \
-             RETURN s.uid, dst.uid, r.confidence, r.display"
+             RETURN s.uid, dst.uid, r.confidence, r.display, r.target"
         );
         let mut stmt = match conn.prepare(&q) {
             Ok(stmt) => stmt,
@@ -5014,6 +5023,10 @@ impl GraphStore {
                         })
                         .unwrap_or(0.0),
                     crate::read::extract_string(&row, 3).unwrap_or_default(),
+                    // nw-122: `target` is empty on rows written before the
+                    // column existed; readers fall back to `display`, which is
+                    // exactly what those rows have always carried.
+                    crate::read::extract_string(&row, 4).unwrap_or_default(),
                 ))
             })
             .collect())
@@ -5160,9 +5173,9 @@ impl GraphStore {
         // here, so restoring them verbatim is sufficient. A link whose TARGET
         // lives in another vault is preserved too: that node is untouched by
         // this cascade.
-        let wikilink_to_note: Vec<(String, String, f32, String)> =
+        let wikilink_to_note: Vec<WikilinkEdgeRecord> =
             self.wikilink_edges_for_vault(old_vault_uid, "WIKILINK_TO_NOTE", "dst:Note")?;
-        let wikilink_to_heading: Vec<(String, String, f32, String)> =
+        let wikilink_to_heading: Vec<WikilinkEdgeRecord> =
             self.wikilink_edges_for_vault(old_vault_uid, "WIKILINK_TO_HEADING", "dst:Heading")?;
 
         // `delete_vault_cascade` removes UnresolvedWikilink rows whose source
@@ -5238,16 +5251,32 @@ impl GraphStore {
         // 9. Restore the wikilink graph. Runs last: the edges reference
         //    sections, notes and headings, all of which are back in place by
         //    now (nw-112).
-        let wl_note: Vec<(&str, &str, f32, &str)> = wikilink_to_note
+        let wl_note: Vec<(&str, &str, f32, &str, &str)> = wikilink_to_note
             .iter()
-            .map(|(src, dst, conf, disp)| (src.as_str(), dst.as_str(), *conf, disp.as_str()))
+            .map(|(src, dst, conf, disp, tgt)| {
+                (
+                    src.as_str(),
+                    dst.as_str(),
+                    *conf,
+                    disp.as_str(),
+                    tgt.as_str(),
+                )
+            })
             .collect();
         if !wl_note.is_empty() {
             Self::batch_insert_wikilink_to_note_edges_on(conn, &wl_note)?;
         }
-        let wl_heading: Vec<(&str, &str, f32, &str)> = wikilink_to_heading
+        let wl_heading: Vec<(&str, &str, f32, &str, &str)> = wikilink_to_heading
             .iter()
-            .map(|(src, dst, conf, disp)| (src.as_str(), dst.as_str(), *conf, disp.as_str()))
+            .map(|(src, dst, conf, disp, tgt)| {
+                (
+                    src.as_str(),
+                    dst.as_str(),
+                    *conf,
+                    disp.as_str(),
+                    tgt.as_str(),
+                )
+            })
             .collect();
         if !wl_heading.is_empty() {
             Self::batch_insert_wikilink_to_heading_edges_on(conn, &wl_heading)?;
@@ -6623,6 +6652,7 @@ mod tests {
                 src_sec.as_str(),
                 dst_note.as_str(),
                 1.0f32,
+                "Beta",
                 "Beta",
             )])
             .unwrap();

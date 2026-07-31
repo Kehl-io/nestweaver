@@ -241,10 +241,14 @@ containing it is available, use this source-build path.
 | `search` | Full-text search across indexed symbols and notes |
 | `symbol` | Look up a symbol by name and display its metadata |
 | `impact` | Trace the blast radius of a symbol through the dependency graph (fails closed on unknown/foreign UIDs, exit 2; `--depth` 1–15; pruning by impact-score threshold or depth is disclosed, `--min-score 0` opts out) |
+| `blast-radius` | Assess blast radius for a set of changed files; reports `gate_state`/`status` and blind spots, and never reports `ok` for a truncated traversal |
+| `flow-trace` | Trace forward execution flow from a symbol — what it calls, and what those call |
 | `read-symbols` | Read a symbol's source span |
 | `regex-search` | Regex search over indexed text (trigram pre-filter; falls back to a full scan with `stale_index: true` when the trigram index is stale — re-run `index --with-trigrams`) |
 | `count-patterns` | Count regex matches per pattern |
 | `investigate` | Orient on a topic in one call |
+| `investigate-expand` | Drill into investigate bundle entries — full body plus immediate neighbours |
+| `investigate-hydrate` | Fill in bodies/summaries for all un-hydrated entries of a bundle |
 | `affected-tests` | Select tests for changed files (tiered; carries a `recommendation` CI directive — `run-full-suite` on any degraded run or when changed files have unrecognized extensions like Makefile/CI YAML/`.sql`) |
 | `repo-map` | Generate a token-budgeted map of the repository structure |
 | `summary` | Hierarchical code summaries at symbol, file, or cluster level |
@@ -288,6 +292,8 @@ containing it is available, use this source-build path.
 | `rts-eval record-truth` | Report a full-suite outcome from CI so selection quality can be measured |
 | `rts-eval report` | Measured file-recall / change-recall / selection-breadth of past selections (refuses percentages below 10 joined runs) |
 | `dead-code` | Detect unreachable symbols via entry point reachability (`unreachable_count` is the unfiltered total; `matching_count` reflects `--min-confidence`; Rust `pub mod` Modules are never flagged; visibility isn't persisted, so all confidence scores are inferred/Medium) |
+| `rerank` | Lightweight result reranker (off-by-default heuristic) |
+| `info` | Show hardware and configuration information |
 | `contracts list` | List API contracts derived from spec files + framework handlers |
 | `contracts drift` | Routes declared in a spec but not implemented, and vice versa (presence-level) |
 | `contracts diff` | Field/type-level OpenAPI breaking-change diff between two spec versions (`--base`/`--head`, `--fail-on-breaking` for CI) |
@@ -343,6 +349,8 @@ containing it is available, use this source-build path.
 | `admin` | Subagent guidance instructions |
 | `interactions` | Manage interaction memory |
 | `hooks` | Install/remove the local pre-push blast-radius check (`--install`, `--strict`, `--uninstall`) |
+| `pre-push-impact` | Analyse local changes against the org-wide graph — what `hooks` runs, and runnable directly (alias `ppi`) |
+| `format-comment` | Format impact analysis results as a PR/MR comment, for CI to post |
 
 </details>
 

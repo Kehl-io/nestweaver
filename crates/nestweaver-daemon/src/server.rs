@@ -3360,6 +3360,32 @@ impl NestWeaverDaemon for DaemonService {
                     _ = tokio::time::sleep(index_timeout) => {
                         tracing::warn!(?index_timeout, "index exceeded timeout; cancelling");
                         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // nw-127: previously the watchdog set the flag and said
+                        // nothing, so the client's stream simply ended and it
+                        // reported "index progress stream ended before
+                        // completion" — indistinguishable from a crash, and
+                        // reported as a FAILURE for an index that (because
+                        // cancellation is cooperative and only observed at the
+                        // pre-write boundary) may still be running and may still
+                        // succeed. Send a terminal Error event so the caller
+                        // learns what actually happened, names the knob, and is
+                        // warned not to assume the work stopped.
+                        let _ = watch_tx
+                            .send(Ok(IndexProgress {
+                                phase: Phase::Error as i32,
+                                message: format!(
+                                    "index exceeded the {}s timeout and cancellation was requested \
+                                     (raise NESTWEAVER_INDEX_TIMEOUT_SECS). Cancellation is \
+                                     cooperative and is only observed at the next pre-write \
+                                     boundary, so the daemon may still be finishing this index — \
+                                     check the daemon log before assuming it stopped or retrying.",
+                                    index_timeout.as_secs()
+                                ),
+                                files_processed: 0,
+                                files_total: 0,
+                                symbols_found: 0,
+                            }))
+                            .await;
                     }
                     _ = watch_tx.closed() => {
                         // Client dropped the progress stream — stop wasting CPU.
@@ -6973,13 +6999,26 @@ pub async fn run_server(
     let store_open_ms = boot_started.elapsed().as_millis() as u64;
 
     // Load sidecars (PageRank, interaction scores).
+    //
+    // nw-119: nw-114 attributed daemon boot cost to opening the store, and the
+    // instrumentation it added disproved that — `boot_ms=6712` against
+    // `store_open_ms=876` on a warm cache, and a later boot measured 36,474ms
+    // against 10,041ms. So the majority of pre-bind time was somewhere in here
+    // and nobody could say where. Guessing once was already wrong; time each
+    // phase instead. These sidecars are not small (the production
+    // `.pagerank.json` is 13 MB of JSON), which is a candidate but not yet a
+    // conclusion.
+    let sidecar_started = std::time::Instant::now();
     nestweaver_engine::migrate_sidecar(&db_path, "pagerank.json", ".pagerank.json");
     let pr_path = nestweaver_engine::sidecar_path(&db_path, ".pagerank.json");
     let _ = store.load_pagerank_cache(&pr_path);
+    let pagerank_load_ms = sidecar_started.elapsed().as_millis() as u64;
 
+    let interactions_started = std::time::Instant::now();
     if let Some(scores) = nestweaver_engine::load_interaction_scores(&db_path) {
         store.load_interaction_cache(scores);
     }
+    let interactions_load_ms = interactions_started.elapsed().as_millis() as u64;
 
     // Open the Tantivy index. A read-only snapshot replica intentionally
     // disables search reconciliation and uses a reader when one is available.
@@ -6990,7 +7029,9 @@ pub async fn run_server(
     // opens, queries use substring fallback and indexed mutations still surface
     // the configured-index failure.
     let tantivy_path = nestweaver_mcp::tantivy_sidecar_path(&db_path);
+    let tantivy_started = std::time::Instant::now();
     let (tantivy, search_reconciliation) = open_search_index(&tantivy_path, read_only);
+    let tantivy_open_ms = tantivy_started.elapsed().as_millis() as u64;
 
     let idle_notify = Arc::new(Notify::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -7122,7 +7163,18 @@ pub async fn run_server(
     )?;
 
     // Build the per-repo authz policy ONCE, before the state is assembled.
+    // nw-119: the first instrumentation pass narrowed the gap but did not close
+    // it — store open, pagerank and tantivy together accounted for well under a
+    // third of boot, leaving ~52s unattributed on a 66s boot. The 13 MB
+    // `.pagerank.json` was the leading suspect and measured 448ms, so that
+    // hypothesis is dead too. Everything between the tantivy open and the bind
+    // is the remaining candidate; `get_embedding_metadata` is a store query
+    // against a 5.6 GB database, which is the next thing worth timing rather
+    // than assuming.
+    let permission_started = std::time::Instant::now();
     let permission_source = build_daemon_permission_source(instance_cfg.as_ref());
+    let permission_source_ms = permission_started.elapsed().as_millis() as u64;
+    let embedding_probe_started = std::time::Instant::now();
     let embedding_cfg = instance_cfg
         .as_ref()
         .map(|config| config.embedding.clone())
@@ -7138,6 +7190,7 @@ pub async fn run_server(
         cfg!(feature = "embed"),
         daemon_metal_compiled(),
     );
+    let embedding_probe_ms = embedding_probe_started.elapsed().as_millis() as u64;
     let state = Arc::new(DaemonState {
         store: Arc::new(store),
 
@@ -7171,6 +7224,15 @@ pub async fn run_server(
         ui_server: std::sync::Mutex::new(None),
     });
 
+    // nw-119: two instrumentation passes narrowed the unattributed boot time to
+    // the span between the Tantivy open and the bind — 253s of a 268s boot,
+    // with no log output in it at all. Config load, permission source and the
+    // embedding probe measured 0-210ms, so the cost is here: these reconcile
+    // passes walk extension state against a 5.6 GB graph, synchronously, before
+    // the socket is allowed to bind. Measure rather than assume — the previous
+    // two hypotheses (store open, then the 13 MB pagerank sidecar) were both
+    // wrong.
+    let reconcile_started = std::time::Instant::now();
     if !read_only {
         recover_pending_instance_extension_migration(&state).with_context(|| {
             format!(
@@ -7193,6 +7255,8 @@ pub async fn run_server(
                 )
             })?;
     }
+
+    let extension_reconcile_ms = reconcile_started.elapsed().as_millis() as u64;
 
     // Pre-warm PPR adjacency cache so the first PPR query after startup
     // hits the cache instead of spending ~350ms rebuilding from the DB.
@@ -7315,10 +7379,33 @@ pub async fn run_server(
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
     // The line a stalled-boot investigation actually needs: how long the client
-    // had to wait, and how much of it was the database open.
+    // had to wait, and where it went.
+    //
+    // nw-119: `boot_ms` and `store_open_ms` alone showed the store was a small
+    // fraction of boot without saying what the rest was, so the phases are
+    // broken out. `unattributed_ms` is deliberately reported rather than left
+    // for the reader to subtract — if it stays large, the next phase to
+    // instrument is still missing, and that should be visible instead of
+    // requiring arithmetic nobody performs.
+    let boot_ms = boot_started.elapsed().as_millis() as u64;
     tracing::info!(
-        boot_ms = boot_started.elapsed().as_millis() as u64,
+        boot_ms = boot_ms,
         store_open_ms = store_open_ms,
+        pagerank_load_ms = pagerank_load_ms,
+        interactions_load_ms = interactions_load_ms,
+        tantivy_open_ms = tantivy_open_ms,
+        permission_source_ms = permission_source_ms,
+        embedding_probe_ms = embedding_probe_ms,
+        extension_reconcile_ms = extension_reconcile_ms,
+        unattributed_ms = boot_ms.saturating_sub(
+            store_open_ms
+                + pagerank_load_ms
+                + interactions_load_ms
+                + tantivy_open_ms
+                + permission_source_ms
+                + embedding_probe_ms
+                + extension_reconcile_ms
+        ),
         socket = %sock_path.display(),
         "socket bound and accepting connections"
     );

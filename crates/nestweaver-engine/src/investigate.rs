@@ -144,6 +144,21 @@ pub struct InvestigateResult {
     /// Number of additional connected nodes dropped due to the token budget.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub more_available: usize,
+    /// Whether semantic retrieval contributed to this map.
+    ///
+    /// nw-120: the daemon passes its warm embedding model here while the CLI's
+    /// direct path hardcodes `None`, so the two return materially different
+    /// RANKINGS for the same query — daemon topped "daemon boot" with
+    /// `wait_for_daemon_boot`, direct with a lexical `BootstrapErrorScreen`.
+    /// The tradeoff is defensible (a per-invocation BERT load is expensive and
+    /// the daemon is the supported path); reporting nothing about it was not,
+    /// because the caller had no way to know the ranking was BM25-only.
+    #[serde(default)]
+    pub semantic_applied: bool,
+    /// Retrieval components that were requested but unavailable, matching
+    /// `brain_context` / `brain_search`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_components: Vec<String>,
 }
 
 /// The result of `investigate_expand`: the expanded entries plus their
@@ -573,6 +588,7 @@ pub fn investigate(
         })?;
     }
 
+    let semantic_applied = embed_model.is_some();
     Ok(InvestigateResult {
         bundle_id,
         query: query.to_string(),
@@ -580,6 +596,12 @@ pub fn investigate(
         domains,
         entries,
         more_available,
+        semantic_applied,
+        degraded_components: if semantic_applied {
+            Vec::new()
+        } else {
+            vec!["semantic".to_string()]
+        },
     })
 }
 

@@ -95,6 +95,7 @@ pub mod recency;
 pub mod registry;
 pub mod rerank;
 pub mod resolution_cache;
+pub mod resolver_generation;
 pub mod rts_eval;
 pub mod scheduler;
 pub mod signature_diff;
