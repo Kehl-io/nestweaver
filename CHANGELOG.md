@@ -3,25 +3,6 @@
 ## Unreleased
 
 
-### Upgrade Notes
-
-* **Re-index your repositories after upgrading.** The import-edge fan-out fix
-  (nw-103) changed how edges are *written*, not how they are read, so it runs at
-  index time and cannot repair edges already in your database. Until a repo is
-  re-indexed, `hubs`, `bridges`, `summary --level hub` and PageRank keep
-  returning the pre-fix ranking for it — on a real 34-repo graph the upgraded
-  binary still reported the exact corrupted ranking from the bug report, and
-  re-indexing a single repo removed all of its artefacts from the top 10.
-
-  ```sh
-  nestweaver index --repo /path/to/each/repo
-  ```
-
-  You do not have to guess whether this affects you: `hubs` and `bridges` now
-  report on stderr when a database contains repos indexed by an older resolver,
-  and stay quiet once everything is current. Vault (`brain refresh`) data is
-  unaffected — this applies to code repositories only.
-
 ### Bug Fixes
 
 * **search:** `regex-search`/`count-patterns` — fix trigram pre-filter correctness for alternation patterns; detect a stale trigram index and fall back to a full scan (`stale_index: true` in JSON, note in text output; remedy: re-run `index --with-trigrams`); bound `--limit` to 1–10000 and `--max-millis` to 1–600000
@@ -58,6 +39,96 @@
 * **daemon:** `daemon stop` against a dead pidfile PID retargets the live socket-peer daemon instead of declaring not-running and deleting its socket; `wait_healthy` caps each health-check attempt at the remaining budget so the poll loop never overshoots its timeout
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
+
+## [3.0.0](https://github.com/Kehl-io/nestweaver/compare/v2.7.1...v3.0.0) (2026-07-31)
+
+
+### Upgrade Notes
+
+* **Re-index your repositories after upgrading.** The import-edge fan-out fix
+  (nw-103) changed how edges are *written*, not how they are read, so it runs at
+  index time and cannot repair edges already in your database. Until a repo is
+  re-indexed, `hubs`, `bridges`, `summary --level hub` and PageRank keep
+  returning the pre-fix ranking for it — on a real 34-repo graph the upgraded
+  binary still reported the exact corrupted ranking from the bug report, and
+  re-indexing a single repo removed all of its artefacts from the top 10.
+
+  ```sh
+  nestweaver index --repo /path/to/each/repo
+  ```
+
+  You do not have to guess whether this affects you: `hubs` and `bridges` now
+  report on stderr when a database contains repos indexed by an older resolver,
+  and stay quiet once everything is current. Vault (`brain refresh`) data is
+  unaffected — this applies to code repositories only.
+
+### ⚠ BREAKING CHANGES
+
+* **cli:** one JSON envelope for impact, and dead-code parity across paths ([#218](https://github.com/Kehl-io/nestweaver/issues/218))
+
+  **`impact --json` / `brain_impact`.** Previously emitted three incompatible
+  shapes: a bare node array for a complete walk, an object when the traversal was
+  pruned, and a bare *candidate* array when the symbol name was ambiguous. The
+  last was the dangerous one — structurally indistinguishable from a result set,
+  so a mistyped name returned candidates that read as impacted symbols, and only
+  the exit code disambiguated. Piped JSON never sees an exit code.
+
+  Every outcome now returns one envelope discriminated by `status`
+  (`ok` / `ambiguous` / `not_found`). The ambiguous form carries `candidates` and
+  never `nodes`, so the two cannot be confused.
+
+  ```jsonc
+  // before (complete walk)        // after
+  [ { "uid": "...", ... } ]        { "status": "ok", "nodes": [ { "uid": "...", ... } ] }
+  ```
+
+  *Migration:* read `status` first, then `nodes` (or `candidates`). A consumer
+  that indexes the top-level value as an array must be updated.
+
+  **`dead-code --json`.** `confidence` serialised as the PascalCase variant name
+  on the direct path (`"Medium"`) and lowercase through the daemon (`"medium"`),
+  so output depended on whether a daemon happened to be running. Lowercase wins —
+  it already matches `Display`, the daemon, and the `--min-confidence` values
+  callers pass in. The direct path now also reports its own local scope in `_meta`
+  rather than omitting the field.
+
+### Features
+
+* **cli:** add blast-radius and flow-trace subcommands ([#219](https://github.com/Kehl-io/nestweaver/issues/219)) ([1133382](https://github.com/Kehl-io/nestweaver/commit/1133382c8a63afbdbe8d821a1c156e41e165f0f6))
+* **cli:** detect nw-073 crash recurrence in diagnostics capabilities ([#200](https://github.com/Kehl-io/nestweaver/issues/200)) ([72b47d2](https://github.com/Kehl-io/nestweaver/commit/72b47d295d6193433eab231b6db6bd7c5c49de9c))
+
+
+### Bug Fixes
+
+* **client:** wait for a booting daemon, fail fast on a dead one ([#210](https://github.com/Kehl-io/nestweaver/issues/210)) ([7d82ac7](https://github.com/Kehl-io/nestweaver/commit/7d82ac71d0c6f17055b57ea4df1b4054e57e5a16))
+* **cli:** make dead-code and investigate output format depend on the flag, not the daemon ([#208](https://github.com/Kehl-io/nestweaver/issues/208)) ([dbcbbcb](https://github.com/Kehl-io/nestweaver/commit/dbcbbcba3f862d47e0fb873c158c4e974fe98290))
+* **cli:** make search limit honest and enforce float/enum flag contracts ([#206](https://github.com/Kehl-io/nestweaver/issues/206)) ([3981f48](https://github.com/Kehl-io/nestweaver/commit/3981f48a4bd134da0ee98b3e0a5602de01865564))
+* **cli:** one JSON envelope for impact, and dead-code parity across paths ([#218](https://github.com/Kehl-io/nestweaver/issues/218)) ([85b8146](https://github.com/Kehl-io/nestweaver/commit/85b81463e00a74f095cebddaa42ada65c9e80846))
+* **cli:** report db_not_found from every read-only open, not just some ([#209](https://github.com/Kehl-io/nestweaver/issues/209)) ([81039bb](https://github.com/Kehl-io/nestweaver/commit/81039bb87251a674239b7b6ec5511491d1cce620))
+* **cli:** resolve brain refresh against the existing vault registration ([#212](https://github.com/Kehl-io/nestweaver/issues/212)) ([e21a2f7](https://github.com/Kehl-io/nestweaver/commit/e21a2f7b8b5c040cc64f3e2198173ad976b8ecbe))
+* **daemon:** log boot timing so a stalled start is diagnosable ([#221](https://github.com/Kehl-io/nestweaver/issues/221)) ([1b2d32c](https://github.com/Kehl-io/nestweaver/commit/1b2d32c383c91372245b7e756d7fa2ee7655f753))
+* **engine:** disclose when read_symbols exceeds the requested token budget ([#217](https://github.com/Kehl-io/nestweaver/issues/217)) ([9871af2](https://github.com/Kehl-io/nestweaver/commit/9871af233cee97a31fff32a005d31b5801b7395b))
+* **engine:** disclose when the co-change sidecar does not cover a changed file ([#201](https://github.com/Kehl-io/nestweaver/issues/201)) ([82723b8](https://github.com/Kehl-io/nestweaver/commit/82723b858caf9000cc90b9773a1215c92108d495))
+* **engine:** link declared gRPC contracts to their Rust/tonic implementations ([#215](https://github.com/Kehl-io/nestweaver/issues/215)) ([cee6a2e](https://github.com/Kehl-io/nestweaver/commit/cee6a2ecfff0de21c8d351b43a23011c87c85ca7))
+* **engine:** repo-qualify the co-change sidecar instead of overwriting it ([#220](https://github.com/Kehl-io/nestweaver/issues/220)) ([4133a16](https://github.com/Kehl-io/nestweaver/commit/4133a167e9401ec316955ac85f8a6a39e92f1e69))
+* **engine:** resolve path-qualified wikilinks, and stop indexing external urls ([#213](https://github.com/Kehl-io/nestweaver/issues/213)) ([3904efb](https://github.com/Kehl-io/nestweaver/commit/3904efb79561da41182e9cd95502b2837b159e58))
+* **engine:** stop reporting resolved wikilinks as broken ([#205](https://github.com/Kehl-io/nestweaver/issues/205)) ([84ae503](https://github.com/Kehl-io/nestweaver/commit/84ae5030d743f51069e6b6bff971c15a0f36fc32))
+* **engine:** suggest broken-link targets by filename stem, and stop over-promising ([#214](https://github.com/Kehl-io/nestweaver/issues/214)) ([987064c](https://github.com/Kehl-io/nestweaver/commit/987064cb01c5bbd2aa0380e4a7feb819965fcd53))
+* **parser:** accept non-ASCII inline tag names ([#207](https://github.com/Kehl-io/nestweaver/issues/207)) ([a389fe1](https://github.com/Kehl-io/nestweaver/commit/a389fe10d814726ac1080612933d313eee8d72b1))
+* **parser:** stop double-encoding non-ASCII in wikilinks and tags ([#204](https://github.com/Kehl-io/nestweaver/issues/204)) ([1d257dc](https://github.com/Kehl-io/nestweaver/commit/1d257dc0c7bc03908ce783b7d6a1b89105e5cafc))
+* **store:** conserve the wikilink graph across an instance merge ([#211](https://github.com/Kehl-io/nestweaver/issues/211)) ([53ff548](https://github.com/Kehl-io/nestweaver/commit/53ff54872eb809ecdb5def69afe44368becb8054))
+* **store:** label the edge type flow_trace followed to each callee ([#216](https://github.com/Kehl-io/nestweaver/issues/216)) ([2ba732d](https://github.com/Kehl-io/nestweaver/commit/2ba732df05c85b3e8962985d8842d97a52df2649))
+* **daemon (data safety):** a SIGKILLed daemon left an orphaned WAL that made the database unopenable by *every* path, and the resulting error misclassified a live 5.6 GB database as missing — advising `index --repo`, which would have written a new database over recoverable data. The orphaned WAL is now quarantined by rename (never deleted, since a log can hold committed work) and diagnosis consults the filesystem instead of the error text; nw-126 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **daemon:** a daemon boot timeout silently fell back to the direct path — exit 0, nothing on stderr, an authoritative-looking result — while requesting that same bypass explicitly is refused with a WAL-corruption warning. Both routes now disclose the bypass, naming the RPC and the cause; nw-125 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **store:** `hubs` and `bridges` now report on stderr when a database holds repos indexed by an older resolver, so a stale ranking is visible rather than silently served — see Upgrade Notes; nw-124 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **index:** a no-op incremental index (zero changed files) walked every call site against the full graph, costing 3440.6s and exiting 1 with "index progress stream ended before completion" for work that had in fact succeeded. Measured on the same repo and command: **3440.6s exit 1 → 18s exit 0**. A timeout now reports a terminal error in-band naming the variable to raise, instead of truncating the stream; nw-127 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **daemon:** boot spent 77% of its time on a full-graph extension liveness walk; **53.9s → 9.5s**. Boot phase timings are now logged at bind so a slow start is diagnosable; nw-119 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **daemon:** boot-failure messages pointed at the stderr log, which is guaranteed not to contain the tracing error being hunted — the dated rolling file holds it. All ten operator-facing pointers now name the directory and distinguish the two files; nw-118 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **investigate:** the CLI's direct path is BM25-only while the daemon applies semantic ranking, so the two returned materially different orderings with nothing to explain why. `InvestigateResult` now carries `semantic_applied` and `degraded_components`, and the text renderer states that ranking is lexical-only; nw-120 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **brain:** `broken-links` printed a piped wikilink's *display alias* as though it were the link, so grepping the vault for the reported text found nothing. Wikilink edges now carry the target alongside the display text; backlinks still show the alias, which is correct there; nw-122 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **brain context:** semantic nearest neighbours were counted as resolved seeds, so a nonsense query exited 0 and printed a confident-looking result; nw-102 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **cli:** `brain status` on the direct path omitted the entire Embedding block, and the `impact` JSON envelope's key set varied by truncation path; nw-121, nw-123 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
+* **cli,mcp,store:** `regex-search --json` omitted the honesty note MCP already returned; `query_extensions` key+value matching returned 0 results against array-valued properties (scalar-in-array membership now matches); `clusters --json` recomputed on every call while `--help` promised a cache; nw-097, nw-109, nw-075 ([#222](https://github.com/Kehl-io/nestweaver/issues/222)) ([4bade71](https://github.com/Kehl-io/nestweaver/commit/4bade712ce3f327045efb1fed6ad8fb3aa13a928))
 
 ## [2.7.1](https://github.com/Kehl-io/nestweaver/compare/v2.7.0...v2.7.1) (2026-07-29)
 
