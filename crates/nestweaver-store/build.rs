@@ -9,7 +9,7 @@ mod build_support;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-const LBUG_ABI_VERSION: &str = "0.18.2";
+const LBUG_ABI_VERSION: &str = "0.19.1";
 const LBUG_SOURCE_MANIFEST_ENV: &str = "NESTWEAVER_LBUG_SOURCE_MANIFEST";
 
 fn lbug_src_dir() -> Result<PathBuf, String> {

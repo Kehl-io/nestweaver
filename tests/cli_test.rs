@@ -218,16 +218,22 @@ fn installation_docs_only_claim_live_channels() {
     }
 }
 
+/// Guards the Ladybug source-build configuration.
+///
+/// lbug's published prebuilt archive hides its zstd Huffman ASM symbols in the
+/// ELF, which breaks the link on x86_64 Linux. Building lbug from source is the
+/// fix, and it only works if every build path agrees: the workspace
+/// `.cargo/config.toml` must force `LBUG_BUILD_FROM_SOURCE`, CI workflows must
+/// append to that file rather than overwrite it, the Docker build context must
+/// include it, and the image must install the native toolchain the source build
+/// needs and resolve the committed lockfile with `--locked`.
+///
+/// Each of these has silently regressed before, and the failure only surfaces as
+/// a link error in a release build, so assert them here.
 #[test]
-fn ladybug_hotfix_dependency_is_immutable_and_built_from_source() {
-    const LBUG_RUST_FORK: &str = "https://github.com/kory-io/ladybug-rust.git";
-    const LBUG_RUST_REV: &str = "8992183ff8de526e8a852be8a97ad04b412f56ed";
-
+fn source_build_configuration_is_intact_and_reproducible() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest = std::fs::read_to_string(repo_root.join("Cargo.toml")).unwrap();
-    let lockfile = std::fs::read_to_string(repo_root.join("Cargo.lock")).unwrap();
     let cargo_config = std::fs::read_to_string(repo_root.join(".cargo/config.toml")).unwrap();
-    let installation = std::fs::read_to_string(repo_root.join("INSTALL.md")).unwrap();
     let ci_workflow = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
     let release_workflow =
         std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
@@ -235,24 +241,8 @@ fn ladybug_hotfix_dependency_is_immutable_and_built_from_source() {
     let dockerignore = std::fs::read_to_string(repo_root.join(".dockerignore")).unwrap();
 
     assert!(
-        manifest.contains("[patch.crates-io]"),
-        "the temporary lbug fork must be a workspace-level crates.io patch"
-    );
-    assert!(
-        manifest.contains(&format!(
-            "lbug = {{ git = \"{LBUG_RUST_FORK}\", rev = \"{LBUG_RUST_REV}\" }}"
-        )),
-        "Cargo.toml must pin the reviewed lbug wrapper commit"
-    );
-    assert!(
-        lockfile.contains(&format!(
-            "source = \"git+{LBUG_RUST_FORK}?rev={LBUG_RUST_REV}#{LBUG_RUST_REV}\""
-        )),
-        "Cargo.lock must resolve lbug to the exact reviewed wrapper commit"
-    );
-    assert!(
         cargo_config.contains("LBUG_BUILD_FROM_SOURCE = { value = \"1\", force = true }"),
-        "workspace builds must compile the pinned Ladybug submodule instead of downloading a prebuilt archive"
+        "workspace builds must compile Ladybug from source instead of downloading a prebuilt archive"
     );
     for (workflow_name, workflow) in [
         ("ci.yml", ci_workflow.as_str()),
@@ -284,18 +274,6 @@ fn ladybug_hotfix_dependency_is_immutable_and_built_from_source() {
         dockerfile.contains("cargo build --locked --release --bin nestweaver"),
         "the Docker image must resolve the reviewed dependency lockfile without updating it"
     );
-    for required_provenance in [
-        LBUG_RUST_REV,
-        "9e221866e08371d380c8bd91f7bc98d101ebf723",
-        "https://github.com/LadybugDB/ladybug/pull/737",
-        ".cargo/config.toml",
-        "LBUG_BUILD_FROM_SOURCE=1",
-    ] {
-        assert!(
-            installation.contains(required_provenance),
-            "INSTALL.md must document Ladybug provenance and source-build requirement `{required_provenance}`"
-        );
-    }
 }
 
 #[test]

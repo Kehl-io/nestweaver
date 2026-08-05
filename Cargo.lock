@@ -3649,8 +3649,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "lbug"
-version = "0.18.2"
-source = "git+https://github.com/kory-io/ladybug-rust.git?rev=8992183ff8de526e8a852be8a97ad04b412f56ed#8992183ff8de526e8a852be8a97ad04b412f56ed"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7a032d5968ac2260545e8c5cf05a123559de2c6ba2bd0dde11c0ed958dfa172"
 dependencies = [
  "cmake",
  "cxx",
