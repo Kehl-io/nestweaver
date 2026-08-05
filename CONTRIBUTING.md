@@ -87,10 +87,11 @@ pre-commit install
 pre-commit install --hook-type commit-msg
 ```
 
-Keep `.cargo/config.toml` in place. It forces the reviewed Ladybug dependency
-to build from its immutable source pin; the initial native build can take
-several minutes. See [INSTALL.md](INSTALL.md#build-from-source) for CMake, C++,
-OpenSSL, zstd, `pkg-config`, and Protocol Buffers prerequisites.
+Keep `.cargo/config.toml` in place. It forces the Ladybug dependency to build
+from source instead of a prebuilt archive, which avoids zstd link errors; the
+initial native build can take several minutes. See
+[INSTALL.md](INSTALL.md#build-from-source) for CMake, C++, OpenSSL, zstd,
+`pkg-config`, and Protocol Buffers prerequisites.
 
 ### Check suite
 
