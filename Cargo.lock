@@ -4069,7 +4069,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nestweaver"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4112,7 +4112,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-algorithms"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -4120,7 +4120,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-client"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "hyper-util",
@@ -4144,7 +4144,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-daemon"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4189,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-embed"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -4208,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-engine"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -4257,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-federation"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4275,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-mcp"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4306,7 +4306,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-parser"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "bumpalo",
  "comrak",
@@ -4354,7 +4354,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-proto"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "prost",
  "tokio-stream",
@@ -4366,7 +4366,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-resolver"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "glob",
  "insta",
@@ -4383,7 +4383,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-schema"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "hex",
  "serde",
@@ -4394,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-storage"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -4409,7 +4409,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-store"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -4435,7 +4435,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-wasm"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "js-sys",
  "nestweaver-algorithms",
@@ -4448,7 +4448,7 @@ dependencies = [
 
 [[package]]
 name = "nestweaver-web"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "axum",

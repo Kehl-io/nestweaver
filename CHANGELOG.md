@@ -40,6 +40,17 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [4.0.0](https://github.com/Kehl-io/nestweaver/compare/v3.0.0...v4.0.0) (2026-08-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **deps:** the on-disk storage format moves from version 42 to 43. Databases written by earlier releases (lbug 0.18.2) are still READ by this release without a re-index, but the migration is one-way and is applied automatically: the daemon rewrites the database to v43 on its shutdown checkpoint. Because the CLI auto-spawns a daemon, even a read-only command such as `search` or `list-repos` will upgrade the file once that daemon exits. After the upgrade, older builds fail to open the database with "Trying to read a database file with a different version. Database file version: 43, Current build storage version: 42".
+
+### Bug Fixes
+
+* **deps:** return lbug to upstream 0.19.1 ([7919574](https://github.com/Kehl-io/nestweaver/commit/7919574c6f016b5b418fd9a5e7869c2376c09b7a))
+
 ## [3.0.0](https://github.com/Kehl-io/nestweaver/compare/v2.7.1...v3.0.0) (2026-07-31)
 
 
