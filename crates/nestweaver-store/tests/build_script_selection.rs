@@ -5,26 +5,26 @@ use serde_json::json;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-const LBUG_VERSION: &str = "0.18.2";
+const LBUG_VERSION: &str = "0.19.1";
 
 #[test]
 fn resolved_edge_uses_cargo_identity_when_exact_version_exists_across_sources() {
     let fixture = Fixture::new();
     let crates_io = fixture.lbug_package(
-        "registry+crates.io#lbug@0.18.2",
+        "registry+crates.io#lbug@0.19.1",
         "registry-a",
         LBUG_VERSION,
         true,
     );
     let mirror = fixture.lbug_package(
-        "registry+mirror#lbug@0.18.2",
+        "registry+mirror#lbug@0.19.1",
         "registry-b",
         LBUG_VERSION,
         true,
     );
     let metadata = fixture.metadata(
         vec![crates_io.clone(), mirror],
-        vec![dep("lbug", "registry+crates.io#lbug@0.18.2")],
+        vec![dep("lbug", "registry+crates.io#lbug@0.19.1")],
     );
 
     let selected = build_support::resolved_dependency_source(
@@ -35,7 +35,7 @@ fn resolved_edge_uses_cargo_identity_when_exact_version_exists_across_sources() 
     )
     .unwrap();
 
-    assert_eq!(selected.package_id, "registry+crates.io#lbug@0.18.2");
+    assert_eq!(selected.package_id, "registry+crates.io#lbug@0.19.1");
     assert_eq!(selected.version, LBUG_VERSION);
     assert_eq!(selected.source.as_deref(), Some("registry+crates.io"));
     assert_eq!(selected.source_dir, fixture.source_dir(&crates_io));
@@ -46,14 +46,14 @@ fn resolved_edge_selects_the_direct_dependency_when_multiple_versions_exist() {
     let fixture = Fixture::new();
     let old = fixture.lbug_package("registry+crates.io#lbug@0.16.1", "old", "0.16.1", true);
     let current = fixture.lbug_package(
-        "registry+crates.io#lbug@0.18.2",
+        "registry+crates.io#lbug@0.19.1",
         "current",
         LBUG_VERSION,
         true,
     );
     let metadata = fixture.metadata(
         vec![old, current.clone()],
-        vec![dep("lbug", "registry+crates.io#lbug@0.18.2")],
+        vec![dep("lbug", "registry+crates.io#lbug@0.19.1")],
     );
 
     let selected = build_support::resolved_dependency_source(
@@ -71,13 +71,13 @@ fn resolved_edge_selects_the_direct_dependency_when_multiple_versions_exist() {
 #[test]
 fn duplicate_direct_dependency_edges_are_rejected_as_ambiguous() {
     let fixture = Fixture::new();
-    let first = fixture.lbug_package("registry+a#lbug@0.18.2", "a", LBUG_VERSION, true);
-    let second = fixture.lbug_package("registry+b#lbug@0.18.2", "b", LBUG_VERSION, true);
+    let first = fixture.lbug_package("registry+a#lbug@0.19.1", "a", LBUG_VERSION, true);
+    let second = fixture.lbug_package("registry+b#lbug@0.19.1", "b", LBUG_VERSION, true);
     let metadata = fixture.metadata(
         vec![first, second],
         vec![
-            dep("lbug", "registry+a#lbug@0.18.2"),
-            dep("lbug", "registry+b#lbug@0.18.2"),
+            dep("lbug", "registry+a#lbug@0.19.1"),
+            dep("lbug", "registry+b#lbug@0.19.1"),
         ],
     );
 
@@ -93,17 +93,17 @@ fn duplicate_direct_dependency_edges_are_rejected_as_ambiguous() {
         error.contains("ambiguous direct dependency lbug"),
         "{error}"
     );
-    assert!(error.contains("registry+a#lbug@0.18.2"), "{error}");
-    assert!(error.contains("registry+b#lbug@0.18.2"), "{error}");
+    assert!(error.contains("registry+a#lbug@0.19.1"), "{error}");
+    assert!(error.contains("registry+b#lbug@0.19.1"), "{error}");
 }
 
 #[test]
 fn duplicate_records_for_the_resolved_package_identity_are_rejected() {
     let fixture = Fixture::new();
-    let package = fixture.lbug_package("registry+a#lbug@0.18.2", "a", LBUG_VERSION, true);
+    let package = fixture.lbug_package("registry+a#lbug@0.19.1", "a", LBUG_VERSION, true);
     let metadata = fixture.metadata(
         vec![package.clone(), package],
-        vec![dep("lbug", "registry+a#lbug@0.18.2")],
+        vec![dep("lbug", "registry+a#lbug@0.19.1")],
     );
 
     let error = build_support::resolved_dependency_source(
@@ -122,7 +122,7 @@ fn missing_resolved_package_source_is_reported() {
     let fixture = Fixture::new();
     let metadata = fixture.metadata(
         Vec::new(),
-        vec![dep("lbug", "registry+missing#lbug@0.18.2")],
+        vec![dep("lbug", "registry+missing#lbug@0.19.1")],
     );
 
     let error = build_support::resolved_dependency_source(
@@ -133,15 +133,15 @@ fn missing_resolved_package_source_is_reported() {
     )
     .unwrap_err();
 
-    assert!(error.contains("registry+missing#lbug@0.18.2"), "{error}");
+    assert!(error.contains("registry+missing#lbug@0.19.1"), "{error}");
     assert!(error.contains("has no package record"), "{error}");
 }
 
 #[test]
 fn missing_bundled_source_directory_is_reported() {
     let fixture = Fixture::new();
-    let package = fixture.lbug_package("registry+a#lbug@0.18.2", "a", LBUG_VERSION, false);
-    let metadata = fixture.metadata(vec![package], vec![dep("lbug", "registry+a#lbug@0.18.2")]);
+    let package = fixture.lbug_package("registry+a#lbug@0.19.1", "a", LBUG_VERSION, false);
+    let metadata = fixture.metadata(vec![package], vec![dep("lbug", "registry+a#lbug@0.19.1")]);
 
     let error = build_support::resolved_dependency_source(
         &metadata,
@@ -231,7 +231,7 @@ fn isolated_resolver_manifest_uses_an_exact_dependency() {
         build_support::write_isolated_resolver_manifest(temp.path(), "lbug", LBUG_VERSION).unwrap();
     let contents = std::fs::read_to_string(manifest).unwrap();
 
-    assert!(contents.contains("lbug = \"=0.18.2\""), "{contents}");
+    assert!(contents.contains("lbug = \"=0.19.1\""), "{contents}");
     assert!(contents.contains("[workspace]"), "{contents}");
 }
 
@@ -263,14 +263,14 @@ fn cargo_locates_the_workspace_before_metadata_resolution() {
 fn vendored_manifest_path_is_the_source_of_bundled_files() {
     let fixture = Fixture::new();
     let package = fixture.lbug_package(
-        "path+file:///vendor/lbug#0.18.2",
+        "path+file:///vendor/lbug#0.19.1",
         "vendor/lbug",
         LBUG_VERSION,
         true,
     );
     let metadata = fixture.metadata(
         vec![package.clone()],
-        vec![dep("lbug", "path+file:///vendor/lbug#0.18.2")],
+        vec![dep("lbug", "path+file:///vendor/lbug#0.19.1")],
     );
 
     let selected = build_support::resolved_dependency_source(
@@ -292,7 +292,7 @@ fn source_manifest_override_accepts_exact_lbug_package() {
     std::fs::create_dir_all(manifest.parent().unwrap().join("lbug-src")).unwrap();
     std::fs::write(
         &manifest,
-        "[package]\nname = \"lbug\"\nversion = \"0.18.2\"\n",
+        "[package]\nname = \"lbug\"\nversion = \"0.19.1\"\n",
     )
     .unwrap();
 
@@ -314,7 +314,7 @@ fn source_manifest_override_rejects_wrong_package_identity() {
     std::fs::create_dir_all(manifest.parent().unwrap().join("lbug-src")).unwrap();
     std::fs::write(
         &manifest,
-        "[package]\nname = \"lookalike\"\nversion = \"0.18.2\"\n",
+        "[package]\nname = \"lookalike\"\nversion = \"0.19.1\"\n",
     )
     .unwrap();
 
@@ -326,8 +326,8 @@ fn source_manifest_override_rejects_wrong_package_identity() {
     )
     .unwrap_err();
 
-    assert!(error.contains("expected package lbug 0.18.2"), "{error}");
-    assert!(error.contains("lookalike 0.18.2"), "{error}");
+    assert!(error.contains("expected package lbug 0.19.1"), "{error}");
+    assert!(error.contains("lookalike 0.19.1"), "{error}");
 }
 
 #[test]
@@ -349,7 +349,7 @@ fn source_manifest_override_rejects_wrong_abi_version() {
     )
     .unwrap_err();
 
-    assert!(error.contains("expected package lbug 0.18.2"), "{error}");
+    assert!(error.contains("expected package lbug 0.19.1"), "{error}");
     assert!(error.contains("lbug 0.18.1"), "{error}");
 }
 

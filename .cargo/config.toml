@@ -1,5 +1,7 @@
 [env]
-# The temporary lbug wrapper pin contains the reviewed Ladybug source as an
-# immutable submodule. Always compile that source so Cargo cannot substitute an
-# unrelated prebuilt archive while the upstream release is pending.
+# Build lbug from source instead of linking its published prebuilt archive.
+# The prebuilt hides its zstd Huffman ASM symbols in the ELF, which breaks the
+# link on x86_64 Linux; compiling from source resolves those symbols and keeps
+# cross-platform release builds reproducible. See 6768374, "fix(ci): eliminate
+# zstd link errors and skip daemon tests on Linux".
 LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }
