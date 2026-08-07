@@ -3030,9 +3030,6 @@ fn derive_contracts(
 ) -> Result<(), anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
 
-    // Bulk delete existing contracts for this repo in one query.
-    store.clear_repo_contracts(r_uid)?;
-
     // 1. Declared contracts from specs.
     let mut all_contracts = ContractSet::new();
     // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
@@ -3169,11 +3166,25 @@ fn derive_contracts(
     // in edge cardinality: two handlers whose routes normalize to one UID both
     // keep their IMPLEMENTS_CONTRACT edge onto the surviving contract.
     let all_contracts = all_contracts.into_contracts();
-    store.batch_insert_contracts(&all_contracts)?;
 
+    // Clear + insert + edges must be ONE transaction. Previously the clear ran
+    // on its own connection ahead of the inserts, so any failure in between
+    // (e.g. a single row the COPY rejects) left the repo with zero contracts
+    // and zero IMPLEMENTS_CONTRACT edges — and the caller only warns, so the
+    // index still reported success. The transaction opens here, as late as
+    // possible: all the spec/handler parsing above is expensive and holding a
+    // write transaction across it would serialise writers for no benefit.
+    //
+    // No explicit rollback on the error paths, matching `bulk_reindex_write`:
+    // a statement that throws inside an explicit transaction already rolls it
+    // back, and dropping the connection rolls back anything still open.
+    let conn = store.begin_transaction()?;
+    GraphStore::clear_repo_contracts_on(&conn, r_uid)?;
+    GraphStore::batch_insert_contracts_on(&conn, &all_contracts)?;
     if !edges.is_empty() {
-        store.batch_insert_edges(&edges)?;
+        GraphStore::batch_insert_edges_on(&conn, &edges)?;
     }
+    store.commit_transaction(&conn)?;
     Ok(())
 }
 
@@ -5225,6 +5236,137 @@ function hello(name) { return "Hello " + name; }
         assert!(
             implemented.contains(&"contract:http:POST:/v1/approvals".to_string()),
             "expected IMPLEMENTS_CONTRACT edge; implemented: {implemented:?}"
+        );
+    }
+
+    /// A failure inside `derive_contracts` must leave the PREVIOUS contract
+    /// graph intact.
+    ///
+    /// The clear used to run on its own connection ahead of the COPY, so a
+    /// single row the COPY rejected wiped every Contract and every
+    /// IMPLEMENTS_CONTRACT edge for the repo — not a partial result, nothing —
+    /// while the caller only warned and the index still reported success.
+    ///
+    /// The rejected row here is a real one: `contracts::contract_uid` mints a
+    /// UID from kind/verb/path alone, with no repo component, so a route
+    /// another repo has already declared collides on `Contract`'s primary key.
+    /// `clear_repo_contracts` deletes only this repo's rows, so the other
+    /// repo's row is still there when the COPY runs.
+    ///
+    /// Assertions are on the CONTENTS of the graph, never on the `Result` of
+    /// an `index_*` call: derivation errors are swallowed by the caller, so a
+    /// `Result` assertion would pass with or without the fix.
+    #[test]
+    fn failed_contract_derivation_preserves_existing_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\n\
+             info: { title: t, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/approvals:\n    \
+             post:\n      \
+             operationId: createApproval\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("ApprovalsController.java"),
+            "@RestController\n\
+             @RequestMapping(\"/v1/approvals\")\n\
+             public class ApprovalsController {\n  \
+             @PostMapping\n  \
+             public void create() {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let repo_uid = store
+            .list_contracts(None)
+            .unwrap()
+            .first()
+            .expect("first index derives at least one contract")
+            .repo_uid
+            .clone();
+        let mut contracts_before: Vec<String> = store
+            .list_contracts(Some(&repo_uid))
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.repo_uid == repo_uid)
+            .map(|c| c.uid)
+            .collect();
+        contracts_before.sort();
+        let mut implemented_before = store.list_implemented_contract_uids().unwrap();
+        implemented_before.sort();
+        assert!(!contracts_before.is_empty(), "expected seeded contracts");
+        assert!(
+            !implemented_before.is_empty(),
+            "expected a seeded IMPLEMENTS_CONTRACT edge"
+        );
+
+        // A Contract owned by a DIFFERENT repo, under a UID this repo's next
+        // derivation also mints.
+        store
+            .batch_insert_contracts(&[nestweaver_schema::Contract {
+                uid: "contract:http:GET:/v1/shared".to_string(),
+                kind: "http".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/v1/shared".to_string()),
+                operation_id: None,
+                repo_uid: "repo:other".to_string(),
+                source_path: "openapi.yaml".to_string(),
+                confidence: 1.0,
+            }])
+            .unwrap();
+
+        // Re-derive this repo's contracts from a spec that declares the shared
+        // route. The COPY must reject the colliding row.
+        let poisoned = dir.path().join("poisoned");
+        fs::create_dir_all(&poisoned).unwrap();
+        let spec = poisoned.join("openapi.yaml");
+        fs::write(
+            &spec,
+            "openapi: 3.0.0\n\
+             info: { title: t, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/shared:\n    \
+             get:\n      \
+             operationId: getShared\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&poisoned);
+        let err = derive_contracts(&store, &reader, &repo_uid, &[spec], &[], &[])
+            .expect_err("a colliding contract UID must fail the COPY");
+        assert!(
+            err.to_string().contains("COPY Contract"),
+            "expected the COPY to be what failed; got {err}"
+        );
+
+        // The failed derivation must not have touched the previous graph.
+        let mut contracts_after: Vec<String> = store
+            .list_contracts(Some(&repo_uid))
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.repo_uid == repo_uid)
+            .map(|c| c.uid)
+            .collect();
+        contracts_after.sort();
+        assert_eq!(
+            contracts_before, contracts_after,
+            "contracts must survive a failed derivation"
+        );
+
+        let mut implemented_after = store.list_implemented_contract_uids().unwrap();
+        implemented_after.sort();
+        assert_eq!(
+            implemented_before, implemented_after,
+            "IMPLEMENTS_CONTRACT edges must survive a failed derivation"
         );
     }
 
