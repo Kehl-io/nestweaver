@@ -2746,6 +2746,12 @@ where
 
         // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
         let _phase_contracts_span = tracing::info_span!("index_phase_contracts").entered();
+        // Deterministic input order for the whole phase: `FilesystemReader`
+        // walks in readdir order while `GitReader` walks git-sorted, so without
+        // this the same repo feeds the contract phase in a different order on
+        // different machines (and after unrelated file churn).
+        spec_files.sort();
+        handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         // Best-effort: a malformed spec or unexpected store error here must not
         // fail the whole index. Contracts are hypotheses layered on top of the
         // code graph.
@@ -2910,6 +2916,101 @@ fn is_parseable(path: &Path) -> bool {
     detect_language(path).is_some()
 }
 
+/// Where a candidate [`nestweaver_schema::Contract`] came from. Ordered worst
+/// to best: a spec declaration always outranks a route inferred from handler
+/// source, which is the preference the old `declared_uids` guard encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ContractOrigin {
+    CodeDerived,
+    Declared,
+}
+
+/// Order-preserving, UID-keyed accumulator for Contract nodes.
+///
+/// `Contract.uid` is the primary key of the `Contract` node table, so the bulk
+/// COPY in `batch_insert_contracts` aborts the *whole* batch the moment a UID
+/// repeats — and repeats are normal, not pathological:
+///
+/// - [`nestweaver_schema::uid::normalize_http_path`] deliberately discards the
+///   *name* of a path parameter, so `GET /users/{id}` and `GET /users/{userId}`
+///   mint one UID.
+/// - [`nestweaver_schema::uid::contract_uid`] never mixes in the spec's
+///   location, so one spec vendored at two paths mints its routes twice.
+/// - `.proto` / `.graphql` operations carry no cross-file uniqueness check, so
+///   two files declaring the same RPC or `Query` field collide too.
+///
+/// This accumulator is the only place that sees every candidate, so it is where
+/// the collapse belongs.
+struct ContractSet {
+    /// UIDs in first-sighting order, so the COPY input stays reproducible.
+    order: Vec<String>,
+    by_uid: HashMap<String, (ContractOrigin, nestweaver_schema::Contract)>,
+}
+
+impl ContractSet {
+    fn new() -> Self {
+        Self {
+            order: Vec::new(),
+            by_uid: HashMap::new(),
+        }
+    }
+
+    /// True once any candidate has claimed `uid`.
+    fn contains(&self, uid: &str) -> bool {
+        self.by_uid.contains_key(uid)
+    }
+
+    /// True when a *spec* declared `uid`. Replaces the old `declared_uids`
+    /// set: the declared loop populates it by inserting, so the guard on the
+    /// code-derived path can no longer fall out of sync with what was stored.
+    fn is_declared(&self, uid: &str) -> bool {
+        matches!(self.by_uid.get(uid), Some((ContractOrigin::Declared, _)))
+    }
+
+    /// Record `contract`, keeping the better row when its UID is already held.
+    ///
+    /// The winner is chosen by a **total, order-independent** order:
+    ///
+    /// 1. spec-declared beats code-derived (the `declared_uids` semantics);
+    /// 2. then higher `confidence` — `f32` has no `Ord`, so `total_cmp`;
+    /// 3. then the lexicographically smallest `source_path`.
+    ///
+    /// Collection order deliberately breaks no tie. `FilesystemReader` walks in
+    /// readdir order while `GitReader` walks git-sorted, so "first one wins"
+    /// would pick a different survivor on two machines and make the collapse
+    /// untestable. Rows that tie on all three differ at most in `operation_id`;
+    /// kind, verb and path are already pinned by the shared UID, so they are
+    /// equivalent for the graph and the incumbent stays.
+    fn insert(&mut self, origin: ContractOrigin, contract: nestweaver_schema::Contract) {
+        match self.by_uid.entry(contract.uid.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                self.order.push(contract.uid.clone());
+                slot.insert((origin, contract));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let (held_origin, held) = slot.get();
+                let wins = origin
+                    .cmp(held_origin)
+                    .then_with(|| contract.confidence.total_cmp(&held.confidence))
+                    .then_with(|| held.source_path.cmp(&contract.source_path))
+                    .is_gt();
+                if wins {
+                    slot.insert((origin, contract));
+                }
+            }
+        }
+    }
+
+    /// The deduplicated rows, first-sighting order preserved.
+    fn into_contracts(self) -> Vec<nestweaver_schema::Contract> {
+        let Self { order, mut by_uid } = self;
+        order
+            .into_iter()
+            .filter_map(|uid| by_uid.remove(&uid).map(|(_, c)| c))
+            .collect()
+    }
+}
+
 /// F2-core: build the API contract graph for one repo.
 ///
 /// 1. Parse spec files into **declared** [`nestweaver_schema::Contract`] nodes
@@ -2928,14 +3029,12 @@ fn derive_contracts(
     all_symbols: &[nestweaver_schema::Symbol],
 ) -> Result<(), anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
-    use std::collections::HashSet;
 
     // Bulk delete existing contracts for this repo in one query.
     store.clear_repo_contracts(r_uid)?;
 
     // 1. Declared contracts from specs.
-    let mut all_contracts: Vec<nestweaver_schema::Contract> = Vec::new();
-    let mut declared_uids: HashSet<String> = HashSet::new();
+    let mut all_contracts = ContractSet::new();
     // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
     let mut declared_grpc: Vec<(String, String)> = Vec::new();
     let repo_path = reader.root();
@@ -2959,11 +3058,15 @@ fn derive_contracts(
                 .then(|| sc.operation_id.clone())
                 .flatten();
             let contract = sc.into_contract(r_uid, &rel, 1.0);
-            if let Some(operation) = grpc_operation {
+            // One entry per declared RPC: `detect_grpc_impls` emits a match per
+            // entry, so an RPC declared in two .proto files would otherwise
+            // produce two identical IMPLEMENTS_CONTRACT edges.
+            if let Some(operation) = grpc_operation
+                && !all_contracts.contains(&contract.uid)
+            {
                 declared_grpc.push((contract.uid.clone(), operation));
             }
-            declared_uids.insert(contract.uid.clone());
-            all_contracts.push(contract);
+            all_contracts.insert(ContractOrigin::Declared, contract);
         }
     }
 
@@ -2983,12 +3086,15 @@ fn derive_contracts(
         for m in matches {
             let contract_uid = m.contract.uid();
             // Mint a code-derived contract only when no spec declared this UID.
-            if !declared_uids.contains(&contract_uid) {
+            // The set is authoritative either way — inserting a code-derived row
+            // over a declared one loses on provenance — but skipping the work is
+            // free, and the edge below still points at the declared node.
+            if !all_contracts.is_declared(&contract_uid) {
                 let contract = m
                     .contract
                     .clone()
                     .into_contract(r_uid, &hf.rel_path, m.confidence);
-                all_contracts.push(contract);
+                all_contracts.insert(ContractOrigin::CodeDerived, contract);
             }
             if let Some((sym_uid, _)) = hf.symbols.get(m.symbol_index) {
                 edges.push(ResolvedEdge {
@@ -3057,7 +3163,12 @@ fn derive_contracts(
         }
     }
 
-    // Batch insert all contracts at once via COPY FROM CSV.
+    // Batch insert all contracts at once via COPY FROM CSV. `Contract.uid` is
+    // the node table's primary key, so the rows must already be unique by UID —
+    // `ContractSet` guarantees that. Note the collapse is intentionally visible
+    // in edge cardinality: two handlers whose routes normalize to one UID both
+    // keep their IMPLEMENTS_CONTRACT edge onto the surviving contract.
+    let all_contracts = all_contracts.into_contracts();
     store.batch_insert_contracts(&all_contracts)?;
 
     if !edges.is_empty() {
@@ -5177,6 +5288,219 @@ function hello(name) { return "Hello " + name; }
         assert!(
             !implemented.contains(&"contract:grpc:demo.v1.Greeter/NeverBuilt".to_string()),
             "an unimplemented RPC must remain drift; implemented: {implemented:?}"
+        );
+    }
+
+    // ── Contract UID deduplication (duplicate-PK on the bulk COPY) ────────
+
+    /// Every Contract UID appears at most once, else the COPY would have
+    /// aborted. Returns the surviving rows keyed by UID for further assertions.
+    fn assert_unique_contract_uids(contracts: &[nestweaver_schema::Contract]) {
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for c in contracts {
+            *seen.entry(c.uid.as_str()).or_default() += 1;
+        }
+        let dupes: Vec<(&str, usize)> = seen.into_iter().filter(|(_, n)| *n > 1).collect();
+        assert!(
+            dupes.is_empty(),
+            "duplicate Contract UIDs reached the store: {dupes:?}"
+        );
+    }
+
+    #[test]
+    fn routes_differing_only_in_path_param_name_collapse_to_one_contract() {
+        // BUG repro: `normalize_http_path` discards the *name* of a path
+        // parameter, so GET /users/{id} and GET /users/{userId} mint the same
+        // UID. Undeduplicated, the bulk COPY died with "Found duplicated
+        // primary key value contract:http:GET:/users/{}" and the contract phase
+        // lost EVERY contract for the repo.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("UserController.java"),
+            "@RestController\n\
+             public class UserController {\n  \
+             @GetMapping(\"/users/{id}\")\n  \
+             public void byId() {}\n  \
+             @GetMapping(\"/users/{userId}\")\n  \
+             public void byUserId() {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let contracts = store.list_contracts(None).unwrap();
+        assert_unique_contract_uids(&contracts);
+        let collapsed: Vec<&nestweaver_schema::Contract> = contracts
+            .iter()
+            .filter(|c| c.uid == "contract:http:GET:/users/{}")
+            .collect();
+        assert_eq!(
+            collapsed.len(),
+            1,
+            "the two routes must collapse to exactly one contract; got {:?}",
+            contracts.iter().map(|c| &c.uid).collect::<Vec<_>>()
+        );
+
+        // Dedup CHANGES EDGE CARDINALITY BY DESIGN: both handlers legitimately
+        // implement the one surviving contract, so assert the two edges rather
+        // than a count that would encode the old one-contract-per-handler shape.
+        for handler in ["byId", "byUserId"] {
+            let syms = store.lookup_symbols_by_name(handler).unwrap();
+            let sym = syms
+                .iter()
+                .find(|s| s.name == handler)
+                .unwrap_or_else(|| panic!("{handler} symbol indexed"));
+            let implemented = store.contracts_implemented_by(&sym.uid).unwrap();
+            assert!(
+                implemented
+                    .iter()
+                    .any(|(uid, _)| uid == "contract:http:GET:/users/{}"),
+                "{handler} must link to the surviving contract; got {implemented:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_spec_vendored_at_two_paths_indexes_once() {
+        // `contract_uid` derives from verb + path and never from the spec's
+        // location, so a spec vendored twice declares each route twice.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("api")).unwrap();
+        fs::create_dir_all(src.join("docs")).unwrap();
+        let spec = "openapi: 3.0.0\n\
+                    info: { title: t, version: \"1.0\" }\n\
+                    paths:\n  \
+                    /v1/items:\n    \
+                    get:\n      \
+                    responses: { \"200\": { description: ok } }\n";
+        fs::write(src.join("api").join("openapi.yaml"), spec).unwrap();
+        fs::write(src.join("docs").join("openapi.yaml"), spec).unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let contracts = store.list_contracts(None).unwrap();
+        assert_unique_contract_uids(&contracts);
+        let survivor = contracts
+            .iter()
+            .find(|c| c.uid == "contract:http:GET:/v1/items")
+            .expect("the declared route survives the collapse");
+        // Both copies are declared at confidence 1.0, so the tie-break falls to
+        // the lexicographically smallest source_path — NOT to collection order.
+        assert_eq!(survivor.source_path, "api/openapi.yaml");
+    }
+
+    #[test]
+    fn overlapping_proto_and_graphql_definitions_index_cleanly() {
+        // `parse_proto` mints "<package>.<Service>/<Method>" and `parse_graphql`
+        // collects every field of any Query/Mutation/Subscription type — neither
+        // has a cross-file uniqueness check, so two files declaring the same
+        // operation collide on the primary key.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        let proto = "syntax = \"proto3\";\n\
+                     package demo.v1;\n\
+                     service Greeter {\n  \
+                     rpc SayHello (Empty) returns (Empty);\n\
+                     }\n\
+                     message Empty {}\n";
+        fs::write(src.join("a.proto"), proto).unwrap();
+        fs::write(src.join("b.proto"), proto).unwrap();
+        let schema = "type Query {\n  me: String\n}\n";
+        fs::write(src.join("one.graphql"), schema).unwrap();
+        fs::write(src.join("two.graphql"), schema).unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let contracts = store.list_contracts(None).unwrap();
+        assert_unique_contract_uids(&contracts);
+        let uids: Vec<&str> = contracts.iter().map(|c| c.uid.as_str()).collect();
+        assert!(
+            uids.contains(&"contract:grpc:demo.v1.Greeter/SayHello"),
+            "the duplicated RPC must survive exactly once; got {uids:?}"
+        );
+        assert!(
+            uids.contains(&"contract:graphql:Query.me"),
+            "the duplicated GraphQL field must survive exactly once; got {uids:?}"
+        );
+    }
+
+    #[test]
+    fn contract_collision_resolves_independently_of_input_order() {
+        // The acceptance criterion is that a collision resolves the SAME way
+        // whichever order the candidates arrive in. It cannot lean on
+        // collection order: `FilesystemReader` walks readdir order while
+        // `GitReader` walks git-sorted, so the two readers disagree.
+        fn candidate(source_path: &str, confidence: f32) -> nestweaver_schema::Contract {
+            nestweaver_schema::Contract {
+                uid: "contract:http:GET:/users/{}".to_string(),
+                kind: "http".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/users/{}".to_string()),
+                operation_id: None,
+                repo_uid: "repo:test".to_string(),
+                source_path: source_path.to_string(),
+                confidence,
+            }
+        }
+        fn survivor(
+            first: (ContractOrigin, nestweaver_schema::Contract),
+            second: (ContractOrigin, nestweaver_schema::Contract),
+        ) -> nestweaver_schema::Contract {
+            let mut set = ContractSet::new();
+            set.insert(first.0, first.1);
+            set.insert(second.0, second.1);
+            let mut rows = set.into_contracts();
+            assert_eq!(rows.len(), 1, "colliding UIDs must collapse to one row");
+            rows.remove(0)
+        }
+
+        // 1. Provenance: a spec declaration outranks a code-derived route even
+        //    when the code-derived one is more confident and sorts earlier.
+        let declared = (ContractOrigin::Declared, candidate("z/openapi.yaml", 0.8));
+        let derived = (ContractOrigin::CodeDerived, candidate("a/Ctrl.java", 1.0));
+        assert_eq!(
+            survivor(declared.clone(), derived.clone()).source_path,
+            "z/openapi.yaml"
+        );
+        assert_eq!(
+            survivor(derived, declared).source_path,
+            "z/openapi.yaml",
+            "provenance must not depend on which candidate arrived first"
+        );
+
+        // 2. Then confidence, compared with total_cmp.
+        let strong = (ContractOrigin::CodeDerived, candidate("z/Ctrl.java", 1.0));
+        let weak = (ContractOrigin::CodeDerived, candidate("a/Ctrl.java", 0.8));
+        assert_eq!(
+            survivor(strong.clone(), weak.clone()).source_path,
+            "z/Ctrl.java"
+        );
+        assert_eq!(
+            survivor(weak, strong).source_path,
+            "z/Ctrl.java",
+            "confidence must not depend on which candidate arrived first"
+        );
+
+        // 3. Then the lexicographically smallest source_path — the common case,
+        //    since two @RequestMappings in one controller tie on 1 and 2.
+        let early = (ContractOrigin::CodeDerived, candidate("a/Ctrl.java", 1.0));
+        let late = (ContractOrigin::CodeDerived, candidate("z/Ctrl.java", 1.0));
+        assert_eq!(
+            survivor(early.clone(), late.clone()).source_path,
+            "a/Ctrl.java"
+        );
+        assert_eq!(
+            survivor(late, early).source_path,
+            "a/Ctrl.java",
+            "the path tie-break must not depend on which candidate arrived first"
         );
     }
 
