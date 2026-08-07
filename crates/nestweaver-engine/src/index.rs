@@ -7305,6 +7305,188 @@ function hello(name) { return "Hello " + name; }
         assert!(store.symbols_in_file("old.js").unwrap().is_empty());
     }
 
+    /// Trips the cancel flag inside `establish_marker`, which the index runs
+    /// immediately AFTER the pre-write cancellation poll — so the run passes
+    /// every abort point and can only observe the cancellation at the
+    /// committed finalizer, exactly like a timeout or Ctrl-C that lands
+    /// mid-write.
+    struct CancelOnMarkerIo {
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl IndexEpilogueIo for CancelOnMarkerIo {
+        fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.establish_marker(path)?;
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.clear_marker(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            FileSystemIndexEpilogueIo.remove_file(path)
+        }
+
+        fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            FileSystemIndexEpilogueIo.rename_file(from, to)
+        }
+
+        fn save_generation(
+            &self,
+            store: &GraphStore,
+            path: &Path,
+            generation: u64,
+        ) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.save_generation(store, path, generation)
+        }
+
+        fn compute_pagerank(
+            &self,
+            store: &GraphStore,
+            scope: &nestweaver_store::GraphScope,
+        ) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.compute_pagerank(store, scope)
+        }
+
+        fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.save_pagerank(store, path)
+        }
+    }
+
+    /// A cancellation observed only AFTER the last pre-write poll cannot abort
+    /// the run — the graph commits — but the publication must stay dirty:
+    /// `.index-dirty` survives and the durable generation is not advanced, so
+    /// the next open reconciles the publication fail-closed instead of
+    /// trusting a generation/PageRank that predates the commit.
+    #[test]
+    fn cancelled_commit_keeps_publication_dirty_and_generation_unpublished() {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.js"), "function kept() { return 1; }").unwrap();
+        let repo_url = "https://example.com/cancelled-commit";
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let result = index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-1",
+                name: None,
+                cancel: Some(&cancel),
+                epilogue_io: &CancelOnMarkerIo {
+                    cancel: Arc::clone(&cancel),
+                },
+            },
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .expect("a cancellation past the last pre-write poll cannot abort the commit");
+
+        assert!(result.files_count > 0, "the run indexed the file");
+        assert!(
+            store
+                .list_repos(Some("test"))
+                .unwrap()
+                .iter()
+                .any(|repo| repo.url == repo_url),
+            "the cancelled run's graph mutation IS persisted"
+        );
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        assert!(
+            marker_path.exists(),
+            "a cancelled commit must leave the publication dirty"
+        );
+        assert!(
+            !generation_path.exists(),
+            "a cancelled commit must not durably advance the generation"
+        );
+        drop(store);
+
+        // Reconciliation on the next open is fail-closed: the committed graph
+        // is there, but the dirty marker blocks trusting generation/PageRank
+        // state until a successful writer heals the publication.
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            reopened.is_index_publication_dirty(),
+            "the dirty marker must survive reopen"
+        );
+        assert_eq!(
+            reopened.graph_generation(),
+            u64::MAX,
+            "with no published `.generation` and the dirty marker present, reopen must \
+             report the fail-closed sentinel rather than a trustworthy generation"
+        );
+        assert!(
+            reopened
+                .list_repos(Some("test"))
+                .unwrap()
+                .iter()
+                .any(|repo| repo.url == repo_url),
+            "the committed graph survives reopen"
+        );
+    }
+
+    /// Control for the cancelled-commit test: the same run without a
+    /// cancellation retires `.index-dirty` and durably publishes the advanced
+    /// generation.
+    #[test]
+    fn uncancelled_commit_retires_marker_and_publishes_generation() {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.js"), "function kept() { return 1; }").unwrap();
+        let repo_url = "https://example.com/uncancelled-commit";
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let generation_before = store.graph_generation();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-1",
+                name: None,
+                cancel: Some(&cancel),
+                epilogue_io: &FileSystemIndexEpilogueIo,
+            },
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .expect("an uncancelled index must succeed");
+
+        assert!(
+            !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "a clean commit retires the dirty marker"
+        );
+        assert!(store.graph_generation() > generation_before);
+        assert_eq!(
+            fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            store.graph_generation(),
+            "a clean commit durably publishes the advanced generation"
+        );
+        assert!(!store.is_index_publication_dirty());
+    }
+
     #[test]
     fn marker_establishment_failure_aborts_before_full_graph_mutation() {
         let dir = tempfile::tempdir().unwrap();
