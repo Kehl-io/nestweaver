@@ -709,6 +709,252 @@ mod tests {
         assert_eq!(idx.dimension(), Some(3));
     }
 
+    // ── Recorded-model write guard ────────────────────────────────────
+    // A same-dimension model swap passes the dimension guard, but two
+    // contrastively trained embedding spaces share no basis, so a
+    // mixed-model index is unusable for retrieval. `add_with_model` refuses
+    // the write (naming both ids via tracing) unless the run is `--force`.
+
+    #[test]
+    fn add_with_model_rejects_a_different_recorded_model_at_the_same_dimension() {
+        let mut idx = EmbeddingIndex::new();
+        idx.set_recorded_model_id(Some("sentence-transformers/model-a".to_string()));
+        assert!(idx.add_with_model(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+
+        // Same dimension, different producer — the hole the dimension guard
+        // cannot see. Must be rejected, and the index must stay untouched.
+        assert!(!idx.add_with_model(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            Some("sentence-transformers/model-b"),
+            false,
+        ));
+        assert_eq!(idx.len(), 1, "a cross-model vector must not be added");
+        assert_eq!(idx.dimension(), Some(3));
+        assert!(idx.get("sym:b").is_none());
+    }
+
+    #[test]
+    fn add_with_model_accepts_the_recorded_model() {
+        let mut idx = EmbeddingIndex::new();
+        idx.set_recorded_model_id(Some("sentence-transformers/model-a".to_string()));
+        assert!(idx.add_with_model(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+        assert!(idx.add_with_model(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn add_with_model_allows_any_model_when_none_is_recorded() {
+        // Absent metadata means unknown, not mismatch: a database that was
+        // never stamped must keep accepting writes (guarded by dimension
+        // only), or every pre-fingerprint database would be frozen.
+        let mut idx = EmbeddingIndex::new();
+        assert!(idx.add_with_model(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+        assert!(idx.add_with_model(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            Some("sentence-transformers/model-b"),
+            false,
+        ));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn add_with_model_force_overrides_the_recorded_model_guard() {
+        // A --force run re-embeds everything, so no mixture survives; the
+        // switch must be allowed through.
+        let mut idx = EmbeddingIndex::new();
+        idx.set_recorded_model_id(Some("sentence-transformers/model-a".to_string()));
+        assert!(idx.add_with_model(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+        assert!(idx.add_with_model(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            Some("sentence-transformers/model-b"),
+            true,
+        ));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn add_without_a_producer_model_skips_the_model_guard() {
+        // `add` names no producing model (unknown producer), so the model
+        // guard cannot fire on it; the dimension guard still applies.
+        let mut idx = EmbeddingIndex::new();
+        idx.set_recorded_model_id(Some("sentence-transformers/model-a".to_string()));
+        assert!(idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false));
+        assert!(idx.add("sym:b", vec![0.0_f32, 1.0, 0.0], false));
+        assert!(!idx.add("sym:c", vec![1.0_f32, 0.0], false));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn store_model_guard_reads_the_recorded_model_from_a_reopened_database() {
+        // The recorded model id is persisted in the database's embedding
+        // metadata and handed to the index once at open — a store that
+        // reopens a stamped database must enforce the guard without anyone
+        // re-stamping.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("model_guard.lbug");
+        {
+            let store = GraphStore::create(&db_path).unwrap();
+            store
+                .set_embedding_metadata("sentence-transformers/model-a", 3)
+                .unwrap();
+            assert!(store.add_embedding_with_force(
+                "sym:a",
+                vec![1.0_f32, 0.0, 0.0],
+                "sentence-transformers/model-a",
+                false,
+            ));
+            store.flush_embedding_index().unwrap();
+        }
+
+        let store = GraphStore::open(&db_path).unwrap();
+        assert!(
+            !store.add_embedding_with_force(
+                "sym:b",
+                vec![0.0_f32, 1.0, 0.0],
+                "sentence-transformers/model-b",
+                false,
+            ),
+            "a same-dimension write from a different model must be rejected"
+        );
+        assert!(!store.has_embedding("sym:b"));
+        assert!(store.add_embedding_with_force(
+            "sym:c",
+            vec![0.0_f32, 1.0, 0.0],
+            "sentence-transformers/model-a",
+            false,
+        ));
+        assert!(store.add_embedding_with_force(
+            "sym:d",
+            vec![1.0_f32, 1.0, 0.0],
+            "sentence-transformers/model-b",
+            true,
+        ));
+    }
+
+    #[test]
+    fn set_embedding_metadata_refreshes_the_in_memory_recorded_model() {
+        // Long-lived stores (the daemon) must check new writes against the
+        // fingerprint that was just stamped, not the one read at open.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("model_refresh.lbug")).unwrap();
+        store
+            .set_embedding_metadata("sentence-transformers/model-a", 3)
+            .unwrap();
+        assert!(!store.add_embedding_with_force(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            "sentence-transformers/model-b",
+            false,
+        ));
+
+        store
+            .set_embedding_metadata("sentence-transformers/model-b", 3)
+            .unwrap();
+        assert!(
+            store.add_embedding_with_force(
+                "sym:a",
+                vec![1.0_f32, 0.0, 0.0],
+                "sentence-transformers/model-b",
+                false,
+            ),
+            "writes must be checked against the newly stamped model"
+        );
+        assert!(!store.add_embedding_with_force(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            "sentence-transformers/model-a",
+            false,
+        ));
+    }
+
+    // ── Embedding flush checkpoint ─────────────────────────────────────
+    // An interrupted embed pass used to lose everything: the only flush ran
+    // once at the end. The checkpoint flushes at chunk boundaries once the
+    // interval elapsed AND new embeddings were accepted since the last
+    // flush. The 300s cadence itself lives in `EMBED_CHECKPOINT_INTERVAL`
+    // (per-batch flushing is not implementable — save_binary rewrites the
+    // whole sidecar), so these tests drive the helper with a zero/long
+    // interval instead.
+
+    #[test]
+    fn flush_if_due_does_not_flush_before_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        assert!(store.add_embedding("sym:a", vec![0.1_f32, 0.2, 0.3]));
+        let sidecar = store.embedding_sidecar_path().unwrap();
+
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::from_secs(3600));
+        assert!(
+            !checkpoint.flush_if_due(&store, 1).unwrap(),
+            "no flush may happen before the interval elapses"
+        );
+        assert!(!sidecar.exists(), "nothing may be written early");
+    }
+
+    #[test]
+    fn flush_if_due_without_new_work_never_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+
+        // A zero interval means always due; with no accepted embeddings the
+        // checkpoint must still not write (there is nothing new to persist).
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(!checkpoint.flush_if_due(&store, 0).unwrap());
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn flush_if_due_flushes_when_due_with_new_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+        assert!(store.add_embedding("sym:a", vec![0.1_f32, 0.2, 0.3]));
+
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(
+            checkpoint.flush_if_due(&store, 1).unwrap(),
+            "a due checkpoint with newly accepted embeddings must flush"
+        );
+        assert!(sidecar.exists(), "the flush must persist the sidecar");
+
+        // A due checkpoint with no new accepts since the last flush must not
+        // rewrite the sidecar (each rewrite rewrites every vector).
+        assert!(!checkpoint.flush_if_due(&store, 1).unwrap());
+
+        // Newly accepted work since the flush re-arms it.
+        assert!(store.add_embedding("sym:b", vec![0.4_f32, 0.5, 0.6]));
+        assert!(checkpoint.flush_if_due(&store, 2).unwrap());
+    }
+
     #[test]
     fn vector_search_excludes_dimension_mismatched_vectors() {
         // Defense-in-depth for the query path: simulate a legacy/loaded index that
