@@ -1918,9 +1918,14 @@ where
 
         // Cooperative cancellation: once the daemon trips the flag (index
         // timeout or client disconnect), skip the expensive read+parse for
-        // every remaining file so all cores are freed promptly. The index
-        // then bails before any graph mutation (checked right after the
-        // collect), so no partial/empty graph is ever persisted.
+        // every remaining file so all cores are freed promptly. Cancellation
+        // is observed here per-file during parse, at the post-parse barrier
+        // below, and once more at the pre-write boundary after the write
+        // guard is acquired — all before any graph mutation, so an index
+        // cancelled at those points never persists a partial/empty graph.
+        // A cancel that lands after the pre-write boundary still commits;
+        // the daemon reports that as committed-after-cancellation and names
+        // `index --force` as the repair.
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
             parse_pb.inc(1);
             return ParseOutcome::Skipped(SkippedFile {
@@ -2016,10 +2021,16 @@ where
     parse_pb.finish_and_clear();
     drop(_phase2_span);
 
-    // Cooperative cancellation: if the flag tripped during the parallel parse,
-    // bail now — BEFORE collection, resolution, and any graph mutation — so a
-    // cancelled index never persists a partial/empty graph. The `?` returns
-    // ahead of the write gate below, preserving the no-partial-write invariant.
+    // Cooperative cancellation, post-parse barrier: if the flag tripped
+    // during the parallel parse, bail now — BEFORE collection, resolution,
+    // and any graph mutation. This is one of three observation points
+    // (per-file during parse above, here, and at the pre-write boundary
+    // after the write guard is acquired); an index cancelled at any of them
+    // persists nothing. The no-partial-write invariant does NOT extend past
+    // the pre-write boundary: a cancel landing after it still commits, the
+    // publication is left dirty for the next open to reconcile, and the
+    // daemon reports the run as committed-after-cancellation, naming
+    // `index --force` as the repair.
     if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
         anyhow::bail!("index cancelled");
     }
