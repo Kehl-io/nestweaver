@@ -2273,6 +2273,20 @@ where
     drop(_phase_collect_span);
 
     let _write_guard = acquire_write_guard()?;
+
+    // Last cancellation observation point. Bailing in this window needs no
+    // teardown: the marker call below is what creates `.index-dirty` and
+    // reserves the generation, so nothing owned by this run exists yet and
+    // any pre-existing `.index-dirty` (a prior interrupted publication)
+    // stays untouched for its own recovery. A cancel that lands AFTER this
+    // poll still commits; the committed finalizer then keeps the
+    // publication dirty and the daemon reports committed-after-cancellation.
+    // The incremental path (`incremental_index_with_reader_and_write_gate`)
+    // takes no cancel token by design this cycle.
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        anyhow::bail!("index cancelled");
+    }
+
     let publication = establish_index_publication_marker_with_io(
         store,
         store.db_path(),
