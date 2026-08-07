@@ -13999,6 +13999,98 @@ external_model = "unavailable-test-model"
         );
     }
 
+    /// A daemon embed that produces vectors stamps the fingerprint of the
+    /// model the daemon actually loaded (`status.model_id`) at the produced
+    /// dimension. Before the fix the embed RPC never called
+    /// `set_embedding_metadata` at all, so daemon-populated databases had no
+    /// fingerprint for any downstream guard — this test fails there because
+    /// the metadata stays `None`.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_handler_stamps_the_loaded_models_fingerprint_after_a_productive_run() {
+        let state = test_state_with_writer();
+        insert_unembedded_symbol(&state.store, "sym-stamp");
+        let model = Arc::new(CountingEmbed {
+            calls: Arc::new(AtomicU32::new(0)),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let mut ready = state.embedding_runtime.status();
+        ready.state = "ready".to_string();
+        ready.selected_device = "cpu".to_string();
+        ready.model_id = "daemon-loaded-model".to_string();
+        state.embedding_runtime.publish_ready(ready, model);
+
+        let mut request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 8,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let response = DaemonService::new(state.clone())
+            .embed(request)
+            .await
+            .expect("a ready daemon must accept the embed RPC")
+            .into_inner();
+        assert_eq!(response.succeeded, 1);
+        assert_eq!(response.rejected, 0);
+
+        assert_eq!(
+            state.store.get_embedding_metadata().unwrap(),
+            Some(("daemon-loaded-model".to_string(), 3)),
+            "a productive daemon embed must stamp the model it loaded at the produced dimension"
+        );
+    }
+
+    /// A daemon embed with no eligible work produces nothing, so it must not
+    /// invent or overwrite metadata — the daemon-route analogue of the CLI's
+    /// Reproduction A. The recorded fingerprint names a different model than
+    /// the loaded one; a zero-work run must leave it untouched.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_handler_without_eligible_work_leaves_metadata_untouched() {
+        let state = test_state_with_writer();
+        insert_unembedded_symbol(&state.store, "sym-noop");
+        assert!(state.store.add_embedding_with_force(
+            "sym-noop",
+            vec![0.1, 0.2, 0.3],
+            "recorded-model",
+            false,
+        ));
+        state
+            .store
+            .set_embedding_metadata("recorded-model", 3)
+            .unwrap();
+        let model = Arc::new(CountingEmbed {
+            calls: Arc::new(AtomicU32::new(0)),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let mut ready = state.embedding_runtime.status();
+        ready.state = "ready".to_string();
+        ready.selected_device = "cpu".to_string();
+        ready.model_id = "other-loaded-model".to_string();
+        state.embedding_runtime.publish_ready(ready, model);
+
+        let mut request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 8,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let response = DaemonService::new(state.clone())
+            .embed(request)
+            .await
+            .expect("a no-op embed is not an error")
+            .into_inner();
+        assert_eq!(response.succeeded, 0, "nothing was eligible to embed");
+        assert_eq!(response.skipped, 1);
+
+        assert_eq!(
+            state.store.get_embedding_metadata().unwrap(),
+            Some(("recorded-model".to_string(), 3)),
+            "a daemon embed that produced nothing must not overwrite the recorded fingerprint"
+        );
+    }
+
     #[tokio::test]
     async fn typed_brain_search_enforces_request_repo_visibility_and_preserves_counts() {
         use nestweaver_engine::authz::{Identity, StaticConfigPermissionSource};
