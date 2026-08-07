@@ -3158,6 +3158,54 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Delete all resolved (semantic) edges originating from symbols in a
+    /// repo. Used when full (unfiltered) resolution runs: every resolved
+    /// edge is about to be re-created, so the stale set must be cleared
+    /// repo-wide or the edges accumulate as duplicates.
+    ///
+    /// Edge types deleted: CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM,
+    /// INCLUDES_SYM, USES, ACCESSES, MEMBER_OF — deliberately the same list
+    /// as [`Self::delete_resolved_edges_for_file`], so "resolved edge" has
+    /// one definition across both helpers. CROSS_REPO_LINK is NOT included:
+    /// it is outside the per-file clear's list today, and the duplication
+    /// vector this helper guards (an empty resolution-deps sidecar forcing
+    /// an unfiltered re-resolution) routes through `bulk_reindex_write`,
+    /// whose DETACH DELETE of the repo's symbols already removes every
+    /// incident edge including CROSS_REPO_LINK before
+    /// `infer_cross_repo_call_edges` re-creates them. The re-CREATE-on-every
+    /// -run semantics of cross-repo inference on other paths are unchanged
+    /// here and are covered by the merge/uniqueness defense, not this
+    /// clear.
+    pub fn delete_resolved_edges_for_repo(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+
+        // Same one-DELETE-per-rel-type pattern as the per-file variant;
+        // the WHERE clause is scoped to the repo instead of a single file.
+        for rel in &[
+            "CALLS",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+            "USES",
+            "ACCESSES",
+            "MEMBER_OF",
+        ] {
+            let query = format!(
+                "MATCH (s:Symbol)-[r:{rel}]->() \
+                 WHERE s.repo_uid = $repo \
+                 DELETE r"
+            );
+            exec_params(
+                &conn,
+                &query,
+                vec![("repo", lbug::Value::String(repo_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("delete {rel} edges for repo: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Delete a File node by its UID using `DETACH DELETE`, which removes all
     /// incident edges (REPO_HAS_FILE, FILE_HAS_SYMBOL) automatically.
     pub fn delete_file_node(&self, file_uid: &str) -> Result<(), StoreError> {
