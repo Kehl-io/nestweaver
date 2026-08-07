@@ -828,21 +828,16 @@ fn finalize_committed_index_with_io(
     refresh_pagerank: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let scope = refresh_pagerank.then(nestweaver_store::GraphScope::code_only);
-    finalize_committed_index_for_scope_with_io(
-        lease,
-        db_path,
-        operation,
-        io,
-        scope.as_ref(),
-        true,
-    )
+    finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref(), true)
 }
 
 /// `publish_clean`: when false (a run that committed AFTER cancellation was
-/// requested), only the invalidation preamble runs — the generation advance,
-/// `.index-dirty` retirement, and the scoped PageRank refresh are skipped so
-/// the publication stays dirty and the next open reconciles it instead of
-/// trusting generation/PageRank state that predates this commit.
+/// requested), the file-backed generation advance, `.index-dirty` retirement,
+/// and the scoped PageRank refresh are skipped so the publication stays dirty
+/// and the next open reconciles it instead of trusting generation/PageRank
+/// state that predates this commit. In-memory stores are the exception: they
+/// have no `.index-dirty` marker to reconcile on a later open, so their
+/// generation bump still runs (see below).
 pub(crate) fn finalize_committed_index_for_scope_with_io(
     lease: nestweaver_store::IndexPublicationLease<'_>,
     db_path: Option<&Path>,
@@ -930,6 +925,20 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
             } else {
                 publication_clean = true;
             }
+        }
+    } else if db_path.is_none() {
+        // In-memory stores have no `.index-dirty` marker for a later open to
+        // reconcile, so a cancelled-but-committed run would otherwise be
+        // invisible to generation-keyed snapshot readers. Bump the in-memory
+        // generation even though the file-backed clean-publish steps above
+        // stay skipped.
+        if let Err(error) = store.try_bump_graph_generation() {
+            push_reconciliation_failure(
+                &mut failures,
+                DeletionReconciliationStage::GenerationPersistence,
+                None,
+                format!("advance graph generation: {error:#}"),
+            );
         }
     }
 
@@ -2971,13 +2980,15 @@ where
     // finalizer (pagerank invalidation, failure aggregation, lease release)
     // is unchanged.
     let finalization = if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
-        let scope = bump_generation_after_write.then(nestweaver_store::GraphScope::code_only);
         finalize_committed_index_for_scope_with_io(
             publication,
             store.db_path(),
             "index graph write (committed after cancellation)",
             epilogue_io,
-            scope.as_ref(),
+            // The scoped PageRank refresh is gated on `publication_clean`,
+            // which stays false for a cancelled commit — pass `None` so the
+            // skip is explicit rather than implied by a dead scope.
+            None,
             false,
         )
     } else {
@@ -7317,8 +7328,7 @@ function hello(name) { return "Hello " + name; }
     impl IndexEpilogueIo for CancelOnMarkerIo {
         fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
             FileSystemIndexEpilogueIo.establish_marker(path)?;
-            self.cancel
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
 
