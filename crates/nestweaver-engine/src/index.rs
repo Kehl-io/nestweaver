@@ -91,6 +91,10 @@ pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 /// unversioned flat map) fails deserialization and loads as empty — a
 /// deliberate fail-open that costs one full re-index and can never
 /// mis-classify a file.
+///
+/// Paired with `resolution_cache::CACHE_VERSION`: bumping one requires
+/// bumping the other (both sidecars must be invalidated together), enforced
+/// by `resolution_cache::tests::cache_version_moves_with_filemeta_version`.
 pub const FILEMETA_VERSION: u32 = 2;
 
 /// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
@@ -1799,7 +1803,24 @@ where
     if let Some(out) = reidentified_old_uid_out {
         *out = reidentify_old_uid.clone();
     }
-    let filemeta_cache = if reidentify_old_uid.is_some() {
+    // An empty resolution-deps slice for this repo (missing/corrupt/stale
+    // sidecar — the loader fails open to empty) is unsafe to combine with a
+    // valid filemeta cache: unchanged files would stay classified Unchanged
+    // while full resolution runs with no stale-edge clear and no bulk
+    // delete, re-creating (duplicating) every resolved edge. Bypass the
+    // cache so every file classifies Parsed, `force_reindex` falls out
+    // below (`files_unchanged == 0`), and the atomic `bulk_reindex_write`
+    // replaces the repo's graph instead of accumulating edges on top of it.
+    let deps_empty_for_repo = resolution_deps
+        .as_ref()
+        .is_some_and(|rd| rd.is_empty_for_repo(&r_uid));
+    if deps_empty_for_repo && reidentify_old_uid.is_none() && filemeta_cache.is_some() {
+        tracing::warn!(
+            repo_uid = %r_uid,
+            "resolution deps empty for repo; bypassing filemeta cache to force a full replacement"
+        );
+    }
+    let filemeta_cache = if reidentify_old_uid.is_some() || deps_empty_for_repo {
         None
     } else {
         filemeta_cache
@@ -2680,12 +2701,18 @@ where
             .filter(|e| !e.target_uid.starts_with("unresolved:"))
             .collect();
 
-        // When doing incremental resolution, delete old resolved edges for
-        // affected files before inserting the new ones.
+        // Delete old resolved edges before inserting the new ones, or every
+        // re-resolution accumulates duplicates. Incremental resolution clears
+        // per affected file; a full (unfiltered) run re-creates every
+        // resolved edge in the repo, so it must clear them repo-wide. When
+        // `skip_resolution` holds, nothing is re-created and nothing is
+        // cleared.
         if let Some(ref filter) = resolve_filter {
             for file_path in filter {
                 let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
             }
+        } else if !skip_resolution {
+            let _ = store.delete_resolved_edges_for_repo(&r_uid);
         }
 
         let mut edges_count = insertable_edges.len();
@@ -2748,8 +2775,44 @@ where
                         .insert(tgt_file.clone());
                 }
             }
-            for (file, deps) in file_deps {
-                rd.set_deps_for_repo(&r_uid, file, deps);
+            // Record the dep set for every file this run actually resolved —
+            // including files that resolve to ZERO outbound edges, recorded as
+            // an empty set. Without those entries a repo whose files have no
+            // cross-file edges would look identical to a missing/corrupt
+            // sidecar (`is_empty_for_repo`), and the empty-deps cache bypass
+            // above would force a full replacement on every index. On an
+            // incremental run only the affected files were re-resolved, so
+            // only their entries are refreshed (files in the resolve filter
+            // that were not actually fed to the resolver keep their previous
+            // records); other files' records carry over. Nothing is recorded
+            // when resolution was skipped: the previous records are still
+            // accurate.
+            if !skip_resolution {
+                match &resolve_filter {
+                    Some(filter) => {
+                        // Only files actually fed to the resolver may have
+                        // their records refreshed: a filter member that was
+                        // NOT re-resolved (e.g. an unchanged dependent on a
+                        // cold parsed cache) must keep its previous record
+                        // rather than be clobbered with an empty set.
+                        let resolved: std::collections::HashSet<_> = parsed_files_for_resolver
+                            .iter()
+                            .map(|(p, _, _, _)| p)
+                            .collect();
+                        for file in filter {
+                            if resolved.contains(file) {
+                                let deps = file_deps.remove(file).unwrap_or_default();
+                                rd.set_deps_for_repo(&r_uid, file.clone(), deps);
+                            }
+                        }
+                    }
+                    None => {
+                        for (path, _, _, _) in &parsed_files_for_resolver {
+                            let deps = file_deps.remove(path).unwrap_or_default();
+                            rd.set_deps_for_repo(&r_uid, path.clone(), deps);
+                        }
+                    }
+                }
             }
         }
 

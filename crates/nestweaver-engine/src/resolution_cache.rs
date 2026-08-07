@@ -6,9 +6,21 @@ use serde::{Deserialize, Serialize};
 
 /// Sidecar format version. v2 = per-repo keying (nw-045). v1 (a flat,
 /// bare-rel-path `deps` map shared across all repos) fails deserialization
-/// and/or the version check and loads as empty — a deliberate fail-open that
-/// costs one full re-resolution and can never resurrect a stale cross-repo
-/// edge decision. Mirrors `index::FILEMETA_VERSION`.
+/// and/or the version check and loads as empty — a deliberate fail-open.
+///
+/// Hazard: fail-open does NOT merely cost one full re-resolution. With a
+/// valid filemeta sidecar, unchanged files stay classified Unchanged
+/// (`files_unchanged > 0`), so an empty deps map would run full resolution
+/// with no stale-edge clear and no bulk delete — re-creating (duplicating)
+/// every resolved edge. Mitigation: the indexer treats an empty deps slice
+/// for the repo as a filemeta-cache-bypass trigger, so every file
+/// classifies Parsed and the atomic `bulk_reindex_write` performs a full
+/// replacement. Only with that pairing does "never resurrects a stale
+/// cross-repo edge decision" hold.
+///
+/// Paired with `index::FILEMETA_VERSION`: bumping one requires bumping the
+/// other (both sidecars must be invalidated together), enforced by
+/// `tests::cache_version_moves_with_filemeta_version`.
 const CACHE_VERSION: u32 = 2;
 
 /// Maximum number of transitive reverse-dependency hops expanded when deciding
@@ -39,8 +51,12 @@ pub struct ResolutionDeps {
 impl ResolutionDeps {
     /// Load resolution deps from a MessagePack file. Missing, corrupt, or
     /// old-format (flat, pre-nw-045) files yield empty deps — a deliberate
-    /// fail-open that costs one full re-resolution and never resurrects a
-    /// stale cross-repo edge decision.
+    /// fail-open. Empty deps are hazardous when the filemeta sidecar is
+    /// still valid (`files_unchanged > 0`): full resolution would run with
+    /// no stale-edge clear and no bulk delete, duplicating every resolved
+    /// edge. The indexer closes that path by treating an empty deps slice
+    /// as a cache-bypass trigger that forces a full replacement, so the
+    /// fail-open can never resurrect a stale cross-repo edge decision.
     pub fn load(path: &Path) -> Self {
         let repos = match std::fs::read(path) {
             Ok(data) => match rmp_serde::from_slice::<ResolutionCacheFile>(&data) {
@@ -147,6 +163,19 @@ mod tests {
     use super::*;
 
     const R: &str = "repo:x";
+
+    #[test]
+    fn cache_version_moves_with_filemeta_version() {
+        // The resolution-deps sidecar and the filemeta sidecar are versioned
+        // together: a stale-resolution-deps fail-open is only safe because an
+        // empty deps slice forces the same full replacement a filemeta
+        // version bump triggers. Keep the two constants in lockstep.
+        assert_eq!(
+            CACHE_VERSION,
+            crate::index::FILEMETA_VERSION,
+            "bumping FILEMETA_VERSION requires bumping CACHE_VERSION (and vice versa)"
+        );
+    }
 
     #[test]
     fn affected_files_includes_changed_and_dependents() {
