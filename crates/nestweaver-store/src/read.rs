@@ -2625,6 +2625,50 @@ impl GraphStore {
         }
         Ok(Some((model_id, dimension)))
     }
+
+    /// Repos whose last contract derivation failed, sorted by UID.
+    ///
+    /// `repo_uid` scopes the answer to a single repo (the drift analysis is
+    /// optionally repo-filtered); `None` reports every degraded repo in the DB.
+    ///
+    /// Reads the markers written by
+    /// [`GraphStore::set_contract_derivation_failed`]. Absent markers — and an
+    /// old DB with no `Meta` table — mean "nothing known to be degraded", which
+    /// is the pre-existing behaviour, not a claim of health.
+    pub fn contract_derivation_failures(
+        &self,
+        repo_uid: Option<&str>,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        // The Meta table holds a handful of singleton rows, so scanning it and
+        // filtering the prefix in Rust avoids depending on a string-predicate
+        // dialect for a set this small.
+        let mut stmt = match conn.prepare("MATCH (m:Meta) RETURN m.key") {
+            Ok(s) => s,
+            // Meta table doesn't exist on older databases — treat as absent.
+            Err(_) => return Ok(Vec::new()),
+        };
+        let result = match conn.execute(&mut stmt, vec![]) {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let prefix = crate::write::CONTRACT_DERIVATION_FAILED_PREFIX;
+        let mut out: Vec<String> = Vec::new();
+        for row in result {
+            let Ok(key) = extract_string(&row, 0) else {
+                continue;
+            };
+            let Some(uid) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            if repo_uid.is_some_and(|want| want != uid) {
+                continue;
+            }
+            out.push(uid.to_string());
+        }
+        out.sort();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,12 @@ struct HandlerFileData {
 }
 
 /// Result returned by the indexing functions.
+///
+/// Not `Serialize`: no surface emits an `IndexResult` as JSON — the CLI and the
+/// daemon both destructure it into their own progress/report types — so a serde
+/// derive here would be published API surface nobody consumes. `Debug` is
+/// derived because the contract-status fields are asserted on in tests.
+#[derive(Debug, Clone)]
 pub struct IndexResult {
     pub symbols_count: usize,
     pub edges_count: usize,
@@ -48,6 +54,16 @@ pub struct IndexResult {
     /// Symbols removed by replacement/deletion transactions during this run.
     pub symbols_deleted: usize,
     pub skipped_files: Vec<SkippedFile>,
+    /// Contract nodes written by the contract phase. `0` on a repo with no
+    /// specs and no route handlers — and also `0` when derivation failed, which
+    /// is exactly why `contracts_status` exists alongside it.
+    pub contracts_derived: usize,
+    /// Whether the contract phase ran to completion. Reuses the blast-radius
+    /// trust vocabulary: [`AnalysisStatus::Complete`] or
+    /// [`AnalysisStatus::Degraded`]. Contract derivation is best-effort and
+    /// never fails the index, so this is the ONLY signal a caller has that the
+    /// repo's contract graph is missing rather than empty.
+    pub contracts_status: crate::blast_radius::AnalysisStatus,
 }
 
 // ── Tiered change detection ───────────────────────────────────────────────
@@ -2755,7 +2771,16 @@ where
         // Best-effort: a malformed spec or unexpected store error here must not
         // fail the whole index. Contracts are hypotheses layered on top of the
         // code graph.
-        if let Err(e) = derive_contracts(
+        //
+        // Non-fatal is not the same as invisible: the failure is RECORDED here,
+        // both on the returned `IndexResult` and as a durable per-repo marker,
+        // because drift is recomputed at query time and a repo with no
+        // contracts is otherwise indistinguishable from a repo whose contracts
+        // could not be derived. A successful run clears the marker so a repo
+        // heals on the next clean index.
+        let mut contracts_derived = 0usize;
+        let mut contracts_status = crate::blast_radius::AnalysisStatus::Complete;
+        match derive_contracts(
             store,
             reader,
             &r_uid,
@@ -2763,7 +2788,23 @@ where
             &handler_files,
             &all_symbols,
         ) {
-            tracing::warn!("contract derivation failed (non-fatal): {e}");
+            Ok(count) => {
+                contracts_derived = count;
+                if let Err(e) = store.clear_contract_derivation_failed(&r_uid) {
+                    tracing::warn!("clearing contract derivation marker failed: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("contract derivation failed (non-fatal): {e}");
+                contracts_status = crate::blast_radius::AnalysisStatus::Degraded;
+                // Best-effort: if even the marker cannot be written the run is
+                // still degraded, it just cannot say so at query time.
+                if let Err(marker_err) =
+                    store.set_contract_derivation_failed(&r_uid, &e.to_string())
+                {
+                    tracing::warn!("recording contract derivation failure failed: {marker_err}");
+                }
+            }
         }
         tracing::info!(
             spec_files = spec_files.len(),
@@ -2821,6 +2862,8 @@ where
             files_deleted,
             symbols_deleted,
             skipped_files,
+            contracts_derived,
+            contracts_status,
         };
 
         Ok(result)
@@ -3020,6 +3063,9 @@ impl ContractSet {
 ///    otherwise mint a **code-derived** contract and link to that.
 /// 3. Emit `IMPLEMENTS_CONTRACT` edges (handler Symbol → Contract) carrying the
 ///    match confidence (1.0 exact verb+path, 0.8 base-path-inferred).
+///
+/// Returns the number of Contract nodes written, so the caller can report
+/// "derived N" rather than only "did not blow up".
 fn derive_contracts(
     store: &GraphStore,
     reader: &dyn crate::content_reader::ContentReader,
@@ -3027,7 +3073,7 @@ fn derive_contracts(
     spec_files: &[PathBuf],
     handler_files: &[HandlerFileData],
     all_symbols: &[nestweaver_schema::Symbol],
-) -> Result<(), anyhow::Error> {
+) -> Result<usize, anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
 
     // 1. Declared contracts from specs.
@@ -3185,7 +3231,7 @@ fn derive_contracts(
         GraphStore::batch_insert_edges_on(&conn, &edges)?;
     }
     store.commit_transaction(&conn)?;
-    Ok(())
+    Ok(all_contracts.len())
 }
 
 /// Returns true if the file looks like a minified bundle, webpack output,
@@ -5431,6 +5477,196 @@ function hello(name) { return "Hello " + name; }
             !implemented.contains(&"contract:grpc:demo.v1.Greeter/NeverBuilt".to_string()),
             "an unimplemented RPC must remain drift; implemented: {implemented:?}"
         );
+    }
+
+    // ── Contract derivation status (degraded vs genuinely empty) ──────────
+
+    /// Index `src` into `store` a second time, reusing the private full-index
+    /// entry point so the contract phase — and its swallow — actually runs.
+    /// `index_directory_in_memory` always mints a fresh store, which is no use
+    /// when the point is to re-index a store that has been poisoned.
+    fn reindex_into(store: &GraphStore, src: &Path, sha: &str) -> IndexResult {
+        let reader = crate::content_reader::FilesystemReader::new(src);
+        let local_root = src.display().to_string();
+        index_into_store(
+            &reader,
+            store,
+            "test",
+            "https://example.com/repo",
+            sha,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .expect("indexing must succeed even when contract derivation does not")
+    }
+
+    /// Write a repo whose only content is an OpenAPI spec declaring
+    /// `GET /v1/shared`, plus a handler that implements it.
+    fn write_shared_route_repo(src: &Path) {
+        fs::create_dir_all(src).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\n\
+             info: { title: t, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/shared:\n    \
+             get:\n      \
+             operationId: getShared\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("SharedController.java"),
+            "@RestController\n\
+             @RequestMapping(\"/v1/shared\")\n\
+             public class SharedController {\n  \
+             @GetMapping\n  \
+             public void get() {}\n\
+             }\n",
+        )
+        .unwrap();
+    }
+
+    /// A repo whose contract derivation FAILED must not be reported as clean.
+    ///
+    /// Assertions are on the reported STATUS and on graph contents, never on
+    /// the `Result` of the index call: derivation errors are swallowed, so
+    /// `index_*` returns `Ok` with or without this fix and a `Result`
+    /// assertion would prove nothing.
+    ///
+    /// The failure induced here is the observed one: `contract_uid` mints a UID
+    /// with no repo component, so a route another repo already declared
+    /// collides on `Contract`'s primary key and the bulk COPY rejects the row —
+    /// discarding every contract and every IMPLEMENTS_CONTRACT edge for this
+    /// repo while the index still reports success.
+    #[test]
+    fn degraded_contract_derivation_is_not_reported_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        write_shared_route_repo(&src);
+
+        let (first, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert_eq!(
+            first.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete,
+            "a healthy first index must report a complete contract phase"
+        );
+        assert!(
+            first.contracts_derived > 0,
+            "the spec declares a route, so contracts must have been derived"
+        );
+
+        let repo_uid = store
+            .list_contracts(None)
+            .unwrap()
+            .first()
+            .expect("first index derives at least one contract")
+            .repo_uid
+            .clone();
+
+        // Poison: hand this repo's UID to a DIFFERENT repo, so the next
+        // derivation's COPY hits a duplicate primary key it cannot clear.
+        store.clear_repo_contracts(&repo_uid).unwrap();
+        store
+            .batch_insert_contracts(&[nestweaver_schema::Contract {
+                uid: "contract:http:GET:/v1/shared".to_string(),
+                kind: "http".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/v1/shared".to_string()),
+                operation_id: None,
+                repo_uid: "repo:other".to_string(),
+                source_path: "openapi.yaml".to_string(),
+                confidence: 1.0,
+            }])
+            .unwrap();
+
+        let second = reindex_into(&store, &src, "def456");
+
+        // 1. The index result says so.
+        assert_eq!(
+            second.contracts_status,
+            crate::blast_radius::AnalysisStatus::Degraded,
+            "a failed contract phase must be reported as degraded"
+        );
+        assert_eq!(
+            second.contracts_derived, 0,
+            "a failed derivation writes no contracts"
+        );
+
+        // 2. The query-time drift analysis says so. This assertion is the one
+        //    that catches the original bug: `is_clean()` predates this fix and
+        //    returned `true` for exactly this repo.
+        let report = crate::contracts::drift_for_store(&store, Some(&repo_uid)).unwrap();
+        assert!(
+            !report.is_clean(),
+            "a degraded repo must not report clean; report: {report:?}"
+        );
+        assert_eq!(
+            report.contracts_status,
+            crate::blast_radius::AnalysisStatus::Degraded
+        );
+        assert_eq!(report.degraded_repos, vec![repo_uid.clone()]);
+
+        // 3. The envelope both front-ends serialize says so.
+        let envelope = crate::contracts::drift_envelope(report, 50);
+        assert_eq!(envelope["clean"], serde_json::json!(false));
+        assert_eq!(envelope["contracts_status"], serde_json::json!("degraded"));
+
+        // A clean re-index heals the repo: the marker is cleared, not sticky.
+        store.clear_repo_contracts("repo:other").unwrap();
+        let third = reindex_into(&store, &src, "ghi789");
+        assert_eq!(
+            third.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete,
+            "a successful re-index must clear the degraded marker"
+        );
+        assert!(
+            crate::contracts::drift_for_store(&store, Some(&repo_uid))
+                .unwrap()
+                .degraded_repos
+                .is_empty(),
+            "the failure marker must not survive a successful derivation"
+        );
+    }
+
+    /// The counterpart the fix must NOT break: a repo that genuinely declares
+    /// and implements no contracts is still clean. Reporting "not clean"
+    /// everywhere would make the new signal worthless — the whole point is that
+    /// empty and broken are now distinguishable.
+    #[test]
+    fn repo_with_no_contracts_is_still_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("util.rs"), "pub fn add(a: i32) -> i32 { a + 1 }\n").unwrap();
+
+        let (result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert_eq!(
+            result.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete
+        );
+        assert_eq!(result.contracts_derived, 0, "no specs, no handlers");
+        assert!(
+            store.list_contracts(None).unwrap().is_empty(),
+            "sanity: the repo really has no contracts"
+        );
+
+        let report = crate::contracts::drift_for_store(&store, None).unwrap();
+        assert!(
+            report.is_clean(),
+            "an empty-but-healthy repo must still be clean; report: {report:?}"
+        );
+        assert!(report.degraded_repos.is_empty());
+
+        let envelope = crate::contracts::drift_envelope(report, 50);
+        assert_eq!(envelope["clean"], serde_json::json!(true));
+        assert_eq!(envelope["contracts_status"], serde_json::json!("complete"));
     }
 
     // ── Contract UID deduplication (duplicate-PK on the bulk COPY) ────────

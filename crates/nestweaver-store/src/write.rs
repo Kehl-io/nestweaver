@@ -32,6 +32,16 @@ use crate::error::StoreError;
 /// this module must use it.
 const COPY_CSV_OPTS: &str = "(PARALLEL=FALSE, DELIM=',', QUOTE='\"', ESCAPE='\"', HEADER=false)";
 
+/// `Meta.key` prefix for the per-repo contract-derivation failure marker.
+///
+/// The full key is `<prefix><repo_uid>`. Contract derivation is best-effort at
+/// index time, but drift is recomputed at QUERY time from stored `Contract`
+/// rows — and an empty contract set looks identical whether the repo declares
+/// no routes or its derivation blew up. This marker is the only thing that
+/// carries that distinction across the two, so it is written by the indexer and
+/// read by [`GraphStore::contract_derivation_failures`].
+pub const CONTRACT_DERIVATION_FAILED_PREFIX: &str = "contract_derivation_failed:";
+
 /// What a classified destructive store mutation can prove about durable state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationDisposition {
@@ -6377,6 +6387,64 @@ impl GraphStore {
                 ("v", lbug::Value::String(value)),
             ],
         )
+    }
+
+    /// Record that contract derivation failed for `repo_uid`.
+    ///
+    /// Contract derivation is best-effort: a malformed spec or a rejected bulk
+    /// insert leaves the repo with its PREVIOUS contracts (or none at all)
+    /// while indexing still succeeds. Nothing in the resulting graph
+    /// distinguishes "this repo declares no contracts" from "this repo's
+    /// contracts could not be derived", so the failure is persisted here as a
+    /// `Meta` marker keyed
+    /// [`CONTRACT_DERIVATION_FAILED_PREFIX`]`<repo_uid>` and read back at query
+    /// time by the drift analysis.
+    ///
+    /// `reason` is stored for operators reading the DB directly; the query-time
+    /// surfaces report only WHICH repos are degraded, never the error text.
+    pub fn set_contract_derivation_failed(
+        &self,
+        repo_uid: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let key = format!("{CONTRACT_DERIVATION_FAILED_PREFIX}{repo_uid}");
+
+        // Delete-then-create upsert (lbug has no MERGE/SET), matching
+        // `set_embedding_metadata`. Best-effort delete: an old DB may have no
+        // Meta table at all.
+        let _ = exec_params(
+            &conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![("k", lbug::Value::String(key.clone()))],
+        );
+
+        exec_params(
+            &conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                ("k", lbug::Value::String(key)),
+                ("v", lbug::Value::String(reason.to_string())),
+            ],
+        )
+    }
+
+    /// Clear the contract-derivation failure marker for `repo_uid`.
+    ///
+    /// Called on every successful derivation so a repo heals as soon as it is
+    /// re-indexed cleanly. Best-effort by design — a DB with no `Meta` table
+    /// has no marker to clear.
+    pub fn clear_contract_derivation_failed(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let _ = exec_params(
+            &conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![(
+                "k",
+                lbug::Value::String(format!("{CONTRACT_DERIVATION_FAILED_PREFIX}{repo_uid}")),
+            )],
+        );
+        Ok(())
     }
 }
 
