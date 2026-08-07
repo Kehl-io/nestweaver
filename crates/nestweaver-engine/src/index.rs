@@ -2782,15 +2782,28 @@ where
             // sidecar (`is_empty_for_repo`), and the empty-deps cache bypass
             // above would force a full replacement on every index. On an
             // incremental run only the affected files were re-resolved, so
-            // only their entries are refreshed; other files' records carry
-            // over. Nothing is recorded when resolution was skipped: the
-            // previous records are still accurate.
+            // only their entries are refreshed (files in the resolve filter
+            // that were not actually fed to the resolver keep their previous
+            // records); other files' records carry over. Nothing is recorded
+            // when resolution was skipped: the previous records are still
+            // accurate.
             if !skip_resolution {
                 match &resolve_filter {
                     Some(filter) => {
+                        // Only files actually fed to the resolver may have
+                        // their records refreshed: a filter member that was
+                        // NOT re-resolved (e.g. an unchanged dependent on a
+                        // cold parsed cache) must keep its previous record
+                        // rather than be clobbered with an empty set.
+                        let resolved: std::collections::HashSet<_> = parsed_files_for_resolver
+                            .iter()
+                            .map(|(p, _, _, _)| p)
+                            .collect();
                         for file in filter {
-                            let deps = file_deps.remove(file).unwrap_or_default();
-                            rd.set_deps_for_repo(&r_uid, file.clone(), deps);
+                            if resolved.contains(file) {
+                                let deps = file_deps.remove(file).unwrap_or_default();
+                                rd.set_deps_for_repo(&r_uid, file.clone(), deps);
+                            }
                         }
                     }
                     None => {
