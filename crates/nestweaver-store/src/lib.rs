@@ -39,11 +39,12 @@ pub use traverse::{
     ImpactSnapshot,
 };
 pub use write::{
-    DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteRepoCascadeOutcome,
-    DeleteVaultCascadeOutcome, DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery,
-    InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan, InstanceUidRemap,
-    InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult, MutationDisposition,
-    MutationFailure, MutationOutcome, ProjectMutationDisposition, PurgeInstanceResult,
+    CONTRACT_DERIVATION_FAILED_PREFIX, DeleteProjectCascadeError, DeleteProjectCascadeOutcome,
+    DeleteRepoCascadeOutcome, DeleteVaultCascadeOutcome, DiscardedVault, InstanceProjectRecovery,
+    InstanceRepoRecovery, InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan,
+    InstanceUidRemap, InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult,
+    MutationDisposition, MutationFailure, MutationOutcome, ProjectMutationDisposition,
+    PurgeInstanceResult,
 };
 
 #[cfg(test)]

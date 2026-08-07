@@ -16852,9 +16852,31 @@ fn render_contract_drift_human(value: &serde_json::Value) {
     let ind = value
         .get("implemented_not_declared")
         .and_then(|v| v.as_array());
+    // Trust signal first: a repo whose contract derivation failed has zero
+    // findings for the wrong reason, and "No contract drift detected." on that
+    // repo is a false clean bill of health.
+    let degraded: Vec<&str> = value
+        .get("degraded_repos")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if !degraded.is_empty() {
+        println!(
+            "Contract derivation FAILED for {} repo(s): {}",
+            degraded.len(),
+            degraded.join(", ")
+        );
+        println!(
+            "Drift results below are STALE (last successful derivation) — re-index to refresh them.\n"
+        );
+    }
     let empty = |a: Option<&Vec<serde_json::Value>>| a.map(|v| v.is_empty()).unwrap_or(true);
     if empty(dni) && empty(ind) {
-        println!("No contract drift detected.");
+        if degraded.is_empty() {
+            println!("No contract drift detected.");
+        } else {
+            println!("No contract drift reported, but the analysis is degraded (see above).");
+        }
         return;
     }
     println!("Contract drift (hypotheses, not ground truth):\n");
@@ -16961,32 +16983,27 @@ fn run_contracts(
             let report = nestweaver_engine::contracts::drift_for_store(&store, repo_uid.as_deref())
                 .map_err(|e| anyhow::anyhow!(e))?;
 
+            // nw-097 family: this path used to print a BARE `DriftReport` while
+            // the daemon path printed the MCP envelope — different keys, no
+            // totals, no `clean`, and no limit truncation at all, so the JSON
+            // shape depended on whether a daemon happened to be running. Build
+            // the same envelope from the same builder and render it with the
+            // same renderer.
+            let cfg = load_instance_config_opt(None);
+            let limit = resolve_limit(
+                None,
+                cfg.as_ref(),
+                nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
+            );
+            let mut value = nestweaver_engine::contracts::drift_envelope(report, limit);
+            // nw-117: `_meta` is added by the federation layer, which only runs
+            // on the daemon path. This result is genuinely local scope and can
+            // say so, keeping ONE shape in both modes.
+            attach_local_meta(&mut value);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else if report.is_clean() {
-                println!("No contract drift detected.");
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                println!("Contract drift (hypotheses, not ground truth):\n");
-                if !report.declared_not_implemented.is_empty() {
-                    println!(
-                        "Declared but NOT implemented ({}):",
-                        report.declared_not_implemented.len()
-                    );
-                    for f in &report.declared_not_implemented {
-                        println!("  - {}", f.uid);
-                    }
-                    println!();
-                }
-                if !report.implemented_not_declared.is_empty() {
-                    println!(
-                        "Implemented but NOT declared in any spec ({}):",
-                        report.implemented_not_declared.len()
-                    );
-                    for f in &report.implemented_not_declared {
-                        println!("  - {}", f.uid);
-                    }
-                    println!();
-                }
+                render_contract_drift_human(&value);
             }
             Ok((EXIT_SUCCESS, None))
         }

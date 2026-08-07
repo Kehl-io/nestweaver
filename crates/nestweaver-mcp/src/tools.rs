@@ -4116,6 +4116,44 @@ mod brain_search_total_contract_tests {
         }
     }
 
+    /// Both contract surfaces must report a repo whose derivation failed as
+    /// degraded. `contract_drift`'s `clean` field is the one that actively lied:
+    /// a degraded repo has zero declared and zero implemented contracts, so the
+    /// old `dni_total == 0 && ind_total == 0` asserted `clean: true` about a
+    /// repo with no contract graph at all.
+    #[test]
+    fn degraded_repo_is_not_reported_clean_by_either_contract_tool() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .set_contract_derivation_failed("repo:broken", "COPY Contract: duplicate primary key")
+            .unwrap();
+
+        let drift = tool_contract_drift(&store, json!({})).unwrap();
+        assert_eq!(drift["clean"], json!(false), "drift envelope: {drift}");
+        assert_eq!(drift["contracts_status"], json!("degraded"));
+        assert_eq!(drift["degraded_repos"], json!(["repo:broken"]));
+
+        let cross = tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" })).unwrap();
+        assert_eq!(cross["contracts_status"], json!("degraded"), "{cross}");
+        assert_eq!(cross["degraded_repos"], json!(["repo:broken"]));
+    }
+
+    /// The distinction has to be a distinction: an empty graph with no
+    /// derivation failure is still clean and still complete.
+    #[test]
+    fn empty_graph_is_reported_clean_by_either_contract_tool() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let drift = tool_contract_drift(&store, json!({})).unwrap();
+        assert_eq!(drift["clean"], json!(true), "drift envelope: {drift}");
+        assert_eq!(drift["contracts_status"], json!("complete"));
+        assert_eq!(drift["degraded_repos"], json!([]));
+
+        let cross = tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" })).unwrap();
+        assert_eq!(cross["contracts_status"], json!("complete"), "{cross}");
+        assert_eq!(cross["degraded_repos"], json!([]));
+    }
+
     fn search_fixture() -> GraphStore {
         let store = GraphStore::in_memory().unwrap();
         for n in [
@@ -5710,7 +5748,7 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
+        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5777,12 +5815,30 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
     let total = rows.len();
     rows.truncate(limit);
 
+    // Trust signal: contract derivation is best-effort at index time, so a repo
+    // whose derivation failed contributes no `contract` rows at all. Without
+    // this, "this symbol implements no contract" and "this symbol's repo has no
+    // contract graph" look identical. The check is DB-wide rather than scoped
+    // to the symbol's repo: contract UIDs carry no repo component, so the rows
+    // above cannot be attributed to one repo, and a degraded repo anywhere can
+    // cost this symbol a link.
+    let degraded_repos = store
+        .contract_derivation_failures(None)
+        .map_err(|e| anyhow!("contract_derivation_failures: {e}"))?;
+    let contracts_status = if degraded_repos.is_empty() {
+        "complete"
+    } else {
+        "degraded"
+    };
+
     Ok(json!({
         "uid": uid,
         "total": total,
         "returned": rows.len(),
         "note": "Links are hypotheses, not ground truth — check confidence. \
                  link_type \"contract\" denotes an implemented API contract.",
+        "contracts_status": contracts_status,
+        "degraded_repos": degraded_repos,
         "contracts": rows,
     }))
 }
@@ -5792,7 +5848,7 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
 fn tool_schema_contract_drift() -> Value {
     json!({
         "name": "contract_drift",
-        "description": "Audit API contract drift: routes declared in specs (OpenAPI, .proto, GraphQL) but not implemented, and routes implemented but not declared in any spec.\n\nGuidelines:\n- Use to spot missing endpoints or undocumented APIs\n- Optional repo filter scopes to a single repository\n- Returns two buckets: declared_not_implemented and implemented_not_declared\n\nLimitations:\n- Contract links are hypotheses derived from spec parsing and handler heuristics (same-repo only)\n- Only supports OpenAPI/Swagger, .proto, and GraphQL spec formats\n\nIn server mode, the server has the full org-wide view of contract drift. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
+        "description": "Audit API contract drift: routes declared in specs (OpenAPI, .proto, GraphQL) but not implemented, and routes implemented but not declared in any spec.\n\nGuidelines:\n- Use to spot missing endpoints or undocumented APIs\n- Optional repo filter scopes to a single repository\n- Returns two buckets: declared_not_implemented and implemented_not_declared\n\nTrust contract (read before trusting a clean result):\n- contracts_status (complete/degraded) + degraded_repos: contract derivation is best-effort at index time and never fails the index. Failure is atomic, so a degraded repo's contracts and drift findings reflect its PREVIOUS successful derivation — stale, not wiped. `clean` is true only when the analysis ALSO ran to completion — a degraded repo reports clean: false with contracts_status \"degraded\"\n- Empty buckets on a complete run mean 'no drift'; empty buckets on a degraded run mean 'unknown', not 'safe'\n\nLimitations:\n- Contract links are hypotheses derived from spec parsing and handler heuristics (same-repo only)\n- Only supports OpenAPI/Swagger, .proto, and GraphQL spec formats\n\nIn server mode, the server has the full org-wide view of contract drift. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5816,27 +5872,10 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         .unwrap_or_else(configured_result_limit);
     let report = nestweaver_engine::contracts::drift_for_store(store, repo)
         .map_err(|e| anyhow!("drift_for_store: {e}"))?;
-    let dni_total = report.declared_not_implemented.len();
-    let ind_total = report.implemented_not_declared.len();
-    let dni: Vec<_> = report
-        .declared_not_implemented
-        .into_iter()
-        .take(limit)
-        .collect();
-    let ind: Vec<_> = report
-        .implemented_not_declared
-        .into_iter()
-        .take(limit)
-        .collect();
-    Ok(json!({
-        "note": "Contract links are hypotheses, not ground truth.",
-        "declared_not_implemented": dni,
-        "declared_not_implemented_total": dni_total,
-        "implemented_not_declared": ind,
-        "implemented_not_declared_total": ind_total,
-        "clean": dni_total == 0 && ind_total == 0,
-        "limit": limit,
-    }))
+    // Shared with the CLI's local path so the two serializations cannot drift
+    // apart again (they previously disagreed on totals, `clean`, `limit`, and
+    // whether truncation happened at all).
+    Ok(nestweaver_engine::contracts::drift_envelope(report, limit))
 }
 
 // ── 8. brain_impact ─────────────────────────────────────────────────────────
