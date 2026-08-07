@@ -91,6 +91,10 @@ pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 /// unversioned flat map) fails deserialization and loads as empty — a
 /// deliberate fail-open that costs one full re-index and can never
 /// mis-classify a file.
+///
+/// Paired with `resolution_cache::CACHE_VERSION`: bumping one requires
+/// bumping the other (both sidecars must be invalidated together), enforced
+/// by `resolution_cache::tests::cache_version_moves_with_filemeta_version`.
 pub const FILEMETA_VERSION: u32 = 2;
 
 /// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
