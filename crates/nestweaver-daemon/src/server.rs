@@ -3559,13 +3559,31 @@ impl NestWeaverDaemon for DaemonService {
                         }
                     }
 
-                    // DONE phase
-                    let _ = tx.blocking_send(Ok(IndexProgress {
-                        phase: Phase::Done as i32,
-                        message: format!(
+                    // DONE phase. When cancellation was requested (timeout or
+                    // client disconnect) but the run had already passed the
+                    // point where it could abort safely, say so plainly: the
+                    // index COMMITTED, and a plain `Done` would be a lie about
+                    // what the caller asked for. Name the repair.
+                    let message = if cancel_for_index.load(std::sync::atomic::Ordering::Acquire) {
+                        format!(
+                            "Done — {} files, {} symbols, {} edges. Cancellation was requested \
+                             but the index had already passed its last cancellation point and \
+                             COMMITTED anyway. To discard this run and re-index from scratch, \
+                             run: nestweaver index --repo {} --force",
+                            result.files_count,
+                            result.symbols_count,
+                            result.edges_count,
+                            repo_path.display()
+                        )
+                    } else {
+                        format!(
                             "Done — {} files, {} symbols, {} edges",
                             result.files_count, result.symbols_count, result.edges_count
-                        ),
+                        )
+                    };
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Done as i32,
+                        message,
                         files_processed: result.files_count as u64,
                         files_total: result.files_count as u64,
                         symbols_found: result.symbols_count as u64,
