@@ -5573,6 +5573,10 @@ impl NestWeaverDaemon for DaemonService {
                     )
                 }));
             };
+            // The model the daemon actually loaded (startup preference: the
+            // DB-recorded id wins, else the configured external/local model).
+            // Used to stamp embedding metadata after a productive run.
+            let embed_model_id = status.model_id.clone();
 
             let store = self.state.store.clone();
 
@@ -5582,6 +5586,10 @@ impl NestWeaverDaemon for DaemonService {
                 let mut rejected = 0u32;
                 let mut scoped = 0u64;
                 let mut eligible = 0u64;
+                // Dimension of the vectors THIS run produced, set on the first
+                // accepted write; gates the metadata stamp below (mirrors the
+                // CLI's `run_embed` tail).
+                let mut produced_dim: Option<usize> = None;
 
                 // Each embed run may legitimately force-switch the model once;
                 // re-arm the once-per-run clear guard on this long-lived index.
@@ -5606,8 +5614,12 @@ impl NestWeaverDaemon for DaemonService {
                             );
                             match model.embed_query(&text) {
                                 Ok(emb) => {
+                                    let emb_dim = emb.len();
                                     if store.add_embedding_with_force(&sym.uid, emb, force) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5637,8 +5649,12 @@ impl NestWeaverDaemon for DaemonService {
                                 nestweaver_embed::preprocess::note_embed_text(&note.title, None);
                             match model.embed_query(&text) {
                                 Ok(emb) => {
+                                    let emb_dim = emb.len();
                                     if store.add_embedding_with_force(&note.uid, emb, force) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5668,8 +5684,12 @@ impl NestWeaverDaemon for DaemonService {
                                 nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
                             match model.embed_query(&text) {
                                 Ok(emb) => {
+                                    let emb_dim = emb.len();
                                     if store.add_embedding_with_force(&heading.uid, emb, force) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5687,6 +5707,17 @@ impl NestWeaverDaemon for DaemonService {
                     && let Err(e) = store.flush_embedding_index()
                 {
                     tracing::warn!("failed to flush embedding index: {e}");
+                }
+
+                // Stamp the fingerprint only from vectors this run produced:
+                // a daemon embed that produced nothing must not invent (or
+                // overwrite) metadata. The daemon route previously never
+                // stamped at all, leaving daemon-populated databases without a
+                // fingerprint for the startup and CLI guards to check.
+                if let Some(dim) = produced_dim
+                    && let Err(e) = store.set_embedding_metadata(&embed_model_id, dim as u32)
+                {
+                    tracing::warn!("failed to record embedding model metadata: {e}");
                 }
 
                 tracing::info!(succeeded, failed, rejected, "embed RPC completed");

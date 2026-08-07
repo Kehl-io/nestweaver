@@ -78,6 +78,58 @@ fn external_embedding_model(model: Option<&str>) -> &str {
     model.unwrap_or(DEFAULT_EXTERNAL_EMBEDDING_MODEL)
 }
 
+/// Batch embedder for the direct `--local` embed path. Abstracted from
+/// `nestweaver_embed::EmbedModel` so tests can inject a stub emitting
+/// fixed-dimension vectors instead of loading real model artifacts (the
+/// artifact cache is process-global and hard to stage hermetically).
+/// Deliberately free of `nestweaver_embed` types so `run_embed` keeps one
+/// signature with and without the `embed` feature.
+trait CliBatchEmbedder {
+    // Only called from the `embed`-gated local branch of `run_embed`.
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
+}
+
+#[cfg(feature = "embed")]
+impl CliBatchEmbedder for nestweaver_embed::EmbedModel {
+    fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed(texts)
+    }
+}
+
+/// Production loader for the direct `--local` embed path, passed to
+/// `run_embed` as a parameter — the same loader-injection idiom as the
+/// daemon's `load_daemon_embedding_backend_with`.
+#[cfg(feature = "embed")]
+fn load_cli_local_embedder(
+    model_id: &str,
+    cache_dir: Option<&Path>,
+    accelerator: Option<CliEmbeddingAccelerator>,
+) -> anyhow::Result<Box<dyn CliBatchEmbedder>> {
+    let config = direct_local_embedding_config(model_id, cache_dir);
+    let policy = cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
+    let model = nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(
+        &config,
+        policy,
+        cli_embedding_artifact_mode(),
+    )?;
+    Ok(Box::new(model))
+}
+
+/// Fallback loader for builds without the `embed` feature: keeps
+/// `run_embed`'s signature uniform and fails only if the local path runs.
+#[cfg(not(feature = "embed"))]
+fn load_cli_local_embedder(
+    _model_id: &str,
+    _cache_dir: Option<&Path>,
+    _accelerator: Option<CliEmbeddingAccelerator>,
+) -> anyhow::Result<Box<dyn CliBatchEmbedder>> {
+    anyhow::bail!(
+        "local embedding requires the `embed` feature; \
+         rebuild with `--features embed` or pass --endpoint"
+    );
+}
+
 fn local_embedding_model_id(model_id: Option<&str>) -> &str {
     model_id.unwrap_or(nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID)
 }
@@ -7374,6 +7426,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             force,
             stats,
             use_daemon,
+            load_cli_local_embedder,
         )
         .map(|c| (c, None)),
 
@@ -16212,7 +16265,7 @@ fn print_project_context_json(
 
 /// Generate embeddings for symbols, notes, and/or headings.
 #[allow(clippy::too_many_arguments)]
-fn run_embed(
+fn run_embed<Load>(
     db: Option<&Path>,
     local: bool,
     endpoint: Option<&str>,
@@ -16225,7 +16278,15 @@ fn run_embed(
     force: bool,
     stats: bool,
     use_daemon: bool,
-) -> anyhow::Result<i32> {
+    local_model_loader: Load,
+) -> anyhow::Result<i32>
+where
+    Load: Fn(
+        &str,
+        Option<&Path>,
+        Option<CliEmbeddingAccelerator>,
+    ) -> anyhow::Result<Box<dyn CliBatchEmbedder>>,
+{
     // Validate flags
     if local && endpoint.is_some() {
         anyhow::bail!("--local and --endpoint are mutually exclusive");
@@ -16408,6 +16469,12 @@ fn run_embed(
     let mut success_count = 0usize;
     let mut error_count = 0usize;
     let mut rejected_count = 0usize;
+    // Dimension of the vectors THIS run produced, set on the first accepted
+    // write. The metadata stamp below is gated on it: a run that produced
+    // nothing (everything already embedded, or every batch rejected) must not
+    // overwrite the recorded fingerprint with a fabricated (model, dimension)
+    // pair taken from pre-existing vectors.
+    let mut produced_dim: Option<usize> = None;
 
     if let Some(ep) = endpoint {
         // ── External API path ────────────────────────────────────
@@ -16446,8 +16513,12 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (sym, emb) in chunk.iter().zip(embeddings) {
+                                let emb_dim = emb.len();
                                 if store.add_embedding_with_force(&sym.uid, emb, force) {
                                     success_count += 1;
+                                    if produced_dim.is_none() {
+                                        produced_dim = Some(emb_dim);
+                                    }
                                 } else {
                                     rejected_count += 1;
                                 }
@@ -16486,8 +16557,12 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (note, emb) in chunk.iter().zip(embeddings) {
+                                let emb_dim = emb.len();
                                 if store.add_embedding_with_force(&note.uid, emb, force) {
                                     success_count += 1;
+                                    if produced_dim.is_none() {
+                                        produced_dim = Some(emb_dim);
+                                    }
                                 } else {
                                     rejected_count += 1;
                                 }
@@ -16545,8 +16620,12 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (h, emb) in chunk.iter().zip(embeddings) {
+                                let emb_dim = emb.len();
                                 if store.add_embedding_with_force(&h.uid, emb, force) {
                                     success_count += 1;
+                                    if produced_dim.is_none() {
+                                        produced_dim = Some(emb_dim);
+                                    }
                                 } else {
                                     rejected_count += 1;
                                 }
@@ -16565,15 +16644,8 @@ fn run_embed(
         // ── Local model path (default) ───────────────────────────
         #[cfg(feature = "embed")]
         {
-            let config = direct_local_embedding_config(local_model_id, cache_dir);
-            let policy =
-                cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
-            let embed_model = nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(
-                &config,
-                policy,
-                cli_embedding_artifact_mode(),
-            )
-            .context("failed to load local embedding model")?;
+            let embed_model = local_model_loader(local_model_id, cache_dir, accelerator)
+                .context("failed to load local embedding model")?;
 
             if do_symbols {
                 let all = store
@@ -16604,12 +16676,15 @@ fn run_embed(
                             })
                             .collect();
                         let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-                        match embed_model.embed(&text_refs) {
+                        match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
                                     if store.add_embedding_with_force(&sym.uid, emb.clone(), force)
                                     {
                                         success_count += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb.len());
+                                        }
                                     } else {
                                         rejected_count += 1;
                                     }
@@ -16648,12 +16723,15 @@ fn run_embed(
                             .map(|n| nestweaver_embed::preprocess::note_embed_text(&n.title, None))
                             .collect();
                         let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-                        match embed_model.embed(&text_refs) {
+                        match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
                                     if store.add_embedding_with_force(&note.uid, emb.clone(), force)
                                     {
                                         success_count += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb.len());
+                                        }
                                     } else {
                                         rejected_count += 1;
                                     }
@@ -16705,11 +16783,14 @@ fn run_embed(
                             })
                             .collect();
                         let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-                        match embed_model.embed(&text_refs) {
+                        match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (h, emb) in batch.iter().zip(embeddings.iter()) {
                                     if store.add_embedding_with_force(&h.uid, emb.clone(), force) {
                                         success_count += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb.len());
+                                        }
                                     } else {
                                         rejected_count += 1;
                                     }
@@ -16728,6 +16809,7 @@ fn run_embed(
 
         #[cfg(not(feature = "embed"))]
         {
+            let _ = &local_model_loader;
             anyhow::bail!(
                 "local embedding requires the `embed` feature; \
                  rebuild with `--features embed` or pass --endpoint"
@@ -16742,11 +16824,25 @@ fn run_embed(
         eprintln!("Warning: failed to save embedding sidecar: {e}");
     }
 
+    if rejected_count > 0 {
+        eprintln!(
+            "Error: {rejected_count} embedding(s) rejected due to dimension mismatch. \
+             Use --force to switch models (clears existing embeddings)."
+        );
+    }
+
     // Record which embedding model produced these vectors, so the daemon loads a matching
     // model at startup regardless of the compiled default or the instance config (see
     // run_server). This is what lets the shipped default stay light for most users while a
     // given DB transparently uses whatever model it was embedded with.
-    if let Some(dim) = store.embedding_index_dimension() {
+    //
+    // The stamped pair must describe vectors THIS run produced: the dimension
+    // comes from `produced_dim` (set on the first accepted write), never from
+    // pre-existing vectors, and a run that produced nothing — everything
+    // already embedded, or every batch rejected — stamps nothing. The stamp
+    // also sits below the rejection warning so a fully-rejected run cannot
+    // write the pair before the warning says the writes failed.
+    if let Some(dim) = produced_dim {
         let effective_model = if endpoint.is_some() {
             external_embedding_model(model)
         } else {
@@ -16757,12 +16853,16 @@ fn run_embed(
         {
             eprintln!("Warning: failed to record embedding model metadata: {e}");
         }
-    }
-
-    if rejected_count > 0 {
+    } else if let Some(requested) = (if endpoint.is_some() { model } else { model_id })
+        && let Ok(Some((recorded, _))) = store.get_embedding_metadata()
+        && recorded != requested
+    {
+        // Zero-work path with an explicit model mismatch: name it, or the run
+        // ends with "Done: 0 embedding(s)" and no hint that the requested
+        // model was never applied.
         eprintln!(
-            "Error: {rejected_count} embedding(s) rejected due to dimension mismatch. \
-             Use --force to switch models (clears existing embeddings)."
+            "No embeddings were produced; the database remains embedded with '{recorded}'. \
+             Re-run with --force to re-embed everything with '{requested}'."
         );
     }
 
