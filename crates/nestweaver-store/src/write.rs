@@ -2108,8 +2108,17 @@ impl GraphStore {
     /// starts clean without per-contract DELETE round-trips.
     pub fn clear_repo_contracts(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::clear_repo_contracts_on(&conn, repo_uid)
+    }
+
+    /// Like [`clear_repo_contracts`](Self::clear_repo_contracts) but operates on
+    /// an existing connection/transaction.
+    pub fn clear_repo_contracts_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (c:Contract) WHERE c.repo_uid = $repo DETACH DELETE c",
             vec![("repo", lbug::Value::String(repo_uid.to_string()))],
         )
@@ -2120,12 +2129,25 @@ impl GraphStore {
         if contracts.is_empty() {
             return Ok(());
         }
+        let conn = self.conn()?;
+        Self::batch_insert_contracts_on(&conn, contracts)
+    }
+
+    /// Like [`batch_insert_contracts`](Self::batch_insert_contracts) but
+    /// operates on an existing connection/transaction. The tempdir holding the
+    /// staged CSV is kept alive for the whole call so it outlives the COPY.
+    pub fn batch_insert_contracts_on(
+        conn: &lbug::Connection<'_>,
+        contracts: &[Contract],
+    ) -> Result<(), StoreError> {
+        if contracts.is_empty() {
+            return Ok(());
+        }
         let tmp_dir =
             tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join("contracts.csv");
         write_contracts_csv(contracts, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        let conn = self.conn()?;
         conn.query(&format!("COPY Contract FROM '{csv_str}' {COPY_CSV_OPTS}"))
             .map_err(|e| StoreError::Query(format!("COPY Contract: {e}")))?;
         Ok(())
