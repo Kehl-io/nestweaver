@@ -495,6 +495,61 @@ fn resolve_effective_instance_id(requested: &str, configured: &str) -> Result<St
     Ok(effective.to_string())
 }
 
+/// Build the terminal `Phase::Done` message for `IndexRepo`. When
+/// cancellation was requested (timeout or client disconnect) but the run had
+/// already passed the point where it could abort safely, say so plainly: the
+/// index COMMITTED, and a plain `Done` would be a lie about what the caller
+/// asked for. Name the repair.
+fn index_done_message(
+    files_count: usize,
+    symbols_count: usize,
+    edges_count: usize,
+    repo_path: &std::path::Path,
+    cancelled: bool,
+) -> String {
+    if cancelled {
+        format!(
+            "Done — {} files, {} symbols, {} edges. Cancellation was requested \
+             but the index had already passed its last cancellation point and \
+             COMMITTED anyway. To discard this run and re-index from scratch, \
+             run: nestweaver index --repo {} --force",
+            files_count,
+            symbols_count,
+            edges_count,
+            repo_path.display()
+        )
+    } else {
+        format!(
+            "Done — {} files, {} symbols, {} edges",
+            files_count, symbols_count, edges_count
+        )
+    }
+}
+
+#[cfg(test)]
+mod index_done_message_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_variant_reports_commit_and_names_repair() {
+        let message = index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), true);
+        assert!(message.contains("COMMITTED"), "{message}");
+        assert!(
+            message.contains("nestweaver index --repo /tmp/repo --force"),
+            "{message}"
+        );
+        assert!(message.contains("12 files"), "{message}");
+        assert!(message.contains("340 symbols"), "{message}");
+        assert!(message.contains("1500 edges"), "{message}");
+    }
+
+    #[test]
+    fn uncancelled_variant_is_the_plain_done_line() {
+        let message = index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), false);
+        assert_eq!(message, "Done — 12 files, 340 symbols, 1500 edges");
+    }
+}
+
 /// Stop and unregister any active file watcher. Idempotent.
 ///
 /// Called on EVERY shutdown path (gRPC Shutdown, SIGTERM, post-serve
@@ -3476,7 +3531,24 @@ impl NestWeaverDaemon for DaemonService {
                     // and the trigram rebuild scans the whole index — since
                     // nobody is waiting on the result. The graph itself is
                     // already indexed; these sidecars rebuild on the next index.
+                    // The terminal Done is still sent first: the stream must
+                    // not close without reporting the committed-after-cancel
+                    // outcome, or the client reads the committed index as a
+                    // truncated failure.
                     if cancel_for_index.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            phase: Phase::Done as i32,
+                            message: index_done_message(
+                                result.files_count,
+                                result.symbols_count,
+                                result.edges_count,
+                                &repo_path,
+                                true,
+                            ),
+                            files_processed: result.files_count as u64,
+                            files_total: result.files_count as u64,
+                            symbols_found: result.symbols_count as u64,
+                        }));
                         return;
                     }
 
@@ -3559,31 +3631,19 @@ impl NestWeaverDaemon for DaemonService {
                         }
                     }
 
-                    // DONE phase. When cancellation was requested (timeout or
-                    // client disconnect) but the run had already passed the
-                    // point where it could abort safely, say so plainly: the
-                    // index COMMITTED, and a plain `Done` would be a lie about
-                    // what the caller asked for. Name the repair.
-                    let message = if cancel_for_index.load(std::sync::atomic::Ordering::Acquire) {
-                        format!(
-                            "Done — {} files, {} symbols, {} edges. Cancellation was requested \
-                             but the index had already passed its last cancellation point and \
-                             COMMITTED anyway. To discard this run and re-index from scratch, \
-                             run: nestweaver index --repo {} --force",
+                    // DONE phase. Re-read the cancel flag here: cancellation
+                    // can still arrive while the post-index phases above run,
+                    // and the committed-after-cancel variant must say so
+                    // plainly rather than claim a clean `Done`.
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Done as i32,
+                        message: index_done_message(
                             result.files_count,
                             result.symbols_count,
                             result.edges_count,
-                            repo_path.display()
-                        )
-                    } else {
-                        format!(
-                            "Done — {} files, {} symbols, {} edges",
-                            result.files_count, result.symbols_count, result.edges_count
-                        )
-                    };
-                    let _ = tx.blocking_send(Ok(IndexProgress {
-                        phase: Phase::Done as i32,
-                        message,
+                            &repo_path,
+                            cancel_for_index.load(std::sync::atomic::Ordering::Acquire),
+                        ),
                         files_processed: result.files_count as u64,
                         files_total: result.files_count as u64,
                         symbols_found: result.symbols_count as u64,
