@@ -3367,23 +3367,25 @@ impl NestWeaverDaemon for DaemonService {
                         // reported as a FAILURE for an index that (because
                         // cancellation is cooperative and only observed at the
                         // pre-write boundary) may still be running and may still
-                        // succeed. Send a terminal Error event so the caller
-                        // learns what actually happened, names the knob, and is
-                        // warned not to assume the work stopped.
+                        // succeed. Send a NON-TERMINAL warning instead: the
+                        // progress tracker treats Done|Error as terminal, so a
+                        // terminal Error here would make the run's own late
+                        // Writing/Done events be rejected as AfterTerminal and
+                        // misreport a committed index as failed. The genuine
+                        // terminal event still follows and says whether the run
+                        // aborted before writing or committed anyway.
                         let _ = watch_tx
                             .send(Ok(IndexProgress {
-                                phase: Phase::Error as i32,
                                 message: format!(
                                     "index exceeded the {}s timeout and cancellation was requested \
                                      (raise NESTWEAVER_INDEX_TIMEOUT_SECS). Cancellation is \
                                      cooperative and is only observed at the next pre-write \
-                                     boundary, so the daemon may still be finishing this index — \
-                                     check the daemon log before assuming it stopped or retrying.",
+                                     boundary, so this run may still commit — the final stream \
+                                     event will say whether it aborted before writing or \
+                                     committed anyway.",
                                     index_timeout.as_secs()
                                 ),
-                                files_processed: 0,
-                                files_total: 0,
-                                symbols_found: 0,
+                                ..Default::default()
                             }))
                             .await;
                     }

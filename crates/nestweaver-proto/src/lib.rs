@@ -257,17 +257,21 @@ mod index_progress_tracker_tests {
         ));
     }
 
-    /// nw-127: a timeout must reach the caller as a REPORTED error naming the
-    /// cause, not as a truncated stream.
+    /// nw-127: an in-band terminal error must reach the caller as a REPORTED
+    /// error naming the cause, not as a truncated stream.
     ///
     /// The daemon's watchdog used to set its cancel flag and say nothing, so the
     /// client saw the stream simply end and rendered "index progress stream
     /// ended before completion" — indistinguishable from a crash, and shown as a
-    /// failure for an index that was still running and went on to SUCCEED.
-    /// Emitting a terminal `Phase::Error` is what turns that into an explanation.
+    /// failure for an index that was still running and went on to SUCCEED. The
+    /// watchdog now emits a non-terminal warning (naming
+    /// NESTWEAVER_INDEX_TIMEOUT_SECS) and lets the run's own terminal event
+    /// report whether it aborted before writing or committed anyway; what
+    /// remains pinned here is that any terminal `Phase::Error` still surfaces
+    /// as an explanation rather than a truncation.
     #[test]
     fn a_timeout_reported_in_band_beats_a_truncated_stream() {
-        // What the watchdog does now.
+        // A terminal Error event reported in-band.
         let mut reported = IndexProgressTracker::default();
         reported
             .observe(&progress(Phase::Writing, "still writing"))
