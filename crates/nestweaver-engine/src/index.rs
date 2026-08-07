@@ -7447,6 +7447,40 @@ function hello(name) { return "Hello " + name; }
         );
     }
 
+    /// In-memory stores have no `.index-dirty` marker for a later open to
+    /// reconcile, so a cancelled-but-committed run must still bump the
+    /// in-memory generation — otherwise the commit is invisible to
+    /// generation-keyed snapshot readers.
+    #[test]
+    fn cancelled_commit_still_bumps_in_memory_generation() {
+        let store = GraphStore::in_memory().unwrap();
+        store.bump_graph_generation();
+        let before = store.graph_generation();
+
+        let lease = establish_index_publication_marker_with_io(
+            &store,
+            None,
+            "cancelled in-memory commit",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        finalize_committed_index_for_scope_with_io(
+            lease,
+            None,
+            "cancelled in-memory commit",
+            &FileSystemIndexEpilogueIo,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.graph_generation(),
+            before + 1,
+            "in-memory stores have no dirty marker, so the generation bump must still run"
+        );
+    }
+
     /// Control for the cancelled-commit test: the same run without a
     /// cancellation retires `.index-dirty` and durably publishes the advanced
     /// generation.
