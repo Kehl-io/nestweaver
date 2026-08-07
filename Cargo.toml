@@ -160,3 +160,8 @@ test = false
 name = "index_benchmarks"
 harness = false
 test = false
+
+[[bench]]
+name = "remove_repo_benchmarks"
+harness = false
+test = false

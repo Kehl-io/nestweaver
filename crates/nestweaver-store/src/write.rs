@@ -3763,6 +3763,13 @@ impl GraphStore {
 
     /// Like [`bulk_delete_repo_files_and_symbols`](Self::bulk_delete_repo_files_and_symbols)
     /// but operates on an existing connection/transaction.
+    //
+    // Cost note: the DETACH DELETEs below are quadratic in node DEGREE —
+    // Θ(Σ_v deg(v)² + Σ_(u→v) deg_bwd(v)) — so repos with a high-degree hub
+    // (e.g. a Service holding ~87k SERVICE_HAS_SYMBOL edges) dominate removal
+    // time. Incident-profile readings of a full node-group scan / O(n²) in
+    // relationships deleted are refuted; see benches/remove_repo_benchmarks.rs
+    // for the regression benchmark and the full refuted-claims record.
     pub fn bulk_delete_repo_files_and_symbols_on(
         conn: &lbug::Connection<'_>,
         repo_uid: &str,
