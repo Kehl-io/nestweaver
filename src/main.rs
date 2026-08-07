@@ -16866,7 +16866,9 @@ fn render_contract_drift_human(value: &serde_json::Value) {
             degraded.len(),
             degraded.join(", ")
         );
-        println!("Drift results below are INCOMPLETE — re-index to restore them.\n");
+        println!(
+            "Drift results below are STALE (last successful derivation) — re-index to refresh them.\n"
+        );
     }
     let empty = |a: Option<&Vec<serde_json::Value>>| a.map(|v| v.is_empty()).unwrap_or(true);
     if empty(dni) && empty(ind) {
