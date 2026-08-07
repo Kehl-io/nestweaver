@@ -424,6 +424,54 @@ fn atomic_replace_file(
     crate::durable_sidecar::atomic_replace_file(path, write).map_err(Into::into)
 }
 
+/// Default cadence for time-based embedding-index checkpoints during long
+/// embed passes (CLI direct loops and the daemon embed RPC).
+pub const EMBED_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Time-based checkpoint for long embed passes.
+///
+/// An interrupted embed pass used to lose everything: the only flush ran
+/// once at the end. `flush_if_due` flushes at chunk boundaries once
+/// `interval` has elapsed and new embeddings were accepted since the last
+/// flush, so a killed pass keeps all work up to the last checkpoint.
+///
+/// Per-batch flushing is NOT implementable: `EmbeddingIndex::save_binary`
+/// rewrites the entire sidecar file on every call (roughly a quarter of a
+/// gigabyte for a large graph), so the cadence must stay coarse — minutes,
+/// not batches.
+pub struct EmbeddingFlushCheckpoint {
+    interval: std::time::Duration,
+    last_flush: std::time::Instant,
+    flushed_success_count: usize,
+}
+
+impl EmbeddingFlushCheckpoint {
+    pub fn new(interval: std::time::Duration) -> Self {
+        Self {
+            interval,
+            last_flush: std::time::Instant::now(),
+            flushed_success_count: 0,
+        }
+    }
+
+    /// Flush the embedding index when `interval` elapsed and `success_count`
+    /// advanced since the last flush. Returns whether a flush happened.
+    pub fn flush_if_due(
+        &mut self,
+        store: &GraphStore,
+        success_count: usize,
+    ) -> Result<bool, StoreError> {
+        if success_count == self.flushed_success_count || self.last_flush.elapsed() < self.interval
+        {
+            return Ok(false);
+        }
+        store.flush_embedding_index()?;
+        self.last_flush = std::time::Instant::now();
+        self.flushed_success_count = success_count;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {

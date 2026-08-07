@@ -5590,6 +5590,13 @@ impl NestWeaverDaemon for DaemonService {
                 // accepted write; gates the metadata stamp below (mirrors the
                 // CLI's `run_embed` tail).
                 let mut produced_dim: Option<usize> = None;
+                // Checkpoint the index to the sidecar about every five minutes
+                // so an interrupted pass keeps completed work. Per-batch
+                // flushing is not implementable: save_binary rewrites the
+                // entire sidecar on every call, so the cadence must stay coarse.
+                let mut flush_checkpoint = nestweaver_store::EmbeddingFlushCheckpoint::new(
+                    nestweaver_store::EMBED_CHECKPOINT_INTERVAL,
+                );
 
                 // Each embed run may legitimately force-switch the model once;
                 // re-arm the once-per-run clear guard on this long-lived index.
@@ -5635,6 +5642,9 @@ impl NestWeaverDaemon for DaemonService {
                                 }
                             }
                         }
+                        if let Err(e) = flush_checkpoint.flush_if_due(&store, succeeded as usize) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
+                        }
                     }
                 }
 
@@ -5675,6 +5685,9 @@ impl NestWeaverDaemon for DaemonService {
                                 }
                             }
                         }
+                        if let Err(e) = flush_checkpoint.flush_if_due(&store, succeeded as usize) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
+                        }
                     }
                 }
 
@@ -5714,6 +5727,9 @@ impl NestWeaverDaemon for DaemonService {
                                     failed += 1;
                                 }
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due(&store, succeeded as usize) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
                     }
                 }

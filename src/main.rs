@@ -2420,7 +2420,9 @@ enum Commands {
     /// By default uses the bundled local model (sentence-transformers/all-MiniLM-L6-v2).
     /// Pass --endpoint to use an external OpenAI-compatible API instead.
     /// Only nodes that do not yet have an embedding are processed (incremental);
-    /// use --force to re-embed everything.
+    /// use --force to re-embed everything. The index is checkpointed to disk
+    /// about every 5 minutes and once at the end of the pass, so interrupting
+    /// a run keeps only the work completed up to the last checkpoint.
     #[command(
         after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --local --cache-dir /path/to/cache  # populate a configured daemon cache\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing"
     )]
@@ -16508,6 +16510,13 @@ where
     // overwrite the recorded fingerprint with a fabricated (model, dimension)
     // pair taken from pre-existing vectors.
     let mut produced_dim: Option<usize> = None;
+    // Checkpoint the index to the sidecar about every five minutes so an
+    // interrupted pass keeps completed work. Per-batch flushing is not
+    // implementable: save_binary rewrites the entire sidecar on every call,
+    // so the cadence must stay coarse.
+    let mut flush_checkpoint = nestweaver_store::EmbeddingFlushCheckpoint::new(
+        nestweaver_store::EMBED_CHECKPOINT_INTERVAL,
+    );
 
     if let Some(ep) = endpoint {
         // ── External API path ────────────────────────────────────
@@ -16562,6 +16571,9 @@ where
                             error_count += chunk.len();
                         }
                     }
+                    if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                        eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
+                    }
                 }
                 eprintln!();
             }
@@ -16606,6 +16618,9 @@ where
                             eprintln!("\n    Warning: batch embedding API error: {e}");
                             error_count += chunk.len();
                         }
+                    }
+                    if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                        eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
                 }
                 eprintln!();
@@ -16670,6 +16685,9 @@ where
                             error_count += chunk.len();
                         }
                     }
+                    if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                        eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
+                    }
                 }
                 eprintln!();
             }
@@ -16733,6 +16751,9 @@ where
                                 error_count += batch.len();
                             }
                         }
+                        if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                            eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
+                        }
                     }
                     eprintln!();
                 }
@@ -16783,6 +16804,9 @@ where
                                 eprintln!("\n    Warning: local embed error: {e}");
                                 error_count += batch.len();
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                            eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
                     }
                     eprintln!();
@@ -16847,6 +16871,9 @@ where
                                 eprintln!("\n    Warning: local embed error: {e}");
                                 error_count += batch.len();
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                            eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
                     }
                     eprintln!();
