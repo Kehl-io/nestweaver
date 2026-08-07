@@ -304,6 +304,54 @@ mod index_progress_tracker_tests {
         );
     }
 
+    /// The watchdog's timeout warning is NON-TERMINAL (its phase defaults to
+    /// DISCOVERING), so the run's own late Writing/Done events still land and
+    /// the caller's outcome derives from the genuine terminal event. This is
+    /// the sequence a cancelled-but-committed index produces; back when the
+    /// watchdog emitted a terminal `Phase::Error`, the late Writing/Done
+    /// events were rejected as AfterTerminal and an index that had in fact
+    /// committed was misreported to the CLI as a failure.
+    #[test]
+    fn a_non_terminal_timeout_warning_lets_the_real_done_report_through() {
+        let mut tracker = IndexProgressTracker::default();
+        tracker
+            .observe(&progress(
+                Phase::Discovering,
+                "index exceeded the 1800s timeout and cancellation was requested \
+                 (raise NESTWEAVER_INDEX_TIMEOUT_SECS)",
+            ))
+            .unwrap();
+        tracker
+            .observe(&progress(
+                Phase::Writing,
+                "Indexed 239745 files, 3122546 symbols",
+            ))
+            .unwrap();
+        tracker
+            .observe(&progress(
+                Phase::Done,
+                "Done — 239745 files, 3122546 symbols, 4725058 edges. Cancellation was \
+                 requested but the index had already passed its last cancellation point and \
+                 COMMITTED anyway. To discard this run and re-index from scratch, \
+                 run: nestweaver index --repo /repos/big --force",
+            ))
+            .unwrap();
+
+        let message = tracker.finish().unwrap();
+        assert!(
+            message.contains("COMMITTED"),
+            "a committed-after-cancellation run must say so, got: {message}"
+        );
+        assert!(
+            message.contains("nestweaver index --repo /repos/big --force"),
+            "the repair must be named, got: {message}"
+        );
+        assert!(
+            message.contains("239745 files"),
+            "the real counts must survive, got: {message}"
+        );
+    }
+
     #[test]
     fn any_event_after_a_terminal_event_is_rejected() {
         for terminal in [Phase::Done, Phase::Error] {
