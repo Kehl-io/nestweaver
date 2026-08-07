@@ -21125,3 +21125,455 @@ mod embed_accelerator_cli_tests {
             .expect("join");
     }
 }
+
+/// Regression tests for the embedding-metadata truth fixes: the recorded
+/// `(model_id, dimension)` fingerprint may only be written from vectors the
+/// run actually produced, and the direct `--local` / `--endpoint` paths must
+/// honor the fingerprint already recorded in the database.
+///
+/// Every test drives `run_embed` with an injected stub loader (the seam added
+/// for exactly this purpose) — no model artifacts, no network except the
+/// refused-loopback endpoint cases.
+#[cfg(all(test, feature = "embed"))]
+mod embed_metadata_truth_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const RECORDED_MODEL: &str = "sentence-transformers/recorded-model";
+    const OTHER_MODEL: &str = "sentence-transformers/other-model";
+
+    /// A `CliBatchEmbedder` emitting fixed-dimension vectors, so tests reach
+    /// the embed loops without a warm artifact cache.
+    struct StubEmbedder {
+        dimension: usize,
+    }
+
+    impl CliBatchEmbedder for StubEmbedder {
+        fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1_f32; self.dimension]).collect())
+        }
+    }
+
+    /// A loader standing in for `load_cli_local_embedder`: records how it was
+    /// called and hands back a `StubEmbedder` of the given dimension.
+    struct StubLoader {
+        dimension: usize,
+        calls: Arc<AtomicU32>,
+        loaded_model_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StubLoader {
+        fn new(dimension: usize) -> Self {
+            Self {
+                dimension,
+                calls: Arc::new(AtomicU32::new(0)),
+                loaded_model_ids: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn loaded_model_ids(&self) -> Vec<String> {
+            self.loaded_model_ids.lock().unwrap().clone()
+        }
+
+        fn closure(
+            &self,
+        ) -> impl Fn(
+            &str,
+            Option<&Path>,
+            Option<CliEmbeddingAccelerator>,
+        ) -> anyhow::Result<Box<dyn CliBatchEmbedder>> {
+            let dimension = self.dimension;
+            let calls = self.calls.clone();
+            let loaded = self.loaded_model_ids.clone();
+            move |model_id, _cache_dir, _accelerator| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                loaded.lock().unwrap().push(model_id.to_string());
+                Ok(Box::new(StubEmbedder { dimension }))
+            }
+        }
+    }
+
+    fn test_symbol(name: &str) -> nestweaver_schema::Symbol {
+        nestweaver_schema::Symbol {
+            uid: format!("sym:{name}"),
+            name: name.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash-{name}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// Seed a database with symbols, 3-dimensional sidecar embeddings for the
+    /// `embedded` subset, and an optional recorded `(model_id, dimension)`
+    /// fingerprint. The store is dropped so `run_embed` can reopen the DB.
+    fn seed_embed_db(
+        embedded: &[&str],
+        unembedded: &[&str],
+        metadata: Option<(&str, u32)>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        {
+            let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+            for name in embedded.iter().chain(unembedded.iter()) {
+                store.insert_symbol(&test_symbol(name)).unwrap();
+            }
+            let producer = metadata.map(|(model, _)| model).unwrap_or("seed-model");
+            for name in embedded {
+                assert!(
+                    store.add_embedding_with_force(
+                        &format!("sym:{name}"),
+                        vec![0.1_f32, 0.2, 0.3],
+                        producer,
+                        false,
+                    ),
+                    "fixture embedding must be accepted for {name}"
+                );
+            }
+            store.flush_embedding_index().unwrap();
+            if let Some((model, dim)) = metadata {
+                store.set_embedding_metadata(model, dim).unwrap();
+            }
+        }
+        (dir, db_path)
+    }
+
+    fn recorded_metadata(db_path: &Path) -> Option<(String, u32)> {
+        let store = nestweaver_store::GraphStore::open_read_only(db_path).unwrap();
+        store.get_embedding_metadata().unwrap()
+    }
+
+    /// Reproduction A: a fully embedded database re-embedded with a different
+    /// explicit `--model-id`. The run produces nothing, so the recorded
+    /// fingerprint must survive untouched — and the conflicting model must be
+    /// called out by name. Before the fix the tail stamped the requested
+    /// model against a pre-existing vector's dimension, fabricating a pair
+    /// that was never true together.
+    #[test]
+    fn conflicting_model_id_against_a_fully_embedded_db_leaves_metadata_untouched() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &[], Some((RECORDED_MODEL, 3)));
+        let loader = StubLoader::new(3);
+
+        let error = run_embed(
+            Some(&db_path),
+            true, // --local
+            None,
+            None,
+            Some(OTHER_MODEL),
+            None,
+            None,
+            8,
+            "symbols",
+            false, // no --force
+            false,
+            false, // direct path
+            loader.closure(),
+        )
+        .expect_err("a conflicting explicit --model-id must bail, not silently stamp");
+
+        let message = format!("{error:#}");
+        assert!(message.contains(RECORDED_MODEL), "must name the recorded model: {message}");
+        assert!(message.contains(OTHER_MODEL), "must name the requested model: {message}");
+        assert_eq!(
+            loader.call_count(),
+            0,
+            "the bail must happen before the model is even loaded"
+        );
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 3)),
+            "a zero-work run must not overwrite the recorded fingerprint"
+        );
+    }
+
+    /// Reproduction B (dimension): every add is rejected by the dimension
+    /// guard. The run produced nothing, so the recorded pair must not move —
+    /// and the exit path must not claim success.
+    ///
+    /// The fixture records dimension 768 against a 3-dimensional index — the
+    /// poisoned state the unconditional stamp used to create — so the
+    /// pre-change stamp, which would have rewritten the pair to
+    /// `(RECORDED_MODEL, 3)` from a pre-existing vector, fails the "untouched"
+    /// assertion instead of coincidentally rewriting the same values.
+    #[test]
+    fn fully_rejected_embed_leaves_metadata_untouched_and_reports_failure() {
+        let (_dir, db_path) =
+            seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 768)));
+        let loader = StubLoader::new(4); // stub emits the wrong dimension
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(RECORDED_MODEL), // matches the fingerprint, so only the dim guard fires
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a rejected run still returns an exit code");
+
+        assert_eq!(loader.call_count(), 1);
+        assert_eq!(
+            code, EXIT_ERROR,
+            "a fully rejected run must not exit successfully"
+        );
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 768)),
+            "a run that produced no accepted vectors must not stamp"
+        );
+        let store = nestweaver_store::GraphStore::open_read_only(&db_path).unwrap();
+        assert!(
+            !store.has_embedding("sym:pending"),
+            "rejected vectors must not reach the index"
+        );
+    }
+
+    /// Reproduction B (model): forgetting `--model-id` on a database recorded
+    /// with a non-default model must not mix the compiled default's vectors
+    /// into the index. The CLI guard passes (no explicit model to conflict),
+    /// so the store's recorded-model guard is what rejects every write.
+    #[test]
+    fn embed_without_model_id_cannot_mix_the_default_model_into_a_recorded_index() {
+        let (_dir, db_path) =
+            seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 3)));
+        assert_ne!(
+            RECORDED_MODEL,
+            nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID,
+            "the fixture needs a non-default recorded model for this test to mean anything"
+        );
+        let loader = StubLoader::new(3); // right dimension, wrong (default) model
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            None, // no --model-id: resolves to the compiled default
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a rejected run still returns an exit code");
+
+        assert_eq!(
+            loader.loaded_model_ids(),
+            vec![nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID.to_string()],
+        );
+        assert_eq!(code, EXIT_ERROR, "rejected writes must not report success");
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 3)),
+            "the recorded fingerprint must survive a fully rejected run"
+        );
+        let store = nestweaver_store::GraphStore::open_read_only(&db_path).unwrap();
+        assert!(!store.has_embedding("sym:pending"));
+    }
+
+    /// The escape hatch: an explicit `--model-id` that disagrees with the
+    /// recorded fingerprint proceeds under `--force`, and the successful run
+    /// re-stamps the fingerprint with the model it actually used.
+    #[test]
+    fn force_reembed_with_a_new_model_proceeds_and_restamps_the_fingerprint() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &[], Some((RECORDED_MODEL, 3)));
+        let loader = StubLoader::new(3);
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(OTHER_MODEL),
+            None,
+            None,
+            8,
+            "symbols",
+            true, // --force
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a forced re-embed must run");
+
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(loader.loaded_model_ids(), vec![OTHER_MODEL.to_string()]);
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((OTHER_MODEL.to_string(), 3)),
+            "a productive --force run must re-stamp the model it used"
+        );
+    }
+
+    /// A genuine run records the dimension of the vectors it wrote. The
+    /// database carries a stale 768-dimension fingerprint but an empty index;
+    /// the stub produces 3-dimensional vectors, so the stamp must say 3 —
+    /// never a dimension read back from anywhere else.
+    #[test]
+    fn a_productive_run_stamps_the_dimension_it_produced() {
+        let (_dir, db_path) = seed_embed_db(&[], &["pending"], Some((RECORDED_MODEL, 768)));
+        let loader = StubLoader::new(3);
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(RECORDED_MODEL),
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a matching model id must not bail");
+
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 3)),
+            "the stamp must describe the vectors this run produced"
+        );
+    }
+
+    /// A `--force` run over a database with no embeddable nodes produces
+    /// nothing, so even with a conflicting requested model nothing is
+    /// stamped (the run explains the discrepancy on stderr instead).
+    #[test]
+    fn force_embed_with_no_eligible_nodes_does_not_stamp() {
+        let (_dir, db_path) = seed_embed_db(&[], &[], Some((RECORDED_MODEL, 3)));
+        let loader = StubLoader::new(3);
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(OTHER_MODEL),
+            None,
+            None,
+            8,
+            "all",
+            true, // --force, so the mismatch guard does not bail
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a zero-work force run must not fail");
+
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 3)),
+            "no produced vectors, no stamp — even under --force"
+        );
+    }
+
+    /// The endpoint branch compares the recorded fingerprint against the
+    /// endpoint's model (`--model`, defaulting to the external default) —
+    /// never `--model-id`. A correctly configured external run carries a
+    /// local-model `--model-id` that must not trip the guard. The endpoint
+    /// is a refused loopback port: the guard passing means the run reaches
+    /// the HTTP batch and fails there (an exit code), rather than bailing.
+    #[test]
+    fn endpoint_embed_compares_the_fingerprint_against_the_endpoint_model() {
+        let (_dir, db_path) = seed_embed_db(
+            &["seeded"],
+            &["pending"],
+            Some((DEFAULT_EXTERNAL_EMBEDDING_MODEL, 3)),
+        );
+        let loader = StubLoader::new(3);
+
+        let code = run_embed(
+            Some(&db_path),
+            false,
+            Some("http://127.0.0.1:1"), // connection refused, fast
+            None,                       // --model defaults to the external default
+            Some(OTHER_MODEL),          // a local model id — irrelevant on this branch
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("the local --model-id must not bail the endpoint branch");
+
+        assert_eq!(
+            code, EXIT_ERROR,
+            "the batch fails against a refused endpoint, proving the guard let the run through"
+        );
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((DEFAULT_EXTERNAL_EMBEDDING_MODEL.to_string(), 3)),
+            "a run that produced nothing must not stamp"
+        );
+        assert_eq!(loader.call_count(), 0, "the endpoint branch never loads a local model");
+    }
+
+    /// The flip side: an endpoint run whose `--model` disagrees with the
+    /// recorded fingerprint bails, naming both models.
+    #[test]
+    fn endpoint_embed_bails_when_the_endpoint_model_conflicts_with_the_fingerprint() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &[], Some(("external-model-a", 3)));
+        let loader = StubLoader::new(3);
+
+        let error = run_embed(
+            Some(&db_path),
+            false,
+            Some("http://127.0.0.1:1"),
+            Some("external-model-b"),
+            None,
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect_err("a conflicting --model must bail on the endpoint branch too");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("external-model-a"), "must name the recorded model: {message}");
+        assert!(message.contains("external-model-b"), "must name the requested model: {message}");
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some(("external-model-a".to_string(), 3)),
+        );
+    }
+}
