@@ -1803,7 +1803,24 @@ where
     if let Some(out) = reidentified_old_uid_out {
         *out = reidentify_old_uid.clone();
     }
-    let filemeta_cache = if reidentify_old_uid.is_some() {
+    // An empty resolution-deps slice for this repo (missing/corrupt/stale
+    // sidecar — the loader fails open to empty) is unsafe to combine with a
+    // valid filemeta cache: unchanged files would stay classified Unchanged
+    // while full resolution runs with no stale-edge clear and no bulk
+    // delete, re-creating (duplicating) every resolved edge. Bypass the
+    // cache so every file classifies Parsed, `force_reindex` falls out
+    // below (`files_unchanged == 0`), and the atomic `bulk_reindex_write`
+    // replaces the repo's graph instead of accumulating edges on top of it.
+    let deps_empty_for_repo = resolution_deps
+        .as_ref()
+        .is_some_and(|rd| rd.is_empty_for_repo(&r_uid));
+    if deps_empty_for_repo && reidentify_old_uid.is_none() && filemeta_cache.is_some() {
+        tracing::warn!(
+            repo_uid = %r_uid,
+            "resolution deps empty for repo; bypassing filemeta cache to force a full replacement"
+        );
+    }
+    let filemeta_cache = if reidentify_old_uid.is_some() || deps_empty_for_repo {
         None
     } else {
         filemeta_cache
@@ -2752,8 +2769,31 @@ where
                         .insert(tgt_file.clone());
                 }
             }
-            for (file, deps) in file_deps {
-                rd.set_deps_for_repo(&r_uid, file, deps);
+            // Record the dep set for every file this run actually resolved —
+            // including files that resolve to ZERO outbound edges, recorded as
+            // an empty set. Without those entries a repo whose files have no
+            // cross-file edges would look identical to a missing/corrupt
+            // sidecar (`is_empty_for_repo`), and the empty-deps cache bypass
+            // above would force a full replacement on every index. On an
+            // incremental run only the affected files were re-resolved, so
+            // only their entries are refreshed; other files' records carry
+            // over. Nothing is recorded when resolution was skipped: the
+            // previous records are still accurate.
+            if !skip_resolution {
+                match &resolve_filter {
+                    Some(filter) => {
+                        for file in filter {
+                            let deps = file_deps.remove(file).unwrap_or_default();
+                            rd.set_deps_for_repo(&r_uid, file.clone(), deps);
+                        }
+                    }
+                    None => {
+                        for (path, _, _, _) in &parsed_files_for_resolver {
+                            let deps = file_deps.remove(path).unwrap_or_default();
+                            rd.set_deps_for_repo(&r_uid, path.clone(), deps);
+                        }
+                    }
+                }
             }
         }
 
