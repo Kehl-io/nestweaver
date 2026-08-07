@@ -16466,6 +16466,38 @@ where
         anyhow::bail!("unknown --scope '{scope}': expected one of: all, symbols, notes, headings");
     }
 
+    // The direct paths (--local / --endpoint) resolve their model from flags
+    // alone and bypass the daemon route's recorded-model guard at the top of
+    // this function. Apply the same check here — reusing
+    // daemon_route_model_override_is_honored so the routes cannot drift — so a
+    // conflicting explicit model requires --force. Absent metadata means the
+    // database was never stamped: unknown, so proceed (first embed).
+    let recorded_model_id = store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(model_id, _)| model_id);
+    if !force && let Some(recorded) = recorded_model_id.as_deref() {
+        // On the endpoint branch the comparison operand is the endpoint's
+        // model (--model, defaulting to the external default), never
+        // --model-id — comparing --model-id would bail on every correctly
+        // configured external run.
+        let requested = if endpoint.is_some() {
+            Some(external_embedding_model(model))
+        } else {
+            model_id
+        };
+        if daemon_route_model_override_is_honored(requested, Some(recorded)).is_err() {
+            // In the Err case `requested` is always Some (None is Ok).
+            anyhow::bail!(
+                "embedding model mismatch: the database was embedded with '{recorded}' but this \
+                 run requested '{}'; use the recorded model or pass --force to switch models \
+                 (re-embeds everything)",
+                requested.unwrap_or_default()
+            );
+        }
+    }
+
     let mut success_count = 0usize;
     let mut error_count = 0usize;
     let mut rejected_count = 0usize;
