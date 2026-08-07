@@ -2701,12 +2701,18 @@ where
             .filter(|e| !e.target_uid.starts_with("unresolved:"))
             .collect();
 
-        // When doing incremental resolution, delete old resolved edges for
-        // affected files before inserting the new ones.
+        // Delete old resolved edges before inserting the new ones, or every
+        // re-resolution accumulates duplicates. Incremental resolution clears
+        // per affected file; a full (unfiltered) run re-creates every
+        // resolved edge in the repo, so it must clear them repo-wide. When
+        // `skip_resolution` holds, nothing is re-created and nothing is
+        // cleared.
         if let Some(ref filter) = resolve_filter {
             for file_path in filter {
                 let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
             }
+        } else if !skip_resolution {
+            let _ = store.delete_resolved_edges_for_repo(&r_uid);
         }
 
         let mut edges_count = insertable_edges.len();
