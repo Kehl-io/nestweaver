@@ -828,15 +828,28 @@ fn finalize_committed_index_with_io(
     refresh_pagerank: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let scope = refresh_pagerank.then(nestweaver_store::GraphScope::code_only);
-    finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref())
+    finalize_committed_index_for_scope_with_io(
+        lease,
+        db_path,
+        operation,
+        io,
+        scope.as_ref(),
+        true,
+    )
 }
 
+/// `publish_clean`: when false (a run that committed AFTER cancellation was
+/// requested), only the invalidation preamble runs — the generation advance,
+/// `.index-dirty` retirement, and the scoped PageRank refresh are skipped so
+/// the publication stays dirty and the next open reconciles it instead of
+/// trusting generation/PageRank state that predates this commit.
 pub(crate) fn finalize_committed_index_for_scope_with_io(
     lease: nestweaver_store::IndexPublicationLease<'_>,
     db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
     pagerank_scope: Option<&nestweaver_store::GraphScope>,
+    publish_clean: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let mut failures = Vec::new();
     let store = lease.store();
@@ -852,64 +865,71 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         true
     };
 
-    let generation_advanced = if db_path.is_some() {
-        lease.clean_generation()
-    } else {
-        store.try_bump_graph_generation()
-    };
-    let generation_durable = match generation_advanced {
-        Err(error) => {
-            push_reconciliation_failure(
-                &mut failures,
-                DeletionReconciliationStage::GenerationPersistence,
-                None,
-                format!("advance graph generation: {error:#}"),
-            );
-            false
-        }
-        Ok(generation) if db_path.is_some() => {
-            let generation_path = crate::sidecar_path(db_path.unwrap(), ".generation");
-            match io.save_generation(store, &generation_path, generation) {
-                Ok(()) => true,
-                Err(error) => {
-                    push_reconciliation_failure(
-                        &mut failures,
-                        DeletionReconciliationStage::GenerationPersistence,
-                        None,
-                        format!("{}: {error:#}", generation_path.display()),
-                    );
-                    false
+    // A cancelled-but-committed run skips the generation advance and the
+    // clean-publish/marker retirement below: `.index-dirty` and the reserved
+    // generation survive so the next open reconciles this publication as
+    // dirty (fail-closed) rather than treating it as a clean commit.
+    let mut publication_clean = false;
+    if publish_clean {
+        let generation_advanced = if db_path.is_some() {
+            lease.clean_generation()
+        } else {
+            store.try_bump_graph_generation()
+        };
+        let generation_durable = match generation_advanced {
+            Err(error) => {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::GenerationPersistence,
+                    None,
+                    format!("advance graph generation: {error:#}"),
+                );
+                false
+            }
+            Ok(generation) if db_path.is_some() => {
+                let generation_path = crate::sidecar_path(db_path.unwrap(), ".generation");
+                match io.save_generation(store, &generation_path, generation) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        push_reconciliation_failure(
+                            &mut failures,
+                            DeletionReconciliationStage::GenerationPersistence,
+                            None,
+                            format!("{}: {error:#}", generation_path.display()),
+                        );
+                        false
+                    }
                 }
             }
-        }
-        Ok(_) => true,
-    };
+            Ok(_) => true,
+        };
 
-    let mut publication_clean = db_path.is_none();
-    if generation_durable
-        && pagerank_safe
-        && let Some(db_path) = db_path
-    {
-        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
-        let retirement =
-            store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
-                lease.publish_clean_generation()?;
-                if let Err(error) = io.clear_marker(&marker_path) {
-                    lease.fail_clean_generation()?;
-                    return Err(error);
-                }
-                lease.complete_generation()?;
-                Ok(())
-            });
-        if let Err(error) = retirement {
-            push_reconciliation_failure(
-                &mut failures,
-                DeletionReconciliationStage::IndexPublicationMarkerRetirement,
-                None,
-                format!("{}: {error:#}", marker_path.display()),
-            );
-        } else {
-            publication_clean = true;
+        publication_clean = db_path.is_none();
+        if generation_durable
+            && pagerank_safe
+            && let Some(db_path) = db_path
+        {
+            let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+            let retirement =
+                store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
+                    lease.publish_clean_generation()?;
+                    if let Err(error) = io.clear_marker(&marker_path) {
+                        lease.fail_clean_generation()?;
+                        return Err(error);
+                    }
+                    lease.complete_generation()?;
+                    Ok(())
+                });
+            if let Err(error) = retirement {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::IndexPublicationMarkerRetirement,
+                    None,
+                    format!("{}: {error:#}", marker_path.display()),
+                );
+            } else {
+                publication_clean = true;
+            }
         }
     }
 
@@ -2881,6 +2901,7 @@ where
                     "recovered index graph write",
                     epilogue_io,
                     Some(&nestweaver_store::GraphScope::unified()),
+                    true,
                 )
                 .map(|()| result)
                 .map_err(anyhow::Error::from),
@@ -2915,13 +2936,34 @@ where
 
     // The write guard stays alive through this mandatory epilogue. Publish
     // invalidation/generation/PageRank on success and every later graph error.
-    let finalization = finalize_committed_index_with_io(
-        publication,
-        store.db_path(),
-        "index graph write",
-        epilogue_io,
-        bump_generation_after_write,
-    );
+    //
+    // Cancellation observed here arrived past every pre-write observation
+    // point, so the graph committed anyway. Do NOT run the clean publish:
+    // `.index-dirty` and the reserved generation must survive so the next
+    // open reconciles this publication as dirty (fail-closed) instead of
+    // trusting a generation/PageRank that predates the commit. The daemon
+    // reports the outcome as committed-after-cancellation. The rest of the
+    // finalizer (pagerank invalidation, failure aggregation, lease release)
+    // is unchanged.
+    let finalization = if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        let scope = bump_generation_after_write.then(nestweaver_store::GraphScope::code_only);
+        finalize_committed_index_for_scope_with_io(
+            publication,
+            store.db_path(),
+            "index graph write (committed after cancellation)",
+            epilogue_io,
+            scope.as_ref(),
+            false,
+        )
+    } else {
+        finalize_committed_index_with_io(
+            publication,
+            store.db_path(),
+            "index graph write",
+            epilogue_io,
+            bump_generation_after_write,
+        )
+    };
     match (graph_result, finalization) {
         (Ok(result), Ok(())) => {
             // nw-124: stamp WHICH resolver produced this repo's edges. Some
@@ -4809,6 +4851,7 @@ mod tests {
             "successful no-op recovery",
             &FileSystemIndexEpilogueIo,
             Some(&nestweaver_store::GraphScope::unified()),
+            true,
         )
         .unwrap();
 

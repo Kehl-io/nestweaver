@@ -64,6 +64,7 @@ impl CodeWatcher {
             "code watcher batch",
             io,
             Some(&GraphScope::code_only()),
+            true,
         )
     }
 
