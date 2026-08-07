@@ -144,6 +144,52 @@ fn cancelled_index_stops_before_reading_or_parsing_any_file() {
     );
 }
 
+/// Cancellation that trips AT the write gate — after the per-file and
+/// post-parse barrier polls have already passed — must still abort the run
+/// before any graph mutation. The flag flips inside the caller-supplied
+/// `acquire_write_guard` closure, so the abort can only come from the poll at
+/// the pre-write boundary: `read_count() > 0` proves files were read and
+/// parsed (ruling out the earlier barrier), and the empty store proves no
+/// write slipped through.
+#[test]
+fn cancelled_at_the_write_gate_bails_after_parsing_without_writing() {
+    let store = GraphStore::in_memory().unwrap();
+    let spy = CountingReader::new(FilesystemReader::new(&testdata_js()));
+    let cancel = Arc::new(AtomicBool::new(false)); // trips only at the write gate
+    let cancel_in_guard = Arc::clone(&cancel);
+
+    let result = nestweaver_engine::index_with_reader_and_write_gate(
+        &spy,
+        &store,
+        "default",
+        "file:///test/js",
+        "abc",
+        None,
+        Some(&cancel),
+        move || {
+            cancel_in_guard.store(true, Ordering::SeqCst);
+            Ok::<(), anyhow::Error>(())
+        },
+    );
+
+    let err = match result {
+        Ok(_) => panic!("an index cancelled at the write gate must return an error"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().to_lowercase().contains("cancel"),
+        "error should mention cancellation, got: {err}"
+    );
+    assert!(
+        spy.read_count() > 0,
+        "the abort happens at the write gate, AFTER parsing — not at the earlier barrier"
+    );
+    assert!(
+        store.list_repos(None).unwrap().is_empty(),
+        "an index cancelled at the write gate must not write the repo into the store"
+    );
+}
+
 #[test]
 fn uncancelled_reader_index_still_reads_and_writes() {
     let store = GraphStore::in_memory().unwrap();

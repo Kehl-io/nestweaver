@@ -828,15 +828,23 @@ fn finalize_committed_index_with_io(
     refresh_pagerank: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let scope = refresh_pagerank.then(nestweaver_store::GraphScope::code_only);
-    finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref())
+    finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref(), true)
 }
 
+/// `publish_clean`: when false (a run that committed AFTER cancellation was
+/// requested), the file-backed generation advance, `.index-dirty` retirement,
+/// and the scoped PageRank refresh are skipped so the publication stays dirty
+/// and the next open reconciles it instead of trusting generation/PageRank
+/// state that predates this commit. In-memory stores are the exception: they
+/// have no `.index-dirty` marker to reconcile on a later open, so their
+/// generation bump still runs (see below).
 pub(crate) fn finalize_committed_index_for_scope_with_io(
     lease: nestweaver_store::IndexPublicationLease<'_>,
     db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
     pagerank_scope: Option<&nestweaver_store::GraphScope>,
+    publish_clean: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let mut failures = Vec::new();
     let store = lease.store();
@@ -852,64 +860,85 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         true
     };
 
-    let generation_advanced = if db_path.is_some() {
-        lease.clean_generation()
-    } else {
-        store.try_bump_graph_generation()
-    };
-    let generation_durable = match generation_advanced {
-        Err(error) => {
+    // A cancelled-but-committed run skips the generation advance and the
+    // clean-publish/marker retirement below: `.index-dirty` and the reserved
+    // generation survive so the next open reconciles this publication as
+    // dirty (fail-closed) rather than treating it as a clean commit.
+    let mut publication_clean = false;
+    if publish_clean {
+        let generation_advanced = if db_path.is_some() {
+            lease.clean_generation()
+        } else {
+            store.try_bump_graph_generation()
+        };
+        let generation_durable = match generation_advanced {
+            Err(error) => {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::GenerationPersistence,
+                    None,
+                    format!("advance graph generation: {error:#}"),
+                );
+                false
+            }
+            Ok(generation) if db_path.is_some() => {
+                let generation_path = crate::sidecar_path(db_path.unwrap(), ".generation");
+                match io.save_generation(store, &generation_path, generation) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        push_reconciliation_failure(
+                            &mut failures,
+                            DeletionReconciliationStage::GenerationPersistence,
+                            None,
+                            format!("{}: {error:#}", generation_path.display()),
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(_) => true,
+        };
+
+        publication_clean = db_path.is_none();
+        if generation_durable
+            && pagerank_safe
+            && let Some(db_path) = db_path
+        {
+            let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+            let retirement =
+                store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
+                    lease.publish_clean_generation()?;
+                    if let Err(error) = io.clear_marker(&marker_path) {
+                        lease.fail_clean_generation()?;
+                        return Err(error);
+                    }
+                    lease.complete_generation()?;
+                    Ok(())
+                });
+            if let Err(error) = retirement {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::IndexPublicationMarkerRetirement,
+                    None,
+                    format!("{}: {error:#}", marker_path.display()),
+                );
+            } else {
+                publication_clean = true;
+            }
+        }
+    } else if db_path.is_none() {
+        // In-memory stores have no `.index-dirty` marker for a later open to
+        // reconcile, so a cancelled-but-committed run would otherwise be
+        // invisible to generation-keyed snapshot readers. Bump the in-memory
+        // generation even though the file-backed clean-publish steps above
+        // stay skipped.
+        if let Err(error) = store.try_bump_graph_generation() {
             push_reconciliation_failure(
                 &mut failures,
                 DeletionReconciliationStage::GenerationPersistence,
                 None,
                 format!("advance graph generation: {error:#}"),
             );
-            false
-        }
-        Ok(generation) if db_path.is_some() => {
-            let generation_path = crate::sidecar_path(db_path.unwrap(), ".generation");
-            match io.save_generation(store, &generation_path, generation) {
-                Ok(()) => true,
-                Err(error) => {
-                    push_reconciliation_failure(
-                        &mut failures,
-                        DeletionReconciliationStage::GenerationPersistence,
-                        None,
-                        format!("{}: {error:#}", generation_path.display()),
-                    );
-                    false
-                }
-            }
-        }
-        Ok(_) => true,
-    };
-
-    let mut publication_clean = db_path.is_none();
-    if generation_durable
-        && pagerank_safe
-        && let Some(db_path) = db_path
-    {
-        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
-        let retirement =
-            store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
-                lease.publish_clean_generation()?;
-                if let Err(error) = io.clear_marker(&marker_path) {
-                    lease.fail_clean_generation()?;
-                    return Err(error);
-                }
-                lease.complete_generation()?;
-                Ok(())
-            });
-        if let Err(error) = retirement {
-            push_reconciliation_failure(
-                &mut failures,
-                DeletionReconciliationStage::IndexPublicationMarkerRetirement,
-                None,
-                format!("{}: {error:#}", marker_path.display()),
-            );
-        } else {
-            publication_clean = true;
         }
     }
 
@@ -1898,9 +1927,14 @@ where
 
         // Cooperative cancellation: once the daemon trips the flag (index
         // timeout or client disconnect), skip the expensive read+parse for
-        // every remaining file so all cores are freed promptly. The index
-        // then bails before any graph mutation (checked right after the
-        // collect), so no partial/empty graph is ever persisted.
+        // every remaining file so all cores are freed promptly. Cancellation
+        // is observed here per-file during parse, at the post-parse barrier
+        // below, and once more at the pre-write boundary after the write
+        // guard is acquired — all before any graph mutation, so an index
+        // cancelled at those points never persists a partial/empty graph.
+        // A cancel that lands after the pre-write boundary still commits;
+        // the daemon reports that as committed-after-cancellation and names
+        // `index --force` as the repair.
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
             parse_pb.inc(1);
             return ParseOutcome::Skipped(SkippedFile {
@@ -1996,10 +2030,16 @@ where
     parse_pb.finish_and_clear();
     drop(_phase2_span);
 
-    // Cooperative cancellation: if the flag tripped during the parallel parse,
-    // bail now — BEFORE collection, resolution, and any graph mutation — so a
-    // cancelled index never persists a partial/empty graph. The `?` returns
-    // ahead of the write gate below, preserving the no-partial-write invariant.
+    // Cooperative cancellation, post-parse barrier: if the flag tripped
+    // during the parallel parse, bail now — BEFORE collection, resolution,
+    // and any graph mutation. This is one of three observation points
+    // (per-file during parse above, here, and at the pre-write boundary
+    // after the write guard is acquired); an index cancelled at any of them
+    // persists nothing. The no-partial-write invariant does NOT extend past
+    // the pre-write boundary: a cancel landing after it still commits, the
+    // publication is left dirty for the next open to reconcile, and the
+    // daemon reports the run as committed-after-cancellation, naming
+    // `index --force` as the repair.
     if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
         anyhow::bail!("index cancelled");
     }
@@ -2253,6 +2293,20 @@ where
     drop(_phase_collect_span);
 
     let _write_guard = acquire_write_guard()?;
+
+    // Last cancellation observation point. Bailing in this window needs no
+    // teardown: the marker call below is what creates `.index-dirty` and
+    // reserves the generation, so nothing owned by this run exists yet and
+    // any pre-existing `.index-dirty` (a prior interrupted publication)
+    // stays untouched for its own recovery. A cancel that lands AFTER this
+    // poll still commits; the committed finalizer then keeps the
+    // publication dirty and the daemon reports committed-after-cancellation.
+    // The incremental path (`incremental_index_with_reader_and_write_gate`)
+    // takes no cancel token by design this cycle.
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        anyhow::bail!("index cancelled");
+    }
+
     let publication = establish_index_publication_marker_with_io(
         store,
         store.db_path(),
@@ -2881,6 +2935,7 @@ where
                     "recovered index graph write",
                     epilogue_io,
                     Some(&nestweaver_store::GraphScope::unified()),
+                    true,
                 )
                 .map(|()| result)
                 .map_err(anyhow::Error::from),
@@ -2915,13 +2970,36 @@ where
 
     // The write guard stays alive through this mandatory epilogue. Publish
     // invalidation/generation/PageRank on success and every later graph error.
-    let finalization = finalize_committed_index_with_io(
-        publication,
-        store.db_path(),
-        "index graph write",
-        epilogue_io,
-        bump_generation_after_write,
-    );
+    //
+    // Cancellation observed here arrived past every pre-write observation
+    // point, so the graph committed anyway. Do NOT run the clean publish:
+    // `.index-dirty` and the reserved generation must survive so the next
+    // open reconciles this publication as dirty (fail-closed) instead of
+    // trusting a generation/PageRank that predates the commit. The daemon
+    // reports the outcome as committed-after-cancellation. The rest of the
+    // finalizer (pagerank invalidation, failure aggregation, lease release)
+    // is unchanged.
+    let finalization = if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        finalize_committed_index_for_scope_with_io(
+            publication,
+            store.db_path(),
+            "index graph write (committed after cancellation)",
+            epilogue_io,
+            // The scoped PageRank refresh is gated on `publication_clean`,
+            // which stays false for a cancelled commit — pass `None` so the
+            // skip is explicit rather than implied by a dead scope.
+            None,
+            false,
+        )
+    } else {
+        finalize_committed_index_with_io(
+            publication,
+            store.db_path(),
+            "index graph write",
+            epilogue_io,
+            bump_generation_after_write,
+        )
+    };
     match (graph_result, finalization) {
         (Ok(result), Ok(())) => {
             // nw-124: stamp WHICH resolver produced this repo's edges. Some
@@ -4809,6 +4887,7 @@ mod tests {
             "successful no-op recovery",
             &FileSystemIndexEpilogueIo,
             Some(&nestweaver_store::GraphScope::unified()),
+            true,
         )
         .unwrap();
 
@@ -7235,6 +7314,221 @@ function hello(name) { return "Hello " + name; }
         );
         assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
         assert!(store.symbols_in_file("old.js").unwrap().is_empty());
+    }
+
+    /// Trips the cancel flag inside `establish_marker`, which the index runs
+    /// immediately AFTER the pre-write cancellation poll — so the run passes
+    /// every abort point and can only observe the cancellation at the
+    /// committed finalizer, exactly like a timeout or Ctrl-C that lands
+    /// mid-write.
+    struct CancelOnMarkerIo {
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl IndexEpilogueIo for CancelOnMarkerIo {
+        fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.establish_marker(path)?;
+            self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.clear_marker(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            FileSystemIndexEpilogueIo.remove_file(path)
+        }
+
+        fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            FileSystemIndexEpilogueIo.rename_file(from, to)
+        }
+
+        fn save_generation(
+            &self,
+            store: &GraphStore,
+            path: &Path,
+            generation: u64,
+        ) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.save_generation(store, path, generation)
+        }
+
+        fn compute_pagerank(
+            &self,
+            store: &GraphStore,
+            scope: &nestweaver_store::GraphScope,
+        ) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.compute_pagerank(store, scope)
+        }
+
+        fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.save_pagerank(store, path)
+        }
+    }
+
+    /// A cancellation observed only AFTER the last pre-write poll cannot abort
+    /// the run — the graph commits — but the publication must stay dirty:
+    /// `.index-dirty` survives and the durable generation is not advanced, so
+    /// the next open reconciles the publication fail-closed instead of
+    /// trusting a generation/PageRank that predates the commit.
+    #[test]
+    fn cancelled_commit_keeps_publication_dirty_and_generation_unpublished() {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.js"), "function kept() { return 1; }").unwrap();
+        let repo_url = "https://example.com/cancelled-commit";
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let result = index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-1",
+                name: None,
+                cancel: Some(&cancel),
+                epilogue_io: &CancelOnMarkerIo {
+                    cancel: Arc::clone(&cancel),
+                },
+            },
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .expect("a cancellation past the last pre-write poll cannot abort the commit");
+
+        assert!(result.files_count > 0, "the run indexed the file");
+        assert!(
+            store
+                .list_repos(Some("test"))
+                .unwrap()
+                .iter()
+                .any(|repo| repo.url == repo_url),
+            "the cancelled run's graph mutation IS persisted"
+        );
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        assert!(
+            marker_path.exists(),
+            "a cancelled commit must leave the publication dirty"
+        );
+        assert!(
+            !generation_path.exists(),
+            "a cancelled commit must not durably advance the generation"
+        );
+        drop(store);
+
+        // Reconciliation on the next open is fail-closed: the committed graph
+        // is there, but the dirty marker blocks trusting generation/PageRank
+        // state until a successful writer heals the publication.
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            reopened.is_index_publication_dirty(),
+            "the dirty marker must survive reopen"
+        );
+        assert_eq!(
+            reopened.graph_generation(),
+            u64::MAX,
+            "with no published `.generation` and the dirty marker present, reopen must \
+             report the fail-closed sentinel rather than a trustworthy generation"
+        );
+        assert!(
+            reopened
+                .list_repos(Some("test"))
+                .unwrap()
+                .iter()
+                .any(|repo| repo.url == repo_url),
+            "the committed graph survives reopen"
+        );
+    }
+
+    /// In-memory stores have no `.index-dirty` marker for a later open to
+    /// reconcile, so a cancelled-but-committed run must still bump the
+    /// in-memory generation — otherwise the commit is invisible to
+    /// generation-keyed snapshot readers.
+    #[test]
+    fn cancelled_commit_still_bumps_in_memory_generation() {
+        let store = GraphStore::in_memory().unwrap();
+        store.bump_graph_generation();
+        let before = store.graph_generation();
+
+        let lease = establish_index_publication_marker_with_io(
+            &store,
+            None,
+            "cancelled in-memory commit",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        finalize_committed_index_for_scope_with_io(
+            lease,
+            None,
+            "cancelled in-memory commit",
+            &FileSystemIndexEpilogueIo,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.graph_generation(),
+            before + 1,
+            "in-memory stores have no dirty marker, so the generation bump must still run"
+        );
+    }
+
+    /// Control for the cancelled-commit test: the same run without a
+    /// cancellation retires `.index-dirty` and durably publishes the advanced
+    /// generation.
+    #[test]
+    fn uncancelled_commit_retires_marker_and_publishes_generation() {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.js"), "function kept() { return 1; }").unwrap();
+        let repo_url = "https://example.com/uncancelled-commit";
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let generation_before = store.graph_generation();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-1",
+                name: None,
+                cancel: Some(&cancel),
+                epilogue_io: &FileSystemIndexEpilogueIo,
+            },
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .expect("an uncancelled index must succeed");
+
+        assert!(
+            !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "a clean commit retires the dirty marker"
+        );
+        assert!(store.graph_generation() > generation_before);
+        assert_eq!(
+            fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            store.graph_generation(),
+            "a clean commit durably publishes the advanced generation"
+        );
+        assert!(!store.is_index_publication_dirty());
     }
 
     #[test]
