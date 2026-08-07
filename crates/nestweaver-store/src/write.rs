@@ -7102,6 +7102,97 @@ mod tests {
             .unwrap();
     }
 
+    /// The repo-wide resolved-edge clear deletes exactly the resolved rel
+    /// types for exactly the named repo: edges sourced from other repos
+    /// survive (including edges INTO the named repo), and CROSS_REPO_LINK —
+    /// deliberately excluded from the resolved-edge list — survives even for
+    /// the named repo.
+    #[test]
+    fn delete_resolved_edges_for_repo_scopes_by_repo_and_rel_type() {
+        let store = GraphStore::in_memory().expect("store");
+
+        let sym = |uid: &str, repo: &str| Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: format!("{uid}.js"),
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let edge = |src: &str, tgt: &str, ty: EdgeType| ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: tgt.to_string(),
+            edge_type: ty,
+            confidence: 1.0,
+            link_type: None,
+            evidence: Vec::new(),
+        };
+
+        for s in [
+            sym("a1", "repo:a"),
+            sym("a2", "repo:a"),
+            sym("b1", "repo:b"),
+            sym("b2", "repo:b"),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        store
+            .insert_edge(&edge("a1", "a2", EdgeType::Calls))
+            .unwrap();
+        store
+            .insert_edge(&edge("a1", "a2", EdgeType::MemberOf))
+            .unwrap();
+        store
+            .insert_edge(&edge("b1", "b2", EdgeType::Calls))
+            .unwrap();
+        store
+            .insert_edge(&edge("b1", "a1", EdgeType::Calls))
+            .unwrap();
+        let mut cross = edge("a1", "b1", EdgeType::CrossRepoLink);
+        cross.link_type = Some(nestweaver_schema::CrossRepoLinkType::SharedImport);
+        store.insert_edge(&cross).unwrap();
+
+        store.delete_resolved_edges_for_repo("repo:a").unwrap();
+
+        let remaining: std::collections::HashSet<(String, String, String)> = store
+            .load_typed_edges()
+            .unwrap()
+            .into_iter()
+            .map(|(src, tgt, ty, _conf, _ev)| (src, tgt, ty))
+            .collect();
+        assert_eq!(
+            remaining,
+            [
+                ("b1".to_string(), "b2".to_string(), "CALLS".to_string()),
+                ("b1".to_string(), "a1".to_string(), "CALLS".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            "only repo:a's resolved edges (CALLS, MEMBER_OF) may be deleted"
+        );
+        // CROSS_REPO_LINK is deliberately outside the resolved-edge list and
+        // must survive even for the named repo. (`load_typed_edges` only
+        // walks ALL_SYMBOL_EDGE_TYPES, so assert via the dedicated reader.)
+        let cross_links = store.list_all_cross_repo_links(10).unwrap();
+        assert_eq!(
+            cross_links.len(),
+            1,
+            "the CROSS_REPO_LINK from repo:a must survive the repo-wide clear"
+        );
+    }
+
     /// nw-112: a merge must CONSERVE the wikilink graph.
     ///
     /// `reparent_vault` captures notes, headings, sections, tags and their edges
