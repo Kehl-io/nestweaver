@@ -38,6 +38,11 @@ pub struct EmbeddingIndex {
     ///
     /// [`reset_force_guard`]: EmbeddingIndex::reset_force_guard
     force_cleared: bool,
+    /// The model id recorded in the database's embedding metadata, loaded once
+    /// by `GraphStore` at open (and refreshed when new metadata is stamped) —
+    /// never read per-add. `None` means unknown (never stamped, or unreadable),
+    /// and unknown always allows the write: the dimension guard still applies.
+    recorded_model_id: Option<String>,
 }
 
 impl Default for EmbeddingIndex {
@@ -51,7 +56,17 @@ impl EmbeddingIndex {
         Self {
             embeddings: HashMap::new(),
             force_cleared: false,
+            recorded_model_id: None,
         }
+    }
+
+    /// Record the model id the database's embedding metadata names as the
+    /// producer of this index's vectors. Called once by `GraphStore` at open
+    /// and again whenever new metadata is stamped; `None` marks the producer
+    /// as unknown, which disables the model guard (writes are then guarded by
+    /// dimension only).
+    pub fn set_recorded_model_id(&mut self, model_id: Option<String>) {
+        self.recorded_model_id = model_id;
     }
 
     /// Insert an embedding. Returns `true` if accepted, `false` if rejected
@@ -62,8 +77,47 @@ impl EmbeddingIndex {
     /// already stored, the entire index is cleared on the first mismatch so
     /// the new dimension becomes authoritative — this is the model-switch path.
     /// The clear happens at most once per run (see `force_cleared`).
+    ///
+    /// This entry point names no producing model, so the model guard is
+    /// skipped (unknown producer); embed runs should use [`add_with_model`].
+    ///
+    /// [`add_with_model`]: EmbeddingIndex::add_with_model
     #[must_use = "a false return means the dimension guard rejected the embedding"]
     pub fn add(&mut self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
+        self.add_with_model(uid, embedding, None, force)
+    }
+
+    /// Like [`add`], but also refuses a vector produced by a different model
+    /// than the one recorded for this index, even at the same dimension:
+    /// contrastively trained spaces share no basis, so mixing two models'
+    /// vectors makes the index unusable for retrieval. The rejection names
+    /// both model ids. `force` allows the switch (a `--force` run re-embeds
+    /// everything, so no mixture survives). A `None` recorded or incoming
+    /// model id is unknown and always allowed — the dimension guard still
+    /// applies.
+    ///
+    /// [`add`]: EmbeddingIndex::add
+    #[must_use = "a false return means a guard rejected the embedding"]
+    pub fn add_with_model(
+        &mut self,
+        uid: &str,
+        embedding: Vec<f32>,
+        model_id: Option<&str>,
+        force: bool,
+    ) -> bool {
+        if let (Some(recorded), Some(incoming)) = (self.recorded_model_id.as_deref(), model_id)
+            && recorded != incoming
+            && !force
+        {
+            tracing::warn!(
+                uid,
+                recorded,
+                incoming,
+                "skipping embedding from a different model than the one recorded for this \
+                 index (re-embed with --force to switch models)"
+            );
+            return false;
+        }
         if let Some(existing) = self.embeddings.values().next()
             && embedding.len() != existing.len()
         {
@@ -117,6 +171,7 @@ impl EmbeddingIndex {
         Ok(Self {
             embeddings,
             force_cleared: false,
+            recorded_model_id: None,
         })
     }
 
@@ -213,6 +268,7 @@ impl EmbeddingIndex {
         Ok(Self {
             embeddings,
             force_cleared: false,
+            recorded_model_id: None,
         })
     }
 

@@ -5615,7 +5615,12 @@ impl NestWeaverDaemon for DaemonService {
                             match model.embed_query(&text) {
                                 Ok(emb) => {
                                     let emb_dim = emb.len();
-                                    if store.add_embedding_with_force(&sym.uid, emb, force) {
+                                    if store.add_embedding_with_force(
+                                        &sym.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb_dim);
@@ -5650,7 +5655,12 @@ impl NestWeaverDaemon for DaemonService {
                             match model.embed_query(&text) {
                                 Ok(emb) => {
                                     let emb_dim = emb.len();
-                                    if store.add_embedding_with_force(&note.uid, emb, force) {
+                                    if store.add_embedding_with_force(
+                                        &note.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb_dim);
@@ -5685,7 +5695,12 @@ impl NestWeaverDaemon for DaemonService {
                             match model.embed_query(&text) {
                                 Ok(emb) => {
                                     let emb_dim = emb.len();
-                                    if store.add_embedding_with_force(&heading.uid, emb, force) {
+                                    if store.add_embedding_with_force(
+                                        &heading.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb_dim);

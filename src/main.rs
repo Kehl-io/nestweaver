@@ -16377,15 +16377,16 @@ where
                         let elapsed = t0.elapsed();
                         if resp.rejected > 0 {
                             eprintln!(
-                                "Error: {} embedding(s) rejected due to dimension mismatch. \
-                                 Use --force to switch models (clears existing embeddings).",
+                                "Error: {} embedding(s) rejected by the embedding guards \
+                                 (model or dimension mismatch). Use --force to switch models \
+                                 (clears existing embeddings).",
                                 resp.rejected
                             );
                         }
                         if stats {
                             eprintln!(
                                 "Embed stats: {} succeeded, {} failed, \
-                                 {} rejected (dim mismatch), {} eligible, \
+                                 {} rejected (model/dim mismatch), {} eligible, \
                                  {} already embedded, {} scoped node(s), {:.2}s elapsed",
                                 resp.succeeded,
                                 resp.failed,
@@ -16546,7 +16547,7 @@ where
                         Ok(embeddings) => {
                             for (sym, emb) in chunk.iter().zip(embeddings) {
                                 let emb_dim = emb.len();
-                                if store.add_embedding_with_force(&sym.uid, emb, force) {
+                                if store.add_embedding_with_force(&sym.uid, emb, api_model, force) {
                                     success_count += 1;
                                     if produced_dim.is_none() {
                                         produced_dim = Some(emb_dim);
@@ -16590,7 +16591,8 @@ where
                         Ok(embeddings) => {
                             for (note, emb) in chunk.iter().zip(embeddings) {
                                 let emb_dim = emb.len();
-                                if store.add_embedding_with_force(&note.uid, emb, force) {
+                                if store.add_embedding_with_force(&note.uid, emb, api_model, force)
+                                {
                                     success_count += 1;
                                     if produced_dim.is_none() {
                                         produced_dim = Some(emb_dim);
@@ -16653,7 +16655,7 @@ where
                         Ok(embeddings) => {
                             for (h, emb) in chunk.iter().zip(embeddings) {
                                 let emb_dim = emb.len();
-                                if store.add_embedding_with_force(&h.uid, emb, force) {
+                                if store.add_embedding_with_force(&h.uid, emb, api_model, force) {
                                     success_count += 1;
                                     if produced_dim.is_none() {
                                         produced_dim = Some(emb_dim);
@@ -16711,8 +16713,12 @@ where
                         match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(&sym.uid, emb.clone(), force)
-                                    {
+                                    if store.add_embedding_with_force(
+                                        &sym.uid,
+                                        emb.clone(),
+                                        local_model_id,
+                                        force,
+                                    ) {
                                         success_count += 1;
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb.len());
@@ -16758,8 +16764,12 @@ where
                         match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(&note.uid, emb.clone(), force)
-                                    {
+                                    if store.add_embedding_with_force(
+                                        &note.uid,
+                                        emb.clone(),
+                                        local_model_id,
+                                        force,
+                                    ) {
                                         success_count += 1;
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb.len());
@@ -16818,7 +16828,12 @@ where
                         match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (h, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(&h.uid, emb.clone(), force) {
+                                    if store.add_embedding_with_force(
+                                        &h.uid,
+                                        emb.clone(),
+                                        local_model_id,
+                                        force,
+                                    ) {
                                         success_count += 1;
                                         if produced_dim.is_none() {
                                             produced_dim = Some(emb.len());
@@ -16858,8 +16873,9 @@ where
 
     if rejected_count > 0 {
         eprintln!(
-            "Error: {rejected_count} embedding(s) rejected due to dimension mismatch. \
-             Use --force to switch models (clears existing embeddings)."
+            "Error: {rejected_count} embedding(s) rejected by the embedding guards \
+             (model or dimension mismatch). Use --force to switch models \
+             (clears existing embeddings)."
         );
     }
 
@@ -16902,7 +16918,7 @@ where
         let elapsed = t0.elapsed();
         eprintln!(
             "Embed stats: {success_count} succeeded, {error_count} failed, \
-             {rejected_count} rejected (dim mismatch), {:.2}s elapsed",
+             {rejected_count} rejected (model/dim mismatch), {:.2}s elapsed",
             elapsed.as_secs_f64()
         );
     } else {
