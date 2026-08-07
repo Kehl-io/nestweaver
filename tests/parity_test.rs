@@ -450,6 +450,19 @@ fn parity_affected_tests_direct_vs_daemon() {
     );
 }
 
+/// `contracts drift` had the nw-097 divergence in its purest form: the daemon
+/// branch printed the MCP envelope (totals, `clean`, `limit`, truncated
+/// buckets) while the direct branch printed a BARE `DriftReport` — different
+/// keys, no verdict, and no truncation at all. Human output matched, so only
+/// `--json` exposed it, and this file is where that class of divergence is
+/// caught. The fixture declares no specs and no route handlers, so this also
+/// pins the healthy-empty case: both modes must agree that it is clean.
+#[test]
+fn parity_contracts_drift_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(&fixture.db_path, "contracts drift", &["contracts", "drift"]);
+}
+
 /// nw-108: `dead-code`'s daemon branch printed the RPC response verbatim with
 /// no `if json` guard, so the OUTPUT FORMAT depended on whether a daemon
 /// happened to be running rather than on the flag — text standalone, JSON once
