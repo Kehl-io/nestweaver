@@ -2196,7 +2196,9 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     index_repo(&local_repo, &db_local);
 
     let server = helpers::server_guard::ServerGuard::start_with_auth(&db_server, HYBRID_TOKEN);
-    let _local_guard = helpers::server_guard::ServerGuard::start(&db_local);
+    let cfg_path = dir.path().join("instance.toml");
+    write_upstream_config(&cfg_path, "server", &server.grpc_addr(), HYBRID_TOKEN);
+    let _local_guard = helpers::server_guard::ServerGuard::start_with_config(&db_local, &cfg_path);
 
     let mut local = connect_local(&db_local).await;
 
@@ -2323,8 +2325,6 @@ async fn hybrid_brain_search_merge_combines_local_and_server_sources() {
     // Exercise the real non-JSON CLI renderer through daemon + configured
     // merge routing. A hybrid result must never claim it is a substring
     // fallback merely because its engine is not the single-source "bm25".
-    let cfg_path = dir.path().join("instance.toml");
-    write_upstream_config(&cfg_path, "server", &server.grpc_addr(), HYBRID_TOKEN);
     // Retry-bound the CLI probe: even with the generous upstream timeout, a
     // transient ejection under CI load may yield a local-only first answer;
     // the circuit breaker re-probes and recovers, so the hybrid path must

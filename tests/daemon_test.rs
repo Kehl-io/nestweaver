@@ -1133,9 +1133,12 @@ fn daemon_crash_recovery() {
 fn daemon_restart_preserves_and_overrides_live_effective_config_without_early_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
     let db_path = dir.path().join("restart-config").join("test.lbug");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     write_test_repo(&repo_dir);
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Config continuity\n").unwrap();
     create_db(&repo_dir, &db_path);
     let _guard = DaemonGuard::new(&db_path);
 
@@ -1193,6 +1196,20 @@ credential_method = "gh"
         assert!(output.status.success(), "status failed: {output:?}");
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
+    let list_vaults = || {
+        let output = daemon_cmd()
+            .args([
+                "brain",
+                "list",
+                "--json",
+                "--db",
+                &db_path.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "brain list failed: {output:?}");
+        output.stdout
+    };
     let index_and_assert_instance = |repo_name: &str, expected_instance: &str| {
         let indexed_repo = dir.path().join(repo_name);
         write_test_repo(&indexed_repo);
@@ -1232,6 +1249,20 @@ credential_method = "gh"
         .success();
     let pid_a = read_pid();
     assert!(status().contains(&format!("Config: {}", canonical_a.display())));
+
+    daemon_cmd()
+        .args([
+            "brain",
+            "add",
+            &vault_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_a.display().to_string(),
+        ])
+        .assert()
+        .success();
+    let vaults_before_mismatch = list_vaults();
 
     // A direct start against a live daemon may succeed only when the explicit
     // path canonicalizes to the daemon's typed configured provenance. Neither
@@ -1300,6 +1331,104 @@ credential_method = "gh"
         .failure()
         .stderr(contains("restart --config"));
     assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+    assert_eq!(list_vaults(), vaults_before_mismatch);
+
+    // Read commands must enforce the same identity contract. In particular,
+    // brain search used to swallow HybridClient::connect's mismatch and return
+    // a successful direct-disk result, silently discarding the explicit config.
+    daemon_cmd()
+        .args([
+            "brain",
+            "search",
+            "test",
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("refusing direct")
+                .and(contains("fallback"))
+                .and(contains("restart --config")),
+        );
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+
+    daemon_cmd()
+        .args([
+            "brain",
+            "add",
+            &vault_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("restart --config"));
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+    assert_eq!(list_vaults(), vaults_before_mismatch);
+
+    daemon_cmd()
+        .args([
+            "brain",
+            "refresh",
+            &vault_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("restart --config"));
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+    assert_eq!(list_vaults(), vaults_before_mismatch);
+
+    // An explicit, authorized direct bypass is not a daemon fallback and must
+    // retain its legacy behavior even when the live daemon uses another config.
+    no_daemon_cmd()
+        .args([
+            "--no-daemon",
+            "brain",
+            "search",
+            "test",
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let occupied_ui_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_ui_port_arg = occupied_ui_port.local_addr().unwrap().port().to_string();
+    daemon_cmd()
+        .args([
+            "ui",
+            "--no-open",
+            "--port",
+            &occupied_ui_port_arg,
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("refusing direct")
+                .and(contains("fallback"))
+                .and(contains("restart --config")),
+        );
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
 
     daemon_action_cmd(&db_path, "restart").assert().success();
     let pid_preserved = read_pid();
@@ -1381,6 +1510,21 @@ credential_method = "gh"
 
     // Cold restart ignores a stale sidecar. Omitted config is an explicit
     // compiled-default decision; an explicit path is still validated/chosen.
+    daemon_action_cmd(&db_path, "stop").assert().success();
+    // A configless query preserves legacy availability when it starts with no
+    // daemon (autostart where possible, direct fallback if connect cannot win).
+    daemon_cmd()
+        .args([
+            "brain",
+            "search",
+            "test",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+    // The query may have autostarted a compiled-default daemon; restore the
+    // stopped precondition for the stale-sidecar cold-start case below.
     daemon_action_cmd(&db_path, "stop").assert().success();
     nestweaver_daemon::lifecycle::write_effective_config_binding(
         &instance_id,
