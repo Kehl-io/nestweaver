@@ -383,7 +383,7 @@ fn effective_config_proto(provenance: &EffectiveConfigProvenance) -> EffectiveCo
 
 fn load_daemon_instance_config(
     config_path: Option<&Path>,
-    server_mode: bool,
+    _server_mode: bool,
 ) -> anyhow::Result<(
     Option<Arc<nestweaver_engine::InstanceConfig>>,
     EffectiveConfigProvenance,
@@ -399,34 +399,23 @@ fn load_daemon_instance_config(
                 );
                 Ok((Some(Arc::new(config)), provenance))
             }
-            Err(error) if path.exists() => {
-                // Present but broken. Surface to the console (docker/foreground
-                // operators never see the rotating log) and fail fast in server
-                // mode so a typo can't masquerade as a healthy-but-empty server.
-                eprintln!(
-                    "[daemon] failed to parse --config {}: {error}",
-                    path.display()
-                );
+            Err(error) => {
+                // Any explicitly supplied config is a binding, not a hint.
+                // This applies equally to UDS and network server modes: a
+                // version-mismatch restart prevalidates its captured path, but
+                // the file can disappear or change before the replacement
+                // parses it. Falling back here would silently fork identity and
+                // widen configured authorization to compiled defaults.
+                eprintln!("[daemon] cannot honor --config {}: {error}", path.display());
                 tracing::error!(
                     config = %path.display(),
                     error = %error,
-                    "failed to parse --config"
+                    "cannot honor explicitly supplied --config"
                 );
-                if server_mode {
-                    anyhow::bail!(
-                        "invalid --config {}: {error} (server mode requires a parseable config)",
-                        path.display()
-                    );
-                }
-                Ok((None, EffectiveConfigProvenance::CompiledDefaults))
-            }
-            Err(error) => {
-                tracing::warn!(
-                    config = %path.display(),
-                    error = %error,
-                    "instance config not found — using built-in defaults"
-                );
-                Ok((None, EffectiveConfigProvenance::CompiledDefaults))
+                anyhow::bail!(
+                    "invalid or unreadable --config {}: {error}; explicitly supplied config must be honored",
+                    path.display()
+                )
             }
         },
     }
@@ -7771,11 +7760,10 @@ pub async fn run_server(
     // tool dispatch (e.g. F6 `[ranking]` priors in `brain_search`) can apply
     // it without re-parsing the file per RPC.
     //
-    // Distinguish a MISSING file (non-fatal — the daemon serves with built-in
-    // defaults) from a file that is PRESENT but unparseable. In server mode a
-    // malformed config means the server would silently index nothing and have no
-    // webhook secret; that failure must be loud (stderr) and fatal rather than a
-    // warning buried in the rotating log file.
+    // An explicitly supplied path is a binding, not a discovery hint. Missing,
+    // unreadable, or malformed input is fatal in both UDS and network server
+    // modes; otherwise a restart-time file race could silently demote the
+    // instance to compiled-default identity and authorization.
     let (instance_cfg, effective_config) =
         load_daemon_instance_config(config_path, server_opts.is_some())?;
     let live_binding = lifecycle::EffectiveConfigBinding::new(
@@ -14372,6 +14360,41 @@ credential_method = "gh"
         assert!(
             error.to_string().contains("not valid UTF-8"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn uds_config_loader_rejects_missing_explicit_config_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("deleted-after-restart-prepare.toml");
+
+        let error = load_daemon_instance_config(Some(&missing), false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("invalid or unreadable --config"),
+            "{message}"
+        );
+        assert!(
+            message.contains("explicitly supplied config must be honored"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn uds_config_loader_rejects_malformed_explicit_config_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = dir.path().join("changed-after-restart-prepare.toml");
+        std::fs::write(&malformed, "instance_id = [not-valid").unwrap();
+
+        let error = load_daemon_instance_config(Some(&malformed), false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("invalid or unreadable --config"),
+            "{message}"
+        );
+        assert!(
+            message.contains("explicitly supplied config must be honored"),
+            "{message}"
         );
     }
 
