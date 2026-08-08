@@ -6891,7 +6891,7 @@ mod embedding_load_config_tests {
             .finish();
 
         tracing::subscriber::with_default(subscriber, || {
-            log_embedding_ready("local", "cpu", "test-owner/test-model", cache.path());
+            log_embedding_ready("local", "cpu", "test-owner/test-model", Some(cache.path()));
         });
 
         let rendered = {
@@ -7036,6 +7036,33 @@ mod embedding_load_config_tests {
         assert!(status.error.contains("~/models"));
         assert!(status.error.contains("no home directory"));
         assert!(status.error.contains("absolute path"));
+    }
+
+    #[test]
+    fn external_embedding_ignores_unexpandable_local_cache_dir() {
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            cache_dir: "~/models".to_string(),
+            external_endpoint: Some("http://127.0.0.1:11434/v1".to_string()),
+            external_model: Some("test-external-model".to_string()),
+            ..Default::default()
+        };
+        let resolver_called = std::cell::Cell::new(false);
+
+        let cache_dir = embedding_cache_dir_for_load_with(&cfg, |_| {
+            resolver_called.set(true);
+            Err(
+                nestweaver_engine::ResolveUserPathError::HomeDirectoryUnavailable {
+                    input: cfg.cache_dir.clone(),
+                },
+            )
+        })
+        .expect("external embedding must not resolve an irrelevant local cache path");
+
+        assert!(!resolver_called.get());
+        assert!(cache_dir.as_os_str().is_empty());
+        let load_config = embedding_load_config(&cfg, cache_dir, None);
+        assert_eq!(load_config.external_endpoint, cfg.external_endpoint);
+        assert_eq!(load_config.external_model, cfg.external_model);
     }
 }
 
@@ -7259,19 +7286,45 @@ fn embedding_cache_dir_resolution_failure_status(
 }
 
 #[cfg(feature = "embed")]
+fn embedding_cache_dir_for_load_with<E, Resolve>(
+    cfg: &nestweaver_engine::config::EmbeddingConfig,
+    resolve: Resolve,
+) -> Result<std::path::PathBuf, E>
+where
+    Resolve: FnOnce(&str) -> Result<std::path::PathBuf, E>,
+{
+    if cfg.external_endpoint.is_some() {
+        // External backends do not consume Hugging Face artifacts. Keep their
+        // construction independent of an irrelevant local cache path.
+        Ok(std::path::PathBuf::new())
+    } else {
+        resolve(&cfg.cache_dir)
+    }
+}
+
+#[cfg(feature = "embed")]
 fn log_embedding_ready(
     backend: &str,
     selected_device: &str,
     model_id: &str,
-    cache_dir: &std::path::Path,
+    cache_dir: Option<&std::path::Path>,
 ) {
-    tracing::info!(
-        backend,
-        device = selected_device,
-        model_id,
-        cache_dir = %cache_dir.display(),
-        "Embedding model ready"
-    );
+    if let Some(cache_dir) = cache_dir {
+        tracing::info!(
+            backend,
+            device = selected_device,
+            model_id,
+            cache_dir = %cache_dir.display(),
+            "Embedding model ready"
+        );
+    } else {
+        tracing::info!(
+            backend,
+            device = selected_device,
+            model_id,
+            "Embedding model ready"
+        );
+    }
 }
 
 /// Load the embedding model into `state.embedding_runtime`. MUST be called on the daemon's main
@@ -7332,23 +7385,26 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
             );
         }
     }
-    // Resolve the configured cache dir: expand a leading tilde and absolutize
-    // relative paths so diagnostics always name a usable location.
-    let cache_dir = match nestweaver_engine::resolve_user_path(&cfg.cache_dir) {
-        Ok(cache_dir) => cache_dir,
-        Err(error) => {
-            let status = embedding_cache_dir_resolution_failure_status(
-                state.embedding_runtime.status(),
-                state.store.embedding_index_dimension(),
-                &cfg.cache_dir,
-                &error,
-            );
-            let message = status.error.clone();
-            state.embedding_runtime.publish_unavailable(status);
-            tracing::warn!("Failed to resolve embedding cache directory: {message}");
-            return;
-        }
-    };
+    // Local backends resolve the configured cache dir: expand a leading tilde
+    // and absolutize relative paths so diagnostics always name a usable
+    // location. External backends do not consume this setting and must remain
+    // independent of it.
+    let cache_dir =
+        match embedding_cache_dir_for_load_with(&cfg, nestweaver_engine::resolve_user_path) {
+            Ok(cache_dir) => cache_dir,
+            Err(error) => {
+                let status = embedding_cache_dir_resolution_failure_status(
+                    state.embedding_runtime.status(),
+                    state.store.embedding_index_dimension(),
+                    &cfg.cache_dir,
+                    &error,
+                );
+                let message = status.error.clone();
+                state.embedding_runtime.publish_unavailable(status);
+                tracing::warn!("Failed to resolve embedding cache directory: {message}");
+                return;
+            }
+        };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
     let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
     let loaded = load_daemon_embedding_backend_with(
@@ -7373,10 +7429,15 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
                         std::sync::Arc::new(model)
                             as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>,
                     );
-                    // Name the model and the resolved cache dir: a populated
-                    // but WRONG cache loads fine, and only this line makes the
-                    // wrong model visible.
-                    log_embedding_ready(&backend, &selected_device, &model_id, &cache_dir);
+                    // Name the model and, for local backends, the resolved
+                    // cache dir: a populated but WRONG cache loads fine, and
+                    // only this line makes the wrong model visible. External
+                    // backends do not use the local cache setting.
+                    let cache_dir = config
+                        .external_endpoint
+                        .is_none()
+                        .then_some(cache_dir.as_path());
+                    log_embedding_ready(&backend, &selected_device, &model_id, cache_dir);
                 } else {
                     let error = status.error.clone();
                     state.embedding_runtime.publish_unavailable(status);
