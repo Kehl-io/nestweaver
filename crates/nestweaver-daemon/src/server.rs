@@ -6964,7 +6964,7 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     // relative paths so diagnostics always name a usable location.
     let cache_dir = nestweaver_engine::resolve_user_path(&cfg.cache_dir);
     let policy = daemon_embedding_device_policy(cfg.accelerator);
-    let config = embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
+    let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
     let loaded = load_daemon_embedding_backend_with(
         &config,
         policy,
@@ -6981,12 +6981,22 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
                 if status.state == "ready" {
                     let backend = status.backend.clone();
                     let selected_device = status.selected_device.clone();
+                    let model_id = status.model_id.clone();
                     state.embedding_runtime.publish_ready(
                         status,
                         std::sync::Arc::new(model)
                             as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>,
                     );
-                    tracing::info!(backend, device = selected_device, "Embedding model ready");
+                    // Name the model and the resolved cache dir: a populated
+                    // but WRONG cache loads fine, and only this line makes the
+                    // wrong model visible.
+                    tracing::info!(
+                        backend,
+                        device = selected_device,
+                        model_id,
+                        cache_dir = %cache_dir.display(),
+                        "Embedding model ready"
+                    );
                 } else {
                     let error = status.error.clone();
                     state.embedding_runtime.publish_unavailable(status);
