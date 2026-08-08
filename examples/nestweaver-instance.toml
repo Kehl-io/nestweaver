@@ -39,7 +39,11 @@ summary_model = "qwen2.5-coder:7b"
 # directly and never fall back to a local model.
 [embedding]
 model_id = "sentence-transformers/all-MiniLM-L6-v2"
-cache_dir = "~/.cache/nestweaver/models"
+# cache_dir defaults to the platform-native cache directory:
+# ~/Library/Caches/nestweaver/models on macOS, $XDG_CACHE_HOME/nestweaver/models
+# (or ~/.cache/nestweaver/models) on Linux. Uncomment to override; a leading ~/
+# in an explicit value is expanded at startup.
+# cache_dir = "~/.cache/nestweaver/models"
 # auto: Metal in a Metal-enabled build; CPU only when Metal is not compiled.
 #       A Metal failure is reported; auto does not retry on CPU.
 # metal: require compiled Metal plus successful device and full inference probes;

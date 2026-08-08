@@ -21117,6 +21117,21 @@ mod embed_accelerator_cli_tests {
     }
 
     #[test]
+    fn engine_and_embed_default_cache_dirs_resolve_identically() {
+        // Regression guard for the default-cache-dir divergence: the
+        // config-driven daemon default (`EmbeddingConfig::cache_dir`) and the
+        // `embed --local` default (`EmbedConfig::cache_dir`) must resolve to
+        // the same directory on every platform. Both sides consult
+        // dirs::cache_dir() in-process, so no environment manipulation is
+        // needed for determinism.
+        let engine_default = nestweaver_engine::config::EmbeddingConfig::default().cache_dir;
+        let engine_resolved = nestweaver_engine::resolve_user_path(&engine_default);
+        let embed_default = nestweaver_embed::EmbedConfig::default().cache_dir;
+        let embed_resolved = std::path::absolute(&embed_default).unwrap_or(embed_default);
+        assert_eq!(engine_resolved, embed_resolved);
+    }
+
+    #[test]
     fn external_metadata_uses_the_actual_default_api_model() {
         assert_eq!(
             external_embedding_model(None),

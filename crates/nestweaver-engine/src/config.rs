@@ -284,8 +284,11 @@ pub struct EmbeddingConfig {
     /// recorded embedding model overrides this at daemon startup.
     #[serde(default = "default_model_id")]
     pub model_id: String,
-    /// Directory where downloaded model weights are stored.
-    /// Default: `"~/.cache/nestweaver/models"`.
+    /// Directory where downloaded model weights are stored. Default: the
+    /// platform-native cache directory — `~/Library/Caches/nestweaver/models`
+    /// on macOS, `$XDG_CACHE_HOME/nestweaver/models` (or
+    /// `~/.cache/nestweaver/models`) on Linux. An explicit leading `~/` is
+    /// expanded at startup via [`crate::resolve_user_path`].
     #[serde(default = "default_embedding_cache_dir")]
     pub cache_dir: String,
     /// Accelerator used by the local embedding backend. Default: automatically
@@ -347,7 +350,15 @@ fn default_model_id() -> String {
     DEFAULT_EMBEDDING_MODEL_ID.to_string()
 }
 fn default_embedding_cache_dir() -> String {
-    "~/.cache/nestweaver/models".to_string()
+    // Platform-native default; keep in sync with nestweaver-embed's
+    // `default_cache_dir`, which sits below this crate in the dependency
+    // graph and cannot call this function.
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
+        .join("nestweaver")
+        .join("models")
+        .to_string_lossy()
+        .into_owned()
 }
 fn default_weight_ppr() -> f64 {
     0.40

@@ -87,9 +87,11 @@ pub struct EmbedConfig {
 impl Default for EmbedConfig {
     fn default() -> Self {
         Self {
-            // Keep in sync with nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID
-            // (the canonical constant; this crate sits below nestweaver-engine in
-            // the dependency graph, so it cannot reference it directly).
+            // Keep in sync with nestweaver_engine::config — both the
+            // DEFAULT_EMBEDDING_MODEL_ID constant and the
+            // default_embedding_cache_dir() default (this crate sits below
+            // nestweaver-engine in the dependency graph, so it cannot
+            // reference either directly).
             model_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             cache_dir: default_cache_dir(),
             external_endpoint: None,
