@@ -5642,7 +5642,12 @@ impl NestWeaverDaemon for DaemonService {
                                 }
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due(&store, succeeded as usize) {
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
                     }
@@ -5685,7 +5690,12 @@ impl NestWeaverDaemon for DaemonService {
                                 }
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due(&store, succeeded as usize) {
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
                     }
@@ -5728,7 +5738,12 @@ impl NestWeaverDaemon for DaemonService {
                                 }
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due(&store, succeeded as usize) {
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
                             tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
                     }
