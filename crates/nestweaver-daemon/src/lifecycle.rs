@@ -2,6 +2,164 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
+pub const EFFECTIVE_CONFIG_BINDING_VERSION: u32 = 1;
+const EFFECTIVE_CONFIG_BINDING_FILE: &str = "effective-config.json";
+const EFFECTIVE_CONFIG_BINDING_MAX_BYTES: u64 = 64 * 1024;
+static EFFECTIVE_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn effective_config_temp_path(parent: &Path, sequence: u64) -> PathBuf {
+    parent.join(format!(
+        ".{EFFECTIVE_CONFIG_BINDING_FILE}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ))
+}
+
+/// The configuration source a live daemon actually uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum EffectiveConfigBindingSource {
+    Configured { path: String },
+    CompiledDefaults,
+}
+
+/// Versioned daemon-owned live binding between an instance, PID, and its
+/// effective configuration. This record is meaningful only while `pid` still
+/// identifies the daemon holding the corresponding pidfile lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveConfigBinding {
+    pub version: u32,
+    pub pid: u32,
+    pub effective_config: EffectiveConfigBindingSource,
+}
+
+impl EffectiveConfigBinding {
+    pub fn new(pid: u32, effective_config: EffectiveConfigBindingSource) -> Self {
+        Self {
+            version: EFFECTIVE_CONFIG_BINDING_VERSION,
+            pid,
+            effective_config,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum EffectiveConfigBindingError {
+    Absent {
+        path: PathBuf,
+    },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Corrupt {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    Unsafe {
+        path: PathBuf,
+        reason: String,
+    },
+    TooLarge {
+        path: PathBuf,
+        size: u64,
+        max: u64,
+    },
+    UnsupportedVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+    PidMismatch {
+        path: PathBuf,
+        expected: u32,
+        found: u32,
+    },
+    Serialize {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for EffectiveConfigBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent { path } => {
+                write!(f, "effective-config binding is absent: {}", path.display())
+            }
+            Self::Read { path, source } => write!(
+                f,
+                "failed to read effective-config binding {}: {source}",
+                path.display()
+            ),
+            Self::Corrupt { path, source } => write!(
+                f,
+                "effective-config binding {} is corrupt: {source}",
+                path.display()
+            ),
+            Self::Unsafe { path, reason } => write!(
+                f,
+                "effective-config binding {} is unsafe: {reason}",
+                path.display()
+            ),
+            Self::TooLarge { path, size, max } => write!(
+                f,
+                "effective-config binding {} is too large ({size} bytes; maximum {max})",
+                path.display()
+            ),
+            Self::UnsupportedVersion {
+                path,
+                found,
+                supported,
+            } => write!(
+                f,
+                "effective-config binding {} has unsupported version {found} (supported: {supported})",
+                path.display()
+            ),
+            Self::PidMismatch {
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "effective-config binding {} belongs to PID {found}, expected PID {expected}",
+                path.display()
+            ),
+            Self::Serialize { path, source } => write!(
+                f,
+                "failed to serialize effective-config binding {}: {source}",
+                path.display()
+            ),
+            Self::Write { path, source } => write!(
+                f,
+                "failed to publish effective-config binding {}: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EffectiveConfigBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Corrupt { source, .. } | Self::Serialize { source, .. } => Some(source),
+            Self::Absent { .. }
+            | Self::Unsafe { .. }
+            | Self::TooLarge { .. }
+            | Self::UnsupportedVersion { .. }
+            | Self::PidMismatch { .. } => None,
+        }
+    }
+}
+
 /// Canonicalize a database path even before the database file exists.
 ///
 /// `std::fs::canonicalize(path)` only succeeds once the file exists. Daemon
@@ -187,6 +345,298 @@ pub fn pidfile_path(instance_id: &str) -> PathBuf {
     runtime_dir(instance_id).join("daemon.pid")
 }
 
+/// Path to the daemon-owned effective-config live binding for an instance.
+pub fn effective_config_binding_path(instance_id: &str) -> PathBuf {
+    runtime_dir(instance_id).join(EFFECTIVE_CONFIG_BINDING_FILE)
+}
+
+#[cfg(unix)]
+fn verify_effective_config_runtime_dir_for_owner(
+    dir: &Path,
+    expected_uid: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective-config runtime path {} is not a real directory",
+                dir.display()
+            ),
+        ));
+    }
+    if metadata.uid() != expected_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective-config runtime directory {} is owned by uid {} (expected {})",
+                dir.display(),
+                metadata.uid(),
+                expected_uid
+            ),
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective-config runtime directory {} has unsafe mode {mode:04o}",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_effective_config_runtime_dir_for_owner(
+    dir: &Path,
+    expected_uid: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == expected_uid
+        && metadata.permissions().mode() & 0o777 != 0o700
+    {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    verify_effective_config_runtime_dir_for_owner(dir, expected_uid)
+}
+
+fn secure_effective_config_runtime_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        secure_effective_config_runtime_dir_for_owner(dir, unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Atomically publish a live effective-config binding beside the pidfile.
+///
+/// The temporary file is created in the same directory, synced, and renamed
+/// over the destination so readers observe either the complete old record or
+/// the complete new record. On Unix the record is explicitly mode 0600.
+pub fn write_effective_config_binding(
+    instance_id: &str,
+    binding: &EffectiveConfigBinding,
+) -> Result<(), EffectiveConfigBindingError> {
+    let path = effective_config_binding_path(instance_id);
+    let bytes = serde_json::to_vec_pretty(binding).map_err(|source| {
+        EffectiveConfigBindingError::Serialize {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    let parent = path
+        .parent()
+        .expect("effective-config binding path always has a runtime directory");
+    secure_effective_config_runtime_dir(parent).map_err(|source| {
+        EffectiveConfigBindingError::Write {
+            path: path.clone(),
+            source,
+        }
+    })?;
+
+    let (temp_path, mut file) = loop {
+        let sequence =
+            EFFECTIVE_CONFIG_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = effective_config_temp_path(parent, sequence);
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(EffectiveConfigBindingError::Write { path, source });
+            }
+        }
+    };
+    let mut published = false;
+    let write_result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &path)?;
+        published = true;
+        // Persist the directory entry. If this fails, publication failed even
+        // though rename made the file visible, so the error path unlinks it.
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(source) = write_result {
+        let _ = std::fs::remove_file(if published { &path } else { &temp_path });
+        return Err(EffectiveConfigBindingError::Write { path, source });
+    }
+    Ok(())
+}
+
+/// Read and validate the schema version of an instance's live binding.
+pub fn read_effective_config_binding(
+    instance_id: &str,
+) -> Result<EffectiveConfigBinding, EffectiveConfigBindingError> {
+    let path = effective_config_binding_path(instance_id);
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .expect("effective-config binding path always has a runtime directory");
+        if let Err(error) =
+            verify_effective_config_runtime_dir_for_owner(parent, unsafe { libc::geteuid() })
+        {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Err(EffectiveConfigBindingError::Absent { path });
+            }
+            return Err(EffectiveConfigBindingError::Unsafe {
+                path,
+                reason: error.to_string(),
+            });
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(EffectiveConfigBindingError::Absent { path });
+        }
+        #[cfg(unix)]
+        Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(EffectiveConfigBindingError::Unsafe {
+                path,
+                reason: "symbolic links are not accepted".to_string(),
+            });
+        }
+        Err(source) => {
+            return Err(EffectiveConfigBindingError::Read { path, source });
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|source| EffectiveConfigBindingError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    if !metadata.file_type().is_file() {
+        return Err(EffectiveConfigBindingError::Unsafe {
+            path,
+            reason: "record is not a regular file".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = metadata.uid();
+        let expected_owner = unsafe { libc::geteuid() };
+        if owner != expected_owner {
+            return Err(EffectiveConfigBindingError::Unsafe {
+                path,
+                reason: format!("owned by uid {owner}, expected uid {expected_owner}"),
+            });
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(EffectiveConfigBindingError::Unsafe {
+                path,
+                reason: format!("mode {mode:04o} grants group or other access"),
+            });
+        }
+    }
+    if metadata.len() > EFFECTIVE_CONFIG_BINDING_MAX_BYTES {
+        return Err(EffectiveConfigBindingError::TooLarge {
+            path,
+            size: metadata.len(),
+            max: EFFECTIVE_CONFIG_BINDING_MAX_BYTES,
+        });
+    }
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(EFFECTIVE_CONFIG_BINDING_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| EffectiveConfigBindingError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    if bytes.len() as u64 > EFFECTIVE_CONFIG_BINDING_MAX_BYTES {
+        return Err(EffectiveConfigBindingError::TooLarge {
+            path,
+            size: bytes.len() as u64,
+            max: EFFECTIVE_CONFIG_BINDING_MAX_BYTES,
+        });
+    }
+    let binding: EffectiveConfigBinding =
+        serde_json::from_slice(&bytes).map_err(|source| EffectiveConfigBindingError::Corrupt {
+            path: path.clone(),
+            source,
+        })?;
+    if binding.version != EFFECTIVE_CONFIG_BINDING_VERSION {
+        return Err(EffectiveConfigBindingError::UnsupportedVersion {
+            path,
+            found: binding.version,
+            supported: EFFECTIVE_CONFIG_BINDING_VERSION,
+        });
+    }
+    Ok(binding)
+}
+
+/// Read a binding and require its integer PID to match a daemon identity the
+/// caller has already verified through kernel socket/health evidence plus the
+/// held pidfile lock. This helper does not itself prove process liveness or
+/// ownership; PID equality alone is vulnerable to stale files and PID reuse.
+pub fn read_effective_config_binding_for_verified_pid(
+    instance_id: &str,
+    expected_pid: u32,
+) -> Result<EffectiveConfigBinding, EffectiveConfigBindingError> {
+    let binding = read_effective_config_binding(instance_id)?;
+    if binding.pid != expected_pid {
+        return Err(EffectiveConfigBindingError::PidMismatch {
+            path: effective_config_binding_path(instance_id),
+            expected: expected_pid,
+            found: binding.pid,
+        });
+    }
+    Ok(binding)
+}
+
+/// Remove an instance's live binding. Absence is already the desired state.
+pub fn remove_effective_config_binding(instance_id: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(effective_config_binding_path(instance_id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Directory for daemon log files.
 pub fn log_dir(instance_id: &str) -> PathBuf {
     dirs::state_dir()
@@ -271,9 +721,10 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
 
     let old_pid_path = pidfile_path(&old_id);
     let old_sock_path = socket_path(&old_id);
+    let old_binding_path = effective_config_binding_path(&old_id);
     let old_rt_dir = runtime_dir(&old_id);
 
-    if !old_pid_path.exists() && !old_sock_path.exists() {
+    if !old_pid_path.exists() && !old_sock_path.exists() && !old_binding_path.exists() {
         return;
     }
 
@@ -332,6 +783,7 @@ pub fn stop_legacy_hash_daemon(db_path: &Path) {
     // Clean up stale runtime artifacts.
     let _ = std::fs::remove_file(&old_sock_path);
     let _ = std::fs::remove_file(&old_pid_path);
+    let _ = std::fs::remove_file(&old_binding_path);
     let _ = std::fs::remove_dir(&old_rt_dir);
 }
 
@@ -343,6 +795,289 @@ mod tests {
     // Tests that mutate environment variables must hold this lock to avoid
     // racing with each other under `cargo test`'s default parallel execution.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_xdg_runtime<T>(root: &Path, test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", root);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[test]
+    fn effective_config_binding_paths_are_isolated_per_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let first = effective_config_binding_path("instance-a");
+            let second = effective_config_binding_path("instance-b");
+            assert_ne!(first, second);
+            assert_eq!(first.file_name().unwrap(), EFFECTIVE_CONFIG_BINDING_FILE);
+            assert!(first.starts_with(runtime_dir("instance-a")));
+            assert!(second.starts_with(runtime_dir("instance-b")));
+
+            let first_binding =
+                EffectiveConfigBinding::new(101, EffectiveConfigBindingSource::CompiledDefaults);
+            let second_binding = EffectiveConfigBinding::new(
+                202,
+                EffectiveConfigBindingSource::Configured {
+                    path: "/second.toml".to_string(),
+                },
+            );
+            write_effective_config_binding("instance-a", &first_binding).unwrap();
+            write_effective_config_binding("instance-b", &second_binding).unwrap();
+            assert_eq!(
+                read_effective_config_binding("instance-a").unwrap(),
+                first_binding
+            );
+            assert_eq!(
+                read_effective_config_binding("instance-b").unwrap(),
+                second_binding
+            );
+        });
+    }
+
+    #[test]
+    fn effective_config_binding_roundtrips_configured_and_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let configured = EffectiveConfigBinding::new(
+                41,
+                EffectiveConfigBindingSource::Configured {
+                    path: "/canonical/instance.toml".to_string(),
+                },
+            );
+            write_effective_config_binding("roundtrip", &configured).unwrap();
+            assert_eq!(
+                read_effective_config_binding_for_verified_pid("roundtrip", 41).unwrap(),
+                configured
+            );
+
+            let defaults =
+                EffectiveConfigBinding::new(42, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding("roundtrip", &defaults).unwrap();
+            assert_eq!(
+                read_effective_config_binding_for_verified_pid("roundtrip", 42).unwrap(),
+                defaults
+            );
+        });
+    }
+
+    #[test]
+    fn effective_config_binding_reports_absent_corrupt_version_and_pid_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            assert!(matches!(
+                read_effective_config_binding("errors"),
+                Err(EffectiveConfigBindingError::Absent { .. })
+            ));
+
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding("errors", &binding).unwrap();
+            let path = effective_config_binding_path("errors");
+            std::fs::write(&path, b"not json").unwrap();
+            assert!(matches!(
+                read_effective_config_binding("errors"),
+                Err(EffectiveConfigBindingError::Corrupt { .. })
+            ));
+
+            std::fs::write(
+                &path,
+                br#"{"version":99,"pid":7,"effective_config":{"source":"compiled_defaults"}}"#,
+            )
+            .unwrap();
+            assert!(matches!(
+                read_effective_config_binding("errors"),
+                Err(EffectiveConfigBindingError::UnsupportedVersion {
+                    found: 99,
+                    supported: EFFECTIVE_CONFIG_BINDING_VERSION,
+                    ..
+                })
+            ));
+
+            write_effective_config_binding("errors", &binding).unwrap();
+            assert!(matches!(
+                read_effective_config_binding_for_verified_pid("errors", 8),
+                Err(EffectiveConfigBindingError::PidMismatch {
+                    expected: 8,
+                    found: 7,
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn effective_config_binding_replacement_leaves_one_complete_record() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            for pid in 1..=20 {
+                let binding = EffectiveConfigBinding::new(
+                    pid,
+                    EffectiveConfigBindingSource::Configured {
+                        path: format!("/config/{pid}.toml"),
+                    },
+                );
+                write_effective_config_binding("replace", &binding).unwrap();
+                assert_eq!(read_effective_config_binding("replace").unwrap(), binding);
+            }
+            let parent = effective_config_binding_path("replace")
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let entries = std::fs::read_dir(parent)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(entries.len(), 1, "atomic replacement left a temp artifact");
+            assert_eq!(entries[0].file_name(), EFFECTIVE_CONFIG_BINDING_FILE);
+        });
+    }
+
+    #[test]
+    fn effective_config_binding_retries_stale_temp_name_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let path = effective_config_binding_path("collision");
+            let parent = path.parent().unwrap();
+            std::fs::create_dir_all(parent).unwrap();
+            let sequence =
+                EFFECTIVE_CONFIG_TEMP_SEQUENCE.load(std::sync::atomic::Ordering::Relaxed);
+            let stale_temp = effective_config_temp_path(parent, sequence);
+            std::fs::write(&stale_temp, b"orphan from crashed daemon").unwrap();
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+
+            write_effective_config_binding("collision", &binding).unwrap();
+
+            assert_eq!(read_effective_config_binding("collision").unwrap(), binding);
+            assert!(
+                stale_temp.exists(),
+                "writer must not overwrite stale temp files"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_config_binding_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding("permissions", &binding).unwrap();
+            let mode = std::fs::metadata(effective_config_binding_path("permissions"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_config_binding_secures_or_rejects_precreated_runtime_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o777)).unwrap();
+        secure_effective_config_runtime_dir_for_owner(&runtime, unsafe { libc::geteuid() })
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let error = secure_effective_config_runtime_dir_for_owner(
+            &runtime,
+            unsafe { libc::geteuid() }.saturating_add(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let target = temp.path().join("target");
+        let linked = temp.path().join("linked");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        let error =
+            secure_effective_config_runtime_dir_for_owner(&linked, unsafe { libc::geteuid() })
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_config_binding_reader_rejects_unsafe_mode_and_oversize() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding("unsafe", &binding).unwrap();
+            let path = effective_config_binding_path("unsafe");
+            let parent = path.parent().unwrap();
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(matches!(
+                read_effective_config_binding("unsafe"),
+                Err(EffectiveConfigBindingError::Unsafe { .. })
+            ));
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                read_effective_config_binding("unsafe"),
+                Err(EffectiveConfigBindingError::Unsafe { .. })
+            ));
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(
+                &path,
+                vec![b' '; EFFECTIVE_CONFIG_BINDING_MAX_BYTES as usize + 1],
+            )
+            .unwrap();
+            assert!(matches!(
+                read_effective_config_binding("unsafe"),
+                Err(EffectiveConfigBindingError::TooLarge { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn legacy_runtime_cleanup_removes_effective_config_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_runtime(temp.path(), || {
+            let db_path = temp.path().join("brain.lbug");
+            let old_id = legacy_instance_id_from_db_path(&db_path);
+            assert_ne!(old_id, instance_id_from_db_path(&db_path));
+            let binding =
+                EffectiveConfigBinding::new(7, EffectiveConfigBindingSource::CompiledDefaults);
+            write_effective_config_binding(&old_id, &binding).unwrap();
+            let binding_path = effective_config_binding_path(&old_id);
+            assert!(binding_path.exists());
+
+            stop_legacy_hash_daemon(&db_path);
+
+            assert!(!binding_path.exists());
+            assert!(!runtime_dir(&old_id).exists());
+        });
+    }
 
     #[test]
     fn instance_id_is_8_hex_chars() {

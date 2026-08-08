@@ -5,8 +5,9 @@ pub mod nestweaver_daemon_v1 {
 pub use nestweaver_daemon_v1::*;
 
 #[cfg(test)]
-mod embedding_telemetry_contract_tests {
+mod additive_status_contract_tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn status_and_hybrid_responses_expose_additive_embedding_telemetry() {
@@ -43,6 +44,42 @@ mod embedding_telemetry_contract_tests {
             degraded_components: vec!["semantic".to_string()],
         };
         assert_eq!(context.degraded_components, ["semantic"]);
+    }
+
+    #[test]
+    fn effective_config_roundtrip_preserves_all_three_provenance_states() {
+        use effective_config::Source;
+
+        let configured = BrainStatusResponse {
+            effective_config: Some(EffectiveConfig {
+                source: Some(Source::ConfiguredPath("/tmp/instance.toml".to_string())),
+            }),
+            ..Default::default()
+        };
+        let configured =
+            BrainStatusResponse::decode(configured.encode_to_vec().as_slice()).unwrap();
+        assert!(matches!(
+            configured.effective_config.unwrap().source,
+            Some(Source::ConfiguredPath(path)) if path == "/tmp/instance.toml"
+        ));
+
+        let defaults = BrainStatusResponse {
+            effective_config: Some(EffectiveConfig {
+                source: Some(Source::CompiledDefaults(
+                    effective_config::CompiledDefaults {},
+                )),
+            }),
+            ..Default::default()
+        };
+        let defaults = BrainStatusResponse::decode(defaults.encode_to_vec().as_slice()).unwrap();
+        assert!(matches!(
+            defaults.effective_config.unwrap().source,
+            Some(Source::CompiledDefaults(_))
+        ));
+
+        let unknown = BrainStatusResponse::default();
+        let unknown = BrainStatusResponse::decode(unknown.encode_to_vec().as_slice()).unwrap();
+        assert!(unknown.effective_config.is_none());
     }
 }
 

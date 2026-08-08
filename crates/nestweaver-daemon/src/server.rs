@@ -346,6 +346,109 @@ fn daemon_metal_compiled() -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EffectiveConfigProvenance {
+    Configured(PathBuf),
+    CompiledDefaults,
+}
+
+fn configured_provenance(path: &Path) -> anyhow::Result<EffectiveConfigProvenance> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize --config {}", path.display()))?;
+    anyhow::ensure!(
+        canonical.to_str().is_some(),
+        "canonical --config path is not valid UTF-8: {}",
+        canonical.display()
+    );
+    Ok(EffectiveConfigProvenance::Configured(canonical))
+}
+
+fn effective_config_proto(provenance: &EffectiveConfigProvenance) -> EffectiveConfig {
+    use effective_config::Source;
+
+    let source = match provenance {
+        EffectiveConfigProvenance::Configured(path) => Source::ConfiguredPath(
+            path.to_str()
+                .expect("configured provenance is validated as UTF-8 at startup")
+                .to_string(),
+        ),
+        EffectiveConfigProvenance::CompiledDefaults => {
+            Source::CompiledDefaults(effective_config::CompiledDefaults {})
+        }
+    };
+    EffectiveConfig {
+        source: Some(source),
+    }
+}
+
+fn load_daemon_instance_config(
+    config_path: Option<&Path>,
+    _server_mode: bool,
+) -> anyhow::Result<(
+    Option<Arc<nestweaver_engine::InstanceConfig>>,
+    EffectiveConfigProvenance,
+)> {
+    match config_path {
+        None => Ok((None, EffectiveConfigProvenance::CompiledDefaults)),
+        Some(path) => match nestweaver_engine::InstanceConfig::from_file(path) {
+            Ok(config) => {
+                let provenance = configured_provenance(path)?;
+                tracing::info!(
+                    config = %path.display(),
+                    "loaded instance config (ranking, response, features)"
+                );
+                Ok((Some(Arc::new(config)), provenance))
+            }
+            Err(error) => {
+                // Any explicitly supplied config is a binding, not a hint.
+                // This applies equally to UDS and network server modes: a
+                // version-mismatch restart prevalidates its captured path, but
+                // the file can disappear or change before the replacement
+                // parses it. Falling back here would silently fork identity and
+                // widen configured authorization to compiled defaults.
+                eprintln!("[daemon] cannot honor --config {}: {error}", path.display());
+                tracing::error!(
+                    config = %path.display(),
+                    error = %error,
+                    "cannot honor explicitly supplied --config"
+                );
+                anyhow::bail!(
+                    "invalid or unreadable --config {}: {error}; explicitly supplied config must be honored",
+                    path.display()
+                )
+            }
+        },
+    }
+}
+
+fn live_binding_source(
+    provenance: &EffectiveConfigProvenance,
+) -> lifecycle::EffectiveConfigBindingSource {
+    match provenance {
+        EffectiveConfigProvenance::Configured(path) => {
+            lifecycle::EffectiveConfigBindingSource::Configured {
+                path: path
+                    .to_str()
+                    .expect("configured provenance is validated as UTF-8 at startup")
+                    .to_string(),
+            }
+        }
+        EffectiveConfigProvenance::CompiledDefaults => {
+            lifecycle::EffectiveConfigBindingSource::CompiledDefaults
+        }
+    }
+}
+
+struct EffectiveConfigBindingCleanup {
+    instance_id: String,
+}
+
+impl Drop for EffectiveConfigBindingCleanup {
+    fn drop(&mut self) {
+        let _ = lifecycle::remove_effective_config_binding(&self.instance_id);
+    }
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
@@ -374,6 +477,10 @@ pub struct DaemonState {
     /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
     /// `brain_search`) via the `set_current_instance_config` thread-local.
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+    /// Effective configuration used by this process. Configured paths are
+    /// canonicalized at startup; `CompiledDefaults` represents the process's
+    /// actual configless/default mode.
+    pub(crate) effective_config: EffectiveConfigProvenance,
     /// Per-repo authorization policy (R9/R9b), built ONCE at startup from
     /// `[authz]` config — not rebuilt per request. No `[authz]` ⇒ a disabled
     /// source that resolves every identity to `VisibleRepos::All`. Mirrors the
@@ -4621,6 +4728,7 @@ impl NestWeaverDaemon for DaemonService {
             indexing_repo,
             queue_depth,
             embedding_status: Some(embedding_status),
+            effective_config: Some(effective_config_proto(&self.state.effective_config)),
         }))
     }
 
@@ -7539,6 +7647,12 @@ pub async fn run_server(
     // lifetime; released on drop. A daemonize child proves it inherited the
     // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
+    // We now exclusively own this instance's pidfile lock, so any binding left
+    // by a crashed predecessor is stale. Clear it before fallible startup work;
+    // a failed boot must not leave old provenance looking live.
+    lifecycle::remove_effective_config_binding(&instance_id).with_context(|| {
+        format!("remove stale effective-config binding for instance {instance_id}")
+    })?;
 
     // Snapshot replica: materialize the snapshot into a private working copy and
     // serve it read-only. `read_only` gates out the write RPCs (via the
@@ -7646,44 +7760,24 @@ pub async fn run_server(
     // tool dispatch (e.g. F6 `[ranking]` priors in `brain_search`) can apply
     // it without re-parsing the file per RPC.
     //
-    // Distinguish a MISSING file (non-fatal — the daemon serves with built-in
-    // defaults) from a file that is PRESENT but unparseable. In server mode a
-    // malformed config means the server would silently index nothing and have no
-    // webhook secret; that failure must be loud (stderr) and fatal rather than a
-    // warning buried in the rotating log file.
-    let instance_cfg = match config_path {
-        None => None,
-        Some(p) => match nestweaver_engine::InstanceConfig::from_file(p) {
-            Ok(c) => {
-                tracing::info!(
-                    config = %p.display(),
-                    "loaded instance config (ranking, response, features)"
-                );
-                Some(Arc::new(c))
-            }
-            Err(e) if p.exists() => {
-                // Present but broken. Surface to the console (docker/foreground
-                // operators never see the rotating log) and fail fast in server
-                // mode so a typo can't masquerade as a healthy-but-empty server.
-                eprintln!("[daemon] failed to parse --config {}: {e}", p.display());
-                tracing::error!(config = %p.display(), error = %e, "failed to parse --config");
-                if server_opts.is_some() {
-                    anyhow::bail!(
-                        "invalid --config {}: {e} (server mode requires a parseable config)",
-                        p.display()
-                    );
-                }
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    config = %p.display(),
-                    error = %e,
-                    "instance config not found — using built-in defaults"
-                );
-                None
-            }
-        },
+    // An explicitly supplied path is a binding, not a discovery hint. Missing,
+    // unreadable, or malformed input is fatal in both UDS and network server
+    // modes; otherwise a restart-time file race could silently demote the
+    // instance to compiled-default identity and authorization.
+    let (instance_cfg, effective_config) =
+        load_daemon_instance_config(config_path, server_opts.is_some())?;
+    let live_binding = lifecycle::EffectiveConfigBinding::new(
+        std::process::id(),
+        live_binding_source(&effective_config),
+    );
+    lifecycle::write_effective_config_binding(&instance_id, &live_binding).with_context(|| {
+        format!("publish effective-config binding for daemon instance {instance_id}")
+    })?;
+    // Removes the binding on every normal return path, including startup
+    // errors after publication. A process crash can still leave a stale file;
+    // later consumers must validate its PID before trusting it.
+    let _effective_config_binding_cleanup = EffectiveConfigBindingCleanup {
+        instance_id: instance_id.clone(),
     };
 
     // nw-019: graph-data identity — the config's logical `instance_id` when we
@@ -7814,6 +7908,7 @@ pub async fn run_server(
         watcher_stop: std::sync::Mutex::new(None),
         next_watcher_id: std::sync::atomic::AtomicU64::new(0),
         instance_cfg,
+        effective_config,
         permission_source,
         embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(embedding_status)),
         write_mutex: Arc::new(tokio::sync::Mutex::new(())),
@@ -9173,6 +9268,9 @@ pub async fn run_server(
     }
 
     let _ = std::fs::remove_file(&sock_path);
+    // The RAII owner removes the live binding before the pidfile lock is
+    // released. On earlier error returns its Drop provides the same cleanup.
+    drop(_effective_config_binding_cleanup);
     // Drop the instance lock's pidfile on clean shutdown (the flock itself is
     // released when `_pid_guard` drops at end of scope).
     let _ = std::fs::remove_file(lifecycle::pidfile_path(&instance_id));
@@ -14052,6 +14150,7 @@ mod startup_helper_tests {
             watcher_stop: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
+            effective_config: EffectiveConfigProvenance::CompiledDefaults,
             permission_source: build_daemon_permission_source(None),
             embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(initial_embedding_status(
                 &nestweaver_engine::config::EmbeddingConfig::default(),
@@ -14073,6 +14172,37 @@ mod startup_helper_tests {
             worker_handle: std::sync::Mutex::new(None),
             ui_server: std::sync::Mutex::new(None),
         })
+    }
+
+    fn write_provenance_test_config(path: &Path, root: &Path) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+instance_id = "provenance-test"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+                root.join("snapshots").display(),
+                root.join("workspace").display()
+            ),
+        )
+        .unwrap();
     }
 
     /// Build a minimal `DaemonState` over the given store and permission
@@ -14097,6 +14227,7 @@ mod startup_helper_tests {
             watcher_stop: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
+            effective_config: EffectiveConfigProvenance::CompiledDefaults,
             permission_source,
             embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(initial_embedding_status(
                 &nestweaver_engine::config::EmbeddingConfig::default(),
@@ -14137,11 +14268,16 @@ mod startup_helper_tests {
             });
         let service = DaemonService::new(state);
 
-        let typed = service
+        let response = service
             .brain_status(Request::new(BrainStatusRequest {}))
             .await
             .expect("typed brain status")
-            .into_inner()
+            .into_inner();
+        assert!(matches!(
+            response.effective_config.unwrap().source,
+            Some(effective_config::Source::CompiledDefaults(_))
+        ));
+        let typed = response
             .embedding_status
             .expect("structured embedding status");
         assert_eq!(typed.state, "failed");
@@ -14163,6 +14299,103 @@ mod startup_helper_tests {
         assert_eq!(value["embedding_status"]["requested_device"], "metal");
         assert_eq!(value["embedding_status"]["selected_device"], "");
         assert_eq!(value["embedding_status"]["fallback_used"], false);
+        assert!(
+            value.get("effective_config").is_none(),
+            "effective config provenance must remain typed-only so Combined federation cannot backfill it"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_status_reports_canonical_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let config = dir.path().join("instance.toml");
+        std::fs::write(&config, "instance_id = 'test'").unwrap();
+        let noncanonical = nested.join("..").join("instance.toml");
+
+        let mut state = test_state_with_writer();
+        Arc::get_mut(&mut state).unwrap().effective_config =
+            configured_provenance(&noncanonical).unwrap();
+        let response = DaemonService::new(state)
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("typed brain status")
+            .into_inner();
+
+        assert!(matches!(
+            response.effective_config.unwrap().source,
+            Some(effective_config::Source::ConfiguredPath(path))
+                if path == std::fs::canonicalize(config).unwrap().to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn production_config_loader_couples_parsed_config_to_canonical_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("instance.toml");
+        write_provenance_test_config(&config_path, dir.path());
+
+        let (config, provenance) = load_daemon_instance_config(Some(&config_path), false).unwrap();
+
+        assert_eq!(config.unwrap().instance_id, "provenance-test");
+        assert_eq!(
+            provenance,
+            EffectiveConfigProvenance::Configured(std::fs::canonicalize(config_path).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_config_loader_rejects_non_utf8_config_provenance() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let name = OsString::from_vec(b"instance-\xff.toml".to_vec());
+        let config_path = dir.path().join(name);
+        write_provenance_test_config(&config_path, dir.path());
+
+        let error = load_daemon_instance_config(Some(&config_path), false).unwrap_err();
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn uds_config_loader_rejects_missing_explicit_config_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("deleted-after-restart-prepare.toml");
+
+        let error = load_daemon_instance_config(Some(&missing), false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("invalid or unreadable --config"),
+            "{message}"
+        );
+        assert!(
+            message.contains("explicitly supplied config must be honored"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn uds_config_loader_rejects_malformed_explicit_config_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = dir.path().join("changed-after-restart-prepare.toml");
+        std::fs::write(&malformed, "instance_id = [not-valid").unwrap();
+
+        let error = load_daemon_instance_config(Some(&malformed), false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("invalid or unreadable --config"),
+            "{message}"
+        );
+        assert!(
+            message.contains("explicitly supplied config must be honored"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

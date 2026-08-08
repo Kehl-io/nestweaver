@@ -1353,6 +1353,50 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
     }
 }
 
+fn format_effective_config(config: Option<&nestweaver_proto::EffectiveConfig>) -> String {
+    use nestweaver_proto::effective_config::Source;
+
+    match config.and_then(|config| config.source.as_ref()) {
+        Some(Source::ConfiguredPath(path)) if !path.is_empty() => path.clone(),
+        Some(Source::CompiledDefaults(_)) => "none — compiled defaults".to_string(),
+        Some(Source::ConfiguredPath(_)) | None => "unknown (older daemon)".to_string(),
+    }
+}
+
+fn format_daemon_status_response(
+    response: Result<&nestweaver_proto::BrainStatusResponse, &str>,
+) -> String {
+    match response {
+        Ok(status) => {
+            let mut lines = vec![format!(
+                "Config: {}",
+                format_effective_config(status.effective_config.as_ref())
+            )];
+            lines.push("Embedding:".to_string());
+            if let Some(embedding) = status.embedding_status.as_ref() {
+                lines.push(format_embedding_status(embedding));
+            } else {
+                lines.push("  State:            unknown (older daemon)".to_string());
+            }
+            lines.join("\n")
+        }
+        Err(error) => [
+            "Config: unknown (daemon unreachable)".to_string(),
+            "Embedding:".to_string(),
+            "  State:            unavailable (daemon booting or unreachable)".to_string(),
+            format!("  Error:            {error}"),
+        ]
+        .join("\n"),
+    }
+}
+
+fn format_daemon_not_running_status(summary: &str) -> String {
+    format!(
+        "{summary}\n{}",
+        format_daemon_status_response(Err("daemon is not running"))
+    )
+}
+
 fn print_daemon_embedding_status(db_path: &Path) {
     let result = tokio::runtime::Runtime::new()
         .map_err(anyhow::Error::from)
@@ -1364,18 +1408,87 @@ fn print_daemon_embedding_status(db_path: &Path) {
         });
     match result {
         Ok(status) => {
-            println!("Embedding:");
-            if let Some(status) = status.embedding_status {
-                println!("{}", format_embedding_status(&status));
-            } else {
-                println!("  State:            unknown (older daemon)");
-            }
+            println!("{}", format_daemon_status_response(Ok(&status)));
         }
         Err(error) => {
-            println!("Embedding:");
-            println!("  State:            unavailable (daemon booting or unreachable)");
-            println!("  Error:            {error:#}");
+            let error = format!("{error:#}");
+            println!("{}", format_daemon_status_response(Err(&error)));
         }
+    }
+}
+
+#[cfg(test)]
+mod daemon_status_renderer_tests {
+    use super::*;
+    use nestweaver_proto::effective_config::{CompiledDefaults, Source};
+
+    fn embedding() -> nestweaver_proto::EmbeddingStatus {
+        nestweaver_proto::EmbeddingStatus {
+            state: "ready".to_string(),
+            backend: "local".to_string(),
+            requested_device: "auto".to_string(),
+            selected_device: "cpu".to_string(),
+            model_id: "test-model".to_string(),
+            error: String::new(),
+            metal_compiled: false,
+            fallback_used: false,
+        }
+    }
+
+    #[test]
+    fn configured_path_and_embedding_share_one_status_render() {
+        let status = nestweaver_proto::BrainStatusResponse {
+            effective_config: Some(nestweaver_proto::EffectiveConfig {
+                source: Some(Source::ConfiguredPath(
+                    "/canonical/instance.toml".to_string(),
+                )),
+            }),
+            embedding_status: Some(embedding()),
+            ..Default::default()
+        };
+
+        let output = format_daemon_status_response(Ok(&status));
+        assert!(output.starts_with("Config: /canonical/instance.toml\nEmbedding:\n"));
+        assert!(output.contains("  State:            ready"));
+        assert!(output.contains("  Model:            test-model"));
+    }
+
+    #[test]
+    fn compiled_defaults_are_explicit() {
+        let status = nestweaver_proto::BrainStatusResponse {
+            effective_config: Some(nestweaver_proto::EffectiveConfig {
+                source: Some(Source::CompiledDefaults(CompiledDefaults {})),
+            }),
+            embedding_status: Some(embedding()),
+            ..Default::default()
+        };
+
+        let output = format_daemon_status_response(Ok(&status));
+        assert!(output.starts_with("Config: none — compiled defaults\nEmbedding:\n"));
+    }
+
+    #[test]
+    fn absent_old_wire_fields_are_reported_as_unknown() {
+        let output =
+            format_daemon_status_response(Ok(&nestweaver_proto::BrainStatusResponse::default()));
+        assert!(output.starts_with("Config: unknown (older daemon)\nEmbedding:\n"));
+        assert!(output.contains("  State:            unknown (older daemon)"));
+    }
+
+    #[test]
+    fn unreachable_daemon_reports_config_and_embedding_honestly() {
+        let output = format_daemon_status_response(Err("transport refused"));
+        assert!(output.starts_with("Config: unknown (daemon unreachable)\nEmbedding:\n"));
+        assert!(output.contains("unavailable (daemon booting or unreachable)"));
+        assert!(output.ends_with("  Error:            transport refused"));
+    }
+
+    #[test]
+    fn not_running_command_path_still_reports_config_provenance() {
+        let output = format_daemon_not_running_status("Daemon is not running.");
+        assert!(output.starts_with(
+            "Daemon is not running.\nConfig: unknown (daemon unreachable)\nEmbedding:\n"
+        ));
     }
 }
 
@@ -4151,18 +4264,18 @@ fn vault_registrations_for_root(
     db_path: &Path,
     config: Option<&Path>,
     root: &Path,
-) -> Vec<(String, String)> {
+) -> anyhow::Result<Vec<(String, String)>> {
     let root_str = root.to_string_lossy().to_string();
     let matches_root = |candidate: &str| candidate == root_str;
 
-    if let Some(value) = try_hybrid_json_rpc(
+    if let Some(value) = try_hybrid_json_rpc_checked(
         use_daemon,
         db_path,
         config,
         "brain_status",
         serde_json::json!({}),
-    ) {
-        return value
+    )? {
+        return Ok(value
             .get("vaults")
             .and_then(|v| v.as_array())
             .map(|vaults| {
@@ -4181,14 +4294,14 @@ fn vault_registrations_for_root(
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default());
     }
 
     // Direct fallback. A missing database is not an error here.
     if !db_path.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    match open_store(Some(db_path)) {
+    Ok(match open_store(Some(db_path)) {
         Ok(store) => store
             .list_vaults(None)
             .map(|vaults| {
@@ -4203,7 +4316,7 @@ fn vault_registrations_for_root(
             tracing::debug!("vault_registrations_for_root: store read skipped: {error}");
             Vec::new()
         }
-    }
+    })
 }
 
 /// The instance the caller EXPLICITLY asked for, if any.
@@ -4959,13 +5072,18 @@ fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
 /// another starter cannot acquire this inode before the stale socket is
 /// removed, and the pidfile is unlinked last so a later starter gets a fresh
 /// inode that this cleanup never touches.
-#[cfg(target_os = "macos")]
-fn remove_unowned_daemon_runtime(pidfile: &std::path::Path, socket: &std::path::Path) {
+fn remove_unowned_daemon_runtime(
+    pidfile: &std::path::Path,
+    socket: &std::path::Path,
+    effective_config_binding: &std::path::Path,
+) {
     use std::os::unix::io::AsRawFd;
 
     let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(pidfile)
     else {
         return;
@@ -4976,6 +5094,7 @@ fn remove_unowned_daemon_runtime(pidfile: &std::path::Path, socket: &std::path::
     }
 
     let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(effective_config_binding);
     let _ = std::fs::remove_file(pidfile);
     unsafe {
         libc::flock(fd, libc::LOCK_UN);
@@ -5068,6 +5187,228 @@ fn daemon_identity_verified(
         return false;
     }
     daemon_socket_reported_pid(socket) == Some(pid)
+}
+
+fn daemon_restart_start_args(
+    db_path: &std::path::Path,
+    idle_timeout: u64,
+    restart_config: &nestweaver_client::RestartConfig,
+) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        "daemon".into(),
+        "--db".into(),
+        db_path.as_os_str().to_owned(),
+        "start".into(),
+        "--idle-timeout".into(),
+        idle_timeout.to_string().into(),
+    ];
+    if let Some(config) = restart_config.as_path() {
+        args.push("--config".into());
+        args.push(config.as_os_str().to_owned());
+    }
+    args
+}
+
+fn verify_explicit_config_before_start_success(
+    db_path: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let Some(config_path) = config_path else {
+        return Ok(());
+    };
+    let runtime = tokio::runtime::Runtime::new()
+        .context("create runtime for explicit daemon config verification")?;
+    runtime.block_on(nestweaver_client::verify_running_daemon_config(
+        db_path,
+        config_path,
+    ))
+}
+
+fn acquire_daemon_start_spawn_lock(
+    db_path: &std::path::Path,
+    inherited_fd: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<nestweaver_client::autostart::SpawnLock>> {
+    if let Some(inherited_fd) = inherited_fd {
+        let inherited_fd = inherited_fd
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("inherited parent spawnlock FD is not valid UTF-8"))?
+            .parse::<std::os::fd::RawFd>()
+            .context("inherited parent spawnlock FD is not an integer")?;
+        nestweaver_client::autostart::SpawnLock::inherit_parent_handoff(db_path, inherited_fd)
+            .map(Some)
+    } else {
+        nestweaver_client::autostart::SpawnLock::acquire(db_path).map(Some)
+    }
+}
+
+async fn start_and_verify_restarted_daemon(
+    db_path: &std::path::Path,
+    executable: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    restart_config: &nestweaver_client::RestartConfig,
+    spawn_lock: nestweaver_client::autostart::SpawnLock,
+) -> anyhow::Result<()> {
+    let mut command = daemon_restart_command(executable, args);
+    spawn_lock.configure_child_handoff(&mut command)?;
+    let status = tokio::task::spawn_blocking(move || command.status())
+        .await
+        .context("daemon restart command task failed")?
+        .context("failed to execute daemon start")?;
+    anyhow::ensure!(status.success(), "daemon start failed with {status}");
+
+    // `daemon start` preserves existing platform routing. Persistent macOS
+    // agents use KeepAlive.Crashed, so the preceding successful gRPC shutdown
+    // exits 0 and is not respawned; `start` then bootouts/reinstalls the plist.
+    // launchd may report a still-booting success, so wait for health without
+    // auto-starting before final trust checks.
+    nestweaver_client::DaemonClient::wait_healthy(db_path, std::time::Duration::from_secs(60))
+        .await?;
+    let socket =
+        nestweaver_daemon::socket_path(&nestweaver_daemon::instance_id_from_db_path(db_path));
+    let verified =
+        nestweaver_client::connect_verified_replacement(&socket, db_path, restart_config).await;
+    drop(spawn_lock);
+    verified.map(|_| ())
+}
+
+fn daemon_restart_command(
+    executable: PathBuf,
+    args: Vec<std::ffi::OsString>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command.args(args);
+    command
+}
+
+async fn restart_verified_live_under_lock(
+    db_path: &std::path::Path,
+    idle_timeout: u64,
+    explicit_config: Option<&std::path::Path>,
+    original: nestweaver_client::PreparedRestart,
+    expected_config: nestweaver_client::RestartConfig,
+    spawn_lock: nestweaver_client::autostart::SpawnLock,
+) -> anyhow::Result<()> {
+    let mut client = nestweaver_client::DaemonClient::connect_existing(db_path)
+        .await
+        .context("reconnect to live daemon after acquiring restart transaction lock")?;
+    let locked_health = client.health_check().await.context(
+        "could not revalidate live daemon after acquiring restart transaction lock; no shutdown was attempted",
+    )?;
+    let prepared = nestweaver_client::prepare_restart(db_path, &locked_health, explicit_config)
+        .and_then(|prepared| {
+            anyhow::ensure!(
+                prepared.config() == &expected_config,
+                "daemon effective config changed while waiting for the restart transaction lock; no shutdown was attempted"
+            );
+            Ok(prepared)
+        });
+    drop(original);
+
+    // PREPARE includes every fallible local decision needed to launch. In
+    // particular, a broken current_exe lookup must leave the live daemon
+    // untouched rather than discovering the failure after Shutdown.
+    let executable = std::env::current_exe().context("cannot determine binary path")?;
+    let start_args = daemon_restart_start_args(db_path, idle_timeout, &expected_config);
+
+    nestweaver_client::run_prepared_restart(
+        prepared,
+        || async {
+            let response = client
+                .inner_mut()
+                .shutdown(nestweaver_proto::ShutdownRequest {})
+                .await
+                .context("daemon shutdown request failed; refusing to start a replacement")?
+                .into_inner();
+            Ok(response.ok)
+        },
+        |mut prepared| async move {
+            prepared.wait_for_owner_release().await?;
+            prepared.release_pidfile_lock();
+            start_and_verify_restarted_daemon(
+                db_path,
+                executable,
+                start_args,
+                prepared.config(),
+                spawn_lock,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn restart_live_daemon_preserving_config(
+    db_path: &std::path::Path,
+    idle_timeout: u64,
+    explicit_config: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    match nestweaver_client::DaemonClient::connect_existing(db_path).await {
+        Ok(mut client) => {
+            let original_health = client.health_check().await?;
+            let original =
+                nestweaver_client::prepare_restart(db_path, &original_health, explicit_config)?;
+            let expected_config = original.config().clone();
+            let spawn_lock =
+                nestweaver_client::autostart::SpawnLock::acquire_async(db_path).await?;
+            restart_verified_live_under_lock(
+                db_path,
+                idle_timeout,
+                explicit_config,
+                original,
+                expected_config,
+                spawn_lock,
+            )
+            .await
+        }
+        Err(_) => {
+            // Serialize against auto-start, then recheck: a concurrent client
+            // may have published a daemon while the first connection failed.
+            let spawn_lock =
+                nestweaver_client::autostart::SpawnLock::acquire_async(db_path).await?;
+            if let Ok(mut winner) = nestweaver_client::DaemonClient::connect_existing(db_path).await
+            {
+                let health = winner.health_check().await?;
+                let original =
+                    nestweaver_client::prepare_restart(db_path, &health, explicit_config)?;
+                let expected_config = original.config().clone();
+                return restart_verified_live_under_lock(
+                    db_path,
+                    idle_timeout,
+                    explicit_config,
+                    original,
+                    expected_config,
+                    spawn_lock,
+                )
+                .await;
+            }
+
+            // No healthy socket winner. Prove the current pidfile inode is
+            // unowned before treating this as cold; an unresponsive live
+            // daemon fails here instead of being overlapped. Stale sidecar
+            // state is intentionally ignored on this branch.
+            let mut unowned = nestweaver_client::autostart::UnownedPidfileLock::acquire(db_path)?;
+            if nestweaver_client::DaemonClient::connect_existing(db_path)
+                .await
+                .is_ok()
+            {
+                anyhow::bail!(
+                    "a daemon became connectable while proving cold-start ownership; refusing to overlap it"
+                );
+            }
+            let restart_config = nestweaver_client::RestartConfig::for_cold_start(explicit_config)?;
+            let executable = std::env::current_exe().context("cannot determine binary path")?;
+            let start_args = daemon_restart_start_args(db_path, idle_timeout, &restart_config);
+            unowned.release();
+            start_and_verify_restarted_daemon(
+                db_path,
+                executable,
+                start_args,
+                &restart_config,
+                spawn_lock,
+            )
+            .await
+        }
+    }
 }
 
 /// nw-087: commands that operate on an existing database must fail
@@ -5488,9 +5829,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref inst) = instance {
                     args["instance"] = serde_json::json!(inst);
                 }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "list_repos", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config_opt.as_deref(),
+                    "list_repos",
+                    args,
+                )? {
                     let value = unwrap_hybrid_payload(value);
                     let repo_count = value.as_array().map(|a| a.len()).unwrap_or(0);
                     if json {
@@ -6160,13 +6505,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "intent": intent.clone().unwrap_or_default(),
                             "include_seeds": true,
                         });
-                        if let Some(result_json) = try_hybrid_json_rpc(
+                        if let Some(result_json) = try_hybrid_json_rpc_checked(
                             use_daemon,
                             db_path,
                             config.as_deref(),
                             "brain_context",
                             hybrid_args,
-                        ) {
+                        )? {
                             let result: nestweaver_engine::BrainContextResult =
                                 serde_json::from_value(result_json)?;
                             let effective_limit = limit.unwrap_or(30);
@@ -6256,13 +6601,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "intent": intent.clone().unwrap_or_default(),
                     "include_seeds": true,
                 });
-                if let Some(result_json) = try_hybrid_json_rpc(
+                if let Some(result_json) = try_hybrid_json_rpc_checked(
                     use_daemon,
                     db_path,
                     config.as_deref(),
                     "brain_context",
                     hybrid_args,
-                ) {
+                )? {
                     let result: nestweaver_engine::BrainContextResult =
                         serde_json::from_value(result_json)?;
                     let cut = match token_budget {
@@ -6385,13 +6730,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({});
-                if let Some(value) = try_hybrid_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config_opt.as_deref(),
                     "suggest_links",
                     args,
-                ) {
+                )? {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -6571,9 +6916,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref c) = config {
                     args["config"] = serde_json::json!(c.to_string_lossy());
                 }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "brain_guide", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "brain_guide",
+                    args,
+                )? {
                     // brain_guide returns { "guide": "<markdown>" }. Extract the
                     // raw markdown body — printing the JSON object would emit an
                     // envelope with escaped newlines instead of a usable guide.
@@ -6724,73 +7073,54 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             require_existing_db(&db_path)?;
 
             // ── hybrid guard (routes through local + upstream) ────
-            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let start_dir =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
-                    &db_path,
-                    config.as_deref(),
-                    &start_dir,
-                ));
-                if let Ok(mut hybrid) = connect {
-                    let rpc = rt.block_on(hybrid.query(
-                        "hub_nodes",
-                        &serde_json::json!({
-                            "top_n": top,
-                        }),
-                    ));
-                    match rpc {
-                        Ok(value) => {
-                            // Deserialize into the direct path's type so
-                            // both output modes match direct output byte-for-byte
-                            // (the daemon envelope carries _meta/count the direct
-                            // path never prints).
-                            let hubs: Vec<HubNode> = value
-                                .get("hubs")
-                                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                                .unwrap_or_default();
-                            if json {
-                                println!("{}", serde_json::to_string_pretty(&hubs)?);
-                            } else if hubs.is_empty() {
-                                println!("No hub nodes found (graph may be empty).");
-                            } else {
-                                println!("Top {} hub nodes (by total degree):\n", hubs.len());
-                                for h in &hubs {
-                                    let cluster = h
-                                        .cluster_id
-                                        .map(|id| format!(" cluster={id}"))
-                                        .unwrap_or_default();
-                                    println!(
-                                        "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
-                                        h.name,
-                                        h.file_path,
-                                        h.in_degree,
-                                        h.out_degree,
-                                        h.total_degree,
-                                        h.pagerank_score,
-                                    );
-                                }
-                            }
-                            // nw-124: the daemon serves this path, so the
-                            // disclosure has to live here too — otherwise it
-                            // only ever fires on the direct path users are
-                            // told not to use.
-                            warn_stale_resolver_rankings_no_store(&db_path);
-                            let stats = format!(
-                                "{} hubs in {} (via hybrid)",
-                                value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
-                                format_elapsed(t0.elapsed())
-                            );
-                            return Ok((EXIT_SUCCESS, Some(stats)));
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "warning: hybrid hub_nodes query failed ({}); falling back to direct DB read",
-                                e
-                            );
-                        }
+            if let Some(value) = try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "hub_nodes",
+                serde_json::json!({ "top_n": top }),
+            )? {
+                // Deserialize into the direct path's type so
+                // both output modes match direct output byte-for-byte
+                // (the daemon envelope carries _meta/count the direct
+                // path never prints).
+                let hubs: Vec<HubNode> = value
+                    .get("hubs")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&hubs)?);
+                } else if hubs.is_empty() {
+                    println!("No hub nodes found (graph may be empty).");
+                } else {
+                    println!("Top {} hub nodes (by total degree):\n", hubs.len());
+                    for h in &hubs {
+                        let cluster = h
+                            .cluster_id
+                            .map(|id| format!(" cluster={id}"))
+                            .unwrap_or_default();
+                        println!(
+                            "  {} ({}) in={} out={} total={} pr={:.4}{cluster}",
+                            h.name,
+                            h.file_path,
+                            h.in_degree,
+                            h.out_degree,
+                            h.total_degree,
+                            h.pagerank_score,
+                        );
                     }
                 }
+                // nw-124: the daemon serves this path, so the
+                // disclosure has to live here too — otherwise it
+                // only ever fires on the direct path users are
+                // told not to use.
+                warn_stale_resolver_rankings_no_store(&db_path);
+                let stats = format!(
+                    "{} hubs in {} (via hybrid)",
+                    value.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+                    format_elapsed(t0.elapsed())
+                );
+                return Ok((EXIT_SUCCESS, Some(stats)));
             }
 
             let store = open_store(Some(&db_path))?;
@@ -6848,9 +7178,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = bridge_nodes_rpc_args(top);
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "bridge_nodes", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config_opt.as_deref(),
+                    "bridge_nodes",
+                    args,
+                )? {
                     // Deserialize the tool's `bridges` array into the
                     // direct path's type so both modes render identically.
                     let bridges: Vec<nestweaver_engine::BridgeNode> = serde_json::from_value(
@@ -7076,9 +7410,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(r) = resolution {
                     args["resolution"] = serde_json::json!(r);
                 }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config_opt.as_deref(), "clusters", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config_opt.as_deref(),
+                    "clusters",
+                    args,
+                )? {
                     // The tool returns {clusters: [...]} with `size` where
                     // the direct path's ClusteringOutput uses `communities` and
                     // `member_count`. Rebuild the real structs so both modes
@@ -7461,13 +7799,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // paths therefore produce one payload and render through one
             // function, so the output format follows --json rather than whether
             // a daemon happens to be running (nw-108).
-            let payload = match try_hybrid_json_rpc(
+            let payload = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "blast_radius",
                 args.clone(),
-            ) {
+            )? {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
@@ -7506,13 +7844,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 "max_depth": max_depth,
             });
 
-            let payload = match try_hybrid_json_rpc(
+            let payload = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "flow_trace",
                 args.clone(),
-            ) {
+            )? {
                 Some(value) => value,
                 None => {
                     let store = open_store(Some(&db_path))?;
@@ -8363,14 +8701,36 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
+            let daemon_connection = if use_daemon {
+                match tokio::runtime::Runtime::new() {
+                    Ok(rt) => match rt.block_on(nestweaver_client::DaemonClient::connect(
+                        &db_path,
+                        config.as_deref().map(std::path::Path::as_ref),
+                    )) {
+                        Ok(client) => Some((rt, client)),
+                        Err(error) if config.is_some() => {
+                            return Err(error).context(
+                                "explicit config could not be honored by the daemon for UI; refusing direct fallback",
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "daemon UI connection failed, falling back to direct: {error:#}"
+                            );
+                            None
+                        }
+                    },
+                    Err(error) if config.is_some() => {
+                        return Err(error).context("create runtime for explicit-config daemon UI");
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
             let mut daemon_ok = false;
-            if use_daemon
-                && let Ok(rt) = tokio::runtime::Runtime::new()
-                && let Ok(mut client) = rt.block_on(nestweaver_client::DaemonClient::connect(
-                    &db_path,
-                    config.as_deref().map(std::path::Path::as_ref),
-                ))
-            {
+            if let Some((rt, mut client)) = daemon_connection {
                 let watch_repo_path = if watch {
                     detect_repo_root().display().to_string()
                 } else {
@@ -8432,8 +8792,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("ServeUi RPC failed, falling back to direct: {e}");
+                    Err(error) if config.is_some() => {
+                        return Err(error).context(
+                            "explicit-config daemon UI request failed; refusing direct fallback",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!("ServeUi RPC failed, falling back to direct: {error}");
                     }
                 }
             }
@@ -8487,9 +8852,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "query": query, "limit": limit });
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "search_symbols", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "search_symbols",
+                    args,
+                )? {
                     if json {
                         // Normalize to the same bare-array shape the direct path emits (below):
                         // unwrap the {results, _meta} hybrid envelope so `search --json` yields
@@ -8570,9 +8939,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ms) = max_millis {
                     args["max_millis"] = serde_json::json!(ms);
                 }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "regex_search", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "regex_search",
+                    args,
+                )? {
                     // Strip the hybrid `_meta` provenance so both output
                     // modes match the direct path byte-for-byte.
                     let res: nestweaver_store::regex::RegexSearchResult =
@@ -8694,9 +9067,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref k) = kinds {
                     args["kinds"] = serde_json::json!(k);
                 }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "count_patterns", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "count_patterns",
+                    args,
+                )? {
                     // The tool wraps counts in {"patterns": [...]}
                     // (plus a hybrid `_meta`); rebuild the real PatternCount
                     // structs so daemon output is byte-identical to the direct
@@ -8773,9 +9150,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args =
                     read_symbols_rpc_args(&targets, neighbors, token_budget, root.as_deref());
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "read_symbols", args)
-                {
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "read_symbols",
+                    args,
+                )? {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -9516,7 +9897,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // silently ignored.
             if use_daemon && repo_filter.is_none() && min_score.is_none() && confidence <= 0.0 {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
-                if let Some(value) = try_hybrid_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config_opt.as_deref(),
@@ -9529,7 +9910,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "symbol": name_or_uid,
                         "depth": depth,
                     }),
-                ) {
+                )? {
                     // Honor the daemon tool's status so daemon mode matches the direct path's
                     // exit-code contract (not_found=2, ambiguous=3) instead of always exit 0.
                     match value.get("status").and_then(|v| v.as_str()) {
@@ -9978,40 +10359,23 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
             let db_path = db.unwrap_or_else(default_db_path);
 
-            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let start_dir =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
-                    &db_path,
-                    config.as_deref(),
-                    &start_dir,
-                ));
-                if let Ok(mut hybrid) = connect {
-                    let rpc = rt.block_on(hybrid.query(
-                        "project_context",
-                        &serde_json::json!({
-                            "project": name,
-                            "token_budget": token_budget,
-                            "response_format": response_format,
-                            "include_components": include_components,
-                            "since": since.clone().unwrap_or_default(),
-                            "recency_weight": recency_weight,
-                            "recency_half_life_days": recency_half_life_days,
-                        }),
-                    ));
-                    match rpc {
-                        Ok(value) => {
-                            render_project_context_daemon_response(&value, json, token_budget);
-                            return Ok((EXIT_SUCCESS, None));
-                        }
-                        Err(e) => {
-                            tracing::info!(
-                                "hybrid project_context query failed ({}); falling back to direct mode",
-                                e
-                            );
-                        }
-                    }
-                }
+            if let Some(value) = try_hybrid_json_rpc_checked(
+                use_daemon,
+                &db_path,
+                config.as_deref(),
+                "project_context",
+                serde_json::json!({
+                    "project": name,
+                    "token_budget": token_budget,
+                    "response_format": response_format,
+                    "include_components": include_components,
+                    "since": since.clone().unwrap_or_default(),
+                    "recency_weight": recency_weight,
+                    "recency_half_life_days": recency_half_life_days,
+                }),
+            )? {
+                render_project_context_daemon_response(&value, json, token_budget);
+                return Ok((EXIT_SUCCESS, None));
             }
 
             let store = open_store(Some(&db_path))?;
@@ -10890,11 +11254,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     config,
                     track_interactions,
                 } => {
+                    // Serialize every direct start from incumbent preflight
+                    // through readiness and final config attestation. Parents
+                    // in autostart/restart already hold this exact lock and
+                    // mark only their child command to avoid self-deadlock.
+                    let inherited_spawn_lock =
+                        std::env::var_os(nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV);
+                    let mut start_spawn_lock =
+                        acquire_daemon_start_spawn_lock(&db_path, inherited_spawn_lock)?;
                     if track_interactions {
                         eprintln!(
                             "note: --track-interactions is an MCP flag, not a daemon flag. \
                              Use: nestweaver mcp --track-interactions"
                         );
+                    }
+                    if let Some(requested_config) = config.as_deref() {
+                        // Validate before any platform-specific stop/install or
+                        // daemonize mutation. A bad explicit path must leave an
+                        // already-running daemon untouched.
+                        let _ = nestweaver_client::RestartConfig::for_cold_start(Some(
+                            requested_config,
+                        ))?;
                     }
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
@@ -10931,6 +11311,41 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .ok()
                                 .filter(|v| v.trim().parse::<u32>().is_ok());
                             let config_abs = config.as_deref().map(abs_for_daemon);
+
+                            // An explicit start against a live incumbent is an
+                            // assertion about that daemon, not permission to
+                            // replace it. Attest before bootout or SIGTERM so a
+                            // mismatch, old wire, or missing provenance leaves
+                            // the incumbent untouched. A stale launchd job or
+                            // live pidfile with no healthy RPC is likewise not
+                            // safe to mutate implicitly.
+                            if let Some(requested_config) = config_abs.as_deref() {
+                                let launchd_owned =
+                                    nestweaver_daemon::launchd::is_running(&instance_id);
+                                // The held flock, not a numeric PID plus
+                                // kill(0), is the ownership proof. The latter
+                                // could identify an unrelated recycled PID.
+                                let live_pidfile = pidfile_flock_held(&pidfile);
+                                match verify_explicit_config_before_start_success(
+                                    &db_path_abs,
+                                    Some(requested_config),
+                                ) {
+                                    Ok(()) => {
+                                        eprintln!("Daemon already running with requested config.");
+                                        return Ok((EXIT_SUCCESS, None));
+                                    }
+                                    Err(error) if launchd_owned || live_pidfile => {
+                                        return Err(error).context(
+                                            "refusing to stop a launchd/pidfile-owned incumbent before explicit --config provenance is verified",
+                                        );
+                                    }
+                                    Err(_) => {
+                                        // No live ownership evidence: this is
+                                        // a cold start; final attestation below
+                                        // still protects a concurrent winner.
+                                    }
+                                }
+                            }
                             let plist = nestweaver_daemon::launchd::generate_plist_with_config(
                                 &instance_id,
                                 &binary_path,
@@ -11012,8 +11427,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 &db_path,
                                 std::time::Duration::from_secs(60),
                             )) {
-                                Ok(_) => return Ok((EXIT_SUCCESS, None)),
-                                Err(_) => {
+                                Ok(_) => {
+                                    verify_explicit_config_before_start_success(
+                                        &db_path,
+                                        config.as_deref(),
+                                    )?;
+                                    return Ok((EXIT_SUCCESS, None));
+                                }
+                                Err(error) => {
+                                    if config.is_some() {
+                                        return Err(error).context(
+                                            "daemon start cannot confirm that the running launchd agent honors explicit --config",
+                                        );
+                                    }
                                     // Deliberately NOT reaping the half-booted
                                     // agent: launchd owns its lifecycle and a
                                     // bootout here would race launchd's next
@@ -11097,6 +11523,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     }
                                     eprintln!("Daemon already running (PID {}).", health.pid);
                                 }
+                                verify_explicit_config_before_start_success(
+                                    &db_path_abs,
+                                    config_abs.as_deref(),
+                                )?;
                                 Ok((EXIT_SUCCESS, None))
                             }
                             Err(error) => {
@@ -11108,7 +11538,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     let _ = child.kill();
                                     let _ = child.wait();
                                 }
-                                remove_unowned_daemon_runtime(&pidfile, &socket);
+                                remove_unowned_daemon_runtime(
+                                    &pidfile,
+                                    &socket,
+                                    &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                                );
                                 anyhow::bail!(
                                     "temporary daemon for {} did not become healthy: {error:#}",
                                     db_path_abs.display()
@@ -11154,6 +11588,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 } else {
                                     eprintln!("Daemon already running (PID {pid_trimmed}).");
                                 }
+                                verify_explicit_config_before_start_success(
+                                    &db_path,
+                                    config.as_deref(),
+                                )?;
                                 return Ok((EXIT_SUCCESS, None));
                             }
                             anyhow::bail!("flock on pidfile failed: {err}");
@@ -11201,6 +11639,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         match unsafe { daemonize.execute() } {
                             daemonize2::Outcome::Child(Ok(_)) => {
                                 // We are now the daemon process.
+                                if let Some(lock) = start_spawn_lock.take() {
+                                    lock.close_in_forked_child_without_unlock();
+                                }
                                 // daemonize2's pidfile flock was acquired before
                                 // the fork and is inherited by this child. Mark
                                 // that ownership only after `execute()` returns in
@@ -11247,6 +11688,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                                 if wait_for_daemon_boot(&socket, std::time::Duration::from_secs(10))
                                 {
+                                    if let Err(error) = verify_explicit_config_before_start_success(
+                                        &db_path,
+                                        config.as_deref(),
+                                    ) {
+                                        eprintln!("Error: {error:#}");
+                                        std::process::exit(EXIT_ERROR);
+                                    }
                                     eprintln!("Daemon started.");
                                     std::process::exit(EXIT_SUCCESS);
                                 }
@@ -11402,8 +11850,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         } else {
                             println!("Daemon is not running.");
                         }
-                        let _ = std::fs::remove_file(&pidfile);
-                        let _ = std::fs::remove_file(&socket);
+                        remove_unowned_daemon_runtime(
+                            &pidfile,
+                            &socket,
+                            &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                        );
                         return Ok((EXIT_SUCCESS, None));
                     };
 
@@ -11448,8 +11899,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         if unsafe { libc::kill(pid, 0) } != 0 {
                             eprintln!("Daemon stopped.");
-                            let _ = std::fs::remove_file(&pidfile);
-                            let _ = std::fs::remove_file(&socket);
+                            remove_unowned_daemon_runtime(
+                                &pidfile,
+                                &socket,
+                                &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                            );
                             return Ok((EXIT_SUCCESS, None));
                         }
                     }
@@ -11461,8 +11915,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         libc::kill(pid, libc::SIGKILL);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
-                    let _ = std::fs::remove_file(&pidfile);
-                    let _ = std::fs::remove_file(&socket);
+                    remove_unowned_daemon_runtime(
+                        &pidfile,
+                        &socket,
+                        &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                    );
                     eprintln!("Daemon killed.");
                     Ok((EXIT_SUCCESS, None))
                 }
@@ -11497,7 +11954,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             print_daemon_embedding_status(&db_path);
                         } else {
                             println!(
-                                "Daemon is not running (pidfile PID {pid} belongs to another process)."
+                                "{}",
+                                format_daemon_not_running_status(&format!(
+                                    "Daemon is not running (pidfile PID {pid} belongs to another process)."
+                                ))
                             );
                         }
                         return Ok((EXIT_SUCCESS, None));
@@ -11515,7 +11975,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
-                    println!("Daemon is not running.");
+                    println!(
+                        "{}",
+                        format_daemon_not_running_status("Daemon is not running.")
+                    );
                     Ok((EXIT_SUCCESS, None))
                 }
                 DaemonAction::Gc => {
@@ -11555,50 +12018,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     idle_timeout,
                     config,
                 } => {
-                    // Stop if running.
-                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
-                        && let Ok(pid) = pid_str.trim().parse::<i32>()
-                        && unsafe { libc::kill(pid, 0) } == 0
-                    {
-                        eprintln!("Stopping daemon (PID {pid})...");
-                        unsafe { libc::kill(pid, libc::SIGTERM) };
-                        for _ in 0..50 {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            if unsafe { libc::kill(pid, 0) } != 0 {
-                                break;
-                            }
-                        }
-                        if unsafe { libc::kill(pid, 0) } == 0 {
-                            unsafe { libc::kill(pid, libc::SIGKILL) };
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                        }
-                        let _ = std::fs::remove_file(&pidfile);
-                        let _ = std::fs::remove_file(&socket);
-                        eprintln!("Daemon stopped.");
-                    }
-
-                    // Re-exec ourselves to start the daemon fresh.
-                    let exe =
-                        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nestweaver"));
-                    let mut start_args: Vec<String> = vec![
-                        "daemon".to_string(),
-                        "--db".to_string(),
-                        db_path.display().to_string(),
-                        "start".to_string(),
-                        "--idle-timeout".to_string(),
-                        idle_timeout.to_string(),
-                    ];
-                    if let Some(cfg) = config.as_deref() {
-                        start_args.push("--config".to_string());
-                        start_args.push(cfg.display().to_string());
-                    }
-                    let status = std::process::Command::new(&exe)
-                        .args(&start_args)
-                        .status()
-                        .with_context(|| "failed to restart daemon")?;
-                    if !status.success() {
-                        anyhow::bail!("daemon start failed with {status}");
-                    }
+                    let runtime = tokio::runtime::Runtime::new()
+                        .context("failed to create daemon restart runtime")?;
+                    runtime.block_on(restart_live_daemon_preserving_config(
+                        &db_path,
+                        idle_timeout,
+                        config.as_deref(),
+                    ))?;
                     Ok((EXIT_SUCCESS, None))
                 }
             }
@@ -12432,13 +12858,13 @@ fn run_memory(
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({});
-                if let Some(value) = try_hybrid_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config.as_deref(),
                     "brain_memory_lint",
                     args,
-                ) {
+                )? {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -12497,13 +12923,13 @@ fn run_memory(
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
                 let args = serde_json::json!({ "apply": apply });
-                if let Some(value) = try_hybrid_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config.as_deref(),
                     "brain_memory_consolidate",
                     args,
-                ) {
+                )? {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -12556,13 +12982,13 @@ fn run_memory(
                     "edge_types": edge_types,
                     "depth": depth,
                 });
-                if let Some(value) = try_hybrid_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config.as_deref(),
                     "brain_memory_related",
                     args,
-                ) {
+                )? {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
                 }
@@ -12595,20 +13021,27 @@ fn run_memory(
 
 /// Dispatch a read-only brain command through the `HybridClient`, which
 /// queries the local daemon **and** any configured upstream servers.
-/// Returns `Some(json_value)` on success, `None` if the daemon is
-/// unavailable or the RPC fails (caller should fall through to
-/// direct-disk mode).
-fn try_hybrid_json_rpc(
+/// Returns `Some(json_value)` on success and `None` when a configless caller
+/// may use the legacy direct-disk fallback. With an explicit config, daemon
+/// connection or hybrid query failures are returned: falling through would
+/// silently discard configured provenance/upstreams while still exiting 0.
+fn try_hybrid_json_rpc_checked(
     use_daemon: bool,
     db_path: &std::path::Path,
     config: Option<&std::path::Path>,
     rpc_name: &str,
     args: serde_json::Value,
-) -> Option<serde_json::Value> {
+) -> anyhow::Result<Option<serde_json::Value>> {
     if !use_daemon {
-        return None;
+        return Ok(None);
     }
-    let rt = tokio::runtime::Runtime::new().ok()?;
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) if config.is_some() => {
+            return Err(error).context("create runtime for explicit-config daemon query");
+        }
+        Err(_) => return Ok(None),
+    };
     let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // nw-087: a read/query against a NONEXISTENT local db must not autostart a
     // daemon that CREATES an empty store — that turns a typo'd `--db` path into a
@@ -12618,23 +13051,56 @@ fn try_hybrid_json_rpc(
     // `db_not_found` and a non-zero exit. `index` creates dbs and does NOT route
     // through here, so it is unaffected.
     if !db_path.exists() {
-        return rt
-            .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
-                config, &start_dir, rpc_name, &args,
-            ))
-            .ok();
+        if let Some(config_path) = config {
+            nestweaver_engine::InstanceConfig::from_file(config_path).with_context(|| {
+                format!(
+                    "load explicit instance config {} before missing-DB upstream routing",
+                    config_path.display()
+                )
+            })?;
+        }
+        let discovered =
+            nestweaver_client::discovery::discover_upstreams_with_config(&start_dir, config);
+        if discovered.is_empty() {
+            return Ok(None);
+        }
+        return match rt.block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
+            config, &start_dir, rpc_name, &args,
+        )) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if config.is_some() => Err(error).with_context(|| {
+                format!(
+                    "explicit-config upstream query {rpc_name} failed; refusing direct fallback"
+                )
+            }),
+            Err(_) => Ok(None),
+        };
     }
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {
         Ok(mut hybrid) => match rt.block_on(hybrid.query(rpc_name, &args)) {
-            Ok(value) => Some(value),
+            Ok(value) => Ok(Some(value)),
             Err(e) => {
+                if config.is_some() {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "explicit-config hybrid query {rpc_name} failed; refusing direct fallback"
+                        )
+                    });
+                }
                 warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
-                None
+                Ok(None)
             }
         },
         Err(e) => {
+            if config.is_some() {
+                return Err(e).with_context(|| {
+                    format!(
+                        "explicit config could not be honored by the daemon for {rpc_name}; refusing direct fallback"
+                    )
+                });
+            }
             let upstream = rt
                 .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
                     config, &start_dir, rpc_name, &args,
@@ -12643,8 +13109,47 @@ fn try_hybrid_json_rpc(
             if upstream.is_none() {
                 warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
             }
-            upstream
+            Ok(upstream)
         }
+    }
+}
+
+/// Configless compatibility wrapper. Callers with an explicit config must use
+/// [`try_hybrid_json_rpc_checked`] and propagate its error.
+fn try_hybrid_json_rpc(
+    use_daemon: bool,
+    db_path: &std::path::Path,
+    config: Option<&std::path::Path>,
+    rpc_name: &str,
+    args: serde_json::Value,
+) -> Option<serde_json::Value> {
+    debug_assert!(
+        !use_daemon || config.is_none(),
+        "explicit-config callers must use try_hybrid_json_rpc_checked"
+    );
+    match try_hybrid_json_rpc_checked(use_daemon, db_path, config, rpc_name, args) {
+        Ok(value) => value,
+        Err(error) => {
+            warn_daemon_bypassed(db_path, rpc_name, &format!("{error:#}"));
+            None
+        }
+    }
+}
+
+fn hybrid_source_label(value: &serde_json::Value) -> &'static str {
+    if value
+        .get("_meta")
+        .and_then(|meta| meta.get("sources"))
+        .and_then(|sources| sources.as_array())
+        .is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| source.as_str() == Some("server"))
+        })
+    {
+        "daemon+hybrid"
+    } else {
+        "daemon"
     }
 }
 
@@ -12912,8 +13417,10 @@ fn run_brain(
 
             if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client =
-                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ))?;
                 // Absolute path: the daemon runs with CWD=/ and would otherwise resolve
                 // a client-relative vault path against the wrong directory (indexing 0).
                 let vault_abs = abs_for_daemon(&path);
@@ -13103,13 +13610,13 @@ fn run_brain(
             let db_path = db_resolved.as_path();
 
             // ── daemon guard ──────────────────────────────────────
-            if let Some(value) = try_hybrid_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 db_path,
                 config.as_deref(),
                 "brain_status",
                 serde_json::json!({}),
-            ) {
+            )? {
                 if json {
                     // Inject upstream info into JSON output.
                     let mut value = value;
@@ -13559,13 +14066,13 @@ fn run_brain(
             require_existing_db(&db_path)?;
 
             // ── daemon guard ──────────────────────────────────────
-            if let Some(value) = try_hybrid_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 None,
                 "stale_check",
                 serde_json::json!({}),
-            ) {
+            )? {
                 // Emit the exact JSON shape the direct path
                 // produces (the hybrid `_meta` envelope — whose background
                 // `stale_repos` verdict could contradict the tool's fresh
@@ -14066,7 +14573,7 @@ fn run_brain(
             // rows. The command documented in this repo's own CLAUDE.md did
             // this.
             let existing =
-                vault_registrations_for_root(use_daemon, &db_path, config.as_deref(), &canonical);
+                vault_registrations_for_root(use_daemon, &db_path, config.as_deref(), &canonical)?;
             let explicit = explicit_instance_id(instance.as_deref(), config.as_deref());
             let instance_id = match existing.as_slice() {
                 // Nothing registered here yet — a genuine create.
@@ -14132,8 +14639,10 @@ fn run_brain(
             if use_daemon && since.is_none() {
                 // Route full refresh through daemon's IndexVault RPC
                 let rt = tokio::runtime::Runtime::new()?;
-                let mut client =
-                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
+                let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ))?;
                 let req = nestweaver_proto::IndexVaultRequest {
                     // Absolute path: the daemon runs with CWD=/ and would otherwise
                     // resolve a client-relative vault path against the wrong directory.
@@ -14464,84 +14973,103 @@ fn run_brain(
             // and stay in sync with live re-indexing. Falls through to the
             // direct-disk implementation below when `--no-daemon` is set,
             // `NESTWEAVER_NO_DAEMON` is in the env, or the daemon is down.
-            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
-                    &db_path,
-                    config.as_deref(),
-                    &cwd,
-                ));
-                if let Ok(mut hybrid) = connect {
-                    if hybrid.has_upstreams() {
-                        // Route through HybridClient::query for upstream routing.
-                        let params = serde_json::json!({
-                            "query": raw_query,
-                            "limit": limit,
-                            "prf": prf,
-                        });
-                        let rpc = rt.block_on(hybrid.query("brain_search", &params));
-                        match rpc {
-                            Ok(result) => {
-                                if json {
-                                    println!("{}", serde_json::to_string_pretty(&result)?);
-                                } else {
-                                    render_brain_search_json(&result)?;
+            if use_daemon {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(runtime) => Some(runtime),
+                    Err(error) if config.is_some() => {
+                        return Err(error)
+                            .context("create runtime for explicit-config brain search");
+                    }
+                    Err(_) => None,
+                };
+                if let Some(rt) = rt {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
+                        &db_path,
+                        config.as_deref(),
+                        &cwd,
+                    )) {
+                        Ok(mut hybrid) if hybrid.has_upstreams() => {
+                            let params = serde_json::json!({
+                                "query": raw_query,
+                                "limit": limit,
+                                "prf": prf,
+                            });
+                            match rt.block_on(hybrid.query("brain_search", &params)) {
+                                Ok(result) => {
+                                    if json {
+                                        println!("{}", serde_json::to_string_pretty(&result)?);
+                                    } else {
+                                        render_brain_search_json(&result)?;
+                                    }
+                                    let count = result
+                                        .get("results")
+                                        .and_then(|v| v.as_array())
+                                        .map(|a| a.len())
+                                        .unwrap_or(0);
+                                    let stats = format!(
+                                        "{} results in {} (via daemon+hybrid)",
+                                        count,
+                                        format_elapsed(t0.elapsed())
+                                    );
+                                    return Ok((EXIT_SUCCESS, Some(stats)));
                                 }
-                                let count = result
-                                    .get("results")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| a.len())
-                                    .unwrap_or(0);
-                                let stats = format!(
-                                    "{} results in {} (via daemon+hybrid)",
-                                    count,
-                                    format_elapsed(t0.elapsed())
-                                );
-                                return Ok((EXIT_SUCCESS, Some(stats)));
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "warning: hybrid search failed ({}); falling back to direct DB read",
-                                    e
-                                );
+                                Err(error) if config.is_some() => {
+                                    return Err(error).context(
+                                        "explicit-config hybrid brain search failed; refusing direct fallback",
+                                    );
+                                }
+                                Err(error) => warn_daemon_bypassed(
+                                    &db_path,
+                                    "brain_search",
+                                    &format!("{error:#}"),
+                                ),
                             }
                         }
-                    } else {
-                        // No upstreams — use typed RPC for efficiency.
-                        let req = nestweaver_proto::BrainSearchRequest {
-                            query: raw_query.clone(),
-                            limit: limit as i32,
-                            response_format: None,
-                            include_bodies: false,
-                            prf,
-                            rerank: false,
-                            root: None,
-                        };
-                        let rpc = rt.block_on(async {
-                            hybrid.inner_mut().search(req).await.map(|r| r.into_inner())
-                        });
-                        match rpc {
-                            Ok(resp) => {
-                                render_brain_search_response(&resp, json)?;
-                                let stats = format!(
-                                    "{} results in {} (via daemon)",
-                                    resp.results.len(),
-                                    format_elapsed(t0.elapsed())
-                                );
-                                return Ok((EXIT_SUCCESS, Some(stats)));
+                        Ok(mut hybrid) => {
+                            let req = nestweaver_proto::BrainSearchRequest {
+                                query: raw_query.clone(),
+                                limit: limit as i32,
+                                response_format: None,
+                                include_bodies: false,
+                                prf,
+                                rerank: false,
+                                root: None,
+                            };
+                            match rt.block_on(async {
+                                hybrid.inner_mut().search(req).await.map(|r| r.into_inner())
+                            }) {
+                                Ok(resp) => {
+                                    render_brain_search_response(&resp, json)?;
+                                    let stats = format!(
+                                        "{} results in {} (via daemon)",
+                                        resp.results.len(),
+                                        format_elapsed(t0.elapsed())
+                                    );
+                                    return Ok((EXIT_SUCCESS, Some(stats)));
+                                }
+                                Err(error) if config.is_some() => {
+                                    return Err(error).context(
+                                        "explicit-config daemon brain search failed; refusing direct fallback",
+                                    );
+                                }
+                                Err(error) => warn_daemon_bypassed(
+                                    &db_path,
+                                    "brain_search",
+                                    &format!("{error:#}"),
+                                ),
                             }
-                            Err(status) => {
-                                eprintln!(
-                                    "warning: daemon search RPC failed ({}); falling back to direct DB read",
-                                    status.message()
-                                );
-                            }
+                        }
+                        Err(error) if config.is_some() => {
+                            return Err(error).context(
+                                "explicit config could not be honored by the daemon for brain_search; refusing direct fallback",
+                            );
+                        }
+                        Err(error) => {
+                            warn_daemon_bypassed(&db_path, "brain_search", &format!("{error:#}"));
                         }
                     }
                 }
-                // Connect failed → silently fall through (daemon may not be
-                // running for this DB; the direct-disk path is the legacy
-                // behavior and remains correct).
             }
 
             let store = open_store(Some(&db_path))?;
@@ -14638,20 +15166,9 @@ fn run_brain(
             // `--prefer-instance` are applied client-side and the daemon
             // proto does not yet carry them, so fall through to the local
             // path when either is set.
-            if use_daemon
-                && !no_tests
-                && prefer_instance.is_none()
-                && let Ok(rt) = tokio::runtime::Runtime::new()
-            {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let connect = rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
-                    &db_path,
-                    config_path.as_deref(),
-                    &cwd,
-                ));
-                if let Ok(mut hybrid) = connect {
-                    // Build params JSON — used by both hybrid and typed paths.
-                    let context_params = serde_json::json!({
+            if use_daemon && !no_tests && prefer_instance.is_none() {
+                // Build params JSON — used by both hybrid and typed paths.
+                let context_params = serde_json::json!({
                         "seeds": seeds,
                         "token_budget": token_budget.unwrap_or(0),
                         "repos": repos,
@@ -14672,44 +15189,35 @@ fn run_brain(
                         "since": since.as_deref().unwrap_or(""),
                         "recency_weight": recency_weight,
                         "recency_half_life_days": recency_half_life_days,
-                    });
+                });
 
-                    // Route through hybrid.query for upstream merge.
-                    let rpc = rt.block_on(hybrid.query("brain_context", &context_params));
-                    match rpc {
-                        Ok(result_json) => {
-                            let result: nestweaver_engine::BrainContextResult =
-                                serde_json::from_value(result_json)?;
-                            let cut = match token_budget {
-                                Some(budget) => token_budgeted_truncate(&result.connected, budget),
-                                None => limit.min(result.connected.len()),
-                            };
-                            if json {
-                                print_brain_context_json(&result, cut)?;
-                            } else {
-                                print_brain_context_text(&result, cut, token_budget);
-                            }
-                            let source = if hybrid.has_upstreams() {
-                                "daemon+hybrid"
-                            } else {
-                                "daemon"
-                            };
-                            let node_count = result.seeds.len() + cut;
-                            let stats = format!(
-                                "{} nodes in {} (via {})",
-                                node_count,
-                                format_elapsed(t0.elapsed()),
-                                source,
-                            );
-                            return Ok((EXIT_SUCCESS, Some(stats)));
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "warning: daemon context RPC failed ({}); falling back to direct DB read",
-                                e
-                            );
-                        }
+                if let Some(result_json) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config_path.as_deref(),
+                    "brain_context",
+                    context_params,
+                )? {
+                    let source = hybrid_source_label(&result_json);
+                    let result: nestweaver_engine::BrainContextResult =
+                        serde_json::from_value(result_json)?;
+                    let cut = match token_budget {
+                        Some(budget) => token_budgeted_truncate(&result.connected, budget),
+                        None => limit.min(result.connected.len()),
+                    };
+                    if json {
+                        print_brain_context_json(&result, cut)?;
+                    } else {
+                        print_brain_context_text(&result, cut, token_budget);
                     }
+                    let node_count = result.seeds.len() + cut;
+                    let stats = format!(
+                        "{} nodes in {} (via {})",
+                        node_count,
+                        format_elapsed(t0.elapsed()),
+                        source,
+                    );
+                    return Ok((EXIT_SUCCESS, Some(stats)));
                 }
             }
 
@@ -15031,13 +15539,13 @@ fn run_brain(
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
-            if let Some(value) = try_hybrid_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "brain_broken_links",
                 serde_json::json!({ "max_suggestions": max_suggestions, "limit": limit }),
-            ) {
+            )? {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else if let Some(arr) = value.get("broken_links") {
@@ -15142,13 +15650,13 @@ fn run_brain(
                     args["allowlist"] = serde_json::json!(allow);
                 }
                 args["limit"] = serde_json::json!(limit);
-                if let Some(value) = try_hybrid_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc_checked(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
                     "brain_orphan_documents",
                     args,
-                ) {
+                )? {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else if let Some(arr) = value.get("orphans") {
@@ -15223,13 +15731,13 @@ fn run_brain(
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
-            if let Some(value) = try_hybrid_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "brain_topic_clusters",
                 serde_json::json!({ "resolution": resolution, "limit": limit }),
-            ) {
+            )? {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else if let Some(arr) = value.get("clusters") {
@@ -15305,13 +15813,13 @@ fn run_brain(
                 if let Some(ref t) = tag {
                     args["tag"] = serde_json::json!(t);
                 }
-                if let Some(value) = try_hybrid_json_rpc(
+                if let Some(value) = try_hybrid_json_rpc_checked(
                     use_daemon,
                     &db_path,
                     config.as_deref(),
                     "brain_tag_graph",
                     args,
-                ) {
+                )? {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else if tag.is_some() {
@@ -15414,13 +15922,13 @@ fn run_brain(
             // missing --db, matching the other read commands.
             require_existing_db(&db_path)?;
 
-            if let Some(value) = try_hybrid_json_rpc(
+            if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
                 "brain_doc_stats",
                 serde_json::json!({ "top_tags_limit": top_tags_limit }),
-            ) {
+            )? {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
@@ -17553,7 +18061,7 @@ mod refresh_instance_resolution_tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.lbug");
         let root = dir.path().join("vault");
-        let found = vault_registrations_for_root(false, &missing, None, &root);
+        let found = vault_registrations_for_root(false, &missing, None, &root).unwrap();
         assert!(found.is_empty(), "got: {found:?}");
     }
 }
@@ -18659,6 +19167,116 @@ fn impact_item_to_result(
 mod abs_for_daemon_tests {
     use super::*;
 
+    fn restart_args(config: &nestweaver_client::RestartConfig) -> Vec<std::ffi::OsString> {
+        daemon_restart_start_args(std::path::Path::new("/tmp/brain.lbug"), 123, config)
+    }
+
+    #[test]
+    fn restart_without_flag_preserves_captured_configured_path() {
+        let args = restart_args(&nestweaver_client::RestartConfig::Configured(
+            "/canonical/instance.toml".into(),
+        ));
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                "/tmp/brain.lbug",
+                "start",
+                "--idle-timeout",
+                "123",
+                "--config",
+                "/canonical/instance.toml",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn restart_without_flag_preserves_captured_compiled_defaults() {
+        let args = restart_args(&nestweaver_client::RestartConfig::CompiledDefaults);
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                "/tmp/brain.lbug",
+                "start",
+                "--idle-timeout",
+                "123",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn restart_explicit_override_is_the_spawned_config_decision() {
+        let args = restart_args(&nestweaver_client::RestartConfig::Configured(
+            "/explicit/override.toml".into(),
+        ));
+        assert_eq!(args[6], "--config");
+        assert_eq!(args[7], "/explicit/override.toml");
+    }
+
+    #[test]
+    fn restart_child_command_marks_parent_spawn_lock_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let spawn_lock = nestweaver_client::autostart::SpawnLock::acquire(&db).unwrap();
+        let mut command = daemon_restart_command(
+            PathBuf::from("/opt/nestweaver"),
+            restart_args(&nestweaver_client::RestartConfig::CompiledDefaults),
+        );
+        spawn_lock.configure_child_handoff(&mut command).unwrap();
+        let fd = command
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV)
+                    .then_some(value.unwrap())
+            })
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<std::os::fd::RawFd>()
+            .unwrap();
+        assert!(fd >= 3);
+    }
+
+    #[test]
+    fn direct_start_serialization_rejects_missing_fd_and_blocks_contenders() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+
+        // Leave the expected lock file present but unowned. Ambient marker
+        // state alone must not bypass direct-start serialization.
+        drop(acquire_daemon_start_spawn_lock(&db, None).unwrap().unwrap());
+        let forged = match acquire_daemon_start_spawn_lock(&db, Some("-1".into())) {
+            Err(error) => error,
+            Ok(_) => panic!("forged parent marker must not skip an unowned spawn lock"),
+        };
+        assert!(format!("{forged:#}").contains("invalid inherited"));
+
+        let first = acquire_daemon_start_spawn_lock(&db, None).unwrap().unwrap();
+
+        let contender_db = db.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let second = acquire_daemon_start_spawn_lock(&contender_db, None)
+                .unwrap()
+                .unwrap();
+            tx.send(()).unwrap();
+            drop(second);
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(150))
+                .is_err()
+        );
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("direct start contender should proceed after readiness owner releases");
+        contender.join().unwrap();
+    }
+
     #[test]
     fn relative_path_becomes_absolute_never_bare_relative() {
         // The daemon runs with CWD=/ (launchd), so a relative path in an RPC would resolve
@@ -19098,6 +19716,35 @@ mod snapshot_build_guard_tests {
 #[cfg(test)]
 mod hybrid_cli_tests {
     use super::*;
+
+    fn valid_local_instance_config(dir: &std::path::Path, extra: &str) -> String {
+        format!(
+            r#"
+instance_id = "missing-db-test"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+
+{extra}
+"#,
+            dir.join("snapshots").display(),
+            dir.join("workspace").display(),
+        )
+    }
 
     /// The CLI must send the exact arg names the MCP tools read —
     /// `top_n` for bridge_nodes, `changed_files` (array) for affected_tests.
@@ -19623,6 +20270,95 @@ mod hybrid_cli_tests {
         let items: Vec<String> =
             serde_json::from_value(unwrap_hybrid_payload(bare)).unwrap_or_default();
         assert_eq!(items, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn missing_db_does_not_swallow_explicit_config_upstream_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db = dir.path().join("missing.lbug");
+        let invalid_config = dir.path().join("invalid.toml");
+        std::fs::write(&invalid_config, "this is not valid = [toml").unwrap();
+
+        let error = try_hybrid_json_rpc_checked(
+            true,
+            &missing_db,
+            Some(&invalid_config),
+            "list_repos",
+            serde_json::json!({}),
+        )
+        .expect_err("an explicit config error must not become direct fallback");
+
+        assert!(
+            format!("{error:#}").contains("load explicit instance config"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn missing_db_with_valid_local_only_config_preserves_direct_not_found_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db = dir.path().join("missing.lbug");
+        let config = dir.path().join("instance.toml");
+        std::fs::write(&config, valid_local_instance_config(dir.path(), "")).unwrap();
+
+        let value = try_hybrid_json_rpc_checked(
+            true,
+            &missing_db,
+            Some(&config),
+            "list_repos",
+            serde_json::json!({}),
+        )
+        .expect("a valid local-only config is not an upstream failure");
+
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn missing_db_with_unusable_configured_upstream_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db = dir.path().join("missing.lbug");
+        let config = dir.path().join("instance.toml");
+        std::fs::write(
+            &config,
+            valid_local_instance_config(
+                dir.path(),
+                r#"
+[[upstream]]
+name = "unreachable"
+url = "http://127.0.0.1:1"
+mode = "primary"
+timeout = "20ms"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let error = try_hybrid_json_rpc_checked(
+            true,
+            &missing_db,
+            Some(&config),
+            "list_repos",
+            serde_json::json!({}),
+        )
+        .expect_err("a declared but unusable upstream must fail closed");
+
+        assert!(format!("{error:#}").contains("refusing direct fallback"));
+    }
+
+    #[test]
+    fn hybrid_source_label_distinguishes_daemon_only_from_server_merge() {
+        assert_eq!(
+            hybrid_source_label(&serde_json::json!({
+                "_meta": { "sources": ["local"] }
+            })),
+            "daemon"
+        );
+        assert_eq!(
+            hybrid_source_label(&serde_json::json!({
+                "_meta": { "sources": ["local", "server"] }
+            })),
+            "daemon+hybrid"
+        );
     }
 }
 
@@ -20760,14 +21496,15 @@ mod daemon_cli_tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
-    fn macos_failed_start_cleanup_preserves_concurrent_owner() {
+    fn unowned_runtime_cleanup_preserves_concurrent_owner_and_removes_binding() {
         use std::os::unix::io::AsRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("daemon.pid");
         let socket = dir.path().join("daemon.sock");
+        let binding = dir.path().join("effective-config.json");
         let owner = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -20776,19 +21513,25 @@ mod daemon_cli_tests {
             .open(&pidfile)
             .unwrap();
         std::fs::write(&socket, "incumbent socket").unwrap();
+        std::fs::write(&binding, "incumbent binding").unwrap();
         assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-        remove_unowned_daemon_runtime(&pidfile, &socket);
+        remove_unowned_daemon_runtime(&pidfile, &socket, &binding);
         assert!(
             pidfile.exists(),
             "a concurrent owner's pidfile must survive"
         );
         assert!(socket.exists(), "a concurrent owner's socket must survive");
+        assert!(
+            binding.exists(),
+            "a concurrent owner's effective-config binding must survive"
+        );
 
         assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(owner);
-        remove_unowned_daemon_runtime(&pidfile, &socket);
+        remove_unowned_daemon_runtime(&pidfile, &socket, &binding);
         assert!(!socket.exists(), "unowned socket must be retired");
+        assert!(!binding.exists(), "unowned binding must be retired");
         assert!(!pidfile.exists(), "unowned pidfile must be retired");
     }
 }
