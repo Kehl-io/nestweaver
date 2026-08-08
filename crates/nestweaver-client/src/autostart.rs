@@ -9,6 +9,79 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 
+/// Serializes daemon spawns for one runtime instance.
+///
+/// Version-mismatch restarts acquire this before shutdown and retain it until
+/// the replacement is ready, so a concurrent config-less caller cannot win
+/// the gap between the old daemon releasing its pidfile and the replacement
+/// publishing its socket.
+pub struct SpawnLock {
+    file: fs::File,
+    instance_id: String,
+}
+
+impl SpawnLock {
+    pub fn acquire(db_path: &Path) -> Result<Self> {
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+        let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+        let spawn_lock_path = pidfile.with_extension("spawnlock");
+        Self::acquire_at(instance_id, &spawn_lock_path)
+    }
+
+    /// Acquire the blocking OS flock without blocking a Tokio executor thread.
+    pub async fn acquire_async(db_path: &Path) -> Result<Self> {
+        let db_path = db_path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::acquire(&db_path))
+            .await
+            .context("spawn-lock acquisition task failed")?
+    }
+
+    fn acquire_at(instance_id: String, spawn_lock_path: &Path) -> Result<Self> {
+        if let Some(parent) = spawn_lock_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create spawn lock directory {}", parent.display())
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&spawn_lock_path)
+            .with_context(|| format!("failed to open spawn lock {}", spawn_lock_path.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            bail!(
+                "flock on spawn lock failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(Self { file, instance_id })
+    }
+}
+
+impl Drop for SpawnLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Attempt to own this exact pidfile inode. `true` is authoritative evidence
+/// that no daemon holds it, regardless of whether its numeric contents happen
+/// to name a live (recycled) process.
+fn try_acquire_pidfile_lock(file: &fs::File) -> std::io::Result<bool> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
 /// Ensure a daemon is running for the given DB and return the socket path.
 ///
 /// Acquires an exclusive flock on the pidfile, checks whether a live daemon
@@ -36,10 +109,8 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
     // for its process lifetime, regardless of whether launchd, a foreground
     // child, or a non-macOS daemonized launcher created it.
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+    match try_acquire_pidfile_lock(&file) {
+        Ok(false) => {
             // Lock held by the running daemon — it's alive.
             if let Some(pid) = read_pid_from_file(&mut file) {
                 debug!(pid, "daemon already running (lock held)");
@@ -48,19 +119,15 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
             wait_for_socket(&sock)?;
             return Ok(sock);
         }
-        bail!("flock on pidfile failed: {}", err);
+        Ok(true) => {}
+        Err(error) => bail!("flock on pidfile failed: {error}"),
     }
 
-    // We acquired the lock, so no daemon holds it. Check if a process
-    // from the pidfile is still alive (shouldn't be, but be safe).
+    // We acquired the lock, so no daemon owns this pidfile. Its numeric PID is
+    // stale even if the kernel has recycled that number for another live
+    // process; never mistake numeric liveness for daemon ownership.
     if let Some(pid) = read_pid_from_file(&mut file) {
-        if is_process_alive(pid) {
-            debug!(pid, "daemon already running");
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            wait_for_socket(&sock)?;
-            return Ok(sock);
-        }
-        warn!(pid, "stale daemon pid — cleaning up");
+        warn!(pid, "unowned daemon pidfile is stale — cleaning up");
     }
 
     // Clean up stale socket if present.
@@ -83,30 +150,43 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
     unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(file);
 
-    // Serialize concurrent auto-starts on a SEPARATE spawn-lock. The pidfile flock had to be
-    // released above for the daemon to take it, which opens a window where a fleet of clients
-    // starting at once could each spawn a daemon (only the DB write-lock would then absorb the
-    // pile-up). Holding this blocking lock across spawn + socket-wait, with a re-check, means
-    // exactly one client spawns and the rest observe the started daemon. Acquired AFTER releasing
-    // the pidfile flock so the spawned daemon can take that flock (otherwise: deadlock).
-    let spawn_lock_path = pidfile.with_extension("spawnlock");
-    let spawn_lock = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&spawn_lock_path)
-        .with_context(|| format!("failed to open spawn lock {}", spawn_lock_path.display()))?;
-    if unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        bail!(
-            "flock on spawn lock failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    // Serialize concurrent auto-starts on a SEPARATE spawn-lock. The pidfile
+    // flock had to be released above for the daemon to take it.
+    let spawn_lock = SpawnLock::acquire(db_path)?;
+    ensure_daemon_with_spawn_lock(db_path, config_path, &spawn_lock)
+}
+
+/// Async-safe wrapper around the synchronous pidfile/spawn/socket-readiness
+/// protocol. All filesystem flocks and polling sleeps run off the executor.
+pub async fn ensure_daemon_async(db_path: &Path, config_path: Option<&Path>) -> Result<PathBuf> {
+    let db_path = db_path.to_path_buf();
+    let config_path = config_path.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || ensure_daemon(&db_path, config_path.as_deref()))
+        .await
+        .context("daemon ensure task failed")?
+}
+
+/// Start a daemon while the caller retains the instance's spawn lock.
+///
+/// This is the commit half of a version-mismatch restart. The caller acquires
+/// the guard before shutting down the old daemon and passes the same guard
+/// through replacement readiness.
+pub fn ensure_daemon_with_spawn_lock(
+    db_path: &Path,
+    config_path: Option<&Path>,
+    spawn_lock: &SpawnLock,
+) -> Result<PathBuf> {
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+    anyhow::ensure!(
+        spawn_lock.instance_id == instance_id,
+        "spawn lock belongs to daemon instance {}, not {instance_id}",
+        spawn_lock.instance_id
+    );
+    let sock = nestweaver_daemon::lifecycle::socket_path(&instance_id);
+    let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
 
     // Re-check: another client may have started the daemon while we waited for the spawn-lock.
     if socket_accepts_connections(&sock) {
-        unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
         debug!("daemon started by a concurrent client while awaiting spawn lock");
         return Ok(sock);
     }
@@ -127,11 +207,28 @@ pub fn ensure_daemon(db_path: &Path, config_path: Option<&Path>) -> Result<PathB
     // waiting on was just spawned by us, so a process that has already exited
     // means it will never bind and there is nothing to wait for.
     let waited = wait_for_socket_watching(&sock, Some(&pidfile), stale_pid);
-    unsafe { libc::flock(spawn_lock.as_raw_fd(), libc::LOCK_UN) };
     waited?;
 
     info!("daemon started, socket at {}", sock.display());
     Ok(sock)
+}
+
+/// Async-safe guarded spawn/readiness commit. The guard is moved into the
+/// blocking task and returned only after readiness, letting the async caller
+/// retain it through successor identity/config verification.
+pub async fn ensure_daemon_with_spawn_lock_async(
+    db_path: &Path,
+    config_path: Option<&Path>,
+    spawn_lock: SpawnLock,
+) -> Result<(PathBuf, SpawnLock)> {
+    let db_path = db_path.to_path_buf();
+    let config_path = config_path.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        let socket = ensure_daemon_with_spawn_lock(&db_path, config_path.as_deref(), &spawn_lock)?;
+        Ok((socket, spawn_lock))
+    })
+    .await
+    .context("guarded daemon spawn/readiness task failed")?
 }
 
 /// Read a PID from an already-opened pidfile.
@@ -376,6 +473,107 @@ fn wait_for_socket_watching(
 mod tests {
     use super::*;
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn acquired_pidfile_flock_makes_even_a_live_numeric_pid_stale() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&pidfile)
+            .unwrap();
+        write!(file, "{}", std::process::id()).unwrap();
+        assert!(is_process_alive(std::process::id() as i32));
+        assert!(
+            try_acquire_pidfile_lock(&file).unwrap(),
+            "acquiring the flock is authoritative: no daemon owns this pidfile"
+        );
+        assert_eq!(
+            read_pid_from_file(&mut file),
+            Some(std::process::id() as i32)
+        );
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    #[test]
+    fn spawn_lock_blocks_a_concurrent_configless_contender_until_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("daemon.spawnlock");
+        let first = SpawnLock::acquire_at("same-instance".to_string(), &lock_path).unwrap();
+        let contender_path = lock_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let second =
+                SpawnLock::acquire_at("same-instance".to_string(), &contender_path).unwrap();
+            tx.send(()).unwrap();
+            drop(second);
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "contender must remain blocked across shutdown and replacement spawn"
+        );
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("contender should proceed after transaction releases spawn lock");
+        contender.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_spawn_lock_contention_does_not_block_current_thread_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let first = SpawnLock::acquire(&db).unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            drop(first);
+        });
+
+        let second = tokio::time::timeout(Duration::from_secs(2), SpawnLock::acquire_async(&db))
+            .await
+            .expect("timer-driven holder release must run on a current-thread runtime")
+            .unwrap();
+        release.await.unwrap();
+        drop(second);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_ensure_production_seam_allows_timer_driven_transaction_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+        let socket = nestweaver_daemon::lifecycle::socket_path(&instance_id);
+        let runtime = nestweaver_daemon::lifecycle::runtime_dir(&instance_id);
+        let transaction_lock = SpawnLock::acquire(&db).unwrap();
+        let holder_socket = socket.clone();
+        let holder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(parent) = holder_socket.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let _ = fs::remove_file(&holder_socket);
+            let listener = UnixListener::bind(&holder_socket).unwrap();
+            drop(transaction_lock);
+            listener
+        });
+
+        let ensured = tokio::time::timeout(Duration::from_secs(3), ensure_daemon_async(&db, None))
+            .await
+            .expect("blocking spawn-lock wait must not prevent the holder's timer")
+            .unwrap();
+        assert_eq!(ensured, socket);
+        let listener = holder.await.unwrap();
+        drop(listener);
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir_all(runtime);
+    }
 
     #[test]
     fn daemon_start_command_does_not_pin_fork_routing() {
