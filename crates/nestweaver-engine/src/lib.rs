@@ -16,6 +16,82 @@ pub fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Failure while resolving a user-supplied path.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveUserPathError {
+    /// An empty path would otherwise resolve to the process working directory,
+    /// which is never a safe interpretation of user input.
+    #[error("cannot resolve an empty user path; configure a non-empty path")]
+    EmptyPath,
+    /// `~` requires a discoverable home directory; never reinterpret it as a
+    /// relative path when one is unavailable.
+    #[error(
+        "cannot expand user path '{input}': no home directory is available; configure an absolute path"
+    )]
+    HomeDirectoryUnavailable { input: String },
+    /// Resolving an ordinary relative path requires the process working
+    /// directory.
+    #[error("cannot resolve relative user path '{input}' against the current directory: {source}")]
+    CurrentDirectoryUnavailable {
+        input: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Resolve a user-supplied path string to an absolute [`PathBuf`].
+///
+/// - A leading `~/` (or a bare `~`) expands against [`dirs::home_dir`]. When no
+///   home directory is known, resolution fails rather than treating `~` as a
+///   relative directory.
+/// - Absolute paths pass through unchanged.
+/// - Relative paths are absolutized against the current working directory
+///   (lexically, without touching the filesystem), so a relative configured
+///   path never prints as relative in an error message.
+pub fn resolve_user_path(input: &str) -> Result<PathBuf, ResolveUserPathError> {
+    resolve_user_path_with_home(input, dirs::home_dir())
+}
+
+fn resolve_user_path_with_home(
+    input: &str,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, ResolveUserPathError> {
+    if input.trim().is_empty() {
+        return Err(ResolveUserPathError::EmptyPath);
+    }
+    let expanded = if input == "~" {
+        match home {
+            Some(home) => home,
+            None => {
+                return Err(ResolveUserPathError::HomeDirectoryUnavailable {
+                    input: input.to_string(),
+                });
+            }
+        }
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        match home {
+            Some(home) => home.join(rest),
+            None => {
+                return Err(ResolveUserPathError::HomeDirectoryUnavailable {
+                    input: input.to_string(),
+                });
+            }
+        }
+    } else {
+        PathBuf::from(input)
+    };
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        std::path::absolute(&expanded).map_err(|source| {
+            ResolveUserPathError::CurrentDirectoryUnavailable {
+                input: input.to_string(),
+                source,
+            }
+        })
+    }
+}
+
 /// Migrate a sidecar from the old `with_extension` naming convention to the
 /// new `push` convention. If the old-convention path exists and the
 /// new-convention path does not, renames the old file to the new location.
@@ -262,3 +338,74 @@ pub use summaries::{
 };
 pub use watch_code::CodeWatcher;
 pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};
+
+#[cfg(test)]
+mod resolve_user_path_tests {
+    use super::*;
+
+    #[test]
+    fn tilde_slash_expands_against_home() {
+        assert_eq!(
+            resolve_user_path_with_home("~/cache/models", Some(PathBuf::from("/home/tester")))
+                .expect("home-backed tilde path must resolve"),
+            PathBuf::from("/home/tester/cache/models")
+        );
+    }
+
+    #[test]
+    fn bare_tilde_is_the_home_directory() {
+        assert_eq!(
+            resolve_user_path_with_home("~", Some(PathBuf::from("/home/tester")))
+                .expect("bare tilde must resolve to home"),
+            PathBuf::from("/home/tester")
+        );
+    }
+
+    #[test]
+    fn absolute_path_passes_through_unchanged() {
+        assert_eq!(
+            resolve_user_path_with_home("/var/cache/models", Some(PathBuf::from("/home/tester")))
+                .expect("absolute path must resolve"),
+            PathBuf::from("/var/cache/models")
+        );
+    }
+
+    #[test]
+    fn relative_path_is_absolutized() {
+        let resolved =
+            resolve_user_path_with_home("rel/cache", None).expect("relative path must resolve");
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with(Path::new("rel").join("cache")));
+    }
+
+    #[test]
+    fn tilde_without_home_fails_closed() {
+        for input in ["~/cache", "~/", "~"] {
+            let error = resolve_user_path_with_home(input, None)
+                .expect_err("tilde without a home directory must fail");
+            assert!(matches!(
+                &error,
+                ResolveUserPathError::HomeDirectoryUnavailable { input: failed }
+                    if failed == input
+            ));
+            assert!(error.to_string().contains("configure an absolute path"));
+        }
+    }
+
+    #[test]
+    fn empty_path_fails_closed_without_erasing_meaningful_spaces() {
+        for input in ["", " ", "\t\r\n"] {
+            let error = resolve_user_path_with_home(input, Some(PathBuf::from("/home/tester")))
+                .expect_err("empty user paths must not resolve to the working directory");
+            assert!(matches!(error, ResolveUserPathError::EmptyPath));
+            assert!(error.to_string().contains("non-empty path"));
+        }
+
+        let resolved = resolve_user_path_with_home(
+            "cache dir/with spaces",
+            Some(PathBuf::from("/home/tester")),
+        )
+        .expect("a meaningful path containing spaces must resolve");
+        assert!(resolved.ends_with(Path::new("cache dir").join("with spaces")));
+    }
+}

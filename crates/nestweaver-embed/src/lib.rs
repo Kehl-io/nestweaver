@@ -87,9 +87,11 @@ pub struct EmbedConfig {
 impl Default for EmbedConfig {
     fn default() -> Self {
         Self {
-            // Keep in sync with nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID
-            // (the canonical constant; this crate sits below nestweaver-engine in
-            // the dependency graph, so it cannot reference it directly).
+            // Keep in sync with nestweaver_engine::config — both the
+            // DEFAULT_EMBEDDING_MODEL_ID constant and the
+            // default_embedding_cache_dir() default (this crate sits below
+            // nestweaver-engine in the dependency graph, so it cannot
+            // reference either directly).
             model_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             cache_dir: default_cache_dir(),
             external_endpoint: None,
@@ -99,10 +101,22 @@ impl Default for EmbedConfig {
 }
 
 fn default_cache_dir() -> PathBuf {
+    #[cfg(not(windows))]
+    const FALLBACK: &str = "/var/cache/nestweaver/models";
+    #[cfg(windows)]
+    const FALLBACK: &str = r"C:\ProgramData\nestweaver\models";
+
+    // InstanceConfig persists this default as a UTF-8 String. Use the native
+    // cache only when both sides can represent it exactly; never silently
+    // replace non-UTF-8 bytes or fall back relative to a caller's CWD.
+    let utf8_model_dir = |root: PathBuf| {
+        let path = root.join("nestweaver").join("models");
+        path.to_str().is_some().then_some(path)
+    };
     dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("nestweaver")
-        .join("models")
+        .and_then(&utf8_model_dir)
+        .or_else(|| dirs::home_dir().and_then(|home| utf8_model_dir(home.join(".cache"))))
+        .unwrap_or_else(|| PathBuf::from(FALLBACK))
 }
 
 pub struct EmbedModel {

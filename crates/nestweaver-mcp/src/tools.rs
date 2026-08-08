@@ -5267,6 +5267,28 @@ fn tool_schema_brain_add_source() -> Value {
     })
 }
 
+fn resolve_add_source_path(raw_path: &str) -> Result<std::path::PathBuf, anyhow::Error> {
+    nestweaver_engine::resolve_user_path(raw_path).map_err(anyhow::Error::new)
+}
+
+#[cfg(test)]
+mod add_source_path_tests {
+    use super::*;
+
+    #[test]
+    fn empty_path_is_rejected_instead_of_becoming_the_working_directory() {
+        let cwd = std::env::current_dir().expect("working directory");
+        assert!(cwd.is_dir(), "test requires an existing working directory");
+
+        for input in ["", " ", "\t\r\n"] {
+            let error = resolve_add_source_path(input)
+                .expect_err("an empty source path must fail before source indexing");
+            assert!(error.is::<nestweaver_engine::ResolveUserPathError>());
+            assert!(error.to_string().contains("non-empty path"));
+        }
+    }
+}
+
 fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     // Always route through the daemon (start it if needed). This ensures
     // consistent write serialization whether or not the MCP server itself
@@ -5306,8 +5328,8 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("'path' must be a string"))?;
-        let expanded = expand_tilde(raw_path);
-        let path = Path::new(&expanded);
+        let path = resolve_add_source_path(raw_path)?;
+        let path = path.as_path();
         if !path.exists() {
             return Err(anyhow!("path does not exist: {}", path.display()));
         }
@@ -5431,34 +5453,42 @@ fn match_repo_target<'a>(
     repos: &'a [nestweaver_schema::Repo],
     target: &str,
 ) -> Vec<&'a nestweaver_schema::Repo> {
-    let expand = |input: &str| -> String {
-        if let Some(stripped) = input.strip_prefix("~/")
-            && let Ok(home) = std::env::var("HOME")
-        {
-            return format!("{home}/{stripped}");
-        }
-        input.to_string()
+    let expand = |input: &str| -> Option<String> {
+        nestweaver_engine::resolve_user_path(input)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
     };
     let target_trimmed = target.trim_end_matches('/');
-    let canonical_target = std::fs::canonicalize(expand(target_trimmed))
+    let expanded_target = expand(target_trimmed);
+    if (target_trimmed == "~" || target_trimmed.starts_with("~/")) && expanded_target.is_none() {
+        return Vec::new();
+    }
+    let canonical_target = expanded_target
+        .as_deref()
+        .and_then(|path| std::fs::canonicalize(path).ok())
         .map(|p| format!("file://{}", p.display()))
         .unwrap_or_default();
     let url_target = if target_trimmed.starts_with("file://") {
         target_trimmed.to_string()
     } else if std::path::Path::new(target_trimmed).is_absolute() || target_trimmed.starts_with("~/")
     {
-        let expanded = expand(target_trimmed);
-        std::fs::canonicalize(&expanded)
-            .map(|p| format!("file://{}", p.display()))
-            .unwrap_or_else(|_| format!("file://{expanded}"))
+        expanded_target
+            .as_deref()
+            .map(|expanded| {
+                std::fs::canonicalize(expanded)
+                    .map(|p| format!("file://{}", p.display()))
+                    .unwrap_or_else(|_| format!("file://{expanded}"))
+            })
+            .unwrap_or_default()
     } else {
         String::new()
     };
     // A path target may refer to a repo identified by its git origin remote
     // rather than a file:// URL — try that identity too (read from git config,
     // never fetched).
-    let origin_target = std::fs::canonicalize(expand(target_trimmed))
-        .ok()
+    let origin_target = expanded_target
+        .as_deref()
+        .and_then(|path| std::fs::canonicalize(path).ok())
         .filter(|p| p.join(".git").exists())
         .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
         .unwrap_or_default();
@@ -8495,18 +8525,6 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     }))
 }
 
-/// Expand a leading `~/` to the user's home directory. Returns the input
-/// unchanged when no expansion is possible.
-#[cfg(not(feature = "daemon"))]
-fn expand_tilde(input: &str) -> String {
-    if let Some(stripped) = input.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}/{stripped}");
-    }
-    input.to_string()
-}
-
 /// Shallow check: does the directory contain any `.md` file in its tree?
 /// Bounded depth to avoid blowing time on huge monorepos.
 #[cfg(not(feature = "daemon"))]
@@ -9262,11 +9280,13 @@ fn dispatch_add_source_via_daemon(
     rt: &tokio::runtime::Runtime,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    let path = args
+    let raw_path = args
         .get("path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?
-        .to_string();
+        .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?;
+    let path = resolve_add_source_path(raw_path)?
+        .to_string_lossy()
+        .into_owned();
 
     // Vault schema promises "Defaults to the directory name" — resolve it
     // here, but ONLY for vaults: forwarding "" blanks a vault's stored

@@ -4213,6 +4213,7 @@ dependencies = [
  "anyhow",
  "apollo-parser",
  "blake3",
+ "dirs",
  "globset",
  "html2md",
  "ignore",
