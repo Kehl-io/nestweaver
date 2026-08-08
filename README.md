@@ -515,6 +515,9 @@ model_id = "sentence-transformers/all-MiniLM-L6-v2"
 # cache_dir defaults to the platform-native cache directory:
 # ~/Library/Caches/nestweaver/models on macOS, $XDG_CACHE_HOME/nestweaver/models
 # (or ~/.cache/nestweaver/models) on Linux. Explicit values may use ~/.
+# If unavailable or non-UTF-8, a UTF-8 HOME uses ~/.cache first. The final
+# fallback is /var/cache/nestweaver/models on Unix or C:\ProgramData\nestweaver\models
+# on Windows; set cache_dir explicitly if that system location is not writable.
 # cache_dir = "~/Library/Caches/nestweaver/models"
 accelerator = "auto" # auto | metal | cpu; see the policy table above
 weight_ppr = 0.40

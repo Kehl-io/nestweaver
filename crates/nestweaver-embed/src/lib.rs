@@ -101,10 +101,22 @@ impl Default for EmbedConfig {
 }
 
 fn default_cache_dir() -> PathBuf {
+    #[cfg(not(windows))]
+    const FALLBACK: &str = "/var/cache/nestweaver/models";
+    #[cfg(windows)]
+    const FALLBACK: &str = r"C:\ProgramData\nestweaver\models";
+
+    // InstanceConfig persists this default as a UTF-8 String. Use the native
+    // cache only when both sides can represent it exactly; never silently
+    // replace non-UTF-8 bytes or fall back relative to a caller's CWD.
+    let utf8_model_dir = |root: PathBuf| {
+        let path = root.join("nestweaver").join("models");
+        path.to_str().is_some().then_some(path)
+    };
     dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("nestweaver")
-        .join("models")
+        .and_then(&utf8_model_dir)
+        .or_else(|| dirs::home_dir().and_then(|home| utf8_model_dir(home.join(".cache"))))
+        .unwrap_or_else(|| PathBuf::from(FALLBACK))
 }
 
 pub struct EmbedModel {

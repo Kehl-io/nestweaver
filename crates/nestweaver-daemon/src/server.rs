@@ -6837,7 +6837,8 @@ mod embedding_load_config_tests {
             cache_dir: cache.path().display().to_string(),
             ..Default::default()
         };
-        let cache_dir = nestweaver_engine::resolve_user_path(&cfg.cache_dir);
+        let cache_dir = nestweaver_engine::resolve_user_path(&cfg.cache_dir)
+            .expect("absolute fixture cache path must resolve");
         assert!(cache_dir.is_absolute());
         assert_eq!(cache_dir, cache.path());
 
@@ -6857,6 +6858,54 @@ mod embedding_load_config_tests {
         assert_eq!(status.state, "ready");
         assert_eq!(status.model_id, "test-owner/test-model");
         assert_eq!(load_config.cache_dir, cache_dir);
+    }
+
+    #[test]
+    fn ready_startup_log_names_model_and_absolute_cache_dir() {
+        #[derive(Clone)]
+        struct BufferWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for BufferWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture ready log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        assert!(cache.path().is_absolute());
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || BufferWriter(writer.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_embedding_ready("local", "cpu", "test-owner/test-model", cache.path());
+        });
+
+        let rendered = {
+            let bytes = captured.lock().expect("read captured ready log");
+            String::from_utf8(bytes.clone()).expect("tracing output must be UTF-8")
+        };
+        assert!(rendered.contains("Embedding model ready"), "{rendered}");
+        assert!(rendered.contains("model_id"), "{rendered}");
+        assert!(rendered.contains("test-owner/test-model"), "{rendered}");
+        assert!(rendered.contains("cache_dir"), "{rendered}");
+        assert!(
+            rendered.contains(&cache.path().display().to_string()),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -6885,6 +6934,108 @@ mod embedding_load_config_tests {
         assert!(
             legacy_cache_hint_at(legacy.path(), legacy.path(), "test-owner/test-model").is_none()
         );
+    }
+
+    #[test]
+    fn missing_artifact_failure_publishes_legacy_cache_hint_in_status() {
+        let legacy = tempfile::tempdir().expect("legacy tempdir");
+        write_complete_hf_cache(legacy.path());
+        let resolved = tempfile::tempdir().expect("resolved tempdir");
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: resolved.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+        let error = anyhow::Error::new(nestweaver_embed::MissingModelArtifactError {
+            model_id: config.model_id.clone(),
+            filename: "model.safetensors".to_string(),
+            cache_dir: config.cache_dir.clone(),
+        })
+        .context("local embedding startup failed");
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            model_id: config.model_id.clone(),
+            cache_dir: resolved.path().display().to_string(),
+            ..Default::default()
+        };
+
+        let (status, hint) = embedding_load_failure_status_at(
+            initial_embedding_status(&cfg, None, true, false),
+            None,
+            &error,
+            &config,
+            legacy.path(),
+            resolved.path(),
+        );
+
+        let hint = hint.expect("typed missing-artifact failure must report the legacy cache");
+        assert_eq!(status.state, "failed");
+        assert!(status.error.contains("local embedding startup failed"));
+        assert!(status.error.contains("model.safetensors"));
+        assert!(
+            status
+                .error
+                .contains(&resolved.path().display().to_string())
+        );
+        assert!(status.error.contains(&hint));
+        assert!(hint.contains(&legacy.path().display().to_string()));
+    }
+
+    #[test]
+    fn non_artifact_local_failure_gets_no_legacy_cache_hint() {
+        let legacy = tempfile::tempdir().expect("legacy tempdir");
+        write_complete_hf_cache(legacy.path());
+        let resolved = tempfile::tempdir().expect("resolved tempdir");
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: resolved.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+        let error = anyhow::anyhow!("Metal device initialization failed");
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            model_id: config.model_id.clone(),
+            cache_dir: resolved.path().display().to_string(),
+            ..Default::default()
+        };
+
+        let (status, hint) = embedding_load_failure_status_at(
+            initial_embedding_status(&cfg, None, true, true),
+            None,
+            &error,
+            &config,
+            legacy.path(),
+            resolved.path(),
+        );
+
+        assert!(hint.is_none());
+        assert_eq!(status.state, "failed");
+        assert!(status.error.contains("Metal device initialization failed"));
+        assert!(!status.error.contains("legacy cache"));
+        assert!(!status.error.contains(&legacy.path().display().to_string()));
+    }
+
+    #[test]
+    fn unexpandable_embedding_cache_dir_becomes_actionable_failed_status() {
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            cache_dir: "~/models".to_string(),
+            ..Default::default()
+        };
+        let error = nestweaver_engine::ResolveUserPathError::HomeDirectoryUnavailable {
+            input: cfg.cache_dir.clone(),
+        };
+
+        let status = embedding_cache_dir_resolution_failure_status(
+            initial_embedding_status(&cfg, None, true, false),
+            None,
+            &cfg.cache_dir,
+            &error,
+        );
+
+        assert_eq!(status.state, "failed");
+        assert!(status.error.contains("~/models"));
+        assert!(status.error.contains("no home directory"));
+        assert!(status.error.contains("absolute path"));
     }
 }
 
@@ -7007,17 +7158,6 @@ async fn probe_loaded_embedding_model(
     }
 }
 
-/// If the model's artifacts are complete in the legacy (pre-platform-native)
-/// default cache directory but that is not where the daemon looked, say so.
-/// Cache-only probe: pure filesystem, no network — preserves the daemon's
-/// cache-only startup contract.
-#[cfg(feature = "embed")]
-fn legacy_cache_hint(resolved_dir: &std::path::Path, model_id: &str) -> Option<String> {
-    let legacy_dir =
-        nestweaver_engine::resolve_user_path(nestweaver_engine::config::LEGACY_EMBEDDING_CACHE_DIR);
-    legacy_cache_hint_at(&legacy_dir, resolved_dir, model_id)
-}
-
 #[cfg(feature = "embed")]
 fn legacy_cache_hint_at(
     legacy_dir: &std::path::Path,
@@ -7041,6 +7181,97 @@ fn legacy_cache_hint_at(
          the daemon is cache-only and will not re-download",
         legacy_dir.display()
     ))
+}
+
+#[cfg(feature = "embed")]
+fn embedding_load_failure_status_at(
+    current_status: EmbeddingRuntimeStatus,
+    embedding_dimension: Option<usize>,
+    error: &anyhow::Error,
+    config: &nestweaver_embed::EmbedConfig,
+    legacy_dir: &std::path::Path,
+    resolved_dir: &std::path::Path,
+) -> (EmbeddingRuntimeStatus, Option<String>) {
+    let mut status = finalize_embedding_status(
+        current_status,
+        embedding_dimension,
+        Err(format!("{error:#}")),
+    );
+    // A local load can also fail during device selection or model
+    // construction. Only a typed missing-artifact cause makes another cache
+    // location relevant remediation.
+    let missing_artifact = error
+        .chain()
+        .any(|cause| cause.is::<nestweaver_embed::MissingModelArtifactError>());
+    let hint = if config.external_endpoint.is_none() && missing_artifact {
+        legacy_cache_hint_at(legacy_dir, resolved_dir, &config.model_id)
+    } else {
+        None
+    };
+    if let Some(hint) = &hint {
+        status.error = format!("{}; {hint}", status.error);
+    }
+    (status, hint)
+}
+
+#[cfg(feature = "embed")]
+fn embedding_load_failure_status(
+    current_status: EmbeddingRuntimeStatus,
+    embedding_dimension: Option<usize>,
+    error: &anyhow::Error,
+    config: &nestweaver_embed::EmbedConfig,
+    resolved_dir: &std::path::Path,
+) -> (EmbeddingRuntimeStatus, Option<String>) {
+    let Ok(legacy_dir) =
+        nestweaver_engine::resolve_user_path(nestweaver_engine::config::LEGACY_EMBEDDING_CACHE_DIR)
+    else {
+        let status = finalize_embedding_status(
+            current_status,
+            embedding_dimension,
+            Err(format!("{error:#}")),
+        );
+        return (status, None);
+    };
+    embedding_load_failure_status_at(
+        current_status,
+        embedding_dimension,
+        error,
+        config,
+        &legacy_dir,
+        resolved_dir,
+    )
+}
+
+#[cfg(feature = "embed")]
+fn embedding_cache_dir_resolution_failure_status(
+    current_status: EmbeddingRuntimeStatus,
+    embedding_dimension: Option<usize>,
+    configured_cache_dir: &str,
+    error: &nestweaver_engine::ResolveUserPathError,
+) -> EmbeddingRuntimeStatus {
+    finalize_embedding_status(
+        current_status,
+        embedding_dimension,
+        Err(format!(
+            "failed to resolve configured embedding cache directory '{configured_cache_dir}': {error}"
+        )),
+    )
+}
+
+#[cfg(feature = "embed")]
+fn log_embedding_ready(
+    backend: &str,
+    selected_device: &str,
+    model_id: &str,
+    cache_dir: &std::path::Path,
+) {
+    tracing::info!(
+        backend,
+        device = selected_device,
+        model_id,
+        cache_dir = %cache_dir.display(),
+        "Embedding model ready"
+    );
 }
 
 /// Load the embedding model into `state.embedding_runtime`. MUST be called on the daemon's main
@@ -7103,7 +7334,21 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
     }
     // Resolve the configured cache dir: expand a leading tilde and absolutize
     // relative paths so diagnostics always name a usable location.
-    let cache_dir = nestweaver_engine::resolve_user_path(&cfg.cache_dir);
+    let cache_dir = match nestweaver_engine::resolve_user_path(&cfg.cache_dir) {
+        Ok(cache_dir) => cache_dir,
+        Err(error) => {
+            let status = embedding_cache_dir_resolution_failure_status(
+                state.embedding_runtime.status(),
+                state.store.embedding_index_dimension(),
+                &cfg.cache_dir,
+                &error,
+            );
+            let message = status.error.clone();
+            state.embedding_runtime.publish_unavailable(status);
+            tracing::warn!("Failed to resolve embedding cache directory: {message}");
+            return;
+        }
+    };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
     let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
     let loaded = load_daemon_embedding_backend_with(
@@ -7131,13 +7376,7 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
                     // Name the model and the resolved cache dir: a populated
                     // but WRONG cache loads fine, and only this line makes the
                     // wrong model visible.
-                    tracing::info!(
-                        backend,
-                        device = selected_device,
-                        model_id,
-                        cache_dir = %cache_dir.display(),
-                        "Embedding model ready"
-                    );
+                    log_embedding_ready(&backend, &selected_device, &model_id, &cache_dir);
                 } else {
                     let error = status.error.clone();
                     state.embedding_runtime.publish_unavailable(status);
@@ -7156,21 +7395,13 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
             }
         },
         Err(e) => {
-            let mut status = finalize_embedding_status(
+            let (status, hint) = embedding_load_failure_status(
                 state.embedding_runtime.status(),
                 state.store.embedding_index_dimension(),
-                Err(format!("{e:#}")),
+                &e,
+                &config,
+                &cache_dir,
             );
-            // Local-only: an external endpoint never consults the cache, so a
-            // legacy-cache hit would be a red herring for its failures.
-            let hint = if config.external_endpoint.is_none() {
-                legacy_cache_hint(&cache_dir, &config.model_id)
-            } else {
-                None
-            };
-            if let Some(hint) = &hint {
-                status.error = format!("{}; {hint}", status.error);
-            }
             state.embedding_runtime.publish_unavailable(status);
             match hint {
                 Some(hint) => tracing::warn!("Failed to load embedding model: {e}; {hint}"),
@@ -14030,6 +14261,92 @@ mod startup_helper_tests {
             0,
             "incremental embedding must consult the sidecar index, not graph-row fields"
         );
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(not(target_os = "macos"))]
+    async fn missing_local_artifact_keeps_daemon_healthy_and_reports_failed_status() {
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        assert!(
+            cache.path().is_absolute(),
+            "the startup diagnostic fixture must use an absolute cache path"
+        );
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "missing-local-artifact-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[embedding]
+model_id = "test-owner/group-f-missing-artifact"
+cache_dir = {:?}
+accelerator = "cpu"
+"#,
+            cache.path().display().to_string()
+        ))
+        .expect("valid local embedding fixture config");
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.instance_cfg = Some(Arc::new(config.clone()));
+        state_mut
+            .embedding_runtime
+            .publish_unavailable(initial_embedding_status(
+                &config.embedding,
+                None,
+                true,
+                daemon_metal_compiled(),
+            ));
+
+        load_embedding_model(&state).await;
+
+        let (status, model) = state.embedding_runtime.snapshot();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.backend, "local");
+        assert_eq!(status.model_id, "test-owner/group-f-missing-artifact");
+        assert!(
+            status.error.contains("test-owner/group-f-missing-artifact"),
+            "startup failure must name the configured model: {}",
+            status.error
+        );
+        assert!(
+            status.error.contains(&cache.path().display().to_string()),
+            "startup failure must name the absolute cache directory: {}",
+            status.error
+        );
+        assert!(model.is_none(), "a failed load must not publish a model");
+
+        let service = DaemonService::new(state);
+        service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("a non-semantic RPC must remain usable");
+        let typed = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("status RPC must remain usable")
+            .into_inner()
+            .embedding_status
+            .expect("structured embedding status");
+        assert_eq!(typed.state, "failed");
+        assert_eq!(typed.backend, "local");
+        assert_eq!(typed.model_id, "test-owner/group-f-missing-artifact");
+        assert!(typed.error.contains("test-owner/group-f-missing-artifact"));
+        assert!(typed.error.contains(&cache.path().display().to_string()));
     }
 
     #[cfg(feature = "embed")]

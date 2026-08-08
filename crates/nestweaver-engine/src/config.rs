@@ -287,8 +287,10 @@ pub struct EmbeddingConfig {
     /// Directory where downloaded model weights are stored. Default: the
     /// platform-native cache directory — `~/Library/Caches/nestweaver/models`
     /// on macOS, `$XDG_CACHE_HOME/nestweaver/models` (or
-    /// `~/.cache/nestweaver/models`) on Linux. An explicit leading `~/` is
-    /// expanded at startup via [`crate::resolve_user_path`].
+    /// `~/.cache/nestweaver/models`) on Linux. If that path is unavailable or
+    /// not UTF-8, a UTF-8 home directory supplies `~/.cache/nestweaver/models`;
+    /// only then does it use [`FALLBACK_EMBEDDING_CACHE_DIR`]. An explicit
+    /// leading `~/` is expanded at startup via [`crate::resolve_user_path`].
     #[serde(default = "default_embedding_cache_dir")]
     pub cache_dir: String,
     /// Accelerator used by the local embedding backend. Default: automatically
@@ -352,6 +354,13 @@ pub const DEFAULT_EMBEDDING_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L
 /// longer a default anywhere.
 pub const LEGACY_EMBEDDING_CACHE_DIR: &str = "~/.cache/nestweaver/models";
 
+/// Absolute fallback used when the platform cache directory is unavailable or
+/// cannot be represented in `InstanceConfig`'s UTF-8 `String` field.
+#[cfg(not(windows))]
+pub const FALLBACK_EMBEDDING_CACHE_DIR: &str = "/var/cache/nestweaver/models";
+#[cfg(windows)]
+pub const FALLBACK_EMBEDDING_CACHE_DIR: &str = r"C:\ProgramData\nestweaver\models";
+
 fn default_model_id() -> String {
     DEFAULT_EMBEDDING_MODEL_ID.to_string()
 }
@@ -359,12 +368,17 @@ fn default_embedding_cache_dir() -> String {
     // Platform-native default; keep in sync with nestweaver-embed's
     // `default_cache_dir`, which sits below this crate in the dependency
     // graph and cannot call this function.
+    let utf8_model_dir = |root: std::path::PathBuf| {
+        root.join("nestweaver")
+            .join("models")
+            .into_os_string()
+            .into_string()
+            .ok()
+    };
     dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
-        .join("nestweaver")
-        .join("models")
-        .to_string_lossy()
-        .into_owned()
+        .and_then(&utf8_model_dir)
+        .or_else(|| dirs::home_dir().and_then(|home| utf8_model_dir(home.join(".cache"))))
+        .unwrap_or_else(|| FALLBACK_EMBEDDING_CACHE_DIR.to_string())
 }
 fn default_weight_ppr() -> f64 {
     0.40

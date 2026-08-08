@@ -14290,6 +14290,16 @@ fn run_brain(
             // path. A naive `vault_uid` lookup misses these cases even
             // though `brain status` clearly shows the row.
             let path_matches = |stored: &str| -> bool {
+                if stored == "~" || stored.starts_with("~/") {
+                    let Ok(expanded) = nestweaver_engine::resolve_user_path(stored) else {
+                        return false;
+                    };
+                    if expanded.to_string_lossy() == *canon_str {
+                        return true;
+                    }
+                    return std::fs::canonicalize(&expanded)
+                        .is_ok_and(|path| path.to_string_lossy() == *canon_str);
+                }
                 if stored == canon_str || stored == raw_str {
                     return true;
                 }
@@ -14298,17 +14308,6 @@ fn run_brain(
                     .unwrap_or_else(|_| stored.to_string());
                 if stored_canon == *canon_str {
                     return true;
-                }
-                if stored.starts_with("~/") {
-                    let expanded = nestweaver_engine::resolve_user_path(stored);
-                    if expanded.to_string_lossy() == *canon_str {
-                        return true;
-                    }
-                    if let Ok(c) = std::fs::canonicalize(&expanded)
-                        && c.to_string_lossy() == *canon_str
-                    {
-                        return true;
-                    }
                 }
                 false
             };
@@ -21125,10 +21124,83 @@ mod embed_accelerator_cli_tests {
         // dirs::cache_dir() in-process, so no environment manipulation is
         // needed for determinism.
         let engine_default = nestweaver_engine::config::EmbeddingConfig::default().cache_dir;
-        let engine_resolved = nestweaver_engine::resolve_user_path(&engine_default);
+        let engine_resolved = nestweaver_engine::resolve_user_path(&engine_default)
+            .expect("default engine cache path must resolve");
         let embed_default = nestweaver_embed::EmbedConfig::default().cache_dir;
         let embed_resolved = std::path::absolute(&embed_default).unwrap_or(embed_default);
         assert_eq!(engine_resolved, embed_resolved);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_xdg_cache_home_keeps_engine_and_embed_defaults_identical() {
+        const CHILD_MARKER: &str = "NESTWEAVER_TEST_XDG_DEFAULT_CHILD";
+        const CHILD_SENTINEL: &str = "NESTWEAVER_XDG_DEFAULT_CHILD_OK";
+
+        if let Some(case) = std::env::var_os(CHILD_MARKER) {
+            let case = case.to_str().expect("child case marker must be UTF-8");
+            let engine_default = nestweaver_engine::config::EmbeddingConfig::default().cache_dir;
+            let engine_resolved = nestweaver_engine::resolve_user_path(&engine_default)
+                .expect("default engine cache path must resolve");
+            let embed_default = nestweaver_embed::EmbedConfig::default().cache_dir;
+            let embed_resolved = std::path::absolute(&embed_default).unwrap_or(embed_default);
+            assert_eq!(engine_resolved, embed_resolved);
+            let expected = match case {
+                "utf8" => std::path::PathBuf::from(
+                    std::env::var_os("XDG_CACHE_HOME").expect("child XDG cache root"),
+                )
+                .join("nestweaver")
+                .join("models"),
+                "non-utf8" => std::path::PathBuf::from(
+                    std::env::var_os("HOME").expect("child home directory"),
+                )
+                .join(".cache")
+                .join("nestweaver")
+                .join("models"),
+                other => panic!("unexpected child case: {other}"),
+            };
+            assert_eq!(engine_resolved, expected);
+            println!("{CHILD_SENTINEL}:{case}");
+            return;
+        }
+
+        // `dirs::cache_dir()` reads process-global environment. Re-run only
+        // this test in a child process so setting XDG_CACHE_HOME cannot race
+        // any other test. Exercise both the native UTF-8 path and the shared
+        // user-writable home fallback for a path InstanceConfig cannot
+        // represent.
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().expect("XDG cache test tempdir");
+        let utf8_root = root.path().join("utf8-cache");
+        let non_utf8_root = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"cache-\xff".to_vec()));
+        for (case, xdg_root) in [("utf8", utf8_root), ("non-utf8", non_utf8_root)] {
+            let home = root.path().join(format!("home-{case}"));
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("locate the current test binary"),
+            )
+            .arg("--exact")
+            .arg("embed_accelerator_cli_tests::linux_xdg_cache_home_keeps_engine_and_embed_defaults_identical")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, case)
+            .env("XDG_CACHE_HOME", &xdg_root)
+            .env("HOME", &home)
+            .output()
+            .expect("run isolated XDG cache regression child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert!(
+                output.status.success(),
+                "isolated XDG cache regression ({case}) failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stdout.contains(&format!("{CHILD_SENTINEL}:{case}")),
+                "isolated XDG child ({case}) did not execute the selected test:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
     }
 
     #[test]
