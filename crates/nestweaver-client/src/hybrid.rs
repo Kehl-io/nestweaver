@@ -314,6 +314,10 @@ impl HybridClient {
                         if let (Some(local_obj), Some(server_obj)) =
                             (result.as_object_mut(), server.as_object())
                         {
+                            // Do not expose daemon config provenance through this
+                            // Combined JSON merge. A missing local key is backfilled
+                            // from upstream, which could falsely label the local
+                            // daemon with a remote server's effective config.
                             for (k, v) in server_obj {
                                 if k.starts_with('_') {
                                     continue;

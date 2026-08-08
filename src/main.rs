@@ -1353,6 +1353,50 @@ fn embedding_status_from_json(value: &serde_json::Value) -> nestweaver_proto::Em
     }
 }
 
+fn format_effective_config(config: Option<&nestweaver_proto::EffectiveConfig>) -> String {
+    use nestweaver_proto::effective_config::Source;
+
+    match config.and_then(|config| config.source.as_ref()) {
+        Some(Source::ConfiguredPath(path)) if !path.is_empty() => path.clone(),
+        Some(Source::CompiledDefaults(_)) => "none — compiled defaults".to_string(),
+        Some(Source::ConfiguredPath(_)) | None => "unknown (older daemon)".to_string(),
+    }
+}
+
+fn format_daemon_status_response(
+    response: Result<&nestweaver_proto::BrainStatusResponse, &str>,
+) -> String {
+    match response {
+        Ok(status) => {
+            let mut lines = vec![format!(
+                "Config: {}",
+                format_effective_config(status.effective_config.as_ref())
+            )];
+            lines.push("Embedding:".to_string());
+            if let Some(embedding) = status.embedding_status.as_ref() {
+                lines.push(format_embedding_status(embedding));
+            } else {
+                lines.push("  State:            unknown (older daemon)".to_string());
+            }
+            lines.join("\n")
+        }
+        Err(error) => [
+            "Config: unknown (daemon unreachable)".to_string(),
+            "Embedding:".to_string(),
+            "  State:            unavailable (daemon booting or unreachable)".to_string(),
+            format!("  Error:            {error}"),
+        ]
+        .join("\n"),
+    }
+}
+
+fn format_daemon_not_running_status(summary: &str) -> String {
+    format!(
+        "{summary}\n{}",
+        format_daemon_status_response(Err("daemon is not running"))
+    )
+}
+
 fn print_daemon_embedding_status(db_path: &Path) {
     let result = tokio::runtime::Runtime::new()
         .map_err(anyhow::Error::from)
@@ -1364,18 +1408,87 @@ fn print_daemon_embedding_status(db_path: &Path) {
         });
     match result {
         Ok(status) => {
-            println!("Embedding:");
-            if let Some(status) = status.embedding_status {
-                println!("{}", format_embedding_status(&status));
-            } else {
-                println!("  State:            unknown (older daemon)");
-            }
+            println!("{}", format_daemon_status_response(Ok(&status)));
         }
         Err(error) => {
-            println!("Embedding:");
-            println!("  State:            unavailable (daemon booting or unreachable)");
-            println!("  Error:            {error:#}");
+            let error = format!("{error:#}");
+            println!("{}", format_daemon_status_response(Err(&error)));
         }
+    }
+}
+
+#[cfg(test)]
+mod daemon_status_renderer_tests {
+    use super::*;
+    use nestweaver_proto::effective_config::{CompiledDefaults, Source};
+
+    fn embedding() -> nestweaver_proto::EmbeddingStatus {
+        nestweaver_proto::EmbeddingStatus {
+            state: "ready".to_string(),
+            backend: "local".to_string(),
+            requested_device: "auto".to_string(),
+            selected_device: "cpu".to_string(),
+            model_id: "test-model".to_string(),
+            error: String::new(),
+            metal_compiled: false,
+            fallback_used: false,
+        }
+    }
+
+    #[test]
+    fn configured_path_and_embedding_share_one_status_render() {
+        let status = nestweaver_proto::BrainStatusResponse {
+            effective_config: Some(nestweaver_proto::EffectiveConfig {
+                source: Some(Source::ConfiguredPath(
+                    "/canonical/instance.toml".to_string(),
+                )),
+            }),
+            embedding_status: Some(embedding()),
+            ..Default::default()
+        };
+
+        let output = format_daemon_status_response(Ok(&status));
+        assert!(output.starts_with("Config: /canonical/instance.toml\nEmbedding:\n"));
+        assert!(output.contains("  State:            ready"));
+        assert!(output.contains("  Model:            test-model"));
+    }
+
+    #[test]
+    fn compiled_defaults_are_explicit() {
+        let status = nestweaver_proto::BrainStatusResponse {
+            effective_config: Some(nestweaver_proto::EffectiveConfig {
+                source: Some(Source::CompiledDefaults(CompiledDefaults {})),
+            }),
+            embedding_status: Some(embedding()),
+            ..Default::default()
+        };
+
+        let output = format_daemon_status_response(Ok(&status));
+        assert!(output.starts_with("Config: none — compiled defaults\nEmbedding:\n"));
+    }
+
+    #[test]
+    fn absent_old_wire_fields_are_reported_as_unknown() {
+        let output =
+            format_daemon_status_response(Ok(&nestweaver_proto::BrainStatusResponse::default()));
+        assert!(output.starts_with("Config: unknown (older daemon)\nEmbedding:\n"));
+        assert!(output.contains("  State:            unknown (older daemon)"));
+    }
+
+    #[test]
+    fn unreachable_daemon_reports_config_and_embedding_honestly() {
+        let output = format_daemon_status_response(Err("transport refused"));
+        assert!(output.starts_with("Config: unknown (daemon unreachable)\nEmbedding:\n"));
+        assert!(output.contains("unavailable (daemon booting or unreachable)"));
+        assert!(output.ends_with("  Error:            transport refused"));
+    }
+
+    #[test]
+    fn not_running_command_path_still_reports_config_provenance() {
+        let output = format_daemon_not_running_status("Daemon is not running.");
+        assert!(output.starts_with(
+            "Daemon is not running.\nConfig: unknown (daemon unreachable)\nEmbedding:\n"
+        ));
     }
 }
 
@@ -11497,7 +11610,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             print_daemon_embedding_status(&db_path);
                         } else {
                             println!(
-                                "Daemon is not running (pidfile PID {pid} belongs to another process)."
+                                "{}",
+                                format_daemon_not_running_status(&format!(
+                                    "Daemon is not running (pidfile PID {pid} belongs to another process)."
+                                ))
                             );
                         }
                         return Ok((EXIT_SUCCESS, None));
@@ -11515,7 +11631,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         print_daemon_embedding_status(&db_path);
                         return Ok((EXIT_SUCCESS, None));
                     }
-                    println!("Daemon is not running.");
+                    println!(
+                        "{}",
+                        format_daemon_not_running_status("Daemon is not running.")
+                    );
                     Ok((EXIT_SUCCESS, None))
                 }
                 DaemonAction::Gc => {
