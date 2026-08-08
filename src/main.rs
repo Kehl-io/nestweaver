@@ -5209,6 +5209,38 @@ fn daemon_restart_start_args(
     args
 }
 
+fn verify_explicit_config_before_start_success(
+    db_path: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let Some(config_path) = config_path else {
+        return Ok(());
+    };
+    let runtime = tokio::runtime::Runtime::new()
+        .context("create runtime for explicit daemon config verification")?;
+    runtime.block_on(nestweaver_client::verify_running_daemon_config(
+        db_path,
+        config_path,
+    ))
+}
+
+fn acquire_daemon_start_spawn_lock(
+    db_path: &std::path::Path,
+    inherited_fd: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<nestweaver_client::autostart::SpawnLock>> {
+    if let Some(inherited_fd) = inherited_fd {
+        let inherited_fd = inherited_fd
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("inherited parent spawnlock FD is not valid UTF-8"))?
+            .parse::<std::os::fd::RawFd>()
+            .context("inherited parent spawnlock FD is not an integer")?;
+        nestweaver_client::autostart::SpawnLock::inherit_parent_handoff(db_path, inherited_fd)
+            .map(Some)
+    } else {
+        nestweaver_client::autostart::SpawnLock::acquire(db_path).map(Some)
+    }
+}
+
 async fn start_and_verify_restarted_daemon(
     db_path: &std::path::Path,
     executable: PathBuf,
@@ -5216,12 +5248,12 @@ async fn start_and_verify_restarted_daemon(
     restart_config: &nestweaver_client::RestartConfig,
     spawn_lock: nestweaver_client::autostart::SpawnLock,
 ) -> anyhow::Result<()> {
-    let status = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(executable).args(args).status()
-    })
-    .await
-    .context("daemon restart command task failed")?
-    .context("failed to execute daemon start")?;
+    let mut command = daemon_restart_command(executable, args);
+    spawn_lock.configure_child_handoff(&mut command)?;
+    let status = tokio::task::spawn_blocking(move || command.status())
+        .await
+        .context("daemon restart command task failed")?
+        .context("failed to execute daemon start")?;
     anyhow::ensure!(status.success(), "daemon start failed with {status}");
 
     // `daemon start` preserves existing platform routing. Persistent macOS
@@ -5237,6 +5269,15 @@ async fn start_and_verify_restarted_daemon(
         nestweaver_client::connect_verified_replacement(&socket, db_path, restart_config).await;
     drop(spawn_lock);
     verified.map(|_| ())
+}
+
+fn daemon_restart_command(
+    executable: PathBuf,
+    args: Vec<std::ffi::OsString>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command.args(args);
+    command
 }
 
 async fn restart_verified_live_under_lock(
@@ -11190,11 +11231,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     config,
                     track_interactions,
                 } => {
+                    // Serialize every direct start from incumbent preflight
+                    // through readiness and final config attestation. Parents
+                    // in autostart/restart already hold this exact lock and
+                    // mark only their child command to avoid self-deadlock.
+                    let inherited_spawn_lock =
+                        std::env::var_os(nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV);
+                    let mut start_spawn_lock =
+                        acquire_daemon_start_spawn_lock(&db_path, inherited_spawn_lock)?;
                     if track_interactions {
                         eprintln!(
                             "note: --track-interactions is an MCP flag, not a daemon flag. \
                              Use: nestweaver mcp --track-interactions"
                         );
+                    }
+                    if let Some(requested_config) = config.as_deref() {
+                        // Validate before any platform-specific stop/install or
+                        // daemonize mutation. A bad explicit path must leave an
+                        // already-running daemon untouched.
+                        let _ = nestweaver_client::RestartConfig::for_cold_start(Some(
+                            requested_config,
+                        ))?;
                     }
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
@@ -11231,6 +11288,41 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .ok()
                                 .filter(|v| v.trim().parse::<u32>().is_ok());
                             let config_abs = config.as_deref().map(abs_for_daemon);
+
+                            // An explicit start against a live incumbent is an
+                            // assertion about that daemon, not permission to
+                            // replace it. Attest before bootout or SIGTERM so a
+                            // mismatch, old wire, or missing provenance leaves
+                            // the incumbent untouched. A stale launchd job or
+                            // live pidfile with no healthy RPC is likewise not
+                            // safe to mutate implicitly.
+                            if let Some(requested_config) = config_abs.as_deref() {
+                                let launchd_owned =
+                                    nestweaver_daemon::launchd::is_running(&instance_id);
+                                // The held flock, not a numeric PID plus
+                                // kill(0), is the ownership proof. The latter
+                                // could identify an unrelated recycled PID.
+                                let live_pidfile = pidfile_flock_held(&pidfile);
+                                match verify_explicit_config_before_start_success(
+                                    &db_path_abs,
+                                    Some(requested_config),
+                                ) {
+                                    Ok(()) => {
+                                        eprintln!("Daemon already running with requested config.");
+                                        return Ok((EXIT_SUCCESS, None));
+                                    }
+                                    Err(error) if launchd_owned || live_pidfile => {
+                                        return Err(error).context(
+                                            "refusing to stop a launchd/pidfile-owned incumbent before explicit --config provenance is verified",
+                                        );
+                                    }
+                                    Err(_) => {
+                                        // No live ownership evidence: this is
+                                        // a cold start; final attestation below
+                                        // still protects a concurrent winner.
+                                    }
+                                }
+                            }
                             let plist = nestweaver_daemon::launchd::generate_plist_with_config(
                                 &instance_id,
                                 &binary_path,
@@ -11312,8 +11404,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 &db_path,
                                 std::time::Duration::from_secs(60),
                             )) {
-                                Ok(_) => return Ok((EXIT_SUCCESS, None)),
-                                Err(_) => {
+                                Ok(_) => {
+                                    verify_explicit_config_before_start_success(
+                                        &db_path,
+                                        config.as_deref(),
+                                    )?;
+                                    return Ok((EXIT_SUCCESS, None));
+                                }
+                                Err(error) => {
+                                    if config.is_some() {
+                                        return Err(error).context(
+                                            "daemon start cannot confirm that the running launchd agent honors explicit --config",
+                                        );
+                                    }
                                     // Deliberately NOT reaping the half-booted
                                     // agent: launchd owns its lifecycle and a
                                     // bootout here would race launchd's next
@@ -11397,6 +11500,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     }
                                     eprintln!("Daemon already running (PID {}).", health.pid);
                                 }
+                                verify_explicit_config_before_start_success(
+                                    &db_path_abs,
+                                    config_abs.as_deref(),
+                                )?;
                                 Ok((EXIT_SUCCESS, None))
                             }
                             Err(error) => {
@@ -11458,6 +11565,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 } else {
                                     eprintln!("Daemon already running (PID {pid_trimmed}).");
                                 }
+                                verify_explicit_config_before_start_success(
+                                    &db_path,
+                                    config.as_deref(),
+                                )?;
                                 return Ok((EXIT_SUCCESS, None));
                             }
                             anyhow::bail!("flock on pidfile failed: {err}");
@@ -11505,6 +11616,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         match unsafe { daemonize.execute() } {
                             daemonize2::Outcome::Child(Ok(_)) => {
                                 // We are now the daemon process.
+                                if let Some(lock) = start_spawn_lock.take() {
+                                    lock.close_in_forked_child_without_unlock();
+                                }
                                 // daemonize2's pidfile flock was acquired before
                                 // the fork and is inherited by this child. Mark
                                 // that ownership only after `execute()` returns in
@@ -11551,6 +11665,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                                 if wait_for_daemon_boot(&socket, std::time::Duration::from_secs(10))
                                 {
+                                    if let Err(error) = verify_explicit_config_before_start_success(
+                                        &db_path,
+                                        config.as_deref(),
+                                    ) {
+                                        eprintln!("Error: {error:#}");
+                                        std::process::exit(EXIT_ERROR);
+                                    }
                                     eprintln!("Daemon started.");
                                     std::process::exit(EXIT_SUCCESS);
                                 }
@@ -18990,6 +19111,65 @@ mod abs_for_daemon_tests {
         ));
         assert_eq!(args[6], "--config");
         assert_eq!(args[7], "/explicit/override.toml");
+    }
+
+    #[test]
+    fn restart_child_command_marks_parent_spawn_lock_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let spawn_lock = nestweaver_client::autostart::SpawnLock::acquire(&db).unwrap();
+        let mut command = daemon_restart_command(
+            PathBuf::from("/opt/nestweaver"),
+            restart_args(&nestweaver_client::RestartConfig::CompiledDefaults),
+        );
+        spawn_lock.configure_child_handoff(&mut command).unwrap();
+        let fd = command
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV)
+                    .then_some(value.unwrap())
+            })
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<std::os::fd::RawFd>()
+            .unwrap();
+        assert!(fd >= 3);
+    }
+
+    #[test]
+    fn direct_start_serialization_rejects_missing_fd_and_blocks_contenders() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+
+        // Leave the expected lock file present but unowned. Ambient marker
+        // state alone must not bypass direct-start serialization.
+        drop(acquire_daemon_start_spawn_lock(&db, None).unwrap().unwrap());
+        let forged = match acquire_daemon_start_spawn_lock(&db, Some("-1".into())) {
+            Err(error) => error,
+            Ok(_) => panic!("forged parent marker must not skip an unowned spawn lock"),
+        };
+        assert!(format!("{forged:#}").contains("invalid inherited"));
+
+        let first = acquire_daemon_start_spawn_lock(&db, None).unwrap().unwrap();
+
+        let contender_db = db.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let second = acquire_daemon_start_spawn_lock(&contender_db, None)
+                .unwrap()
+                .unwrap();
+            tx.send(()).unwrap();
+            drop(second);
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(150))
+                .is_err()
+        );
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("direct start contender should proceed after readiness owner releases");
+        contender.join().unwrap();
     }
 
     #[test]

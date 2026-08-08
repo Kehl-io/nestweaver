@@ -323,6 +323,116 @@ fn verify_replacement_evidence(
     Ok(())
 }
 
+fn restart_with_requested_config_remedy(db_path: &Path, requested: &RestartConfig) -> String {
+    let requested = requested
+        .as_path()
+        .expect("explicit requested config is always configured");
+    format!(
+        "Run `nestweaver daemon --db {} restart --config {}` to apply the requested configuration",
+        db_path.display(),
+        requested.display()
+    )
+}
+
+fn verify_requested_config_evidence(
+    db_path: &Path,
+    health: &nestweaver_proto::HealthCheckResponse,
+    requested: &RestartConfig,
+    binding: nestweaver_daemon::lifecycle::EffectiveConfigBinding,
+) -> Result<()> {
+    let expected_instance = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+    anyhow::ensure!(
+        health.instance_id == expected_instance,
+        "running daemon instance {} does not match requested DB instance {expected_instance}; {}",
+        health.instance_id,
+        restart_with_requested_config_remedy(db_path, requested)
+    );
+    anyhow::ensure!(health.pid != 0, "running daemon HealthCheck returned PID 0");
+    anyhow::ensure!(
+        binding.pid == health.pid,
+        "running daemon binding PID {} does not match HealthCheck PID {}; {}",
+        binding.pid,
+        health.pid,
+        restart_with_requested_config_remedy(db_path, requested)
+    );
+    let effective = select_restart_config(None, || Ok(binding)).with_context(|| {
+        format!(
+            "cannot verify the running daemon's effective config for explicit --config {}; effective config is unknown. {}",
+            requested.as_path().unwrap().display(),
+            restart_with_requested_config_remedy(db_path, requested)
+        )
+    })?;
+    if &effective != requested {
+        let effective_description = match &effective {
+            RestartConfig::Configured(path) => path.display().to_string(),
+            RestartConfig::CompiledDefaults => "compiled defaults".to_string(),
+        };
+        anyhow::bail!(
+            "explicit --config {} does not match the running daemon's effective config ({effective_description}). {}",
+            requested.as_path().unwrap().display(),
+            restart_with_requested_config_remedy(db_path, requested)
+        );
+    }
+    Ok(())
+}
+
+fn verify_requested_config_with_health(
+    db_path: &Path,
+    health: &nestweaver_proto::HealthCheckResponse,
+    requested_path: &Path,
+) -> Result<()> {
+    let requested = RestartConfig::for_cold_start(Some(requested_path))?;
+    let remedy = restart_with_requested_config_remedy(db_path, &requested);
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+    let _pidfile = open_verified_live_pidfile(&instance_id, health.pid).with_context(|| {
+        format!(
+            "cannot prove ownership for the running daemon while enforcing explicit --config {}. {}",
+            requested.as_path().unwrap().display(),
+            restart_with_requested_config_remedy(db_path, &requested)
+        )
+    })?;
+    let binding = nestweaver_daemon::lifecycle::read_effective_config_binding_for_verified_pid(
+        &instance_id,
+        health.pid,
+    )
+    .with_context(|| {
+        format!(
+            "cannot verify the running daemon's effective config for explicit --config {}; effective config is unknown. {}",
+            requested.as_path().unwrap().display(),
+            restart_with_requested_config_remedy(db_path, &requested)
+        )
+    })?;
+    verify_requested_config_evidence(db_path, health, &requested, binding).with_context(|| {
+        format!(
+            "the running daemon did not accept explicit --config {}; {remedy}",
+            requested.as_path().unwrap().display()
+        )
+    })
+}
+
+/// Require an already-running daemon to prove that it is honoring an explicit
+/// caller config. Canonical path identity is the contract; valid edits at the
+/// same path do not require a restart.
+pub async fn verify_running_daemon_config(db_path: &Path, requested_path: &Path) -> Result<()> {
+    let requested = RestartConfig::for_cold_start(Some(requested_path))?;
+    let remedy = restart_with_requested_config_remedy(db_path, &requested);
+    let mut client = DaemonClient::connect_existing(db_path)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot reach a healthy running daemon to verify explicit --config {}; effective config is unknown. {remedy}",
+                requested.as_path().unwrap().display()
+            )
+        })?;
+    let health = client.health_check().await.with_context(|| {
+        format!(
+            "cannot verify HealthCheck for explicit --config {}; effective config is unknown. {remedy}",
+            requested.as_path().unwrap().display()
+        )
+    })?;
+    verify_requested_config_with_health(db_path, &health, requested_path)
+}
+
 /// Connect to a replacement and require current-version runtime identity,
 /// pidfile ownership, and exact effective-config agreement before accepting it.
 pub async fn connect_verified_replacement(
@@ -358,7 +468,7 @@ impl DaemonClient {
     /// version doesn't match this binary's version, it asks the daemon to
     /// gracefully drain active writes and shut down, then restarts.
     pub async fn connect(db_path: &Path, config_path: Option<&Path>) -> Result<Self> {
-        let sock_path = autostart::ensure_daemon_async(db_path, config_path).await?;
+        let sock_path = autostart::ensure_daemon_for_client_async(db_path, config_path).await?;
         let mut client = Self::connect_to_socket(&sock_path).await?;
 
         // Version check. Bounded so a connected-but-unresponsive daemon can't hang connect().
@@ -463,6 +573,11 @@ impl DaemonClient {
             .await?;
 
             info!("reconnected after daemon restart");
+        } else if let Some(requested_config) = config_path {
+            // A current-version daemon is not restarted, so success is allowed
+            // only after proving that the explicit caller config is the same
+            // canonical path as the daemon's typed live provenance.
+            verify_requested_config_with_health(db_path, &resp, requested_config)?;
         }
 
         Ok(client)
@@ -938,6 +1053,93 @@ credential_method = "gh"
             RestartConfig::for_cold_start(Some(&missing)).is_err(),
             "an explicit cold config is validated even though stale sidecar provenance is ignored"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_config_identity_is_canonical_for_relative_and_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let real = valid_config(&dir, "real.toml");
+        let link = dir.path().join("alias.toml");
+        symlink(fs::canonicalize(&real).unwrap(), &link).unwrap();
+        let relative = RestartConfig::for_cold_start(Some(&real)).unwrap();
+        let aliased = RestartConfig::for_cold_start(Some(&link)).unwrap();
+        assert_eq!(relative, aliased);
+        assert!(relative.as_path().unwrap().is_absolute());
+    }
+
+    #[test]
+    fn explicit_config_evidence_names_requested_and_effective_mismatch_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let requested_path = fs::canonicalize(valid_config(&dir, "requested.toml")).unwrap();
+        let effective_path = fs::canonicalize(valid_config(&dir, "effective.toml")).unwrap();
+        let requested = RestartConfig::Configured(requested_path.clone());
+        let health = nestweaver_proto::HealthCheckResponse {
+            instance_id: nestweaver_daemon::lifecycle::instance_id_from_db_path(&db),
+            pid: 91,
+            ..Default::default()
+        };
+
+        let different = verify_requested_config_evidence(
+            &db,
+            &health,
+            &requested,
+            binding(
+                91,
+                nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                    path: effective_path.to_str().unwrap().to_string(),
+                },
+            ),
+        )
+        .unwrap_err();
+        let message = format!("{different:#}");
+        assert!(
+            message.contains(requested_path.to_str().unwrap()),
+            "{message}"
+        );
+        assert!(
+            message.contains(effective_path.to_str().unwrap()),
+            "{message}"
+        );
+        assert!(message.contains("daemon --db"), "{message}");
+        assert!(message.contains("restart --config"), "{message}");
+
+        let defaults = verify_requested_config_evidence(
+            &db,
+            &health,
+            &requested,
+            binding(
+                91,
+                nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults,
+            ),
+        )
+        .unwrap_err();
+        assert!(format!("{defaults:#}").contains("compiled defaults"));
+
+        // Editing valid contents at the SAME canonical path does not change
+        // identity; path equality remains sufficient.
+        fs::write(
+            &requested_path,
+            fs::read_to_string(&requested_path)
+                .unwrap()
+                .replace("restart-test", "restart-test-edited"),
+        )
+        .unwrap();
+        verify_requested_config_evidence(
+            &db,
+            &health,
+            &requested,
+            binding(
+                91,
+                nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                    path: requested_path.to_str().unwrap().to_string(),
+                },
+            ),
+        )
+        .unwrap();
     }
 
     #[test]

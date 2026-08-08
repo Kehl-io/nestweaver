@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### ⚠ BREAKING CHANGES
+
+* **daemon/config:** commands that explicitly pass `--config` now fail when a current-version, already-running daemon cannot prove the same canonical configured path (including compiled-default daemons and daemons using a different config). Previously these commands could exit successfully while silently ignoring the requested configuration. Use `nestweaver daemon --db <db> restart --config <path>` to apply a different configuration. A verified version-upgrade restart still applies the explicit config to its verified successor. Relative paths and symlinks remain accepted when they canonicalize to the daemon's configured path. Editing that file in place does not trigger a path mismatch, but the daemon must still be restarted to load the changed contents.
 
 ### Bug Fixes
 

@@ -1233,6 +1233,74 @@ credential_method = "gh"
     let pid_a = read_pid();
     assert!(status().contains(&format!("Config: {}", canonical_a.display())));
 
+    // A direct start against a live daemon may succeed only when the explicit
+    // path canonicalizes to the daemon's typed configured provenance. Neither
+    // a relative spelling nor a symlink changes config identity.
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .success();
+    assert_eq!(read_pid(), pid_a);
+
+    let original_a = std::fs::read_to_string(&config_a).unwrap();
+    std::fs::write(&config_a, format!("{original_a}\n# valid live edit\n")).unwrap();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .success();
+    assert_eq!(read_pid(), pid_a);
+    std::fs::write(&config_a, original_a).unwrap();
+
+    let config_a_alias = dir.path().join("a-alias.toml");
+    std::os::unix::fs::symlink(&canonical_a, &config_a_alias).unwrap();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a_alias)
+        .assert()
+        .success();
+    assert_eq!(read_pid(), pid_a);
+
+    let mut relative_start = daemon_action_cmd(&db_path, "start");
+    relative_start
+        .current_dir(dir.path())
+        .arg("--config")
+        .arg("a.toml")
+        .assert()
+        .success();
+    assert_eq!(read_pid(), pid_a);
+
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_b)
+        .assert()
+        .failure()
+        .stderr(
+            contains(canonical_a.to_str().unwrap())
+                .and(contains(canonical_b.to_str().unwrap()))
+                .and(contains("restart --config")),
+        );
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+
+    // Exercise DaemonClient::connect's same-version early-success gate, not
+    // only the direct daemon-start path.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("restart --config"));
+    assert_eq!(read_pid(), pid_a);
+
     daemon_action_cmd(&db_path, "restart").assert().success();
     let pid_preserved = read_pid();
     assert_ne!(
@@ -1244,6 +1312,14 @@ credential_method = "gh"
 
     let binding_path = nestweaver_daemon::effective_config_binding_path(&instance_id);
     std::fs::remove_file(&binding_path).unwrap();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .failure()
+        .stderr(contains("effective config is unknown"));
+    assert_eq!(read_pid(), pid_preserved);
+    assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
     daemon_action_cmd(&db_path, "restart")
         .assert()
         .failure()
@@ -1318,6 +1394,15 @@ credential_method = "gh"
     .unwrap();
     daemon_action_cmd(&db_path, "restart").assert().success();
     assert!(status().contains("Config: none"));
+    let pid_defaults = read_pid();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .failure()
+        .stderr(contains("compiled defaults").and(contains("restart --config")));
+    assert_eq!(read_pid(), pid_defaults);
+    assert_eq!(unsafe { libc::kill(pid_defaults, 0) }, 0);
 
     daemon_action_cmd(&db_path, "stop").assert().success();
     daemon_action_cmd(&db_path, "restart")
