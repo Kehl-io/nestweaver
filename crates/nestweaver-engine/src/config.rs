@@ -346,6 +346,12 @@ pub enum EmbeddingAccelerator {
 /// other way); keep the two in sync.
 pub const DEFAULT_EMBEDDING_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
+/// The pre-platform-native embedding cache-dir default, as a literal
+/// user-facing path. Kept so the daemon can detect models left behind in the
+/// legacy location by older installs and point the user at them; it is no
+/// longer a default anywhere.
+pub const LEGACY_EMBEDDING_CACHE_DIR: &str = "~/.cache/nestweaver/models";
+
 fn default_model_id() -> String {
     DEFAULT_EMBEDDING_MODEL_ID.to_string()
 }

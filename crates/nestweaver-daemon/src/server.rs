@@ -6902,6 +6902,42 @@ async fn probe_loaded_embedding_model(
     }
 }
 
+/// If the model's artifacts are complete in the legacy (pre-platform-native)
+/// default cache directory but that is not where the daemon looked, say so.
+/// Cache-only probe: pure filesystem, no network — preserves the daemon's
+/// cache-only startup contract.
+#[cfg(feature = "embed")]
+fn legacy_cache_hint(resolved_dir: &std::path::Path, model_id: &str) -> Option<String> {
+    let legacy_dir =
+        nestweaver_engine::resolve_user_path(nestweaver_engine::config::LEGACY_EMBEDDING_CACHE_DIR);
+    legacy_cache_hint_at(&legacy_dir, resolved_dir, model_id)
+}
+
+#[cfg(feature = "embed")]
+fn legacy_cache_hint_at(
+    legacy_dir: &std::path::Path,
+    resolved_dir: &std::path::Path,
+    model_id: &str,
+) -> Option<String> {
+    if legacy_dir == resolved_dir {
+        return None;
+    }
+    let probe = nestweaver_embed::EmbedConfig {
+        model_id: model_id.to_string(),
+        cache_dir: legacy_dir.to_path_buf(),
+        external_endpoint: None,
+        external_model: None,
+    };
+    nestweaver_embed::resolve_model_artifacts(&probe, nestweaver_embed::ArtifactMode::CacheOnly)
+        .ok()?;
+    Some(format!(
+        "model '{model_id}' was found in the legacy cache directory '{}'; \
+         set [embedding] cache_dir in instance.toml or move the cache — \
+         the daemon is cache-only and will not re-download",
+        legacy_dir.display()
+    ))
+}
+
 /// Load the embedding model into `state.embedding_runtime`. MUST be called on the daemon's main
 /// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
 /// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
@@ -7015,13 +7051,26 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
             }
         },
         Err(e) => {
-            let status = finalize_embedding_status(
+            let mut status = finalize_embedding_status(
                 state.embedding_runtime.status(),
                 state.store.embedding_index_dimension(),
                 Err(format!("{e:#}")),
             );
+            // Local-only: an external endpoint never consults the cache, so a
+            // legacy-cache hit would be a red herring for its failures.
+            let hint = if config.external_endpoint.is_none() {
+                legacy_cache_hint(&cache_dir, &config.model_id)
+            } else {
+                None
+            };
+            if let Some(hint) = &hint {
+                status.error = format!("{}; {hint}", status.error);
+            }
             state.embedding_runtime.publish_unavailable(status);
-            tracing::warn!("Failed to load embedding model: {e}");
+            match hint {
+                Some(hint) => tracing::warn!("Failed to load embedding model: {e}; {hint}"),
+                None => tracing::warn!("Failed to load embedding model: {e}"),
+            }
         }
     }
 }
