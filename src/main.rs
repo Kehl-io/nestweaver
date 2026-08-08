@@ -16571,7 +16571,12 @@ where
                             error_count += chunk.len();
                         }
                     }
-                    if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        &store,
+                        success_count,
+                        api_model,
+                        produced_dim,
+                    ) {
                         eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
                 }
@@ -16619,7 +16624,12 @@ where
                             error_count += chunk.len();
                         }
                     }
-                    if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        &store,
+                        success_count,
+                        api_model,
+                        produced_dim,
+                    ) {
                         eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
                 }
@@ -16685,7 +16695,12 @@ where
                             error_count += chunk.len();
                         }
                     }
-                    if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        &store,
+                        success_count,
+                        api_model,
+                        produced_dim,
+                    ) {
                         eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
                 }
@@ -16751,7 +16766,12 @@ where
                                 error_count += batch.len();
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            success_count,
+                            local_model_id,
+                            produced_dim,
+                        ) {
                             eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
                     }
@@ -16805,7 +16825,12 @@ where
                                 error_count += batch.len();
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            success_count,
+                            local_model_id,
+                            produced_dim,
+                        ) {
                             eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
                     }
@@ -16872,7 +16897,12 @@ where
                                 error_count += batch.len();
                             }
                         }
-                        if let Err(e) = flush_checkpoint.flush_if_due(&store, success_count) {
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            success_count,
+                            local_model_id,
+                            produced_dim,
+                        ) {
                             eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
                     }
@@ -21151,7 +21181,10 @@ mod embed_metadata_truth_tests {
 
     impl CliBatchEmbedder for StubEmbedder {
         fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-            Ok(texts.iter().map(|_| vec![0.1_f32; self.dimension]).collect())
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.1_f32; self.dimension])
+                .collect())
         }
     }
 
@@ -21290,8 +21323,14 @@ mod embed_metadata_truth_tests {
         .expect_err("a conflicting explicit --model-id must bail, not silently stamp");
 
         let message = format!("{error:#}");
-        assert!(message.contains(RECORDED_MODEL), "must name the recorded model: {message}");
-        assert!(message.contains(OTHER_MODEL), "must name the requested model: {message}");
+        assert!(
+            message.contains(RECORDED_MODEL),
+            "must name the recorded model: {message}"
+        );
+        assert!(
+            message.contains(OTHER_MODEL),
+            "must name the requested model: {message}"
+        );
         assert_eq!(
             loader.call_count(),
             0,
@@ -21315,8 +21354,7 @@ mod embed_metadata_truth_tests {
     /// assertion instead of coincidentally rewriting the same values.
     #[test]
     fn fully_rejected_embed_leaves_metadata_untouched_and_reports_failure() {
-        let (_dir, db_path) =
-            seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 768)));
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 768)));
         let loader = StubLoader::new(4); // stub emits the wrong dimension
 
         let code = run_embed(
@@ -21359,8 +21397,7 @@ mod embed_metadata_truth_tests {
     /// so the store's recorded-model guard is what rejects every write.
     #[test]
     fn embed_without_model_id_cannot_mix_the_default_model_into_a_recorded_index() {
-        let (_dir, db_path) =
-            seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 3)));
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 3)));
         assert_ne!(
             RECORDED_MODEL,
             nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID,
@@ -21541,7 +21578,11 @@ mod embed_metadata_truth_tests {
             Some((DEFAULT_EXTERNAL_EMBEDDING_MODEL.to_string(), 3)),
             "a run that produced nothing must not stamp"
         );
-        assert_eq!(loader.call_count(), 0, "the endpoint branch never loads a local model");
+        assert_eq!(
+            loader.call_count(),
+            0,
+            "the endpoint branch never loads a local model"
+        );
     }
 
     /// The flip side: an endpoint run whose `--model` disagrees with the
@@ -21569,8 +21610,14 @@ mod embed_metadata_truth_tests {
         .expect_err("a conflicting --model must bail on the endpoint branch too");
 
         let message = format!("{error:#}");
-        assert!(message.contains("external-model-a"), "must name the recorded model: {message}");
-        assert!(message.contains("external-model-b"), "must name the requested model: {message}");
+        assert!(
+            message.contains("external-model-a"),
+            "must name the recorded model: {message}"
+        );
+        assert!(
+            message.contains("external-model-b"),
+            "must name the requested model: {message}"
+        );
         assert_eq!(
             recorded_metadata(&db_path),
             Some(("external-model-a".to_string(), 3)),
