@@ -16,6 +16,41 @@ pub fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Resolve a user-supplied path string to an absolute [`PathBuf`].
+///
+/// - A leading `~/` (or a bare `~`) expands against [`dirs::home_dir`]. When no
+///   home directory is known the input is returned unchanged rather than
+///   absolutized, so a literal `~/...` never silently becomes a `./~/...`
+///   directory relative to the working directory.
+/// - Absolute paths pass through unchanged.
+/// - Relative paths are absolutized against the current working directory
+///   (lexically, without touching the filesystem), so a relative configured
+///   path never prints as relative in an error message.
+pub fn resolve_user_path(input: &str) -> PathBuf {
+    resolve_user_path_with_home(input, dirs::home_dir())
+}
+
+fn resolve_user_path_with_home(input: &str, home: Option<PathBuf>) -> PathBuf {
+    let expanded = if input == "~" {
+        match home {
+            Some(home) => home,
+            None => return PathBuf::from(input),
+        }
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        match home {
+            Some(home) => home.join(rest),
+            None => return PathBuf::from(input),
+        }
+    } else {
+        PathBuf::from(input)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::path::absolute(&expanded).unwrap_or(expanded)
+    }
+}
+
 /// Migrate a sidecar from the old `with_extension` naming convention to the
 /// new `push` convention. If the old-convention path exists and the
 /// new-convention path does not, renames the old file to the new location.
@@ -262,3 +297,50 @@ pub use summaries::{
 };
 pub use watch_code::CodeWatcher;
 pub use watcher::{BrainWatcher, ShutdownHandle, UpdateOutcome};
+
+#[cfg(test)]
+mod resolve_user_path_tests {
+    use super::*;
+
+    #[test]
+    fn tilde_slash_expands_against_home() {
+        assert_eq!(
+            resolve_user_path_with_home("~/cache/models", Some(PathBuf::from("/home/tester"))),
+            PathBuf::from("/home/tester/cache/models")
+        );
+    }
+
+    #[test]
+    fn bare_tilde_is_the_home_directory() {
+        assert_eq!(
+            resolve_user_path_with_home("~", Some(PathBuf::from("/home/tester"))),
+            PathBuf::from("/home/tester")
+        );
+    }
+
+    #[test]
+    fn absolute_path_passes_through_unchanged() {
+        assert_eq!(
+            resolve_user_path_with_home("/var/cache/models", Some(PathBuf::from("/home/tester"))),
+            PathBuf::from("/var/cache/models")
+        );
+    }
+
+    #[test]
+    fn relative_path_is_absolutized() {
+        let resolved = resolve_user_path_with_home("rel/cache", None);
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with(Path::new("rel").join("cache")));
+    }
+
+    #[test]
+    fn tilde_without_home_stays_literal() {
+        // Never absolutize an unexpandable `~`: a literal `./~/...` directory
+        // is worse than an honest `~/...` in an error message.
+        assert_eq!(
+            resolve_user_path_with_home("~/cache", None),
+            PathBuf::from("~/cache")
+        );
+        assert_eq!(resolve_user_path_with_home("~", None), PathBuf::from("~"));
+    }
+}

@@ -14282,14 +14282,13 @@ fn run_brain(
             };
 
             // Helper: a stored vault matches the caller's path if any of its
-            // representations (canonical, literal, shell-expanded `~`)
+            // representations (canonical, literal, tilde-expanded `~`)
             // resolve to the same absolute path. `brain add` may have
             // registered the vault with a literal `~/...` string (from a
             // config file or programmatic call) while the caller of
             // `brain remove` typically passes a shell-expanded absolute
             // path. A naive `vault_uid` lookup misses these cases even
             // though `brain status` clearly shows the row.
-            let home = std::env::var("HOME").ok();
             let path_matches = |stored: &str| -> bool {
                 if stored == canon_str || stored == raw_str {
                     return true;
@@ -14300,9 +14299,9 @@ fn run_brain(
                 if stored_canon == *canon_str {
                     return true;
                 }
-                if let (Some(h), Some(rest)) = (home.as_deref(), stored.strip_prefix("~/")) {
-                    let expanded = format!("{h}/{rest}");
-                    if expanded == *canon_str {
+                if stored.starts_with("~/") {
+                    let expanded = nestweaver_engine::resolve_user_path(stored);
+                    if expanded.to_string_lossy() == *canon_str {
                         return true;
                     }
                     if let Ok(c) = std::fs::canonicalize(&expanded)

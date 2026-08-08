@@ -5306,8 +5306,8 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("'path' must be a string"))?;
-        let expanded = expand_tilde(raw_path);
-        let path = Path::new(&expanded);
+        let path = nestweaver_engine::resolve_user_path(raw_path);
+        let path = path.as_path();
         if !path.exists() {
             return Err(anyhow!("path does not exist: {}", path.display()));
         }
@@ -5432,12 +5432,9 @@ fn match_repo_target<'a>(
     target: &str,
 ) -> Vec<&'a nestweaver_schema::Repo> {
     let expand = |input: &str| -> String {
-        if let Some(stripped) = input.strip_prefix("~/")
-            && let Ok(home) = std::env::var("HOME")
-        {
-            return format!("{home}/{stripped}");
-        }
-        input.to_string()
+        nestweaver_engine::resolve_user_path(input)
+            .to_string_lossy()
+            .into_owned()
     };
     let target_trimmed = target.trim_end_matches('/');
     let canonical_target = std::fs::canonicalize(expand(target_trimmed))
@@ -8493,18 +8490,6 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         "cached": from_cache,
         "summaries": text,
     }))
-}
-
-/// Expand a leading `~/` to the user's home directory. Returns the input
-/// unchanged when no expansion is possible.
-#[cfg(not(feature = "daemon"))]
-fn expand_tilde(input: &str) -> String {
-    if let Some(stripped) = input.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}/{stripped}");
-    }
-    input.to_string()
 }
 
 /// Shallow check: does the directory contain any `.md` file in its tree?

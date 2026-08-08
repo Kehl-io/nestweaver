@@ -6960,16 +6960,9 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
             );
         }
     }
-    // Expand tilde in cache_dir using the home directory.
-    let cache_dir = if cfg.cache_dir.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            home.join(&cfg.cache_dir[2..])
-        } else {
-            std::path::PathBuf::from(&cfg.cache_dir)
-        }
-    } else {
-        std::path::PathBuf::from(&cfg.cache_dir)
-    };
+    // Resolve the configured cache dir: expand a leading tilde and absolutize
+    // relative paths so diagnostics always name a usable location.
+    let cache_dir = nestweaver_engine::resolve_user_path(&cfg.cache_dir);
     let policy = daemon_embedding_device_policy(cfg.accelerator);
     let config = embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
     let loaded = load_daemon_embedding_backend_with(
