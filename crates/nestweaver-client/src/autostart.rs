@@ -155,7 +155,7 @@ impl SpawnLock {
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&spawn_lock_path)
+            .open(spawn_lock_path)
             .with_context(|| format!("failed to open spawn lock {}", spawn_lock_path.display()))?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             bail!(

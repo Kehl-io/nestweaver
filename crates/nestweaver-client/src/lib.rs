@@ -186,7 +186,7 @@ fn open_verified_live_pidfile_at(path: &Path, health_pid: u32) -> Result<fs::Fil
     use std::os::unix::fs::OpenOptionsExt;
     options.custom_flags(libc::O_NOFOLLOW);
     let mut file = options
-        .open(&path)
+        .open(path)
         .with_context(|| format!("open existing daemon pidfile {}", path.display()))?;
     let metadata = file
         .metadata()
