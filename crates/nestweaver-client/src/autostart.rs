@@ -67,6 +67,57 @@ impl Drop for SpawnLock {
     }
 }
 
+/// Exclusive proof that no daemon owns the current pidfile inode.
+///
+/// Used by an explicit cold `daemon restart` only after acquiring SpawnLock
+/// and rechecking the socket. Stale sidecar contents are deliberately not read.
+pub struct UnownedPidfileLock {
+    file: fs::File,
+    owns_lock: bool,
+}
+
+impl UnownedPidfileLock {
+    pub fn acquire(db_path: &Path) -> Result<Self> {
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+        let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+        if let Some(parent) = pidfile.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create runtime dir: {}", parent.display()))?;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(&pidfile)
+            .with_context(|| format!("open pidfile: {}", pidfile.display()))?;
+        anyhow::ensure!(
+            try_acquire_pidfile_lock(&file)?,
+            "daemon pidfile {} is still owned; refusing a cold restart over a live or shutting-down daemon",
+            pidfile.display()
+        );
+        Ok(Self {
+            file,
+            owns_lock: true,
+        })
+    }
+
+    pub fn release(&mut self) {
+        if self.owns_lock {
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+            self.owns_lock = false;
+        }
+    }
+}
+
+impl Drop for UnownedPidfileLock {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Attempt to own this exact pidfile inode. `true` is authoritative evidence
 /// that no daemon holds it, regardless of whether its numeric contents happen
 /// to name a live (recycled) process.

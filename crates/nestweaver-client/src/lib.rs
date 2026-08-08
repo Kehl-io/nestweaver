@@ -45,6 +45,15 @@ impl RestartConfig {
             Self::CompiledDefaults => None,
         }
     }
+
+    /// Choose a cold-start decision without consulting any stale live-binding
+    /// sidecar. An explicit config remains canonical, UTF-8, and parse-valid.
+    pub fn for_cold_start(explicit_config: Option<&Path>) -> Result<Self> {
+        match explicit_config {
+            Some(path) => validate_restart_config(path).map(Self::Configured),
+            None => Ok(Self::CompiledDefaults),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -260,7 +269,7 @@ fn restart_prepare_result<T>(db_path: &Path, prepared: Result<T>) -> Result<T> {
 
 /// Transaction gate shared by production and ordering tests. Neither callback
 /// runs when PREPARE fails, and COMMIT cannot run unless Shutdown was accepted.
-async fn run_prepared_restart<T, Shutdown, ShutdownFuture, Commit, CommitFuture>(
+pub async fn run_prepared_restart<T, Shutdown, ShutdownFuture, Commit, CommitFuture>(
     prepared: Result<PreparedRestart>,
     shutdown: Shutdown,
     commit: Commit,
@@ -908,6 +917,27 @@ credential_method = "gh"
 
         assert_eq!(configured.as_path(), Some(canonical.as_path()));
         assert_eq!(defaults.as_path(), None);
+    }
+
+    #[test]
+    fn cold_restart_ignores_stale_provenance_and_uses_explicit_or_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = valid_config(&dir, "cold-explicit.toml");
+        let canonical = fs::canonicalize(&explicit).unwrap();
+
+        assert_eq!(
+            RestartConfig::for_cold_start(None).unwrap(),
+            RestartConfig::CompiledDefaults
+        );
+        assert_eq!(
+            RestartConfig::for_cold_start(Some(&explicit)).unwrap(),
+            RestartConfig::Configured(canonical)
+        );
+        let missing = dir.path().join("stale-sidecar-config.toml");
+        assert!(
+            RestartConfig::for_cold_start(Some(&missing)).is_err(),
+            "an explicit cold config is validated even though stale sidecar provenance is ignored"
+        );
     }
 
     #[test]

@@ -1128,6 +1128,206 @@ fn daemon_crash_recovery() {
         .stdout(contains("running").and(contains("PID")));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_restart_preserves_and_overrides_live_effective_config_without_early_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("restart-config").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+    let _guard = DaemonGuard::new(&db_path);
+
+    let write_config = |name: &str, instance_id: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+instance_id = "{instance_id}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+                dir.path()
+                    .join(format!("{instance_id}-snapshots"))
+                    .display(),
+                dir.path()
+                    .join(format!("{instance_id}-workspace"))
+                    .display(),
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let config_a = write_config("a.toml", "restart-a");
+    let config_b = write_config("b.toml", "restart-b");
+    let canonical_a = std::fs::canonicalize(&config_a).unwrap();
+    let canonical_b = std::fs::canonicalize(&config_b).unwrap();
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let read_pid = || {
+        std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap()
+    };
+    let status = || {
+        let output = daemon_action_cmd(&db_path, "status").output().unwrap();
+        assert!(output.status.success(), "status failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let index_and_assert_instance = |repo_name: &str, expected_instance: &str| {
+        let indexed_repo = dir.path().join(repo_name);
+        write_test_repo(&indexed_repo);
+        daemon_cmd()
+            .args([
+                "index",
+                "--repo",
+                &indexed_repo.display().to_string(),
+                "--db",
+                &db_path.display().to_string(),
+            ])
+            .assert()
+            .success();
+        let output = daemon_cmd()
+            .args([
+                "list-repos",
+                "--db",
+                &db_path.display().to_string(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let repos: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            repos.as_array().unwrap().iter().any(|repo| {
+                repo.get("instance_id").and_then(|value| value.as_str()) == Some(expected_instance)
+            }),
+            "no indexed repo retained logical instance {expected_instance}: {repos}"
+        );
+    };
+
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .success();
+    let pid_a = read_pid();
+    assert!(status().contains(&format!("Config: {}", canonical_a.display())));
+
+    daemon_action_cmd(&db_path, "restart").assert().success();
+    let pid_preserved = read_pid();
+    assert_ne!(
+        pid_preserved, pid_a,
+        "restart must replace the daemon process"
+    );
+    assert!(status().contains(&format!("Config: {}", canonical_a.display())));
+    index_and_assert_instance("repo-after-a", "restart-a");
+
+    let binding_path = nestweaver_daemon::effective_config_binding_path(&instance_id);
+    std::fs::remove_file(&binding_path).unwrap();
+    daemon_action_cmd(&db_path, "restart")
+        .assert()
+        .failure()
+        .stderr(contains("daemon has not been shut down"));
+    assert_eq!(read_pid(), pid_preserved);
+    assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
+    assert!(status().contains(&format!("Config: {}", canonical_a.display())));
+
+    nestweaver_daemon::lifecycle::write_effective_config_binding(
+        &instance_id,
+        &nestweaver_daemon::lifecycle::EffectiveConfigBinding::new(
+            pid_preserved as u32,
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                path: canonical_a.to_str().unwrap().to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    std::fs::write(&binding_path, "{not-json").unwrap();
+    daemon_action_cmd(&db_path, "restart")
+        .assert()
+        .failure()
+        .stderr(contains("daemon has not been shut down"));
+    assert_eq!(read_pid(), pid_preserved);
+    assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
+
+    // Explicit config bypasses the corrupt provenance value but still uses
+    // the already-verified live PID/pidfile ownership evidence.
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&config_b)
+        .assert()
+        .success();
+    let pid_overridden = read_pid();
+    assert_ne!(pid_overridden, pid_preserved);
+    assert!(status().contains(&format!("Config: {}", canonical_b.display())));
+    index_and_assert_instance("repo-after-b", "restart-b");
+
+    let missing = dir.path().join("missing.toml");
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&missing)
+        .assert()
+        .failure()
+        .stderr(contains("daemon has not been shut down"));
+    assert_eq!(read_pid(), pid_overridden);
+    assert_eq!(unsafe { libc::kill(pid_overridden, 0) }, 0);
+
+    let malformed = dir.path().join("malformed.toml");
+    std::fs::write(&malformed, "instance_id = [invalid").unwrap();
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&malformed)
+        .assert()
+        .failure()
+        .stderr(contains("daemon has not been shut down"));
+    assert_eq!(read_pid(), pid_overridden);
+    assert_eq!(unsafe { libc::kill(pid_overridden, 0) }, 0);
+
+    // Cold restart ignores a stale sidecar. Omitted config is an explicit
+    // compiled-default decision; an explicit path is still validated/chosen.
+    daemon_action_cmd(&db_path, "stop").assert().success();
+    nestweaver_daemon::lifecycle::write_effective_config_binding(
+        &instance_id,
+        &nestweaver_daemon::lifecycle::EffectiveConfigBinding::new(
+            999,
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                path: canonical_b.to_str().unwrap().to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    daemon_action_cmd(&db_path, "restart").assert().success();
+    assert!(status().contains("Config: none"));
+
+    daemon_action_cmd(&db_path, "stop").assert().success();
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .success();
+    assert!(status().contains(&format!("Config: {}", canonical_a.display())));
+}
+
 #[test]
 fn daemon_concurrent_mcp() {
     let dir = tempfile::tempdir().unwrap();

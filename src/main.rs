@@ -5189,6 +5189,187 @@ fn daemon_identity_verified(
     daemon_socket_reported_pid(socket) == Some(pid)
 }
 
+fn daemon_restart_start_args(
+    db_path: &std::path::Path,
+    idle_timeout: u64,
+    restart_config: &nestweaver_client::RestartConfig,
+) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        "daemon".into(),
+        "--db".into(),
+        db_path.as_os_str().to_owned(),
+        "start".into(),
+        "--idle-timeout".into(),
+        idle_timeout.to_string().into(),
+    ];
+    if let Some(config) = restart_config.as_path() {
+        args.push("--config".into());
+        args.push(config.as_os_str().to_owned());
+    }
+    args
+}
+
+async fn start_and_verify_restarted_daemon(
+    db_path: &std::path::Path,
+    executable: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    restart_config: &nestweaver_client::RestartConfig,
+    spawn_lock: nestweaver_client::autostart::SpawnLock,
+) -> anyhow::Result<()> {
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(executable).args(args).status()
+    })
+    .await
+    .context("daemon restart command task failed")?
+    .context("failed to execute daemon start")?;
+    anyhow::ensure!(status.success(), "daemon start failed with {status}");
+
+    // `daemon start` preserves existing platform routing. Persistent macOS
+    // agents use KeepAlive.Crashed, so the preceding successful gRPC shutdown
+    // exits 0 and is not respawned; `start` then bootouts/reinstalls the plist.
+    // launchd may report a still-booting success, so wait for health without
+    // auto-starting before final trust checks.
+    nestweaver_client::DaemonClient::wait_healthy(db_path, std::time::Duration::from_secs(60))
+        .await?;
+    let socket =
+        nestweaver_daemon::socket_path(&nestweaver_daemon::instance_id_from_db_path(db_path));
+    let verified =
+        nestweaver_client::connect_verified_replacement(&socket, db_path, restart_config).await;
+    drop(spawn_lock);
+    verified.map(|_| ())
+}
+
+async fn restart_verified_live_under_lock(
+    db_path: &std::path::Path,
+    idle_timeout: u64,
+    explicit_config: Option<&std::path::Path>,
+    original: nestweaver_client::PreparedRestart,
+    expected_config: nestweaver_client::RestartConfig,
+    spawn_lock: nestweaver_client::autostart::SpawnLock,
+) -> anyhow::Result<()> {
+    let mut client = nestweaver_client::DaemonClient::connect_existing(db_path)
+        .await
+        .context("reconnect to live daemon after acquiring restart transaction lock")?;
+    let locked_health = client.health_check().await.context(
+        "could not revalidate live daemon after acquiring restart transaction lock; no shutdown was attempted",
+    )?;
+    let prepared = nestweaver_client::prepare_restart(db_path, &locked_health, explicit_config)
+        .and_then(|prepared| {
+            anyhow::ensure!(
+                prepared.config() == &expected_config,
+                "daemon effective config changed while waiting for the restart transaction lock; no shutdown was attempted"
+            );
+            Ok(prepared)
+        });
+    drop(original);
+
+    // PREPARE includes every fallible local decision needed to launch. In
+    // particular, a broken current_exe lookup must leave the live daemon
+    // untouched rather than discovering the failure after Shutdown.
+    let executable = std::env::current_exe().context("cannot determine binary path")?;
+    let start_args = daemon_restart_start_args(db_path, idle_timeout, &expected_config);
+
+    nestweaver_client::run_prepared_restart(
+        prepared,
+        || async {
+            let response = client
+                .inner_mut()
+                .shutdown(nestweaver_proto::ShutdownRequest {})
+                .await
+                .context("daemon shutdown request failed; refusing to start a replacement")?
+                .into_inner();
+            Ok(response.ok)
+        },
+        |mut prepared| async move {
+            prepared.wait_for_owner_release().await?;
+            prepared.release_pidfile_lock();
+            start_and_verify_restarted_daemon(
+                db_path,
+                executable,
+                start_args,
+                prepared.config(),
+                spawn_lock,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn restart_live_daemon_preserving_config(
+    db_path: &std::path::Path,
+    idle_timeout: u64,
+    explicit_config: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    match nestweaver_client::DaemonClient::connect_existing(db_path).await {
+        Ok(mut client) => {
+            let original_health = client.health_check().await?;
+            let original =
+                nestweaver_client::prepare_restart(db_path, &original_health, explicit_config)?;
+            let expected_config = original.config().clone();
+            let spawn_lock =
+                nestweaver_client::autostart::SpawnLock::acquire_async(db_path).await?;
+            restart_verified_live_under_lock(
+                db_path,
+                idle_timeout,
+                explicit_config,
+                original,
+                expected_config,
+                spawn_lock,
+            )
+            .await
+        }
+        Err(_) => {
+            // Serialize against auto-start, then recheck: a concurrent client
+            // may have published a daemon while the first connection failed.
+            let spawn_lock =
+                nestweaver_client::autostart::SpawnLock::acquire_async(db_path).await?;
+            if let Ok(mut winner) = nestweaver_client::DaemonClient::connect_existing(db_path).await
+            {
+                let health = winner.health_check().await?;
+                let original =
+                    nestweaver_client::prepare_restart(db_path, &health, explicit_config)?;
+                let expected_config = original.config().clone();
+                return restart_verified_live_under_lock(
+                    db_path,
+                    idle_timeout,
+                    explicit_config,
+                    original,
+                    expected_config,
+                    spawn_lock,
+                )
+                .await;
+            }
+
+            // No healthy socket winner. Prove the current pidfile inode is
+            // unowned before treating this as cold; an unresponsive live
+            // daemon fails here instead of being overlapped. Stale sidecar
+            // state is intentionally ignored on this branch.
+            let mut unowned = nestweaver_client::autostart::UnownedPidfileLock::acquire(db_path)?;
+            if nestweaver_client::DaemonClient::connect_existing(db_path)
+                .await
+                .is_ok()
+            {
+                anyhow::bail!(
+                    "a daemon became connectable while proving cold-start ownership; refusing to overlap it"
+                );
+            }
+            let restart_config = nestweaver_client::RestartConfig::for_cold_start(explicit_config)?;
+            let executable = std::env::current_exe().context("cannot determine binary path")?;
+            let start_args = daemon_restart_start_args(db_path, idle_timeout, &restart_config);
+            unowned.release();
+            start_and_verify_restarted_daemon(
+                db_path,
+                executable,
+                start_args,
+                &restart_config,
+                spawn_lock,
+            )
+            .await
+        }
+    }
+}
+
 /// nw-087: commands that operate on an existing database must fail
 /// `db_not_found` when the file is absent — never autostart a daemon that
 /// CREATES an empty DB (a typo'd `--db` must not false-green). The message is
@@ -11693,53 +11874,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     idle_timeout,
                     config,
                 } => {
-                    // Stop if running.
-                    if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
-                        && let Ok(pid) = pid_str.trim().parse::<i32>()
-                        && unsafe { libc::kill(pid, 0) } == 0
-                    {
-                        eprintln!("Stopping daemon (PID {pid})...");
-                        unsafe { libc::kill(pid, libc::SIGTERM) };
-                        for _ in 0..50 {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            if unsafe { libc::kill(pid, 0) } != 0 {
-                                break;
-                            }
-                        }
-                        if unsafe { libc::kill(pid, 0) } == 0 {
-                            unsafe { libc::kill(pid, libc::SIGKILL) };
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                        }
-                        remove_unowned_daemon_runtime(
-                            &pidfile,
-                            &socket,
-                            &nestweaver_daemon::effective_config_binding_path(&instance_id),
-                        );
-                        eprintln!("Daemon stopped.");
-                    }
-
-                    // Re-exec ourselves to start the daemon fresh.
-                    let exe =
-                        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nestweaver"));
-                    let mut start_args: Vec<String> = vec![
-                        "daemon".to_string(),
-                        "--db".to_string(),
-                        db_path.display().to_string(),
-                        "start".to_string(),
-                        "--idle-timeout".to_string(),
-                        idle_timeout.to_string(),
-                    ];
-                    if let Some(cfg) = config.as_deref() {
-                        start_args.push("--config".to_string());
-                        start_args.push(cfg.display().to_string());
-                    }
-                    let status = std::process::Command::new(&exe)
-                        .args(&start_args)
-                        .status()
-                        .with_context(|| "failed to restart daemon")?;
-                    if !status.success() {
-                        anyhow::bail!("daemon start failed with {status}");
-                    }
+                    let runtime = tokio::runtime::Runtime::new()
+                        .context("failed to create daemon restart runtime")?;
+                    runtime.block_on(restart_live_daemon_preserving_config(
+                        &db_path,
+                        idle_timeout,
+                        config.as_deref(),
+                    ))?;
                     Ok((EXIT_SUCCESS, None))
                 }
             }
@@ -18799,6 +18940,57 @@ fn impact_item_to_result(
 #[cfg(test)]
 mod abs_for_daemon_tests {
     use super::*;
+
+    fn restart_args(config: &nestweaver_client::RestartConfig) -> Vec<std::ffi::OsString> {
+        daemon_restart_start_args(std::path::Path::new("/tmp/brain.lbug"), 123, config)
+    }
+
+    #[test]
+    fn restart_without_flag_preserves_captured_configured_path() {
+        let args = restart_args(&nestweaver_client::RestartConfig::Configured(
+            "/canonical/instance.toml".into(),
+        ));
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                "/tmp/brain.lbug",
+                "start",
+                "--idle-timeout",
+                "123",
+                "--config",
+                "/canonical/instance.toml",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn restart_without_flag_preserves_captured_compiled_defaults() {
+        let args = restart_args(&nestweaver_client::RestartConfig::CompiledDefaults);
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                "/tmp/brain.lbug",
+                "start",
+                "--idle-timeout",
+                "123",
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn restart_explicit_override_is_the_spawned_config_decision() {
+        let args = restart_args(&nestweaver_client::RestartConfig::Configured(
+            "/explicit/override.toml".into(),
+        ));
+        assert_eq!(args[6], "--config");
+        assert_eq!(args[7], "/explicit/override.toml");
+    }
 
     #[test]
     fn relative_path_becomes_absolute_never_bare_relative() {
