@@ -243,6 +243,18 @@ message EmbeddingStatus {
   bool metal_compiled = 7;
   bool fallback_used = 8;        // invariant: always false
 }
+message EffectiveConfig {
+  // The daemon's effective configuration source. Absence of EffectiveConfig
+  // on BrainStatusResponse means an older daemon that cannot report it.
+  oneof source {
+    string configured_path = 1;       // canonical absolute path
+    CompiledDefaults compiled_defaults = 2;
+  }
+
+  // An explicit marker rather than an empty path, so defaults cannot be
+  // confused with unknown provenance from an older daemon.
+  message CompiledDefaults {}
+}
 message BrainStatusResponse {
   int32 vault_count = 1;
   int32 notes = 2;
@@ -257,6 +269,7 @@ message BrainStatusResponse {
   string indexing_repo = 11;  // repo currently being indexed (empty if idle)
   int32 queue_depth = 12;     // number of pending + running jobs
   EmbeddingStatus embedding_status = 13;
+  EffectiveConfig effective_config = 14;
 }
 
 // repo_states — per-repo indexed SHA and metadata for staleness comparison
