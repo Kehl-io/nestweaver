@@ -6781,6 +6781,111 @@ mod embedding_load_config_tests {
         assert_eq!(embeddings[0].len(), 4);
         assert!(embeddings[0].iter().all(|value| value.is_finite()));
     }
+
+    #[test]
+    fn missing_artifact_fails_startup_and_names_model_and_dir() {
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        let artifacts = write_complete_hf_cache(cache.path());
+        std::fs::remove_file(&artifacts.weights).expect("remove weights fixture");
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: cache.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+
+        let error = load_daemon_embedding_backend_with(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+        )
+        .err()
+        .expect("a cache missing an artifact must fail the startup load");
+
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            model_id: "test-owner/test-model".to_string(),
+            ..Default::default()
+        };
+        let status = finalize_embedding_status(
+            initial_embedding_status(&cfg, None, true, false),
+            None,
+            Err(format!("{error:#}")),
+        );
+        assert_eq!(status.state, "failed");
+        assert!(
+            status.error.contains("test-owner/test-model"),
+            "startup error must name the model id: {}",
+            status.error
+        );
+        assert!(
+            status.error.contains(&cache.path().display().to_string()),
+            "startup error must name the cache directory searched: {}",
+            status.error
+        );
+    }
+
+    #[test]
+    fn ready_status_carries_the_model_id_and_resolved_cache_dir() {
+        // The ready-path startup diagnostic logs status.model_id and the
+        // resolved cache_dir (cloned before the move into
+        // embedding_load_config); pin the values that line reports so a
+        // wrong-but-populated cache stays visible.
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        write_complete_hf_cache(cache.path());
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: cache.path().display().to_string(),
+            ..Default::default()
+        };
+        let cache_dir = nestweaver_engine::resolve_user_path(&cfg.cache_dir);
+        assert!(cache_dir.is_absolute());
+        assert_eq!(cache_dir, cache.path());
+
+        let load_config = embedding_load_config(&cfg, cache_dir.clone(), None);
+        let model = load_daemon_embedding_backend_with(
+            &load_config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+        )
+        .expect("complete fixture cache must load");
+        let probe = probe_embedding_model(&model).expect("readiness probe must pass");
+        let status = finalize_embedding_status(
+            initial_embedding_status(&cfg, None, true, false),
+            None,
+            Ok(probe),
+        );
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.model_id, "test-owner/test-model");
+        assert_eq!(load_config.cache_dir, cache_dir);
+    }
+
+    #[test]
+    fn legacy_cache_hint_reports_a_complete_model_in_the_legacy_dir() {
+        let legacy = tempfile::tempdir().expect("legacy tempdir");
+        write_complete_hf_cache(legacy.path());
+        let resolved = tempfile::tempdir().expect("resolved tempdir");
+
+        let hint = legacy_cache_hint_at(legacy.path(), resolved.path(), "test-owner/test-model")
+            .expect("a complete model in the legacy dir must produce a hint");
+        assert!(hint.contains("test-owner/test-model"));
+        assert!(hint.contains(&legacy.path().display().to_string()));
+        assert!(hint.contains("cache-only"));
+    }
+
+    #[test]
+    fn legacy_cache_hint_is_absent_when_nothing_is_findable_elsewhere() {
+        let legacy = tempfile::tempdir().expect("legacy tempdir");
+        let resolved = tempfile::tempdir().expect("resolved tempdir");
+        // Empty legacy dir: nothing to point the user at.
+        assert!(
+            legacy_cache_hint_at(legacy.path(), resolved.path(), "test-owner/test-model").is_none()
+        );
+        // Legacy == resolved: the configured dir IS the legacy dir, so there
+        // is no second location to report.
+        assert!(
+            legacy_cache_hint_at(legacy.path(), legacy.path(), "test-owner/test-model").is_none()
+        );
+    }
 }
 
 #[cfg(feature = "embed")]
