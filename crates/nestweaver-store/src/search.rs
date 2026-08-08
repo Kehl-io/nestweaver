@@ -439,6 +439,11 @@ pub const EMBED_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::
 /// rewrites the entire sidecar file on every call (roughly a quarter of a
 /// gigabyte for a large graph), so the cadence must stay coarse — minutes,
 /// not batches.
+///
+/// Mid-run call sites (CLI and daemon embed loops) should use
+/// [`Self::flush_if_due_with_stamp`] so the model fingerprint travels with
+/// each checkpoint; plain `flush_if_due` remains for the final flush, which
+/// is followed by the run's tail stamp.
 pub struct EmbeddingFlushCheckpoint {
     interval: std::time::Duration,
     last_flush: std::time::Instant,
@@ -461,14 +466,60 @@ impl EmbeddingFlushCheckpoint {
         store: &GraphStore,
         success_count: usize,
     ) -> Result<bool, StoreError> {
-        if success_count == self.flushed_success_count || self.last_flush.elapsed() < self.interval
-        {
+        if !self.is_due(success_count) {
             return Ok(false);
         }
         store.flush_embedding_index()?;
+        self.record_flush(success_count);
+        Ok(true)
+    }
+
+    /// Checkpoint like [`Self::flush_if_due`], then stamp the flushed index's
+    /// fingerprint (`model_id`, `produced_dim`) into the embedding metadata.
+    ///
+    /// The fingerprint must travel with the checkpoint: a `--force` run
+    /// switching to a different model at the same dimension overwrites old
+    /// vectors as it goes, so a checkpoint that persisted vectors without
+    /// updating the metadata would leave a durable mixed-model index whose
+    /// metadata still names the OLD model — every open-time guard would pass
+    /// and a later non-force embed would see all-present embeddings and do
+    /// zero work. Stamping here means an interrupted force-switch instead
+    /// leaves a consistent (new-model, partial) index that the next run
+    /// resumes or re-embeds honestly.
+    ///
+    /// The stamp keys off `produced_dim` (the dimension of vectors THIS run
+    /// produced): when it is `None` the run produced nothing yet and the
+    /// existing fingerprint is left untouched. A failed stamp after a
+    /// successful flush only warns (matching the warn-only flush style at the
+    /// call sites); the flush itself still counts.
+    pub fn flush_if_due_with_stamp(
+        &mut self,
+        store: &GraphStore,
+        success_count: usize,
+        model_id: &str,
+        produced_dim: Option<usize>,
+    ) -> Result<bool, StoreError> {
+        if !self.is_due(success_count) {
+            return Ok(false);
+        }
+        store.flush_embedding_index()?;
+        self.record_flush(success_count);
+        if let Some(dim) = produced_dim
+            && !model_id.is_empty()
+            && let Err(e) = store.set_embedding_metadata(model_id, dim as u32)
+        {
+            tracing::warn!("failed to stamp embedding metadata at checkpoint: {e}");
+        }
+        Ok(true)
+    }
+
+    fn is_due(&self, success_count: usize) -> bool {
+        success_count != self.flushed_success_count && self.last_flush.elapsed() >= self.interval
+    }
+
+    fn record_flush(&mut self, success_count: usize) {
         self.last_flush = std::time::Instant::now();
         self.flushed_success_count = success_count;
-        Ok(true)
     }
 }
 
@@ -953,6 +1004,89 @@ mod tests {
         // Newly accepted work since the flush re-arms it.
         assert!(store.add_embedding("sym:b", vec![0.4_f32, 0.5, 0.6]));
         assert!(checkpoint.flush_if_due(&store, 2).unwrap());
+    }
+
+    #[test]
+    fn flush_if_due_with_stamp_stamps_the_fingerprint_with_the_checkpoint() {
+        // A due checkpoint persists vectors AND the fingerprint describing
+        // them, so an interrupted --force model switch leaves a consistent
+        // (new-model, partial) index instead of mixed vectors under the old
+        // model's metadata.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+        assert!(store.add_embedding_with_force(
+            "sym:a",
+            vec![0.1_f32, 0.2, 0.3],
+            "sentence-transformers/model-b",
+            true,
+        ));
+
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(
+            checkpoint
+                .flush_if_due_with_stamp(&store, 1, "sentence-transformers/model-b", Some(3))
+                .unwrap(),
+            "a due checkpoint with newly accepted embeddings must flush"
+        );
+        assert!(sidecar.exists(), "the flush must persist the sidecar");
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("sentence-transformers/model-b".to_string(), 3)),
+            "the checkpoint must stamp the fingerprint of the vectors it persisted"
+        );
+        // The in-memory recorded model refreshes too, so subsequent writes in
+        // the same run are guarded against the newly stamped model.
+        assert!(store.add_embedding_with_force(
+            "sym:b",
+            vec![0.4_f32, 0.5, 0.6],
+            "sentence-transformers/model-b",
+            false,
+        ));
+    }
+
+    #[test]
+    fn flush_if_due_with_stamp_without_new_work_neither_flushes_nor_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+
+        // A zero interval means always due; with no accepted embeddings the
+        // checkpoint must still not write or stamp (there is nothing new to
+        // persist).
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(
+            !checkpoint
+                .flush_if_due_with_stamp(&store, 0, "sentence-transformers/model-b", Some(3))
+                .unwrap()
+        );
+        assert!(!sidecar.exists());
+        assert_eq!(store.get_embedding_metadata().unwrap(), None);
+    }
+
+    #[test]
+    fn flush_if_due_with_stamp_with_no_produced_dim_flushes_but_does_not_stamp() {
+        // `produced_dim == None` means this run produced nothing, so the
+        // pre-existing fingerprint must survive even when a flush fires.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        store
+            .set_embedding_metadata("sentence-transformers/model-a", 3)
+            .unwrap();
+        assert!(store.add_embedding("sym:a", vec![0.1_f32, 0.2, 0.3]));
+
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(
+            checkpoint
+                .flush_if_due_with_stamp(&store, 1, "sentence-transformers/model-b", None)
+                .unwrap(),
+            "the flush decision keys off new accepts, not produced_dim"
+        );
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("sentence-transformers/model-a".to_string(), 3)),
+            "a checkpoint with no produced vectors must not overwrite the fingerprint"
+        );
     }
 
     #[test]
