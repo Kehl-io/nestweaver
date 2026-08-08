@@ -5573,6 +5573,10 @@ impl NestWeaverDaemon for DaemonService {
                     )
                 }));
             };
+            // The model the daemon actually loaded (startup preference: the
+            // DB-recorded id wins, else the configured external/local model).
+            // Used to stamp embedding metadata after a productive run.
+            let embed_model_id = status.model_id.clone();
 
             let store = self.state.store.clone();
 
@@ -5582,6 +5586,17 @@ impl NestWeaverDaemon for DaemonService {
                 let mut rejected = 0u32;
                 let mut scoped = 0u64;
                 let mut eligible = 0u64;
+                // Dimension of the vectors THIS run produced, set on the first
+                // accepted write; gates the metadata stamp below (mirrors the
+                // CLI's `run_embed` tail).
+                let mut produced_dim: Option<usize> = None;
+                // Checkpoint the index to the sidecar about every five minutes
+                // so an interrupted pass keeps completed work. Per-batch
+                // flushing is not implementable: save_binary rewrites the
+                // entire sidecar on every call, so the cadence must stay coarse.
+                let mut flush_checkpoint = nestweaver_store::EmbeddingFlushCheckpoint::new(
+                    nestweaver_store::EMBED_CHECKPOINT_INTERVAL,
+                );
 
                 // Each embed run may legitimately force-switch the model once;
                 // re-arm the once-per-run clear guard on this long-lived index.
@@ -5606,8 +5621,17 @@ impl NestWeaverDaemon for DaemonService {
                             );
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    if store.add_embedding_with_force(&sym.uid, emb, force) {
+                                    let emb_dim = emb.len();
+                                    if store.add_embedding_with_force(
+                                        &sym.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5617,6 +5641,14 @@ impl NestWeaverDaemon for DaemonService {
                                     failed += 1;
                                 }
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
                     }
                 }
@@ -5637,8 +5669,17 @@ impl NestWeaverDaemon for DaemonService {
                                 nestweaver_embed::preprocess::note_embed_text(&note.title, None);
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    if store.add_embedding_with_force(&note.uid, emb, force) {
+                                    let emb_dim = emb.len();
+                                    if store.add_embedding_with_force(
+                                        &note.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5648,6 +5689,14 @@ impl NestWeaverDaemon for DaemonService {
                                     failed += 1;
                                 }
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
                     }
                 }
@@ -5668,8 +5717,17 @@ impl NestWeaverDaemon for DaemonService {
                                 nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    if store.add_embedding_with_force(&heading.uid, emb, force) {
+                                    let emb_dim = emb.len();
+                                    if store.add_embedding_with_force(
+                                        &heading.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5680,6 +5738,14 @@ impl NestWeaverDaemon for DaemonService {
                                 }
                             }
                         }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
+                        }
                     }
                 }
 
@@ -5687,6 +5753,17 @@ impl NestWeaverDaemon for DaemonService {
                     && let Err(e) = store.flush_embedding_index()
                 {
                     tracing::warn!("failed to flush embedding index: {e}");
+                }
+
+                // Stamp the fingerprint only from vectors this run produced:
+                // a daemon embed that produced nothing must not invent (or
+                // overwrite) metadata. The daemon route previously never
+                // stamped at all, leaving daemon-populated databases without a
+                // fingerprint for the startup and CLI guards to check.
+                if let Some(dim) = produced_dim
+                    && let Err(e) = store.set_embedding_metadata(&embed_model_id, dim as u32)
+                {
+                    tracing::warn!("failed to record embedding model metadata: {e}");
                 }
 
                 tracing::info!(succeeded, failed, rejected, "embed RPC completed");
@@ -13934,6 +14011,98 @@ external_model = "unavailable-test-model"
         assert!(
             calls.load(Ordering::Relaxed) > 0,
             "ready snapshots must route work through the exact published model"
+        );
+    }
+
+    /// A daemon embed that produces vectors stamps the fingerprint of the
+    /// model the daemon actually loaded (`status.model_id`) at the produced
+    /// dimension. Before the fix the embed RPC never called
+    /// `set_embedding_metadata` at all, so daemon-populated databases had no
+    /// fingerprint for any downstream guard — this test fails there because
+    /// the metadata stays `None`.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_handler_stamps_the_loaded_models_fingerprint_after_a_productive_run() {
+        let state = test_state_with_writer();
+        insert_unembedded_symbol(&state.store, "sym-stamp");
+        let model = Arc::new(CountingEmbed {
+            calls: Arc::new(AtomicU32::new(0)),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let mut ready = state.embedding_runtime.status();
+        ready.state = "ready".to_string();
+        ready.selected_device = "cpu".to_string();
+        ready.model_id = "daemon-loaded-model".to_string();
+        state.embedding_runtime.publish_ready(ready, model);
+
+        let mut request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 8,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let response = DaemonService::new(state.clone())
+            .embed(request)
+            .await
+            .expect("a ready daemon must accept the embed RPC")
+            .into_inner();
+        assert_eq!(response.succeeded, 1);
+        assert_eq!(response.rejected, 0);
+
+        assert_eq!(
+            state.store.get_embedding_metadata().unwrap(),
+            Some(("daemon-loaded-model".to_string(), 3)),
+            "a productive daemon embed must stamp the model it loaded at the produced dimension"
+        );
+    }
+
+    /// A daemon embed with no eligible work produces nothing, so it must not
+    /// invent or overwrite metadata — the daemon-route analogue of the CLI's
+    /// Reproduction A. The recorded fingerprint names a different model than
+    /// the loaded one; a zero-work run must leave it untouched.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_handler_without_eligible_work_leaves_metadata_untouched() {
+        let state = test_state_with_writer();
+        insert_unembedded_symbol(&state.store, "sym-noop");
+        assert!(state.store.add_embedding_with_force(
+            "sym-noop",
+            vec![0.1, 0.2, 0.3],
+            "recorded-model",
+            false,
+        ));
+        state
+            .store
+            .set_embedding_metadata("recorded-model", 3)
+            .unwrap();
+        let model = Arc::new(CountingEmbed {
+            calls: Arc::new(AtomicU32::new(0)),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let mut ready = state.embedding_runtime.status();
+        ready.state = "ready".to_string();
+        ready.selected_device = "cpu".to_string();
+        ready.model_id = "other-loaded-model".to_string();
+        state.embedding_runtime.publish_ready(ready, model);
+
+        let mut request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 8,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let response = DaemonService::new(state.clone())
+            .embed(request)
+            .await
+            .expect("a no-op embed is not an error")
+            .into_inner();
+        assert_eq!(response.succeeded, 0, "nothing was eligible to embed");
+        assert_eq!(response.skipped, 1);
+
+        assert_eq!(
+            state.store.get_embedding_metadata().unwrap(),
+            Some(("recorded-model".to_string(), 3)),
+            "a daemon embed that produced nothing must not overwrite the recorded fingerprint"
         );
     }
 

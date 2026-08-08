@@ -78,6 +78,58 @@ fn external_embedding_model(model: Option<&str>) -> &str {
     model.unwrap_or(DEFAULT_EXTERNAL_EMBEDDING_MODEL)
 }
 
+/// Batch embedder for the direct `--local` embed path. Abstracted from
+/// `nestweaver_embed::EmbedModel` so tests can inject a stub emitting
+/// fixed-dimension vectors instead of loading real model artifacts (the
+/// artifact cache is process-global and hard to stage hermetically).
+/// Deliberately free of `nestweaver_embed` types so `run_embed` keeps one
+/// signature with and without the `embed` feature.
+trait CliBatchEmbedder {
+    // Only called from the `embed`-gated local branch of `run_embed`.
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
+}
+
+#[cfg(feature = "embed")]
+impl CliBatchEmbedder for nestweaver_embed::EmbedModel {
+    fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed(texts)
+    }
+}
+
+/// Production loader for the direct `--local` embed path, passed to
+/// `run_embed` as a parameter — the same loader-injection idiom as the
+/// daemon's `load_daemon_embedding_backend_with`.
+#[cfg(feature = "embed")]
+fn load_cli_local_embedder(
+    model_id: &str,
+    cache_dir: Option<&Path>,
+    accelerator: Option<CliEmbeddingAccelerator>,
+) -> anyhow::Result<Box<dyn CliBatchEmbedder>> {
+    let config = direct_local_embedding_config(model_id, cache_dir);
+    let policy = cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
+    let model = nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(
+        &config,
+        policy,
+        cli_embedding_artifact_mode(),
+    )?;
+    Ok(Box::new(model))
+}
+
+/// Fallback loader for builds without the `embed` feature: keeps
+/// `run_embed`'s signature uniform and fails only if the local path runs.
+#[cfg(not(feature = "embed"))]
+fn load_cli_local_embedder(
+    _model_id: &str,
+    _cache_dir: Option<&Path>,
+    _accelerator: Option<CliEmbeddingAccelerator>,
+) -> anyhow::Result<Box<dyn CliBatchEmbedder>> {
+    anyhow::bail!(
+        "local embedding requires the `embed` feature; \
+         rebuild with `--features embed` or pass --endpoint"
+    );
+}
+
 fn local_embedding_model_id(model_id: Option<&str>) -> &str {
     model_id.unwrap_or(nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID)
 }
@@ -2368,7 +2420,9 @@ enum Commands {
     /// By default uses the bundled local model (sentence-transformers/all-MiniLM-L6-v2).
     /// Pass --endpoint to use an external OpenAI-compatible API instead.
     /// Only nodes that do not yet have an embedding are processed (incremental);
-    /// use --force to re-embed everything.
+    /// use --force to re-embed everything. The index is checkpointed to disk
+    /// about every 5 minutes and once at the end of the pass, so interrupting
+    /// a run keeps only the work completed up to the last checkpoint.
     #[command(
         after_help = "Examples:\n  nestweaver embed                           # local model, all node types\n  nestweaver embed --scope symbols           # only symbols\n  nestweaver embed --local --cache-dir /path/to/cache  # populate a configured daemon cache\n  nestweaver embed --endpoint https://api.openai.com --model text-embedding-3-small\n  nestweaver embed --force --stats            # re-embed everything, print timing"
     )]
@@ -7374,6 +7428,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             force,
             stats,
             use_daemon,
+            load_cli_local_embedder,
         )
         .map(|c| (c, None)),
 
@@ -16212,7 +16267,7 @@ fn print_project_context_json(
 
 /// Generate embeddings for symbols, notes, and/or headings.
 #[allow(clippy::too_many_arguments)]
-fn run_embed(
+fn run_embed<Load>(
     db: Option<&Path>,
     local: bool,
     endpoint: Option<&str>,
@@ -16225,7 +16280,15 @@ fn run_embed(
     force: bool,
     stats: bool,
     use_daemon: bool,
-) -> anyhow::Result<i32> {
+    local_model_loader: Load,
+) -> anyhow::Result<i32>
+where
+    Load: Fn(
+        &str,
+        Option<&Path>,
+        Option<CliEmbeddingAccelerator>,
+    ) -> anyhow::Result<Box<dyn CliBatchEmbedder>>,
+{
     // Validate flags
     if local && endpoint.is_some() {
         anyhow::bail!("--local and --endpoint are mutually exclusive");
@@ -16316,15 +16379,16 @@ fn run_embed(
                         let elapsed = t0.elapsed();
                         if resp.rejected > 0 {
                             eprintln!(
-                                "Error: {} embedding(s) rejected due to dimension mismatch. \
-                                 Use --force to switch models (clears existing embeddings).",
+                                "Error: {} embedding(s) rejected by the embedding guards \
+                                 (model or dimension mismatch). Use --force to switch models \
+                                 (clears existing embeddings).",
                                 resp.rejected
                             );
                         }
                         if stats {
                             eprintln!(
                                 "Embed stats: {} succeeded, {} failed, \
-                                 {} rejected (dim mismatch), {} eligible, \
+                                 {} rejected (model/dim mismatch), {} eligible, \
                                  {} already embedded, {} scoped node(s), {:.2}s elapsed",
                                 resp.succeeded,
                                 resp.failed,
@@ -16405,9 +16469,54 @@ fn run_embed(
         anyhow::bail!("unknown --scope '{scope}': expected one of: all, symbols, notes, headings");
     }
 
+    // The direct paths (--local / --endpoint) resolve their model from flags
+    // alone and bypass the daemon route's recorded-model guard at the top of
+    // this function. Apply the same check here — reusing
+    // daemon_route_model_override_is_honored so the routes cannot drift — so a
+    // conflicting explicit model requires --force. Absent metadata means the
+    // database was never stamped: unknown, so proceed (first embed).
+    let recorded_model_id = store
+        .get_embedding_metadata()
+        .ok()
+        .flatten()
+        .map(|(model_id, _)| model_id);
+    if !force && let Some(recorded) = recorded_model_id.as_deref() {
+        // On the endpoint branch the comparison operand is the endpoint's
+        // model (--model, defaulting to the external default), never
+        // --model-id — comparing --model-id would bail on every correctly
+        // configured external run.
+        let requested = if endpoint.is_some() {
+            Some(external_embedding_model(model))
+        } else {
+            model_id
+        };
+        if daemon_route_model_override_is_honored(requested, Some(recorded)).is_err() {
+            // In the Err case `requested` is always Some (None is Ok).
+            anyhow::bail!(
+                "embedding model mismatch: the database was embedded with '{recorded}' but this \
+                 run requested '{}'; use the recorded model or pass --force to switch models \
+                 (re-embeds everything)",
+                requested.unwrap_or_default()
+            );
+        }
+    }
+
     let mut success_count = 0usize;
     let mut error_count = 0usize;
     let mut rejected_count = 0usize;
+    // Dimension of the vectors THIS run produced, set on the first accepted
+    // write. The metadata stamp below is gated on it: a run that produced
+    // nothing (everything already embedded, or every batch rejected) must not
+    // overwrite the recorded fingerprint with a fabricated (model, dimension)
+    // pair taken from pre-existing vectors.
+    let mut produced_dim: Option<usize> = None;
+    // Checkpoint the index to the sidecar about every five minutes so an
+    // interrupted pass keeps completed work. Per-batch flushing is not
+    // implementable: save_binary rewrites the entire sidecar on every call,
+    // so the cadence must stay coarse.
+    let mut flush_checkpoint = nestweaver_store::EmbeddingFlushCheckpoint::new(
+        nestweaver_store::EMBED_CHECKPOINT_INTERVAL,
+    );
 
     if let Some(ep) = endpoint {
         // ── External API path ────────────────────────────────────
@@ -16446,8 +16555,12 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (sym, emb) in chunk.iter().zip(embeddings) {
-                                if store.add_embedding_with_force(&sym.uid, emb, force) {
+                                let emb_dim = emb.len();
+                                if store.add_embedding_with_force(&sym.uid, emb, api_model, force) {
                                     success_count += 1;
+                                    if produced_dim.is_none() {
+                                        produced_dim = Some(emb_dim);
+                                    }
                                 } else {
                                     rejected_count += 1;
                                 }
@@ -16457,6 +16570,14 @@ fn run_embed(
                             eprintln!("\n    Warning: batch embedding API error: {e}");
                             error_count += chunk.len();
                         }
+                    }
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        &store,
+                        success_count,
+                        api_model,
+                        produced_dim,
+                    ) {
+                        eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
                 }
                 eprintln!();
@@ -16486,8 +16607,13 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (note, emb) in chunk.iter().zip(embeddings) {
-                                if store.add_embedding_with_force(&note.uid, emb, force) {
+                                let emb_dim = emb.len();
+                                if store.add_embedding_with_force(&note.uid, emb, api_model, force)
+                                {
                                     success_count += 1;
+                                    if produced_dim.is_none() {
+                                        produced_dim = Some(emb_dim);
+                                    }
                                 } else {
                                     rejected_count += 1;
                                 }
@@ -16497,6 +16623,14 @@ fn run_embed(
                             eprintln!("\n    Warning: batch embedding API error: {e}");
                             error_count += chunk.len();
                         }
+                    }
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        &store,
+                        success_count,
+                        api_model,
+                        produced_dim,
+                    ) {
+                        eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                     }
                 }
                 eprintln!();
@@ -16545,8 +16679,12 @@ fn run_embed(
                     match rt.block_on(generate_embeddings_batch(ep, api_model, &text_refs)) {
                         Ok(embeddings) => {
                             for (h, emb) in chunk.iter().zip(embeddings) {
-                                if store.add_embedding_with_force(&h.uid, emb, force) {
+                                let emb_dim = emb.len();
+                                if store.add_embedding_with_force(&h.uid, emb, api_model, force) {
                                     success_count += 1;
+                                    if produced_dim.is_none() {
+                                        produced_dim = Some(emb_dim);
+                                    }
                                 } else {
                                     rejected_count += 1;
                                 }
@@ -16557,6 +16695,14 @@ fn run_embed(
                             error_count += chunk.len();
                         }
                     }
+                    if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                        &store,
+                        success_count,
+                        api_model,
+                        produced_dim,
+                    ) {
+                        eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
+                    }
                 }
                 eprintln!();
             }
@@ -16565,15 +16711,8 @@ fn run_embed(
         // ── Local model path (default) ───────────────────────────
         #[cfg(feature = "embed")]
         {
-            let config = direct_local_embedding_config(local_model_id, cache_dir);
-            let policy =
-                cli_embedding_device_policy(accelerator.unwrap_or(CliEmbeddingAccelerator::Auto));
-            let embed_model = nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode(
-                &config,
-                policy,
-                cli_embedding_artifact_mode(),
-            )
-            .context("failed to load local embedding model")?;
+            let embed_model = local_model_loader(local_model_id, cache_dir, accelerator)
+                .context("failed to load local embedding model")?;
 
             if do_symbols {
                 let all = store
@@ -16604,12 +16743,19 @@ fn run_embed(
                             })
                             .collect();
                         let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-                        match embed_model.embed(&text_refs) {
+                        match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (sym, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(&sym.uid, emb.clone(), force)
-                                    {
+                                    if store.add_embedding_with_force(
+                                        &sym.uid,
+                                        emb.clone(),
+                                        local_model_id,
+                                        force,
+                                    ) {
                                         success_count += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb.len());
+                                        }
                                     } else {
                                         rejected_count += 1;
                                     }
@@ -16619,6 +16765,14 @@ fn run_embed(
                                 eprintln!("\n    Warning: local embed error: {e}");
                                 error_count += batch.len();
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            success_count,
+                            local_model_id,
+                            produced_dim,
+                        ) {
+                            eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
                     }
                     eprintln!();
@@ -16648,12 +16802,19 @@ fn run_embed(
                             .map(|n| nestweaver_embed::preprocess::note_embed_text(&n.title, None))
                             .collect();
                         let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-                        match embed_model.embed(&text_refs) {
+                        match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (note, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(&note.uid, emb.clone(), force)
-                                    {
+                                    if store.add_embedding_with_force(
+                                        &note.uid,
+                                        emb.clone(),
+                                        local_model_id,
+                                        force,
+                                    ) {
                                         success_count += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb.len());
+                                        }
                                     } else {
                                         rejected_count += 1;
                                     }
@@ -16663,6 +16824,14 @@ fn run_embed(
                                 eprintln!("\n    Warning: local embed error: {e}");
                                 error_count += batch.len();
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            success_count,
+                            local_model_id,
+                            produced_dim,
+                        ) {
+                            eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
                         }
                     }
                     eprintln!();
@@ -16705,11 +16874,19 @@ fn run_embed(
                             })
                             .collect();
                         let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-                        match embed_model.embed(&text_refs) {
+                        match embed_model.embed_batch(&text_refs) {
                             Ok(embeddings) => {
                                 for (h, emb) in batch.iter().zip(embeddings.iter()) {
-                                    if store.add_embedding_with_force(&h.uid, emb.clone(), force) {
+                                    if store.add_embedding_with_force(
+                                        &h.uid,
+                                        emb.clone(),
+                                        local_model_id,
+                                        force,
+                                    ) {
                                         success_count += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb.len());
+                                        }
                                     } else {
                                         rejected_count += 1;
                                     }
@@ -16720,6 +16897,14 @@ fn run_embed(
                                 error_count += batch.len();
                             }
                         }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            success_count,
+                            local_model_id,
+                            produced_dim,
+                        ) {
+                            eprintln!("\n    Warning: failed to checkpoint embedding index: {e}");
+                        }
                     }
                     eprintln!();
                 }
@@ -16728,6 +16913,7 @@ fn run_embed(
 
         #[cfg(not(feature = "embed"))]
         {
+            let _ = &local_model_loader;
             anyhow::bail!(
                 "local embedding requires the `embed` feature; \
                  rebuild with `--features embed` or pass --endpoint"
@@ -16742,11 +16928,26 @@ fn run_embed(
         eprintln!("Warning: failed to save embedding sidecar: {e}");
     }
 
+    if rejected_count > 0 {
+        eprintln!(
+            "Error: {rejected_count} embedding(s) rejected by the embedding guards \
+             (model or dimension mismatch). Use --force to switch models \
+             (clears existing embeddings)."
+        );
+    }
+
     // Record which embedding model produced these vectors, so the daemon loads a matching
     // model at startup regardless of the compiled default or the instance config (see
     // run_server). This is what lets the shipped default stay light for most users while a
     // given DB transparently uses whatever model it was embedded with.
-    if let Some(dim) = store.embedding_index_dimension() {
+    //
+    // The stamped pair must describe vectors THIS run produced: the dimension
+    // comes from `produced_dim` (set on the first accepted write), never from
+    // pre-existing vectors, and a run that produced nothing — everything
+    // already embedded, or every batch rejected — stamps nothing. The stamp
+    // also sits below the rejection warning so a fully-rejected run cannot
+    // write the pair before the warning says the writes failed.
+    if let Some(dim) = produced_dim {
         let effective_model = if endpoint.is_some() {
             external_embedding_model(model)
         } else {
@@ -16757,12 +16958,16 @@ fn run_embed(
         {
             eprintln!("Warning: failed to record embedding model metadata: {e}");
         }
-    }
-
-    if rejected_count > 0 {
+    } else if let Some(requested) = (if endpoint.is_some() { model } else { model_id })
+        && let Ok(Some((recorded, _))) = store.get_embedding_metadata()
+        && recorded != requested
+    {
+        // Zero-work path with an explicit model mismatch: name it, or the run
+        // ends with "Done: 0 embedding(s)" and no hint that the requested
+        // model was never applied.
         eprintln!(
-            "Error: {rejected_count} embedding(s) rejected due to dimension mismatch. \
-             Use --force to switch models (clears existing embeddings)."
+            "No embeddings were produced; the database remains embedded with '{recorded}'. \
+             Re-run with --force to re-embed everything with '{requested}'."
         );
     }
 
@@ -16770,7 +16975,7 @@ fn run_embed(
         let elapsed = t0.elapsed();
         eprintln!(
             "Embed stats: {success_count} succeeded, {error_count} failed, \
-             {rejected_count} rejected (dim mismatch), {:.2}s elapsed",
+             {rejected_count} rejected (model/dim mismatch), {:.2}s elapsed",
             elapsed.as_secs_f64()
         );
     } else {
@@ -20948,5 +21153,474 @@ mod embed_accelerator_cli_tests {
             .expect("spawn")
             .join()
             .expect("join");
+    }
+}
+
+/// Regression tests for the embedding-metadata truth fixes: the recorded
+/// `(model_id, dimension)` fingerprint may only be written from vectors the
+/// run actually produced, and the direct `--local` / `--endpoint` paths must
+/// honor the fingerprint already recorded in the database.
+///
+/// Every test drives `run_embed` with an injected stub loader (the seam added
+/// for exactly this purpose) — no model artifacts, no network except the
+/// refused-loopback endpoint cases.
+#[cfg(all(test, feature = "embed"))]
+mod embed_metadata_truth_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const RECORDED_MODEL: &str = "sentence-transformers/recorded-model";
+    const OTHER_MODEL: &str = "sentence-transformers/other-model";
+
+    /// A `CliBatchEmbedder` emitting fixed-dimension vectors, so tests reach
+    /// the embed loops without a warm artifact cache.
+    struct StubEmbedder {
+        dimension: usize,
+    }
+
+    impl CliBatchEmbedder for StubEmbedder {
+        fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.1_f32; self.dimension])
+                .collect())
+        }
+    }
+
+    /// A loader standing in for `load_cli_local_embedder`: records how it was
+    /// called and hands back a `StubEmbedder` of the given dimension.
+    struct StubLoader {
+        dimension: usize,
+        calls: Arc<AtomicU32>,
+        loaded_model_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StubLoader {
+        fn new(dimension: usize) -> Self {
+            Self {
+                dimension,
+                calls: Arc::new(AtomicU32::new(0)),
+                loaded_model_ids: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn loaded_model_ids(&self) -> Vec<String> {
+            self.loaded_model_ids.lock().unwrap().clone()
+        }
+
+        fn closure(
+            &self,
+        ) -> impl Fn(
+            &str,
+            Option<&Path>,
+            Option<CliEmbeddingAccelerator>,
+        ) -> anyhow::Result<Box<dyn CliBatchEmbedder>> {
+            let dimension = self.dimension;
+            let calls = self.calls.clone();
+            let loaded = self.loaded_model_ids.clone();
+            move |model_id, _cache_dir, _accelerator| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                loaded.lock().unwrap().push(model_id.to_string());
+                Ok(Box::new(StubEmbedder { dimension }))
+            }
+        }
+    }
+
+    fn test_symbol(name: &str) -> nestweaver_schema::Symbol {
+        nestweaver_schema::Symbol {
+            uid: format!("sym:{name}"),
+            name: name.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo:test".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("fn {name}()"),
+            summary: None,
+            content_hash: format!("hash-{name}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// Seed a database with symbols, 3-dimensional sidecar embeddings for the
+    /// `embedded` subset, and an optional recorded `(model_id, dimension)`
+    /// fingerprint. The store is dropped so `run_embed` can reopen the DB.
+    fn seed_embed_db(
+        embedded: &[&str],
+        unembedded: &[&str],
+        metadata: Option<(&str, u32)>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        {
+            let store = nestweaver_store::GraphStore::create(&db_path).unwrap();
+            for name in embedded.iter().chain(unembedded.iter()) {
+                store.insert_symbol(&test_symbol(name)).unwrap();
+            }
+            let producer = metadata.map(|(model, _)| model).unwrap_or("seed-model");
+            for name in embedded {
+                assert!(
+                    store.add_embedding_with_force(
+                        &format!("sym:{name}"),
+                        vec![0.1_f32, 0.2, 0.3],
+                        producer,
+                        false,
+                    ),
+                    "fixture embedding must be accepted for {name}"
+                );
+            }
+            store.flush_embedding_index().unwrap();
+            if let Some((model, dim)) = metadata {
+                store.set_embedding_metadata(model, dim).unwrap();
+            }
+        }
+        (dir, db_path)
+    }
+
+    fn recorded_metadata(db_path: &Path) -> Option<(String, u32)> {
+        let store = nestweaver_store::GraphStore::open_read_only(db_path).unwrap();
+        store.get_embedding_metadata().unwrap()
+    }
+
+    /// Reproduction A: a fully embedded database re-embedded with a different
+    /// explicit `--model-id`. The run produces nothing, so the recorded
+    /// fingerprint must survive untouched — and the conflicting model must be
+    /// called out by name. Before the fix the tail stamped the requested
+    /// model against a pre-existing vector's dimension, fabricating a pair
+    /// that was never true together.
+    #[test]
+    fn conflicting_model_id_against_a_fully_embedded_db_leaves_metadata_untouched() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &[], Some((RECORDED_MODEL, 3)));
+        let loader = StubLoader::new(3);
+
+        let error = run_embed(
+            Some(&db_path),
+            true, // --local
+            None,
+            None,
+            Some(OTHER_MODEL),
+            None,
+            None,
+            8,
+            "symbols",
+            false, // no --force
+            false,
+            false, // direct path
+            loader.closure(),
+        )
+        .expect_err("a conflicting explicit --model-id must bail, not silently stamp");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(RECORDED_MODEL),
+            "must name the recorded model: {message}"
+        );
+        assert!(
+            message.contains(OTHER_MODEL),
+            "must name the requested model: {message}"
+        );
+        assert_eq!(
+            loader.call_count(),
+            0,
+            "the bail must happen before the model is even loaded"
+        );
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 3)),
+            "a zero-work run must not overwrite the recorded fingerprint"
+        );
+    }
+
+    /// Reproduction B (dimension): every add is rejected by the dimension
+    /// guard. The run produced nothing, so the recorded pair must not move —
+    /// and the exit path must not claim success.
+    ///
+    /// The fixture records dimension 768 against a 3-dimensional index — the
+    /// poisoned state the unconditional stamp used to create — so the
+    /// pre-change stamp, which would have rewritten the pair to
+    /// `(RECORDED_MODEL, 3)` from a pre-existing vector, fails the "untouched"
+    /// assertion instead of coincidentally rewriting the same values.
+    #[test]
+    fn fully_rejected_embed_leaves_metadata_untouched_and_reports_failure() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 768)));
+        let loader = StubLoader::new(4); // stub emits the wrong dimension
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(RECORDED_MODEL), // matches the fingerprint, so only the dim guard fires
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a rejected run still returns an exit code");
+
+        assert_eq!(loader.call_count(), 1);
+        assert_eq!(
+            code, EXIT_ERROR,
+            "a fully rejected run must not exit successfully"
+        );
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 768)),
+            "a run that produced no accepted vectors must not stamp"
+        );
+        let store = nestweaver_store::GraphStore::open_read_only(&db_path).unwrap();
+        assert!(
+            !store.has_embedding("sym:pending"),
+            "rejected vectors must not reach the index"
+        );
+    }
+
+    /// Reproduction B (model): forgetting `--model-id` on a database recorded
+    /// with a non-default model must not mix the compiled default's vectors
+    /// into the index. The CLI guard passes (no explicit model to conflict),
+    /// so the store's recorded-model guard is what rejects every write.
+    #[test]
+    fn embed_without_model_id_cannot_mix_the_default_model_into_a_recorded_index() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &["pending"], Some((RECORDED_MODEL, 3)));
+        assert_ne!(
+            RECORDED_MODEL,
+            nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID,
+            "the fixture needs a non-default recorded model for this test to mean anything"
+        );
+        let loader = StubLoader::new(3); // right dimension, wrong (default) model
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            None, // no --model-id: resolves to the compiled default
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a rejected run still returns an exit code");
+
+        assert_eq!(
+            loader.loaded_model_ids(),
+            vec![nestweaver_engine::config::DEFAULT_EMBEDDING_MODEL_ID.to_string()],
+        );
+        assert_eq!(code, EXIT_ERROR, "rejected writes must not report success");
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 3)),
+            "the recorded fingerprint must survive a fully rejected run"
+        );
+        let store = nestweaver_store::GraphStore::open_read_only(&db_path).unwrap();
+        assert!(!store.has_embedding("sym:pending"));
+    }
+
+    /// The escape hatch: an explicit `--model-id` that disagrees with the
+    /// recorded fingerprint proceeds under `--force`, and the successful run
+    /// re-stamps the fingerprint with the model it actually used.
+    #[test]
+    fn force_reembed_with_a_new_model_proceeds_and_restamps_the_fingerprint() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &[], Some((RECORDED_MODEL, 3)));
+        let loader = StubLoader::new(3);
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(OTHER_MODEL),
+            None,
+            None,
+            8,
+            "symbols",
+            true, // --force
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a forced re-embed must run");
+
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(loader.loaded_model_ids(), vec![OTHER_MODEL.to_string()]);
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((OTHER_MODEL.to_string(), 3)),
+            "a productive --force run must re-stamp the model it used"
+        );
+    }
+
+    /// A genuine run records the dimension of the vectors it wrote. The
+    /// database carries a stale 768-dimension fingerprint but an empty index;
+    /// the stub produces 3-dimensional vectors, so the stamp must say 3 —
+    /// never a dimension read back from anywhere else.
+    #[test]
+    fn a_productive_run_stamps_the_dimension_it_produced() {
+        let (_dir, db_path) = seed_embed_db(&[], &["pending"], Some((RECORDED_MODEL, 768)));
+        let loader = StubLoader::new(3);
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(RECORDED_MODEL),
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a matching model id must not bail");
+
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 3)),
+            "the stamp must describe the vectors this run produced"
+        );
+    }
+
+    /// A `--force` run over a database with no embeddable nodes produces
+    /// nothing, so even with a conflicting requested model nothing is
+    /// stamped (the run explains the discrepancy on stderr instead).
+    #[test]
+    fn force_embed_with_no_eligible_nodes_does_not_stamp() {
+        let (_dir, db_path) = seed_embed_db(&[], &[], Some((RECORDED_MODEL, 3)));
+        let loader = StubLoader::new(3);
+
+        let code = run_embed(
+            Some(&db_path),
+            true,
+            None,
+            None,
+            Some(OTHER_MODEL),
+            None,
+            None,
+            8,
+            "all",
+            true, // --force, so the mismatch guard does not bail
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("a zero-work force run must not fail");
+
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((RECORDED_MODEL.to_string(), 3)),
+            "no produced vectors, no stamp — even under --force"
+        );
+    }
+
+    /// The endpoint branch compares the recorded fingerprint against the
+    /// endpoint's model (`--model`, defaulting to the external default) —
+    /// never `--model-id`. A correctly configured external run carries a
+    /// local-model `--model-id` that must not trip the guard. The endpoint
+    /// is a refused loopback port: the guard passing means the run reaches
+    /// the HTTP batch and fails there (an exit code), rather than bailing.
+    #[test]
+    fn endpoint_embed_compares_the_fingerprint_against_the_endpoint_model() {
+        let (_dir, db_path) = seed_embed_db(
+            &["seeded"],
+            &["pending"],
+            Some((DEFAULT_EXTERNAL_EMBEDDING_MODEL, 3)),
+        );
+        let loader = StubLoader::new(3);
+
+        let code = run_embed(
+            Some(&db_path),
+            false,
+            Some("http://127.0.0.1:1"), // connection refused, fast
+            None,                       // --model defaults to the external default
+            Some(OTHER_MODEL),          // a local model id — irrelevant on this branch
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect("the local --model-id must not bail the endpoint branch");
+
+        assert_eq!(
+            code, EXIT_ERROR,
+            "the batch fails against a refused endpoint, proving the guard let the run through"
+        );
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some((DEFAULT_EXTERNAL_EMBEDDING_MODEL.to_string(), 3)),
+            "a run that produced nothing must not stamp"
+        );
+        assert_eq!(
+            loader.call_count(),
+            0,
+            "the endpoint branch never loads a local model"
+        );
+    }
+
+    /// The flip side: an endpoint run whose `--model` disagrees with the
+    /// recorded fingerprint bails, naming both models.
+    #[test]
+    fn endpoint_embed_bails_when_the_endpoint_model_conflicts_with_the_fingerprint() {
+        let (_dir, db_path) = seed_embed_db(&["seeded"], &[], Some(("external-model-a", 3)));
+        let loader = StubLoader::new(3);
+
+        let error = run_embed(
+            Some(&db_path),
+            false,
+            Some("http://127.0.0.1:1"),
+            Some("external-model-b"),
+            None,
+            None,
+            None,
+            8,
+            "symbols",
+            false,
+            false,
+            false,
+            loader.closure(),
+        )
+        .expect_err("a conflicting --model must bail on the endpoint branch too");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("external-model-a"),
+            "must name the recorded model: {message}"
+        );
+        assert!(
+            message.contains("external-model-b"),
+            "must name the requested model: {message}"
+        );
+        assert_eq!(
+            recorded_metadata(&db_path),
+            Some(("external-model-a".to_string(), 3)),
+        );
     }
 }

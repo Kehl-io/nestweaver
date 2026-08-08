@@ -6434,14 +6434,24 @@ impl GraphStore {
             vec![("k", lbug::Value::String("embedding".to_string()))],
         );
 
-        exec_params(
+        let result = exec_params(
             &conn,
             "CREATE (:Meta {key: $k, value: $v})",
             vec![
                 ("k", lbug::Value::String("embedding".to_string())),
                 ("v", lbug::Value::String(value)),
             ],
-        )
+        );
+        if result.is_ok() {
+            // Keep the in-memory index's recorded model in sync with what was
+            // just persisted, so the recorded-model write guard in this
+            // long-lived store checks against the new fingerprint.
+            self.embedding_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_recorded_model_id(Some(model_id.to_string()));
+        }
+        result
     }
 
     /// Record that contract derivation failed for `repo_uid`.
