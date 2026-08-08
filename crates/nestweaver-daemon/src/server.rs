@@ -432,6 +432,34 @@ fn load_daemon_instance_config(
     }
 }
 
+fn live_binding_source(
+    provenance: &EffectiveConfigProvenance,
+) -> lifecycle::EffectiveConfigBindingSource {
+    match provenance {
+        EffectiveConfigProvenance::Configured(path) => {
+            lifecycle::EffectiveConfigBindingSource::Configured {
+                path: path
+                    .to_str()
+                    .expect("configured provenance is validated as UTF-8 at startup")
+                    .to_string(),
+            }
+        }
+        EffectiveConfigProvenance::CompiledDefaults => {
+            lifecycle::EffectiveConfigBindingSource::CompiledDefaults
+        }
+    }
+}
+
+struct EffectiveConfigBindingCleanup {
+    instance_id: String,
+}
+
+impl Drop for EffectiveConfigBindingCleanup {
+    fn drop(&mut self) {
+        let _ = lifecycle::remove_effective_config_binding(&self.instance_id);
+    }
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
@@ -7630,6 +7658,12 @@ pub async fn run_server(
     // lifetime; released on drop. A daemonize child proves it inherited the
     // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
+    // We now exclusively own this instance's pidfile lock, so any binding left
+    // by a crashed predecessor is stale. Clear it before fallible startup work;
+    // a failed boot must not leave old provenance looking live.
+    lifecycle::remove_effective_config_binding(&instance_id).with_context(|| {
+        format!("remove stale effective-config binding for instance {instance_id}")
+    })?;
 
     // Snapshot replica: materialize the snapshot into a private working copy and
     // serve it read-only. `read_only` gates out the write RPCs (via the
@@ -7744,6 +7778,19 @@ pub async fn run_server(
     // warning buried in the rotating log file.
     let (instance_cfg, effective_config) =
         load_daemon_instance_config(config_path, server_opts.is_some())?;
+    let live_binding = lifecycle::EffectiveConfigBinding::new(
+        std::process::id(),
+        live_binding_source(&effective_config),
+    );
+    lifecycle::write_effective_config_binding(&instance_id, &live_binding).with_context(|| {
+        format!("publish effective-config binding for daemon instance {instance_id}")
+    })?;
+    // Removes the binding on every normal return path, including startup
+    // errors after publication. A process crash can still leave a stale file;
+    // later consumers must validate its PID before trusting it.
+    let _effective_config_binding_cleanup = EffectiveConfigBindingCleanup {
+        instance_id: instance_id.clone(),
+    };
 
     // nw-019: graph-data identity — the config's logical `instance_id` when we
     // have a parsed config, else fall back to the runtime hash so a config-less
@@ -9233,6 +9280,9 @@ pub async fn run_server(
     }
 
     let _ = std::fs::remove_file(&sock_path);
+    // The RAII owner removes the live binding before the pidfile lock is
+    // released. On earlier error returns its Drop provides the same cleanup.
+    drop(_effective_config_binding_cleanup);
     // Drop the instance lock's pidfile on clean shutdown (the flock itself is
     // released when `_pid_guard` drops at end of scope).
     let _ = std::fs::remove_file(lifecycle::pidfile_path(&instance_id));

@@ -5072,13 +5072,18 @@ fn pidfile_flock_held(pidfile: &std::path::Path) -> bool {
 /// another starter cannot acquire this inode before the stale socket is
 /// removed, and the pidfile is unlinked last so a later starter gets a fresh
 /// inode that this cleanup never touches.
-#[cfg(target_os = "macos")]
-fn remove_unowned_daemon_runtime(pidfile: &std::path::Path, socket: &std::path::Path) {
+fn remove_unowned_daemon_runtime(
+    pidfile: &std::path::Path,
+    socket: &std::path::Path,
+    effective_config_binding: &std::path::Path,
+) {
     use std::os::unix::io::AsRawFd;
 
     let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(pidfile)
     else {
         return;
@@ -5089,6 +5094,7 @@ fn remove_unowned_daemon_runtime(pidfile: &std::path::Path, socket: &std::path::
     }
 
     let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(effective_config_binding);
     let _ = std::fs::remove_file(pidfile);
     unsafe {
         libc::flock(fd, libc::LOCK_UN);
@@ -11221,7 +11227,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     let _ = child.kill();
                                     let _ = child.wait();
                                 }
-                                remove_unowned_daemon_runtime(&pidfile, &socket);
+                                remove_unowned_daemon_runtime(
+                                    &pidfile,
+                                    &socket,
+                                    &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                                );
                                 anyhow::bail!(
                                     "temporary daemon for {} did not become healthy: {error:#}",
                                     db_path_abs.display()
@@ -11515,8 +11525,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         } else {
                             println!("Daemon is not running.");
                         }
-                        let _ = std::fs::remove_file(&pidfile);
-                        let _ = std::fs::remove_file(&socket);
+                        remove_unowned_daemon_runtime(
+                            &pidfile,
+                            &socket,
+                            &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                        );
                         return Ok((EXIT_SUCCESS, None));
                     };
 
@@ -11561,8 +11574,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         if unsafe { libc::kill(pid, 0) } != 0 {
                             eprintln!("Daemon stopped.");
-                            let _ = std::fs::remove_file(&pidfile);
-                            let _ = std::fs::remove_file(&socket);
+                            remove_unowned_daemon_runtime(
+                                &pidfile,
+                                &socket,
+                                &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                            );
                             return Ok((EXIT_SUCCESS, None));
                         }
                     }
@@ -11574,8 +11590,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         libc::kill(pid, libc::SIGKILL);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
-                    let _ = std::fs::remove_file(&pidfile);
-                    let _ = std::fs::remove_file(&socket);
+                    remove_unowned_daemon_runtime(
+                        &pidfile,
+                        &socket,
+                        &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                    );
                     eprintln!("Daemon killed.");
                     Ok((EXIT_SUCCESS, None))
                 }
@@ -11691,8 +11710,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             unsafe { libc::kill(pid, libc::SIGKILL) };
                             std::thread::sleep(std::time::Duration::from_millis(200));
                         }
-                        let _ = std::fs::remove_file(&pidfile);
-                        let _ = std::fs::remove_file(&socket);
+                        remove_unowned_daemon_runtime(
+                            &pidfile,
+                            &socket,
+                            &nestweaver_daemon::effective_config_binding_path(&instance_id),
+                        );
                         eprintln!("Daemon stopped.");
                     }
 
@@ -20879,14 +20901,15 @@ mod daemon_cli_tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
-    fn macos_failed_start_cleanup_preserves_concurrent_owner() {
+    fn unowned_runtime_cleanup_preserves_concurrent_owner_and_removes_binding() {
         use std::os::unix::io::AsRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("daemon.pid");
         let socket = dir.path().join("daemon.sock");
+        let binding = dir.path().join("effective-config.json");
         let owner = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -20895,19 +20918,25 @@ mod daemon_cli_tests {
             .open(&pidfile)
             .unwrap();
         std::fs::write(&socket, "incumbent socket").unwrap();
+        std::fs::write(&binding, "incumbent binding").unwrap();
         assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-        remove_unowned_daemon_runtime(&pidfile, &socket);
+        remove_unowned_daemon_runtime(&pidfile, &socket, &binding);
         assert!(
             pidfile.exists(),
             "a concurrent owner's pidfile must survive"
         );
         assert!(socket.exists(), "a concurrent owner's socket must survive");
+        assert!(
+            binding.exists(),
+            "a concurrent owner's effective-config binding must survive"
+        );
 
         assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(owner);
-        remove_unowned_daemon_runtime(&pidfile, &socket);
+        remove_unowned_daemon_runtime(&pidfile, &socket, &binding);
         assert!(!socket.exists(), "unowned socket must be retired");
+        assert!(!binding.exists(), "unowned binding must be retired");
         assert!(!pidfile.exists(), "unowned pidfile must be retired");
     }
 }
