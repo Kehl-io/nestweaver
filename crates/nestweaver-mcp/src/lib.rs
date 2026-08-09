@@ -222,13 +222,13 @@ pub fn run_stdio_server(
             }
             let mut responses: Vec<Value> = Vec::new();
             for item in arr {
-                let req: protocol::Request = match serde_json::from_value(item) {
+                let req = match protocol::validate_request(item) {
                     Ok(r) => r,
                     Err(e) => {
                         responses.push(serde_json::to_value(error(
-                            Value::Null,
+                            e.response_id,
                             error_code::INVALID_REQUEST,
-                            format!("invalid request in batch: {e}"),
+                            format!("invalid request in batch: {}", e.message),
                         ))?);
                         continue;
                     }
@@ -259,13 +259,13 @@ pub fn run_stdio_server(
             }
         } else {
             // Single request.
-            let req: protocol::Request = match serde_json::from_value(parsed) {
+            let req = match protocol::validate_request(parsed) {
                 Ok(r) => r,
                 Err(e) => {
                     let resp = error(
-                        Value::Null,
+                        e.response_id,
                         error_code::INVALID_REQUEST,
-                        format!("invalid request: {e}"),
+                        format!("invalid request: {}", e.message),
                     );
                     write_response(&mut stdout, &Frame::Error(resp))?;
                     continue;
@@ -366,13 +366,13 @@ pub fn run_stdio_server_daemon(
             }
             let mut responses: Vec<Value> = Vec::new();
             for item in arr {
-                let req: protocol::Request = match serde_json::from_value(item) {
+                let req = match protocol::validate_request(item) {
                     Ok(r) => r,
                     Err(e) => {
                         responses.push(serde_json::to_value(error(
-                            Value::Null,
+                            e.response_id,
                             error_code::INVALID_REQUEST,
-                            format!("invalid request in batch: {e}"),
+                            format!("invalid request in batch: {}", e.message),
                         ))?);
                         continue;
                     }
@@ -402,13 +402,13 @@ pub fn run_stdio_server_daemon(
                 stdout.flush()?;
             }
         } else {
-            let req: protocol::Request = match serde_json::from_value(parsed) {
+            let req = match protocol::validate_request(parsed) {
                 Ok(r) => r,
                 Err(e) => {
                     let resp = error(
-                        Value::Null,
+                        e.response_id,
                         error_code::INVALID_REQUEST,
-                        format!("invalid request: {e}"),
+                        format!("invalid request: {}", e.message),
                     );
                     write_response(&mut stdout, &Frame::Error(resp))?;
                     continue;

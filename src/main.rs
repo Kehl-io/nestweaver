@@ -18483,6 +18483,177 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
 /// applies fallback/merge/primary routing across upstream servers. Write
 /// operations (brain_add_source, brain_remove_source, prune_stale) go
 /// through the standard gRPC path.
+fn dispatch_hybrid_mcp_request(
+    hybrid: &mut nestweaver_client::hybrid::HybridClient,
+    rt: &tokio::runtime::Runtime,
+    lite: bool,
+    write_tools: &std::collections::HashSet<&str>,
+    request: &nestweaver_mcp::protocol::Request,
+) -> serde_json::Value {
+    let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+    match request.method.as_str() {
+        "initialize" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "nestweaver-brain",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            }
+        }),
+        "notifications/initialized" | "initialized" => serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "result": null
+        }),
+        "tools/list" => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": nestweaver_mcp::tools::tool_list(lite),
+        }),
+        "tools/call" => {
+            let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let name = params
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            if name.is_empty() {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "tools/call: 'name' is required" }
+                })
+            } else if let Err(error) = nestweaver_mcp::tools::enforce_tool_allowed(name) {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                })
+            } else if let Err(error) =
+                nestweaver_mcp::tools::validate_tool_arguments(name, &arguments)
+            {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                })
+            } else {
+                let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if write_tools.contains(name) {
+                        nestweaver_mcp::tools::dispatch_via_daemon(
+                            hybrid.inner_mut(),
+                            rt,
+                            name,
+                            arguments.clone(),
+                        )
+                    } else {
+                        rt.block_on(hybrid.query(name, &arguments))
+                    }
+                }));
+                match dispatched {
+                    Ok(Ok(result)) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_result(result),
+                    }),
+                    Ok(Err(error)) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                    }),
+                    Err(_) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_error(
+                            &format!("tool '{name}' panicked")
+                        ),
+                    }),
+                }
+            }
+        }
+        "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+        method => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32601, "message": format!("method not implemented: {method}") }
+        }),
+    }
+}
+
+fn process_hybrid_mcp_envelope(
+    parsed: serde_json::Value,
+    mut dispatch: impl FnMut(&nestweaver_mcp::protocol::Request) -> serde_json::Value,
+) -> Option<serde_json::Value> {
+    let invalid = |error: nestweaver_mcp::protocol::InvalidRequest| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": error.response_id,
+            "error": { "code": -32600, "message": error.message }
+        })
+    };
+    if let serde_json::Value::Array(items) = parsed {
+        if items.is_empty() {
+            return Some(serde_json::json!({
+                "jsonrpc": "2.0", "id": null,
+                "error": { "code": -32600, "message": "empty batch array" }
+            }));
+        }
+        let mut responses = Vec::new();
+        for item in items {
+            match nestweaver_mcp::protocol::validate_request(item) {
+                Ok(request) => {
+                    let notification = request.id.is_none();
+                    let result = dispatch(&request);
+                    if !notification {
+                        responses.push(result);
+                    }
+                }
+                Err(error) => responses.push(invalid(error)),
+            }
+        }
+        (!responses.is_empty()).then_some(serde_json::Value::Array(responses))
+    } else {
+        match nestweaver_mcp::protocol::validate_request(parsed) {
+            Ok(request) => {
+                let notification = request.id.is_none();
+                let result = dispatch(&request);
+                (!notification).then_some(result)
+            }
+            Err(error) => Some(invalid(error)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_mcp_envelope_tests {
+    use super::process_hybrid_mcp_envelope;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn hybrid_envelope_rejects_before_dispatch_and_distinguishes_null_notification() {
+        let mut dispatched = Vec::new();
+        let response = process_hybrid_mcp_envelope(
+            json!([
+                {"jsonrpc":"1.0","id":"version","method":"ping"},
+                {"jsonrpc":"2.0","id":true,"method":"ping"},
+                {"jsonrpc":"2.0","id":null,"method":"ping"},
+                {"jsonrpc":"2.0","method":"ping"}
+            ]),
+            |request| {
+                dispatched.push(request.id.clone());
+                json!({"jsonrpc":"2.0","id":request.id.clone().unwrap_or(Value::Null),"result":{}})
+            },
+        )
+        .unwrap();
+
+        assert_eq!(dispatched, vec![Some(Value::Null), None]);
+        let responses = response.as_array().unwrap();
+        assert_eq!(responses.len(), 3, "notification response must be omitted");
+        assert_eq!(responses[0]["error"]["code"], -32600);
+        assert_eq!(responses[0]["id"], "version");
+        assert_eq!(responses[1]["error"]["code"], -32600);
+        assert_eq!(responses[1]["id"], Value::Null);
+        assert_eq!(responses[2]["id"], Value::Null);
+    }
+}
+
 fn run_mcp_hybrid(
     mut hybrid: nestweaver_client::hybrid::HybridClient,
     rt: tokio::runtime::Runtime,
@@ -18549,133 +18720,15 @@ fn run_mcp_hybrid(
             }
         };
 
-        let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let response = process_hybrid_mcp_envelope(parsed, |request| {
+            dispatch_hybrid_mcp_request(&mut hybrid, &rt, lite, &write_tools, request)
+        });
 
-        let response = match method {
-            "initialize" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": {
-                        "name": "nestweaver-brain",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                }
-            }),
-            "notifications/initialized" | "initialized" => continue,
-            "tools/list" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": nestweaver_mcp::tools::tool_list(lite),
-            }),
-            "tools/call" => {
-                let params = parsed
-                    .get("params")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-
-                if name.is_empty() {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32602, "message": "tools/call: 'name' is required" }
-                    })
-                } else if let Err(error) = nestweaver_mcp::tools::enforce_tool_allowed(name) {
-                    // The HybridClient read path dispatches queries itself
-                    // and would otherwise bypass the --tools/--lite gate. Same
-                    // error text as the local and daemon-proxy paths.
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
-                    })
-                } else if let Err(error) =
-                    nestweaver_mcp::tools::validate_tool_arguments(name, &arguments)
-                {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
-                    })
-                } else if write_tools.contains(name) {
-                    // Write operations go through standard gRPC dispatch.
-                    let grpc = hybrid.inner_mut();
-                    let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        nestweaver_mcp::tools::dispatch_via_daemon(
-                            grpc,
-                            &rt,
-                            name,
-                            arguments.clone(),
-                        )
-                    }));
-                    match dispatched {
-                        Ok(Ok(result)) => {
-                            serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": nestweaver_mcp::tools::wrap_tool_result(result),
-                            })
-                        }
-                        Ok(Err(e)) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
-                        }),
-                        Err(_) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": nestweaver_mcp::tools::wrap_tool_error(
-                                &format!("tool '{name}' panicked")
-                            ),
-                        }),
-                    }
-                } else {
-                    // Read queries go through HybridClient for routing.
-                    let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        rt.block_on(hybrid.query(name, &arguments))
-                    }));
-                    match dispatched {
-                        Ok(Ok(result)) => {
-                            serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": nestweaver_mcp::tools::wrap_tool_result(result),
-                            })
-                        }
-                        Ok(Err(e)) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
-                        }),
-                        Err(_) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": nestweaver_mcp::tools::wrap_tool_error(
-                                &format!("tool '{name}' panicked")
-                            ),
-                        }),
-                    }
-                }
-            }
-            "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
-            _ => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": format!("method not implemented: {method}") }
-            }),
-        };
-
-        serde_json::to_writer(&mut stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
+        if let Some(response) = response {
+            serde_json::to_writer(&mut stdout, &response)?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+        }
     }
 }
 
