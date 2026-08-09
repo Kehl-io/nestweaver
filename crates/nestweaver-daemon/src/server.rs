@@ -3807,14 +3807,15 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            let index_result = nestweaver_engine::index_markdown_directory_with_store(
-                &state.store,
-                &vault_path,
-                &state.db_path,
-                &instance_id,
-                &vault_name,
-                &extra_patterns,
-            );
+            let index_result =
+                nestweaver_engine::index_markdown_directory_with_store_and_deletion_count(
+                    &state.store,
+                    &vault_path,
+                    &state.db_path,
+                    &instance_id,
+                    &vault_name,
+                    &extra_patterns,
+                );
 
             match index_result {
                 Ok(result) => {
@@ -3822,11 +3823,13 @@ impl NestWeaverDaemon for DaemonService {
                         phase: Phase::Writing as i32,
                         message: format!(
                             "Indexed {} notes, {} headings, {} sections",
-                            result.notes_count, result.headings_count, result.sections_count
+                            result.index.notes_count,
+                            result.index.headings_count,
+                            result.index.sections_count
                         ),
-                        files_processed: result.notes_count as u64,
-                        files_total: result.notes_count as u64,
-                        symbols_found: result.headings_count as u64,
+                        files_processed: result.index.notes_count as u64,
+                        files_total: result.index.notes_count as u64,
+                        symbols_found: result.index.headings_count as u64,
                     }));
 
                     // Rebuild Tantivy search index so BM25 search reflects
@@ -3847,16 +3850,12 @@ impl NestWeaverDaemon for DaemonService {
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
-                        message: format!(
-                            "Done — {} notes, {} headings, {} sections, {} tags",
-                            result.notes_count,
-                            result.headings_count,
-                            result.sections_count,
-                            result.tags_count
+                        message: nestweaver_engine::index_md::format_markdown_refresh_summary(
+                            &result,
                         ),
-                        files_processed: result.notes_count as u64,
-                        files_total: result.notes_count as u64,
-                        symbols_found: result.headings_count as u64,
+                        files_processed: result.index.notes_count as u64,
+                        files_total: result.index.notes_count as u64,
+                        symbols_found: result.index.headings_count as u64,
                     }));
                 }
                 Err(e) => {

@@ -37,6 +37,30 @@ pub struct MarkdownIndexResult {
     pub skipped: Vec<SkippedFile>,
 }
 
+/// Full-refresh outcome with the committed cascade count. Kept separate from
+/// [`MarkdownIndexResult`] so existing callers that construct or destructure
+/// the stable index result are not broken by an added public field.
+pub struct MarkdownRefreshResult {
+    pub index: MarkdownIndexResult,
+    pub notes_deleted: usize,
+}
+
+/// Canonical full-refresh summary shared by direct CLI and daemon progress.
+pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String {
+    format!(
+        "Refreshed vault '{}': dropped {} stale note(s), reindexed {} note(s), \
+         {} heading(s), {} section(s), {} tag(s), {} wikilink(s) ({} unresolved).",
+        result.index.vault_name,
+        result.notes_deleted,
+        result.index.notes_count,
+        result.index.headings_count,
+        result.index.sections_count,
+        result.index.tags_count,
+        result.index.wikilinks_resolved,
+        result.index.wikilinks_unresolved,
+    )
+}
+
 /// Directory names skipped when walking a vault. Includes `.obsidian` (config),
 /// `.trash` (Obsidian's recycle bin), and common synthetic dirs.
 const SKIP_DIRS: &[&str] = &[
@@ -101,9 +125,28 @@ pub fn index_markdown_directory_with_ignore(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_markdown_directory_with_ignore_and_deletion_count(
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+    )
+    .map(|result| result.index)
+}
+
+/// Like [`index_markdown_directory_with_ignore`], but also returns the number
+/// of old notes deleted by the successfully committed replacement transaction.
+pub fn index_markdown_directory_with_ignore_and_deletion_count(
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+) -> Result<MarkdownRefreshResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
-    index_markdown_directory_with_store(
+    index_markdown_directory_with_store_and_deletion_count(
         &store,
         vault_root,
         db_path,
@@ -122,6 +165,27 @@ pub fn index_markdown_directory_with_store(
     vault_name: &str,
     extra_ignore_patterns: &[String],
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
+    index_markdown_directory_with_store_and_deletion_count(
+        store,
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+    )
+    .map(|result| result.index)
+}
+
+/// Like [`index_markdown_directory_with_store`], but also returns the number
+/// of old notes deleted by the successfully committed replacement transaction.
+pub fn index_markdown_directory_with_store_and_deletion_count(
+    store: &GraphStore,
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+) -> Result<MarkdownRefreshResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
     let reader = crate::content_reader::FilesystemReader::new(&canonical);
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
@@ -174,7 +238,7 @@ pub fn index_markdown_directory_in_memory(
     let reader = crate::content_reader::FilesystemReader::new(&canonical);
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, &[]);
     let result = index_into_store(&reader, &store, instance_id, vault_name, &ignore_set)?;
-    Ok((result, store))
+    Ok((result.index, store))
 }
 
 /// Index markdown notes from a caller-provided [`ContentReader`] into `store`.
@@ -194,7 +258,7 @@ pub fn index_markdown_with_reader(
     vault_name: &str,
 ) -> Result<MarkdownIndexResult, anyhow::Error> {
     let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), &[]);
-    index_into_store(reader, store, instance_id, vault_name, &ignore_set)
+    index_into_store(reader, store, instance_id, vault_name, &ignore_set).map(|result| result.index)
 }
 
 /// Server-mode vault entry point: index the markdown exposed by `reader` and
@@ -252,7 +316,7 @@ where
         }
     }
 
-    Ok(result)
+    Ok(result.index)
 }
 
 /// Upsert the `Repo` node for `repo_url` so its `indexed_sha` equals `sha`,
@@ -757,7 +821,7 @@ fn index_into_store(
     instance_id: &str,
     vault_name: &str,
     ignore_set: &GlobSet,
-) -> Result<MarkdownIndexResult, anyhow::Error> {
+) -> Result<MarkdownRefreshResult, anyhow::Error> {
     index_into_store_with_write_gate(
         reader,
         store,
@@ -788,7 +852,7 @@ fn index_into_store_with_write_gate<G, F>(
     ignore_set: &GlobSet,
     record_repo_sha: Option<&str>,
     acquire_write_guard: F,
-) -> Result<MarkdownIndexResult, anyhow::Error>
+) -> Result<MarkdownRefreshResult, anyhow::Error>
 where
     F: FnOnce() -> Result<G, anyhow::Error>,
 {
@@ -1282,7 +1346,7 @@ where
     let wikilinks_resolved = wikilink_to_note.len() + wikilink_to_heading.len();
 
     // 3 & 4. Flush all nodes and edges for this vault in one transaction.
-    {
+    let notes_deleted = {
         let vault_note_refs: Vec<(&str, &str)> = edge_pairs
             .iter()
             .map(|(v, n)| (v.as_str(), n.as_str()))
@@ -1343,8 +1407,8 @@ where
                 &wl_note_refs,
                 &wl_head_refs,
             )
-            .context("bulk_vault_reindex_write")?;
-    }
+            .context("bulk_vault_reindex_write")?
+    };
 
     // Persist genuinely-unresolved wikilinks so broken-links surfaces them.
     // Dedup by uid first (many identical `[[missing]]` links in one section share
@@ -1404,16 +1468,19 @@ where
         elapsed.as_secs_f64(),
     );
 
-    Ok(MarkdownIndexResult {
-        vault_uid: v_uid,
-        vault_name: vault_name.to_string(),
-        notes_count,
-        headings_count,
-        sections_count,
-        tags_count,
-        wikilinks_resolved,
-        wikilinks_unresolved,
-        skipped,
+    Ok(MarkdownRefreshResult {
+        index: MarkdownIndexResult {
+            vault_uid: v_uid,
+            vault_name: vault_name.to_string(),
+            notes_count,
+            headings_count,
+            sections_count,
+            tags_count,
+            wikilinks_resolved,
+            wikilinks_unresolved,
+            skipped,
+        },
+        notes_deleted,
     })
 }
 
@@ -2787,6 +2854,93 @@ sub b body
         assert!(
             store.graph_generation() > 0,
             "vault indexing must advance the graph generation"
+        );
+    }
+
+    #[test]
+    fn direct_and_daemon_refresh_entry_points_report_committed_delete_counts_equally() {
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nalpha\n"), ("b.md", "# B\n\nbeta\n")]);
+        let temp = tempfile::tempdir().unwrap();
+        let direct_db = temp.path().join("direct.lbug");
+        let daemon_db = temp.path().join("daemon.lbug");
+
+        let direct_first = index_markdown_directory_with_ignore_and_deletion_count(
+            &root,
+            &direct_db,
+            "default",
+            "vault",
+            &[],
+        )
+        .unwrap();
+        let daemon_store = GraphStore::open_or_create(&daemon_db).unwrap();
+        let daemon_first = index_markdown_directory_with_store_and_deletion_count(
+            &daemon_store,
+            &root,
+            &daemon_db,
+            "default",
+            "vault",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(direct_first.notes_deleted, 0);
+        assert_eq!(daemon_first.notes_deleted, 0);
+
+        let direct_unchanged = index_markdown_directory_with_ignore_and_deletion_count(
+            &root,
+            &direct_db,
+            "default",
+            "vault",
+            &[],
+        )
+        .unwrap();
+        let daemon_unchanged = index_markdown_directory_with_store_and_deletion_count(
+            &daemon_store,
+            &root,
+            &daemon_db,
+            "default",
+            "vault",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(direct_unchanged.notes_deleted, 2);
+        assert_eq!(daemon_unchanged.notes_deleted, 2);
+        assert_eq!(
+            format_markdown_refresh_summary(&direct_unchanged),
+            format_markdown_refresh_summary(&daemon_unchanged)
+        );
+
+        fs::remove_file(root.join("a.md")).unwrap();
+        fs::write(root.join("b.md"), "# B changed\n\nnew beta\n").unwrap();
+        fs::write(root.join("c.md"), "# C\n\ngamma\n").unwrap();
+        let direct_changed = index_markdown_directory_with_ignore_and_deletion_count(
+            &root,
+            &direct_db,
+            "default",
+            "vault",
+            &[],
+        )
+        .unwrap();
+        let daemon_changed = index_markdown_directory_with_store_and_deletion_count(
+            &daemon_store,
+            &root,
+            &daemon_db,
+            "default",
+            "vault",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(direct_changed.notes_deleted, 2);
+        assert_eq!(direct_changed.index.notes_count, 2);
+        assert_eq!(daemon_changed.notes_deleted, 2);
+        assert_eq!(daemon_changed.index.notes_count, 2);
+        assert_eq!(
+            format_markdown_refresh_summary(&direct_changed),
+            format_markdown_refresh_summary(&daemon_changed)
+        );
+        assert_eq!(
+            format_markdown_refresh_summary(&direct_changed),
+            "Refreshed vault 'vault': dropped 2 stale note(s), reindexed 2 note(s), \
+             2 heading(s), 2 section(s), 0 tag(s), 0 wikilink(s) (0 unresolved)."
         );
     }
 

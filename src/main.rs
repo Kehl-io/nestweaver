@@ -20,10 +20,10 @@ use nestweaver_engine::{
     generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
     generate_summaries, get_last_indexed_at, incremental_index_with_name,
     index_directory_with_options, index_markdown_directory_since_with_ignore,
-    index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
-    load_clusters, load_extensions, lookup_symbol, record_last_indexed_at, render_text,
-    save_clusters, save_cochange_sidecar, save_summaries, search_symbols, suggest_links,
-    truncate_to_budget,
+    index_markdown_directory_with_ignore, index_markdown_directory_with_ignore_and_deletion_count,
+    list_repos, list_services, load_alias_sidecar, load_clusters, load_extensions, lookup_symbol,
+    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -14704,18 +14704,12 @@ fn run_brain(
                     result.wikilinks_resolved,
                 );
             } else {
-                // Full refresh: cascade-delete all notes then re-index from scratch.
-                let store = open_store(Some(&db_path))?;
-                let existing = store.list_notes(Some(&v_uid)).unwrap_or_default();
-                let drop_count = existing.len();
-                for n in &existing {
-                    if let Err(e) = store.delete_note_cascade(&n.uid) {
-                        tracing::warn!("delete_note_cascade {} failed: {e}", n.uid);
-                    }
-                }
-                drop(store);
-
-                let result = index_markdown_directory_with_ignore(
+                // Full refresh: the markdown indexer's writable store performs
+                // the old-vault cascade and replacement in one transaction.
+                // Its returned delete count is therefore committed truth; a
+                // failed cascade/write propagates and cannot be reported as a
+                // successful dropped note.
+                let result = index_markdown_directory_with_ignore_and_deletion_count(
                     &path,
                     &db_path,
                     &instance_id,
@@ -14730,16 +14724,8 @@ fn run_brain(
                 }
 
                 println!(
-                    "Refreshed vault '{}': dropped {} stale note(s), reindexed {} note(s), \
-                     {} heading(s), {} section(s), {} tag(s), {} wikilink(s) ({} unresolved).",
-                    result.vault_name,
-                    drop_count,
-                    result.notes_count,
-                    result.headings_count,
-                    result.sections_count,
-                    result.tags_count,
-                    result.wikilinks_resolved,
-                    result.wikilinks_unresolved,
+                    "{}",
+                    nestweaver_engine::index_md::format_markdown_refresh_summary(&result)
                 );
             }
 

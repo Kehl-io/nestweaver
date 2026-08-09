@@ -2431,6 +2431,61 @@ credential_method = "gh"
     );
 }
 
+#[test]
+fn brain_refresh_direct_reports_only_committed_atomic_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let db = dir.path().join("brain.lbug");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("a.md"), "# A\n\nalpha\n").unwrap();
+    std::fs::write(vault.join("b.md"), "# B\n\nbeta\n").unwrap();
+
+    nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .args(["--instance", "direct-test", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(contains("dropped 0 stale note(s), reindexed 2 note(s)"))
+        .stderr(
+            contains("read-only")
+                .not()
+                .and(contains("delete_note_cascade").not()),
+        );
+
+    nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .args(["--instance", "direct-test", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(contains("dropped 2 stale note(s), reindexed 2 note(s)"))
+        .stderr(
+            contains("read-only")
+                .not()
+                .and(contains("delete_note_cascade").not()),
+        );
+
+    std::fs::remove_file(vault.join("a.md")).unwrap();
+    std::fs::write(vault.join("b.md"), "# B changed\n\nnew beta\n").unwrap();
+    std::fs::write(vault.join("c.md"), "# C\n\ngamma\n").unwrap();
+    nestweaver_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault)
+        .args(["--instance", "direct-test", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(contains("dropped 2 stale note(s), reindexed 2 note(s)"))
+        .stderr(
+            contains("read-only")
+                .not()
+                .and(contains("delete_note_cascade").not()),
+        );
+}
+
 /// nw-047: the no-daemon `index` direct-write path must resolve the instance
 /// id as `--instance` > config `instance_id` > "default" (was
 /// `instance.unwrap_or("default")`, which ignored the config). Without a
