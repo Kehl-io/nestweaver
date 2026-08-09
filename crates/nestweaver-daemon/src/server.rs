@@ -72,6 +72,150 @@ fn arm_disconnect_cancel(cancel: Arc<AtomicBool>) -> tokio_util::sync::DropGuard
     token.drop_guard()
 }
 
+fn list_contracts_impl(
+    store: &GraphStore,
+    repo_filter: Option<&str>,
+    visible: &nestweaver_engine::authz::VisibleRepos,
+) -> Result<ListContractsResponse, Status> {
+    let repo_is_visible = |repo_uid: &str| match visible {
+        nestweaver_engine::authz::VisibleRepos::All => true,
+        nestweaver_engine::authz::VisibleRepos::Only(_) => {
+            !repo_uid.is_empty() && visible.allows(repo_uid)
+        }
+    };
+    let repo_uid = if let Some(filter) = repo_filter {
+        let repos = nestweaver_engine::list_repos(store, None)
+            .map_err(|error| Status::internal(format!("list repositories: {error:#}")))?;
+        let visible_repos: Vec<_> = repos
+            .iter()
+            .filter(|repo| repo_is_visible(&repo.uid))
+            .collect();
+        // Preserve the direct CLI resolver's precedence: an exact UID must
+        // beat an earlier repo whose display name happens to equal that UID.
+        let repo = visible_repos
+            .iter()
+            .copied()
+            .find(|repo| repo.uid == filter)
+            .or_else(|| {
+                let needle = filter.to_lowercase();
+                visible_repos.iter().copied().find(|repo| {
+                    nestweaver_engine::repo_display_name(repo).to_lowercase() == needle
+                })
+            })
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("no indexed repo matches --repo '{filter}'"))
+            })?;
+        Some(repo.uid.clone())
+    } else {
+        None
+    };
+
+    let mut contracts = store
+        .list_contracts(repo_uid.as_deref())
+        .map_err(|error| Status::internal(format!("list contracts: {error}")))?;
+    contracts.retain(|contract| repo_is_visible(&contract.repo_uid));
+    contracts.sort_by(|left, right| left.uid.cmp(&right.uid));
+
+    Ok(ListContractsResponse {
+        contracts: contracts
+            .into_iter()
+            .map(|contract| ContractRecord {
+                uid: contract.uid,
+                kind: contract.kind,
+                verb: contract.verb,
+                path: contract.path,
+                operation_id: contract.operation_id,
+                repo_uid: contract.repo_uid,
+                source_path: contract.source_path,
+                confidence: contract.confidence,
+            })
+            .collect(),
+    })
+}
+
+#[cfg(test)]
+mod list_contracts_tests {
+    use std::collections::HashSet;
+
+    use nestweaver_engine::authz::VisibleRepos;
+    use nestweaver_schema::{Contract, Repo};
+
+    use super::*;
+
+    fn repo(uid: &str, name: &str) -> Repo {
+        Repo {
+            uid: uid.to_string(),
+            url: format!("https://example.test/{name}.git"),
+            indexed_sha: "abc".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: Some(name.to_string()),
+            root_path: None,
+        }
+    }
+
+    fn contract(uid: &str, repo_uid: &str) -> Contract {
+        Contract {
+            uid: uid.to_string(),
+            kind: "http".to_string(),
+            verb: Some("GET".to_string()),
+            path: Some(format!("/{uid}")),
+            operation_id: None,
+            repo_uid: repo_uid.to_string(),
+            source_path: "openapi.yaml".to_string(),
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn list_contracts_prefers_exact_uid_and_filters_hidden_repos() {
+        let store = GraphStore::in_memory().unwrap();
+        // The first repo's display name collides with the second repo's exact
+        // UID. Exact UID must win regardless of list order.
+        store.insert_repo(&repo("repo:display", "target")).unwrap();
+        store.insert_repo(&repo("target", "exact")).unwrap();
+        store
+            .insert_repo(&repo("repo:unicode", "Überblick"))
+            .unwrap();
+        store
+            .insert_contract(&contract("contract:display", "repo:display"))
+            .unwrap();
+        store
+            .insert_contract(&contract("contract:exact", "target"))
+            .unwrap();
+        store
+            .insert_contract(&contract("contract:unicode", "repo:unicode"))
+            .unwrap();
+
+        let exact = list_contracts_impl(&store, Some("target"), &VisibleRepos::All).unwrap();
+        assert_eq!(exact.contracts.len(), 1);
+        assert_eq!(exact.contracts[0].uid, "contract:exact");
+
+        let unicode = list_contracts_impl(&store, Some("überblick"), &VisibleRepos::All).unwrap();
+        assert_eq!(unicode.contracts.len(), 1);
+        assert_eq!(unicode.contracts[0].uid, "contract:unicode");
+
+        let empty = list_contracts_impl(&store, Some(""), &VisibleRepos::All).unwrap_err();
+        assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+        assert!(
+            empty
+                .message()
+                .contains("no indexed repo matches --repo ''")
+        );
+
+        let visible = VisibleRepos::Only(HashSet::from(["target".to_string()]));
+        let unfiltered = list_contracts_impl(&store, None, &visible).unwrap();
+        assert_eq!(unfiltered.contracts.len(), 1);
+        assert_eq!(unfiltered.contracts[0].uid, "contract:exact");
+
+        for filter in ["repo:display", "does-not-exist"] {
+            let error = list_contracts_impl(&store, Some(filter), &visible).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("no indexed repo matches --repo"));
+        }
+    }
+}
+
 /// RAII guard that decrements a connection counter on drop.
 /// Fixes cancellation-safety: if a client disconnects mid-RPC or
 /// the async task is cancelled, the counter is still decremented.
@@ -3807,14 +3951,15 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            let index_result = nestweaver_engine::index_markdown_directory_with_store(
-                &state.store,
-                &vault_path,
-                &state.db_path,
-                &instance_id,
-                &vault_name,
-                &extra_patterns,
-            );
+            let index_result =
+                nestweaver_engine::index_markdown_directory_with_store_and_deletion_count(
+                    &state.store,
+                    &vault_path,
+                    &state.db_path,
+                    &instance_id,
+                    &vault_name,
+                    &extra_patterns,
+                );
 
             match index_result {
                 Ok(result) => {
@@ -3822,11 +3967,13 @@ impl NestWeaverDaemon for DaemonService {
                         phase: Phase::Writing as i32,
                         message: format!(
                             "Indexed {} notes, {} headings, {} sections",
-                            result.notes_count, result.headings_count, result.sections_count
+                            result.index.notes_count,
+                            result.index.headings_count,
+                            result.index.sections_count
                         ),
-                        files_processed: result.notes_count as u64,
-                        files_total: result.notes_count as u64,
-                        symbols_found: result.headings_count as u64,
+                        files_processed: result.index.notes_count as u64,
+                        files_total: result.index.notes_count as u64,
+                        symbols_found: result.index.headings_count as u64,
                     }));
 
                     // Rebuild Tantivy search index so BM25 search reflects
@@ -3847,16 +3994,12 @@ impl NestWeaverDaemon for DaemonService {
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
-                        message: format!(
-                            "Done — {} notes, {} headings, {} sections, {} tags",
-                            result.notes_count,
-                            result.headings_count,
-                            result.sections_count,
-                            result.tags_count
+                        message: nestweaver_engine::index_md::format_markdown_refresh_summary(
+                            &result,
                         ),
-                        files_processed: result.notes_count as u64,
-                        files_total: result.notes_count as u64,
-                        symbols_found: result.headings_count as u64,
+                        files_processed: result.index.notes_count as u64,
+                        files_total: result.index.notes_count as u64,
+                        symbols_found: result.index.headings_count as u64,
                     }));
                 }
                 Err(e) => {
@@ -4918,6 +5061,22 @@ impl NestWeaverDaemon for DaemonService {
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "count_patterns")
+    }
+
+    async fn list_contracts(
+        &self,
+        request: Request<ListContractsRequest>,
+    ) -> Result<Response<ListContractsResponse>, Status> {
+        let visible = self.state.visible_repos_for(request.extensions())?;
+        let repo = request.into_inner().repo;
+        let state = Arc::clone(&self.state);
+        let _guard = ConnectionGuard::read(&state);
+        tokio::task::spawn_blocking(move || {
+            list_contracts_impl(&state.store, repo.as_deref(), &visible)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("task panicked: {error}")))?
+        .map(Response::new)
     }
 
     async fn cross_repo_contracts(
@@ -6144,6 +6303,7 @@ const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
     "Investigate",
     "InvestigateExpand",
     "InvestigateHydrate",
+    "ListContracts",
     "ListProjectsJson",
     "ListReposJson",
     "ListServicesJson",
@@ -15378,6 +15538,7 @@ external_model = "unavailable-test-model"
             "Investigate",
             "InvestigateExpand",
             "InvestigateHydrate",
+            "ListContracts",
             "ListProjectsJson",
             "ListReposJson",
             "ListServicesJson",

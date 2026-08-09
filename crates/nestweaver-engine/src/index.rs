@@ -20,6 +20,12 @@ use serde::{Deserialize, Serialize};
 /// The 4th field carries the retained source string (up to 2 MB) so Phase 3
 /// can build type environments without re-reading files from disk.
 type ParsedFileEntry = (String, Vec<RawSymbol>, Vec<RawReference>, Option<String>);
+type ContractDerivationInputs = (
+    Vec<PathBuf>,
+    Vec<HandlerFileData>,
+    Vec<nestweaver_schema::Symbol>,
+);
+pub(crate) type PreparedFileData = HashMap<String, (Vec<RawSymbol>, Vec<RawReference>)>;
 
 /// F2.2: data captured per Spring/NestJS controller file so handler →
 /// contract edges can be derived after the bulk symbol insert.
@@ -2897,14 +2903,23 @@ where
         // heals on the next clean index.
         let mut contracts_derived = 0usize;
         let mut contracts_status = crate::blast_radius::AnalysisStatus::Complete;
-        match derive_contracts(
-            store,
-            reader,
-            &r_uid,
-            &spec_files,
-            &handler_files,
-            &all_symbols,
-        ) {
+        let contract_result = if files_unchanged == 0 {
+            derive_contracts(
+                store,
+                reader,
+                &r_uid,
+                &spec_files,
+                &handler_files,
+                &all_symbols,
+            )
+        } else {
+            // A tiered/full pass may skip unchanged files, so its accumulated
+            // phase inputs are incomplete. Rebuild the whole-repo derived view
+            // only in that partial case; a true force/full parse reuses the
+            // inputs it already collected.
+            derive_contracts_from_current_repo(store, reader, &r_uid, repo_url)
+        };
+        match contract_result {
             Ok(count) => {
                 contracts_derived = count;
                 if let Err(e) = store.clear_contract_derivation_failed(&r_uid) {
@@ -3195,6 +3210,355 @@ impl ContractSet {
     }
 }
 
+/// Rebuild the whole-repo inputs consumed by contract derivation.
+///
+/// Full indexing accumulates these while parsing every file. Incremental
+/// indexing parses only changed files, but contracts are a derived whole-repo
+/// view: a renamed spec or an unchanged controller can affect the same route.
+/// Rescanning the lightweight contract inputs keeps incremental semantics
+/// identical to force/full indexing without replacing the whole code graph.
+fn collect_contract_derivation_inputs(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+    strict: bool,
+) -> Result<ContractDerivationInputs, anyhow::Error> {
+    let mut spec_files = Vec::new();
+    let mut handler_files = Vec::new();
+    let mut all_symbols = Vec::new();
+    let repo_path = reader.root();
+    let discovered_files = reader
+        .list_files()
+        .context("list files for incremental contract derivation")?;
+    for rel_path in &discovered_files {
+        let abs_path = repo_path.join(rel_path);
+        if crate::contracts::is_spec_file(&abs_path.to_string_lossy()) {
+            spec_files.push(abs_path);
+        }
+    }
+    let has_grpc_specs = spec_files.iter().any(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("proto"))
+    });
+
+    for rel_path in discovered_files {
+        let abs_path = repo_path.join(&rel_path);
+
+        let Some(lang) = detect_language(&abs_path) else {
+            continue;
+        };
+        if is_minified_or_bundled(&abs_path) {
+            continue;
+        }
+        if reader
+            .file_meta(&rel_path)
+            .context("read contract input metadata")?
+            .is_some_and(|(_, size)| size > crate::index_md::MAX_FILE_SIZE_BYTES)
+        {
+            tracing::debug!(path = %rel_path.display(), "skip oversized contract input before read");
+            continue;
+        }
+        let source = match reader.read_file(&rel_path) {
+            Ok(source) => source,
+            Err(error) if strict => {
+                return Err(error).with_context(|| {
+                    format!("read contract handler candidate {}", rel_path.display())
+                });
+            }
+            Err(error) => {
+                tracing::debug!(path = %rel_path.display(), "skip unreadable handler candidate: {error}");
+                continue;
+            }
+        };
+        if source.len() as u64 > crate::index_md::MAX_FILE_SIZE_BYTES {
+            tracing::debug!(path = %rel_path.display(), "skip oversized contract input");
+            continue;
+        }
+        let controller_candidate = match lang {
+            nestweaver_schema::Language::Java | nestweaver_schema::Language::Kotlin => {
+                source.contains("@RestController") || source.contains("@Controller")
+            }
+            nestweaver_schema::Language::JavaScript | nestweaver_schema::Language::TypeScript => {
+                source.contains("@Controller")
+            }
+            _ => false,
+        };
+        let grpc_candidate =
+            has_grpc_specs && lang == nestweaver_schema::Language::Rust && source.contains("impl ");
+        if !controller_candidate && !grpc_candidate {
+            continue;
+        }
+        let parsed = match parse_source(&abs_path, &source) {
+            Ok(parsed) => parsed,
+            Err(error) if strict => {
+                return Err(error).with_context(|| {
+                    format!("parse contract handler candidate {}", rel_path.display())
+                });
+            }
+            Err(error) => {
+                tracing::debug!(path = %rel_path.display(), "skip unparseable handler candidate: {error}");
+                continue;
+            }
+        };
+        let rel_path_string = rel_path.to_string_lossy().into_owned();
+        if grpc_candidate {
+            all_symbols.extend(parsed.symbols.iter().map(|symbol| {
+                let scope = symbol.scope_chain.as_deref().unwrap_or("");
+                nestweaver_schema::Symbol {
+                    uid: symbol_uid(r_uid, &rel_path_string, &symbol.name, symbol.start_line),
+                    name: symbol.name.clone(),
+                    kind: symbol.kind,
+                    repo_uid: r_uid.to_string(),
+                    file_path: rel_path_string.clone(),
+                    start_line: symbol.start_line,
+                    end_line: symbol.end_line,
+                    signature: symbol.signature.clone(),
+                    summary: None,
+                    content_hash: symbol.content_hash.clone(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: symbol.is_entry_point,
+                    entry_point_kind: symbol.entry_point_kind,
+                    visibility: symbol.visibility,
+                    type_info: symbol.type_info.clone(),
+                    framework_hint: None,
+                    canonical_id: Some(canonical_symbol_id(
+                        repo_url,
+                        &rel_path_string,
+                        &symbol.name,
+                        scope,
+                    )),
+                }
+            }));
+        }
+        if !controller_candidate {
+            continue;
+        }
+
+        let Some(lang_str) = crate::contracts::framework_language_str(lang) else {
+            continue;
+        };
+
+        let mut hint_by_index: HashMap<usize, nestweaver_schema::FrameworkHint> =
+            nestweaver_parser::detect_frameworks(&parsed.symbols, &rel_path_string, lang_str)
+                .into_iter()
+                .collect();
+        let class_starts: Vec<(usize, u32)> = parsed
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.kind == nestweaver_schema::SymbolKind::Class)
+            .map(|(index, symbol)| (index, symbol.start_line))
+            .collect();
+        if let Some(controller_index) =
+            crate::contracts::detect_nestjs_controller_index(&source, &class_starts)
+        {
+            hint_by_index.entry(controller_index).or_insert_with(|| {
+                nestweaver_schema::FrameworkHint {
+                    framework: "nestjs".into(),
+                    role: "controller".into(),
+                }
+            });
+        }
+
+        let Some((controller_index, framework)) = hint_by_index.iter().find_map(|(index, hint)| {
+            (hint.role == "controller").then(|| (*index, hint.framework.clone()))
+        }) else {
+            continue;
+        };
+        let class_signature = parsed
+            .symbols
+            .get(controller_index)
+            .map(|symbol| symbol.signature.clone())
+            .unwrap_or_default();
+        let symbols = parsed
+            .symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol_uid(r_uid, &rel_path_string, &symbol.name, symbol.start_line),
+                    crate::contracts::HandlerSymbol {
+                        name: symbol.name.clone(),
+                        signature: symbol.signature.clone(),
+                        start_line: symbol.start_line,
+                    },
+                )
+            })
+            .collect();
+        handler_files.push(HandlerFileData {
+            framework,
+            class_signature,
+            rel_path: rel_path_string,
+            symbols,
+        });
+    }
+
+    spec_files.sort();
+    handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok((spec_files, handler_files, all_symbols))
+}
+
+fn prepare_incremental_contract_derivation(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+) -> Result<ContractDerivationPlan, anyhow::Error> {
+    let (spec_files, handler_files, all_symbols) =
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, false)?;
+    prepare_contract_derivation(
+        reader,
+        r_uid,
+        &spec_files,
+        &handler_files,
+        &all_symbols,
+        false,
+    )
+}
+
+pub(crate) fn prepare_watcher_contract_derivation(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+) -> Result<ContractDerivationPlan, anyhow::Error> {
+    prepare_watcher_contract_derivation_with_hooks(reader, r_uid, repo_url, || {}, || {})
+}
+
+pub(crate) fn watcher_contract_input_snapshot(
+    reader: &dyn crate::content_reader::ContentReader,
+) -> Result<std::collections::BTreeMap<String, String>, anyhow::Error> {
+    let files = reader
+        .list_files()
+        .context("list files for watcher contract snapshot")?;
+    let has_grpc_specs = files.iter().any(|path| {
+        crate::contracts::is_spec_file(&path.to_string_lossy())
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("proto"))
+    });
+    let mut snapshot = std::collections::BTreeMap::new();
+    for rel_path in files {
+        let abs_path = reader.root().join(&rel_path);
+        let is_spec = crate::contracts::is_spec_file(&abs_path.to_string_lossy());
+        let language = detect_language(&abs_path);
+        if !is_spec && language.is_none() {
+            continue;
+        }
+        if !is_spec && is_minified_or_bundled(&abs_path) {
+            continue;
+        }
+        if reader
+            .file_meta(&rel_path)
+            .with_context(|| format!("read watcher contract metadata {}", rel_path.display()))?
+            .is_some_and(|(_, size)| size > crate::index_md::MAX_FILE_SIZE_BYTES)
+        {
+            continue;
+        }
+        let source = reader
+            .read_file(&rel_path)
+            .with_context(|| format!("read watcher contract input {}", rel_path.display()))?;
+        if source.len() as u64 > crate::index_md::MAX_FILE_SIZE_BYTES {
+            continue;
+        }
+        let candidate = if is_spec {
+            true
+        } else {
+            match language.expect("checked above") {
+                nestweaver_schema::Language::Java | nestweaver_schema::Language::Kotlin => {
+                    source.contains("@RestController") || source.contains("@Controller")
+                }
+                nestweaver_schema::Language::JavaScript
+                | nestweaver_schema::Language::TypeScript => source.contains("@Controller"),
+                nestweaver_schema::Language::Rust => has_grpc_specs && source.contains("impl "),
+                _ => false,
+            }
+        };
+        if candidate {
+            snapshot.insert(
+                rel_path.to_string_lossy().into_owned(),
+                crate::hash::blake3_hex(&source),
+            );
+        }
+    }
+    Ok(snapshot)
+}
+
+fn prepare_watcher_contract_derivation_with_hooks<F, G>(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+    before_plan: F,
+    after_plan: G,
+) -> Result<ContractDerivationPlan, anyhow::Error>
+where
+    F: FnOnce(),
+    G: FnOnce(),
+{
+    let before = watcher_contract_input_snapshot(reader)?;
+    before_plan();
+    let observed = watcher_contract_input_snapshot(reader)?;
+    let (spec_files, handler_files, all_symbols) =
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, true)?;
+    let mut plan = prepare_contract_derivation(
+        reader,
+        r_uid,
+        &spec_files,
+        &handler_files,
+        &all_symbols,
+        true,
+    )?;
+    after_plan();
+    let after = watcher_contract_input_snapshot(reader)?;
+    let plan_reads_match_observed = plan
+        .input_hashes
+        .iter()
+        .all(|(path, hash)| observed.get(path) == Some(hash));
+    if before != observed || observed != after || !plan_reads_match_observed {
+        let changed: Vec<_> = before
+            .keys()
+            .chain(observed.keys())
+            .chain(after.keys())
+            .chain(plan.input_hashes.keys())
+            .filter(|path| {
+                before.get(*path) != observed.get(*path)
+                    || observed.get(*path) != after.get(*path)
+                    || plan
+                        .input_hashes
+                        .get(*path)
+                        .is_some_and(|hash| observed.get(*path) != Some(hash))
+            })
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        anyhow::bail!(
+            "contract inputs changed while watcher plan was prepared: {}",
+            changed.join(", ")
+        );
+    }
+    plan.observed_input_hashes = observed;
+    Ok(plan)
+}
+
+fn derive_contracts_from_current_repo(
+    store: &GraphStore,
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+) -> Result<usize, anyhow::Error> {
+    let (spec_files, handler_files, all_symbols) =
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, false)?;
+    derive_contracts(
+        store,
+        reader,
+        r_uid,
+        &spec_files,
+        &handler_files,
+        &all_symbols,
+    )
+}
+
 /// F2-core: build the API contract graph for one repo.
 ///
 /// 1. Parse spec files into **declared** [`nestweaver_schema::Contract`] nodes
@@ -3215,10 +3579,36 @@ fn derive_contracts(
     handler_files: &[HandlerFileData],
     all_symbols: &[nestweaver_schema::Symbol],
 ) -> Result<usize, anyhow::Error> {
+    let plan =
+        prepare_contract_derivation(reader, r_uid, spec_files, handler_files, all_symbols, false)?;
+    let conn = store.begin_transaction()?;
+    let count = apply_contract_derivation_on(&conn, r_uid, &plan)?;
+    store.commit_transaction(&conn)?;
+    Ok(count)
+}
+
+pub(crate) struct ContractDerivationPlan {
+    contracts: Vec<nestweaver_schema::Contract>,
+    edges: Vec<nestweaver_schema::ResolvedEdge>,
+    pub(crate) input_hashes: std::collections::BTreeMap<String, String>,
+    pub(crate) observed_input_hashes: std::collections::BTreeMap<String, String>,
+}
+
+/// Prepare contract rows and implementation edges without mutating the graph.
+/// All source reads and parsing finish before an incremental transaction opens.
+fn prepare_contract_derivation(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    spec_files: &[PathBuf],
+    handler_files: &[HandlerFileData],
+    all_symbols: &[nestweaver_schema::Symbol],
+    strict: bool,
+) -> Result<ContractDerivationPlan, anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
 
     // 1. Declared contracts from specs.
     let mut all_contracts = ContractSet::new();
+    let mut input_hashes = std::collections::BTreeMap::new();
     // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
     let mut declared_grpc: Vec<(String, String)> = Vec::new();
     let repo_path = reader.root();
@@ -3230,12 +3620,23 @@ fn derive_contracts(
             .into_owned();
         let source = match reader.read_file(Path::new(&rel)) {
             Ok(s) => s,
+            Err(error) if strict => {
+                return Err(error).with_context(|| format!("read watched contract spec {rel}"));
+            }
             Err(e) => {
                 tracing::debug!("skip unreadable spec {rel}: {e}");
                 continue;
             }
         };
-        for sc in crate::contracts::parse_spec_file(&rel, &source) {
+        let parsed_specs = if strict {
+            input_hashes.insert(rel.clone(), crate::hash::blake3_hex(&source));
+            crate::contracts::parse_spec_file_strict(&rel, &source)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("parse watched contract spec {rel}"))?
+        } else {
+            crate::contracts::parse_spec_file(&rel, &source)
+        };
+        for sc in parsed_specs {
             // Keep gRPC operations so implementations can be matched against the
             // DECLARED contract rather than minting a UID from source (nw-104).
             let grpc_operation = (sc.kind == "grpc")
@@ -3263,9 +3664,16 @@ fn derive_contracts(
         // class-level base path (@RequestMapping / @Controller) is usually
         // dropped. Read the raw source to recover it; fall back to the
         // truncated signature if the file is unreadable.
-        let base_source = reader
-            .read_file(Path::new(&hf.rel_path))
-            .unwrap_or_else(|_| hf.class_signature.clone());
+        let base_source = match reader.read_file(Path::new(&hf.rel_path)) {
+            Ok(source) => source,
+            Err(error) if strict => {
+                return Err(error).with_context(|| format!("read watched handler {}", hf.rel_path));
+            }
+            Err(_) => hf.class_signature.clone(),
+        };
+        if strict {
+            input_hashes.insert(hf.rel_path.clone(), crate::hash::blake3_hex(&base_source));
+        }
         let matches = crate::contracts::detect_handlers(&hf.framework, &base_source, &handler_syms);
         for m in matches {
             let contract_uid = m.contract.uid();
@@ -3302,6 +3710,21 @@ fn derive_contracts(
     // opened to reach a detector that also did not exist. Matching declared
     // contracts against symbols here needs none of them, and the edge adopts the
     // DECLARED uid so it provably points at a real contract.
+    if strict {
+        for rel_path in all_symbols
+            .iter()
+            .map(|symbol| symbol.file_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if input_hashes.contains_key(rel_path) {
+                continue;
+            }
+            let source = reader
+                .read_file(Path::new(rel_path))
+                .with_context(|| format!("read watched gRPC candidate {rel_path}"))?;
+            input_hashes.insert(rel_path.to_string(), crate::hash::blake3_hex(&source));
+        }
+    }
     if !declared_grpc.is_empty() {
         // Group symbols by file so each candidate file is read once.
         let mut by_file: std::collections::BTreeMap<&str, Vec<(String, String, u32)>> =
@@ -3319,9 +3742,17 @@ fn derive_contracts(
             // Cheap pre-filter: a tonic server implementation is a trait impl, so
             // a file with no `impl ` at all cannot contain one. Avoids reading
             // every source file in the repo.
-            let Ok(source) = reader.read_file(Path::new(rel_path)) else {
-                continue;
+            let source = match reader.read_file(Path::new(rel_path)) {
+                Ok(source) => source,
+                Err(error) if strict => {
+                    return Err(error)
+                        .with_context(|| format!("read watched gRPC handler {rel_path}"));
+                }
+                Err(_) => continue,
             };
+            if strict {
+                input_hashes.insert(rel_path.to_string(), crate::hash::blake3_hex(&source));
+            }
             if !source.contains("impl ") {
                 continue;
             }
@@ -3352,8 +3783,28 @@ fn derive_contracts(
     // `ContractSet` guarantees that. Note the collapse is intentionally visible
     // in edge cardinality: two handlers whose routes normalize to one UID both
     // keep their IMPLEMENTS_CONTRACT edge onto the surviving contract.
-    let all_contracts = all_contracts.into_contracts();
+    let contracts = all_contracts.into_contracts();
 
+    Ok(ContractDerivationPlan {
+        contracts,
+        edges,
+        input_hashes,
+        observed_input_hashes: std::collections::BTreeMap::new(),
+    })
+}
+
+/// Replace one repo's derived contract graph on an existing transaction.
+///
+/// Incremental indexing uses this seam so changed symbols, source paths,
+/// contracts, implementation edges, and the indexed SHA publish as one unit.
+/// Any contract write failure therefore rolls the whole incremental mutation
+/// back, retaining the previously committed graph rather than leaving new
+/// symbols paired with stale or missing derived edges.
+pub(crate) fn apply_contract_derivation_on(
+    conn: &nestweaver_store::DbConnection<'_>,
+    r_uid: &str,
+    plan: &ContractDerivationPlan,
+) -> Result<usize, anyhow::Error> {
     // Clear + insert + edges must be ONE transaction. Previously the clear ran
     // on its own connection ahead of the inserts, so any failure in between
     // (e.g. a single row the COPY rejects) left the repo with zero contracts
@@ -3365,14 +3816,12 @@ fn derive_contracts(
     // No explicit rollback on the error paths, matching `bulk_reindex_write`:
     // a statement that throws inside an explicit transaction already rolls it
     // back, and dropping the connection rolls back anything still open.
-    let conn = store.begin_transaction()?;
-    GraphStore::clear_repo_contracts_on(&conn, r_uid)?;
-    GraphStore::batch_insert_contracts_on(&conn, &all_contracts)?;
-    if !edges.is_empty() {
-        GraphStore::batch_insert_edges_on(&conn, &edges)?;
+    GraphStore::clear_repo_contracts_on(conn, r_uid)?;
+    GraphStore::batch_insert_contracts_on(conn, &plan.contracts)?;
+    if !plan.edges.is_empty() {
+        GraphStore::batch_insert_edges_on(conn, &plan.edges)?;
     }
-    store.commit_transaction(&conn)?;
-    Ok(all_contracts.len())
+    Ok(plan.contracts.len())
 }
 
 /// Returns true if the file looks like a minified bundle, webpack output,
@@ -3599,6 +4048,8 @@ fn incremental_index_with_name_and_io(
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+    let contract_plan = prepare_incremental_contract_derivation(&reader, &r_uid, repo_url)
+        .context("prepare incremental contract derivation")?;
 
     let publication = establish_index_publication_marker_with_io(
         &store,
@@ -3715,6 +4166,15 @@ fn incremental_index_with_name_and_io(
         );
     }
 
+    if let Err(error) = apply_contract_derivation_on(&txn, &r_uid, &contract_plan) {
+        drop(txn);
+        if let Err(marker_error) = store.set_contract_derivation_failed(&r_uid, &error.to_string())
+        {
+            tracing::warn!("recording contract derivation failure failed: {marker_error}");
+        }
+        return Err(error).context("apply incremental contract derivation");
+    }
+
     // 6. Update the stored SHA inside the transaction, then commit.
     // If we crash before commit, the next run replays from the old SHA.
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, &new_sha)
@@ -3724,6 +4184,9 @@ fn incremental_index_with_name_and_io(
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
+    if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
+        tracing::warn!("clearing contract derivation marker failed: {error}");
+    }
 
     finalize_committed_index_with_io(
         publication,
@@ -3788,6 +4251,8 @@ where
     // edges we walk here, so this ordering is correctness-critical.
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
+    let contract_plan = prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
+        .context("prepare server incremental contract derivation")?;
 
     let _write_guard = acquire_write_guard()?;
     let publication = establish_index_publication_marker_with_io(
@@ -3896,12 +4361,24 @@ where
         );
     }
 
+    if let Err(error) = apply_contract_derivation_on(&txn, &r_uid, &contract_plan) {
+        drop(txn);
+        if let Err(marker_error) = store.set_contract_derivation_failed(&r_uid, &error.to_string())
+        {
+            tracing::warn!("recording contract derivation failure failed: {marker_error}");
+        }
+        return Err(error).context("apply server incremental contract derivation");
+    }
+
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, new_sha)
         .with_context(|| "update_repo_sha")?;
     store
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
+    if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
+        tracing::warn!("clearing contract derivation marker failed: {error}");
+    }
 
     finalize_committed_index_with_io(
         publication,
@@ -4180,7 +4657,7 @@ fn reresolve_affected_dependents(
 
     let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
         .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
-    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols)?;
+    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols, None)?;
 
     // Runs inside the same transaction as the mutation loop.
     let count = insertable.len();
@@ -4191,33 +4668,44 @@ fn reresolve_affected_dependents(
     Ok(count)
 }
 
-/// Non-transactional variant of [`reresolve_affected_dependents`] for the
-/// live code watcher (`watch_code.rs`), which interleaves its mutations with
-/// store-level (non-txn) calls. Same nw-008 Phase 2 semantics: re-insert ONLY
-/// the cross-file edges the per-file `DETACH DELETE` destroyed.
-pub(crate) fn reresolve_affected_dependents_on_store(
+/// Prepare the live watcher's reverse-dependent edges before publication.
+///
+/// The watcher supplies the frozen replacement symbols that its transaction
+/// will publish. This produces the same post-mutation symbol view as
+/// [`reresolve_affected_dependents`] without reading source after the dirty
+/// marker has been established.
+pub(crate) struct WatcherReresolveInputs<'a> {
+    pub(crate) changed: &'a std::collections::HashSet<String>,
+    pub(crate) removed: &'a std::collections::HashSet<String>,
+    pub(crate) rdeps: &'a std::collections::HashSet<String>,
+    pub(crate) replacement_symbols: &'a [nestweaver_schema::Symbol],
+    pub(crate) prepared_file_data: &'a PreparedFileData,
+}
+
+pub(crate) fn prepare_watcher_reresolve_edges(
     reader: &dyn crate::content_reader::ContentReader,
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
-    changed: &std::collections::HashSet<String>,
-    rdeps: &std::collections::HashSet<String>,
-) -> Result<usize, anyhow::Error> {
-    if changed.is_empty() {
-        return Ok(0);
+    inputs: WatcherReresolveInputs<'_>,
+) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
+    if inputs.changed.is_empty() {
+        return Ok(Vec::new());
     }
-
-    let db_symbols = store
+    let mut symbols = store
         .lookup_symbols_by_repo(r_uid)
-        .with_context(|| "lookup_symbols_by_repo for forward edge resolution")?;
-    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols)?;
-
-    let count = insertable.len();
-    if count > 0 {
-        store
-            .batch_insert_edges(&insertable)
-            .with_context(|| "batch_insert_edges (transitive re-resolution)")?;
-    }
-    Ok(count)
+        .with_context(|| "lookup_symbols_by_repo for watcher edge preparation")?;
+    symbols.retain(|symbol| {
+        !inputs.changed.contains(&symbol.file_path) && !inputs.removed.contains(&symbol.file_path)
+    });
+    symbols.extend_from_slice(inputs.replacement_symbols);
+    build_reresolve_edges(
+        reader,
+        r_uid,
+        inputs.changed,
+        inputs.rdeps,
+        &symbols,
+        Some(inputs.prepared_file_data),
+    )
 }
 
 /// Shared core of nw-008 Phase 2. Re-parse `S = changed ∪ rdeps` from
@@ -4239,6 +4727,7 @@ fn build_reresolve_edges(
     changed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
     db_symbols: &[nestweaver_schema::Symbol],
+    prepared_file_data: Option<&PreparedFileData>,
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     // S = changed ∪ rdeps — files whose references need re-resolution.
     let mut scope: std::collections::HashSet<String> = changed.clone();
@@ -4251,22 +4740,29 @@ fn build_reresolve_edges(
     for rel_str in &scope {
         let rel_path = Path::new(rel_str.as_str());
         let abs_path = reader.root().join(rel_path);
-        let source = match reader.read_file(rel_path) {
-            Ok(s) => s,
-            Err(_) => continue, // deleted/unreadable — nothing to re-resolve from
-        };
-        let parsed = match parse_source(&abs_path, &source) {
-            Ok(p) => p,
-            Err(_) => continue,
+        let (raw_symbols, raw_references) = if let Some((symbols, references)) =
+            prepared_file_data.and_then(|prepared| prepared.get(rel_str))
+        {
+            (symbols.clone(), references.clone())
+        } else {
+            let source = match reader.read_file(rel_path) {
+                Ok(s) => s,
+                Err(_) => continue, // deleted/unreadable — nothing to re-resolve from
+            };
+            let parsed = match parse_source(&abs_path, &source) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            (parsed.symbols, parsed.references)
         };
         if let Some(lang) = detect_language(&abs_path) {
             *lang_counts.entry(lang).or_insert(0) += 1;
         }
-        for raw_sym in &parsed.symbols {
+        for raw_sym in &raw_symbols {
             let s_uid = symbol_uid(r_uid, rel_str, &raw_sym.name, raw_sym.start_line);
             uid_to_file.insert(s_uid, rel_str.clone());
         }
-        file_data.push((rel_str.clone(), parsed.symbols, parsed.references));
+        file_data.push((rel_str.clone(), raw_symbols, raw_references));
     }
 
     if file_data.is_empty() {
@@ -5424,6 +5920,502 @@ function hello(name) { return "Hello " + name; }
         assert!(
             implemented.contains(&"contract:http:POST:/v1/approvals".to_string()),
             "expected IMPLEMENTS_CONTRACT edge; implemented: {implemented:?}"
+        );
+    }
+
+    #[test]
+    fn contract_collector_skips_reported_oversize_before_reading() {
+        struct OversizeReader {
+            root: PathBuf,
+        }
+        impl crate::content_reader::ContentReader for OversizeReader {
+            fn read_file(&self, _rel_path: &Path) -> anyhow::Result<String> {
+                panic!("oversized contract candidate must not be read")
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("HugeController.java")])
+            }
+            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                Ok(Some((0, crate::index_md::MAX_FILE_SIZE_BYTES + 1)))
+            }
+            fn root(&self) -> &Path {
+                &self.root
+            }
+            fn version_id(&self) -> &str {
+                "oversize-test"
+            }
+        }
+
+        let reader = OversizeReader {
+            root: PathBuf::from("/unused"),
+        };
+        let (specs, handlers, symbols) = collect_contract_derivation_inputs(
+            &reader,
+            "repo:test:oversize",
+            "https://example.com/oversize",
+            false,
+        )
+        .unwrap();
+        assert!(specs.is_empty());
+        assert!(handlers.is_empty());
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn watcher_contract_plan_rejects_create_delete_and_second_save_races() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let get = "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /items:\n    get:\n      responses: { \"200\": { description: ok } }\n";
+        let post = "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /items:\n    post:\n      responses: { \"200\": { description: ok } }\n";
+        let spec = repo.join("openapi.yaml");
+        fs::write(&spec, get).unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+
+        let created = repo.join("openapi.v2.yaml");
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&created, post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.v2.yaml"));
+        fs::remove_file(&created).unwrap();
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::remove_file(&spec).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.yaml"));
+        fs::write(&spec, get).unwrap();
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&spec, post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        fs::write(&spec, get).unwrap();
+        let controller = repo.join("ItemsController.java");
+        let controller_get = "@RestController\n@RequestMapping(\"/items\")\npublic class ItemsController { @GetMapping public void get() {} }\n";
+        let controller_post = "@RestController\n@RequestMapping(\"/items\")\npublic class ItemsController { @PostMapping public void post() {} }\n";
+        fs::write(&controller, controller_get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&controller, controller_post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        fs::write(&controller, controller_get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::remove_file(&controller).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&controller, controller_get).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        fs::write(&spec, get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::write(&spec, post).unwrap(),
+            || fs::write(&spec, get).unwrap(),
+        )
+        .err()
+        .expect("old→new→old must reject the hybrid plan");
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::remove_file(&spec).unwrap(),
+            || fs::write(&spec, get).unwrap(),
+        )
+        .err()
+        .expect("spec delete→identical recreate must reject the hybrid plan");
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::remove_file(&controller).unwrap(),
+            || fs::write(&controller, controller_get).unwrap(),
+        )
+        .err()
+        .expect("controller delete→identical recreate must reject the hybrid plan");
+        assert!(error.to_string().contains("ItemsController.java"));
+    }
+
+    #[test]
+    fn incremental_refreshes_contracts_like_force_and_rolls_back_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let incremental_db = dir.path().join("incremental.lbug");
+        let forced_db = dir.path().join("forced.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        let spec = |methods: &str| {
+            format!(
+                "openapi: 3.0.0\ninfo: {{ title: t, version: \"1.0\" }}\npaths:\n  /v1/items:\n{methods}"
+            )
+        };
+        fs::write(
+            repo.join("openapi.yaml"),
+            spec(
+                "    get:\n      operationId: listItems\n      responses: { \"200\": { description: ok } }\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n}\n",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "initial GET"]);
+        let first_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/contract-refresh";
+        let repo_uid = nestweaver_schema::repo_uid("test", repo_url);
+        index_directory(&repo, &incremental_db, "test", repo_url, &first_sha).unwrap();
+        index_directory(&repo, &forced_db, "test", repo_url, &first_sha).unwrap();
+
+        let other_repo = dir.path().join("other-repo");
+        fs::create_dir_all(&other_repo).unwrap();
+        fs::write(
+            other_repo.join("openapi.yaml"),
+            "openapi: 3.0.0\ninfo: { title: other, version: \"1.0\" }\npaths:\n  /other:\n    get:\n      responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        let other_url = "https://example.com/contract-refresh-other";
+        let other_uid = nestweaver_schema::repo_uid("test", other_url);
+        index_directory(&other_repo, &incremental_db, "test", other_url, "other-sha").unwrap();
+        let other_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        let other_contracts = |store: &GraphStore| {
+            let mut contracts: Vec<(String, String)> = store
+                .list_contracts(Some(&other_uid))
+                .unwrap()
+                .into_iter()
+                .map(|contract| (contract.uid, contract.source_path))
+                .collect();
+            contracts.sort();
+            contracts
+        };
+        let other_before = other_contracts(&other_store);
+        drop(other_store);
+
+        fs::rename(repo.join("openapi.yaml"), repo.join("openapi.v2.yaml")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "rename spec only"]);
+        let rename_sha = git(&["rev-parse", "HEAD"]);
+        let rename_result = incremental_index(&repo, &incremental_db, "test", repo_url).unwrap();
+        assert!(!rename_result.fell_back_to_full);
+        let renamed_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        let renamed_get = renamed_store
+            .list_contracts(Some(&repo_uid))
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.uid == "contract:http:GET:/v1/items")
+            .expect("GET survives a spec-only rename");
+        assert_eq!(renamed_get.source_path, "openapi.v2.yaml");
+        assert!(
+            renamed_store
+                .list_implemented_contract_uids()
+                .unwrap()
+                .contains(&renamed_get.uid),
+            "unchanged controller must be relinked after spec-only rename"
+        );
+        drop(renamed_store);
+        let tiered = index_directory(&repo, &forced_db, "test", repo_url, &rename_sha).unwrap();
+        assert!(
+            tiered.files_unchanged > 0,
+            "control must exercise the partial/tiered full path"
+        );
+        let tiered_store = GraphStore::open_or_create(&forced_db).unwrap();
+        assert_eq!(
+            tiered_store
+                .list_contracts(Some(&repo_uid))
+                .unwrap()
+                .into_iter()
+                .find(|contract| contract.uid == "contract:http:GET:/v1/items")
+                .unwrap()
+                .source_path,
+            "openapi.v2.yaml"
+        );
+        drop(tiered_store);
+
+        fs::write(
+            repo.join("openapi.v2.yaml"),
+            spec(
+                "    get:\n      operationId: listItems\n      responses: { \"200\": { description: ok } }\n    post:\n      operationId: createItem\n      responses: { \"200\": { description: ok } }\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n  @PostMapping\n  public void create() {}\n}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add POST"]);
+        let second_sha = git(&["rev-parse", "HEAD"]);
+
+        let incremental = incremental_index(&repo, &incremental_db, "test", repo_url).unwrap();
+        assert!(!incremental.fell_back_to_full, "must exercise incremental");
+        index_directory_with_options(&repo, &forced_db, "test", repo_url, &second_sha, true, None)
+            .unwrap();
+
+        let snapshot = |store: &GraphStore| {
+            let mut contracts: Vec<(String, String)> = store
+                .list_contracts(Some(&repo_uid))
+                .unwrap()
+                .into_iter()
+                .filter(|contract| contract.repo_uid == repo_uid)
+                .map(|contract| (contract.uid, contract.source_path))
+                .collect();
+            contracts.sort();
+            let mut implemented = store.list_implemented_contract_uids().unwrap();
+            implemented.sort();
+            (contracts, implemented)
+        };
+        let implementation_pairs = |store: &GraphStore| {
+            let mut pairs = Vec::new();
+            for symbol in store.lookup_symbols_by_repo(&repo_uid).unwrap() {
+                for (contract_uid, _) in store.contracts_implemented_by(&symbol.uid).unwrap() {
+                    pairs.push((symbol.name.clone(), contract_uid));
+                }
+            }
+            pairs.sort();
+            pairs
+        };
+        let drift = |store: &GraphStore| {
+            crate::contracts::drift_envelope(
+                crate::contracts::drift_for_store(store, Some(&repo_uid)).unwrap(),
+                50,
+            )
+        };
+        let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        let forced_store = GraphStore::open_or_create(&forced_db).unwrap();
+        let incremental_snapshot = snapshot(&incremental_store);
+        assert_eq!(incremental_snapshot, snapshot(&forced_store));
+        assert_eq!(
+            implementation_pairs(&incremental_store),
+            implementation_pairs(&forced_store)
+        );
+        assert_eq!(drift(&incremental_store), drift(&forced_store));
+        assert_eq!(
+            implementation_pairs(&incremental_store),
+            vec![
+                (
+                    "create".to_string(),
+                    "contract:http:POST:/v1/items".to_string(),
+                ),
+                (
+                    "list".to_string(),
+                    "contract:http:GET:/v1/items".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            other_contracts(&incremental_store),
+            other_before,
+            "refreshing one repo must not alter another repo's contracts"
+        );
+        assert_eq!(
+            incremental_snapshot.0,
+            vec![
+                (
+                    "contract:http:GET:/v1/items".to_string(),
+                    "openapi.v2.yaml".to_string(),
+                ),
+                (
+                    "contract:http:POST:/v1/items".to_string(),
+                    "openapi.v2.yaml".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            incremental_snapshot.1,
+            vec![
+                "contract:http:GET:/v1/items".to_string(),
+                "contract:http:POST:/v1/items".to_string(),
+            ]
+        );
+        drop(incremental_store);
+        drop(forced_store);
+
+        fs::write(
+            repo.join("openapi.v2.yaml"),
+            spec(
+                "    post:\n      operationId: createItem\n      responses: { \"200\": { description: ok } }\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @PostMapping\n  public void create() {}\n}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "delete GET"]);
+        let third_sha = git(&["rev-parse", "HEAD"]);
+        let deletion = incremental_index(&repo, &incremental_db, "test", repo_url).unwrap();
+        assert!(!deletion.fell_back_to_full);
+        index_directory_with_options(&repo, &forced_db, "test", repo_url, &third_sha, true, None)
+            .unwrap();
+        let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        let forced_store = GraphStore::open_or_create(&forced_db).unwrap();
+        let post_only_snapshot = snapshot(&incremental_store);
+        assert_eq!(post_only_snapshot, snapshot(&forced_store));
+        assert_eq!(
+            implementation_pairs(&incremental_store),
+            implementation_pairs(&forced_store)
+        );
+        assert_eq!(drift(&incremental_store), drift(&forced_store));
+        assert_eq!(
+            implementation_pairs(&incremental_store),
+            vec![(
+                "create".to_string(),
+                "contract:http:POST:/v1/items".to_string(),
+            )]
+        );
+        assert_eq!(
+            post_only_snapshot.0,
+            vec![(
+                "contract:http:POST:/v1/items".to_string(),
+                "openapi.v2.yaml".to_string(),
+            )]
+        );
+        assert_eq!(
+            post_only_snapshot.1,
+            vec!["contract:http:POST:/v1/items".to_string()]
+        );
+
+        // Poison the next replacement with a UID owned by another repo. The
+        // contract COPY fails after the changed controller/spec were parsed,
+        // and the single incremental transaction must retain the prior graph.
+        incremental_store
+            .batch_insert_contracts(&[nestweaver_schema::Contract {
+                uid: "contract:http:PUT:/v1/items".to_string(),
+                kind: "http".to_string(),
+                verb: Some("PUT".to_string()),
+                path: Some("/v1/items".to_string()),
+                operation_id: None,
+                repo_uid: "repo:other".to_string(),
+                source_path: "other.yaml".to_string(),
+                confidence: 1.0,
+            }])
+            .unwrap();
+        let generation_path = crate::sidecar_path(&incremental_db, ".generation");
+        let generation_before_failed_apply = fs::read(&generation_path).unwrap();
+        drop(incremental_store);
+        drop(forced_store);
+        fs::write(
+            repo.join("openapi.v2.yaml"),
+            spec(
+                "    get:\n      operationId: listItems\n      responses: { \"200\": { description: ok } }\n    post:\n      operationId: createItem\n      responses: { \"200\": { description: ok } }\n    put:\n      operationId: replaceItem\n      responses: { \"200\": { description: ok } }\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n  @PostMapping\n  public void create() {}\n  @PutMapping\n  public void replace() {}\n}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add colliding PUT"]);
+
+        let error = incremental_index(&repo, &incremental_db, "test", repo_url)
+            .expect_err("contract replacement failure must abort incremental publication");
+        assert!(
+            format!("{error:#}").contains("apply incremental contract derivation"),
+            "unexpected error: {error:#}"
+        );
+        let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        assert_eq!(
+            fs::read(&generation_path).unwrap(),
+            generation_before_failed_apply,
+            "a failed transactional apply must not publish a new generation"
+        );
+        assert_eq!(snapshot(&incremental_store), post_only_snapshot);
+        assert_eq!(
+            other_contracts(&incremental_store),
+            other_before,
+            "a failed replacement must not alter another repo"
+        );
+        assert_eq!(
+            incremental_store
+                .lookup_repo(&repo_uid)
+                .unwrap()
+                .unwrap()
+                .indexed_sha,
+            third_sha,
+            "failed derivation must roll back the indexed SHA"
+        );
+        assert!(
+            incremental_store
+                .lookup_symbols_by_name_in_repo("replace", &repo_uid)
+                .unwrap()
+                .is_empty(),
+            "failed derivation must roll back the new handler symbol"
+        );
+        assert!(
+            incremental_store
+                .contract_derivation_failures(Some(&repo_uid))
+                .unwrap()
+                .contains(&repo_uid),
+            "the failed best-effort contract phase remains diagnosable"
         );
     }
 

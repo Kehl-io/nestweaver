@@ -141,6 +141,38 @@ pub fn parse_spec_file(path: &str, source: &str) -> Vec<SpecContract> {
     }
 }
 
+/// Parse a watched spec without the full-indexer's best-effort fallback.
+///
+/// A live watcher replaces an already-published contract graph, so treating a
+/// transient or malformed save as an empty spec would incorrectly clear the
+/// prior contracts. Watcher planning uses this strict seam before opening its
+/// publication transaction.
+pub(crate) fn parse_spec_file_strict(
+    path: &str,
+    source: &str,
+) -> Result<Vec<SpecContract>, String> {
+    match spec_kind(path) {
+        Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str::<openapiv3::OpenAPI>(source)
+            .map(|spec| openapi_contracts(&spec))
+            .map_err(|error| error.to_string()),
+        Some(SpecFileKind::OpenApiJson) => serde_json::from_str::<openapiv3::OpenAPI>(source)
+            .map(|spec| openapi_contracts(&spec))
+            .map_err(|error| error.to_string()),
+        Some(SpecFileKind::Proto) => protox_parse::parse(path, source)
+            .map(|_| parse_proto(path, source))
+            .map_err(|error| error.to_string()),
+        Some(SpecFileKind::GraphQl) => {
+            let parsed = apollo_parser::Parser::new(source).parse();
+            if let Some(error) = parsed.errors().next() {
+                Err(error.to_string())
+            } else {
+                Ok(parse_graphql(source))
+            }
+        }
+        None => Err(format!("unsupported contract spec path: {path}")),
+    }
+}
+
 fn parse_openapi_yaml(source: &str) -> Vec<SpecContract> {
     match serde_yaml_ng::from_str::<openapiv3::OpenAPI>(source) {
         Ok(spec) => openapi_contracts(&spec),

@@ -4,6 +4,8 @@
 //! JSON-RPC 2.0 bodies.  Handles `initialize`, `tools/list`, and
 //! `tools/call` — the latter delegates to the same `tools::dispatch`
 //! function used by the stdio server.
+//! HTTP accepts one JSON-RPC request per POST. Batch arrays are intentionally
+//! unsupported and return `-32600` rather than being partially dispatched.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,6 +17,7 @@ use axum::http::HeaderMap;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, State},
+    response::{IntoResponse, Response},
     routing::post,
 };
 use dashmap::DashMap;
@@ -554,19 +557,6 @@ pub fn router(state: Arc<McpHttpState>) -> Router {
         .with_state(state)
 }
 
-/// JSON-RPC request as received over HTTP (same shape as the stdio wire
-/// format but parsed from the request body instead of a line).
-#[derive(serde::Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    params: Option<Value>,
-}
-
 /// Optional peer-address extractor.
 ///
 /// `ConnectInfo<SocketAddr>` *rejects* the request when connection info is
@@ -596,12 +586,7 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for OptionalPeerAddr {
 /// Build a JSON-RPC 2.0 error response tuple in the exact shape `handle_mcp`
 /// returns, so its several early-rejection paths (session / rate-limit / parse /
 /// auth / method-not-found) can't drift in envelope structure.
-fn jsonrpc_error(
-    status: axum::http::StatusCode,
-    id: Value,
-    code: i32,
-    message: &str,
-) -> (axum::http::StatusCode, HeaderMap, Json<Value>) {
+fn jsonrpc_error(status: axum::http::StatusCode, id: Value, code: i32, message: &str) -> Response {
     (
         status,
         HeaderMap::new(),
@@ -611,6 +596,36 @@ fn jsonrpc_error(
             "error": { "code": code, "message": message }
         })),
     )
+        .into_response()
+}
+
+fn jsonrpc_http_response(
+    notification: bool,
+    status: axum::http::StatusCode,
+    headers: HeaderMap,
+    body: Value,
+) -> Response {
+    if notification {
+        // JSON-RPC notifications are dispatched but never produce a JSON-RPC
+        // response. HTTP still needs a transport response, so use an empty 202.
+        (axum::http::StatusCode::ACCEPTED, headers).into_response()
+    } else {
+        (status, headers, Json(body)).into_response()
+    }
+}
+
+fn jsonrpc_http_error(
+    notification: bool,
+    status: axum::http::StatusCode,
+    id: Value,
+    code: i32,
+    message: &str,
+) -> Response {
+    if notification {
+        (status, HeaderMap::new()).into_response()
+    } else {
+        jsonrpc_error(status, id, code, message)
+    }
 }
 
 async fn handle_mcp(
@@ -621,8 +636,8 @@ async fn handle_mcp(
     // for keying.
     OptionalPeerAddr(peer_addr): OptionalPeerAddr,
     headers: HeaderMap,
-    Json(req): Json<JsonRpcRequest>,
-) -> (axum::http::StatusCode, HeaderMap, Json<Value>) {
+    raw_request: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
     let peer_ip = peer_addr.map(|addr| addr.ip());
     let provided_bearer = headers
         .get("authorization")
@@ -646,7 +661,13 @@ async fn handle_mcp(
                     query_match || admin_match
                 } => {}
             _ => {
-                return jsonrpc_error(
+                let notification = raw_request
+                    .as_ref()
+                    .ok()
+                    .and_then(|Json(value)| crate::protocol::validate_request(value.clone()).ok())
+                    .is_some_and(|request| request.id.is_none());
+                return jsonrpc_http_error(
+                    notification,
                     axum::http::StatusCode::UNAUTHORIZED,
                     Value::Null,
                     error_code::INVALID_REQUEST,
@@ -655,6 +676,55 @@ async fn handle_mcp(
             }
         }
     }
+
+    let apply_untrusted_rate_limit = || {
+        if !state.server_mode || admin_bypass_rate_limit {
+            return None;
+        }
+        let client_key = http_client_rate_limit_key(provided_bearer, None, peer_ip, false, false);
+        (!state.client_rate_limiter.check(&client_key)).then(|| {
+            jsonrpc_error(
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                Value::Null,
+                error_code::INVALID_REQUEST,
+                "rate limit exceeded: too many requests per minute",
+            )
+        })
+    };
+
+    let raw_request = match raw_request {
+        Ok(Json(value)) => value,
+        Err(error) => {
+            if let Some(response) = apply_untrusted_rate_limit() {
+                return response;
+            }
+            return jsonrpc_error(
+                axum::http::StatusCode::OK,
+                Value::Null,
+                error_code::PARSE_ERROR,
+                &format!("invalid JSON: {error}"),
+            );
+        }
+    };
+
+    let req = match crate::protocol::validate_request(raw_request) {
+        Ok(request) => request,
+        Err(error) => {
+            // Invalid envelopes cannot supply a trusted session id. They still
+            // consume the server-mode client bucket so malformed traffic
+            // cannot bypass the normal boundary limiter.
+            if let Some(response) = apply_untrusted_rate_limit() {
+                return response;
+            }
+            return jsonrpc_error(
+                axum::http::StatusCode::OK,
+                error.response_id,
+                error_code::INVALID_REQUEST,
+                &error.message,
+            );
+        }
+    };
+    let notification = req.id.is_none();
 
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -671,7 +741,8 @@ async fn handle_mcp(
         && req.method != "initialize"
         && !state.sessions.contains_key(sid)
     {
-        return jsonrpc_error(
+        return jsonrpc_http_error(
+            notification,
             axum::http::StatusCode::OK,
             id.clone(),
             error_code::INVALID_REQUEST,
@@ -700,7 +771,8 @@ async fn handle_mcp(
         );
 
         if !admin_bypass_rate_limit && !state.client_rate_limiter.check(&client_key) {
-            return jsonrpc_error(
+            return jsonrpc_http_error(
+                notification,
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                 Value::Null,
                 error_code::INVALID_REQUEST,
@@ -718,7 +790,8 @@ async fn handle_mcp(
             && !check_session_rate_limit(&state.sessions, sid)
             && !admin_bypass_rate_limit
         {
-            return jsonrpc_error(
+            return jsonrpc_http_error(
+                notification,
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                 Value::Null,
                 error_code::INVALID_REQUEST,
@@ -773,7 +846,12 @@ async fn handle_mcp(
                 }
             });
 
-            return (axum::http::StatusCode::OK, resp_headers, Json(body));
+            return jsonrpc_http_response(
+                notification,
+                axum::http::StatusCode::OK,
+                resp_headers,
+                body,
+            );
         }
 
         "notifications/initialized" | "initialized" => json!({
@@ -803,7 +881,8 @@ async fn handle_mcp(
                 .unwrap_or(Value::Object(serde_json::Map::new()));
 
             let Some(name) = name else {
-                return jsonrpc_error(
+                return jsonrpc_http_error(
+                    notification,
                     axum::http::StatusCode::OK,
                     id.clone(),
                     error_code::INVALID_PARAMS,
@@ -812,14 +891,15 @@ async fn handle_mcp(
             };
 
             if let Err(error) = tools::validate_tool_arguments(&name, &arguments) {
-                return (
+                return jsonrpc_http_response(
+                    notification,
                     axum::http::StatusCode::OK,
                     HeaderMap::new(),
-                    Json(json!({
+                    json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": tools::wrap_tool_error(&error.to_string()),
-                    })),
+                    }),
                 );
             }
 
@@ -831,7 +911,8 @@ async fn handle_mcp(
             // there is no writable store to mutate. Mirrors the gRPC
             // `ReadOnlyGuard` chokepoint.
             if state.read_only && MUTATING_TOOLS.contains(&name.as_str()) {
-                return jsonrpc_error(
+                return jsonrpc_http_error(
+                    notification,
                     axum::http::StatusCode::OK,
                     id.clone(),
                     error_code::INVALID_REQUEST,
@@ -848,7 +929,8 @@ async fn handle_mcp(
                 && state.auth_token.is_some()
                 && !admin_bypass_rate_limit
             {
-                return jsonrpc_error(
+                return jsonrpc_http_error(
+                    notification,
                     axum::http::StatusCode::FORBIDDEN,
                     id.clone(),
                     error_code::INVALID_REQUEST,
@@ -888,7 +970,8 @@ async fn handle_mcp(
                         state.permission_source.visible_repos(&identity, &repos)
                     }
                     AuthzRepoListing::FailLoud(msg) => {
-                        return jsonrpc_error(
+                        return jsonrpc_http_error(
+                            notification,
                             axum::http::StatusCode::SERVICE_UNAVAILABLE,
                             id.clone(),
                             error_code::INTERNAL_ERROR,
@@ -917,7 +1000,8 @@ async fn handle_mcp(
                 match apply_safeguard_params(&mut arguments) {
                     Ok(limits) => applied_limits = limits,
                     Err(message) => {
-                        return jsonrpc_error(
+                        return jsonrpc_http_error(
+                            notification,
                             axum::http::StatusCode::OK,
                             id.clone(),
                             error_code::INVALID_PARAMS,
@@ -1075,7 +1159,12 @@ async fn handle_mcp(
         }),
     };
 
-    (axum::http::StatusCode::OK, HeaderMap::new(), Json(response))
+    jsonrpc_http_response(
+        notification,
+        axum::http::StatusCode::OK,
+        HeaderMap::new(),
+        response,
+    )
 }
 
 #[cfg(test)]
@@ -1404,6 +1493,168 @@ mod tests {
         assert_eq!(json["id"], 1);
         assert_eq!(json["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(json["result"]["serverInfo"]["name"], SERVER_NAME);
+    }
+
+    #[tokio::test]
+    async fn http_validates_jsonrpc_version_and_ids_before_dispatch() {
+        for (body, expected_id) in [
+            (
+                json!({"jsonrpc": "1.0", "id": "version-id", "method": "ping"}),
+                json!("version-id"),
+            ),
+            (
+                json!({"jsonrpc": "2.0", "id": true, "method": "ping"}),
+                Value::Null,
+            ),
+            (json!([]), Value::Null),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let response = test_app().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let response: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response["error"]["code"], error_code::INVALID_REQUEST);
+            assert_eq!(response["id"], expected_id);
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                br#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#.as_slice(),
+            ))
+            .unwrap();
+        let response = test_app().oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["id"], Value::Null);
+        assert_eq!(response["result"], json!({}));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                br#"{"jsonrpc":"2.0","method":"ping"}"#.as_slice(),
+            ))
+            .unwrap();
+        let response = test_app().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            bytes.is_empty(),
+            "HTTP notifications must have no JSON body"
+        );
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                br#"{"jsonrpc":"2.0","method":"tools/call","params":{}}"#.as_slice(),
+            ))
+            .unwrap();
+        let response = test_app().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            bytes.is_empty(),
+            "post-validation notification errors must have no JSON body"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_http_envelopes_are_authenticated_and_rate_limited_first() {
+        let invalid = |bearer: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json");
+            if let Some(bearer) = bearer {
+                builder = builder.header("authorization", format!("Bearer {bearer}"));
+            }
+            builder
+                .body(Body::from(
+                    br#"{"jsonrpc":"1.0","id":"bad","method":"ping"}"#.as_slice(),
+                ))
+                .unwrap()
+        };
+
+        let response = test_auth_app().oneshot(invalid(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = test_auth_app()
+            .oneshot(invalid(Some("wrong-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let notification = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong-token")
+            .body(Body::from(
+                br#"{"jsonrpc":"2.0","method":"ping"}"#.as_slice(),
+            ))
+            .unwrap();
+        let response = test_auth_app().oneshot(notification).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "notification auth errors must be bodyless");
+
+        let app = test_server_auth_app_with_limiter(1);
+        let first = app
+            .clone()
+            .oneshot(invalid(Some("shared-query-token")))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], error_code::INVALID_REQUEST);
+        assert_eq!(body["id"], "bad");
+
+        let second = app
+            .oneshot(invalid(Some("shared-query-token")))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn malformed_http_json_is_a_jsonrpc_parse_error() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(br#"{"jsonrpc":"2.0""#.as_slice()))
+            .unwrap();
+        let response = test_app().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], error_code::PARSE_ERROR);
+        assert_eq!(body["id"], Value::Null);
     }
 
     #[tokio::test]

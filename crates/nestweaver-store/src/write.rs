@@ -674,8 +674,13 @@ impl GraphStore {
 
     pub fn insert_repo(&self, repo: &Repo) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::insert_repo_on(&conn, repo)
+    }
+
+    /// Insert a Repo node using an externally-provided transaction.
+    pub fn insert_repo_on(conn: &lbug::Connection<'_>, repo: &Repo) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
              staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
              root_path: $root_path})",

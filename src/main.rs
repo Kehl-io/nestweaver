@@ -1,3 +1,86 @@
+static STDOUT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Debug)]
+struct StdoutWriteFailure(std::io::Error);
+
+impl std::fmt::Display for StdoutWriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "failed writing to stdout: {}", self.0)
+    }
+}
+
+impl std::error::Error for StdoutWriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn write_cli_stdout(
+    writer: &mut impl std::io::Write,
+    arguments: std::fmt::Arguments<'_>,
+    newline: bool,
+) -> std::io::Result<()> {
+    writer.write_fmt(arguments)?;
+    if newline {
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn raise_stdout_failure(error: std::io::Error) -> ! {
+    use std::sync::atomic::Ordering;
+    // Set this before unwinding: destructors may print, and a second panic
+    // during unwinding would abort instead of reaching the typed boundary.
+    STDOUT_FAILED.store(true, Ordering::Relaxed);
+    std::panic::resume_unwind(Box::new(StdoutWriteFailure(error)));
+}
+
+struct TypedStdout;
+
+impl std::io::Write for TypedStdout {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match std::io::stdout().lock().write(buffer) {
+            Ok(written) => Ok(written),
+            Err(error) => raise_stdout_failure(error),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match std::io::stdout().lock().flush() {
+            Ok(()) => Ok(()),
+            Err(error) => raise_stdout_failure(error),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn print_cli_stdout(arguments: std::fmt::Arguments<'_>, newline: bool) {
+    use std::sync::atomic::Ordering;
+    if STDOUT_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
+    // TypedStdout converts the otherwise-untyped `io::Error` into the one
+    // unwind payload accepted by the process boundary.
+    let _ = write_cli_stdout(&mut TypedStdout, arguments, newline);
+}
+
+// Keep unit-test output on the standard harness capture path. Production CLI
+// output (including `setup`, declared below) uses the typed stdout boundary.
+#[cfg(not(test))]
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        crate::print_cli_stdout(format_args!($($arg)*), false)
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! println {
+    () => {{ crate::print_cli_stdout(format_args!(""), true) }};
+    ($($arg:tt)*) => {{
+        crate::print_cli_stdout(format_args!($($arg)*), true)
+    }};
+}
+
 mod setup;
 
 use std::io::IsTerminal;
@@ -20,10 +103,10 @@ use nestweaver_engine::{
     generate_cursor_rule_with_rules, generate_guide_with_tools, generate_repo_map,
     generate_summaries, get_last_indexed_at, incremental_index_with_name,
     index_directory_with_options, index_markdown_directory_since_with_ignore,
-    index_markdown_directory_with_ignore, list_repos, list_services, load_alias_sidecar,
-    load_clusters, load_extensions, lookup_symbol, record_last_indexed_at, render_text,
-    save_clusters, save_cochange_sidecar, save_summaries, search_symbols, suggest_links,
-    truncate_to_budget,
+    index_markdown_directory_with_ignore, index_markdown_directory_with_ignore_and_deletion_count,
+    list_repos, list_services, load_alias_sidecar, load_clusters, load_extensions, lookup_symbol,
+    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
+    search_symbols, suggest_links, truncate_to_budget,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -1407,9 +1490,7 @@ fn print_daemon_embedding_status(db_path: &Path) {
             })
         });
     match result {
-        Ok(status) => {
-            println!("{}", format_daemon_status_response(Ok(&status)));
-        }
+        Ok(status) => println!("{}", format_daemon_status_response(Ok(&status))),
         Err(error) => {
             let error = format!("{error:#}");
             println!("{}", format_daemon_status_response(Err(&error)));
@@ -1489,6 +1570,29 @@ mod daemon_status_renderer_tests {
         assert!(output.starts_with(
             "Daemon is not running.\nConfig: unknown (daemon unreachable)\nEmbedding:\n"
         ));
+    }
+
+    struct ClosedStdout;
+
+    impl std::io::Write for ClosedStdout {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "consumer closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn daemon_status_renderer_reaches_typed_stdout_boundary() {
+        let output = format_daemon_not_running_status("Daemon is not running.");
+        let error =
+            write_cli_stdout(&mut ClosedStdout, format_args!("{output}"), true).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }
 
@@ -5654,6 +5758,40 @@ fn read_symbols_rpc_args(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+fn run_with_stdout_boundary<T>(operation: impl FnOnce() -> T) -> Result<T, StdoutWriteFailure> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(value) => Ok(value),
+        Err(payload) => match payload.downcast::<StdoutWriteFailure>() {
+            Ok(stdout) => Err(*stdout),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+#[cfg(test)]
+mod broken_pipe_policy_tests {
+    use super::*;
+
+    #[test]
+    fn typed_boundary_distinguishes_closed_pipe_from_other_stdout_errors() {
+        for (kind, expected_normal) in [
+            (std::io::ErrorKind::BrokenPipe, true),
+            (std::io::ErrorKind::PermissionDenied, false),
+        ] {
+            let outcome = run_with_stdout_boundary(|| {
+                std::panic::resume_unwind(Box::new(StdoutWriteFailure(std::io::Error::new(
+                    kind, "test",
+                ))))
+            })
+            .unwrap_err();
+            assert_eq!(
+                outcome.0.kind() == std::io::ErrorKind::BrokenPipe,
+                expected_normal
+            );
+        }
+    }
+}
+
 fn main() {
     // Install miette as the global error/panic report handler for rich
     // diagnostics (colours, help text, error codes) on supported terminals.
@@ -5688,7 +5826,22 @@ fn main() {
     let out = OutputConfig::from_cli(&cli);
     let show_stats = cli.stats;
 
-    let exit_code = match run(cli, &out) {
+    // Keep the existing renderer surface (including helper modules) safe when
+    // a downstream consumer such as `head` closes the pipe. Typed stdout
+    // failures use `resume_unwind`, so they never invoke the panic hook;
+    // unrelated panics retain normal behavior and resume unwinding.
+
+    let run_result = match run_with_stdout_boundary(|| run(cli, &out)) {
+        Ok(result) => result,
+        Err(error) if error.0.kind() == std::io::ErrorKind::BrokenPipe => {
+            process::exit(EXIT_SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            process::exit(EXIT_ERROR)
+        }
+    };
+    let exit_code = match run_result {
         Ok((code, summary)) => {
             if let (true, Some(s)) = (show_stats, summary) {
                 eprintln!("stats: {s}");
@@ -5696,6 +5849,13 @@ fn main() {
             code
         }
         Err(e) => {
+            if let Some(stdout) = e.downcast_ref::<nestweaver_mcp::StdoutWriteError>() {
+                if stdout.kind() == std::io::ErrorKind::BrokenPipe {
+                    process::exit(EXIT_SUCCESS);
+                }
+                eprintln!("{stdout}");
+                process::exit(EXIT_ERROR);
+            }
             let report = into_diagnostic(e);
             eprintln!("{report:?}");
             EXIT_ERROR
@@ -8080,7 +8240,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     std::fs::File::create(path)
                         .with_context(|| format!("failed to create {}", path.display()))?,
                 ),
-                None => Box::new(std::io::stdout().lock()),
+                None => Box::new(TypedStdout),
             };
             let mut writer = std::io::BufWriter::new(write_to);
 
@@ -8096,6 +8256,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     return Ok((EXIT_ERROR, None));
                 }
             }
+            std::io::Write::flush(&mut writer)?;
 
             if let Some(path) = &output {
                 out.status(&format!("Exported graph to {}", path.display()));
@@ -8106,8 +8267,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::Completions { shell } => {
+            use clap_complete::Generator;
             let mut cmd = Cli::command();
-            clap_complete::generate(shell, &mut cmd, "nestweaver", &mut std::io::stdout());
+            cmd.set_bin_name("nestweaver");
+            cmd.build();
+            shell.try_generate(&cmd, &mut TypedStdout)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -14704,18 +14868,12 @@ fn run_brain(
                     result.wikilinks_resolved,
                 );
             } else {
-                // Full refresh: cascade-delete all notes then re-index from scratch.
-                let store = open_store(Some(&db_path))?;
-                let existing = store.list_notes(Some(&v_uid)).unwrap_or_default();
-                let drop_count = existing.len();
-                for n in &existing {
-                    if let Err(e) = store.delete_note_cascade(&n.uid) {
-                        tracing::warn!("delete_note_cascade {} failed: {e}", n.uid);
-                    }
-                }
-                drop(store);
-
-                let result = index_markdown_directory_with_ignore(
+                // Full refresh: the markdown indexer's writable store performs
+                // the old-vault cascade and replacement in one transaction.
+                // Its returned delete count is therefore committed truth; a
+                // failed cascade/write propagates and cannot be reported as a
+                // successful dropped note.
+                let result = index_markdown_directory_with_ignore_and_deletion_count(
                     &path,
                     &db_path,
                     &instance_id,
@@ -14730,16 +14888,8 @@ fn run_brain(
                 }
 
                 println!(
-                    "Refreshed vault '{}': dropped {} stale note(s), reindexed {} note(s), \
-                     {} heading(s), {} section(s), {} tag(s), {} wikilink(s) ({} unresolved).",
-                    result.vault_name,
-                    drop_count,
-                    result.notes_count,
-                    result.headings_count,
-                    result.sections_count,
-                    result.tags_count,
-                    result.wikilinks_resolved,
-                    result.wikilinks_unresolved,
+                    "{}",
+                    nestweaver_engine::index_md::format_markdown_refresh_summary(&result)
                 );
             }
 
@@ -17528,30 +17678,59 @@ fn resolve_contract_repo_filter(
     anyhow::bail!("no indexed repo matches --repo '{filter}'")
 }
 
-/// Human rendering of the daemon `cross_repo_contracts` result (used by
-/// `contracts list` without `--json`), so the daemon path honors the `--json`
-/// flag instead of always dumping raw JSON like the direct-store path's table.
-fn render_cross_repo_contracts_human(value: &serde_json::Value) {
-    match value.get("contracts").and_then(|v| v.as_array()) {
-        Some(rows) if !rows.is_empty() => {
-            let total = value
-                .get("total")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(rows.len() as u64);
-            println!(
-                "Cross-repo contract links ({total} total). NOTE: links are \
-                 hypotheses, not ground truth — see confidence.\n"
-            );
-            for r in rows {
-                let sn = r.get("source_name").and_then(|v| v.as_str()).unwrap_or("?");
-                let tn = r.get("target_name").and_then(|v| v.as_str()).unwrap_or("?");
-                let lt = r.get("link_type").and_then(|v| v.as_str()).unwrap_or("");
-                let conf = r.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                println!("  {sn} -> {tn}  [{lt}, confidence {conf:.2}]");
+fn render_contract_list(
+    contracts: &[nestweaver_schema::Contract],
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(contracts)?);
+    } else if contracts.is_empty() {
+        println!(
+            "No contracts found. Index a repo with OpenAPI/proto/GraphQL specs or \
+             Spring/NestJS controllers first."
+        );
+    } else {
+        println!(
+            "API contracts ({} total). NOTE: contract links are hypotheses, \
+             not ground truth — see confidence.\n",
+            contracts.len()
+        );
+        for contract in contracts {
+            println!("{}", contract.uid);
+            println!("  kind:       {}", contract.kind);
+            if let Some(ref verb) = contract.verb {
+                println!("  verb:       {verb}");
             }
+            if let Some(ref path) = contract.path {
+                println!("  path:       {path}");
+            }
+            if let Some(ref operation) = contract.operation_id {
+                println!("  operation:  {operation}");
+            }
+            println!("  source:     {}", contract.source_path);
+            println!("  confidence: {:.2}", contract.confidence);
+            println!();
         }
-        _ => println!("No cross-repo contract links found."),
     }
+    Ok(())
+}
+
+fn list_contracts_via_daemon(
+    db_path: &std::path::Path,
+    repo: Option<&str>,
+) -> anyhow::Result<Vec<nestweaver_schema::Contract>> {
+    let runtime = tokio::runtime::Runtime::new().context("create runtime for contracts list")?;
+    runtime
+        .block_on(async {
+            let mut client = nestweaver_client::DaemonClient::connect(db_path, None).await?;
+            client.list_contracts(repo).await
+        })
+        .with_context(|| {
+            format!(
+                "daemon contracts list failed for {}; refusing direct-store fallback while the daemon owns the database",
+                db_path.display()
+            )
+        })
 }
 
 /// Human rendering of the daemon `contract_drift` result (`contracts drift`
@@ -17613,61 +17792,22 @@ fn run_contracts(
 ) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         ContractCommands::List { repo, json, db } => {
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
-                let mut args = serde_json::json!({});
-                if let Some(ref r) = repo {
-                    args["repo"] = serde_json::json!(r);
-                }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "cross_repo_contracts", args)
-                {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        render_cross_repo_contracts_human(&value);
-                    }
-                    return Ok((EXIT_SUCCESS, None));
-                }
-            }
-            let store = open_store(db.as_deref())?;
-            let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
-            let mut contracts = store
-                .list_contracts(repo_uid.as_deref())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            contracts.sort_by(|a, b| a.uid.cmp(&b.uid));
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&contracts)?);
-            } else if contracts.is_empty() {
-                println!(
-                    "No contracts found. Index a repo with OpenAPI/proto/GraphQL specs or \
-                     Spring/NestJS controllers first."
-                );
+            let db_path = db.clone().unwrap_or_else(default_db_path);
+            // Read-only query: reject a typo'd path before daemon autostart can
+            // create an empty database and false-green with an empty list.
+            require_existing_db(&db_path)?;
+            let contracts = if use_daemon {
+                list_contracts_via_daemon(&db_path, repo.as_deref())?
             } else {
-                println!(
-                    "API contracts ({} total). NOTE: contract links are hypotheses, \
-                     not ground truth — see confidence.\n",
-                    contracts.len()
-                );
-                for c in &contracts {
-                    println!("{}", c.uid);
-                    println!("  kind:       {}", c.kind);
-                    if let Some(ref v) = c.verb {
-                        println!("  verb:       {v}");
-                    }
-                    if let Some(ref p) = c.path {
-                        println!("  path:       {p}");
-                    }
-                    if let Some(ref op) = c.operation_id {
-                        println!("  operation:  {op}");
-                    }
-                    println!("  source:     {}", c.source_path);
-                    println!("  confidence: {:.2}", c.confidence);
-                    println!();
-                }
-            }
+                let store = open_store(Some(&db_path))?;
+                let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
+                let mut contracts = store
+                    .list_contracts(repo_uid.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                contracts.sort_by(|left, right| left.uid.cmp(&right.uid));
+                contracts
+            };
+            render_contract_list(&contracts, json)?;
             Ok((EXIT_SUCCESS, None))
         }
         ContractCommands::Drift { repo, json, db } => {
@@ -18507,6 +18647,177 @@ fn ensure_no_live_daemon_for_snapshot_build(db_path: &Path) -> anyhow::Result<()
 /// applies fallback/merge/primary routing across upstream servers. Write
 /// operations (brain_add_source, brain_remove_source, prune_stale) go
 /// through the standard gRPC path.
+fn dispatch_hybrid_mcp_request(
+    hybrid: &mut nestweaver_client::hybrid::HybridClient,
+    rt: &tokio::runtime::Runtime,
+    lite: bool,
+    write_tools: &std::collections::HashSet<&str>,
+    request: &nestweaver_mcp::protocol::Request,
+) -> serde_json::Value {
+    let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+    match request.method.as_str() {
+        "initialize" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "nestweaver-brain",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            }
+        }),
+        "notifications/initialized" | "initialized" => serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "result": null
+        }),
+        "tools/list" => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": nestweaver_mcp::tools::tool_list(lite),
+        }),
+        "tools/call" => {
+            let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let name = params
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            if name.is_empty() {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "tools/call: 'name' is required" }
+                })
+            } else if let Err(error) = nestweaver_mcp::tools::enforce_tool_allowed(name) {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                })
+            } else if let Err(error) =
+                nestweaver_mcp::tools::validate_tool_arguments(name, &arguments)
+            {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                })
+            } else {
+                let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if write_tools.contains(name) {
+                        nestweaver_mcp::tools::dispatch_via_daemon(
+                            hybrid.inner_mut(),
+                            rt,
+                            name,
+                            arguments.clone(),
+                        )
+                    } else {
+                        rt.block_on(hybrid.query(name, &arguments))
+                    }
+                }));
+                match dispatched {
+                    Ok(Ok(result)) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_result(result),
+                    }),
+                    Ok(Err(error)) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                    }),
+                    Err(_) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": nestweaver_mcp::tools::wrap_tool_error(
+                            &format!("tool '{name}' panicked")
+                        ),
+                    }),
+                }
+            }
+        }
+        "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+        method => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32601, "message": format!("method not implemented: {method}") }
+        }),
+    }
+}
+
+fn process_hybrid_mcp_envelope(
+    parsed: serde_json::Value,
+    mut dispatch: impl FnMut(&nestweaver_mcp::protocol::Request) -> serde_json::Value,
+) -> Option<serde_json::Value> {
+    let invalid = |error: nestweaver_mcp::protocol::InvalidRequest| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": error.response_id,
+            "error": { "code": -32600, "message": error.message }
+        })
+    };
+    if let serde_json::Value::Array(items) = parsed {
+        if items.is_empty() {
+            return Some(serde_json::json!({
+                "jsonrpc": "2.0", "id": null,
+                "error": { "code": -32600, "message": "empty batch array" }
+            }));
+        }
+        let mut responses = Vec::new();
+        for item in items {
+            match nestweaver_mcp::protocol::validate_request(item) {
+                Ok(request) => {
+                    let notification = request.id.is_none();
+                    let result = dispatch(&request);
+                    if !notification {
+                        responses.push(result);
+                    }
+                }
+                Err(error) => responses.push(invalid(error)),
+            }
+        }
+        (!responses.is_empty()).then_some(serde_json::Value::Array(responses))
+    } else {
+        match nestweaver_mcp::protocol::validate_request(parsed) {
+            Ok(request) => {
+                let notification = request.id.is_none();
+                let result = dispatch(&request);
+                (!notification).then_some(result)
+            }
+            Err(error) => Some(invalid(error)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_mcp_envelope_tests {
+    use super::process_hybrid_mcp_envelope;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn hybrid_envelope_rejects_before_dispatch_and_distinguishes_null_notification() {
+        let mut dispatched = Vec::new();
+        let response = process_hybrid_mcp_envelope(
+            json!([
+                {"jsonrpc":"1.0","id":"version","method":"ping"},
+                {"jsonrpc":"2.0","id":true,"method":"ping"},
+                {"jsonrpc":"2.0","id":null,"method":"ping"},
+                {"jsonrpc":"2.0","method":"ping"}
+            ]),
+            |request| {
+                dispatched.push(request.id.clone());
+                json!({"jsonrpc":"2.0","id":request.id.clone().unwrap_or(Value::Null),"result":{}})
+            },
+        )
+        .unwrap();
+
+        assert_eq!(dispatched, vec![Some(Value::Null), None]);
+        let responses = response.as_array().unwrap();
+        assert_eq!(responses.len(), 3, "notification response must be omitted");
+        assert_eq!(responses[0]["error"]["code"], -32600);
+        assert_eq!(responses[0]["id"], "version");
+        assert_eq!(responses[1]["error"]["code"], -32600);
+        assert_eq!(responses[1]["id"], Value::Null);
+        assert_eq!(responses[2]["id"], Value::Null);
+    }
+}
+
 fn run_mcp_hybrid(
     mut hybrid: nestweaver_client::hybrid::HybridClient,
     rt: tokio::runtime::Runtime,
@@ -18536,7 +18847,7 @@ fn run_mcp_hybrid(
     tracing::info!("brain MCP server ready on stdio (hybrid routing mode)");
 
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = TypedStdout;
     let mut line = String::new();
     let mut reader = stdin.lock();
 
@@ -18573,133 +18884,15 @@ fn run_mcp_hybrid(
             }
         };
 
-        let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let response = process_hybrid_mcp_envelope(parsed, |request| {
+            dispatch_hybrid_mcp_request(&mut hybrid, &rt, lite, &write_tools, request)
+        });
 
-        let response = match method {
-            "initialize" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": {
-                        "name": "nestweaver-brain",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                }
-            }),
-            "notifications/initialized" | "initialized" => continue,
-            "tools/list" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": nestweaver_mcp::tools::tool_list(lite),
-            }),
-            "tools/call" => {
-                let params = parsed
-                    .get("params")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-
-                if name.is_empty() {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32602, "message": "tools/call: 'name' is required" }
-                    })
-                } else if let Err(error) = nestweaver_mcp::tools::enforce_tool_allowed(name) {
-                    // The HybridClient read path dispatches queries itself
-                    // and would otherwise bypass the --tools/--lite gate. Same
-                    // error text as the local and daemon-proxy paths.
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
-                    })
-                } else if let Err(error) =
-                    nestweaver_mcp::tools::validate_tool_arguments(name, &arguments)
-                {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
-                    })
-                } else if write_tools.contains(name) {
-                    // Write operations go through standard gRPC dispatch.
-                    let grpc = hybrid.inner_mut();
-                    let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        nestweaver_mcp::tools::dispatch_via_daemon(
-                            grpc,
-                            &rt,
-                            name,
-                            arguments.clone(),
-                        )
-                    }));
-                    match dispatched {
-                        Ok(Ok(result)) => {
-                            serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": nestweaver_mcp::tools::wrap_tool_result(result),
-                            })
-                        }
-                        Ok(Err(e)) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
-                        }),
-                        Err(_) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": nestweaver_mcp::tools::wrap_tool_error(
-                                &format!("tool '{name}' panicked")
-                            ),
-                        }),
-                    }
-                } else {
-                    // Read queries go through HybridClient for routing.
-                    let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        rt.block_on(hybrid.query(name, &arguments))
-                    }));
-                    match dispatched {
-                        Ok(Ok(result)) => {
-                            serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": nestweaver_mcp::tools::wrap_tool_result(result),
-                            })
-                        }
-                        Ok(Err(e)) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": nestweaver_mcp::tools::wrap_tool_error(&e.to_string()),
-                        }),
-                        Err(_) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": nestweaver_mcp::tools::wrap_tool_error(
-                                &format!("tool '{name}' panicked")
-                            ),
-                        }),
-                    }
-                }
-            }
-            "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
-            _ => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": format!("method not implemented: {method}") }
-            }),
-        };
-
-        serde_json::to_writer(&mut stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
+        if let Some(response) = response {
+            serde_json::to_writer(&mut stdout, &response)?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+        }
     }
 }
 

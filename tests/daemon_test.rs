@@ -15,6 +15,18 @@ use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
+#[cfg(unix)]
+fn closed_pipe_stdout() -> Stdio {
+    use std::os::fd::FromRawFd;
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create pipe");
+    assert_eq!(unsafe { libc::close(fds[0]) }, 0, "close pipe reader");
+    // SAFETY: pipe returned an owned write descriptor, and Stdio takes sole
+    // ownership through File.
+    let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Stdio::from(writer)
+}
+
 /// Helper: build a `Command` for the `nestweaver` binary **without** setting
 /// `NESTWEAVER_NO_DAEMON`. This is the key difference from `cli_test.rs`'s
 /// `nestweaver_cmd()` — we want the daemon path exercised.
@@ -353,6 +365,40 @@ fn mcp_tool_call_in_mode(
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn mcp_raw_in_mode(db_path: &Path, input: &str, mode: McpMode) -> std::process::Output {
+    let mut command = StdCommand::new(bin_path());
+    command.args(["mcp", "--db", &db_path.display().to_string()]);
+    match mode {
+        McpMode::Direct => {
+            command
+                .env("NESTWEAVER_NO_DAEMON", "1")
+                .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
+        }
+        McpMode::Daemon => {
+            command
+                .env_remove("NESTWEAVER_NO_DAEMON")
+                .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+                .env_remove("NESTWEAVER_UPSTREAM");
+            #[cfg(not(target_os = "macos"))]
+            command.env("NESTWEAVER_DAEMON_FORK", "1");
+        }
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn nestweaver mcp");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().expect("failed to read mcp output")
+}
+
 /// Index a repo, creating the DB. Uses `NESTWEAVER_NO_DAEMON=1`.
 fn create_db(repo_dir: &Path, db_path: &Path) {
     no_daemon_cmd()
@@ -413,6 +459,109 @@ fn index_via_daemon(repo_dir: &Path, db_path: &Path) {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[test]
+fn mcp_jsonrpc_envelope_validation_matches_direct_and_daemon_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("db").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let input = concat!(
+        "{\"jsonrpc\":\"1.0\",\"id\":\"bad-version\",\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":[],\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"string-id\",\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}\n",
+        "[{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"ping\"},",
+        "{\"jsonrpc\":\"2.0\",\"id\":false,\"method\":\"ping\"},",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"},",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"},",
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}]\n",
+    );
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+    let mut baseline: Option<Vec<serde_json::Value>> = None;
+    for (label, mode) in [("direct", McpMode::Direct), ("daemon", McpMode::Daemon)] {
+        let output = mcp_raw_in_mode(&db_path, input, mode);
+        assert!(
+            output.status.success(),
+            "{label} MCP exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let frames: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("stdout line must be one JSON frame"))
+            .collect();
+        assert_eq!(frames.len(), 8, "{label}: notification emitted a frame");
+
+        for frame in &frames[..4] {
+            assert_eq!(frame["jsonrpc"], "2.0");
+            assert_eq!(frame["error"]["code"], -32600);
+        }
+        assert_eq!(frames[0]["id"], "bad-version");
+        for frame in &frames[1..4] {
+            assert_eq!(frame["id"], serde_json::Value::Null);
+        }
+        assert_eq!(frames[4]["id"], serde_json::Value::Null);
+        assert_eq!(frames[4]["result"], serde_json::json!({}));
+        assert_eq!(frames[5]["id"], "string-id");
+        assert_eq!(frames[6]["id"], 42);
+
+        let batch = frames[7]
+            .as_array()
+            .expect("batch response must be an array");
+        assert_eq!(batch.len(), 4, "batch notification must be omitted");
+        assert_eq!(batch[0]["error"]["code"], -32600);
+        assert_eq!(batch[0]["id"], 1);
+        assert_eq!(batch[1]["error"]["code"], -32600);
+        assert_eq!(batch[1]["id"], serde_json::Value::Null);
+        assert_eq!(batch[2]["id"], serde_json::Value::Null);
+        assert_eq!(batch[2]["result"], serde_json::json!({}));
+        assert_eq!(batch[3]["id"], 8);
+
+        if let Some(expected) = &baseline {
+            assert_eq!(&frames, expected, "direct/daemon wire behavior diverged");
+        } else {
+            baseline = Some(frames);
+        }
+    }
+
+    // A ping-only daemon-mode run could false-green through a local fallback.
+    // These fields are injected by the daemon's `brain_status_json` wrapper
+    // and are absent from direct MCP dispatch, so they pin that the proxy half
+    // reached the daemon even for a local UDS daemon (`server_mode == false`).
+    let sentinel = mcp_raw_in_mode(
+        &db_path,
+        "{\"jsonrpc\":\"2.0\",\"id\":\"daemon-sentinel\",\"method\":\"tools/call\",\"params\":{\"name\":\"brain_status\",\"arguments\":{}}}\n",
+        McpMode::Daemon,
+    );
+    assert!(
+        sentinel.status.success(),
+        "daemon MCP sentinel failed: {}",
+        String::from_utf8_lossy(&sentinel.stderr)
+    );
+    let sentinel: serde_json::Value =
+        serde_json::from_slice(&sentinel.stdout).expect("one daemon sentinel response");
+    assert_eq!(sentinel["id"], "daemon-sentinel");
+    let structured = &sentinel["result"]["structuredContent"];
+    assert!(
+        structured.get("embedding_status").is_some(),
+        "daemon brain_status must inject embedding_status: {sentinel}"
+    );
+    assert!(
+        structured.get("queue_depth").is_some(),
+        "daemon brain_status must inject queue_depth: {sentinel}"
+    );
+}
+
+#[test]
 fn daemon_start_stop() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
@@ -441,6 +590,145 @@ fn daemon_start_stop() {
         .assert()
         .success()
         .stdout(contains("not running"));
+}
+
+#[cfg(unix)]
+#[test]
+fn live_daemon_status_pipe_to_head_exits_quietly() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("broken-pipe").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    for args in [
+        vec!["daemon", "--db", db_path.to_str().unwrap(), "status"],
+        vec!["list-repos", "--db", db_path.to_str().unwrap(), "--json"],
+    ] {
+        let output = StdCommand::new(bin_path())
+            .args(&args)
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .stdout(closed_pipe_stdout())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run command with a deterministically closed stdout");
+        assert!(
+            output.status.success(),
+            "closed-stdout command {args:?} exited {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("panicked"), "unexpected panic: {stderr}");
+        assert!(
+            !stderr.contains("failed writing to stdout"),
+            "broken pipe must be quiet: {stderr}"
+        );
+    }
+
+    let mut mcp = StdCommand::new(bin_path())
+        .args(["mcp", "--db", db_path.to_str().unwrap()])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .stdin(Stdio::piped())
+        .stdout(closed_pipe_stdout())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon-proxy MCP with closed stdout");
+    mcp.stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+        .unwrap();
+    let output = mcp.wait_with_output().expect("wait for MCP closed stdout");
+    assert!(
+        output.status.success(),
+        "MCP closed stdout exited {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+
+    let output = StdCommand::new("bash")
+        .args([
+            "-c",
+            "set -o pipefail; \"$1\" daemon --db \"$2\" status | head -n 4",
+            "nestweaver-broken-pipe-test",
+            bin_path().to_str().unwrap(),
+            db_path.to_str().unwrap(),
+        ])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .output()
+        .expect("run daemon status pipeline");
+
+    assert!(
+        output.status.success(),
+        "pipeline exited {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "unexpected panic: {stderr}");
+    assert!(
+        !stderr.contains("failed printing to stdout"),
+        "unexpected stdout diagnostic: {stderr}"
+    );
+
+    for command in [
+        "set -o pipefail; \"$1\" list-repos --db \"$2\" --json | head -n 1",
+        "set -o pipefail; \"$1\" completions bash | head -n 1",
+    ] {
+        let output = StdCommand::new("bash")
+            .args([
+                "-c",
+                command,
+                "nestweaver-broken-pipe-test",
+                bin_path().to_str().unwrap(),
+                db_path.to_str().unwrap(),
+            ])
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .output()
+            .expect("run stdout pipeline");
+        assert!(
+            output.status.success(),
+            "pipeline `{command}` exited {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+            "pipeline `{command}` panicked"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full is available on Linux");
+        let output = StdCommand::new(bin_path())
+            .args(["daemon", "--db", db_path.to_str().unwrap(), "status"])
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .stdout(Stdio::from(full))
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run status with a failing stdout device");
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("failed writing to stdout"),
+            "genuine stdout failure must be diagnostic: {stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "typed failure leaked a panic");
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

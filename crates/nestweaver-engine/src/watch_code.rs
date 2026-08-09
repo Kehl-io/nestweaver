@@ -23,6 +23,7 @@ use nestweaver_store::{GraphScope, GraphStore};
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEvent, new_debouncer};
 
+use crate::content_reader::ContentReader;
 use crate::index::{is_minified_or_bundled, path_in_skip_dir};
 use crate::watcher::ShutdownHandle;
 
@@ -34,6 +35,17 @@ pub struct CodeWatcher {
     repo_root: PathBuf,
     instance_id: String,
     stop_flag: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+enum WatchBatchOutcome {
+    Published { files_processed: usize },
+    Skipped { reason: anyhow::Error },
+}
+
+enum PreparedPath {
+    Replace(Box<PreparedCodeFile>),
+    Delete { rel_path: String },
 }
 
 impl CodeWatcher {
@@ -120,48 +132,9 @@ impl CodeWatcher {
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
-        // Identity decision (see `resolve_watch_identity`): adopt an existing
-        // `file://` graph rather than re-identifying+pruning, so a watch-first
-        // start over a legacy DB never empties the graph.
-        let root_path = self.repo_root.display().to_string();
-        let (repo_url, r_uid) = resolve_watch_identity(&store, &self.instance_id, &self.repo_root)?;
-
-        // Ensure the Repo node exists so incremental updates can attach
-        // File and Symbol nodes. If there's no prior index we create a
-        // minimal Repo node; the watcher will populate it file-by-file.
-        if store.lookup_repo(&r_uid)?.is_none() {
-            let publication = self.establish_graph_publication_with_io(
-                &store,
-                &crate::index::FileSystemIndexEpilogueIo,
-            )?;
-            let insert_result = store
-                .insert_repo(&nestweaver_schema::Repo {
-                    uid: r_uid.clone(),
-                    url: repo_url.clone(),
-                    indexed_sha: "watch".to_string(),
-                    staleness_commits_behind: 0,
-                    instance_id: self.instance_id.clone(),
-                    name: None,
-                    root_path: Some(root_path.clone()),
-                })
-                .context("insert initial Repo node");
-            let finalization = self.finalize_graph_publication_with_io(
-                publication,
-                &crate::index::FileSystemIndexEpilogueIo,
-            );
-            match (insert_result, finalization) {
-                (Ok(()), Ok(())) => {}
-                (Err(error), Ok(())) => return Err(error),
-                (Ok(()), Err(error)) => return Err(error.into()),
-                (Err(error), Err(finalization)) => {
-                    return Err(error.context(format!(
-                        "initial Repo insert also failed mandatory publication: {finalization}"
-                    )));
-                }
-            }
-        }
-
-        // Channel from the debouncer into our loop.
+        // Register before inspecting or cold-indexing the tree. Events that
+        // race the initial snapshot are queued by the debouncer and replayed
+        // below, closing the former scan-then-watch lost-event window.
         let (tx, rx) = std::sync::mpsc::channel::<DebounceResult>();
         let mut debouncer = new_debouncer(
             Duration::from_secs(2),
@@ -175,11 +148,71 @@ impl CodeWatcher {
             .watch(&self.repo_root, RecursiveMode::Recursive)
             .with_context(|| format!("watch {}", self.repo_root.display()))?;
 
+        // Identity decision (see `resolve_watch_identity`): adopt an existing
+        // `file://` graph rather than re-identifying+pruning, so a watch-first
+        // start over a legacy DB never empties the graph.
+        let (repo_url, r_uid) = resolve_watch_identity(&store, &self.instance_id, &self.repo_root)?;
+
+        // A contract plan is a whole-repo view and must never point at
+        // unchanged controllers that a minimal watch-first graph omitted.
+        // Cold watchers therefore publish an authoritative initial source +
+        // contract snapshot through the exact same atomic batch seam.
+        if store.lookup_repo(&r_uid)?.is_none() {
+            loop {
+                let reader = crate::content_reader::FilesystemReader::new(&self.repo_root);
+                let initial_paths: Vec<PathBuf> = reader
+                    .list_files()
+                    .context("list files for initial watcher snapshot")?
+                    .into_iter()
+                    .map(|path| self.repo_root.join(path))
+                    .filter(|path| is_watcher_input(path))
+                    .filter(|path| !path_in_skip_dir(path))
+                    .filter(|path| !is_minified_or_bundled(path))
+                    .collect();
+                match self.process_batch_and_notify(
+                    &store,
+                    &r_uid,
+                    &repo_url,
+                    &initial_paths,
+                    &crate::index::FileSystemIndexEpilogueIo,
+                    on_change.as_deref().map(|callback| callback as &dyn Fn()),
+                )? {
+                    WatchBatchOutcome::Published { .. } => break,
+                    WatchBatchOutcome::Skipped { reason } => {
+                        // A save racing the cold snapshot is expected to be
+                        // queued because notification was registered first.
+                        // Wait through one debounce window, discard those
+                        // paths, and rebuild the authoritative whole-repo
+                        // snapshot. If no event arrives, this is a stable bad
+                        // input rather than a race and startup fails clearly.
+                        match rx.recv_timeout(Duration::from_millis(2250)) {
+                            Ok(Ok(_)) => {
+                                let _ = drain_queued_events(&rx);
+                                continue;
+                            }
+                            Ok(Err(error)) => {
+                                return Err(anyhow::Error::new(error).context(
+                                    "notification failed while retrying initial watcher snapshot",
+                                ));
+                            }
+                            Err(_) => {
+                                return Err(reason.context(
+                                    "cannot start code watcher without an authoritative initial graph",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::info!(
             repo = %self.repo_root.display(),
             db = %self.db_path.display(),
             "CodeWatcher running"
         );
+
+        let mut replay_batch = drain_queued_events(&rx);
 
         loop {
             if self.stop_flag.load(Ordering::Relaxed) {
@@ -187,38 +220,42 @@ impl CodeWatcher {
                 return Ok(());
             }
 
-            let batch = match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(Ok(events)) => events,
-                Ok(Err(err)) => {
-                    if !self.repo_root.exists() {
-                        tracing::error!(
-                            repo = %self.repo_root.display(),
-                            "repo root no longer exists; watcher exiting"
-                        );
-                        return Err(anyhow::anyhow!(
-                            "repo root '{}' was deleted or unmounted",
-                            self.repo_root.display()
-                        ));
+            let batch = if !replay_batch.is_empty() {
+                std::mem::take(&mut replay_batch)
+            } else {
+                match rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(Ok(events)) => events,
+                    Ok(Err(err)) => {
+                        if !self.repo_root.exists() {
+                            tracing::error!(
+                                repo = %self.repo_root.display(),
+                                "repo root no longer exists; watcher exiting"
+                            );
+                            return Err(anyhow::anyhow!(
+                                "repo root '{}' was deleted or unmounted",
+                                self.repo_root.display()
+                            ));
+                        }
+                        tracing::warn!("notify error: {err}");
+                        continue;
                     }
-                    tracing::warn!("notify error: {err}");
-                    continue;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if !self.repo_root.exists() {
-                        tracing::error!(
-                            repo = %self.repo_root.display(),
-                            "repo root vanished during watch; exiting"
-                        );
-                        return Err(anyhow::anyhow!(
-                            "repo root '{}' was deleted or unmounted",
-                            self.repo_root.display()
-                        ));
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if !self.repo_root.exists() {
+                            tracing::error!(
+                                repo = %self.repo_root.display(),
+                                "repo root vanished during watch; exiting"
+                            );
+                            return Err(anyhow::anyhow!(
+                                "repo root '{}' was deleted or unmounted",
+                                self.repo_root.display()
+                            ));
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    tracing::warn!("code debouncer disconnected; exiting");
-                    return Ok(());
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::warn!("code debouncer disconnected; exiting");
+                        return Ok(());
+                    }
                 }
             };
 
@@ -229,11 +266,14 @@ impl CodeWatcher {
                 unique_paths.insert(event.path.clone());
             }
 
-            // Filter to supported source files not in skip dirs.
+            // Contract specs are first-class watcher inputs even though they
+            // are not parser-supported source files. A spec-only edit must
+            // refresh the derived Contract nodes and IMPLEMENTS_CONTRACT
+            // edges just like an ordinary incremental index.
             let relevant: Vec<PathBuf> = unique_paths
                 .into_iter()
                 .filter(|p| !path_in_skip_dir(p))
-                .filter(|p| is_supported_source(p))
+                .filter(|p| is_watcher_input(p))
                 .filter(|p| !is_minified_or_bundled(p))
                 .collect();
 
@@ -241,79 +281,83 @@ impl CodeWatcher {
                 continue;
             }
 
-            // Publish a dirty marker and reserve N+1 before the first graph
-            // mutation. Any later error leaves reopen fail-closed until the
-            // mandatory N+2 finalization completes.
-            let publication = self.establish_graph_publication_with_io(
-                &store,
-                &crate::index::FileSystemIndexEpilogueIo,
-            )?;
-
             let start = Instant::now();
-            // Per-file PRE-mutation failures are logged and skipped inside
-            // `reindex_paths`: a single unreadable file must not kill the
-            // watch session (the next edit batch retries), and because the
-            // reindex re-parses BEFORE deleting, a failed file keeps its
-            // previous graph data instead of vanishing from the graph while
-            // still on disk. A POST-mutation failure (delete landed, later
-            // insert failed) is different: the graph holds partial data, so
-            // the batch is reported as failed after publication finalizes —
-            // it must not look cleanly successful.
-            let (files_processed, batch_error) = self.reindex_paths(&store, &r_uid, &relevant);
-
-            let finalization = self.finalize_graph_publication_with_io(
-                publication,
+            let outcome = self.process_batch_and_notify(
+                &store,
+                &r_uid,
+                &repo_url,
+                &relevant,
                 &crate::index::FileSystemIndexEpilogueIo,
-            );
-            if finalization.is_ok() && batch_error.is_none() {
-                let duration = start.elapsed();
-                tracing::info!(
-                    files_processed,
-                    elapsed_secs = format!("{:.1}", duration.as_secs_f64()),
-                    "Re-indexed {} file(s) ({:.1}s)",
-                    files_processed,
-                    duration.as_secs_f64()
-                );
-
-                if let Some(ref cb) = on_change {
-                    cb();
+                on_change.as_deref().map(|callback| callback as &dyn Fn()),
+            )?;
+            let files_processed = match outcome {
+                WatchBatchOutcome::Published { files_processed } => files_processed,
+                WatchBatchOutcome::Skipped { reason } => {
+                    tracing::warn!(
+                        error = %reason,
+                        "skipping transient watcher batch before publication; previous graph preserved"
+                    );
+                    continue;
                 }
-            }
-            if let Err(error) = finalization {
-                anyhow::bail!("code watcher batch failed mandatory graph publication: {error}");
-            }
-            if let Some(error) = batch_error {
-                anyhow::bail!(
-                    "code watcher batch partially failed mid-mutation (partial index data; \
-                     the next edit retries, or repair with `nestweaver index --force`): {error}"
-                );
-            }
+            };
+            let duration = start.elapsed();
+            tracing::info!(
+                files_processed,
+                elapsed_secs = format!("{:.1}", duration.as_secs_f64()),
+                "Re-indexed {} file(s) ({:.1}s)",
+                files_processed,
+                duration.as_secs_f64()
+            );
+
+            // Notification is coupled to the published outcome by
+            // `process_batch_and_notify`; skipped/dirty batches cannot emit a
+            // false-positive SSE change event.
         }
     }
 
-    /// Re-index one batch of changed paths against the live graph. Returns
-    /// the number of files processed plus the FIRST post-mutation failure,
-    /// if any — a post-mutation failure means the graph holds partial data
-    /// for that file and the batch must not be reported as cleanly
-    /// successful. Mirrors the engine's incremental index
-    /// (`index.rs::incremental_index_with_name_and_io`): nw-008 Phase 0
-    /// collects reverse-dependents from the live graph BEFORE any mutation,
-    /// and Phase 2 re-resolves them afterwards so the cross-file edges the
-    /// per-file `DETACH DELETE` destroys are restored — without this, a
-    /// watcher reindex leaves the file's symbols in place but strips ALL
-    /// their incoming and outgoing cross-file CALLS/IMPORTS edges.
-    fn reindex_paths(
+    /// Prepare and atomically publish one watcher batch.
+    ///
+    /// All whole-repo contract reads and parsing finish before publication is
+    /// established. Source replacement, reverse-dependent resolution, and
+    /// contract replacement then share one transaction. Any failure before
+    /// commit preserves the previously committed graph; because finalization
+    /// is deliberately skipped, `.index-dirty` remains as the durable
+    /// fail-closed signal and callers cannot report success.
+    fn process_batch_with_io(
         &self,
         store: &GraphStore,
         r_uid: &str,
+        repo_url: &str,
         relevant: &[PathBuf],
-    ) -> (usize, Option<anyhow::Error>) {
-        // Partition into changed (still on disk) / removed (deleted), keeping
-        // the absolute path alongside for the mutation loop.
+        epilogue_io: &dyn crate::index::IndexEpilogueIo,
+    ) -> Result<WatchBatchOutcome, anyhow::Error> {
+        self.process_batch_with_io_and_hook(store, r_uid, repo_url, relevant, epilogue_io, || {})
+    }
+
+    fn process_batch_with_io_and_hook<F>(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+        relevant: &[PathBuf],
+        epilogue_io: &dyn crate::index::IndexEpilogueIo,
+        after_plan: F,
+    ) -> Result<WatchBatchOutcome, anyhow::Error>
+    where
+        F: FnOnce(),
+    {
+        let insert_initial_repo = store.lookup_repo(r_uid)?.is_none();
+        let reader = crate::content_reader::FilesystemReader::new(&self.repo_root);
+        let contract_plan =
+            match crate::index::prepare_watcher_contract_derivation(&reader, r_uid, repo_url) {
+                Ok(plan) => plan,
+                Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+            };
+        after_plan();
+        let mut prepared_paths = Vec::new();
         let mut changed: HashSet<String> = HashSet::new();
         let mut removed: HashSet<String> = HashSet::new();
-        let mut paths: Vec<PathBuf> = Vec::new();
-        for path in relevant {
+        for path in relevant.iter().filter(|path| is_supported_source(path)) {
             let rel_path = match path.strip_prefix(&self.repo_root) {
                 Ok(r) => r,
                 Err(_) => {
@@ -325,122 +369,218 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            if path.exists() {
-                changed.insert(rel_str);
-            } else {
-                removed.insert(rel_str);
+            match std::fs::metadata(path) {
+                Ok(metadata) if metadata.is_file() => {
+                    let prepared =
+                        match prepare_code_file(&self.repo_root, rel_path, r_uid, repo_url) {
+                            Ok(prepared) => prepared,
+                            Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+                        };
+                    if contract_plan
+                        .input_hashes
+                        .get(&rel_str)
+                        .is_some_and(|expected| expected != &prepared.file.content_hash)
+                    {
+                        return Ok(WatchBatchOutcome::Skipped {
+                            reason: anyhow::anyhow!(
+                                "watched controller changed while contract batch was being prepared: {rel_str}"
+                            ),
+                        });
+                    }
+                    changed.insert(rel_str);
+                    prepared_paths.push(PreparedPath::Replace(Box::new(prepared)));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removed.insert(rel_str.clone());
+                    prepared_paths.push(PreparedPath::Delete { rel_path: rel_str });
+                }
+                Ok(_) => continue,
+                Err(error) => {
+                    return Ok(WatchBatchOutcome::Skipped {
+                        reason: anyhow::Error::new(error)
+                            .context(format!("inspect watched path {}", path.display())),
+                    });
+                }
             }
-            paths.push(path.clone());
+        }
+
+        let final_contract_snapshot = match crate::index::watcher_contract_input_snapshot(&reader) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+        };
+        if final_contract_snapshot != contract_plan.observed_input_hashes {
+            return Ok(WatchBatchOutcome::Skipped {
+                reason: anyhow::anyhow!(
+                    "contract inputs changed after watcher plan while changed paths were frozen"
+                ),
+            });
         }
 
         // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph,
         // BEFORE any mutation (the per-file `DETACH DELETE` destroys the
         // edges this query walks).
         let rdeps = crate::index::collect_reverse_dep_files(store, r_uid, &changed, &removed);
+        let replacement_symbols: Vec<_> = prepared_paths
+            .iter()
+            .filter_map(|path| match path {
+                PreparedPath::Replace(file) => Some(file.symbols.iter()),
+                PreparedPath::Delete { .. } => None,
+            })
+            .flatten()
+            .cloned()
+            .collect();
+        let prepared_file_data: std::collections::HashMap<_, _> = prepared_paths
+            .iter()
+            .filter_map(|path| match path {
+                PreparedPath::Replace(file) => Some((
+                    file.rel_path.clone(),
+                    (file.raw_symbols.clone(), file.raw_references.clone()),
+                )),
+                PreparedPath::Delete { .. } => None,
+            })
+            .collect();
+        let reresolved_edges = match crate::index::prepare_watcher_reresolve_edges(
+            &reader,
+            store,
+            r_uid,
+            crate::index::WatcherReresolveInputs {
+                changed: &changed,
+                removed: &removed,
+                rdeps: &rdeps,
+                replacement_symbols: &replacement_symbols,
+                prepared_file_data: &prepared_file_data,
+            },
+        ) {
+            Ok(edges) => edges,
+            Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+        };
+
+        // No graph mutation, including a failure marker, occurs before the
+        // complete plan above exists. Once publication starts, every failure
+        // intentionally leaves the dirty marker for reopen reconciliation.
+        let publication = self
+            .establish_graph_publication_with_io(store, epilogue_io)
+            .map_err(anyhow::Error::from)?;
+        reject_recovered_publication(&publication)?;
+        let txn = store
+            .begin_transaction()
+            .context("begin code watcher batch transaction")?;
+        if insert_initial_repo {
+            nestweaver_store::GraphStore::insert_repo_on(
+                &txn,
+                &nestweaver_schema::Repo {
+                    uid: r_uid.to_string(),
+                    url: repo_url.to_string(),
+                    indexed_sha: "watch".to_string(),
+                    staleness_commits_behind: 0,
+                    instance_id: self.instance_id.clone(),
+                    name: None,
+                    root_path: Some(self.repo_root.display().to_string()),
+                },
+            )
+            .context("insert initial watcher Repo node")?;
+        }
 
         let mut files_processed = 0usize;
-        let mut first_post_mutation_error: Option<anyhow::Error> = None;
-        for path in &paths {
-            let rel_path = match path.strip_prefix(&self.repo_root) {
-                Ok(r) => r,
-                Err(_) => continue, // already logged above
-            };
-            let rel_str = rel_path.to_string_lossy();
-
-            if path.exists() {
-                // File was created or modified: re-parse, then replace.
-                match reindex_file(&self.repo_root, rel_path, r_uid, store) {
-                    Ok(Some(syms)) => {
+        for prepared_path in &prepared_paths {
+            match prepared_path {
+                PreparedPath::Replace(prepared) => {
+                    let symbols = apply_prepared_code_file(&txn, r_uid, prepared)
+                        .with_context(|| format!("apply watched file {}", prepared.rel_path))?;
+                    tracing::debug!(path = %prepared.rel_path, symbols, "re-indexed file");
+                    files_processed += 1;
+                }
+                PreparedPath::Delete { rel_path } => {
+                    let removed_count = nestweaver_store::GraphStore::delete_symbols_in_file_on(
+                        &txn, r_uid, rel_path,
+                    )
+                    .with_context(|| format!("delete symbols for removed file {rel_path}"))?;
+                    let f_uid = nestweaver_schema::file_uid(r_uid, rel_path);
+                    nestweaver_store::GraphStore::delete_file_node_on(&txn, &f_uid)
+                        .with_context(|| format!("delete removed File node {rel_path}"))?;
+                    if removed_count > 0 {
                         tracing::debug!(
-                            path = %rel_str,
-                            symbols = syms,
-                            "re-indexed file"
-                        );
-                        files_processed += 1;
-                    }
-                    Ok(None) => {
-                        // Parse failure — old graph data preserved
-                        // (reindex_file deletes only after a successful
-                        // read+parse). Do NOT re-resolve edges for this
-                        // file below: its edges were never deleted, and
-                        // edge insert is CREATE (duplicates).
-                        changed.remove(rel_str.as_ref());
-                    }
-                    Err(ReindexError::PreMutation(e)) => {
-                        // Same keep-old-data treatment for pre-mutation
-                        // read/store errors (delete never landed).
-                        changed.remove(rel_str.as_ref());
-                        tracing::warn!(
-                            path = %rel_str,
-                            error = %e,
-                            "failed to re-index file; keeping previous index data"
+                            path = %rel_path,
+                            removed = removed_count,
+                            "deleted symbols for removed file"
                         );
                     }
-                    Err(ReindexError::PostMutation(e)) => {
-                        // The delete already landed: the graph holds PARTIAL
-                        // data for this file, not the old data. Keep the file
-                        // in `changed` so Phase 2 re-resolves whatever edges
-                        // it can, and report the batch as failed instead of
-                        // publishing it as cleanly successful.
-                        if first_post_mutation_error.is_none() {
-                            first_post_mutation_error = Some(anyhow::anyhow!("{rel_str}: {e}"));
-                        }
-                        tracing::error!(
-                            path = %rel_str,
-                            error = %e,
-                            "re-index failed mid-mutation; graph holds partial data for this file"
-                        );
-                    }
+                    files_processed += 1;
                 }
-            } else {
-                // File was deleted: remove its symbols and File node.
-                let removed_count = match store.delete_symbols_in_file(r_uid, &rel_str) {
-                    Ok(removed) => removed,
-                    Err(error) => {
-                        tracing::warn!("delete symbols for removed file {rel_str}: {error}");
-                        0
-                    }
-                };
-                let f_uid = nestweaver_schema::file_uid(r_uid, &rel_str);
-                if let Err(error) = store.delete_file_node(&f_uid) {
-                    tracing::warn!("delete removed File node {rel_str}: {error}");
-                }
-                if removed_count > 0 {
-                    tracing::debug!(
-                        path = %rel_str,
-                        removed = removed_count,
-                        "deleted symbols for removed file"
-                    );
-                }
-                files_processed += 1;
             }
         }
 
-        // nw-008 Phase 2 — re-resolve reverse-dependents and surgically
-        // restore the cross-file edges the per-file `DETACH DELETE` removed.
-        let reader = crate::content_reader::FilesystemReader::new(&self.repo_root);
-        match crate::index::reresolve_affected_dependents_on_store(
-            &reader, store, r_uid, &changed, &rdeps,
-        ) {
-            Ok(reresolved) if reresolved > 0 => {
-                tracing::info!(
-                    edges = reresolved,
-                    rdeps = rdeps.len(),
-                    "restored cross-file edges via transitive re-resolution"
+        let reresolved = reresolved_edges.len();
+        if !reresolved_edges.is_empty() {
+            nestweaver_store::GraphStore::batch_insert_edges_on(&txn, &reresolved_edges)
+                .context("insert prepared watcher reverse-dependent edges")?;
+        }
+        if reresolved > 0 {
+            tracing::info!(
+                edges = reresolved,
+                rdeps = rdeps.len(),
+                "restored cross-file edges via transitive re-resolution"
+            );
+        }
+
+        if let Err(error) = crate::index::apply_contract_derivation_on(&txn, r_uid, &contract_plan)
+        {
+            drop(txn);
+            if let Err(marker_error) =
+                store.set_contract_derivation_failed(r_uid, &error.to_string())
+            {
+                tracing::warn!(
+                    "recording watcher contract derivation failure failed: {marker_error}"
                 );
             }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!("transitive re-resolution failed: {e:#}");
-            }
+            return Err(error).context("apply watcher contract derivation");
         }
 
-        (files_processed, first_post_mutation_error)
+        store
+            .commit_transaction(&txn)
+            .context("commit code watcher batch transaction")?;
+        drop(txn);
+        if let Err(error) = store.clear_contract_derivation_failed(r_uid) {
+            tracing::warn!("clearing watcher contract derivation marker failed: {error}");
+        }
+        self.finalize_graph_publication_with_io(publication, epilogue_io)
+            .map_err(anyhow::Error::from)?;
+        Ok(WatchBatchOutcome::Published { files_processed })
+    }
+
+    fn process_batch_and_notify(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+        relevant: &[PathBuf],
+        epilogue_io: &dyn crate::index::IndexEpilogueIo,
+        on_change: Option<&dyn Fn()>,
+    ) -> Result<WatchBatchOutcome, anyhow::Error> {
+        let outcome = self.process_batch_with_io(store, r_uid, repo_url, relevant, epilogue_io)?;
+        if matches!(outcome, WatchBatchOutcome::Published { .. })
+            && let Some(callback) = on_change
+        {
+            callback();
+        }
+        Ok(outcome)
     }
 }
 
 /// The debouncer callback type.
 type DebounceResult = Result<Vec<DebouncedEvent>, notify::Error>;
+
+fn drain_queued_events(rx: &std::sync::mpsc::Receiver<DebounceResult>) -> Vec<DebouncedEvent> {
+    let mut events = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(mut queued)) => events.append(&mut queued),
+            Ok(Err(error)) => tracing::warn!("notify error queued during watcher startup: {error}"),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return events,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return events,
+        }
+    }
+}
 
 /// Decide the repo identity `(url, uid)` the watcher indexes under.
 ///
@@ -496,73 +636,51 @@ fn is_supported_source(path: &Path) -> bool {
     detect_language(path).is_some()
 }
 
-/// Parse a single source file and insert its File node, Symbol nodes, and
-/// edges. Returns `Ok(Some(n))` when the file was re-indexed (n symbols
-/// inserted), or `Ok(None)` when the reindex was SKIPPED and the file's
-/// previous graph data was kept. Mirrors the logic in
-/// `index.rs::process_added_or_modified_file`.
-///
-/// The file is read and parsed BEFORE any graph mutation: on a read or
-/// parse failure the file's previous symbols stay in the graph. The old
-/// code deleted the file's symbols first, so a transient read error (or a
-/// mid-save partial write) left the file's symbols deleted from the graph
-/// while the file was still on disk.
-fn reindex_file(
+fn is_watcher_input(path: &Path) -> bool {
+    is_supported_source(path) || crate::contracts::is_spec_file(&path.to_string_lossy())
+}
+
+struct PreparedCodeFile {
+    rel_path: String,
+    file: nestweaver_schema::File,
+    symbols: Vec<nestweaver_schema::Symbol>,
+    file_symbol_edges: Vec<(String, String)>,
+    resolved_edges: Vec<nestweaver_schema::ResolvedEdge>,
+    raw_symbols: Vec<nestweaver_parser::RawSymbol>,
+    raw_references: Vec<nestweaver_parser::RawReference>,
+}
+
+/// Read, parse, resolve, and annotate a watched source before publication.
+/// The returned object owns every row needed by the transaction, eliminating
+/// the read/delete/re-read race that could otherwise erase a transiently
+/// malformed half-save.
+fn prepare_code_file(
     repo_root: &Path,
     rel_path: &Path,
     r_uid: &str,
-    store: &GraphStore,
-) -> Result<Option<usize>, ReindexError> {
+    repo_url: &str,
+) -> Result<PreparedCodeFile, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol, parse_source};
     use nestweaver_resolver::{discover_workspace_context, resolve_references_with_context};
-    use nestweaver_schema::{File, Symbol, file_uid, symbol_uid};
+    use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
 
     let abs_path = repo_root.join(rel_path);
     let rel_str = rel_path.to_string_lossy().into_owned();
 
-    let source = std::fs::read_to_string(&abs_path).map_err(|e| {
-        ReindexError::PreMutation(anyhow::anyhow!("read {}: {e}", abs_path.display()))
-    })?;
-
-    let parsed = match parse_source(&abs_path, &source) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(path = %abs_path.display(), "parse error: {e}; keeping previous index data");
-            return Ok(None);
-        }
-    };
-
-    // Only now that the fresh parse is in hand: drop the stale symbols.
-    // From this point on the file's graph data is being MUTATED — a failure
-    // here is not "kept previous data".
-    let removed = store.delete_symbols_in_file(r_uid, &rel_str).map_err(|e| {
-        ReindexError::PostMutation(anyhow::anyhow!("delete_symbols_in_file {rel_str}: {e}"))
-    })?;
-    if removed > 0 {
-        tracing::debug!(
-            path = %rel_str,
-            removed,
-            "removed stale symbols before re-index"
-        );
-    }
+    let source = std::fs::read_to_string(&abs_path)
+        .with_context(|| format!("read watched source {}", abs_path.display()))?;
+    let parsed = parse_source(&abs_path, &source)
+        .with_context(|| format!("parse watched source {}", abs_path.display()))?;
 
     let content_hash = crate::hash::blake3_hex(&source);
     let f_uid = file_uid(r_uid, &rel_str);
 
-    // Insert or replace the File node.
     let file = File {
         uid: f_uid.clone(),
         path: rel_str.clone(),
         repo_uid: r_uid.to_string(),
         content_hash,
     };
-    store
-        .insert_file(&file)
-        .map_err(|e| ReindexError::PostMutation(anyhow::anyhow!("insert_file {rel_str}: {e}")))?;
-    store.insert_repo_file_edge(r_uid, &f_uid).map_err(|e| {
-        ReindexError::PostMutation(anyhow::anyhow!("insert_repo_file_edge {rel_str}: {e}"))
-    })?;
-
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut file_sym_pairs: Vec<(String, String)> = Vec::new();
 
@@ -606,6 +724,7 @@ fn reindex_file(
 
     for (sym_idx, raw_sym) in parsed.symbols.iter().enumerate() {
         let s_uid = symbol_uid(r_uid, &rel_str, &raw_sym.name, raw_sym.start_line);
+        let scope = raw_sym.scope_chain.as_deref().unwrap_or("");
         let sym = Symbol {
             uid: s_uid.clone(),
             name: raw_sym.name.clone(),
@@ -624,31 +743,19 @@ fn reindex_file(
             visibility: raw_sym.visibility,
             type_info: raw_sym.type_info.clone(),
             framework_hint: hint_by_index.remove(&sym_idx),
-            canonical_id: None,
+            canonical_id: Some(canonical_symbol_id(
+                repo_url,
+                &rel_str,
+                &raw_sym.name,
+                scope,
+            )),
         };
         symbols.push(sym);
         file_sym_pairs.push((f_uid.clone(), s_uid));
     }
 
-    let sym_count = symbols.len();
-
-    store.batch_insert_symbols(&symbols).map_err(|e| {
-        ReindexError::PostMutation(anyhow::anyhow!("batch_insert_symbols {rel_str}: {e}"))
-    })?;
-
-    let file_sym_refs: Vec<(&str, &str)> = file_sym_pairs
-        .iter()
-        .map(|(f, s)| (f.as_str(), s.as_str()))
-        .collect();
-    store
-        .batch_insert_file_symbol_edges(&file_sym_refs)
-        .map_err(|e| {
-            ReindexError::PostMutation(anyhow::anyhow!(
-                "batch_insert_file_symbol_edges {rel_str}: {e}"
-            ))
-        })?;
-
-    // Resolve cross-file edges within this file.
+    // Resolve cross-file edges within this file while the source snapshot is
+    // still the exact snapshot represented by `symbols`.
     let lang = detect_language(&abs_path).unwrap_or(nestweaver_schema::Language::JavaScript);
 
     // Load workspace context for JS/TS monorepo resolution.
@@ -672,37 +779,54 @@ fn reindex_file(
     )];
     let resolved_edges =
         resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
-    let insertable_edges: Vec<_> = resolved_edges
+    let resolved_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
         .collect();
-    if !insertable_edges.is_empty() {
-        store.batch_insert_edges(&insertable_edges).map_err(|e| {
-            ReindexError::PostMutation(anyhow::anyhow!("batch_insert_edges {rel_str}: {e}"))
-        })?;
-    }
 
-    Ok(Some(sym_count))
+    Ok(PreparedCodeFile {
+        rel_path: rel_str,
+        file,
+        symbols,
+        file_symbol_edges: file_sym_pairs,
+        resolved_edges,
+        raw_symbols: parsed.symbols,
+        raw_references: parsed.references,
+    })
 }
 
-/// Why a watcher re-index of one file failed, split by whether the file's
-/// graph data had already been mutated. Callers must NOT treat a
-/// `PostMutation` failure as "previous data preserved": the
-/// delete already landed, so the graph holds partial data for the file and
-/// the batch must not publish as cleanly successful.
-enum ReindexError {
-    /// Failed before any mutation (read/parse/delete) — old graph data intact.
-    PreMutation(anyhow::Error),
-    /// Failed after the file's symbols were deleted — partial data.
-    PostMutation(anyhow::Error),
+fn apply_prepared_code_file(
+    txn: &nestweaver_store::DbConnection<'_>,
+    r_uid: &str,
+    prepared: &PreparedCodeFile,
+) -> Result<usize, anyhow::Error> {
+    nestweaver_store::GraphStore::delete_symbols_in_file_on(txn, r_uid, &prepared.rel_path)?;
+    let old_file_uid = nestweaver_schema::file_uid(r_uid, &prepared.rel_path);
+    nestweaver_store::GraphStore::delete_file_node_on(txn, &old_file_uid)?;
+    nestweaver_store::GraphStore::insert_file_on(txn, &prepared.file)?;
+    nestweaver_store::GraphStore::insert_repo_file_edge_on(txn, r_uid, &prepared.file.uid)?;
+    nestweaver_store::GraphStore::batch_insert_symbols_on(txn, &prepared.symbols)?;
+    let file_symbol_edges: Vec<(&str, &str)> = prepared
+        .file_symbol_edges
+        .iter()
+        .map(|(file, symbol)| (file.as_str(), symbol.as_str()))
+        .collect();
+    nestweaver_store::GraphStore::batch_insert_file_symbol_edges_on(txn, &file_symbol_edges)?;
+    if !prepared.resolved_edges.is_empty() {
+        nestweaver_store::GraphStore::batch_insert_edges_on(txn, &prepared.resolved_edges)?;
+    }
+    Ok(prepared.symbols.len())
 }
 
-impl std::fmt::Display for ReindexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PreMutation(e) | Self::PostMutation(e) => write!(f, "{e}"),
-        }
+fn reject_recovered_publication(
+    publication: &nestweaver_store::IndexPublicationLease<'_>,
+) -> Result<(), anyhow::Error> {
+    if publication.is_recovered() {
+        anyhow::bail!(
+            "code watcher found an incomplete prior index publication; refusing to retire unknown dirty state (repair with `nestweaver index --force`)"
+        );
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -806,6 +930,25 @@ mod tests {
         assert!(!path_in_skip_dir(p));
     }
 
+    #[test]
+    fn startup_event_drain_replays_every_queued_batch() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(vec![DebouncedEvent::new(
+            PathBuf::from("openapi.yaml"),
+            notify_debouncer_mini::DebouncedEventKind::Any,
+        )]))
+        .unwrap();
+        tx.send(Ok(vec![DebouncedEvent::new(
+            PathBuf::from("ItemsController.java"),
+            notify_debouncer_mini::DebouncedEventKind::Any,
+        )]))
+        .unwrap();
+        let replay = drain_queued_events(&rx);
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].path, PathBuf::from("openapi.yaml"));
+        assert_eq!(replay[1].path, PathBuf::from("ItemsController.java"));
+    }
+
     /// Index a small JS fixture repo (a.js ← b.js ← c.js) into an in-memory
     /// store under its `file://` identity, returning the store, repo uid,
     /// and canonical repo root.
@@ -836,6 +979,28 @@ mod tests {
         (store, r_uid, canonical_root)
     }
 
+    fn index_contract_fixture(dir: &tempfile::TempDir) -> (GraphStore, String, String, PathBuf) {
+        let repo_root = dir.path().join("contract-repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            repo_root.join("openapi.yaml"),
+            "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /v1/items:\n    get:\n      responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_root.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n}\n",
+        )
+        .unwrap();
+        let canonical_root = std::fs::canonicalize(&repo_root).unwrap();
+        let repo_url = format!("file://{}", canonical_root.display());
+        let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
+        let (_result, store) =
+            crate::index::index_directory_in_memory(&canonical_root, "test", &repo_url, "sha1")
+                .unwrap();
+        (store, r_uid, repo_url, canonical_root)
+    }
+
     fn uid_of(store: &GraphStore, r_uid: &str, name: &str) -> String {
         store
             .lookup_symbols_by_repo(r_uid)
@@ -844,6 +1009,24 @@ mod tests {
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("symbol {name} should be indexed"))
             .uid
+    }
+
+    fn process_fixture_batch(
+        watcher: &CodeWatcher,
+        store: &GraphStore,
+        r_uid: &str,
+        root: &Path,
+        paths: &[PathBuf],
+    ) -> WatchBatchOutcome {
+        watcher
+            .process_batch_with_io(
+                store,
+                r_uid,
+                &format!("file://{}", root.display()),
+                paths,
+                &crate::index::FileSystemIndexEpilogueIo,
+            )
+            .unwrap()
     }
 
     /// Regression (CRITICAL — edge loss across watch reindex): a watcher
@@ -885,9 +1068,18 @@ mod tests {
         )
         .unwrap();
         let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
-        let (processed, batch_error) =
-            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
-        assert!(batch_error.is_none(), "{batch_error:?}");
+        let WatchBatchOutcome::Published {
+            files_processed: processed,
+        } = process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &canonical_root,
+            &[canonical_root.join("src/b.js")],
+        )
+        else {
+            panic!("valid watcher batch must publish")
+        };
         assert_eq!(processed, 1);
 
         // THE critical assertions: outgoing (alpha→helper) and incoming
@@ -927,14 +1119,15 @@ mod tests {
         )
         .unwrap();
         let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
-        let (processed, batch_error) =
-            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
-        assert!(batch_error.is_none(), "{batch_error:?}");
-
-        assert_eq!(
-            processed, 0,
-            "an unreadable file is skipped, not half-processed"
-        );
+        let WatchBatchOutcome::Skipped { .. } = process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &canonical_root,
+            &[canonical_root.join("src/b.js")],
+        ) else {
+            panic!("an unreadable file must skip before publication")
+        };
         assert!(
             store
                 .lookup_symbols_by_repo(&r_uid)
@@ -960,9 +1153,18 @@ mod tests {
             "import { helper } from './a.js';\nexport function alpha() { return helper() + 3; }\n",
         )
         .unwrap();
-        let (processed, batch_error) =
-            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
-        assert!(batch_error.is_none(), "{batch_error:?}");
+        let WatchBatchOutcome::Published {
+            files_processed: processed,
+        } = process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &canonical_root,
+            &[canonical_root.join("src/b.js")],
+        )
+        else {
+            panic!("valid retry must publish")
+        };
         assert_eq!(processed, 1, "the batch after a failure must re-index");
         let alpha_uid = uid_of(&store, &r_uid, "alpha");
         assert!(
@@ -985,10 +1187,18 @@ mod tests {
 
         std::fs::remove_file(canonical_root.join("src/b.js")).unwrap();
         let watcher = CodeWatcher::new(dir.path().join("brain.lbug"), &canonical_root, "test");
-        let (processed, batch_error) =
-            watcher.reindex_paths(&store, &r_uid, &[canonical_root.join("src/b.js")]);
-        assert!(batch_error.is_none(), "{batch_error:?}");
-
+        let WatchBatchOutcome::Published {
+            files_processed: processed,
+        } = process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &canonical_root,
+            &[canonical_root.join("src/b.js")],
+        )
+        else {
+            panic!("delete batch must publish")
+        };
         assert_eq!(processed, 1);
         assert!(
             !store
@@ -1006,6 +1216,400 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "helper" || s.name == "gamma"),
         );
+    }
+
+    #[test]
+    fn spec_only_watcher_batch_refreshes_contract_source_and_notifies_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, repo_url, root) = index_contract_fixture(&dir);
+        let old = root.join("openapi.yaml");
+        let renamed = root.join("openapi.v2.yaml");
+        std::fs::rename(&old, &renamed).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+        let notifications = AtomicUsize::new(0);
+
+        let outcome = watcher
+            .process_batch_and_notify(
+                &store,
+                &r_uid,
+                &repo_url,
+                &[old, renamed],
+                &crate::index::FileSystemIndexEpilogueIo,
+                Some(&|| {
+                    notifications.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            WatchBatchOutcome::Published { files_processed: 0 }
+        ));
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        let get = store
+            .list_contracts(Some(&r_uid))
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.uid == "contract:http:GET:/v1/items")
+            .unwrap();
+        assert_eq!(get.source_path, "openapi.v2.yaml");
+        assert!(
+            store
+                .list_implemented_contract_uids()
+                .unwrap()
+                .contains(&get.uid)
+        );
+    }
+
+    #[test]
+    fn controller_and_spec_batch_publish_matching_edges_and_symbol_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, repo_url, root) = index_contract_fixture(&dir);
+        let spec = root.join("openapi.yaml");
+        let controller = root.join("ItemsController.java");
+        std::fs::write(
+            &spec,
+            "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /v1/items:\n    get:\n      responses: { \"200\": { description: ok } }\n    post:\n      responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &controller,
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n  @PostMapping\n  public void create() {}\n}\n",
+        )
+        .unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+        let notifications = AtomicUsize::new(0);
+
+        let outcome = watcher
+            .process_batch_and_notify(
+                &store,
+                &r_uid,
+                &repo_url,
+                &[spec, controller],
+                &crate::index::FileSystemIndexEpilogueIo,
+                Some(&|| {
+                    notifications.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            WatchBatchOutcome::Published { files_processed: 1 }
+        ));
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        let symbols = store.lookup_symbols_by_repo(&r_uid).unwrap();
+        let create = symbols
+            .iter()
+            .find(|symbol| symbol.name == "create")
+            .expect("modified controller method must publish");
+        assert!(create.canonical_id.is_some());
+        assert_eq!(
+            store.contracts_implemented_by(&create.uid).unwrap()[0].0,
+            "contract:http:POST:/v1/items"
+        );
+        let controller_class = symbols
+            .iter()
+            .find(|symbol| symbol.name == "ItemsController")
+            .unwrap();
+        assert_eq!(
+            controller_class
+                .framework_hint
+                .as_ref()
+                .map(|hint| hint.role.as_str()),
+            Some("controller")
+        );
+    }
+
+    #[test]
+    fn malformed_spec_skips_before_publication_and_preserves_contracts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, repo_url, root) = index_contract_fixture(&dir);
+        let spec = root.join("openapi.yaml");
+        let before: Vec<_> = store
+            .list_contracts(Some(&r_uid))
+            .unwrap()
+            .into_iter()
+            .map(|contract| (contract.uid, contract.source_path))
+            .collect();
+        std::fs::write(&spec, "openapi: [unfinished").unwrap();
+        let db_path = dir.path().join("watch.lbug");
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let notifications = AtomicUsize::new(0);
+
+        let outcome = watcher
+            .process_batch_and_notify(
+                &store,
+                &r_uid,
+                &repo_url,
+                &[spec],
+                &crate::index::FileSystemIndexEpilogueIo,
+                Some(&|| {
+                    notifications.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        let after: Vec<_> = store
+            .list_contracts(Some(&r_uid))
+            .unwrap()
+            .into_iter()
+            .map(|contract| (contract.uid, contract.source_path))
+            .collect();
+        assert_eq!(after, before);
+        assert!(!crate::sidecar_path(&db_path, ".index-dirty").exists());
+    }
+
+    #[test]
+    fn final_snapshot_rejects_after_plan_spec_and_controller_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, repo_url, root) = index_contract_fixture(&dir);
+        let db_path = dir.path().join("watch.lbug");
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let spec = root.join("openapi.yaml");
+        let controller = root.join("ItemsController.java");
+        let spec_get = std::fs::read_to_string(&spec).unwrap();
+        let controller_get = std::fs::read_to_string(&controller).unwrap();
+        let spec_post = "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /v1/items:\n    post:\n      responses: { \"200\": { description: ok } }\n";
+        let controller_post = "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController { @PostMapping public void create() {} }\n";
+
+        let outcome = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &r_uid,
+                &repo_url,
+                std::slice::from_ref(&spec),
+                &crate::index::FileSystemIndexEpilogueIo,
+                || std::fs::write(&spec, spec_post).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        std::fs::write(&spec, &spec_get).unwrap();
+
+        let outcome = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &r_uid,
+                &repo_url,
+                std::slice::from_ref(&spec),
+                &crate::index::FileSystemIndexEpilogueIo,
+                || std::fs::remove_file(&spec).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        std::fs::write(&spec, &spec_get).unwrap();
+
+        let created_spec = root.join("openapi.v2.yaml");
+        let outcome = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &r_uid,
+                &repo_url,
+                std::slice::from_ref(&spec),
+                &crate::index::FileSystemIndexEpilogueIo,
+                || std::fs::write(&created_spec, spec_post).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        std::fs::remove_file(&created_spec).unwrap();
+
+        let outcome = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &r_uid,
+                &repo_url,
+                std::slice::from_ref(&controller),
+                &crate::index::FileSystemIndexEpilogueIo,
+                || std::fs::write(&controller, controller_post).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        std::fs::write(&controller, &controller_get).unwrap();
+
+        let outcome = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &r_uid,
+                &repo_url,
+                std::slice::from_ref(&controller),
+                &crate::index::FileSystemIndexEpilogueIo,
+                || std::fs::remove_file(&controller).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        std::fs::write(&controller, &controller_get).unwrap();
+
+        let created_controller = root.join("NewController.java");
+        let outcome = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &r_uid,
+                &repo_url,
+                std::slice::from_ref(&controller),
+                &crate::index::FileSystemIndexEpilogueIo,
+                || std::fs::write(&created_controller, controller_post).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        assert!(!crate::sidecar_path(&db_path, ".index-dirty").exists());
+    }
+
+    #[test]
+    fn contract_apply_failure_rolls_back_source_and_stays_dirty_without_notification() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, repo_url, root) = index_contract_fixture(&dir);
+        store
+            .batch_insert_contracts(&[nestweaver_schema::Contract {
+                uid: "contract:http:POST:/v1/items".into(),
+                kind: "http".into(),
+                verb: Some("POST".into()),
+                path: Some("/v1/items".into()),
+                operation_id: None,
+                repo_uid: "repo:other".into(),
+                source_path: "openapi.yaml".into(),
+                confidence: 1.0,
+            }])
+            .unwrap();
+        std::fs::write(
+            root.join("openapi.yaml"),
+            "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /v1/items:\n    get:\n      responses: { \"200\": { description: ok } }\n    post:\n      responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        let controller = root.join("ItemsController.java");
+        std::fs::write(
+            &controller,
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping public void list() {}\n  @PostMapping public void create() {}\n}\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("watch.lbug");
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let notifications = AtomicUsize::new(0);
+
+        let error = watcher
+            .process_batch_and_notify(
+                &store,
+                &r_uid,
+                &repo_url,
+                &[controller, root.join("openapi.yaml")],
+                &crate::index::FileSystemIndexEpilogueIo,
+                Some(&|| {
+                    notifications.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("apply watcher contract derivation")
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
+        assert_eq!(
+            store
+                .lookup_symbols_by_repo(&r_uid)
+                .unwrap()
+                .iter()
+                .filter(|symbol| symbol.name == "create")
+                .count(),
+            0,
+            "source mutation must roll back with contract replacement"
+        );
+        assert_eq!(store.list_contracts(Some(&r_uid)).unwrap().len(), 1);
+        assert_eq!(
+            store.contract_derivation_failures(Some(&r_uid)).unwrap(),
+            vec![r_uid]
+        );
+    }
+
+    #[test]
+    fn fresh_watcher_batch_builds_authoritative_source_and_contract_graph() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("fresh-repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            repo_root.join("openapi.yaml"),
+            "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /fresh:\n    get:\n      responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_root.join("FreshController.java"),
+            "@RestController\n@RequestMapping(\"/fresh\")\npublic class FreshController {\n  @GetMapping public void get() {}\n}\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(repo_root).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
+        let store = GraphStore::in_memory().unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+        let notifications = AtomicUsize::new(0);
+
+        let outcome = watcher
+            .process_batch_and_notify(
+                &store,
+                &r_uid,
+                &repo_url,
+                &[root.join("openapi.yaml"), root.join("FreshController.java")],
+                &crate::index::FileSystemIndexEpilogueIo,
+                Some(&|| {
+                    notifications.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            WatchBatchOutcome::Published { files_processed: 1 }
+        ));
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert!(store.lookup_repo(&r_uid).unwrap().is_some());
+        let get_symbol = store
+            .lookup_symbols_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "get")
+            .expect("cold watcher must index unchanged controller source");
+        assert_eq!(
+            store.contracts_implemented_by(&get_symbol.uid).unwrap()[0].0,
+            "contract:http:GET:/fresh"
+        );
+    }
+
+    #[test]
+    fn recovered_dirty_publication_is_refused_without_graph_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, repo_url, root) = index_contract_fixture(&dir);
+        let db_path = dir.path().join("watch.lbug");
+        let watcher = CodeWatcher::new(&db_path, &root, "test");
+        let publication = watcher
+            .establish_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo)
+            .unwrap();
+        drop(publication);
+        let before = store.list_contracts(Some(&r_uid)).unwrap().len();
+
+        let error = watcher
+            .process_batch_with_io(
+                &store,
+                &r_uid,
+                &repo_url,
+                &[root.join("openapi.yaml")],
+                &crate::index::FileSystemIndexEpilogueIo,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete prior index publication")
+        );
+        assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
+        assert_eq!(store.list_contracts(Some(&r_uid)).unwrap().len(), before);
     }
 
     #[test]
