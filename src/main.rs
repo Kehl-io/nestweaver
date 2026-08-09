@@ -17514,30 +17514,59 @@ fn resolve_contract_repo_filter(
     anyhow::bail!("no indexed repo matches --repo '{filter}'")
 }
 
-/// Human rendering of the daemon `cross_repo_contracts` result (used by
-/// `contracts list` without `--json`), so the daemon path honors the `--json`
-/// flag instead of always dumping raw JSON like the direct-store path's table.
-fn render_cross_repo_contracts_human(value: &serde_json::Value) {
-    match value.get("contracts").and_then(|v| v.as_array()) {
-        Some(rows) if !rows.is_empty() => {
-            let total = value
-                .get("total")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(rows.len() as u64);
-            println!(
-                "Cross-repo contract links ({total} total). NOTE: links are \
-                 hypotheses, not ground truth — see confidence.\n"
-            );
-            for r in rows {
-                let sn = r.get("source_name").and_then(|v| v.as_str()).unwrap_or("?");
-                let tn = r.get("target_name").and_then(|v| v.as_str()).unwrap_or("?");
-                let lt = r.get("link_type").and_then(|v| v.as_str()).unwrap_or("");
-                let conf = r.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                println!("  {sn} -> {tn}  [{lt}, confidence {conf:.2}]");
+fn render_contract_list(
+    contracts: &[nestweaver_schema::Contract],
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(contracts)?);
+    } else if contracts.is_empty() {
+        println!(
+            "No contracts found. Index a repo with OpenAPI/proto/GraphQL specs or \
+             Spring/NestJS controllers first."
+        );
+    } else {
+        println!(
+            "API contracts ({} total). NOTE: contract links are hypotheses, \
+             not ground truth — see confidence.\n",
+            contracts.len()
+        );
+        for contract in contracts {
+            println!("{}", contract.uid);
+            println!("  kind:       {}", contract.kind);
+            if let Some(ref verb) = contract.verb {
+                println!("  verb:       {verb}");
             }
+            if let Some(ref path) = contract.path {
+                println!("  path:       {path}");
+            }
+            if let Some(ref operation) = contract.operation_id {
+                println!("  operation:  {operation}");
+            }
+            println!("  source:     {}", contract.source_path);
+            println!("  confidence: {:.2}", contract.confidence);
+            println!();
         }
-        _ => println!("No cross-repo contract links found."),
     }
+    Ok(())
+}
+
+fn list_contracts_via_daemon(
+    db_path: &std::path::Path,
+    repo: Option<&str>,
+) -> anyhow::Result<Vec<nestweaver_schema::Contract>> {
+    let runtime = tokio::runtime::Runtime::new().context("create runtime for contracts list")?;
+    runtime
+        .block_on(async {
+            let mut client = nestweaver_client::DaemonClient::connect(db_path, None).await?;
+            client.list_contracts(repo).await
+        })
+        .with_context(|| {
+            format!(
+                "daemon contracts list failed for {}; refusing direct-store fallback while the daemon owns the database",
+                db_path.display()
+            )
+        })
 }
 
 /// Human rendering of the daemon `contract_drift` result (`contracts drift`
@@ -17599,61 +17628,22 @@ fn run_contracts(
 ) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         ContractCommands::List { repo, json, db } => {
-            // ── daemon guard ──────────────────────────────────────
-            if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
-                let mut args = serde_json::json!({});
-                if let Some(ref r) = repo {
-                    args["repo"] = serde_json::json!(r);
-                }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "cross_repo_contracts", args)
-                {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        render_cross_repo_contracts_human(&value);
-                    }
-                    return Ok((EXIT_SUCCESS, None));
-                }
-            }
-            let store = open_store(db.as_deref())?;
-            let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
-            let mut contracts = store
-                .list_contracts(repo_uid.as_deref())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            contracts.sort_by(|a, b| a.uid.cmp(&b.uid));
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&contracts)?);
-            } else if contracts.is_empty() {
-                println!(
-                    "No contracts found. Index a repo with OpenAPI/proto/GraphQL specs or \
-                     Spring/NestJS controllers first."
-                );
+            let db_path = db.clone().unwrap_or_else(default_db_path);
+            // Read-only query: reject a typo'd path before daemon autostart can
+            // create an empty database and false-green with an empty list.
+            require_existing_db(&db_path)?;
+            let contracts = if use_daemon {
+                list_contracts_via_daemon(&db_path, repo.as_deref())?
             } else {
-                println!(
-                    "API contracts ({} total). NOTE: contract links are hypotheses, \
-                     not ground truth — see confidence.\n",
-                    contracts.len()
-                );
-                for c in &contracts {
-                    println!("{}", c.uid);
-                    println!("  kind:       {}", c.kind);
-                    if let Some(ref v) = c.verb {
-                        println!("  verb:       {v}");
-                    }
-                    if let Some(ref p) = c.path {
-                        println!("  path:       {p}");
-                    }
-                    if let Some(ref op) = c.operation_id {
-                        println!("  operation:  {op}");
-                    }
-                    println!("  source:     {}", c.source_path);
-                    println!("  confidence: {:.2}", c.confidence);
-                    println!();
-                }
-            }
+                let store = open_store(Some(&db_path))?;
+                let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
+                let mut contracts = store
+                    .list_contracts(repo_uid.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                contracts.sort_by(|left, right| left.uid.cmp(&right.uid));
+                contracts
+            };
+            render_contract_list(&contracts, json)?;
             Ok((EXIT_SUCCESS, None))
         }
         ContractCommands::Drift { repo, json, db } => {

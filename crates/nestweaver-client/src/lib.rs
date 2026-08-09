@@ -652,6 +652,36 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
+    /// List Contract nodes through the daemon, optionally resolving an exact
+    /// repository UID or case-insensitive repository display name there.
+    pub async fn list_contracts(
+        &mut self,
+        repo: Option<&str>,
+    ) -> Result<Vec<nestweaver_schema::Contract>> {
+        let response = self
+            .inner
+            .list_contracts(nestweaver_proto::ListContractsRequest {
+                repo: repo.map(str::to_string),
+            })
+            .await
+            .context("list_contracts RPC failed")?
+            .into_inner();
+        Ok(response
+            .contracts
+            .into_iter()
+            .map(|contract| nestweaver_schema::Contract {
+                uid: contract.uid,
+                kind: contract.kind,
+                verb: contract.verb,
+                path: contract.path,
+                operation_id: contract.operation_id,
+                repo_uid: contract.repo_uid,
+                source_path: contract.source_path,
+                confidence: contract.confidence,
+            })
+            .collect())
+    }
+
     /// The running daemon's own PID, as reported over its socket.
     ///
     /// Cross-check this against a pidfile PID before signaling that PID: a
