@@ -15,6 +15,18 @@ use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
+#[cfg(unix)]
+fn closed_pipe_stdout() -> Stdio {
+    use std::os::fd::FromRawFd;
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create pipe");
+    assert_eq!(unsafe { libc::close(fds[0]) }, 0, "close pipe reader");
+    // SAFETY: pipe returned an owned write descriptor, and Stdio takes sole
+    // ownership through File.
+    let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Stdio::from(writer)
+}
+
 /// Helper: build a `Command` for the `nestweaver` binary **without** setting
 /// `NESTWEAVER_NO_DAEMON`. This is the key difference from `cli_test.rs`'s
 /// `nestweaver_cmd()` — we want the daemon path exercised.
@@ -578,6 +590,145 @@ fn daemon_start_stop() {
         .assert()
         .success()
         .stdout(contains("not running"));
+}
+
+#[cfg(unix)]
+#[test]
+fn live_daemon_status_pipe_to_head_exits_quietly() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("broken-pipe").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    for args in [
+        vec!["daemon", "--db", db_path.to_str().unwrap(), "status"],
+        vec!["list-repos", "--db", db_path.to_str().unwrap(), "--json"],
+    ] {
+        let output = StdCommand::new(bin_path())
+            .args(&args)
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .stdout(closed_pipe_stdout())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run command with a deterministically closed stdout");
+        assert!(
+            output.status.success(),
+            "closed-stdout command {args:?} exited {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("panicked"), "unexpected panic: {stderr}");
+        assert!(
+            !stderr.contains("failed writing to stdout"),
+            "broken pipe must be quiet: {stderr}"
+        );
+    }
+
+    let mut mcp = StdCommand::new(bin_path())
+        .args(["mcp", "--db", db_path.to_str().unwrap()])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .stdin(Stdio::piped())
+        .stdout(closed_pipe_stdout())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon-proxy MCP with closed stdout");
+    mcp.stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+        .unwrap();
+    let output = mcp.wait_with_output().expect("wait for MCP closed stdout");
+    assert!(
+        output.status.success(),
+        "MCP closed stdout exited {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+
+    let output = StdCommand::new("bash")
+        .args([
+            "-c",
+            "set -o pipefail; \"$1\" daemon --db \"$2\" status | head -n 4",
+            "nestweaver-broken-pipe-test",
+            bin_path().to_str().unwrap(),
+            db_path.to_str().unwrap(),
+        ])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .output()
+        .expect("run daemon status pipeline");
+
+    assert!(
+        output.status.success(),
+        "pipeline exited {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "unexpected panic: {stderr}");
+    assert!(
+        !stderr.contains("failed printing to stdout"),
+        "unexpected stdout diagnostic: {stderr}"
+    );
+
+    for command in [
+        "set -o pipefail; \"$1\" list-repos --db \"$2\" --json | head -n 1",
+        "set -o pipefail; \"$1\" completions bash | head -n 1",
+    ] {
+        let output = StdCommand::new("bash")
+            .args([
+                "-c",
+                command,
+                "nestweaver-broken-pipe-test",
+                bin_path().to_str().unwrap(),
+                db_path.to_str().unwrap(),
+            ])
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .output()
+            .expect("run stdout pipeline");
+        assert!(
+            output.status.success(),
+            "pipeline `{command}` exited {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+            "pipeline `{command}` panicked"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full is available on Linux");
+        let output = StdCommand::new(bin_path())
+            .args(["daemon", "--db", db_path.to_str().unwrap(), "status"])
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .stdout(Stdio::from(full))
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run status with a failing stdout device");
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("failed writing to stdout"),
+            "genuine stdout failure must be diagnostic: {stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "typed failure leaked a panic");
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -1,3 +1,86 @@
+static STDOUT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Debug)]
+struct StdoutWriteFailure(std::io::Error);
+
+impl std::fmt::Display for StdoutWriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "failed writing to stdout: {}", self.0)
+    }
+}
+
+impl std::error::Error for StdoutWriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn write_cli_stdout(
+    writer: &mut impl std::io::Write,
+    arguments: std::fmt::Arguments<'_>,
+    newline: bool,
+) -> std::io::Result<()> {
+    writer.write_fmt(arguments)?;
+    if newline {
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn raise_stdout_failure(error: std::io::Error) -> ! {
+    use std::sync::atomic::Ordering;
+    // Set this before unwinding: destructors may print, and a second panic
+    // during unwinding would abort instead of reaching the typed boundary.
+    STDOUT_FAILED.store(true, Ordering::Relaxed);
+    std::panic::resume_unwind(Box::new(StdoutWriteFailure(error)));
+}
+
+struct TypedStdout;
+
+impl std::io::Write for TypedStdout {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match std::io::stdout().lock().write(buffer) {
+            Ok(written) => Ok(written),
+            Err(error) => raise_stdout_failure(error),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match std::io::stdout().lock().flush() {
+            Ok(()) => Ok(()),
+            Err(error) => raise_stdout_failure(error),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn print_cli_stdout(arguments: std::fmt::Arguments<'_>, newline: bool) {
+    use std::sync::atomic::Ordering;
+    if STDOUT_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
+    // TypedStdout converts the otherwise-untyped `io::Error` into the one
+    // unwind payload accepted by the process boundary.
+    let _ = write_cli_stdout(&mut TypedStdout, arguments, newline);
+}
+
+// Keep unit-test output on the standard harness capture path. Production CLI
+// output (including `setup`, declared below) uses the typed stdout boundary.
+#[cfg(not(test))]
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        crate::print_cli_stdout(format_args!($($arg)*), false)
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! println {
+    () => {{ crate::print_cli_stdout(format_args!(""), true) }};
+    ($($arg:tt)*) => {{
+        crate::print_cli_stdout(format_args!($($arg)*), true)
+    }};
+}
+
 mod setup;
 
 use std::io::IsTerminal;
@@ -1407,9 +1490,7 @@ fn print_daemon_embedding_status(db_path: &Path) {
             })
         });
     match result {
-        Ok(status) => {
-            println!("{}", format_daemon_status_response(Ok(&status)));
-        }
+        Ok(status) => println!("{}", format_daemon_status_response(Ok(&status))),
         Err(error) => {
             let error = format!("{error:#}");
             println!("{}", format_daemon_status_response(Err(&error)));
@@ -1489,6 +1570,29 @@ mod daemon_status_renderer_tests {
         assert!(output.starts_with(
             "Daemon is not running.\nConfig: unknown (daemon unreachable)\nEmbedding:\n"
         ));
+    }
+
+    struct ClosedStdout;
+
+    impl std::io::Write for ClosedStdout {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "consumer closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn daemon_status_renderer_reaches_typed_stdout_boundary() {
+        let output = format_daemon_not_running_status("Daemon is not running.");
+        let error =
+            write_cli_stdout(&mut ClosedStdout, format_args!("{output}"), true).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }
 
@@ -5654,6 +5758,40 @@ fn read_symbols_rpc_args(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+fn run_with_stdout_boundary<T>(operation: impl FnOnce() -> T) -> Result<T, StdoutWriteFailure> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(value) => Ok(value),
+        Err(payload) => match payload.downcast::<StdoutWriteFailure>() {
+            Ok(stdout) => Err(*stdout),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+#[cfg(test)]
+mod broken_pipe_policy_tests {
+    use super::*;
+
+    #[test]
+    fn typed_boundary_distinguishes_closed_pipe_from_other_stdout_errors() {
+        for (kind, expected_normal) in [
+            (std::io::ErrorKind::BrokenPipe, true),
+            (std::io::ErrorKind::PermissionDenied, false),
+        ] {
+            let outcome = run_with_stdout_boundary(|| {
+                std::panic::resume_unwind(Box::new(StdoutWriteFailure(std::io::Error::new(
+                    kind, "test",
+                ))))
+            })
+            .unwrap_err();
+            assert_eq!(
+                outcome.0.kind() == std::io::ErrorKind::BrokenPipe,
+                expected_normal
+            );
+        }
+    }
+}
+
 fn main() {
     // Install miette as the global error/panic report handler for rich
     // diagnostics (colours, help text, error codes) on supported terminals.
@@ -5688,7 +5826,22 @@ fn main() {
     let out = OutputConfig::from_cli(&cli);
     let show_stats = cli.stats;
 
-    let exit_code = match run(cli, &out) {
+    // Keep the existing renderer surface (including helper modules) safe when
+    // a downstream consumer such as `head` closes the pipe. Typed stdout
+    // failures use `resume_unwind`, so they never invoke the panic hook;
+    // unrelated panics retain normal behavior and resume unwinding.
+
+    let run_result = match run_with_stdout_boundary(|| run(cli, &out)) {
+        Ok(result) => result,
+        Err(error) if error.0.kind() == std::io::ErrorKind::BrokenPipe => {
+            process::exit(EXIT_SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            process::exit(EXIT_ERROR)
+        }
+    };
+    let exit_code = match run_result {
         Ok((code, summary)) => {
             if let (true, Some(s)) = (show_stats, summary) {
                 eprintln!("stats: {s}");
@@ -5696,6 +5849,13 @@ fn main() {
             code
         }
         Err(e) => {
+            if let Some(stdout) = e.downcast_ref::<nestweaver_mcp::StdoutWriteError>() {
+                if stdout.kind() == std::io::ErrorKind::BrokenPipe {
+                    process::exit(EXIT_SUCCESS);
+                }
+                eprintln!("{stdout}");
+                process::exit(EXIT_ERROR);
+            }
             let report = into_diagnostic(e);
             eprintln!("{report:?}");
             EXIT_ERROR
@@ -8080,7 +8240,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     std::fs::File::create(path)
                         .with_context(|| format!("failed to create {}", path.display()))?,
                 ),
-                None => Box::new(std::io::stdout().lock()),
+                None => Box::new(TypedStdout),
             };
             let mut writer = std::io::BufWriter::new(write_to);
 
@@ -8096,6 +8256,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     return Ok((EXIT_ERROR, None));
                 }
             }
+            std::io::Write::flush(&mut writer)?;
 
             if let Some(path) = &output {
                 out.status(&format!("Exported graph to {}", path.display()));
@@ -8106,8 +8267,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::Completions { shell } => {
+            use clap_complete::Generator;
             let mut cmd = Cli::command();
-            clap_complete::generate(shell, &mut cmd, "nestweaver", &mut std::io::stdout());
+            cmd.set_bin_name("nestweaver");
+            cmd.build();
+            shell.try_generate(&cmd, &mut TypedStdout)?;
             Ok((EXIT_SUCCESS, None))
         }
 
@@ -18683,7 +18847,7 @@ fn run_mcp_hybrid(
     tracing::info!("brain MCP server ready on stdio (hybrid routing mode)");
 
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = TypedStdout;
     let mut line = String::new();
     let mut reader = stdin.lock();
 
