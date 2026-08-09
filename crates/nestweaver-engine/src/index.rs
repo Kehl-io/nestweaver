@@ -3215,6 +3215,7 @@ fn collect_contract_derivation_inputs(
     reader: &dyn crate::content_reader::ContentReader,
     r_uid: &str,
     repo_url: &str,
+    strict: bool,
 ) -> Result<
     (
         Vec<PathBuf>,
@@ -3261,6 +3262,11 @@ fn collect_contract_derivation_inputs(
         }
         let source = match reader.read_file(&rel_path) {
             Ok(source) => source,
+            Err(error) if strict => {
+                return Err(error).with_context(|| {
+                    format!("read contract handler candidate {}", rel_path.display())
+                });
+            }
             Err(error) => {
                 tracing::debug!(path = %rel_path.display(), "skip unreadable handler candidate: {error}");
                 continue;
@@ -3286,6 +3292,11 @@ fn collect_contract_derivation_inputs(
         }
         let parsed = match parse_source(&abs_path, &source) {
             Ok(parsed) => parsed,
+            Err(error) if strict => {
+                return Err(error).with_context(|| {
+                    format!("parse contract handler candidate {}", rel_path.display())
+                });
+            }
             Err(error) => {
                 tracing::debug!(path = %rel_path.display(), "skip unparseable handler candidate: {error}");
                 continue;
@@ -3395,8 +3406,140 @@ fn prepare_incremental_contract_derivation(
     repo_url: &str,
 ) -> Result<ContractDerivationPlan, anyhow::Error> {
     let (spec_files, handler_files, all_symbols) =
-        collect_contract_derivation_inputs(reader, r_uid, repo_url)?;
-    prepare_contract_derivation(reader, r_uid, &spec_files, &handler_files, &all_symbols)
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, false)?;
+    prepare_contract_derivation(
+        reader,
+        r_uid,
+        &spec_files,
+        &handler_files,
+        &all_symbols,
+        false,
+    )
+}
+
+pub(crate) fn prepare_watcher_contract_derivation(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+) -> Result<ContractDerivationPlan, anyhow::Error> {
+    prepare_watcher_contract_derivation_with_hooks(reader, r_uid, repo_url, || {}, || {})
+}
+
+pub(crate) fn watcher_contract_input_snapshot(
+    reader: &dyn crate::content_reader::ContentReader,
+) -> Result<std::collections::BTreeMap<String, String>, anyhow::Error> {
+    let files = reader
+        .list_files()
+        .context("list files for watcher contract snapshot")?;
+    let has_grpc_specs = files.iter().any(|path| {
+        crate::contracts::is_spec_file(&path.to_string_lossy())
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("proto"))
+    });
+    let mut snapshot = std::collections::BTreeMap::new();
+    for rel_path in files {
+        let abs_path = reader.root().join(&rel_path);
+        let is_spec = crate::contracts::is_spec_file(&abs_path.to_string_lossy());
+        let language = detect_language(&abs_path);
+        if !is_spec && language.is_none() {
+            continue;
+        }
+        if !is_spec && is_minified_or_bundled(&abs_path) {
+            continue;
+        }
+        if reader
+            .file_meta(&rel_path)
+            .with_context(|| format!("read watcher contract metadata {}", rel_path.display()))?
+            .is_some_and(|(_, size)| size > crate::index_md::MAX_FILE_SIZE_BYTES)
+        {
+            continue;
+        }
+        let source = reader
+            .read_file(&rel_path)
+            .with_context(|| format!("read watcher contract input {}", rel_path.display()))?;
+        if source.len() as u64 > crate::index_md::MAX_FILE_SIZE_BYTES {
+            continue;
+        }
+        let candidate = if is_spec {
+            true
+        } else {
+            match language.expect("checked above") {
+                nestweaver_schema::Language::Java | nestweaver_schema::Language::Kotlin => {
+                    source.contains("@RestController") || source.contains("@Controller")
+                }
+                nestweaver_schema::Language::JavaScript
+                | nestweaver_schema::Language::TypeScript => source.contains("@Controller"),
+                nestweaver_schema::Language::Rust => has_grpc_specs && source.contains("impl "),
+                _ => false,
+            }
+        };
+        if candidate {
+            snapshot.insert(
+                rel_path.to_string_lossy().into_owned(),
+                crate::hash::blake3_hex(&source),
+            );
+        }
+    }
+    Ok(snapshot)
+}
+
+fn prepare_watcher_contract_derivation_with_hooks<F, G>(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+    before_plan: F,
+    after_plan: G,
+) -> Result<ContractDerivationPlan, anyhow::Error>
+where
+    F: FnOnce(),
+    G: FnOnce(),
+{
+    let before = watcher_contract_input_snapshot(reader)?;
+    before_plan();
+    let observed = watcher_contract_input_snapshot(reader)?;
+    let (spec_files, handler_files, all_symbols) =
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, true)?;
+    let mut plan = prepare_contract_derivation(
+        reader,
+        r_uid,
+        &spec_files,
+        &handler_files,
+        &all_symbols,
+        true,
+    )?;
+    after_plan();
+    let after = watcher_contract_input_snapshot(reader)?;
+    let plan_reads_match_observed = plan
+        .input_hashes
+        .iter()
+        .all(|(path, hash)| observed.get(path) == Some(hash));
+    if before != observed || observed != after || !plan_reads_match_observed {
+        let changed: Vec<_> = before
+            .keys()
+            .chain(observed.keys())
+            .chain(after.keys())
+            .chain(plan.input_hashes.keys())
+            .filter(|path| {
+                before.get(*path) != observed.get(*path)
+                    || observed.get(*path) != after.get(*path)
+                    || plan
+                        .input_hashes
+                        .get(*path)
+                        .is_some_and(|hash| observed.get(*path) != Some(hash))
+            })
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        anyhow::bail!(
+            "contract inputs changed while watcher plan was prepared: {}",
+            changed.join(", ")
+        );
+    }
+    plan.observed_input_hashes = observed;
+    Ok(plan)
 }
 
 fn derive_contracts_from_current_repo(
@@ -3406,7 +3549,7 @@ fn derive_contracts_from_current_repo(
     repo_url: &str,
 ) -> Result<usize, anyhow::Error> {
     let (spec_files, handler_files, all_symbols) =
-        collect_contract_derivation_inputs(reader, r_uid, repo_url)?;
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, false)?;
     derive_contracts(
         store,
         reader,
@@ -3437,16 +3580,19 @@ fn derive_contracts(
     handler_files: &[HandlerFileData],
     all_symbols: &[nestweaver_schema::Symbol],
 ) -> Result<usize, anyhow::Error> {
-    let plan = prepare_contract_derivation(reader, r_uid, spec_files, handler_files, all_symbols)?;
+    let plan =
+        prepare_contract_derivation(reader, r_uid, spec_files, handler_files, all_symbols, false)?;
     let conn = store.begin_transaction()?;
     let count = apply_contract_derivation_on(&conn, r_uid, &plan)?;
     store.commit_transaction(&conn)?;
     Ok(count)
 }
 
-struct ContractDerivationPlan {
+pub(crate) struct ContractDerivationPlan {
     contracts: Vec<nestweaver_schema::Contract>,
     edges: Vec<nestweaver_schema::ResolvedEdge>,
+    pub(crate) input_hashes: std::collections::BTreeMap<String, String>,
+    pub(crate) observed_input_hashes: std::collections::BTreeMap<String, String>,
 }
 
 /// Prepare contract rows and implementation edges without mutating the graph.
@@ -3457,11 +3603,13 @@ fn prepare_contract_derivation(
     spec_files: &[PathBuf],
     handler_files: &[HandlerFileData],
     all_symbols: &[nestweaver_schema::Symbol],
+    strict: bool,
 ) -> Result<ContractDerivationPlan, anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
 
     // 1. Declared contracts from specs.
     let mut all_contracts = ContractSet::new();
+    let mut input_hashes = std::collections::BTreeMap::new();
     // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
     let mut declared_grpc: Vec<(String, String)> = Vec::new();
     let repo_path = reader.root();
@@ -3473,12 +3621,23 @@ fn prepare_contract_derivation(
             .into_owned();
         let source = match reader.read_file(Path::new(&rel)) {
             Ok(s) => s,
+            Err(error) if strict => {
+                return Err(error).with_context(|| format!("read watched contract spec {rel}"));
+            }
             Err(e) => {
                 tracing::debug!("skip unreadable spec {rel}: {e}");
                 continue;
             }
         };
-        for sc in crate::contracts::parse_spec_file(&rel, &source) {
+        let parsed_specs = if strict {
+            input_hashes.insert(rel.clone(), crate::hash::blake3_hex(&source));
+            crate::contracts::parse_spec_file_strict(&rel, &source)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("parse watched contract spec {rel}"))?
+        } else {
+            crate::contracts::parse_spec_file(&rel, &source)
+        };
+        for sc in parsed_specs {
             // Keep gRPC operations so implementations can be matched against the
             // DECLARED contract rather than minting a UID from source (nw-104).
             let grpc_operation = (sc.kind == "grpc")
@@ -3506,9 +3665,16 @@ fn prepare_contract_derivation(
         // class-level base path (@RequestMapping / @Controller) is usually
         // dropped. Read the raw source to recover it; fall back to the
         // truncated signature if the file is unreadable.
-        let base_source = reader
-            .read_file(Path::new(&hf.rel_path))
-            .unwrap_or_else(|_| hf.class_signature.clone());
+        let base_source = match reader.read_file(Path::new(&hf.rel_path)) {
+            Ok(source) => source,
+            Err(error) if strict => {
+                return Err(error).with_context(|| format!("read watched handler {}", hf.rel_path));
+            }
+            Err(_) => hf.class_signature.clone(),
+        };
+        if strict {
+            input_hashes.insert(hf.rel_path.clone(), crate::hash::blake3_hex(&base_source));
+        }
         let matches = crate::contracts::detect_handlers(&hf.framework, &base_source, &handler_syms);
         for m in matches {
             let contract_uid = m.contract.uid();
@@ -3545,6 +3711,21 @@ fn prepare_contract_derivation(
     // opened to reach a detector that also did not exist. Matching declared
     // contracts against symbols here needs none of them, and the edge adopts the
     // DECLARED uid so it provably points at a real contract.
+    if strict {
+        for rel_path in all_symbols
+            .iter()
+            .map(|symbol| symbol.file_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if input_hashes.contains_key(rel_path) {
+                continue;
+            }
+            let source = reader
+                .read_file(Path::new(rel_path))
+                .with_context(|| format!("read watched gRPC candidate {rel_path}"))?;
+            input_hashes.insert(rel_path.to_string(), crate::hash::blake3_hex(&source));
+        }
+    }
     if !declared_grpc.is_empty() {
         // Group symbols by file so each candidate file is read once.
         let mut by_file: std::collections::BTreeMap<&str, Vec<(String, String, u32)>> =
@@ -3562,9 +3743,17 @@ fn prepare_contract_derivation(
             // Cheap pre-filter: a tonic server implementation is a trait impl, so
             // a file with no `impl ` at all cannot contain one. Avoids reading
             // every source file in the repo.
-            let Ok(source) = reader.read_file(Path::new(rel_path)) else {
-                continue;
+            let source = match reader.read_file(Path::new(rel_path)) {
+                Ok(source) => source,
+                Err(error) if strict => {
+                    return Err(error)
+                        .with_context(|| format!("read watched gRPC handler {rel_path}"));
+                }
+                Err(_) => continue,
             };
+            if strict {
+                input_hashes.insert(rel_path.to_string(), crate::hash::blake3_hex(&source));
+            }
             if !source.contains("impl ") {
                 continue;
             }
@@ -3597,7 +3786,12 @@ fn prepare_contract_derivation(
     // keep their IMPLEMENTS_CONTRACT edge onto the surviving contract.
     let contracts = all_contracts.into_contracts();
 
-    Ok(ContractDerivationPlan { contracts, edges })
+    Ok(ContractDerivationPlan {
+        contracts,
+        edges,
+        input_hashes,
+        observed_input_hashes: std::collections::BTreeMap::new(),
+    })
 }
 
 /// Replace one repo's derived contract graph on an existing transaction.
@@ -3607,7 +3801,7 @@ fn prepare_contract_derivation(
 /// Any contract write failure therefore rolls the whole incremental mutation
 /// back, retaining the previously committed graph rather than leaving new
 /// symbols paired with stale or missing derived edges.
-fn apply_contract_derivation_on(
+pub(crate) fn apply_contract_derivation_on(
     conn: &nestweaver_store::DbConnection<'_>,
     r_uid: &str,
     plan: &ContractDerivationPlan,
@@ -4464,7 +4658,7 @@ fn reresolve_affected_dependents(
 
     let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
         .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
-    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols)?;
+    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols, None)?;
 
     // Runs inside the same transaction as the mutation loop.
     let count = insertable.len();
@@ -4475,33 +4669,40 @@ fn reresolve_affected_dependents(
     Ok(count)
 }
 
-/// Non-transactional variant of [`reresolve_affected_dependents`] for the
-/// live code watcher (`watch_code.rs`), which interleaves its mutations with
-/// store-level (non-txn) calls. Same nw-008 Phase 2 semantics: re-insert ONLY
-/// the cross-file edges the per-file `DETACH DELETE` destroyed.
-pub(crate) fn reresolve_affected_dependents_on_store(
+/// Prepare the live watcher's reverse-dependent edges before publication.
+///
+/// The watcher supplies the frozen replacement symbols that its transaction
+/// will publish. This produces the same post-mutation symbol view as
+/// [`reresolve_affected_dependents`] without reading source after the dirty
+/// marker has been established.
+pub(crate) fn prepare_watcher_reresolve_edges(
     reader: &dyn crate::content_reader::ContentReader,
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
     changed: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
-) -> Result<usize, anyhow::Error> {
+    replacement_symbols: &[nestweaver_schema::Symbol],
+    prepared_file_data: &std::collections::HashMap<String, (Vec<RawSymbol>, Vec<RawReference>)>,
+) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     if changed.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-
-    let db_symbols = store
+    let mut symbols = store
         .lookup_symbols_by_repo(r_uid)
-        .with_context(|| "lookup_symbols_by_repo for forward edge resolution")?;
-    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols)?;
-
-    let count = insertable.len();
-    if count > 0 {
-        store
-            .batch_insert_edges(&insertable)
-            .with_context(|| "batch_insert_edges (transitive re-resolution)")?;
-    }
-    Ok(count)
+        .with_context(|| "lookup_symbols_by_repo for watcher edge preparation")?;
+    symbols.retain(|symbol| {
+        !changed.contains(&symbol.file_path) && !removed.contains(&symbol.file_path)
+    });
+    symbols.extend_from_slice(replacement_symbols);
+    build_reresolve_edges(
+        reader,
+        r_uid,
+        changed,
+        rdeps,
+        &symbols,
+        Some(prepared_file_data),
+    )
 }
 
 /// Shared core of nw-008 Phase 2. Re-parse `S = changed ∪ rdeps` from
@@ -4523,6 +4724,9 @@ fn build_reresolve_edges(
     changed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
     db_symbols: &[nestweaver_schema::Symbol],
+    prepared_file_data: Option<
+        &std::collections::HashMap<String, (Vec<RawSymbol>, Vec<RawReference>)>,
+    >,
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     // S = changed ∪ rdeps — files whose references need re-resolution.
     let mut scope: std::collections::HashSet<String> = changed.clone();
@@ -4535,22 +4739,29 @@ fn build_reresolve_edges(
     for rel_str in &scope {
         let rel_path = Path::new(rel_str.as_str());
         let abs_path = reader.root().join(rel_path);
-        let source = match reader.read_file(rel_path) {
-            Ok(s) => s,
-            Err(_) => continue, // deleted/unreadable — nothing to re-resolve from
-        };
-        let parsed = match parse_source(&abs_path, &source) {
-            Ok(p) => p,
-            Err(_) => continue,
+        let (raw_symbols, raw_references) = if let Some((symbols, references)) =
+            prepared_file_data.and_then(|prepared| prepared.get(rel_str))
+        {
+            (symbols.clone(), references.clone())
+        } else {
+            let source = match reader.read_file(rel_path) {
+                Ok(s) => s,
+                Err(_) => continue, // deleted/unreadable — nothing to re-resolve from
+            };
+            let parsed = match parse_source(&abs_path, &source) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            (parsed.symbols, parsed.references)
         };
         if let Some(lang) = detect_language(&abs_path) {
             *lang_counts.entry(lang).or_insert(0) += 1;
         }
-        for raw_sym in &parsed.symbols {
+        for raw_sym in &raw_symbols {
             let s_uid = symbol_uid(r_uid, rel_str, &raw_sym.name, raw_sym.start_line);
             uid_to_file.insert(s_uid, rel_str.clone());
         }
-        file_data.push((rel_str.clone(), parsed.symbols, parsed.references));
+        file_data.push((rel_str.clone(), raw_symbols, raw_references));
     }
 
     if file_data.is_empty() {
@@ -5741,11 +5952,133 @@ function hello(name) { return "Hello " + name; }
             &reader,
             "repo:test:oversize",
             "https://example.com/oversize",
+            false,
         )
         .unwrap();
         assert!(specs.is_empty());
         assert!(handlers.is_empty());
         assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn watcher_contract_plan_rejects_create_delete_and_second_save_races() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let get = "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /items:\n    get:\n      responses: { \"200\": { description: ok } }\n";
+        let post = "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /items:\n    post:\n      responses: { \"200\": { description: ok } }\n";
+        let spec = repo.join("openapi.yaml");
+        fs::write(&spec, get).unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+
+        let created = repo.join("openapi.v2.yaml");
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&created, post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.v2.yaml"));
+        fs::remove_file(&created).unwrap();
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::remove_file(&spec).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.yaml"));
+        fs::write(&spec, get).unwrap();
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&spec, post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        fs::write(&spec, get).unwrap();
+        let controller = repo.join("ItemsController.java");
+        let controller_get = "@RestController\n@RequestMapping(\"/items\")\npublic class ItemsController { @GetMapping public void get() {} }\n";
+        let controller_post = "@RestController\n@RequestMapping(\"/items\")\npublic class ItemsController { @PostMapping public void post() {} }\n";
+        fs::write(&controller, controller_get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&controller, controller_post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        fs::write(&controller, controller_get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::remove_file(&controller).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&controller, controller_get).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        fs::write(&spec, get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::write(&spec, post).unwrap(),
+            || fs::write(&spec, get).unwrap(),
+        )
+        .err()
+        .expect("old→new→old must reject the hybrid plan");
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::remove_file(&spec).unwrap(),
+            || fs::write(&spec, get).unwrap(),
+        )
+        .err()
+        .expect("spec delete→identical recreate must reject the hybrid plan");
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::remove_file(&controller).unwrap(),
+            || fs::write(&controller, controller_get).unwrap(),
+        )
+        .err()
+        .expect("controller delete→identical recreate must reject the hybrid plan");
+        assert!(error.to_string().contains("ItemsController.java"));
     }
 
     #[test]
