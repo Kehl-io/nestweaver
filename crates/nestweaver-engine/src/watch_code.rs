@@ -44,7 +44,7 @@ enum WatchBatchOutcome {
 }
 
 enum PreparedPath {
-    Replace(PreparedCodeFile),
+    Replace(Box<PreparedCodeFile>),
     Delete { rel_path: String },
 }
 
@@ -388,7 +388,7 @@ impl CodeWatcher {
                         });
                     }
                     changed.insert(rel_str);
-                    prepared_paths.push(PreparedPath::Replace(prepared));
+                    prepared_paths.push(PreparedPath::Replace(Box::new(prepared)));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     removed.insert(rel_str.clone());
@@ -443,11 +443,13 @@ impl CodeWatcher {
             &reader,
             store,
             r_uid,
-            &changed,
-            &removed,
-            &rdeps,
-            &replacement_symbols,
-            &prepared_file_data,
+            crate::index::WatcherReresolveInputs {
+                changed: &changed,
+                removed: &removed,
+                rdeps: &rdeps,
+                replacement_symbols: &replacement_symbols,
+                prepared_file_data: &prepared_file_data,
+            },
         ) {
             Ok(edges) => edges,
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),

@@ -20,6 +20,12 @@ use serde::{Deserialize, Serialize};
 /// The 4th field carries the retained source string (up to 2 MB) so Phase 3
 /// can build type environments without re-reading files from disk.
 type ParsedFileEntry = (String, Vec<RawSymbol>, Vec<RawReference>, Option<String>);
+type ContractDerivationInputs = (
+    Vec<PathBuf>,
+    Vec<HandlerFileData>,
+    Vec<nestweaver_schema::Symbol>,
+);
+pub(crate) type PreparedFileData = HashMap<String, (Vec<RawSymbol>, Vec<RawReference>)>;
 
 /// F2.2: data captured per Spring/NestJS controller file so handler →
 /// contract edges can be derived after the bulk symbol insert.
@@ -3216,14 +3222,7 @@ fn collect_contract_derivation_inputs(
     r_uid: &str,
     repo_url: &str,
     strict: bool,
-) -> Result<
-    (
-        Vec<PathBuf>,
-        Vec<HandlerFileData>,
-        Vec<nestweaver_schema::Symbol>,
-    ),
-    anyhow::Error,
-> {
+) -> Result<ContractDerivationInputs, anyhow::Error> {
     let mut spec_files = Vec::new();
     let mut handler_files = Vec::new();
     let mut all_symbols = Vec::new();
@@ -3232,7 +3231,7 @@ fn collect_contract_derivation_inputs(
         .list_files()
         .context("list files for incremental contract derivation")?;
     for rel_path in &discovered_files {
-        let abs_path = repo_path.join(&rel_path);
+        let abs_path = repo_path.join(rel_path);
         if crate::contracts::is_spec_file(&abs_path.to_string_lossy()) {
             spec_files.push(abs_path);
         }
@@ -4675,33 +4674,37 @@ fn reresolve_affected_dependents(
 /// will publish. This produces the same post-mutation symbol view as
 /// [`reresolve_affected_dependents`] without reading source after the dirty
 /// marker has been established.
+pub(crate) struct WatcherReresolveInputs<'a> {
+    pub(crate) changed: &'a std::collections::HashSet<String>,
+    pub(crate) removed: &'a std::collections::HashSet<String>,
+    pub(crate) rdeps: &'a std::collections::HashSet<String>,
+    pub(crate) replacement_symbols: &'a [nestweaver_schema::Symbol],
+    pub(crate) prepared_file_data: &'a PreparedFileData,
+}
+
 pub(crate) fn prepare_watcher_reresolve_edges(
     reader: &dyn crate::content_reader::ContentReader,
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
-    changed: &std::collections::HashSet<String>,
-    removed: &std::collections::HashSet<String>,
-    rdeps: &std::collections::HashSet<String>,
-    replacement_symbols: &[nestweaver_schema::Symbol],
-    prepared_file_data: &std::collections::HashMap<String, (Vec<RawSymbol>, Vec<RawReference>)>,
+    inputs: WatcherReresolveInputs<'_>,
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
-    if changed.is_empty() {
+    if inputs.changed.is_empty() {
         return Ok(Vec::new());
     }
     let mut symbols = store
         .lookup_symbols_by_repo(r_uid)
         .with_context(|| "lookup_symbols_by_repo for watcher edge preparation")?;
     symbols.retain(|symbol| {
-        !changed.contains(&symbol.file_path) && !removed.contains(&symbol.file_path)
+        !inputs.changed.contains(&symbol.file_path) && !inputs.removed.contains(&symbol.file_path)
     });
-    symbols.extend_from_slice(replacement_symbols);
+    symbols.extend_from_slice(inputs.replacement_symbols);
     build_reresolve_edges(
         reader,
         r_uid,
-        changed,
-        rdeps,
+        inputs.changed,
+        inputs.rdeps,
         &symbols,
-        Some(prepared_file_data),
+        Some(inputs.prepared_file_data),
     )
 }
 
@@ -4724,9 +4727,7 @@ fn build_reresolve_edges(
     changed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
     db_symbols: &[nestweaver_schema::Symbol],
-    prepared_file_data: Option<
-        &std::collections::HashMap<String, (Vec<RawSymbol>, Vec<RawReference>)>,
-    >,
+    prepared_file_data: Option<&PreparedFileData>,
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     // S = changed ∪ rdeps — files whose references need re-resolution.
     let mut scope: std::collections::HashSet<String> = changed.clone();
