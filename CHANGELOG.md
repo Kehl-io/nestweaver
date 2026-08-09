@@ -43,6 +43,71 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [4.1.0](https://github.com/Kehl-io/nestweaver/compare/v4.0.0...v4.1.0) (2026-08-09)
+
+
+### Features
+
+* **cli:** report effective daemon config ([f5d79cb](https://github.com/Kehl-io/nestweaver/commit/f5d79cb9cd70d41366616c99b33ac2b30157071f))
+* **daemon:** detect and report models in the legacy cache directory ([271b59a](https://github.com/Kehl-io/nestweaver/commit/271b59ac85a1076347144fe7ea8f785d18615482))
+* **daemon:** expose effective config provenance ([dad38d6](https://github.com/Kehl-io/nestweaver/commit/dad38d66d839c2e186de97b58a4495e48233c1fd))
+* **daemon:** persist live config provenance ([d1c7fdc](https://github.com/Kehl-io/nestweaver/commit/d1c7fdcbbd1d64e735b680f94f3efd91010e4ea4))
+* **daemon:** ready-path embedding diagnostic names model and cache dir ([5bfb654](https://github.com/Kehl-io/nestweaver/commit/5bfb65407f4d3f039f6e3c1f481afffdb9fb4d96))
+* **daemon:** report a committed-after-cancel index and name index --force ([4a319eb](https://github.com/Kehl-io/nestweaver/commit/4a319eb201c5fa10cfb3da6e8406cfbe47bb833a))
+* **engine:** poll cancellation at the pre-write boundary ([d4486af](https://github.com/Kehl-io/nestweaver/commit/d4486af2997279447250dab57f994ce317457dae))
+* **engine:** report contract derivation status honestly ([8e13c29](https://github.com/Kehl-io/nestweaver/commit/8e13c29336d90ef6b3754380e7cefb646c94aacb))
+* **store:** add repo-wide resolved-edge delete ([f63c399](https://github.com/Kehl-io/nestweaver/commit/f63c3995469571434470324843e0d53f27c3f32d))
+
+
+### Bug Fixes
+
+* **brain:** report committed refresh deletions ([021958a](https://github.com/Kehl-io/nestweaver/commit/021958a498bb995700f22baf3f7c10d1be6fd041))
+* **ci:** satisfy engine clippy checks ([791ebe5](https://github.com/Kehl-io/nestweaver/commit/791ebe519cb10108bd94955a5885761637ac6eac))
+* **cli:** checkpoint the embedding index during long passes ([6f2275c](https://github.com/Kehl-io/nestweaver/commit/6f2275c1301d0322eb5b1b78e947ec32d7acf2e3))
+* **cli:** embedding metadata truth — gated stamping, fingerprint reads, model guard, checkpointing ([0b8a0ec](https://github.com/Kehl-io/nestweaver/commit/0b8a0ec68eb7d894696417575cd4bee7d6d6a1d0))
+* **client:** preserve config across version restarts ([2c71682](https://github.com/Kehl-io/nestweaver/commit/2c71682816bb3b6c8629ef00ce8db712b1d016a1))
+* **client:** satisfy clippy path handling ([44eff5e](https://github.com/Kehl-io/nestweaver/commit/44eff5e3e2bc13a31af14d40744db594b950a425))
+* **cli:** handle closed stdout quietly ([5a471af](https://github.com/Kehl-io/nestweaver/commit/5a471af5de0469c1345dac994626e518cb67b5e9))
+* **cli:** preserve config across daemon restarts ([82c0dce](https://github.com/Kehl-io/nestweaver/commit/82c0dce96186fac3f0b47df0d32890021e8a3886))
+* **cli:** read the recorded embedding fingerprint on direct embed paths ([3eed803](https://github.com/Kehl-io/nestweaver/commit/3eed8032fc811420f27a9c472fad940c41818fe7))
+* **cli:** reject explicit config fallback ([197e260](https://github.com/Kehl-io/nestweaver/commit/197e260b439a5700b0221ff1328f58992d1eface))
+* **cli:** stamp embedding metadata only from vectors the run produced ([a0f1784](https://github.com/Kehl-io/nestweaver/commit/a0f17845155a27e07a2c7249850a2fb149f73ace))
+* **cli:** stamp the fingerprint at embed checkpoints mid-run ([a1ed98a](https://github.com/Kehl-io/nestweaver/commit/a1ed98adeaf76a717269df94808b87f647833e7b))
+* close end-to-end CLI, daemon, watcher, and MCP regressions ([4a84444](https://github.com/Kehl-io/nestweaver/commit/4a8444444dde92174ea3421411f7664878f1904a))
+* **contracts:** route list through daemon rpc ([06ca266](https://github.com/Kehl-io/nestweaver/commit/06ca2661874d82130bbac02d33090168b1213d63))
+* **daemon:** cancelled-index honesty — non-terminal timeout warning, committed-after-cancel reporting, pre-write poll ([3b9fb9c](https://github.com/Kehl-io/nestweaver/commit/3b9fb9c9669542eb3f0f3ca88eda563056ec75fa))
+* **daemon:** enforce explicit config identity ([15077f8](https://github.com/Kehl-io/nestweaver/commit/15077f87cc4efdbc53e46d70a49ca88d1b6d0a19))
+* **daemon:** harden embedding cache diagnostics ([ca868b6](https://github.com/Kehl-io/nestweaver/commit/ca868b6c060182c531ca8f7ced8f58b2e0bd4f2d))
+* **daemon:** isolate external embeddings from local cache ([5c5116b](https://github.com/Kehl-io/nestweaver/commit/5c5116b398b7fdca629b4c5ce789a924fc30d992))
+* **daemon:** preserve and enforce effective config ([893e08d](https://github.com/Kehl-io/nestweaver/commit/893e08d9d64ee3008c1606c0ad90c629dca25ff6))
+* **daemon:** reject unhonored explicit config ([f50d77d](https://github.com/Kehl-io/nestweaver/commit/f50d77d8187609e71050bdcdd298aa006a4a0596))
+* **daemon:** report index timeout as a non-terminal stream warning ([7568b69](https://github.com/Kehl-io/nestweaver/commit/7568b690d9eed8df3b365ad62346eeb7645fd01c))
+* **daemon:** send the terminal Done before skipping post-index phases on cancel ([2a8cc61](https://github.com/Kehl-io/nestweaver/commit/2a8cc61cdb86f367dc466e6b5f61b3c7116c3bca))
+* **daemon:** stamp the fingerprint at embed RPC checkpoints mid-run ([5e23166](https://github.com/Kehl-io/nestweaver/commit/5e23166790637466436b2664ba113d9f4dafd231))
+* **engine:** bump in-memory generation on a cancelled commit and drop a dead scope ([724bbb4](https://github.com/Kehl-io/nestweaver/commit/724bbb4273f53ad2cd92531cc753b630a0b0f4ab))
+* **engine:** clear stale resolved edges whenever full resolution runs ([08cf08b](https://github.com/Kehl-io/nestweaver/commit/08cf08bfdad2d854fe07b7cc981e55d567b2563c))
+* **engine:** contract derivation integrity — CSV pinning, UID dedup, atomicity, honest status ([6d04221](https://github.com/Kehl-io/nestweaver/commit/6d0422138edde0a47844723255ef851bd2f1fcf0))
+* **engine:** deduplicate contract UIDs before the bulk COPY ([411b778](https://github.com/Kehl-io/nestweaver/commit/411b77854d2b146871c3ed0cc407d7865ceed8f1))
+* **engine:** don't clobber dep records of files not actually re-resolved ([91a5fa3](https://github.com/Kehl-io/nestweaver/commit/91a5fa370dd27de56fb82a247351aec96eea4f23))
+* **engine:** force full replacement when resolution deps are empty for the repo ([5a7c473](https://github.com/Kehl-io/nestweaver/commit/5a7c4734c7f213d115b180fea7120d1e578eb939))
+* **engine:** keep .index-dirty and the generation counter dirty on a cancelled commit ([f33b4fc](https://github.com/Kehl-io/nestweaver/commit/f33b4fc671ed36f7fc9c4649acdb97e6499b7110))
+* **engine:** make contract derivation atomic ([7c3b82a](https://github.com/Kehl-io/nestweaver/commit/7c3b82ac65cfa03f524795afab8f1f21416cde54))
+* **engine:** platform-native embedding cache-dir default ([864d8ef](https://github.com/Kehl-io/nestweaver/commit/864d8ef03a5762f101e6ca249bfd3767ab3308c7))
+* **engine:** stop duplicate resolved-edge accumulation on empty resolution-deps sidecar ([899e7cf](https://github.com/Kehl-io/nestweaver/commit/899e7cfe41632448419ec0affe638c89e4d051c0))
+* **index:** refresh contracts during incremental indexing ([ca42d6c](https://github.com/Kehl-io/nestweaver/commit/ca42d6c5b543e07010789cfb0df41242ea64df12))
+* **mcp:** stop reporting a degraded repo as clean ([4f9f067](https://github.com/Kehl-io/nestweaver/commit/4f9f067591ce3491575956fc7c1a9e52c1c07059))
+* **mcp:** validate json-rpc envelopes ([f1bdfc9](https://github.com/Kehl-io/nestweaver/commit/f1bdfc9ff15387c1afaeb9bda7fe4c0ac6e56bec))
+* **storage:** refuse same-dimension writes from a different recorded model ([0d67df4](https://github.com/Kehl-io/nestweaver/commit/0d67df46dc98b49ea877df74adc874061cc8b3e3))
+* **storage:** stamp the embedding fingerprint with each checkpoint flush ([419de92](https://github.com/Kehl-io/nestweaver/commit/419de92a991de46961ceddf05823a9b64b63c2f4))
+* **store:** pin the CSV dialect on every COPY ([553bd6d](https://github.com/Kehl-io/nestweaver/commit/553bd6d6c443abcbf24bf458e7d137131fc7a376))
+* **watch:** publish contract refreshes atomically ([8f2be7d](https://github.com/Kehl-io/nestweaver/commit/8f2be7d8c171a797ed8e4bcc900a0bae8146cf1b))
+
+
+### Performance Improvements
+
+* **store:** add remove-repo hub-degree regression benchmark ([27afb9f](https://github.com/Kehl-io/nestweaver/commit/27afb9f7b7d36b21e75b0463f6e6cdff05316379))
+* **store:** add remove-repo hub-degree regression benchmark ([42a46d6](https://github.com/Kehl-io/nestweaver/commit/42a46d6ff8e9ec09b2d726752996bd1c0a59f2a5))
+
 ## [4.0.0](https://github.com/Kehl-io/nestweaver/compare/v3.0.0...v4.0.0) (2026-08-06)
 
 
