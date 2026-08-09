@@ -1033,6 +1033,7 @@ mod tests {
             "paused watcher publication",
             &crate::index::FileSystemIndexEpilogueIo,
             Some(&nestweaver_store::GraphScope::code_only()),
+            true,
         )
         .unwrap();
         let latest_generation = store.graph_generation();

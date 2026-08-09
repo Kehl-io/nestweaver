@@ -38,6 +38,11 @@ pub struct EmbeddingIndex {
     ///
     /// [`reset_force_guard`]: EmbeddingIndex::reset_force_guard
     force_cleared: bool,
+    /// The model id recorded in the database's embedding metadata, loaded once
+    /// by `GraphStore` at open (and refreshed when new metadata is stamped) —
+    /// never read per-add. `None` means unknown (never stamped, or unreadable),
+    /// and unknown always allows the write: the dimension guard still applies.
+    recorded_model_id: Option<String>,
 }
 
 impl Default for EmbeddingIndex {
@@ -51,7 +56,17 @@ impl EmbeddingIndex {
         Self {
             embeddings: HashMap::new(),
             force_cleared: false,
+            recorded_model_id: None,
         }
+    }
+
+    /// Record the model id the database's embedding metadata names as the
+    /// producer of this index's vectors. Called once by `GraphStore` at open
+    /// and again whenever new metadata is stamped; `None` marks the producer
+    /// as unknown, which disables the model guard (writes are then guarded by
+    /// dimension only).
+    pub fn set_recorded_model_id(&mut self, model_id: Option<String>) {
+        self.recorded_model_id = model_id;
     }
 
     /// Insert an embedding. Returns `true` if accepted, `false` if rejected
@@ -62,8 +77,47 @@ impl EmbeddingIndex {
     /// already stored, the entire index is cleared on the first mismatch so
     /// the new dimension becomes authoritative — this is the model-switch path.
     /// The clear happens at most once per run (see `force_cleared`).
+    ///
+    /// This entry point names no producing model, so the model guard is
+    /// skipped (unknown producer); embed runs should use [`add_with_model`].
+    ///
+    /// [`add_with_model`]: EmbeddingIndex::add_with_model
     #[must_use = "a false return means the dimension guard rejected the embedding"]
     pub fn add(&mut self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
+        self.add_with_model(uid, embedding, None, force)
+    }
+
+    /// Like [`add`], but also refuses a vector produced by a different model
+    /// than the one recorded for this index, even at the same dimension:
+    /// contrastively trained spaces share no basis, so mixing two models'
+    /// vectors makes the index unusable for retrieval. The rejection names
+    /// both model ids. `force` allows the switch (a `--force` run re-embeds
+    /// everything, so no mixture survives). A `None` recorded or incoming
+    /// model id is unknown and always allowed — the dimension guard still
+    /// applies.
+    ///
+    /// [`add`]: EmbeddingIndex::add
+    #[must_use = "a false return means a guard rejected the embedding"]
+    pub fn add_with_model(
+        &mut self,
+        uid: &str,
+        embedding: Vec<f32>,
+        model_id: Option<&str>,
+        force: bool,
+    ) -> bool {
+        if let (Some(recorded), Some(incoming)) = (self.recorded_model_id.as_deref(), model_id)
+            && recorded != incoming
+            && !force
+        {
+            tracing::warn!(
+                uid,
+                recorded,
+                incoming,
+                "skipping embedding from a different model than the one recorded for this \
+                 index (re-embed with --force to switch models)"
+            );
+            return false;
+        }
         if let Some(existing) = self.embeddings.values().next()
             && embedding.len() != existing.len()
         {
@@ -117,6 +171,7 @@ impl EmbeddingIndex {
         Ok(Self {
             embeddings,
             force_cleared: false,
+            recorded_model_id: None,
         })
     }
 
@@ -213,6 +268,7 @@ impl EmbeddingIndex {
         Ok(Self {
             embeddings,
             force_cleared: false,
+            recorded_model_id: None,
         })
     }
 
@@ -366,6 +422,105 @@ fn atomic_replace_file(
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<(), anyhow::Error> {
     crate::durable_sidecar::atomic_replace_file(path, write).map_err(Into::into)
+}
+
+/// Default cadence for time-based embedding-index checkpoints during long
+/// embed passes (CLI direct loops and the daemon embed RPC).
+pub const EMBED_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Time-based checkpoint for long embed passes.
+///
+/// An interrupted embed pass used to lose everything: the only flush ran
+/// once at the end. `flush_if_due` flushes at chunk boundaries once
+/// `interval` has elapsed and new embeddings were accepted since the last
+/// flush, so a killed pass keeps all work up to the last checkpoint.
+///
+/// Per-batch flushing is NOT implementable: `EmbeddingIndex::save_binary`
+/// rewrites the entire sidecar file on every call (roughly a quarter of a
+/// gigabyte for a large graph), so the cadence must stay coarse — minutes,
+/// not batches.
+///
+/// Mid-run call sites (CLI and daemon embed loops) should use
+/// [`Self::flush_if_due_with_stamp`] so the model fingerprint travels with
+/// each checkpoint; plain `flush_if_due` remains for the final flush, which
+/// is followed by the run's tail stamp.
+pub struct EmbeddingFlushCheckpoint {
+    interval: std::time::Duration,
+    last_flush: std::time::Instant,
+    flushed_success_count: usize,
+}
+
+impl EmbeddingFlushCheckpoint {
+    pub fn new(interval: std::time::Duration) -> Self {
+        Self {
+            interval,
+            last_flush: std::time::Instant::now(),
+            flushed_success_count: 0,
+        }
+    }
+
+    /// Flush the embedding index when `interval` elapsed and `success_count`
+    /// advanced since the last flush. Returns whether a flush happened.
+    pub fn flush_if_due(
+        &mut self,
+        store: &GraphStore,
+        success_count: usize,
+    ) -> Result<bool, StoreError> {
+        if !self.is_due(success_count) {
+            return Ok(false);
+        }
+        store.flush_embedding_index()?;
+        self.record_flush(success_count);
+        Ok(true)
+    }
+
+    /// Checkpoint like [`Self::flush_if_due`], then stamp the flushed index's
+    /// fingerprint (`model_id`, `produced_dim`) into the embedding metadata.
+    ///
+    /// The fingerprint must travel with the checkpoint: a `--force` run
+    /// switching to a different model at the same dimension overwrites old
+    /// vectors as it goes, so a checkpoint that persisted vectors without
+    /// updating the metadata would leave a durable mixed-model index whose
+    /// metadata still names the OLD model — every open-time guard would pass
+    /// and a later non-force embed would see all-present embeddings and do
+    /// zero work. Stamping here means an interrupted force-switch instead
+    /// leaves a consistent (new-model, partial) index that the next run
+    /// resumes or re-embeds honestly.
+    ///
+    /// The stamp keys off `produced_dim` (the dimension of vectors THIS run
+    /// produced): when it is `None` the run produced nothing yet and the
+    /// existing fingerprint is left untouched. A failed stamp after a
+    /// successful flush only warns (matching the warn-only flush style at the
+    /// call sites); the flush itself still counts.
+    pub fn flush_if_due_with_stamp(
+        &mut self,
+        store: &GraphStore,
+        success_count: usize,
+        model_id: &str,
+        produced_dim: Option<usize>,
+    ) -> Result<bool, StoreError> {
+        if !self.is_due(success_count) {
+            return Ok(false);
+        }
+        store.flush_embedding_index()?;
+        self.record_flush(success_count);
+        if let Some(dim) = produced_dim
+            && !model_id.is_empty()
+            && let Err(e) = store.set_embedding_metadata(model_id, dim as u32)
+        {
+            tracing::warn!("failed to stamp embedding metadata at checkpoint: {e}");
+        }
+        Ok(true)
+    }
+
+    fn is_due(&self, success_count: usize) -> bool {
+        success_count != self.flushed_success_count && self.last_flush.elapsed() >= self.interval
+    }
+
+    fn record_flush(&mut self, success_count: usize) {
+        self.last_flush = std::time::Instant::now();
+        self.flushed_success_count = success_count;
+    }
 }
 
 #[cfg(test)]
@@ -603,6 +758,335 @@ mod tests {
         assert!(idx.add("sym:c", vec![1.0_f32, 0.0, 0.0], true)); // switch back to dim 3
         assert_eq!(idx.len(), 1);
         assert_eq!(idx.dimension(), Some(3));
+    }
+
+    // ── Recorded-model write guard ────────────────────────────────────
+    // A same-dimension model swap passes the dimension guard, but two
+    // contrastively trained embedding spaces share no basis, so a
+    // mixed-model index is unusable for retrieval. `add_with_model` refuses
+    // the write (naming both ids via tracing) unless the run is `--force`.
+
+    #[test]
+    fn add_with_model_rejects_a_different_recorded_model_at_the_same_dimension() {
+        let mut idx = EmbeddingIndex::new();
+        idx.set_recorded_model_id(Some("sentence-transformers/model-a".to_string()));
+        assert!(idx.add_with_model(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+
+        // Same dimension, different producer — the hole the dimension guard
+        // cannot see. Must be rejected, and the index must stay untouched.
+        assert!(!idx.add_with_model(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            Some("sentence-transformers/model-b"),
+            false,
+        ));
+        assert_eq!(idx.len(), 1, "a cross-model vector must not be added");
+        assert_eq!(idx.dimension(), Some(3));
+        assert!(idx.get("sym:b").is_none());
+    }
+
+    #[test]
+    fn add_with_model_accepts_the_recorded_model() {
+        let mut idx = EmbeddingIndex::new();
+        idx.set_recorded_model_id(Some("sentence-transformers/model-a".to_string()));
+        assert!(idx.add_with_model(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+        assert!(idx.add_with_model(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn add_with_model_allows_any_model_when_none_is_recorded() {
+        // Absent metadata means unknown, not mismatch: a database that was
+        // never stamped must keep accepting writes (guarded by dimension
+        // only), or every pre-fingerprint database would be frozen.
+        let mut idx = EmbeddingIndex::new();
+        assert!(idx.add_with_model(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+        assert!(idx.add_with_model(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            Some("sentence-transformers/model-b"),
+            false,
+        ));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn add_with_model_force_overrides_the_recorded_model_guard() {
+        // A --force run re-embeds everything, so no mixture survives; the
+        // switch must be allowed through.
+        let mut idx = EmbeddingIndex::new();
+        idx.set_recorded_model_id(Some("sentence-transformers/model-a".to_string()));
+        assert!(idx.add_with_model(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            Some("sentence-transformers/model-a"),
+            false,
+        ));
+        assert!(idx.add_with_model(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            Some("sentence-transformers/model-b"),
+            true,
+        ));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn add_without_a_producer_model_skips_the_model_guard() {
+        // `add` names no producing model (unknown producer), so the model
+        // guard cannot fire on it; the dimension guard still applies.
+        let mut idx = EmbeddingIndex::new();
+        idx.set_recorded_model_id(Some("sentence-transformers/model-a".to_string()));
+        assert!(idx.add("sym:a", vec![1.0_f32, 0.0, 0.0], false));
+        assert!(idx.add("sym:b", vec![0.0_f32, 1.0, 0.0], false));
+        assert!(!idx.add("sym:c", vec![1.0_f32, 0.0], false));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn store_model_guard_reads_the_recorded_model_from_a_reopened_database() {
+        // The recorded model id is persisted in the database's embedding
+        // metadata and handed to the index once at open — a store that
+        // reopens a stamped database must enforce the guard without anyone
+        // re-stamping.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("model_guard.lbug");
+        {
+            let store = GraphStore::create(&db_path).unwrap();
+            store
+                .set_embedding_metadata("sentence-transformers/model-a", 3)
+                .unwrap();
+            assert!(store.add_embedding_with_force(
+                "sym:a",
+                vec![1.0_f32, 0.0, 0.0],
+                "sentence-transformers/model-a",
+                false,
+            ));
+            store.flush_embedding_index().unwrap();
+        }
+
+        let store = GraphStore::open(&db_path).unwrap();
+        assert!(
+            !store.add_embedding_with_force(
+                "sym:b",
+                vec![0.0_f32, 1.0, 0.0],
+                "sentence-transformers/model-b",
+                false,
+            ),
+            "a same-dimension write from a different model must be rejected"
+        );
+        assert!(!store.has_embedding("sym:b"));
+        assert!(store.add_embedding_with_force(
+            "sym:c",
+            vec![0.0_f32, 1.0, 0.0],
+            "sentence-transformers/model-a",
+            false,
+        ));
+        assert!(store.add_embedding_with_force(
+            "sym:d",
+            vec![1.0_f32, 1.0, 0.0],
+            "sentence-transformers/model-b",
+            true,
+        ));
+    }
+
+    #[test]
+    fn set_embedding_metadata_refreshes_the_in_memory_recorded_model() {
+        // Long-lived stores (the daemon) must check new writes against the
+        // fingerprint that was just stamped, not the one read at open.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("model_refresh.lbug")).unwrap();
+        store
+            .set_embedding_metadata("sentence-transformers/model-a", 3)
+            .unwrap();
+        assert!(!store.add_embedding_with_force(
+            "sym:a",
+            vec![1.0_f32, 0.0, 0.0],
+            "sentence-transformers/model-b",
+            false,
+        ));
+
+        store
+            .set_embedding_metadata("sentence-transformers/model-b", 3)
+            .unwrap();
+        assert!(
+            store.add_embedding_with_force(
+                "sym:a",
+                vec![1.0_f32, 0.0, 0.0],
+                "sentence-transformers/model-b",
+                false,
+            ),
+            "writes must be checked against the newly stamped model"
+        );
+        assert!(!store.add_embedding_with_force(
+            "sym:b",
+            vec![0.0_f32, 1.0, 0.0],
+            "sentence-transformers/model-a",
+            false,
+        ));
+    }
+
+    // ── Embedding flush checkpoint ─────────────────────────────────────
+    // An interrupted embed pass used to lose everything: the only flush ran
+    // once at the end. The checkpoint flushes at chunk boundaries once the
+    // interval elapsed AND new embeddings were accepted since the last
+    // flush. The 300s cadence itself lives in `EMBED_CHECKPOINT_INTERVAL`
+    // (per-batch flushing is not implementable — save_binary rewrites the
+    // whole sidecar), so these tests drive the helper with a zero/long
+    // interval instead.
+
+    #[test]
+    fn flush_if_due_does_not_flush_before_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        assert!(store.add_embedding("sym:a", vec![0.1_f32, 0.2, 0.3]));
+        let sidecar = store.embedding_sidecar_path().unwrap();
+
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::from_secs(3600));
+        assert!(
+            !checkpoint.flush_if_due(&store, 1).unwrap(),
+            "no flush may happen before the interval elapses"
+        );
+        assert!(!sidecar.exists(), "nothing may be written early");
+    }
+
+    #[test]
+    fn flush_if_due_without_new_work_never_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+
+        // A zero interval means always due; with no accepted embeddings the
+        // checkpoint must still not write (there is nothing new to persist).
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(!checkpoint.flush_if_due(&store, 0).unwrap());
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn flush_if_due_flushes_when_due_with_new_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+        assert!(store.add_embedding("sym:a", vec![0.1_f32, 0.2, 0.3]));
+
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(
+            checkpoint.flush_if_due(&store, 1).unwrap(),
+            "a due checkpoint with newly accepted embeddings must flush"
+        );
+        assert!(sidecar.exists(), "the flush must persist the sidecar");
+
+        // A due checkpoint with no new accepts since the last flush must not
+        // rewrite the sidecar (each rewrite rewrites every vector).
+        assert!(!checkpoint.flush_if_due(&store, 1).unwrap());
+
+        // Newly accepted work since the flush re-arms it.
+        assert!(store.add_embedding("sym:b", vec![0.4_f32, 0.5, 0.6]));
+        assert!(checkpoint.flush_if_due(&store, 2).unwrap());
+    }
+
+    #[test]
+    fn flush_if_due_with_stamp_stamps_the_fingerprint_with_the_checkpoint() {
+        // A due checkpoint persists vectors AND the fingerprint describing
+        // them, so an interrupted --force model switch leaves a consistent
+        // (new-model, partial) index instead of mixed vectors under the old
+        // model's metadata.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+        assert!(store.add_embedding_with_force(
+            "sym:a",
+            vec![0.1_f32, 0.2, 0.3],
+            "sentence-transformers/model-b",
+            true,
+        ));
+
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(
+            checkpoint
+                .flush_if_due_with_stamp(&store, 1, "sentence-transformers/model-b", Some(3))
+                .unwrap(),
+            "a due checkpoint with newly accepted embeddings must flush"
+        );
+        assert!(sidecar.exists(), "the flush must persist the sidecar");
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("sentence-transformers/model-b".to_string(), 3)),
+            "the checkpoint must stamp the fingerprint of the vectors it persisted"
+        );
+        // The in-memory recorded model refreshes too, so subsequent writes in
+        // the same run are guarded against the newly stamped model.
+        assert!(store.add_embedding_with_force(
+            "sym:b",
+            vec![0.4_f32, 0.5, 0.6],
+            "sentence-transformers/model-b",
+            false,
+        ));
+    }
+
+    #[test]
+    fn flush_if_due_with_stamp_without_new_work_neither_flushes_nor_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        let sidecar = store.embedding_sidecar_path().unwrap();
+
+        // A zero interval means always due; with no accepted embeddings the
+        // checkpoint must still not write or stamp (there is nothing new to
+        // persist).
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(
+            !checkpoint
+                .flush_if_due_with_stamp(&store, 0, "sentence-transformers/model-b", Some(3))
+                .unwrap()
+        );
+        assert!(!sidecar.exists());
+        assert_eq!(store.get_embedding_metadata().unwrap(), None);
+    }
+
+    #[test]
+    fn flush_if_due_with_stamp_with_no_produced_dim_flushes_but_does_not_stamp() {
+        // `produced_dim == None` means this run produced nothing, so the
+        // pre-existing fingerprint must survive even when a flush fires.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&dir.path().join("ckpt.lbug")).unwrap();
+        store
+            .set_embedding_metadata("sentence-transformers/model-a", 3)
+            .unwrap();
+        assert!(store.add_embedding("sym:a", vec![0.1_f32, 0.2, 0.3]));
+
+        let mut checkpoint = EmbeddingFlushCheckpoint::new(std::time::Duration::ZERO);
+        assert!(
+            checkpoint
+                .flush_if_due_with_stamp(&store, 1, "sentence-transformers/model-b", None)
+                .unwrap(),
+            "the flush decision keys off new accepts, not produced_dim"
+        );
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("sentence-transformers/model-a".to_string(), 3)),
+            "a checkpoint with no produced vectors must not overwrite the fingerprint"
+        );
     }
 
     #[test]

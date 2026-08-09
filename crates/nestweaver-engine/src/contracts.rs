@@ -30,6 +30,8 @@
 
 use nestweaver_schema::{Contract, Language, contract_uid, normalize_http_path};
 
+use crate::blast_radius::AnalysisStatus;
+
 /// Map the schema [`Language`] enum to the lowercase language string the
 /// parser's `detect_frameworks` expects (`"java"`, `"javascript"`, ...).
 /// Returns `None` for languages with no framework detector.
@@ -136,6 +138,38 @@ pub fn parse_spec_file(path: &str, source: &str) -> Vec<SpecContract> {
         Some(SpecFileKind::Proto) => parse_proto(path, source),
         Some(SpecFileKind::GraphQl) => parse_graphql(source),
         None => Vec::new(),
+    }
+}
+
+/// Parse a watched spec without the full-indexer's best-effort fallback.
+///
+/// A live watcher replaces an already-published contract graph, so treating a
+/// transient or malformed save as an empty spec would incorrectly clear the
+/// prior contracts. Watcher planning uses this strict seam before opening its
+/// publication transaction.
+pub(crate) fn parse_spec_file_strict(
+    path: &str,
+    source: &str,
+) -> Result<Vec<SpecContract>, String> {
+    match spec_kind(path) {
+        Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str::<openapiv3::OpenAPI>(source)
+            .map(|spec| openapi_contracts(&spec))
+            .map_err(|error| error.to_string()),
+        Some(SpecFileKind::OpenApiJson) => serde_json::from_str::<openapiv3::OpenAPI>(source)
+            .map(|spec| openapi_contracts(&spec))
+            .map_err(|error| error.to_string()),
+        Some(SpecFileKind::Proto) => protox_parse::parse(path, source)
+            .map(|_| parse_proto(path, source))
+            .map_err(|error| error.to_string()),
+        Some(SpecFileKind::GraphQl) => {
+            let parsed = apollo_parser::Parser::new(source).parse();
+            if let Some(error) = parsed.errors().next() {
+                Err(error.to_string())
+            } else {
+                Ok(parse_graphql(source))
+            }
+        }
+        None => Err(format!("unsupported contract spec path: {path}")),
     }
 }
 
@@ -888,16 +922,52 @@ pub struct DriftFinding {
     pub category: String,
 }
 
-/// Result of a drift analysis: the two set-difference buckets.
+/// Result of a drift analysis: the two set-difference buckets, plus the trust
+/// signals that say whether those buckets can be believed.
+///
+/// `contracts_status` and `degraded_repos` reuse the blast-radius trust
+/// vocabulary ([`AnalysisStatus`]) rather than inventing a second one: a
+/// degraded run is "unknown", never "clean". Without them an empty report is
+/// indistinguishable from a repo whose contract derivation failed, and the
+/// empty case is by far the more common one — so the empty report wins the
+/// benefit of the doubt and the failure disappears.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct DriftReport {
     pub declared_not_implemented: Vec<DriftFinding>,
     pub implemented_not_declared: Vec<DriftFinding>,
+    /// [`AnalysisStatus::Complete`] when every in-scope repo derived its
+    /// contracts, [`AnalysisStatus::Degraded`] when at least one did not.
+    #[serde(default)]
+    pub contracts_status: AnalysisStatus,
+    /// Repo UIDs whose last contract derivation failed. Empty on a complete
+    /// run. The error text stays in the index logs; only the identity of the
+    /// broken repo is reported.
+    #[serde(default)]
+    pub degraded_repos: Vec<String>,
 }
 
 impl DriftReport {
+    /// Every finding bucket, in report order.
+    ///
+    /// Callers that need "are there any findings at all" (or a total) must go
+    /// through this rather than naming the buckets, so a future third bucket
+    /// (route-pattern lint findings) is one line here instead of an audit of
+    /// every call site.
+    pub fn buckets(&self) -> [&Vec<DriftFinding>; 2] {
+        [
+            &self.declared_not_implemented,
+            &self.implemented_not_declared,
+        ]
+    }
+
+    /// True only when there are no findings AND the analysis ran to completion.
+    ///
+    /// A repo that genuinely declares and implements nothing is still clean.
+    /// A repo whose derivation failed has zero findings for the wrong reason
+    /// and is NOT clean — it is unknown.
     pub fn is_clean(&self) -> bool {
-        self.declared_not_implemented.is_empty() && self.implemented_not_declared.is_empty()
+        self.contracts_status == AnalysisStatus::Complete
+            && self.buckets().iter().all(|b| b.is_empty())
     }
 }
 
@@ -1001,7 +1071,61 @@ pub fn drift_for_store(
     let (declared, code_derived): (Vec<Contract>, Vec<Contract>) =
         all.into_iter().partition(|c| is_spec_file(&c.source_path));
 
-    Ok(compute_drift(&declared, &code_derived, &implemented))
+    let mut report = compute_drift(&declared, &code_derived, &implemented);
+
+    // The set difference above is recomputed at QUERY time from stored
+    // Contracts, so it cannot itself tell a repo that declares nothing from a
+    // repo whose derivation failed — both produce zero rows. The distinction
+    // only exists at INDEX time, so the indexer persists it and we read it
+    // back here. Anything else would be a guess dressed as a fact.
+    let degraded = store.contract_derivation_failures(repo_uid.as_deref())?;
+    if !degraded.is_empty() {
+        report.contracts_status = AnalysisStatus::Degraded;
+        report.degraded_repos = degraded;
+    }
+
+    Ok(report)
+}
+
+/// Build the JSON envelope for a drift report.
+///
+/// The MCP tool and the CLI's local (no-daemon) path both render drift, and
+/// they used to serialize DIFFERENT shapes: the tool emitted totals, `clean`
+/// and `limit` around truncated buckets, while the CLI printed a bare
+/// `DriftReport` with no totals, no `clean`, and no truncation at all. One
+/// builder, used by both, is the only way those stay in agreement.
+///
+/// `limit` truncates each bucket; the `*_total` fields always report the
+/// untruncated count.
+pub fn drift_envelope(report: DriftReport, limit: usize) -> serde_json::Value {
+    // Compute the verdict BEFORE the buckets are consumed: `clean` is about the
+    // full report, not the truncated view.
+    let clean = report.is_clean();
+    let dni_total = report.declared_not_implemented.len();
+    let ind_total = report.implemented_not_declared.len();
+    let dni: Vec<_> = report
+        .declared_not_implemented
+        .into_iter()
+        .take(limit)
+        .collect();
+    let ind: Vec<_> = report
+        .implemented_not_declared
+        .into_iter()
+        .take(limit)
+        .collect();
+    serde_json::json!({
+        "note": "Contract links are hypotheses, not ground truth.",
+        "declared_not_implemented": dni,
+        "declared_not_implemented_total": dni_total,
+        "implemented_not_declared": ind,
+        "implemented_not_declared_total": ind_total,
+        // `clean` is now a TRUST verdict, not a "both buckets empty" shorthand:
+        // a repo whose contract derivation failed reports clean: false.
+        "clean": clean,
+        "contracts_status": report.contracts_status.label(),
+        "degraded_repos": report.degraded_repos,
+        "limit": limit,
+    })
 }
 
 // ── Field-level spec-vs-spec breaking-change diff (F2) ──────────────────────
@@ -1347,6 +1471,90 @@ pub fn diff_openapi(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn finding(uid: &str, category: &str) -> DriftFinding {
+        DriftFinding {
+            uid: uid.to_string(),
+            kind: "http".to_string(),
+            verb: Some("GET".to_string()),
+            path: Some("/x".to_string()),
+            operation_id: None,
+            category: category.to_string(),
+        }
+    }
+
+    /// The MCP tool and the CLI's local path both serialize drift, and they
+    /// used to emit different shapes: the tool wrapped the buckets in totals,
+    /// `clean` and `limit`, while the CLI printed a bare `DriftReport` — no
+    /// totals, no verdict, and no truncation at all. Both now go through
+    /// [`drift_envelope`], so this pins the one shape they share.
+    #[test]
+    fn drift_envelope_is_the_single_serialized_shape() {
+        let report = DriftReport {
+            declared_not_implemented: vec![
+                finding("a", "declared-not-implemented"),
+                finding("b", "declared-not-implemented"),
+            ],
+            implemented_not_declared: vec![finding("c", "implemented-not-declared")],
+            ..Default::default()
+        };
+        let value = drift_envelope(report, 1);
+
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("envelope is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "clean",
+                "contracts_status",
+                "declared_not_implemented",
+                "declared_not_implemented_total",
+                "degraded_repos",
+                "implemented_not_declared",
+                "implemented_not_declared_total",
+                "limit",
+                "note",
+            ]
+        );
+
+        // Truncation applies to the buckets; totals report the full count.
+        assert_eq!(
+            value["declared_not_implemented"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(value["declared_not_implemented_total"], 2);
+        assert_eq!(value["implemented_not_declared_total"], 1);
+        assert_eq!(value["limit"], 1);
+        assert_eq!(value["clean"], false);
+    }
+
+    /// `clean` must mean "no drift AND the analysis ran", not "both buckets
+    /// happen to be empty".
+    #[test]
+    fn clean_distinguishes_empty_from_degraded() {
+        let empty = DriftReport::default();
+        assert!(empty.is_clean(), "a genuinely empty report is clean");
+        assert_eq!(drift_envelope(empty, 50)["clean"], true);
+
+        let degraded = DriftReport {
+            contracts_status: AnalysisStatus::Degraded,
+            degraded_repos: vec!["repo:broken".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !degraded.is_clean(),
+            "zero findings from a failed derivation is not clean"
+        );
+        let value = drift_envelope(degraded, 50);
+        assert_eq!(value["clean"], false);
+        assert_eq!(value["contracts_status"], "degraded");
+        assert_eq!(value["degraded_repos"], serde_json::json!(["repo:broken"]));
+    }
 
     #[test]
     fn first_string_arg_handles_common_spring_forms() {

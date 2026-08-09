@@ -459,6 +459,7 @@ impl GraphStore {
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
+        store.load_recorded_embedding_model_into_index();
         Ok(store)
     }
 
@@ -490,6 +491,7 @@ impl GraphStore {
         };
         store.init_schema()?;
         store.load_graph_generation(&store.generation_sidecar_path());
+        store.load_recorded_embedding_model_into_index();
         Ok(store)
     }
 
@@ -521,6 +523,7 @@ impl GraphStore {
             )),
         };
         store.load_graph_generation(&store.generation_sidecar_path());
+        store.load_recorded_embedding_model_into_index();
         Ok(store)
     }
 
@@ -576,6 +579,7 @@ impl GraphStore {
             )),
         };
         store.init_schema()?;
+        store.load_recorded_embedding_model_into_index();
         Ok(store)
     }
 
@@ -1164,6 +1168,29 @@ impl GraphStore {
         crate::search::EmbeddingIndex::load(&json_path).unwrap_or_default()
     }
 
+    /// Hand the embedding index the model id recorded in the database's
+    /// embedding metadata, so `add_embedding_with_force` can refuse a
+    /// same-dimension write from a different model. Read once here — never
+    /// per-add — and kept current by `set_embedding_metadata`. Absent or
+    /// unreadable metadata means unknown: the model guard stays off and the
+    /// dimension guard alone applies.
+    fn load_recorded_embedding_model_into_index(&self) {
+        let recorded = match self.get_embedding_metadata() {
+            Ok(recorded) => recorded.map(|(model_id, _)| model_id),
+            Err(e) => {
+                tracing::warn!(
+                    "could not read embedding metadata; the recorded-model write guard is \
+                     disabled for this store: {e}"
+                );
+                None
+            }
+        };
+        self.embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_recorded_model_id(recorded);
+    }
+
     /// Compute the legacy JSON sidecar path for a given database path.
     fn embedding_sidecar_json_for(db_path: &Path) -> std::path::PathBuf {
         let mut s = db_path.as_os_str().to_owned();
@@ -1191,18 +1218,38 @@ impl GraphStore {
     ///
     /// Returns `false` when the dimension guard rejects the vector — callers
     /// must not count a rejected embedding as stored.
+    ///
+    /// This entry point names no producing model, so the recorded-model guard
+    /// is skipped (unknown producer); explicit embed runs should use
+    /// [`add_embedding_with_force`], which takes the model id.
+    ///
+    /// [`add_embedding_with_force`]: GraphStore::add_embedding_with_force
     #[must_use = "a false return means the dimension guard rejected the embedding"]
     pub fn add_embedding(&self, uid: &str, embedding: Vec<f32>) -> bool {
-        self.add_embedding_with_force(uid, embedding, false)
-    }
-
-    #[must_use = "a false return means the dimension guard rejected the embedding"]
-    pub fn add_embedding_with_force(&self, uid: &str, embedding: Vec<f32>, force: bool) -> bool {
         let mut idx = self
             .embedding_index
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        idx.add(uid, embedding, force)
+        idx.add(uid, embedding, false)
+    }
+
+    /// Add an embedding produced by `model_id`. Returns `false` when a guard
+    /// rejects the vector: the dimension guard, or — when the database has a
+    /// recorded embedding model — a same-dimension write from a different
+    /// model, unless `force` is set (a `--force` run re-embeds everything).
+    #[must_use = "a false return means a guard rejected the embedding"]
+    pub fn add_embedding_with_force(
+        &self,
+        uid: &str,
+        embedding: Vec<f32>,
+        model_id: &str,
+        force: bool,
+    ) -> bool {
+        let mut idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        idx.add_with_model(uid, embedding, Some(model_id), force)
     }
 
     /// Re-arm the embedding index's once-per-run force-clear guard. Call at
@@ -1238,7 +1285,6 @@ impl GraphStore {
         }
         Ok(())
     }
-
     /// Remove embeddings for graph nodes that no longer exist, update the
     /// live index, and persist the repaired binary sidecar.
     ///

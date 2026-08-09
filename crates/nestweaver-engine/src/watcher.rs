@@ -145,6 +145,7 @@ impl BrainWatcher {
             "brain watcher batch",
             io,
             Some(&GraphScope::unified()),
+            true,
         )
     }
 

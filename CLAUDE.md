@@ -42,7 +42,7 @@ by an error message the tool can print, so they belong somewhere findable.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` | 30 | How long a client waits for the daemon to bind its socket. Raise it on a slow cold start; the boot-failure message names it. Boot phase timings (`boot_ms`, `store_open_ms`, `extension_reconcile_ms`, `unattributed_ms`) are logged at bind so a slow boot is diagnosable rather than guessed at. |
-| `NESTWEAVER_INDEX_TIMEOUT_SECS` | 1800 | Overall ceiling for one index. On expiry the daemon requests cancellation and reports a terminal error naming this variable. Cancellation is COOPERATIVE and only observed at the next pre-write boundary, so the index may still be finishing — check the daemon log before assuming it stopped. |
+| `NESTWEAVER_INDEX_TIMEOUT_SECS` | 1800 | Overall ceiling for one index. On expiry the daemon requests cancellation and reports a non-terminal warning naming this variable. Cancellation is COOPERATIVE and only observed up to the pre-write boundary, so the final stream event says whether the run aborted before writing or committed anyway (committed-after-cancellation names `index --force` as the repair). |
 | `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | How long a shutting-down daemon drains active write RPCs. |
 | `NESTWEAVER_STOP_GRACE_SECS` | — | Grace period before a stopping daemon is escalated. |
 | `NESTWEAVER_INDEX_CPU_PERCENT` | 50 | Index CPU duty cycle, percent of one core (1–99; `0` or `>=100` disables). Also see the launchd note below. |

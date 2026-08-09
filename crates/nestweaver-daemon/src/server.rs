@@ -72,6 +72,150 @@ fn arm_disconnect_cancel(cancel: Arc<AtomicBool>) -> tokio_util::sync::DropGuard
     token.drop_guard()
 }
 
+fn list_contracts_impl(
+    store: &GraphStore,
+    repo_filter: Option<&str>,
+    visible: &nestweaver_engine::authz::VisibleRepos,
+) -> Result<ListContractsResponse, Status> {
+    let repo_is_visible = |repo_uid: &str| match visible {
+        nestweaver_engine::authz::VisibleRepos::All => true,
+        nestweaver_engine::authz::VisibleRepos::Only(_) => {
+            !repo_uid.is_empty() && visible.allows(repo_uid)
+        }
+    };
+    let repo_uid = if let Some(filter) = repo_filter {
+        let repos = nestweaver_engine::list_repos(store, None)
+            .map_err(|error| Status::internal(format!("list repositories: {error:#}")))?;
+        let visible_repos: Vec<_> = repos
+            .iter()
+            .filter(|repo| repo_is_visible(&repo.uid))
+            .collect();
+        // Preserve the direct CLI resolver's precedence: an exact UID must
+        // beat an earlier repo whose display name happens to equal that UID.
+        let repo = visible_repos
+            .iter()
+            .copied()
+            .find(|repo| repo.uid == filter)
+            .or_else(|| {
+                let needle = filter.to_lowercase();
+                visible_repos.iter().copied().find(|repo| {
+                    nestweaver_engine::repo_display_name(repo).to_lowercase() == needle
+                })
+            })
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("no indexed repo matches --repo '{filter}'"))
+            })?;
+        Some(repo.uid.clone())
+    } else {
+        None
+    };
+
+    let mut contracts = store
+        .list_contracts(repo_uid.as_deref())
+        .map_err(|error| Status::internal(format!("list contracts: {error}")))?;
+    contracts.retain(|contract| repo_is_visible(&contract.repo_uid));
+    contracts.sort_by(|left, right| left.uid.cmp(&right.uid));
+
+    Ok(ListContractsResponse {
+        contracts: contracts
+            .into_iter()
+            .map(|contract| ContractRecord {
+                uid: contract.uid,
+                kind: contract.kind,
+                verb: contract.verb,
+                path: contract.path,
+                operation_id: contract.operation_id,
+                repo_uid: contract.repo_uid,
+                source_path: contract.source_path,
+                confidence: contract.confidence,
+            })
+            .collect(),
+    })
+}
+
+#[cfg(test)]
+mod list_contracts_tests {
+    use std::collections::HashSet;
+
+    use nestweaver_engine::authz::VisibleRepos;
+    use nestweaver_schema::{Contract, Repo};
+
+    use super::*;
+
+    fn repo(uid: &str, name: &str) -> Repo {
+        Repo {
+            uid: uid.to_string(),
+            url: format!("https://example.test/{name}.git"),
+            indexed_sha: "abc".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: Some(name.to_string()),
+            root_path: None,
+        }
+    }
+
+    fn contract(uid: &str, repo_uid: &str) -> Contract {
+        Contract {
+            uid: uid.to_string(),
+            kind: "http".to_string(),
+            verb: Some("GET".to_string()),
+            path: Some(format!("/{uid}")),
+            operation_id: None,
+            repo_uid: repo_uid.to_string(),
+            source_path: "openapi.yaml".to_string(),
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn list_contracts_prefers_exact_uid_and_filters_hidden_repos() {
+        let store = GraphStore::in_memory().unwrap();
+        // The first repo's display name collides with the second repo's exact
+        // UID. Exact UID must win regardless of list order.
+        store.insert_repo(&repo("repo:display", "target")).unwrap();
+        store.insert_repo(&repo("target", "exact")).unwrap();
+        store
+            .insert_repo(&repo("repo:unicode", "Überblick"))
+            .unwrap();
+        store
+            .insert_contract(&contract("contract:display", "repo:display"))
+            .unwrap();
+        store
+            .insert_contract(&contract("contract:exact", "target"))
+            .unwrap();
+        store
+            .insert_contract(&contract("contract:unicode", "repo:unicode"))
+            .unwrap();
+
+        let exact = list_contracts_impl(&store, Some("target"), &VisibleRepos::All).unwrap();
+        assert_eq!(exact.contracts.len(), 1);
+        assert_eq!(exact.contracts[0].uid, "contract:exact");
+
+        let unicode = list_contracts_impl(&store, Some("überblick"), &VisibleRepos::All).unwrap();
+        assert_eq!(unicode.contracts.len(), 1);
+        assert_eq!(unicode.contracts[0].uid, "contract:unicode");
+
+        let empty = list_contracts_impl(&store, Some(""), &VisibleRepos::All).unwrap_err();
+        assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+        assert!(
+            empty
+                .message()
+                .contains("no indexed repo matches --repo ''")
+        );
+
+        let visible = VisibleRepos::Only(HashSet::from(["target".to_string()]));
+        let unfiltered = list_contracts_impl(&store, None, &visible).unwrap();
+        assert_eq!(unfiltered.contracts.len(), 1);
+        assert_eq!(unfiltered.contracts[0].uid, "contract:exact");
+
+        for filter in ["repo:display", "does-not-exist"] {
+            let error = list_contracts_impl(&store, Some(filter), &visible).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("no indexed repo matches --repo"));
+        }
+    }
+}
+
 /// RAII guard that decrements a connection counter on drop.
 /// Fixes cancellation-safety: if a client disconnects mid-RPC or
 /// the async task is cancelled, the counter is still decremented.
@@ -346,6 +490,109 @@ fn daemon_metal_compiled() -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EffectiveConfigProvenance {
+    Configured(PathBuf),
+    CompiledDefaults,
+}
+
+fn configured_provenance(path: &Path) -> anyhow::Result<EffectiveConfigProvenance> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize --config {}", path.display()))?;
+    anyhow::ensure!(
+        canonical.to_str().is_some(),
+        "canonical --config path is not valid UTF-8: {}",
+        canonical.display()
+    );
+    Ok(EffectiveConfigProvenance::Configured(canonical))
+}
+
+fn effective_config_proto(provenance: &EffectiveConfigProvenance) -> EffectiveConfig {
+    use effective_config::Source;
+
+    let source = match provenance {
+        EffectiveConfigProvenance::Configured(path) => Source::ConfiguredPath(
+            path.to_str()
+                .expect("configured provenance is validated as UTF-8 at startup")
+                .to_string(),
+        ),
+        EffectiveConfigProvenance::CompiledDefaults => {
+            Source::CompiledDefaults(effective_config::CompiledDefaults {})
+        }
+    };
+    EffectiveConfig {
+        source: Some(source),
+    }
+}
+
+fn load_daemon_instance_config(
+    config_path: Option<&Path>,
+    _server_mode: bool,
+) -> anyhow::Result<(
+    Option<Arc<nestweaver_engine::InstanceConfig>>,
+    EffectiveConfigProvenance,
+)> {
+    match config_path {
+        None => Ok((None, EffectiveConfigProvenance::CompiledDefaults)),
+        Some(path) => match nestweaver_engine::InstanceConfig::from_file(path) {
+            Ok(config) => {
+                let provenance = configured_provenance(path)?;
+                tracing::info!(
+                    config = %path.display(),
+                    "loaded instance config (ranking, response, features)"
+                );
+                Ok((Some(Arc::new(config)), provenance))
+            }
+            Err(error) => {
+                // Any explicitly supplied config is a binding, not a hint.
+                // This applies equally to UDS and network server modes: a
+                // version-mismatch restart prevalidates its captured path, but
+                // the file can disappear or change before the replacement
+                // parses it. Falling back here would silently fork identity and
+                // widen configured authorization to compiled defaults.
+                eprintln!("[daemon] cannot honor --config {}: {error}", path.display());
+                tracing::error!(
+                    config = %path.display(),
+                    error = %error,
+                    "cannot honor explicitly supplied --config"
+                );
+                anyhow::bail!(
+                    "invalid or unreadable --config {}: {error}; explicitly supplied config must be honored",
+                    path.display()
+                )
+            }
+        },
+    }
+}
+
+fn live_binding_source(
+    provenance: &EffectiveConfigProvenance,
+) -> lifecycle::EffectiveConfigBindingSource {
+    match provenance {
+        EffectiveConfigProvenance::Configured(path) => {
+            lifecycle::EffectiveConfigBindingSource::Configured {
+                path: path
+                    .to_str()
+                    .expect("configured provenance is validated as UTF-8 at startup")
+                    .to_string(),
+            }
+        }
+        EffectiveConfigProvenance::CompiledDefaults => {
+            lifecycle::EffectiveConfigBindingSource::CompiledDefaults
+        }
+    }
+}
+
+struct EffectiveConfigBindingCleanup {
+    instance_id: String,
+}
+
+impl Drop for EffectiveConfigBindingCleanup {
+    fn drop(&mut self) {
+        let _ = lifecycle::remove_effective_config_binding(&self.instance_id);
+    }
+}
+
 pub struct DaemonState {
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
@@ -374,6 +621,10 @@ pub struct DaemonState {
     /// daemon start. Used by tool dispatch (e.g. F6 `[ranking]` priors in
     /// `brain_search`) via the `set_current_instance_config` thread-local.
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
+    /// Effective configuration used by this process. Configured paths are
+    /// canonicalized at startup; `CompiledDefaults` represents the process's
+    /// actual configless/default mode.
+    pub(crate) effective_config: EffectiveConfigProvenance,
     /// Per-repo authorization policy (R9/R9b), built ONCE at startup from
     /// `[authz]` config — not rebuilt per request. No `[authz]` ⇒ a disabled
     /// source that resolves every identity to `VisibleRepos::All`. Mirrors the
@@ -493,6 +744,61 @@ fn resolve_effective_instance_id(requested: &str, configured: &str) -> Result<St
     nestweaver_engine::validate_instance_id(effective)
         .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
     Ok(effective.to_string())
+}
+
+/// Build the terminal `Phase::Done` message for `IndexRepo`. When
+/// cancellation was requested (timeout or client disconnect) but the run had
+/// already passed the point where it could abort safely, say so plainly: the
+/// index COMMITTED, and a plain `Done` would be a lie about what the caller
+/// asked for. Name the repair.
+fn index_done_message(
+    files_count: usize,
+    symbols_count: usize,
+    edges_count: usize,
+    repo_path: &std::path::Path,
+    cancelled: bool,
+) -> String {
+    if cancelled {
+        format!(
+            "Done — {} files, {} symbols, {} edges. Cancellation was requested \
+             but the index had already passed its last cancellation point and \
+             COMMITTED anyway. To discard this run and re-index from scratch, \
+             run: nestweaver index --repo {} --force",
+            files_count,
+            symbols_count,
+            edges_count,
+            repo_path.display()
+        )
+    } else {
+        format!(
+            "Done — {} files, {} symbols, {} edges",
+            files_count, symbols_count, edges_count
+        )
+    }
+}
+
+#[cfg(test)]
+mod index_done_message_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_variant_reports_commit_and_names_repair() {
+        let message = index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), true);
+        assert!(message.contains("COMMITTED"), "{message}");
+        assert!(
+            message.contains("nestweaver index --repo /tmp/repo --force"),
+            "{message}"
+        );
+        assert!(message.contains("12 files"), "{message}");
+        assert!(message.contains("340 symbols"), "{message}");
+        assert!(message.contains("1500 edges"), "{message}");
+    }
+
+    #[test]
+    fn uncancelled_variant_is_the_plain_done_line() {
+        let message = index_done_message(12, 340, 1500, std::path::Path::new("/tmp/repo"), false);
+        assert_eq!(message, "Done — 12 files, 340 symbols, 1500 edges");
+    }
 }
 
 /// Stop and unregister any active file watcher. Idempotent.
@@ -3367,23 +3673,25 @@ impl NestWeaverDaemon for DaemonService {
                         // reported as a FAILURE for an index that (because
                         // cancellation is cooperative and only observed at the
                         // pre-write boundary) may still be running and may still
-                        // succeed. Send a terminal Error event so the caller
-                        // learns what actually happened, names the knob, and is
-                        // warned not to assume the work stopped.
+                        // succeed. Send a NON-TERMINAL warning instead: the
+                        // progress tracker treats Done|Error as terminal, so a
+                        // terminal Error here would make the run's own late
+                        // Writing/Done events be rejected as AfterTerminal and
+                        // misreport a committed index as failed. The genuine
+                        // terminal event still follows and says whether the run
+                        // aborted before writing or committed anyway.
                         let _ = watch_tx
                             .send(Ok(IndexProgress {
-                                phase: Phase::Error as i32,
                                 message: format!(
                                     "index exceeded the {}s timeout and cancellation was requested \
                                      (raise NESTWEAVER_INDEX_TIMEOUT_SECS). Cancellation is \
                                      cooperative and is only observed at the next pre-write \
-                                     boundary, so the daemon may still be finishing this index — \
-                                     check the daemon log before assuming it stopped or retrying.",
+                                     boundary, so this run may still commit — the final stream \
+                                     event will say whether it aborted before writing or \
+                                     committed anyway.",
                                     index_timeout.as_secs()
                                 ),
-                                files_processed: 0,
-                                files_total: 0,
-                                symbols_found: 0,
+                                ..Default::default()
                             }))
                             .await;
                     }
@@ -3474,7 +3782,24 @@ impl NestWeaverDaemon for DaemonService {
                     // and the trigram rebuild scans the whole index — since
                     // nobody is waiting on the result. The graph itself is
                     // already indexed; these sidecars rebuild on the next index.
+                    // The terminal Done is still sent first: the stream must
+                    // not close without reporting the committed-after-cancel
+                    // outcome, or the client reads the committed index as a
+                    // truncated failure.
                     if cancel_for_index.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                            phase: Phase::Done as i32,
+                            message: index_done_message(
+                                result.files_count,
+                                result.symbols_count,
+                                result.edges_count,
+                                &repo_path,
+                                true,
+                            ),
+                            files_processed: result.files_count as u64,
+                            files_total: result.files_count as u64,
+                            symbols_found: result.symbols_count as u64,
+                        }));
                         return;
                     }
 
@@ -3557,12 +3882,18 @@ impl NestWeaverDaemon for DaemonService {
                         }
                     }
 
-                    // DONE phase
+                    // DONE phase. Re-read the cancel flag here: cancellation
+                    // can still arrive while the post-index phases above run,
+                    // and the committed-after-cancel variant must say so
+                    // plainly rather than claim a clean `Done`.
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
-                        message: format!(
-                            "Done — {} files, {} symbols, {} edges",
-                            result.files_count, result.symbols_count, result.edges_count
+                        message: index_done_message(
+                            result.files_count,
+                            result.symbols_count,
+                            result.edges_count,
+                            &repo_path,
+                            cancel_for_index.load(std::sync::atomic::Ordering::Acquire),
                         ),
                         files_processed: result.files_count as u64,
                         files_total: result.files_count as u64,
@@ -3620,14 +3951,15 @@ impl NestWeaverDaemon for DaemonService {
                 symbols_found: 0,
             }));
 
-            let index_result = nestweaver_engine::index_markdown_directory_with_store(
-                &state.store,
-                &vault_path,
-                &state.db_path,
-                &instance_id,
-                &vault_name,
-                &extra_patterns,
-            );
+            let index_result =
+                nestweaver_engine::index_markdown_directory_with_store_and_deletion_count(
+                    &state.store,
+                    &vault_path,
+                    &state.db_path,
+                    &instance_id,
+                    &vault_name,
+                    &extra_patterns,
+                );
 
             match index_result {
                 Ok(result) => {
@@ -3635,11 +3967,13 @@ impl NestWeaverDaemon for DaemonService {
                         phase: Phase::Writing as i32,
                         message: format!(
                             "Indexed {} notes, {} headings, {} sections",
-                            result.notes_count, result.headings_count, result.sections_count
+                            result.index.notes_count,
+                            result.index.headings_count,
+                            result.index.sections_count
                         ),
-                        files_processed: result.notes_count as u64,
-                        files_total: result.notes_count as u64,
-                        symbols_found: result.headings_count as u64,
+                        files_processed: result.index.notes_count as u64,
+                        files_total: result.index.notes_count as u64,
+                        symbols_found: result.index.headings_count as u64,
                     }));
 
                     // Rebuild Tantivy search index so BM25 search reflects
@@ -3660,16 +3994,12 @@ impl NestWeaverDaemon for DaemonService {
                     // DONE phase
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Done as i32,
-                        message: format!(
-                            "Done — {} notes, {} headings, {} sections, {} tags",
-                            result.notes_count,
-                            result.headings_count,
-                            result.sections_count,
-                            result.tags_count
+                        message: nestweaver_engine::index_md::format_markdown_refresh_summary(
+                            &result,
                         ),
-                        files_processed: result.notes_count as u64,
-                        files_total: result.notes_count as u64,
-                        symbols_found: result.headings_count as u64,
+                        files_processed: result.index.notes_count as u64,
+                        files_total: result.index.notes_count as u64,
+                        symbols_found: result.index.headings_count as u64,
                     }));
                 }
                 Err(e) => {
@@ -4541,6 +4871,7 @@ impl NestWeaverDaemon for DaemonService {
             indexing_repo,
             queue_depth,
             embedding_status: Some(embedding_status),
+            effective_config: Some(effective_config_proto(&self.state.effective_config)),
         }))
     }
 
@@ -4730,6 +5061,22 @@ impl NestWeaverDaemon for DaemonService {
         r: Request<JsonRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         json_rpc!(self, r, "count_patterns")
+    }
+
+    async fn list_contracts(
+        &self,
+        request: Request<ListContractsRequest>,
+    ) -> Result<Response<ListContractsResponse>, Status> {
+        let visible = self.state.visible_repos_for(request.extensions())?;
+        let repo = request.into_inner().repo;
+        let state = Arc::clone(&self.state);
+        let _guard = ConnectionGuard::read(&state);
+        tokio::task::spawn_blocking(move || {
+            list_contracts_impl(&state.store, repo.as_deref(), &visible)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("task panicked: {error}")))?
+        .map(Response::new)
     }
 
     async fn cross_repo_contracts(
@@ -5493,6 +5840,10 @@ impl NestWeaverDaemon for DaemonService {
                     )
                 }));
             };
+            // The model the daemon actually loaded (startup preference: the
+            // DB-recorded id wins, else the configured external/local model).
+            // Used to stamp embedding metadata after a productive run.
+            let embed_model_id = status.model_id.clone();
 
             let store = self.state.store.clone();
 
@@ -5502,6 +5853,17 @@ impl NestWeaverDaemon for DaemonService {
                 let mut rejected = 0u32;
                 let mut scoped = 0u64;
                 let mut eligible = 0u64;
+                // Dimension of the vectors THIS run produced, set on the first
+                // accepted write; gates the metadata stamp below (mirrors the
+                // CLI's `run_embed` tail).
+                let mut produced_dim: Option<usize> = None;
+                // Checkpoint the index to the sidecar about every five minutes
+                // so an interrupted pass keeps completed work. Per-batch
+                // flushing is not implementable: save_binary rewrites the
+                // entire sidecar on every call, so the cadence must stay coarse.
+                let mut flush_checkpoint = nestweaver_store::EmbeddingFlushCheckpoint::new(
+                    nestweaver_store::EMBED_CHECKPOINT_INTERVAL,
+                );
 
                 // Each embed run may legitimately force-switch the model once;
                 // re-arm the once-per-run clear guard on this long-lived index.
@@ -5526,8 +5888,17 @@ impl NestWeaverDaemon for DaemonService {
                             );
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    if store.add_embedding_with_force(&sym.uid, emb, force) {
+                                    let emb_dim = emb.len();
+                                    if store.add_embedding_with_force(
+                                        &sym.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5537,6 +5908,14 @@ impl NestWeaverDaemon for DaemonService {
                                     failed += 1;
                                 }
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
                     }
                 }
@@ -5557,8 +5936,17 @@ impl NestWeaverDaemon for DaemonService {
                                 nestweaver_embed::preprocess::note_embed_text(&note.title, None);
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    if store.add_embedding_with_force(&note.uid, emb, force) {
+                                    let emb_dim = emb.len();
+                                    if store.add_embedding_with_force(
+                                        &note.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5568,6 +5956,14 @@ impl NestWeaverDaemon for DaemonService {
                                     failed += 1;
                                 }
                             }
+                        }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
                         }
                     }
                 }
@@ -5588,8 +5984,17 @@ impl NestWeaverDaemon for DaemonService {
                                 nestweaver_embed::preprocess::heading_embed_text("", &heading.text);
                             match model.embed_query(&text) {
                                 Ok(emb) => {
-                                    if store.add_embedding_with_force(&heading.uid, emb, force) {
+                                    let emb_dim = emb.len();
+                                    if store.add_embedding_with_force(
+                                        &heading.uid,
+                                        emb,
+                                        &embed_model_id,
+                                        force,
+                                    ) {
                                         succeeded += 1;
+                                        if produced_dim.is_none() {
+                                            produced_dim = Some(emb_dim);
+                                        }
                                     } else {
                                         rejected += 1;
                                     }
@@ -5600,6 +6005,14 @@ impl NestWeaverDaemon for DaemonService {
                                 }
                             }
                         }
+                        if let Err(e) = flush_checkpoint.flush_if_due_with_stamp(
+                            &store,
+                            succeeded as usize,
+                            &embed_model_id,
+                            produced_dim,
+                        ) {
+                            tracing::warn!("failed to checkpoint embedding index: {e}");
+                        }
                     }
                 }
 
@@ -5607,6 +6020,17 @@ impl NestWeaverDaemon for DaemonService {
                     && let Err(e) = store.flush_embedding_index()
                 {
                     tracing::warn!("failed to flush embedding index: {e}");
+                }
+
+                // Stamp the fingerprint only from vectors this run produced:
+                // a daemon embed that produced nothing must not invent (or
+                // overwrite) metadata. The daemon route previously never
+                // stamped at all, leaving daemon-populated databases without a
+                // fingerprint for the startup and CLI guards to check.
+                if let Some(dim) = produced_dim
+                    && let Err(e) = store.set_embedding_metadata(&embed_model_id, dim as u32)
+                {
+                    tracing::warn!("failed to record embedding model metadata: {e}");
                 }
 
                 tracing::info!(succeeded, failed, rejected, "embed RPC completed");
@@ -5879,6 +6303,7 @@ const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
     "Investigate",
     "InvestigateExpand",
     "InvestigateHydrate",
+    "ListContracts",
     "ListProjectsJson",
     "ListReposJson",
     "ListServicesJson",
@@ -6624,6 +7049,289 @@ mod embedding_load_config_tests {
         assert_eq!(embeddings[0].len(), 4);
         assert!(embeddings[0].iter().all(|value| value.is_finite()));
     }
+
+    #[test]
+    fn missing_artifact_fails_startup_and_names_model_and_dir() {
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        let artifacts = write_complete_hf_cache(cache.path());
+        std::fs::remove_file(&artifacts.weights).expect("remove weights fixture");
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: cache.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+
+        let error = load_daemon_embedding_backend_with(
+            &config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+        )
+        .err()
+        .expect("a cache missing an artifact must fail the startup load");
+
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            model_id: "test-owner/test-model".to_string(),
+            ..Default::default()
+        };
+        let status = finalize_embedding_status(
+            initial_embedding_status(&cfg, None, true, false),
+            None,
+            Err(format!("{error:#}")),
+        );
+        assert_eq!(status.state, "failed");
+        assert!(
+            status.error.contains("test-owner/test-model"),
+            "startup error must name the model id: {}",
+            status.error
+        );
+        assert!(
+            status.error.contains(&cache.path().display().to_string()),
+            "startup error must name the cache directory searched: {}",
+            status.error
+        );
+    }
+
+    #[test]
+    fn ready_status_carries_the_model_id_and_resolved_cache_dir() {
+        // The ready-path startup diagnostic logs status.model_id and the
+        // resolved cache_dir (cloned before the move into
+        // embedding_load_config); pin the values that line reports so a
+        // wrong-but-populated cache stays visible.
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        write_complete_hf_cache(cache.path());
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: cache.path().display().to_string(),
+            ..Default::default()
+        };
+        let cache_dir = nestweaver_engine::resolve_user_path(&cfg.cache_dir)
+            .expect("absolute fixture cache path must resolve");
+        assert!(cache_dir.is_absolute());
+        assert_eq!(cache_dir, cache.path());
+
+        let load_config = embedding_load_config(&cfg, cache_dir.clone(), None);
+        let model = load_daemon_embedding_backend_with(
+            &load_config,
+            nestweaver_embed::DevicePolicy::Cpu,
+            nestweaver_embed::EmbedModel::load_with_policy_and_artifact_mode,
+        )
+        .expect("complete fixture cache must load");
+        let probe = probe_embedding_model(&model).expect("readiness probe must pass");
+        let status = finalize_embedding_status(
+            initial_embedding_status(&cfg, None, true, false),
+            None,
+            Ok(probe),
+        );
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.model_id, "test-owner/test-model");
+        assert_eq!(load_config.cache_dir, cache_dir);
+    }
+
+    #[test]
+    fn ready_startup_log_names_model_and_absolute_cache_dir() {
+        #[derive(Clone)]
+        struct BufferWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for BufferWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture ready log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        assert!(cache.path().is_absolute());
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || BufferWriter(writer.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_embedding_ready("local", "cpu", "test-owner/test-model", Some(cache.path()));
+        });
+
+        let rendered = {
+            let bytes = captured.lock().expect("read captured ready log");
+            String::from_utf8(bytes.clone()).expect("tracing output must be UTF-8")
+        };
+        assert!(rendered.contains("Embedding model ready"), "{rendered}");
+        assert!(rendered.contains("model_id"), "{rendered}");
+        assert!(rendered.contains("test-owner/test-model"), "{rendered}");
+        assert!(rendered.contains("cache_dir"), "{rendered}");
+        assert!(
+            rendered.contains(&cache.path().display().to_string()),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn legacy_cache_hint_reports_a_complete_model_in_the_legacy_dir() {
+        let legacy = tempfile::tempdir().expect("legacy tempdir");
+        write_complete_hf_cache(legacy.path());
+        let resolved = tempfile::tempdir().expect("resolved tempdir");
+
+        let hint = legacy_cache_hint_at(legacy.path(), resolved.path(), "test-owner/test-model")
+            .expect("a complete model in the legacy dir must produce a hint");
+        assert!(hint.contains("test-owner/test-model"));
+        assert!(hint.contains(&legacy.path().display().to_string()));
+        assert!(hint.contains("cache-only"));
+    }
+
+    #[test]
+    fn legacy_cache_hint_is_absent_when_nothing_is_findable_elsewhere() {
+        let legacy = tempfile::tempdir().expect("legacy tempdir");
+        let resolved = tempfile::tempdir().expect("resolved tempdir");
+        // Empty legacy dir: nothing to point the user at.
+        assert!(
+            legacy_cache_hint_at(legacy.path(), resolved.path(), "test-owner/test-model").is_none()
+        );
+        // Legacy == resolved: the configured dir IS the legacy dir, so there
+        // is no second location to report.
+        assert!(
+            legacy_cache_hint_at(legacy.path(), legacy.path(), "test-owner/test-model").is_none()
+        );
+    }
+
+    #[test]
+    fn missing_artifact_failure_publishes_legacy_cache_hint_in_status() {
+        let legacy = tempfile::tempdir().expect("legacy tempdir");
+        write_complete_hf_cache(legacy.path());
+        let resolved = tempfile::tempdir().expect("resolved tempdir");
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: resolved.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+        let error = anyhow::Error::new(nestweaver_embed::MissingModelArtifactError {
+            model_id: config.model_id.clone(),
+            filename: "model.safetensors".to_string(),
+            cache_dir: config.cache_dir.clone(),
+        })
+        .context("local embedding startup failed");
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            model_id: config.model_id.clone(),
+            cache_dir: resolved.path().display().to_string(),
+            ..Default::default()
+        };
+
+        let (status, hint) = embedding_load_failure_status_at(
+            initial_embedding_status(&cfg, None, true, false),
+            None,
+            &error,
+            &config,
+            legacy.path(),
+            resolved.path(),
+        );
+
+        let hint = hint.expect("typed missing-artifact failure must report the legacy cache");
+        assert_eq!(status.state, "failed");
+        assert!(status.error.contains("local embedding startup failed"));
+        assert!(status.error.contains("model.safetensors"));
+        assert!(
+            status
+                .error
+                .contains(&resolved.path().display().to_string())
+        );
+        assert!(status.error.contains(&hint));
+        assert!(hint.contains(&legacy.path().display().to_string()));
+    }
+
+    #[test]
+    fn non_artifact_local_failure_gets_no_legacy_cache_hint() {
+        let legacy = tempfile::tempdir().expect("legacy tempdir");
+        write_complete_hf_cache(legacy.path());
+        let resolved = tempfile::tempdir().expect("resolved tempdir");
+        let config = nestweaver_embed::EmbedConfig {
+            model_id: "test-owner/test-model".to_string(),
+            cache_dir: resolved.path().to_path_buf(),
+            external_endpoint: None,
+            external_model: None,
+        };
+        let error = anyhow::anyhow!("Metal device initialization failed");
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            model_id: config.model_id.clone(),
+            cache_dir: resolved.path().display().to_string(),
+            ..Default::default()
+        };
+
+        let (status, hint) = embedding_load_failure_status_at(
+            initial_embedding_status(&cfg, None, true, true),
+            None,
+            &error,
+            &config,
+            legacy.path(),
+            resolved.path(),
+        );
+
+        assert!(hint.is_none());
+        assert_eq!(status.state, "failed");
+        assert!(status.error.contains("Metal device initialization failed"));
+        assert!(!status.error.contains("legacy cache"));
+        assert!(!status.error.contains(&legacy.path().display().to_string()));
+    }
+
+    #[test]
+    fn unexpandable_embedding_cache_dir_becomes_actionable_failed_status() {
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            cache_dir: "~/models".to_string(),
+            ..Default::default()
+        };
+        let error = nestweaver_engine::ResolveUserPathError::HomeDirectoryUnavailable {
+            input: cfg.cache_dir.clone(),
+        };
+
+        let status = embedding_cache_dir_resolution_failure_status(
+            initial_embedding_status(&cfg, None, true, false),
+            None,
+            &cfg.cache_dir,
+            &error,
+        );
+
+        assert_eq!(status.state, "failed");
+        assert!(status.error.contains("~/models"));
+        assert!(status.error.contains("no home directory"));
+        assert!(status.error.contains("absolute path"));
+    }
+
+    #[test]
+    fn external_embedding_ignores_unexpandable_local_cache_dir() {
+        let cfg = nestweaver_engine::config::EmbeddingConfig {
+            cache_dir: "~/models".to_string(),
+            external_endpoint: Some("http://127.0.0.1:11434/v1".to_string()),
+            external_model: Some("test-external-model".to_string()),
+            ..Default::default()
+        };
+        let resolver_called = std::cell::Cell::new(false);
+
+        let cache_dir = embedding_cache_dir_for_load_with(&cfg, |_| {
+            resolver_called.set(true);
+            Err(
+                nestweaver_engine::ResolveUserPathError::HomeDirectoryUnavailable {
+                    input: cfg.cache_dir.clone(),
+                },
+            )
+        })
+        .expect("external embedding must not resolve an irrelevant local cache path");
+
+        assert!(!resolver_called.get());
+        assert!(cache_dir.as_os_str().is_empty());
+        let load_config = embedding_load_config(&cfg, cache_dir, None);
+        assert_eq!(load_config.external_endpoint, cfg.external_endpoint);
+        assert_eq!(load_config.external_model, cfg.external_model);
+    }
 }
 
 #[cfg(feature = "embed")]
@@ -6745,6 +7453,148 @@ async fn probe_loaded_embedding_model(
     }
 }
 
+#[cfg(feature = "embed")]
+fn legacy_cache_hint_at(
+    legacy_dir: &std::path::Path,
+    resolved_dir: &std::path::Path,
+    model_id: &str,
+) -> Option<String> {
+    if legacy_dir == resolved_dir {
+        return None;
+    }
+    let probe = nestweaver_embed::EmbedConfig {
+        model_id: model_id.to_string(),
+        cache_dir: legacy_dir.to_path_buf(),
+        external_endpoint: None,
+        external_model: None,
+    };
+    nestweaver_embed::resolve_model_artifacts(&probe, nestweaver_embed::ArtifactMode::CacheOnly)
+        .ok()?;
+    Some(format!(
+        "model '{model_id}' was found in the legacy cache directory '{}'; \
+         set [embedding] cache_dir in instance.toml or move the cache — \
+         the daemon is cache-only and will not re-download",
+        legacy_dir.display()
+    ))
+}
+
+#[cfg(feature = "embed")]
+fn embedding_load_failure_status_at(
+    current_status: EmbeddingRuntimeStatus,
+    embedding_dimension: Option<usize>,
+    error: &anyhow::Error,
+    config: &nestweaver_embed::EmbedConfig,
+    legacy_dir: &std::path::Path,
+    resolved_dir: &std::path::Path,
+) -> (EmbeddingRuntimeStatus, Option<String>) {
+    let mut status = finalize_embedding_status(
+        current_status,
+        embedding_dimension,
+        Err(format!("{error:#}")),
+    );
+    // A local load can also fail during device selection or model
+    // construction. Only a typed missing-artifact cause makes another cache
+    // location relevant remediation.
+    let missing_artifact = error
+        .chain()
+        .any(|cause| cause.is::<nestweaver_embed::MissingModelArtifactError>());
+    let hint = if config.external_endpoint.is_none() && missing_artifact {
+        legacy_cache_hint_at(legacy_dir, resolved_dir, &config.model_id)
+    } else {
+        None
+    };
+    if let Some(hint) = &hint {
+        status.error = format!("{}; {hint}", status.error);
+    }
+    (status, hint)
+}
+
+#[cfg(feature = "embed")]
+fn embedding_load_failure_status(
+    current_status: EmbeddingRuntimeStatus,
+    embedding_dimension: Option<usize>,
+    error: &anyhow::Error,
+    config: &nestweaver_embed::EmbedConfig,
+    resolved_dir: &std::path::Path,
+) -> (EmbeddingRuntimeStatus, Option<String>) {
+    let Ok(legacy_dir) =
+        nestweaver_engine::resolve_user_path(nestweaver_engine::config::LEGACY_EMBEDDING_CACHE_DIR)
+    else {
+        let status = finalize_embedding_status(
+            current_status,
+            embedding_dimension,
+            Err(format!("{error:#}")),
+        );
+        return (status, None);
+    };
+    embedding_load_failure_status_at(
+        current_status,
+        embedding_dimension,
+        error,
+        config,
+        &legacy_dir,
+        resolved_dir,
+    )
+}
+
+#[cfg(feature = "embed")]
+fn embedding_cache_dir_resolution_failure_status(
+    current_status: EmbeddingRuntimeStatus,
+    embedding_dimension: Option<usize>,
+    configured_cache_dir: &str,
+    error: &nestweaver_engine::ResolveUserPathError,
+) -> EmbeddingRuntimeStatus {
+    finalize_embedding_status(
+        current_status,
+        embedding_dimension,
+        Err(format!(
+            "failed to resolve configured embedding cache directory '{configured_cache_dir}': {error}"
+        )),
+    )
+}
+
+#[cfg(feature = "embed")]
+fn embedding_cache_dir_for_load_with<E, Resolve>(
+    cfg: &nestweaver_engine::config::EmbeddingConfig,
+    resolve: Resolve,
+) -> Result<std::path::PathBuf, E>
+where
+    Resolve: FnOnce(&str) -> Result<std::path::PathBuf, E>,
+{
+    if cfg.external_endpoint.is_some() {
+        // External backends do not consume Hugging Face artifacts. Keep their
+        // construction independent of an irrelevant local cache path.
+        Ok(std::path::PathBuf::new())
+    } else {
+        resolve(&cfg.cache_dir)
+    }
+}
+
+#[cfg(feature = "embed")]
+fn log_embedding_ready(
+    backend: &str,
+    selected_device: &str,
+    model_id: &str,
+    cache_dir: Option<&std::path::Path>,
+) {
+    if let Some(cache_dir) = cache_dir {
+        tracing::info!(
+            backend,
+            device = selected_device,
+            model_id,
+            cache_dir = %cache_dir.display(),
+            "Embedding model ready"
+        );
+    } else {
+        tracing::info!(
+            backend,
+            device = selected_device,
+            model_id,
+            "Embedding model ready"
+        );
+    }
+}
+
 /// Load the embedding model into `state.embedding_runtime`. MUST be called on the daemon's main
 /// (block_on) thread: candle compiles Metal shaders via MTLCompilerService, an Aqua
 /// per-session XPC service reachable from the main thread but NOT from a tokio worker/blocking
@@ -6803,18 +7653,28 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
             );
         }
     }
-    // Expand tilde in cache_dir using the home directory.
-    let cache_dir = if cfg.cache_dir.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            home.join(&cfg.cache_dir[2..])
-        } else {
-            std::path::PathBuf::from(&cfg.cache_dir)
-        }
-    } else {
-        std::path::PathBuf::from(&cfg.cache_dir)
-    };
+    // Local backends resolve the configured cache dir: expand a leading tilde
+    // and absolutize relative paths so diagnostics always name a usable
+    // location. External backends do not consume this setting and must remain
+    // independent of it.
+    let cache_dir =
+        match embedding_cache_dir_for_load_with(&cfg, nestweaver_engine::resolve_user_path) {
+            Ok(cache_dir) => cache_dir,
+            Err(error) => {
+                let status = embedding_cache_dir_resolution_failure_status(
+                    state.embedding_runtime.status(),
+                    state.store.embedding_index_dimension(),
+                    &cfg.cache_dir,
+                    &error,
+                );
+                let message = status.error.clone();
+                state.embedding_runtime.publish_unavailable(status);
+                tracing::warn!("Failed to resolve embedding cache directory: {message}");
+                return;
+            }
+        };
     let policy = daemon_embedding_device_policy(cfg.accelerator);
-    let config = embedding_load_config(&cfg, cache_dir, stored_model_id.as_deref());
+    let config = embedding_load_config(&cfg, cache_dir.clone(), stored_model_id.as_deref());
     let loaded = load_daemon_embedding_backend_with(
         &config,
         policy,
@@ -6831,12 +7691,21 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
                 if status.state == "ready" {
                     let backend = status.backend.clone();
                     let selected_device = status.selected_device.clone();
+                    let model_id = status.model_id.clone();
                     state.embedding_runtime.publish_ready(
                         status,
                         std::sync::Arc::new(model)
                             as std::sync::Arc<dyn nestweaver_engine::EmbedQueryFn>,
                     );
-                    tracing::info!(backend, device = selected_device, "Embedding model ready");
+                    // Name the model and, for local backends, the resolved
+                    // cache dir: a populated but WRONG cache loads fine, and
+                    // only this line makes the wrong model visible. External
+                    // backends do not use the local cache setting.
+                    let cache_dir = config
+                        .external_endpoint
+                        .is_none()
+                        .then_some(cache_dir.as_path());
+                    log_embedding_ready(&backend, &selected_device, &model_id, cache_dir);
                 } else {
                     let error = status.error.clone();
                     state.embedding_runtime.publish_unavailable(status);
@@ -6855,13 +7724,18 @@ async fn load_embedding_model(state: &std::sync::Arc<DaemonState>) {
             }
         },
         Err(e) => {
-            let status = finalize_embedding_status(
+            let (status, hint) = embedding_load_failure_status(
                 state.embedding_runtime.status(),
                 state.store.embedding_index_dimension(),
-                Err(format!("{e:#}")),
+                &e,
+                &config,
+                &cache_dir,
             );
             state.embedding_runtime.publish_unavailable(status);
-            tracing::warn!("Failed to load embedding model: {e}");
+            match hint {
+                Some(hint) => tracing::warn!("Failed to load embedding model: {e}; {hint}"),
+                None => tracing::warn!("Failed to load embedding model: {e}"),
+            }
         }
     }
 }
@@ -6933,6 +7807,12 @@ pub async fn run_server(
     // lifetime; released on drop. A daemonize child proves it inherited the
     // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
+    // We now exclusively own this instance's pidfile lock, so any binding left
+    // by a crashed predecessor is stale. Clear it before fallible startup work;
+    // a failed boot must not leave old provenance looking live.
+    lifecycle::remove_effective_config_binding(&instance_id).with_context(|| {
+        format!("remove stale effective-config binding for instance {instance_id}")
+    })?;
 
     // Snapshot replica: materialize the snapshot into a private working copy and
     // serve it read-only. `read_only` gates out the write RPCs (via the
@@ -7040,44 +7920,24 @@ pub async fn run_server(
     // tool dispatch (e.g. F6 `[ranking]` priors in `brain_search`) can apply
     // it without re-parsing the file per RPC.
     //
-    // Distinguish a MISSING file (non-fatal — the daemon serves with built-in
-    // defaults) from a file that is PRESENT but unparseable. In server mode a
-    // malformed config means the server would silently index nothing and have no
-    // webhook secret; that failure must be loud (stderr) and fatal rather than a
-    // warning buried in the rotating log file.
-    let instance_cfg = match config_path {
-        None => None,
-        Some(p) => match nestweaver_engine::InstanceConfig::from_file(p) {
-            Ok(c) => {
-                tracing::info!(
-                    config = %p.display(),
-                    "loaded instance config (ranking, response, features)"
-                );
-                Some(Arc::new(c))
-            }
-            Err(e) if p.exists() => {
-                // Present but broken. Surface to the console (docker/foreground
-                // operators never see the rotating log) and fail fast in server
-                // mode so a typo can't masquerade as a healthy-but-empty server.
-                eprintln!("[daemon] failed to parse --config {}: {e}", p.display());
-                tracing::error!(config = %p.display(), error = %e, "failed to parse --config");
-                if server_opts.is_some() {
-                    anyhow::bail!(
-                        "invalid --config {}: {e} (server mode requires a parseable config)",
-                        p.display()
-                    );
-                }
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    config = %p.display(),
-                    error = %e,
-                    "instance config not found — using built-in defaults"
-                );
-                None
-            }
-        },
+    // An explicitly supplied path is a binding, not a discovery hint. Missing,
+    // unreadable, or malformed input is fatal in both UDS and network server
+    // modes; otherwise a restart-time file race could silently demote the
+    // instance to compiled-default identity and authorization.
+    let (instance_cfg, effective_config) =
+        load_daemon_instance_config(config_path, server_opts.is_some())?;
+    let live_binding = lifecycle::EffectiveConfigBinding::new(
+        std::process::id(),
+        live_binding_source(&effective_config),
+    );
+    lifecycle::write_effective_config_binding(&instance_id, &live_binding).with_context(|| {
+        format!("publish effective-config binding for daemon instance {instance_id}")
+    })?;
+    // Removes the binding on every normal return path, including startup
+    // errors after publication. A process crash can still leave a stale file;
+    // later consumers must validate its PID before trusting it.
+    let _effective_config_binding_cleanup = EffectiveConfigBindingCleanup {
+        instance_id: instance_id.clone(),
     };
 
     // nw-019: graph-data identity — the config's logical `instance_id` when we
@@ -7208,6 +8068,7 @@ pub async fn run_server(
         watcher_stop: std::sync::Mutex::new(None),
         next_watcher_id: std::sync::atomic::AtomicU64::new(0),
         instance_cfg,
+        effective_config,
         permission_source,
         embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(embedding_status)),
         write_mutex: Arc::new(tokio::sync::Mutex::new(())),
@@ -8567,6 +9428,9 @@ pub async fn run_server(
     }
 
     let _ = std::fs::remove_file(&sock_path);
+    // The RAII owner removes the live binding before the pidfile lock is
+    // released. On earlier error returns its Drop provides the same cleanup.
+    drop(_effective_config_binding_cleanup);
     // Drop the instance lock's pidfile on clean shutdown (the flock itself is
     // released when `_pid_guard` drops at end of scope).
     let _ = std::fs::remove_file(lifecycle::pidfile_path(&instance_id));
@@ -13446,6 +14310,7 @@ mod startup_helper_tests {
             watcher_stop: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
+            effective_config: EffectiveConfigProvenance::CompiledDefaults,
             permission_source: build_daemon_permission_source(None),
             embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(initial_embedding_status(
                 &nestweaver_engine::config::EmbeddingConfig::default(),
@@ -13467,6 +14332,37 @@ mod startup_helper_tests {
             worker_handle: std::sync::Mutex::new(None),
             ui_server: std::sync::Mutex::new(None),
         })
+    }
+
+    fn write_provenance_test_config(path: &Path, root: &Path) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+instance_id = "provenance-test"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+                root.join("snapshots").display(),
+                root.join("workspace").display()
+            ),
+        )
+        .unwrap();
     }
 
     /// Build a minimal `DaemonState` over the given store and permission
@@ -13491,6 +14387,7 @@ mod startup_helper_tests {
             watcher_stop: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
+            effective_config: EffectiveConfigProvenance::CompiledDefaults,
             permission_source,
             embedding_runtime: Arc::new(EmbeddingRuntime::unavailable(initial_embedding_status(
                 &nestweaver_engine::config::EmbeddingConfig::default(),
@@ -13531,11 +14428,16 @@ mod startup_helper_tests {
             });
         let service = DaemonService::new(state);
 
-        let typed = service
+        let response = service
             .brain_status(Request::new(BrainStatusRequest {}))
             .await
             .expect("typed brain status")
-            .into_inner()
+            .into_inner();
+        assert!(matches!(
+            response.effective_config.unwrap().source,
+            Some(effective_config::Source::CompiledDefaults(_))
+        ));
+        let typed = response
             .embedding_status
             .expect("structured embedding status");
         assert_eq!(typed.state, "failed");
@@ -13557,6 +14459,103 @@ mod startup_helper_tests {
         assert_eq!(value["embedding_status"]["requested_device"], "metal");
         assert_eq!(value["embedding_status"]["selected_device"], "");
         assert_eq!(value["embedding_status"]["fallback_used"], false);
+        assert!(
+            value.get("effective_config").is_none(),
+            "effective config provenance must remain typed-only so Combined federation cannot backfill it"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_status_reports_canonical_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let config = dir.path().join("instance.toml");
+        std::fs::write(&config, "instance_id = 'test'").unwrap();
+        let noncanonical = nested.join("..").join("instance.toml");
+
+        let mut state = test_state_with_writer();
+        Arc::get_mut(&mut state).unwrap().effective_config =
+            configured_provenance(&noncanonical).unwrap();
+        let response = DaemonService::new(state)
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("typed brain status")
+            .into_inner();
+
+        assert!(matches!(
+            response.effective_config.unwrap().source,
+            Some(effective_config::Source::ConfiguredPath(path))
+                if path == std::fs::canonicalize(config).unwrap().to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn production_config_loader_couples_parsed_config_to_canonical_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("instance.toml");
+        write_provenance_test_config(&config_path, dir.path());
+
+        let (config, provenance) = load_daemon_instance_config(Some(&config_path), false).unwrap();
+
+        assert_eq!(config.unwrap().instance_id, "provenance-test");
+        assert_eq!(
+            provenance,
+            EffectiveConfigProvenance::Configured(std::fs::canonicalize(config_path).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_config_loader_rejects_non_utf8_config_provenance() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let name = OsString::from_vec(b"instance-\xff.toml".to_vec());
+        let config_path = dir.path().join(name);
+        write_provenance_test_config(&config_path, dir.path());
+
+        let error = load_daemon_instance_config(Some(&config_path), false).unwrap_err();
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn uds_config_loader_rejects_missing_explicit_config_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("deleted-after-restart-prepare.toml");
+
+        let error = load_daemon_instance_config(Some(&missing), false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("invalid or unreadable --config"),
+            "{message}"
+        );
+        assert!(
+            message.contains("explicitly supplied config must be honored"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn uds_config_loader_rejects_malformed_explicit_config_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = dir.path().join("changed-after-restart-prepare.toml");
+        std::fs::write(&malformed, "instance_id = [not-valid").unwrap();
+
+        let error = load_daemon_instance_config(Some(&malformed), false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("invalid or unreadable --config"),
+            "{message}"
+        );
+        assert!(
+            message.contains("explicitly supplied config must be honored"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -13720,6 +14719,92 @@ mod startup_helper_tests {
 
     #[cfg(feature = "embed")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(not(target_os = "macos"))]
+    async fn missing_local_artifact_keeps_daemon_healthy_and_reports_failed_status() {
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        assert!(
+            cache.path().is_absolute(),
+            "the startup diagnostic fixture must use an absolute cache path"
+        );
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "missing-local-artifact-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[embedding]
+model_id = "test-owner/group-f-missing-artifact"
+cache_dir = {:?}
+accelerator = "cpu"
+"#,
+            cache.path().display().to_string()
+        ))
+        .expect("valid local embedding fixture config");
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.instance_cfg = Some(Arc::new(config.clone()));
+        state_mut
+            .embedding_runtime
+            .publish_unavailable(initial_embedding_status(
+                &config.embedding,
+                None,
+                true,
+                daemon_metal_compiled(),
+            ));
+
+        load_embedding_model(&state).await;
+
+        let (status, model) = state.embedding_runtime.snapshot();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.backend, "local");
+        assert_eq!(status.model_id, "test-owner/group-f-missing-artifact");
+        assert!(
+            status.error.contains("test-owner/group-f-missing-artifact"),
+            "startup failure must name the configured model: {}",
+            status.error
+        );
+        assert!(
+            status.error.contains(&cache.path().display().to_string()),
+            "startup failure must name the absolute cache directory: {}",
+            status.error
+        );
+        assert!(model.is_none(), "a failed load must not publish a model");
+
+        let service = DaemonService::new(state);
+        service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("a non-semantic RPC must remain usable");
+        let typed = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("status RPC must remain usable")
+            .into_inner()
+            .embedding_status
+            .expect("structured embedding status");
+        assert_eq!(typed.state, "failed");
+        assert_eq!(typed.backend, "local");
+        assert_eq!(typed.model_id, "test-owner/group-f-missing-artifact");
+        assert!(typed.error.contains("test-owner/group-f-missing-artifact"));
+        assert!(typed.error.contains(&cache.path().display().to_string()));
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unavailable_external_probe_keeps_daemon_healthy_and_failed() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -13854,6 +14939,98 @@ external_model = "unavailable-test-model"
         assert!(
             calls.load(Ordering::Relaxed) > 0,
             "ready snapshots must route work through the exact published model"
+        );
+    }
+
+    /// A daemon embed that produces vectors stamps the fingerprint of the
+    /// model the daemon actually loaded (`status.model_id`) at the produced
+    /// dimension. Before the fix the embed RPC never called
+    /// `set_embedding_metadata` at all, so daemon-populated databases had no
+    /// fingerprint for any downstream guard — this test fails there because
+    /// the metadata stays `None`.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_handler_stamps_the_loaded_models_fingerprint_after_a_productive_run() {
+        let state = test_state_with_writer();
+        insert_unembedded_symbol(&state.store, "sym-stamp");
+        let model = Arc::new(CountingEmbed {
+            calls: Arc::new(AtomicU32::new(0)),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let mut ready = state.embedding_runtime.status();
+        ready.state = "ready".to_string();
+        ready.selected_device = "cpu".to_string();
+        ready.model_id = "daemon-loaded-model".to_string();
+        state.embedding_runtime.publish_ready(ready, model);
+
+        let mut request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 8,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let response = DaemonService::new(state.clone())
+            .embed(request)
+            .await
+            .expect("a ready daemon must accept the embed RPC")
+            .into_inner();
+        assert_eq!(response.succeeded, 1);
+        assert_eq!(response.rejected, 0);
+
+        assert_eq!(
+            state.store.get_embedding_metadata().unwrap(),
+            Some(("daemon-loaded-model".to_string(), 3)),
+            "a productive daemon embed must stamp the model it loaded at the produced dimension"
+        );
+    }
+
+    /// A daemon embed with no eligible work produces nothing, so it must not
+    /// invent or overwrite metadata — the daemon-route analogue of the CLI's
+    /// Reproduction A. The recorded fingerprint names a different model than
+    /// the loaded one; a zero-work run must leave it untouched.
+    #[cfg(feature = "embed")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_handler_without_eligible_work_leaves_metadata_untouched() {
+        let state = test_state_with_writer();
+        insert_unembedded_symbol(&state.store, "sym-noop");
+        assert!(state.store.add_embedding_with_force(
+            "sym-noop",
+            vec![0.1, 0.2, 0.3],
+            "recorded-model",
+            false,
+        ));
+        state
+            .store
+            .set_embedding_metadata("recorded-model", 3)
+            .unwrap();
+        let model = Arc::new(CountingEmbed {
+            calls: Arc::new(AtomicU32::new(0)),
+            vector: vec![0.1, 0.2, 0.3],
+        }) as Arc<dyn nestweaver_engine::EmbedQueryFn>;
+        let mut ready = state.embedding_runtime.status();
+        ready.state = "ready".to_string();
+        ready.selected_device = "cpu".to_string();
+        ready.model_id = "other-loaded-model".to_string();
+        state.embedding_runtime.publish_ready(ready, model);
+
+        let mut request = Request::new(EmbedRequest {
+            scope: "symbols".to_string(),
+            force: false,
+            batch_size: 8,
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let response = DaemonService::new(state.clone())
+            .embed(request)
+            .await
+            .expect("a no-op embed is not an error")
+            .into_inner();
+        assert_eq!(response.succeeded, 0, "nothing was eligible to embed");
+        assert_eq!(response.skipped, 1);
+
+        assert_eq!(
+            state.store.get_embedding_metadata().unwrap(),
+            Some(("recorded-model".to_string(), 3)),
+            "a daemon embed that produced nothing must not overwrite the recorded fingerprint"
         );
     }
 
@@ -14361,6 +15538,7 @@ external_model = "unavailable-test-model"
             "Investigate",
             "InvestigateExpand",
             "InvestigateHydrate",
+            "ListContracts",
             "ListProjectsJson",
             "ListReposJson",
             "ListServicesJson",

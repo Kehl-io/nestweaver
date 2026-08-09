@@ -20,6 +20,12 @@ use serde::{Deserialize, Serialize};
 /// The 4th field carries the retained source string (up to 2 MB) so Phase 3
 /// can build type environments without re-reading files from disk.
 type ParsedFileEntry = (String, Vec<RawSymbol>, Vec<RawReference>, Option<String>);
+type ContractDerivationInputs = (
+    Vec<PathBuf>,
+    Vec<HandlerFileData>,
+    Vec<nestweaver_schema::Symbol>,
+);
+pub(crate) type PreparedFileData = HashMap<String, (Vec<RawSymbol>, Vec<RawReference>)>;
 
 /// F2.2: data captured per Spring/NestJS controller file so handler →
 /// contract edges can be derived after the bulk symbol insert.
@@ -32,6 +38,12 @@ struct HandlerFileData {
 }
 
 /// Result returned by the indexing functions.
+///
+/// Not `Serialize`: no surface emits an `IndexResult` as JSON — the CLI and the
+/// daemon both destructure it into their own progress/report types — so a serde
+/// derive here would be published API surface nobody consumes. `Debug` is
+/// derived because the contract-status fields are asserted on in tests.
+#[derive(Debug, Clone)]
 pub struct IndexResult {
     pub symbols_count: usize,
     pub edges_count: usize,
@@ -48,6 +60,16 @@ pub struct IndexResult {
     /// Symbols removed by replacement/deletion transactions during this run.
     pub symbols_deleted: usize,
     pub skipped_files: Vec<SkippedFile>,
+    /// Contract nodes written by the contract phase. `0` on a repo with no
+    /// specs and no route handlers — and also `0` when derivation failed, which
+    /// is exactly why `contracts_status` exists alongside it.
+    pub contracts_derived: usize,
+    /// Whether the contract phase ran to completion. Reuses the blast-radius
+    /// trust vocabulary: [`AnalysisStatus::Complete`] or
+    /// [`AnalysisStatus::Degraded`]. Contract derivation is best-effort and
+    /// never fails the index, so this is the ONLY signal a caller has that the
+    /// repo's contract graph is missing rather than empty.
+    pub contracts_status: crate::blast_radius::AnalysisStatus,
 }
 
 // ── Tiered change detection ───────────────────────────────────────────────
@@ -75,6 +97,10 @@ pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 /// unversioned flat map) fails deserialization and loads as empty — a
 /// deliberate fail-open that costs one full re-index and can never
 /// mis-classify a file.
+///
+/// Paired with `resolution_cache::CACHE_VERSION`: bumping one requires
+/// bumping the other (both sidecars must be invalidated together), enforced
+/// by `resolution_cache::tests::cache_version_moves_with_filemeta_version`.
 pub const FILEMETA_VERSION: u32 = 2;
 
 /// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
@@ -812,15 +838,23 @@ fn finalize_committed_index_with_io(
     refresh_pagerank: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let scope = refresh_pagerank.then(nestweaver_store::GraphScope::code_only);
-    finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref())
+    finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref(), true)
 }
 
+/// `publish_clean`: when false (a run that committed AFTER cancellation was
+/// requested), the file-backed generation advance, `.index-dirty` retirement,
+/// and the scoped PageRank refresh are skipped so the publication stays dirty
+/// and the next open reconciles it instead of trusting generation/PageRank
+/// state that predates this commit. In-memory stores are the exception: they
+/// have no `.index-dirty` marker to reconcile on a later open, so their
+/// generation bump still runs (see below).
 pub(crate) fn finalize_committed_index_for_scope_with_io(
     lease: nestweaver_store::IndexPublicationLease<'_>,
     db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
     pagerank_scope: Option<&nestweaver_store::GraphScope>,
+    publish_clean: bool,
 ) -> Result<(), DeletionReconciliationError> {
     let mut failures = Vec::new();
     let store = lease.store();
@@ -836,64 +870,85 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         true
     };
 
-    let generation_advanced = if db_path.is_some() {
-        lease.clean_generation()
-    } else {
-        store.try_bump_graph_generation()
-    };
-    let generation_durable = match generation_advanced {
-        Err(error) => {
+    // A cancelled-but-committed run skips the generation advance and the
+    // clean-publish/marker retirement below: `.index-dirty` and the reserved
+    // generation survive so the next open reconciles this publication as
+    // dirty (fail-closed) rather than treating it as a clean commit.
+    let mut publication_clean = false;
+    if publish_clean {
+        let generation_advanced = if db_path.is_some() {
+            lease.clean_generation()
+        } else {
+            store.try_bump_graph_generation()
+        };
+        let generation_durable = match generation_advanced {
+            Err(error) => {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::GenerationPersistence,
+                    None,
+                    format!("advance graph generation: {error:#}"),
+                );
+                false
+            }
+            Ok(generation) if db_path.is_some() => {
+                let generation_path = crate::sidecar_path(db_path.unwrap(), ".generation");
+                match io.save_generation(store, &generation_path, generation) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        push_reconciliation_failure(
+                            &mut failures,
+                            DeletionReconciliationStage::GenerationPersistence,
+                            None,
+                            format!("{}: {error:#}", generation_path.display()),
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(_) => true,
+        };
+
+        publication_clean = db_path.is_none();
+        if generation_durable
+            && pagerank_safe
+            && let Some(db_path) = db_path
+        {
+            let marker_path = crate::sidecar_path(db_path, ".index-dirty");
+            let retirement =
+                store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
+                    lease.publish_clean_generation()?;
+                    if let Err(error) = io.clear_marker(&marker_path) {
+                        lease.fail_clean_generation()?;
+                        return Err(error);
+                    }
+                    lease.complete_generation()?;
+                    Ok(())
+                });
+            if let Err(error) = retirement {
+                push_reconciliation_failure(
+                    &mut failures,
+                    DeletionReconciliationStage::IndexPublicationMarkerRetirement,
+                    None,
+                    format!("{}: {error:#}", marker_path.display()),
+                );
+            } else {
+                publication_clean = true;
+            }
+        }
+    } else if db_path.is_none() {
+        // In-memory stores have no `.index-dirty` marker for a later open to
+        // reconcile, so a cancelled-but-committed run would otherwise be
+        // invisible to generation-keyed snapshot readers. Bump the in-memory
+        // generation even though the file-backed clean-publish steps above
+        // stay skipped.
+        if let Err(error) = store.try_bump_graph_generation() {
             push_reconciliation_failure(
                 &mut failures,
                 DeletionReconciliationStage::GenerationPersistence,
                 None,
                 format!("advance graph generation: {error:#}"),
             );
-            false
-        }
-        Ok(generation) if db_path.is_some() => {
-            let generation_path = crate::sidecar_path(db_path.unwrap(), ".generation");
-            match io.save_generation(store, &generation_path, generation) {
-                Ok(()) => true,
-                Err(error) => {
-                    push_reconciliation_failure(
-                        &mut failures,
-                        DeletionReconciliationStage::GenerationPersistence,
-                        None,
-                        format!("{}: {error:#}", generation_path.display()),
-                    );
-                    false
-                }
-            }
-        }
-        Ok(_) => true,
-    };
-
-    let mut publication_clean = db_path.is_none();
-    if generation_durable
-        && pagerank_safe
-        && let Some(db_path) = db_path
-    {
-        let marker_path = crate::sidecar_path(db_path, ".index-dirty");
-        let retirement =
-            store.with_index_publication_rank_barrier(|| -> Result<(), anyhow::Error> {
-                lease.publish_clean_generation()?;
-                if let Err(error) = io.clear_marker(&marker_path) {
-                    lease.fail_clean_generation()?;
-                    return Err(error);
-                }
-                lease.complete_generation()?;
-                Ok(())
-            });
-        if let Err(error) = retirement {
-            push_reconciliation_failure(
-                &mut failures,
-                DeletionReconciliationStage::IndexPublicationMarkerRetirement,
-                None,
-                format!("{}: {error:#}", marker_path.display()),
-            );
-        } else {
-            publication_clean = true;
         }
     }
 
@@ -1754,7 +1809,24 @@ where
     if let Some(out) = reidentified_old_uid_out {
         *out = reidentify_old_uid.clone();
     }
-    let filemeta_cache = if reidentify_old_uid.is_some() {
+    // An empty resolution-deps slice for this repo (missing/corrupt/stale
+    // sidecar — the loader fails open to empty) is unsafe to combine with a
+    // valid filemeta cache: unchanged files would stay classified Unchanged
+    // while full resolution runs with no stale-edge clear and no bulk
+    // delete, re-creating (duplicating) every resolved edge. Bypass the
+    // cache so every file classifies Parsed, `force_reindex` falls out
+    // below (`files_unchanged == 0`), and the atomic `bulk_reindex_write`
+    // replaces the repo's graph instead of accumulating edges on top of it.
+    let deps_empty_for_repo = resolution_deps
+        .as_ref()
+        .is_some_and(|rd| rd.is_empty_for_repo(&r_uid));
+    if deps_empty_for_repo && reidentify_old_uid.is_none() && filemeta_cache.is_some() {
+        tracing::warn!(
+            repo_uid = %r_uid,
+            "resolution deps empty for repo; bypassing filemeta cache to force a full replacement"
+        );
+    }
+    let filemeta_cache = if reidentify_old_uid.is_some() || deps_empty_for_repo {
         None
     } else {
         filemeta_cache
@@ -1882,9 +1954,14 @@ where
 
         // Cooperative cancellation: once the daemon trips the flag (index
         // timeout or client disconnect), skip the expensive read+parse for
-        // every remaining file so all cores are freed promptly. The index
-        // then bails before any graph mutation (checked right after the
-        // collect), so no partial/empty graph is ever persisted.
+        // every remaining file so all cores are freed promptly. Cancellation
+        // is observed here per-file during parse, at the post-parse barrier
+        // below, and once more at the pre-write boundary after the write
+        // guard is acquired — all before any graph mutation, so an index
+        // cancelled at those points never persists a partial/empty graph.
+        // A cancel that lands after the pre-write boundary still commits;
+        // the daemon reports that as committed-after-cancellation and names
+        // `index --force` as the repair.
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
             parse_pb.inc(1);
             return ParseOutcome::Skipped(SkippedFile {
@@ -1980,10 +2057,16 @@ where
     parse_pb.finish_and_clear();
     drop(_phase2_span);
 
-    // Cooperative cancellation: if the flag tripped during the parallel parse,
-    // bail now — BEFORE collection, resolution, and any graph mutation — so a
-    // cancelled index never persists a partial/empty graph. The `?` returns
-    // ahead of the write gate below, preserving the no-partial-write invariant.
+    // Cooperative cancellation, post-parse barrier: if the flag tripped
+    // during the parallel parse, bail now — BEFORE collection, resolution,
+    // and any graph mutation. This is one of three observation points
+    // (per-file during parse above, here, and at the pre-write boundary
+    // after the write guard is acquired); an index cancelled at any of them
+    // persists nothing. The no-partial-write invariant does NOT extend past
+    // the pre-write boundary: a cancel landing after it still commits, the
+    // publication is left dirty for the next open to reconcile, and the
+    // daemon reports the run as committed-after-cancellation, naming
+    // `index --force` as the repair.
     if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
         anyhow::bail!("index cancelled");
     }
@@ -2237,6 +2320,20 @@ where
     drop(_phase_collect_span);
 
     let _write_guard = acquire_write_guard()?;
+
+    // Last cancellation observation point. Bailing in this window needs no
+    // teardown: the marker call below is what creates `.index-dirty` and
+    // reserves the generation, so nothing owned by this run exists yet and
+    // any pre-existing `.index-dirty` (a prior interrupted publication)
+    // stays untouched for its own recovery. A cancel that lands AFTER this
+    // poll still commits; the committed finalizer then keeps the
+    // publication dirty and the daemon reports committed-after-cancellation.
+    // The incremental path (`incremental_index_with_reader_and_write_gate`)
+    // takes no cancel token by design this cycle.
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        anyhow::bail!("index cancelled");
+    }
+
     let publication = establish_index_publication_marker_with_io(
         store,
         store.db_path(),
@@ -2610,12 +2707,18 @@ where
             .filter(|e| !e.target_uid.starts_with("unresolved:"))
             .collect();
 
-        // When doing incremental resolution, delete old resolved edges for
-        // affected files before inserting the new ones.
+        // Delete old resolved edges before inserting the new ones, or every
+        // re-resolution accumulates duplicates. Incremental resolution clears
+        // per affected file; a full (unfiltered) run re-creates every
+        // resolved edge in the repo, so it must clear them repo-wide. When
+        // `skip_resolution` holds, nothing is re-created and nothing is
+        // cleared.
         if let Some(ref filter) = resolve_filter {
             for file_path in filter {
                 let _ = store.delete_resolved_edges_for_file(&r_uid, file_path);
             }
+        } else if !skip_resolution {
+            let _ = store.delete_resolved_edges_for_repo(&r_uid);
         }
 
         let mut edges_count = insertable_edges.len();
@@ -2678,8 +2781,44 @@ where
                         .insert(tgt_file.clone());
                 }
             }
-            for (file, deps) in file_deps {
-                rd.set_deps_for_repo(&r_uid, file, deps);
+            // Record the dep set for every file this run actually resolved —
+            // including files that resolve to ZERO outbound edges, recorded as
+            // an empty set. Without those entries a repo whose files have no
+            // cross-file edges would look identical to a missing/corrupt
+            // sidecar (`is_empty_for_repo`), and the empty-deps cache bypass
+            // above would force a full replacement on every index. On an
+            // incremental run only the affected files were re-resolved, so
+            // only their entries are refreshed (files in the resolve filter
+            // that were not actually fed to the resolver keep their previous
+            // records); other files' records carry over. Nothing is recorded
+            // when resolution was skipped: the previous records are still
+            // accurate.
+            if !skip_resolution {
+                match &resolve_filter {
+                    Some(filter) => {
+                        // Only files actually fed to the resolver may have
+                        // their records refreshed: a filter member that was
+                        // NOT re-resolved (e.g. an unchanged dependent on a
+                        // cold parsed cache) must keep its previous record
+                        // rather than be clobbered with an empty set.
+                        let resolved: std::collections::HashSet<_> = parsed_files_for_resolver
+                            .iter()
+                            .map(|(p, _, _, _)| p)
+                            .collect();
+                        for file in filter {
+                            if resolved.contains(file) {
+                                let deps = file_deps.remove(file).unwrap_or_default();
+                                rd.set_deps_for_repo(&r_uid, file.clone(), deps);
+                            }
+                        }
+                    }
+                    None => {
+                        for (path, _, _, _) in &parsed_files_for_resolver {
+                            let deps = file_deps.remove(path).unwrap_or_default();
+                            rd.set_deps_for_repo(&r_uid, path.clone(), deps);
+                        }
+                    }
+                }
             }
         }
 
@@ -2746,18 +2885,58 @@ where
 
         // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
         let _phase_contracts_span = tracing::info_span!("index_phase_contracts").entered();
+        // Deterministic input order for the whole phase: `FilesystemReader`
+        // walks in readdir order while `GitReader` walks git-sorted, so without
+        // this the same repo feeds the contract phase in a different order on
+        // different machines (and after unrelated file churn).
+        spec_files.sort();
+        handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         // Best-effort: a malformed spec or unexpected store error here must not
         // fail the whole index. Contracts are hypotheses layered on top of the
         // code graph.
-        if let Err(e) = derive_contracts(
-            store,
-            reader,
-            &r_uid,
-            &spec_files,
-            &handler_files,
-            &all_symbols,
-        ) {
-            tracing::warn!("contract derivation failed (non-fatal): {e}");
+        //
+        // Non-fatal is not the same as invisible: the failure is RECORDED here,
+        // both on the returned `IndexResult` and as a durable per-repo marker,
+        // because drift is recomputed at query time and a repo with no
+        // contracts is otherwise indistinguishable from a repo whose contracts
+        // could not be derived. A successful run clears the marker so a repo
+        // heals on the next clean index.
+        let mut contracts_derived = 0usize;
+        let mut contracts_status = crate::blast_radius::AnalysisStatus::Complete;
+        let contract_result = if files_unchanged == 0 {
+            derive_contracts(
+                store,
+                reader,
+                &r_uid,
+                &spec_files,
+                &handler_files,
+                &all_symbols,
+            )
+        } else {
+            // A tiered/full pass may skip unchanged files, so its accumulated
+            // phase inputs are incomplete. Rebuild the whole-repo derived view
+            // only in that partial case; a true force/full parse reuses the
+            // inputs it already collected.
+            derive_contracts_from_current_repo(store, reader, &r_uid, repo_url)
+        };
+        match contract_result {
+            Ok(count) => {
+                contracts_derived = count;
+                if let Err(e) = store.clear_contract_derivation_failed(&r_uid) {
+                    tracing::warn!("clearing contract derivation marker failed: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("contract derivation failed (non-fatal): {e}");
+                contracts_status = crate::blast_radius::AnalysisStatus::Degraded;
+                // Best-effort: if even the marker cannot be written the run is
+                // still degraded, it just cannot say so at query time.
+                if let Err(marker_err) =
+                    store.set_contract_derivation_failed(&r_uid, &e.to_string())
+                {
+                    tracing::warn!("recording contract derivation failure failed: {marker_err}");
+                }
+            }
         }
         tracing::info!(
             spec_files = spec_files.len(),
@@ -2815,6 +2994,8 @@ where
             files_deleted,
             symbols_deleted,
             skipped_files,
+            contracts_derived,
+            contracts_status,
         };
 
         Ok(result)
@@ -2832,6 +3013,7 @@ where
                     "recovered index graph write",
                     epilogue_io,
                     Some(&nestweaver_store::GraphScope::unified()),
+                    true,
                 )
                 .map(|()| result)
                 .map_err(anyhow::Error::from),
@@ -2866,13 +3048,36 @@ where
 
     // The write guard stays alive through this mandatory epilogue. Publish
     // invalidation/generation/PageRank on success and every later graph error.
-    let finalization = finalize_committed_index_with_io(
-        publication,
-        store.db_path(),
-        "index graph write",
-        epilogue_io,
-        bump_generation_after_write,
-    );
+    //
+    // Cancellation observed here arrived past every pre-write observation
+    // point, so the graph committed anyway. Do NOT run the clean publish:
+    // `.index-dirty` and the reserved generation must survive so the next
+    // open reconciles this publication as dirty (fail-closed) instead of
+    // trusting a generation/PageRank that predates the commit. The daemon
+    // reports the outcome as committed-after-cancellation. The rest of the
+    // finalizer (pagerank invalidation, failure aggregation, lease release)
+    // is unchanged.
+    let finalization = if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        finalize_committed_index_for_scope_with_io(
+            publication,
+            store.db_path(),
+            "index graph write (committed after cancellation)",
+            epilogue_io,
+            // The scoped PageRank refresh is gated on `publication_clean`,
+            // which stays false for a cancelled commit — pass `None` so the
+            // skip is explicit rather than implied by a dead scope.
+            None,
+            false,
+        )
+    } else {
+        finalize_committed_index_with_io(
+            publication,
+            store.db_path(),
+            "index graph write",
+            epilogue_io,
+            bump_generation_after_write,
+        )
+    };
     match (graph_result, finalization) {
         (Ok(result), Ok(())) => {
             // nw-124: stamp WHICH resolver produced this repo's edges. Some
@@ -2910,6 +3115,450 @@ fn is_parseable(path: &Path) -> bool {
     detect_language(path).is_some()
 }
 
+/// Where a candidate [`nestweaver_schema::Contract`] came from. Ordered worst
+/// to best: a spec declaration always outranks a route inferred from handler
+/// source, which is the preference the old `declared_uids` guard encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ContractOrigin {
+    CodeDerived,
+    Declared,
+}
+
+/// Order-preserving, UID-keyed accumulator for Contract nodes.
+///
+/// `Contract.uid` is the primary key of the `Contract` node table, so the bulk
+/// COPY in `batch_insert_contracts` aborts the *whole* batch the moment a UID
+/// repeats — and repeats are normal, not pathological:
+///
+/// - [`nestweaver_schema::uid::normalize_http_path`] deliberately discards the
+///   *name* of a path parameter, so `GET /users/{id}` and `GET /users/{userId}`
+///   mint one UID.
+/// - [`nestweaver_schema::uid::contract_uid`] never mixes in the spec's
+///   location, so one spec vendored at two paths mints its routes twice.
+/// - `.proto` / `.graphql` operations carry no cross-file uniqueness check, so
+///   two files declaring the same RPC or `Query` field collide too.
+///
+/// This accumulator is the only place that sees every candidate, so it is where
+/// the collapse belongs.
+struct ContractSet {
+    /// UIDs in first-sighting order, so the COPY input stays reproducible.
+    order: Vec<String>,
+    by_uid: HashMap<String, (ContractOrigin, nestweaver_schema::Contract)>,
+}
+
+impl ContractSet {
+    fn new() -> Self {
+        Self {
+            order: Vec::new(),
+            by_uid: HashMap::new(),
+        }
+    }
+
+    /// True once any candidate has claimed `uid`.
+    fn contains(&self, uid: &str) -> bool {
+        self.by_uid.contains_key(uid)
+    }
+
+    /// True when a *spec* declared `uid`. Replaces the old `declared_uids`
+    /// set: the declared loop populates it by inserting, so the guard on the
+    /// code-derived path can no longer fall out of sync with what was stored.
+    fn is_declared(&self, uid: &str) -> bool {
+        matches!(self.by_uid.get(uid), Some((ContractOrigin::Declared, _)))
+    }
+
+    /// Record `contract`, keeping the better row when its UID is already held.
+    ///
+    /// The winner is chosen by a **total, order-independent** order:
+    ///
+    /// 1. spec-declared beats code-derived (the `declared_uids` semantics);
+    /// 2. then higher `confidence` — `f32` has no `Ord`, so `total_cmp`;
+    /// 3. then the lexicographically smallest `source_path`.
+    ///
+    /// Collection order deliberately breaks no tie. `FilesystemReader` walks in
+    /// readdir order while `GitReader` walks git-sorted, so "first one wins"
+    /// would pick a different survivor on two machines and make the collapse
+    /// untestable. Rows that tie on all three differ at most in `operation_id`;
+    /// kind, verb and path are already pinned by the shared UID, so they are
+    /// equivalent for the graph and the incumbent stays.
+    fn insert(&mut self, origin: ContractOrigin, contract: nestweaver_schema::Contract) {
+        match self.by_uid.entry(contract.uid.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                self.order.push(contract.uid.clone());
+                slot.insert((origin, contract));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let (held_origin, held) = slot.get();
+                let wins = origin
+                    .cmp(held_origin)
+                    .then_with(|| contract.confidence.total_cmp(&held.confidence))
+                    .then_with(|| held.source_path.cmp(&contract.source_path))
+                    .is_gt();
+                if wins {
+                    slot.insert((origin, contract));
+                }
+            }
+        }
+    }
+
+    /// The deduplicated rows, first-sighting order preserved.
+    fn into_contracts(self) -> Vec<nestweaver_schema::Contract> {
+        let Self { order, mut by_uid } = self;
+        order
+            .into_iter()
+            .filter_map(|uid| by_uid.remove(&uid).map(|(_, c)| c))
+            .collect()
+    }
+}
+
+/// Rebuild the whole-repo inputs consumed by contract derivation.
+///
+/// Full indexing accumulates these while parsing every file. Incremental
+/// indexing parses only changed files, but contracts are a derived whole-repo
+/// view: a renamed spec or an unchanged controller can affect the same route.
+/// Rescanning the lightweight contract inputs keeps incremental semantics
+/// identical to force/full indexing without replacing the whole code graph.
+fn collect_contract_derivation_inputs(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+    strict: bool,
+) -> Result<ContractDerivationInputs, anyhow::Error> {
+    let mut spec_files = Vec::new();
+    let mut handler_files = Vec::new();
+    let mut all_symbols = Vec::new();
+    let repo_path = reader.root();
+    let discovered_files = reader
+        .list_files()
+        .context("list files for incremental contract derivation")?;
+    for rel_path in &discovered_files {
+        let abs_path = repo_path.join(rel_path);
+        if crate::contracts::is_spec_file(&abs_path.to_string_lossy()) {
+            spec_files.push(abs_path);
+        }
+    }
+    let has_grpc_specs = spec_files.iter().any(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("proto"))
+    });
+
+    for rel_path in discovered_files {
+        let abs_path = repo_path.join(&rel_path);
+
+        let Some(lang) = detect_language(&abs_path) else {
+            continue;
+        };
+        if is_minified_or_bundled(&abs_path) {
+            continue;
+        }
+        if reader
+            .file_meta(&rel_path)
+            .context("read contract input metadata")?
+            .is_some_and(|(_, size)| size > crate::index_md::MAX_FILE_SIZE_BYTES)
+        {
+            tracing::debug!(path = %rel_path.display(), "skip oversized contract input before read");
+            continue;
+        }
+        let source = match reader.read_file(&rel_path) {
+            Ok(source) => source,
+            Err(error) if strict => {
+                return Err(error).with_context(|| {
+                    format!("read contract handler candidate {}", rel_path.display())
+                });
+            }
+            Err(error) => {
+                tracing::debug!(path = %rel_path.display(), "skip unreadable handler candidate: {error}");
+                continue;
+            }
+        };
+        if source.len() as u64 > crate::index_md::MAX_FILE_SIZE_BYTES {
+            tracing::debug!(path = %rel_path.display(), "skip oversized contract input");
+            continue;
+        }
+        let controller_candidate = match lang {
+            nestweaver_schema::Language::Java | nestweaver_schema::Language::Kotlin => {
+                source.contains("@RestController") || source.contains("@Controller")
+            }
+            nestweaver_schema::Language::JavaScript | nestweaver_schema::Language::TypeScript => {
+                source.contains("@Controller")
+            }
+            _ => false,
+        };
+        let grpc_candidate =
+            has_grpc_specs && lang == nestweaver_schema::Language::Rust && source.contains("impl ");
+        if !controller_candidate && !grpc_candidate {
+            continue;
+        }
+        let parsed = match parse_source(&abs_path, &source) {
+            Ok(parsed) => parsed,
+            Err(error) if strict => {
+                return Err(error).with_context(|| {
+                    format!("parse contract handler candidate {}", rel_path.display())
+                });
+            }
+            Err(error) => {
+                tracing::debug!(path = %rel_path.display(), "skip unparseable handler candidate: {error}");
+                continue;
+            }
+        };
+        let rel_path_string = rel_path.to_string_lossy().into_owned();
+        if grpc_candidate {
+            all_symbols.extend(parsed.symbols.iter().map(|symbol| {
+                let scope = symbol.scope_chain.as_deref().unwrap_or("");
+                nestweaver_schema::Symbol {
+                    uid: symbol_uid(r_uid, &rel_path_string, &symbol.name, symbol.start_line),
+                    name: symbol.name.clone(),
+                    kind: symbol.kind,
+                    repo_uid: r_uid.to_string(),
+                    file_path: rel_path_string.clone(),
+                    start_line: symbol.start_line,
+                    end_line: symbol.end_line,
+                    signature: symbol.signature.clone(),
+                    summary: None,
+                    content_hash: symbol.content_hash.clone(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: symbol.is_entry_point,
+                    entry_point_kind: symbol.entry_point_kind,
+                    visibility: symbol.visibility,
+                    type_info: symbol.type_info.clone(),
+                    framework_hint: None,
+                    canonical_id: Some(canonical_symbol_id(
+                        repo_url,
+                        &rel_path_string,
+                        &symbol.name,
+                        scope,
+                    )),
+                }
+            }));
+        }
+        if !controller_candidate {
+            continue;
+        }
+
+        let Some(lang_str) = crate::contracts::framework_language_str(lang) else {
+            continue;
+        };
+
+        let mut hint_by_index: HashMap<usize, nestweaver_schema::FrameworkHint> =
+            nestweaver_parser::detect_frameworks(&parsed.symbols, &rel_path_string, lang_str)
+                .into_iter()
+                .collect();
+        let class_starts: Vec<(usize, u32)> = parsed
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.kind == nestweaver_schema::SymbolKind::Class)
+            .map(|(index, symbol)| (index, symbol.start_line))
+            .collect();
+        if let Some(controller_index) =
+            crate::contracts::detect_nestjs_controller_index(&source, &class_starts)
+        {
+            hint_by_index.entry(controller_index).or_insert_with(|| {
+                nestweaver_schema::FrameworkHint {
+                    framework: "nestjs".into(),
+                    role: "controller".into(),
+                }
+            });
+        }
+
+        let Some((controller_index, framework)) = hint_by_index.iter().find_map(|(index, hint)| {
+            (hint.role == "controller").then(|| (*index, hint.framework.clone()))
+        }) else {
+            continue;
+        };
+        let class_signature = parsed
+            .symbols
+            .get(controller_index)
+            .map(|symbol| symbol.signature.clone())
+            .unwrap_or_default();
+        let symbols = parsed
+            .symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol_uid(r_uid, &rel_path_string, &symbol.name, symbol.start_line),
+                    crate::contracts::HandlerSymbol {
+                        name: symbol.name.clone(),
+                        signature: symbol.signature.clone(),
+                        start_line: symbol.start_line,
+                    },
+                )
+            })
+            .collect();
+        handler_files.push(HandlerFileData {
+            framework,
+            class_signature,
+            rel_path: rel_path_string,
+            symbols,
+        });
+    }
+
+    spec_files.sort();
+    handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok((spec_files, handler_files, all_symbols))
+}
+
+fn prepare_incremental_contract_derivation(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+) -> Result<ContractDerivationPlan, anyhow::Error> {
+    let (spec_files, handler_files, all_symbols) =
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, false)?;
+    prepare_contract_derivation(
+        reader,
+        r_uid,
+        &spec_files,
+        &handler_files,
+        &all_symbols,
+        false,
+    )
+}
+
+pub(crate) fn prepare_watcher_contract_derivation(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+) -> Result<ContractDerivationPlan, anyhow::Error> {
+    prepare_watcher_contract_derivation_with_hooks(reader, r_uid, repo_url, || {}, || {})
+}
+
+pub(crate) fn watcher_contract_input_snapshot(
+    reader: &dyn crate::content_reader::ContentReader,
+) -> Result<std::collections::BTreeMap<String, String>, anyhow::Error> {
+    let files = reader
+        .list_files()
+        .context("list files for watcher contract snapshot")?;
+    let has_grpc_specs = files.iter().any(|path| {
+        crate::contracts::is_spec_file(&path.to_string_lossy())
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("proto"))
+    });
+    let mut snapshot = std::collections::BTreeMap::new();
+    for rel_path in files {
+        let abs_path = reader.root().join(&rel_path);
+        let is_spec = crate::contracts::is_spec_file(&abs_path.to_string_lossy());
+        let language = detect_language(&abs_path);
+        if !is_spec && language.is_none() {
+            continue;
+        }
+        if !is_spec && is_minified_or_bundled(&abs_path) {
+            continue;
+        }
+        if reader
+            .file_meta(&rel_path)
+            .with_context(|| format!("read watcher contract metadata {}", rel_path.display()))?
+            .is_some_and(|(_, size)| size > crate::index_md::MAX_FILE_SIZE_BYTES)
+        {
+            continue;
+        }
+        let source = reader
+            .read_file(&rel_path)
+            .with_context(|| format!("read watcher contract input {}", rel_path.display()))?;
+        if source.len() as u64 > crate::index_md::MAX_FILE_SIZE_BYTES {
+            continue;
+        }
+        let candidate = if is_spec {
+            true
+        } else {
+            match language.expect("checked above") {
+                nestweaver_schema::Language::Java | nestweaver_schema::Language::Kotlin => {
+                    source.contains("@RestController") || source.contains("@Controller")
+                }
+                nestweaver_schema::Language::JavaScript
+                | nestweaver_schema::Language::TypeScript => source.contains("@Controller"),
+                nestweaver_schema::Language::Rust => has_grpc_specs && source.contains("impl "),
+                _ => false,
+            }
+        };
+        if candidate {
+            snapshot.insert(
+                rel_path.to_string_lossy().into_owned(),
+                crate::hash::blake3_hex(&source),
+            );
+        }
+    }
+    Ok(snapshot)
+}
+
+fn prepare_watcher_contract_derivation_with_hooks<F, G>(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+    before_plan: F,
+    after_plan: G,
+) -> Result<ContractDerivationPlan, anyhow::Error>
+where
+    F: FnOnce(),
+    G: FnOnce(),
+{
+    let before = watcher_contract_input_snapshot(reader)?;
+    before_plan();
+    let observed = watcher_contract_input_snapshot(reader)?;
+    let (spec_files, handler_files, all_symbols) =
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, true)?;
+    let mut plan = prepare_contract_derivation(
+        reader,
+        r_uid,
+        &spec_files,
+        &handler_files,
+        &all_symbols,
+        true,
+    )?;
+    after_plan();
+    let after = watcher_contract_input_snapshot(reader)?;
+    let plan_reads_match_observed = plan
+        .input_hashes
+        .iter()
+        .all(|(path, hash)| observed.get(path) == Some(hash));
+    if before != observed || observed != after || !plan_reads_match_observed {
+        let changed: Vec<_> = before
+            .keys()
+            .chain(observed.keys())
+            .chain(after.keys())
+            .chain(plan.input_hashes.keys())
+            .filter(|path| {
+                before.get(*path) != observed.get(*path)
+                    || observed.get(*path) != after.get(*path)
+                    || plan
+                        .input_hashes
+                        .get(*path)
+                        .is_some_and(|hash| observed.get(*path) != Some(hash))
+            })
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        anyhow::bail!(
+            "contract inputs changed while watcher plan was prepared: {}",
+            changed.join(", ")
+        );
+    }
+    plan.observed_input_hashes = observed;
+    Ok(plan)
+}
+
+fn derive_contracts_from_current_repo(
+    store: &GraphStore,
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    repo_url: &str,
+) -> Result<usize, anyhow::Error> {
+    let (spec_files, handler_files, all_symbols) =
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, false)?;
+    derive_contracts(
+        store,
+        reader,
+        r_uid,
+        &spec_files,
+        &handler_files,
+        &all_symbols,
+    )
+}
+
 /// F2-core: build the API contract graph for one repo.
 ///
 /// 1. Parse spec files into **declared** [`nestweaver_schema::Contract`] nodes
@@ -2919,6 +3568,9 @@ fn is_parseable(path: &Path) -> bool {
 ///    otherwise mint a **code-derived** contract and link to that.
 /// 3. Emit `IMPLEMENTS_CONTRACT` edges (handler Symbol → Contract) carrying the
 ///    match confidence (1.0 exact verb+path, 0.8 base-path-inferred).
+///
+/// Returns the number of Contract nodes written, so the caller can report
+/// "derived N" rather than only "did not blow up".
 fn derive_contracts(
     store: &GraphStore,
     reader: &dyn crate::content_reader::ContentReader,
@@ -2926,16 +3578,37 @@ fn derive_contracts(
     spec_files: &[PathBuf],
     handler_files: &[HandlerFileData],
     all_symbols: &[nestweaver_schema::Symbol],
-) -> Result<(), anyhow::Error> {
-    use nestweaver_schema::{EdgeType, ResolvedEdge};
-    use std::collections::HashSet;
+) -> Result<usize, anyhow::Error> {
+    let plan =
+        prepare_contract_derivation(reader, r_uid, spec_files, handler_files, all_symbols, false)?;
+    let conn = store.begin_transaction()?;
+    let count = apply_contract_derivation_on(&conn, r_uid, &plan)?;
+    store.commit_transaction(&conn)?;
+    Ok(count)
+}
 
-    // Bulk delete existing contracts for this repo in one query.
-    store.clear_repo_contracts(r_uid)?;
+pub(crate) struct ContractDerivationPlan {
+    contracts: Vec<nestweaver_schema::Contract>,
+    edges: Vec<nestweaver_schema::ResolvedEdge>,
+    pub(crate) input_hashes: std::collections::BTreeMap<String, String>,
+    pub(crate) observed_input_hashes: std::collections::BTreeMap<String, String>,
+}
+
+/// Prepare contract rows and implementation edges without mutating the graph.
+/// All source reads and parsing finish before an incremental transaction opens.
+fn prepare_contract_derivation(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    spec_files: &[PathBuf],
+    handler_files: &[HandlerFileData],
+    all_symbols: &[nestweaver_schema::Symbol],
+    strict: bool,
+) -> Result<ContractDerivationPlan, anyhow::Error> {
+    use nestweaver_schema::{EdgeType, ResolvedEdge};
 
     // 1. Declared contracts from specs.
-    let mut all_contracts: Vec<nestweaver_schema::Contract> = Vec::new();
-    let mut declared_uids: HashSet<String> = HashSet::new();
+    let mut all_contracts = ContractSet::new();
+    let mut input_hashes = std::collections::BTreeMap::new();
     // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
     let mut declared_grpc: Vec<(String, String)> = Vec::new();
     let repo_path = reader.root();
@@ -2947,23 +3620,38 @@ fn derive_contracts(
             .into_owned();
         let source = match reader.read_file(Path::new(&rel)) {
             Ok(s) => s,
+            Err(error) if strict => {
+                return Err(error).with_context(|| format!("read watched contract spec {rel}"));
+            }
             Err(e) => {
                 tracing::debug!("skip unreadable spec {rel}: {e}");
                 continue;
             }
         };
-        for sc in crate::contracts::parse_spec_file(&rel, &source) {
+        let parsed_specs = if strict {
+            input_hashes.insert(rel.clone(), crate::hash::blake3_hex(&source));
+            crate::contracts::parse_spec_file_strict(&rel, &source)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("parse watched contract spec {rel}"))?
+        } else {
+            crate::contracts::parse_spec_file(&rel, &source)
+        };
+        for sc in parsed_specs {
             // Keep gRPC operations so implementations can be matched against the
             // DECLARED contract rather than minting a UID from source (nw-104).
             let grpc_operation = (sc.kind == "grpc")
                 .then(|| sc.operation_id.clone())
                 .flatten();
             let contract = sc.into_contract(r_uid, &rel, 1.0);
-            if let Some(operation) = grpc_operation {
+            // One entry per declared RPC: `detect_grpc_impls` emits a match per
+            // entry, so an RPC declared in two .proto files would otherwise
+            // produce two identical IMPLEMENTS_CONTRACT edges.
+            if let Some(operation) = grpc_operation
+                && !all_contracts.contains(&contract.uid)
+            {
                 declared_grpc.push((contract.uid.clone(), operation));
             }
-            declared_uids.insert(contract.uid.clone());
-            all_contracts.push(contract);
+            all_contracts.insert(ContractOrigin::Declared, contract);
         }
     }
 
@@ -2976,19 +3664,29 @@ fn derive_contracts(
         // class-level base path (@RequestMapping / @Controller) is usually
         // dropped. Read the raw source to recover it; fall back to the
         // truncated signature if the file is unreadable.
-        let base_source = reader
-            .read_file(Path::new(&hf.rel_path))
-            .unwrap_or_else(|_| hf.class_signature.clone());
+        let base_source = match reader.read_file(Path::new(&hf.rel_path)) {
+            Ok(source) => source,
+            Err(error) if strict => {
+                return Err(error).with_context(|| format!("read watched handler {}", hf.rel_path));
+            }
+            Err(_) => hf.class_signature.clone(),
+        };
+        if strict {
+            input_hashes.insert(hf.rel_path.clone(), crate::hash::blake3_hex(&base_source));
+        }
         let matches = crate::contracts::detect_handlers(&hf.framework, &base_source, &handler_syms);
         for m in matches {
             let contract_uid = m.contract.uid();
             // Mint a code-derived contract only when no spec declared this UID.
-            if !declared_uids.contains(&contract_uid) {
+            // The set is authoritative either way — inserting a code-derived row
+            // over a declared one loses on provenance — but skipping the work is
+            // free, and the edge below still points at the declared node.
+            if !all_contracts.is_declared(&contract_uid) {
                 let contract = m
                     .contract
                     .clone()
                     .into_contract(r_uid, &hf.rel_path, m.confidence);
-                all_contracts.push(contract);
+                all_contracts.insert(ContractOrigin::CodeDerived, contract);
             }
             if let Some((sym_uid, _)) = hf.symbols.get(m.symbol_index) {
                 edges.push(ResolvedEdge {
@@ -3012,6 +3710,21 @@ fn derive_contracts(
     // opened to reach a detector that also did not exist. Matching declared
     // contracts against symbols here needs none of them, and the edge adopts the
     // DECLARED uid so it provably points at a real contract.
+    if strict {
+        for rel_path in all_symbols
+            .iter()
+            .map(|symbol| symbol.file_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if input_hashes.contains_key(rel_path) {
+                continue;
+            }
+            let source = reader
+                .read_file(Path::new(rel_path))
+                .with_context(|| format!("read watched gRPC candidate {rel_path}"))?;
+            input_hashes.insert(rel_path.to_string(), crate::hash::blake3_hex(&source));
+        }
+    }
     if !declared_grpc.is_empty() {
         // Group symbols by file so each candidate file is read once.
         let mut by_file: std::collections::BTreeMap<&str, Vec<(String, String, u32)>> =
@@ -3029,9 +3742,17 @@ fn derive_contracts(
             // Cheap pre-filter: a tonic server implementation is a trait impl, so
             // a file with no `impl ` at all cannot contain one. Avoids reading
             // every source file in the repo.
-            let Ok(source) = reader.read_file(Path::new(rel_path)) else {
-                continue;
+            let source = match reader.read_file(Path::new(rel_path)) {
+                Ok(source) => source,
+                Err(error) if strict => {
+                    return Err(error)
+                        .with_context(|| format!("read watched gRPC handler {rel_path}"));
+                }
+                Err(_) => continue,
             };
+            if strict {
+                input_hashes.insert(rel_path.to_string(), crate::hash::blake3_hex(&source));
+            }
             if !source.contains("impl ") {
                 continue;
             }
@@ -3057,13 +3778,50 @@ fn derive_contracts(
         }
     }
 
-    // Batch insert all contracts at once via COPY FROM CSV.
-    store.batch_insert_contracts(&all_contracts)?;
+    // Batch insert all contracts at once via COPY FROM CSV. `Contract.uid` is
+    // the node table's primary key, so the rows must already be unique by UID —
+    // `ContractSet` guarantees that. Note the collapse is intentionally visible
+    // in edge cardinality: two handlers whose routes normalize to one UID both
+    // keep their IMPLEMENTS_CONTRACT edge onto the surviving contract.
+    let contracts = all_contracts.into_contracts();
 
-    if !edges.is_empty() {
-        store.batch_insert_edges(&edges)?;
+    Ok(ContractDerivationPlan {
+        contracts,
+        edges,
+        input_hashes,
+        observed_input_hashes: std::collections::BTreeMap::new(),
+    })
+}
+
+/// Replace one repo's derived contract graph on an existing transaction.
+///
+/// Incremental indexing uses this seam so changed symbols, source paths,
+/// contracts, implementation edges, and the indexed SHA publish as one unit.
+/// Any contract write failure therefore rolls the whole incremental mutation
+/// back, retaining the previously committed graph rather than leaving new
+/// symbols paired with stale or missing derived edges.
+pub(crate) fn apply_contract_derivation_on(
+    conn: &nestweaver_store::DbConnection<'_>,
+    r_uid: &str,
+    plan: &ContractDerivationPlan,
+) -> Result<usize, anyhow::Error> {
+    // Clear + insert + edges must be ONE transaction. Previously the clear ran
+    // on its own connection ahead of the inserts, so any failure in between
+    // (e.g. a single row the COPY rejects) left the repo with zero contracts
+    // and zero IMPLEMENTS_CONTRACT edges — and the caller only warns, so the
+    // index still reported success. The transaction opens here, as late as
+    // possible: all the spec/handler parsing above is expensive and holding a
+    // write transaction across it would serialise writers for no benefit.
+    //
+    // No explicit rollback on the error paths, matching `bulk_reindex_write`:
+    // a statement that throws inside an explicit transaction already rolls it
+    // back, and dropping the connection rolls back anything still open.
+    GraphStore::clear_repo_contracts_on(conn, r_uid)?;
+    GraphStore::batch_insert_contracts_on(conn, &plan.contracts)?;
+    if !plan.edges.is_empty() {
+        GraphStore::batch_insert_edges_on(conn, &plan.edges)?;
     }
-    Ok(())
+    Ok(plan.contracts.len())
 }
 
 /// Returns true if the file looks like a minified bundle, webpack output,
@@ -3290,6 +4048,8 @@ fn incremental_index_with_name_and_io(
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+    let contract_plan = prepare_incremental_contract_derivation(&reader, &r_uid, repo_url)
+        .context("prepare incremental contract derivation")?;
 
     let publication = establish_index_publication_marker_with_io(
         &store,
@@ -3406,6 +4166,15 @@ fn incremental_index_with_name_and_io(
         );
     }
 
+    if let Err(error) = apply_contract_derivation_on(&txn, &r_uid, &contract_plan) {
+        drop(txn);
+        if let Err(marker_error) = store.set_contract_derivation_failed(&r_uid, &error.to_string())
+        {
+            tracing::warn!("recording contract derivation failure failed: {marker_error}");
+        }
+        return Err(error).context("apply incremental contract derivation");
+    }
+
     // 6. Update the stored SHA inside the transaction, then commit.
     // If we crash before commit, the next run replays from the old SHA.
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, &new_sha)
@@ -3415,6 +4184,9 @@ fn incremental_index_with_name_and_io(
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
+    if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
+        tracing::warn!("clearing contract derivation marker failed: {error}");
+    }
 
     finalize_committed_index_with_io(
         publication,
@@ -3479,6 +4251,8 @@ where
     // edges we walk here, so this ordering is correctness-critical.
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
+    let contract_plan = prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
+        .context("prepare server incremental contract derivation")?;
 
     let _write_guard = acquire_write_guard()?;
     let publication = establish_index_publication_marker_with_io(
@@ -3587,12 +4361,24 @@ where
         );
     }
 
+    if let Err(error) = apply_contract_derivation_on(&txn, &r_uid, &contract_plan) {
+        drop(txn);
+        if let Err(marker_error) = store.set_contract_derivation_failed(&r_uid, &error.to_string())
+        {
+            tracing::warn!("recording contract derivation failure failed: {marker_error}");
+        }
+        return Err(error).context("apply server incremental contract derivation");
+    }
+
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, new_sha)
         .with_context(|| "update_repo_sha")?;
     store
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
+    if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
+        tracing::warn!("clearing contract derivation marker failed: {error}");
+    }
 
     finalize_committed_index_with_io(
         publication,
@@ -3871,7 +4657,7 @@ fn reresolve_affected_dependents(
 
     let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
         .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
-    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols)?;
+    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols, None)?;
 
     // Runs inside the same transaction as the mutation loop.
     let count = insertable.len();
@@ -3882,33 +4668,44 @@ fn reresolve_affected_dependents(
     Ok(count)
 }
 
-/// Non-transactional variant of [`reresolve_affected_dependents`] for the
-/// live code watcher (`watch_code.rs`), which interleaves its mutations with
-/// store-level (non-txn) calls. Same nw-008 Phase 2 semantics: re-insert ONLY
-/// the cross-file edges the per-file `DETACH DELETE` destroyed.
-pub(crate) fn reresolve_affected_dependents_on_store(
+/// Prepare the live watcher's reverse-dependent edges before publication.
+///
+/// The watcher supplies the frozen replacement symbols that its transaction
+/// will publish. This produces the same post-mutation symbol view as
+/// [`reresolve_affected_dependents`] without reading source after the dirty
+/// marker has been established.
+pub(crate) struct WatcherReresolveInputs<'a> {
+    pub(crate) changed: &'a std::collections::HashSet<String>,
+    pub(crate) removed: &'a std::collections::HashSet<String>,
+    pub(crate) rdeps: &'a std::collections::HashSet<String>,
+    pub(crate) replacement_symbols: &'a [nestweaver_schema::Symbol],
+    pub(crate) prepared_file_data: &'a PreparedFileData,
+}
+
+pub(crate) fn prepare_watcher_reresolve_edges(
     reader: &dyn crate::content_reader::ContentReader,
     store: &nestweaver_store::GraphStore,
     r_uid: &str,
-    changed: &std::collections::HashSet<String>,
-    rdeps: &std::collections::HashSet<String>,
-) -> Result<usize, anyhow::Error> {
-    if changed.is_empty() {
-        return Ok(0);
+    inputs: WatcherReresolveInputs<'_>,
+) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
+    if inputs.changed.is_empty() {
+        return Ok(Vec::new());
     }
-
-    let db_symbols = store
+    let mut symbols = store
         .lookup_symbols_by_repo(r_uid)
-        .with_context(|| "lookup_symbols_by_repo for forward edge resolution")?;
-    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols)?;
-
-    let count = insertable.len();
-    if count > 0 {
-        store
-            .batch_insert_edges(&insertable)
-            .with_context(|| "batch_insert_edges (transitive re-resolution)")?;
-    }
-    Ok(count)
+        .with_context(|| "lookup_symbols_by_repo for watcher edge preparation")?;
+    symbols.retain(|symbol| {
+        !inputs.changed.contains(&symbol.file_path) && !inputs.removed.contains(&symbol.file_path)
+    });
+    symbols.extend_from_slice(inputs.replacement_symbols);
+    build_reresolve_edges(
+        reader,
+        r_uid,
+        inputs.changed,
+        inputs.rdeps,
+        &symbols,
+        Some(inputs.prepared_file_data),
+    )
 }
 
 /// Shared core of nw-008 Phase 2. Re-parse `S = changed ∪ rdeps` from
@@ -3930,6 +4727,7 @@ fn build_reresolve_edges(
     changed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
     db_symbols: &[nestweaver_schema::Symbol],
+    prepared_file_data: Option<&PreparedFileData>,
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     // S = changed ∪ rdeps — files whose references need re-resolution.
     let mut scope: std::collections::HashSet<String> = changed.clone();
@@ -3942,22 +4740,29 @@ fn build_reresolve_edges(
     for rel_str in &scope {
         let rel_path = Path::new(rel_str.as_str());
         let abs_path = reader.root().join(rel_path);
-        let source = match reader.read_file(rel_path) {
-            Ok(s) => s,
-            Err(_) => continue, // deleted/unreadable — nothing to re-resolve from
-        };
-        let parsed = match parse_source(&abs_path, &source) {
-            Ok(p) => p,
-            Err(_) => continue,
+        let (raw_symbols, raw_references) = if let Some((symbols, references)) =
+            prepared_file_data.and_then(|prepared| prepared.get(rel_str))
+        {
+            (symbols.clone(), references.clone())
+        } else {
+            let source = match reader.read_file(rel_path) {
+                Ok(s) => s,
+                Err(_) => continue, // deleted/unreadable — nothing to re-resolve from
+            };
+            let parsed = match parse_source(&abs_path, &source) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            (parsed.symbols, parsed.references)
         };
         if let Some(lang) = detect_language(&abs_path) {
             *lang_counts.entry(lang).or_insert(0) += 1;
         }
-        for raw_sym in &parsed.symbols {
+        for raw_sym in &raw_symbols {
             let s_uid = symbol_uid(r_uid, rel_str, &raw_sym.name, raw_sym.start_line);
             uid_to_file.insert(s_uid, rel_str.clone());
         }
-        file_data.push((rel_str.clone(), parsed.symbols, parsed.references));
+        file_data.push((rel_str.clone(), raw_symbols, raw_references));
     }
 
     if file_data.is_empty() {
@@ -4641,6 +5446,7 @@ mod tests {
             "successful no-op recovery",
             &FileSystemIndexEpilogueIo,
             Some(&nestweaver_store::GraphScope::unified()),
+            true,
         )
         .unwrap();
 
@@ -5117,6 +5923,633 @@ function hello(name) { return "Hello " + name; }
         );
     }
 
+    #[test]
+    fn contract_collector_skips_reported_oversize_before_reading() {
+        struct OversizeReader {
+            root: PathBuf,
+        }
+        impl crate::content_reader::ContentReader for OversizeReader {
+            fn read_file(&self, _rel_path: &Path) -> anyhow::Result<String> {
+                panic!("oversized contract candidate must not be read")
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("HugeController.java")])
+            }
+            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                Ok(Some((0, crate::index_md::MAX_FILE_SIZE_BYTES + 1)))
+            }
+            fn root(&self) -> &Path {
+                &self.root
+            }
+            fn version_id(&self) -> &str {
+                "oversize-test"
+            }
+        }
+
+        let reader = OversizeReader {
+            root: PathBuf::from("/unused"),
+        };
+        let (specs, handlers, symbols) = collect_contract_derivation_inputs(
+            &reader,
+            "repo:test:oversize",
+            "https://example.com/oversize",
+            false,
+        )
+        .unwrap();
+        assert!(specs.is_empty());
+        assert!(handlers.is_empty());
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn watcher_contract_plan_rejects_create_delete_and_second_save_races() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let get = "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /items:\n    get:\n      responses: { \"200\": { description: ok } }\n";
+        let post = "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /items:\n    post:\n      responses: { \"200\": { description: ok } }\n";
+        let spec = repo.join("openapi.yaml");
+        fs::write(&spec, get).unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+
+        let created = repo.join("openapi.v2.yaml");
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&created, post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.v2.yaml"));
+        fs::remove_file(&created).unwrap();
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::remove_file(&spec).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.yaml"));
+        fs::write(&spec, get).unwrap();
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&spec, post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        fs::write(&spec, get).unwrap();
+        let controller = repo.join("ItemsController.java");
+        let controller_get = "@RestController\n@RequestMapping(\"/items\")\npublic class ItemsController { @GetMapping public void get() {} }\n";
+        let controller_post = "@RestController\n@RequestMapping(\"/items\")\npublic class ItemsController { @PostMapping public void post() {} }\n";
+        fs::write(&controller, controller_get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&controller, controller_post).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        fs::write(&controller, controller_get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::remove_file(&controller).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || {},
+            || fs::write(&controller, controller_get).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ItemsController.java"));
+
+        fs::write(&spec, get).unwrap();
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::write(&spec, post).unwrap(),
+            || fs::write(&spec, get).unwrap(),
+        )
+        .err()
+        .expect("old→new→old must reject the hybrid plan");
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::remove_file(&spec).unwrap(),
+            || fs::write(&spec, get).unwrap(),
+        )
+        .err()
+        .expect("spec delete→identical recreate must reject the hybrid plan");
+        assert!(error.to_string().contains("openapi.yaml"));
+
+        let error = prepare_watcher_contract_derivation_with_hooks(
+            &reader,
+            "repo:test:watch-race",
+            "file:///watch-race",
+            || fs::remove_file(&controller).unwrap(),
+            || fs::write(&controller, controller_get).unwrap(),
+        )
+        .err()
+        .expect("controller delete→identical recreate must reject the hybrid plan");
+        assert!(error.to_string().contains("ItemsController.java"));
+    }
+
+    #[test]
+    fn incremental_refreshes_contracts_like_force_and_rolls_back_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let incremental_db = dir.path().join("incremental.lbug");
+        let forced_db = dir.path().join("forced.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        let spec = |methods: &str| {
+            format!(
+                "openapi: 3.0.0\ninfo: {{ title: t, version: \"1.0\" }}\npaths:\n  /v1/items:\n{methods}"
+            )
+        };
+        fs::write(
+            repo.join("openapi.yaml"),
+            spec(
+                "    get:\n      operationId: listItems\n      responses: { \"200\": { description: ok } }\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n}\n",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "initial GET"]);
+        let first_sha = git(&["rev-parse", "HEAD"]);
+        let repo_url = "https://example.com/contract-refresh";
+        let repo_uid = nestweaver_schema::repo_uid("test", repo_url);
+        index_directory(&repo, &incremental_db, "test", repo_url, &first_sha).unwrap();
+        index_directory(&repo, &forced_db, "test", repo_url, &first_sha).unwrap();
+
+        let other_repo = dir.path().join("other-repo");
+        fs::create_dir_all(&other_repo).unwrap();
+        fs::write(
+            other_repo.join("openapi.yaml"),
+            "openapi: 3.0.0\ninfo: { title: other, version: \"1.0\" }\npaths:\n  /other:\n    get:\n      responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        let other_url = "https://example.com/contract-refresh-other";
+        let other_uid = nestweaver_schema::repo_uid("test", other_url);
+        index_directory(&other_repo, &incremental_db, "test", other_url, "other-sha").unwrap();
+        let other_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        let other_contracts = |store: &GraphStore| {
+            let mut contracts: Vec<(String, String)> = store
+                .list_contracts(Some(&other_uid))
+                .unwrap()
+                .into_iter()
+                .map(|contract| (contract.uid, contract.source_path))
+                .collect();
+            contracts.sort();
+            contracts
+        };
+        let other_before = other_contracts(&other_store);
+        drop(other_store);
+
+        fs::rename(repo.join("openapi.yaml"), repo.join("openapi.v2.yaml")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "rename spec only"]);
+        let rename_sha = git(&["rev-parse", "HEAD"]);
+        let rename_result = incremental_index(&repo, &incremental_db, "test", repo_url).unwrap();
+        assert!(!rename_result.fell_back_to_full);
+        let renamed_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        let renamed_get = renamed_store
+            .list_contracts(Some(&repo_uid))
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.uid == "contract:http:GET:/v1/items")
+            .expect("GET survives a spec-only rename");
+        assert_eq!(renamed_get.source_path, "openapi.v2.yaml");
+        assert!(
+            renamed_store
+                .list_implemented_contract_uids()
+                .unwrap()
+                .contains(&renamed_get.uid),
+            "unchanged controller must be relinked after spec-only rename"
+        );
+        drop(renamed_store);
+        let tiered = index_directory(&repo, &forced_db, "test", repo_url, &rename_sha).unwrap();
+        assert!(
+            tiered.files_unchanged > 0,
+            "control must exercise the partial/tiered full path"
+        );
+        let tiered_store = GraphStore::open_or_create(&forced_db).unwrap();
+        assert_eq!(
+            tiered_store
+                .list_contracts(Some(&repo_uid))
+                .unwrap()
+                .into_iter()
+                .find(|contract| contract.uid == "contract:http:GET:/v1/items")
+                .unwrap()
+                .source_path,
+            "openapi.v2.yaml"
+        );
+        drop(tiered_store);
+
+        fs::write(
+            repo.join("openapi.v2.yaml"),
+            spec(
+                "    get:\n      operationId: listItems\n      responses: { \"200\": { description: ok } }\n    post:\n      operationId: createItem\n      responses: { \"200\": { description: ok } }\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n  @PostMapping\n  public void create() {}\n}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add POST"]);
+        let second_sha = git(&["rev-parse", "HEAD"]);
+
+        let incremental = incremental_index(&repo, &incremental_db, "test", repo_url).unwrap();
+        assert!(!incremental.fell_back_to_full, "must exercise incremental");
+        index_directory_with_options(&repo, &forced_db, "test", repo_url, &second_sha, true, None)
+            .unwrap();
+
+        let snapshot = |store: &GraphStore| {
+            let mut contracts: Vec<(String, String)> = store
+                .list_contracts(Some(&repo_uid))
+                .unwrap()
+                .into_iter()
+                .filter(|contract| contract.repo_uid == repo_uid)
+                .map(|contract| (contract.uid, contract.source_path))
+                .collect();
+            contracts.sort();
+            let mut implemented = store.list_implemented_contract_uids().unwrap();
+            implemented.sort();
+            (contracts, implemented)
+        };
+        let implementation_pairs = |store: &GraphStore| {
+            let mut pairs = Vec::new();
+            for symbol in store.lookup_symbols_by_repo(&repo_uid).unwrap() {
+                for (contract_uid, _) in store.contracts_implemented_by(&symbol.uid).unwrap() {
+                    pairs.push((symbol.name.clone(), contract_uid));
+                }
+            }
+            pairs.sort();
+            pairs
+        };
+        let drift = |store: &GraphStore| {
+            crate::contracts::drift_envelope(
+                crate::contracts::drift_for_store(store, Some(&repo_uid)).unwrap(),
+                50,
+            )
+        };
+        let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        let forced_store = GraphStore::open_or_create(&forced_db).unwrap();
+        let incremental_snapshot = snapshot(&incremental_store);
+        assert_eq!(incremental_snapshot, snapshot(&forced_store));
+        assert_eq!(
+            implementation_pairs(&incremental_store),
+            implementation_pairs(&forced_store)
+        );
+        assert_eq!(drift(&incremental_store), drift(&forced_store));
+        assert_eq!(
+            implementation_pairs(&incremental_store),
+            vec![
+                (
+                    "create".to_string(),
+                    "contract:http:POST:/v1/items".to_string(),
+                ),
+                (
+                    "list".to_string(),
+                    "contract:http:GET:/v1/items".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            other_contracts(&incremental_store),
+            other_before,
+            "refreshing one repo must not alter another repo's contracts"
+        );
+        assert_eq!(
+            incremental_snapshot.0,
+            vec![
+                (
+                    "contract:http:GET:/v1/items".to_string(),
+                    "openapi.v2.yaml".to_string(),
+                ),
+                (
+                    "contract:http:POST:/v1/items".to_string(),
+                    "openapi.v2.yaml".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            incremental_snapshot.1,
+            vec![
+                "contract:http:GET:/v1/items".to_string(),
+                "contract:http:POST:/v1/items".to_string(),
+            ]
+        );
+        drop(incremental_store);
+        drop(forced_store);
+
+        fs::write(
+            repo.join("openapi.v2.yaml"),
+            spec(
+                "    post:\n      operationId: createItem\n      responses: { \"200\": { description: ok } }\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @PostMapping\n  public void create() {}\n}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "delete GET"]);
+        let third_sha = git(&["rev-parse", "HEAD"]);
+        let deletion = incremental_index(&repo, &incremental_db, "test", repo_url).unwrap();
+        assert!(!deletion.fell_back_to_full);
+        index_directory_with_options(&repo, &forced_db, "test", repo_url, &third_sha, true, None)
+            .unwrap();
+        let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        let forced_store = GraphStore::open_or_create(&forced_db).unwrap();
+        let post_only_snapshot = snapshot(&incremental_store);
+        assert_eq!(post_only_snapshot, snapshot(&forced_store));
+        assert_eq!(
+            implementation_pairs(&incremental_store),
+            implementation_pairs(&forced_store)
+        );
+        assert_eq!(drift(&incremental_store), drift(&forced_store));
+        assert_eq!(
+            implementation_pairs(&incremental_store),
+            vec![(
+                "create".to_string(),
+                "contract:http:POST:/v1/items".to_string(),
+            )]
+        );
+        assert_eq!(
+            post_only_snapshot.0,
+            vec![(
+                "contract:http:POST:/v1/items".to_string(),
+                "openapi.v2.yaml".to_string(),
+            )]
+        );
+        assert_eq!(
+            post_only_snapshot.1,
+            vec!["contract:http:POST:/v1/items".to_string()]
+        );
+
+        // Poison the next replacement with a UID owned by another repo. The
+        // contract COPY fails after the changed controller/spec were parsed,
+        // and the single incremental transaction must retain the prior graph.
+        incremental_store
+            .batch_insert_contracts(&[nestweaver_schema::Contract {
+                uid: "contract:http:PUT:/v1/items".to_string(),
+                kind: "http".to_string(),
+                verb: Some("PUT".to_string()),
+                path: Some("/v1/items".to_string()),
+                operation_id: None,
+                repo_uid: "repo:other".to_string(),
+                source_path: "other.yaml".to_string(),
+                confidence: 1.0,
+            }])
+            .unwrap();
+        let generation_path = crate::sidecar_path(&incremental_db, ".generation");
+        let generation_before_failed_apply = fs::read(&generation_path).unwrap();
+        drop(incremental_store);
+        drop(forced_store);
+        fs::write(
+            repo.join("openapi.v2.yaml"),
+            spec(
+                "    get:\n      operationId: listItems\n      responses: { \"200\": { description: ok } }\n    post:\n      operationId: createItem\n      responses: { \"200\": { description: ok } }\n    put:\n      operationId: replaceItem\n      responses: { \"200\": { description: ok } }\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("ItemsController.java"),
+            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n  @PostMapping\n  public void create() {}\n  @PutMapping\n  public void replace() {}\n}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add colliding PUT"]);
+
+        let error = incremental_index(&repo, &incremental_db, "test", repo_url)
+            .expect_err("contract replacement failure must abort incremental publication");
+        assert!(
+            format!("{error:#}").contains("apply incremental contract derivation"),
+            "unexpected error: {error:#}"
+        );
+        let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        assert_eq!(
+            fs::read(&generation_path).unwrap(),
+            generation_before_failed_apply,
+            "a failed transactional apply must not publish a new generation"
+        );
+        assert_eq!(snapshot(&incremental_store), post_only_snapshot);
+        assert_eq!(
+            other_contracts(&incremental_store),
+            other_before,
+            "a failed replacement must not alter another repo"
+        );
+        assert_eq!(
+            incremental_store
+                .lookup_repo(&repo_uid)
+                .unwrap()
+                .unwrap()
+                .indexed_sha,
+            third_sha,
+            "failed derivation must roll back the indexed SHA"
+        );
+        assert!(
+            incremental_store
+                .lookup_symbols_by_name_in_repo("replace", &repo_uid)
+                .unwrap()
+                .is_empty(),
+            "failed derivation must roll back the new handler symbol"
+        );
+        assert!(
+            incremental_store
+                .contract_derivation_failures(Some(&repo_uid))
+                .unwrap()
+                .contains(&repo_uid),
+            "the failed best-effort contract phase remains diagnosable"
+        );
+    }
+
+    /// A failure inside `derive_contracts` must leave the PREVIOUS contract
+    /// graph intact.
+    ///
+    /// The clear used to run on its own connection ahead of the COPY, so a
+    /// single row the COPY rejected wiped every Contract and every
+    /// IMPLEMENTS_CONTRACT edge for the repo — not a partial result, nothing —
+    /// while the caller only warned and the index still reported success.
+    ///
+    /// The rejected row here is a real one: `contracts::contract_uid` mints a
+    /// UID from kind/verb/path alone, with no repo component, so a route
+    /// another repo has already declared collides on `Contract`'s primary key.
+    /// `clear_repo_contracts` deletes only this repo's rows, so the other
+    /// repo's row is still there when the COPY runs.
+    ///
+    /// Assertions are on the CONTENTS of the graph, never on the `Result` of
+    /// an `index_*` call: derivation errors are swallowed by the caller, so a
+    /// `Result` assertion would pass with or without the fix.
+    #[test]
+    fn failed_contract_derivation_preserves_existing_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\n\
+             info: { title: t, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/approvals:\n    \
+             post:\n      \
+             operationId: createApproval\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("ApprovalsController.java"),
+            "@RestController\n\
+             @RequestMapping(\"/v1/approvals\")\n\
+             public class ApprovalsController {\n  \
+             @PostMapping\n  \
+             public void create() {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let repo_uid = store
+            .list_contracts(None)
+            .unwrap()
+            .first()
+            .expect("first index derives at least one contract")
+            .repo_uid
+            .clone();
+        let mut contracts_before: Vec<String> = store
+            .list_contracts(Some(&repo_uid))
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.repo_uid == repo_uid)
+            .map(|c| c.uid)
+            .collect();
+        contracts_before.sort();
+        let mut implemented_before = store.list_implemented_contract_uids().unwrap();
+        implemented_before.sort();
+        assert!(!contracts_before.is_empty(), "expected seeded contracts");
+        assert!(
+            !implemented_before.is_empty(),
+            "expected a seeded IMPLEMENTS_CONTRACT edge"
+        );
+
+        // A Contract owned by a DIFFERENT repo, under a UID this repo's next
+        // derivation also mints.
+        store
+            .batch_insert_contracts(&[nestweaver_schema::Contract {
+                uid: "contract:http:GET:/v1/shared".to_string(),
+                kind: "http".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/v1/shared".to_string()),
+                operation_id: None,
+                repo_uid: "repo:other".to_string(),
+                source_path: "openapi.yaml".to_string(),
+                confidence: 1.0,
+            }])
+            .unwrap();
+
+        // Re-derive this repo's contracts from a spec that declares the shared
+        // route. The COPY must reject the colliding row.
+        let poisoned = dir.path().join("poisoned");
+        fs::create_dir_all(&poisoned).unwrap();
+        let spec = poisoned.join("openapi.yaml");
+        fs::write(
+            &spec,
+            "openapi: 3.0.0\n\
+             info: { title: t, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/shared:\n    \
+             get:\n      \
+             operationId: getShared\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&poisoned);
+        let err = derive_contracts(&store, &reader, &repo_uid, &[spec], &[], &[])
+            .expect_err("a colliding contract UID must fail the COPY");
+        assert!(
+            err.to_string().contains("COPY Contract"),
+            "expected the COPY to be what failed; got {err}"
+        );
+
+        // The failed derivation must not have touched the previous graph.
+        let mut contracts_after: Vec<String> = store
+            .list_contracts(Some(&repo_uid))
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.repo_uid == repo_uid)
+            .map(|c| c.uid)
+            .collect();
+        contracts_after.sort();
+        assert_eq!(
+            contracts_before, contracts_after,
+            "contracts must survive a failed derivation"
+        );
+
+        let mut implemented_after = store.list_implemented_contract_uids().unwrap();
+        implemented_after.sort();
+        assert_eq!(
+            implemented_before, implemented_after,
+            "IMPLEMENTS_CONTRACT edges must survive a failed derivation"
+        );
+    }
+
     /// nw-104: a declared gRPC contract must link to its Rust/tonic
     /// implementation.
     ///
@@ -5177,6 +6610,409 @@ function hello(name) { return "Hello " + name; }
         assert!(
             !implemented.contains(&"contract:grpc:demo.v1.Greeter/NeverBuilt".to_string()),
             "an unimplemented RPC must remain drift; implemented: {implemented:?}"
+        );
+    }
+
+    // ── Contract derivation status (degraded vs genuinely empty) ──────────
+
+    /// Index `src` into `store` a second time, reusing the private full-index
+    /// entry point so the contract phase — and its swallow — actually runs.
+    /// `index_directory_in_memory` always mints a fresh store, which is no use
+    /// when the point is to re-index a store that has been poisoned.
+    fn reindex_into(store: &GraphStore, src: &Path, sha: &str) -> IndexResult {
+        let reader = crate::content_reader::FilesystemReader::new(src);
+        let local_root = src.display().to_string();
+        index_into_store(
+            &reader,
+            store,
+            "test",
+            "https://example.com/repo",
+            sha,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .expect("indexing must succeed even when contract derivation does not")
+    }
+
+    /// Write a repo whose only content is an OpenAPI spec declaring
+    /// `GET /v1/shared`, plus a handler that implements it.
+    fn write_shared_route_repo(src: &Path) {
+        fs::create_dir_all(src).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\n\
+             info: { title: t, version: \"1.0\" }\n\
+             paths:\n  \
+             /v1/shared:\n    \
+             get:\n      \
+             operationId: getShared\n      \
+             responses: { \"200\": { description: ok } }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("SharedController.java"),
+            "@RestController\n\
+             @RequestMapping(\"/v1/shared\")\n\
+             public class SharedController {\n  \
+             @GetMapping\n  \
+             public void get() {}\n\
+             }\n",
+        )
+        .unwrap();
+    }
+
+    /// A repo whose contract derivation FAILED must not be reported as clean.
+    ///
+    /// Assertions are on the reported STATUS and on graph contents, never on
+    /// the `Result` of the index call: derivation errors are swallowed, so
+    /// `index_*` returns `Ok` with or without this fix and a `Result`
+    /// assertion would prove nothing.
+    ///
+    /// The failure induced here is the observed one: `contract_uid` mints a UID
+    /// with no repo component, so a route another repo already declared
+    /// collides on `Contract`'s primary key and the bulk COPY rejects the row —
+    /// discarding every contract and every IMPLEMENTS_CONTRACT edge for this
+    /// repo while the index still reports success.
+    #[test]
+    fn degraded_contract_derivation_is_not_reported_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        write_shared_route_repo(&src);
+
+        let (first, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert_eq!(
+            first.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete,
+            "a healthy first index must report a complete contract phase"
+        );
+        assert!(
+            first.contracts_derived > 0,
+            "the spec declares a route, so contracts must have been derived"
+        );
+
+        let repo_uid = store
+            .list_contracts(None)
+            .unwrap()
+            .first()
+            .expect("first index derives at least one contract")
+            .repo_uid
+            .clone();
+
+        // Poison: hand this repo's UID to a DIFFERENT repo, so the next
+        // derivation's COPY hits a duplicate primary key it cannot clear.
+        store.clear_repo_contracts(&repo_uid).unwrap();
+        store
+            .batch_insert_contracts(&[nestweaver_schema::Contract {
+                uid: "contract:http:GET:/v1/shared".to_string(),
+                kind: "http".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/v1/shared".to_string()),
+                operation_id: None,
+                repo_uid: "repo:other".to_string(),
+                source_path: "openapi.yaml".to_string(),
+                confidence: 1.0,
+            }])
+            .unwrap();
+
+        let second = reindex_into(&store, &src, "def456");
+
+        // 1. The index result says so.
+        assert_eq!(
+            second.contracts_status,
+            crate::blast_radius::AnalysisStatus::Degraded,
+            "a failed contract phase must be reported as degraded"
+        );
+        assert_eq!(
+            second.contracts_derived, 0,
+            "a failed derivation writes no contracts"
+        );
+
+        // 2. The query-time drift analysis says so. This assertion is the one
+        //    that catches the original bug: `is_clean()` predates this fix and
+        //    returned `true` for exactly this repo.
+        let report = crate::contracts::drift_for_store(&store, Some(&repo_uid)).unwrap();
+        assert!(
+            !report.is_clean(),
+            "a degraded repo must not report clean; report: {report:?}"
+        );
+        assert_eq!(
+            report.contracts_status,
+            crate::blast_radius::AnalysisStatus::Degraded
+        );
+        assert_eq!(report.degraded_repos, vec![repo_uid.clone()]);
+
+        // 3. The envelope both front-ends serialize says so.
+        let envelope = crate::contracts::drift_envelope(report, 50);
+        assert_eq!(envelope["clean"], serde_json::json!(false));
+        assert_eq!(envelope["contracts_status"], serde_json::json!("degraded"));
+
+        // A clean re-index heals the repo: the marker is cleared, not sticky.
+        store.clear_repo_contracts("repo:other").unwrap();
+        let third = reindex_into(&store, &src, "ghi789");
+        assert_eq!(
+            third.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete,
+            "a successful re-index must clear the degraded marker"
+        );
+        assert!(
+            crate::contracts::drift_for_store(&store, Some(&repo_uid))
+                .unwrap()
+                .degraded_repos
+                .is_empty(),
+            "the failure marker must not survive a successful derivation"
+        );
+    }
+
+    /// The counterpart the fix must NOT break: a repo that genuinely declares
+    /// and implements no contracts is still clean. Reporting "not clean"
+    /// everywhere would make the new signal worthless — the whole point is that
+    /// empty and broken are now distinguishable.
+    #[test]
+    fn repo_with_no_contracts_is_still_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("util.rs"), "pub fn add(a: i32) -> i32 { a + 1 }\n").unwrap();
+
+        let (result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert_eq!(
+            result.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete
+        );
+        assert_eq!(result.contracts_derived, 0, "no specs, no handlers");
+        assert!(
+            store.list_contracts(None).unwrap().is_empty(),
+            "sanity: the repo really has no contracts"
+        );
+
+        let report = crate::contracts::drift_for_store(&store, None).unwrap();
+        assert!(
+            report.is_clean(),
+            "an empty-but-healthy repo must still be clean; report: {report:?}"
+        );
+        assert!(report.degraded_repos.is_empty());
+
+        let envelope = crate::contracts::drift_envelope(report, 50);
+        assert_eq!(envelope["clean"], serde_json::json!(true));
+        assert_eq!(envelope["contracts_status"], serde_json::json!("complete"));
+    }
+
+    // ── Contract UID deduplication (duplicate-PK on the bulk COPY) ────────
+
+    /// Every Contract UID appears at most once, else the COPY would have
+    /// aborted. Returns the surviving rows keyed by UID for further assertions.
+    fn assert_unique_contract_uids(contracts: &[nestweaver_schema::Contract]) {
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for c in contracts {
+            *seen.entry(c.uid.as_str()).or_default() += 1;
+        }
+        let dupes: Vec<(&str, usize)> = seen.into_iter().filter(|(_, n)| *n > 1).collect();
+        assert!(
+            dupes.is_empty(),
+            "duplicate Contract UIDs reached the store: {dupes:?}"
+        );
+    }
+
+    #[test]
+    fn routes_differing_only_in_path_param_name_collapse_to_one_contract() {
+        // BUG repro: `normalize_http_path` discards the *name* of a path
+        // parameter, so GET /users/{id} and GET /users/{userId} mint the same
+        // UID. Undeduplicated, the bulk COPY died with "Found duplicated
+        // primary key value contract:http:GET:/users/{}" and the contract phase
+        // lost EVERY contract for the repo.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("UserController.java"),
+            "@RestController\n\
+             public class UserController {\n  \
+             @GetMapping(\"/users/{id}\")\n  \
+             public void byId() {}\n  \
+             @GetMapping(\"/users/{userId}\")\n  \
+             public void byUserId() {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let contracts = store.list_contracts(None).unwrap();
+        assert_unique_contract_uids(&contracts);
+        let collapsed: Vec<&nestweaver_schema::Contract> = contracts
+            .iter()
+            .filter(|c| c.uid == "contract:http:GET:/users/{}")
+            .collect();
+        assert_eq!(
+            collapsed.len(),
+            1,
+            "the two routes must collapse to exactly one contract; got {:?}",
+            contracts.iter().map(|c| &c.uid).collect::<Vec<_>>()
+        );
+
+        // Dedup CHANGES EDGE CARDINALITY BY DESIGN: both handlers legitimately
+        // implement the one surviving contract, so assert the two edges rather
+        // than a count that would encode the old one-contract-per-handler shape.
+        for handler in ["byId", "byUserId"] {
+            let syms = store.lookup_symbols_by_name(handler).unwrap();
+            let sym = syms
+                .iter()
+                .find(|s| s.name == handler)
+                .unwrap_or_else(|| panic!("{handler} symbol indexed"));
+            let implemented = store.contracts_implemented_by(&sym.uid).unwrap();
+            assert!(
+                implemented
+                    .iter()
+                    .any(|(uid, _)| uid == "contract:http:GET:/users/{}"),
+                "{handler} must link to the surviving contract; got {implemented:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_spec_vendored_at_two_paths_indexes_once() {
+        // `contract_uid` derives from verb + path and never from the spec's
+        // location, so a spec vendored twice declares each route twice.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("api")).unwrap();
+        fs::create_dir_all(src.join("docs")).unwrap();
+        let spec = "openapi: 3.0.0\n\
+                    info: { title: t, version: \"1.0\" }\n\
+                    paths:\n  \
+                    /v1/items:\n    \
+                    get:\n      \
+                    responses: { \"200\": { description: ok } }\n";
+        fs::write(src.join("api").join("openapi.yaml"), spec).unwrap();
+        fs::write(src.join("docs").join("openapi.yaml"), spec).unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let contracts = store.list_contracts(None).unwrap();
+        assert_unique_contract_uids(&contracts);
+        let survivor = contracts
+            .iter()
+            .find(|c| c.uid == "contract:http:GET:/v1/items")
+            .expect("the declared route survives the collapse");
+        // Both copies are declared at confidence 1.0, so the tie-break falls to
+        // the lexicographically smallest source_path — NOT to collection order.
+        assert_eq!(survivor.source_path, "api/openapi.yaml");
+    }
+
+    #[test]
+    fn overlapping_proto_and_graphql_definitions_index_cleanly() {
+        // `parse_proto` mints "<package>.<Service>/<Method>" and `parse_graphql`
+        // collects every field of any Query/Mutation/Subscription type — neither
+        // has a cross-file uniqueness check, so two files declaring the same
+        // operation collide on the primary key.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        let proto = "syntax = \"proto3\";\n\
+                     package demo.v1;\n\
+                     service Greeter {\n  \
+                     rpc SayHello (Empty) returns (Empty);\n\
+                     }\n\
+                     message Empty {}\n";
+        fs::write(src.join("a.proto"), proto).unwrap();
+        fs::write(src.join("b.proto"), proto).unwrap();
+        let schema = "type Query {\n  me: String\n}\n";
+        fs::write(src.join("one.graphql"), schema).unwrap();
+        fs::write(src.join("two.graphql"), schema).unwrap();
+
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+
+        let contracts = store.list_contracts(None).unwrap();
+        assert_unique_contract_uids(&contracts);
+        let uids: Vec<&str> = contracts.iter().map(|c| c.uid.as_str()).collect();
+        assert!(
+            uids.contains(&"contract:grpc:demo.v1.Greeter/SayHello"),
+            "the duplicated RPC must survive exactly once; got {uids:?}"
+        );
+        assert!(
+            uids.contains(&"contract:graphql:Query.me"),
+            "the duplicated GraphQL field must survive exactly once; got {uids:?}"
+        );
+    }
+
+    #[test]
+    fn contract_collision_resolves_independently_of_input_order() {
+        // The acceptance criterion is that a collision resolves the SAME way
+        // whichever order the candidates arrive in. It cannot lean on
+        // collection order: `FilesystemReader` walks readdir order while
+        // `GitReader` walks git-sorted, so the two readers disagree.
+        fn candidate(source_path: &str, confidence: f32) -> nestweaver_schema::Contract {
+            nestweaver_schema::Contract {
+                uid: "contract:http:GET:/users/{}".to_string(),
+                kind: "http".to_string(),
+                verb: Some("GET".to_string()),
+                path: Some("/users/{}".to_string()),
+                operation_id: None,
+                repo_uid: "repo:test".to_string(),
+                source_path: source_path.to_string(),
+                confidence,
+            }
+        }
+        fn survivor(
+            first: (ContractOrigin, nestweaver_schema::Contract),
+            second: (ContractOrigin, nestweaver_schema::Contract),
+        ) -> nestweaver_schema::Contract {
+            let mut set = ContractSet::new();
+            set.insert(first.0, first.1);
+            set.insert(second.0, second.1);
+            let mut rows = set.into_contracts();
+            assert_eq!(rows.len(), 1, "colliding UIDs must collapse to one row");
+            rows.remove(0)
+        }
+
+        // 1. Provenance: a spec declaration outranks a code-derived route even
+        //    when the code-derived one is more confident and sorts earlier.
+        let declared = (ContractOrigin::Declared, candidate("z/openapi.yaml", 0.8));
+        let derived = (ContractOrigin::CodeDerived, candidate("a/Ctrl.java", 1.0));
+        assert_eq!(
+            survivor(declared.clone(), derived.clone()).source_path,
+            "z/openapi.yaml"
+        );
+        assert_eq!(
+            survivor(derived, declared).source_path,
+            "z/openapi.yaml",
+            "provenance must not depend on which candidate arrived first"
+        );
+
+        // 2. Then confidence, compared with total_cmp.
+        let strong = (ContractOrigin::CodeDerived, candidate("z/Ctrl.java", 1.0));
+        let weak = (ContractOrigin::CodeDerived, candidate("a/Ctrl.java", 0.8));
+        assert_eq!(
+            survivor(strong.clone(), weak.clone()).source_path,
+            "z/Ctrl.java"
+        );
+        assert_eq!(
+            survivor(weak, strong).source_path,
+            "z/Ctrl.java",
+            "confidence must not depend on which candidate arrived first"
+        );
+
+        // 3. Then the lexicographically smallest source_path — the common case,
+        //    since two @RequestMappings in one controller tie on 1 and 2.
+        let early = (ContractOrigin::CodeDerived, candidate("a/Ctrl.java", 1.0));
+        let late = (ContractOrigin::CodeDerived, candidate("z/Ctrl.java", 1.0));
+        assert_eq!(
+            survivor(early.clone(), late.clone()).source_path,
+            "a/Ctrl.java"
+        );
+        assert_eq!(
+            survivor(late, early).source_path,
+            "a/Ctrl.java",
+            "the path tie-break must not depend on which candidate arrived first"
         );
     }
 
@@ -6533,6 +8369,221 @@ function hello(name) { return "Hello " + name; }
         );
         assert!(crate::sidecar_path(&db_path, ".index-dirty").exists());
         assert!(store.symbols_in_file("old.js").unwrap().is_empty());
+    }
+
+    /// Trips the cancel flag inside `establish_marker`, which the index runs
+    /// immediately AFTER the pre-write cancellation poll — so the run passes
+    /// every abort point and can only observe the cancellation at the
+    /// committed finalizer, exactly like a timeout or Ctrl-C that lands
+    /// mid-write.
+    struct CancelOnMarkerIo {
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl IndexEpilogueIo for CancelOnMarkerIo {
+        fn establish_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.establish_marker(path)?;
+            self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clear_marker(&self, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.clear_marker(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            FileSystemIndexEpilogueIo.remove_file(path)
+        }
+
+        fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            FileSystemIndexEpilogueIo.rename_file(from, to)
+        }
+
+        fn save_generation(
+            &self,
+            store: &GraphStore,
+            path: &Path,
+            generation: u64,
+        ) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.save_generation(store, path, generation)
+        }
+
+        fn compute_pagerank(
+            &self,
+            store: &GraphStore,
+            scope: &nestweaver_store::GraphScope,
+        ) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.compute_pagerank(store, scope)
+        }
+
+        fn save_pagerank(&self, store: &GraphStore, path: &Path) -> Result<(), anyhow::Error> {
+            FileSystemIndexEpilogueIo.save_pagerank(store, path)
+        }
+    }
+
+    /// A cancellation observed only AFTER the last pre-write poll cannot abort
+    /// the run — the graph commits — but the publication must stay dirty:
+    /// `.index-dirty` survives and the durable generation is not advanced, so
+    /// the next open reconciles the publication fail-closed instead of
+    /// trusting a generation/PageRank that predates the commit.
+    #[test]
+    fn cancelled_commit_keeps_publication_dirty_and_generation_unpublished() {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.js"), "function kept() { return 1; }").unwrap();
+        let repo_url = "https://example.com/cancelled-commit";
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let result = index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-1",
+                name: None,
+                cancel: Some(&cancel),
+                epilogue_io: &CancelOnMarkerIo {
+                    cancel: Arc::clone(&cancel),
+                },
+            },
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .expect("a cancellation past the last pre-write poll cannot abort the commit");
+
+        assert!(result.files_count > 0, "the run indexed the file");
+        assert!(
+            store
+                .list_repos(Some("test"))
+                .unwrap()
+                .iter()
+                .any(|repo| repo.url == repo_url),
+            "the cancelled run's graph mutation IS persisted"
+        );
+        let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
+        let generation_path = crate::sidecar_path(&db_path, ".generation");
+        assert!(
+            marker_path.exists(),
+            "a cancelled commit must leave the publication dirty"
+        );
+        assert!(
+            !generation_path.exists(),
+            "a cancelled commit must not durably advance the generation"
+        );
+        drop(store);
+
+        // Reconciliation on the next open is fail-closed: the committed graph
+        // is there, but the dirty marker blocks trusting generation/PageRank
+        // state until a successful writer heals the publication.
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            reopened.is_index_publication_dirty(),
+            "the dirty marker must survive reopen"
+        );
+        assert_eq!(
+            reopened.graph_generation(),
+            u64::MAX,
+            "with no published `.generation` and the dirty marker present, reopen must \
+             report the fail-closed sentinel rather than a trustworthy generation"
+        );
+        assert!(
+            reopened
+                .list_repos(Some("test"))
+                .unwrap()
+                .iter()
+                .any(|repo| repo.url == repo_url),
+            "the committed graph survives reopen"
+        );
+    }
+
+    /// In-memory stores have no `.index-dirty` marker for a later open to
+    /// reconcile, so a cancelled-but-committed run must still bump the
+    /// in-memory generation — otherwise the commit is invisible to
+    /// generation-keyed snapshot readers.
+    #[test]
+    fn cancelled_commit_still_bumps_in_memory_generation() {
+        let store = GraphStore::in_memory().unwrap();
+        store.bump_graph_generation();
+        let before = store.graph_generation();
+
+        let lease = establish_index_publication_marker_with_io(
+            &store,
+            None,
+            "cancelled in-memory commit",
+            &FileSystemIndexEpilogueIo,
+        )
+        .unwrap();
+        finalize_committed_index_for_scope_with_io(
+            lease,
+            None,
+            "cancelled in-memory commit",
+            &FileSystemIndexEpilogueIo,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.graph_generation(),
+            before + 1,
+            "in-memory stores have no dirty marker, so the generation bump must still run"
+        );
+    }
+
+    /// Control for the cancelled-commit test: the same run without a
+    /// cancellation retires `.index-dirty` and durably publishes the advanced
+    /// generation.
+    #[test]
+    fn uncancelled_commit_retires_marker_and_publishes_generation() {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.js"), "function kept() { return 1; }").unwrap();
+        let repo_url = "https://example.com/uncancelled-commit";
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let generation_before = store.graph_generation();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        index_with_reader_and_write_gate_and_io(
+            ReaderIndexRequest {
+                reader: &reader,
+                store: &store,
+                instance_id: "test",
+                repo_url,
+                indexed_sha: "sha-1",
+                name: None,
+                cancel: Some(&cancel),
+                epilogue_io: &FileSystemIndexEpilogueIo,
+            },
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .expect("an uncancelled index must succeed");
+
+        assert!(
+            !crate::sidecar_path(&db_path, ".index-dirty").exists(),
+            "a clean commit retires the dirty marker"
+        );
+        assert!(store.graph_generation() > generation_before);
+        assert_eq!(
+            fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            store.graph_generation(),
+            "a clean commit durably publishes the advanced generation"
+        );
+        assert!(!store.is_index_publication_dirty());
     }
 
     #[test]

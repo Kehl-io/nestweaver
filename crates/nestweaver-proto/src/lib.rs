@@ -5,8 +5,9 @@ pub mod nestweaver_daemon_v1 {
 pub use nestweaver_daemon_v1::*;
 
 #[cfg(test)]
-mod embedding_telemetry_contract_tests {
+mod additive_status_contract_tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn status_and_hybrid_responses_expose_additive_embedding_telemetry() {
@@ -43,6 +44,42 @@ mod embedding_telemetry_contract_tests {
             degraded_components: vec!["semantic".to_string()],
         };
         assert_eq!(context.degraded_components, ["semantic"]);
+    }
+
+    #[test]
+    fn effective_config_roundtrip_preserves_all_three_provenance_states() {
+        use effective_config::Source;
+
+        let configured = BrainStatusResponse {
+            effective_config: Some(EffectiveConfig {
+                source: Some(Source::ConfiguredPath("/tmp/instance.toml".to_string())),
+            }),
+            ..Default::default()
+        };
+        let configured =
+            BrainStatusResponse::decode(configured.encode_to_vec().as_slice()).unwrap();
+        assert!(matches!(
+            configured.effective_config.unwrap().source,
+            Some(Source::ConfiguredPath(path)) if path == "/tmp/instance.toml"
+        ));
+
+        let defaults = BrainStatusResponse {
+            effective_config: Some(EffectiveConfig {
+                source: Some(Source::CompiledDefaults(
+                    effective_config::CompiledDefaults {},
+                )),
+            }),
+            ..Default::default()
+        };
+        let defaults = BrainStatusResponse::decode(defaults.encode_to_vec().as_slice()).unwrap();
+        assert!(matches!(
+            defaults.effective_config.unwrap().source,
+            Some(Source::CompiledDefaults(_))
+        ));
+
+        let unknown = BrainStatusResponse::default();
+        let unknown = BrainStatusResponse::decode(unknown.encode_to_vec().as_slice()).unwrap();
+        assert!(unknown.effective_config.is_none());
     }
 }
 
@@ -257,17 +294,21 @@ mod index_progress_tracker_tests {
         ));
     }
 
-    /// nw-127: a timeout must reach the caller as a REPORTED error naming the
-    /// cause, not as a truncated stream.
+    /// nw-127: an in-band terminal error must reach the caller as a REPORTED
+    /// error naming the cause, not as a truncated stream.
     ///
     /// The daemon's watchdog used to set its cancel flag and say nothing, so the
     /// client saw the stream simply end and rendered "index progress stream
     /// ended before completion" — indistinguishable from a crash, and shown as a
-    /// failure for an index that was still running and went on to SUCCEED.
-    /// Emitting a terminal `Phase::Error` is what turns that into an explanation.
+    /// failure for an index that was still running and went on to SUCCEED. The
+    /// watchdog now emits a non-terminal warning (naming
+    /// NESTWEAVER_INDEX_TIMEOUT_SECS) and lets the run's own terminal event
+    /// report whether it aborted before writing or committed anyway; what
+    /// remains pinned here is that any terminal `Phase::Error` still surfaces
+    /// as an explanation rather than a truncation.
     #[test]
     fn a_timeout_reported_in_band_beats_a_truncated_stream() {
-        // What the watchdog does now.
+        // A terminal Error event reported in-band.
         let mut reported = IndexProgressTracker::default();
         reported
             .observe(&progress(Phase::Writing, "still writing"))
@@ -297,6 +338,54 @@ mod index_progress_tracker_tests {
                 IndexProgressError::Truncated { .. }
             ),
             "without the terminal event the caller can only report a truncated stream"
+        );
+    }
+
+    /// The watchdog's timeout warning is NON-TERMINAL (its phase defaults to
+    /// DISCOVERING), so the run's own late Writing/Done events still land and
+    /// the caller's outcome derives from the genuine terminal event. This is
+    /// the sequence a cancelled-but-committed index produces; back when the
+    /// watchdog emitted a terminal `Phase::Error`, the late Writing/Done
+    /// events were rejected as AfterTerminal and an index that had in fact
+    /// committed was misreported to the CLI as a failure.
+    #[test]
+    fn a_non_terminal_timeout_warning_lets_the_real_done_report_through() {
+        let mut tracker = IndexProgressTracker::default();
+        tracker
+            .observe(&progress(
+                Phase::Discovering,
+                "index exceeded the 1800s timeout and cancellation was requested \
+                 (raise NESTWEAVER_INDEX_TIMEOUT_SECS)",
+            ))
+            .unwrap();
+        tracker
+            .observe(&progress(
+                Phase::Writing,
+                "Indexed 239745 files, 3122546 symbols",
+            ))
+            .unwrap();
+        tracker
+            .observe(&progress(
+                Phase::Done,
+                "Done — 239745 files, 3122546 symbols, 4725058 edges. Cancellation was \
+                 requested but the index had already passed its last cancellation point and \
+                 COMMITTED anyway. To discard this run and re-index from scratch, \
+                 run: nestweaver index --repo /repos/big --force",
+            ))
+            .unwrap();
+
+        let message = tracker.finish().unwrap();
+        assert!(
+            message.contains("COMMITTED"),
+            "a committed-after-cancellation run must say so, got: {message}"
+        );
+        assert!(
+            message.contains("nestweaver index --repo /repos/big --force"),
+            "the repair must be named, got: {message}"
+        );
+        assert!(
+            message.contains("239745 files"),
+            "the real counts must survive, got: {message}"
         );
     }
 

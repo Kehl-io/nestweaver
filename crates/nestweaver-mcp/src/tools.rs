@@ -4116,6 +4116,44 @@ mod brain_search_total_contract_tests {
         }
     }
 
+    /// Both contract surfaces must report a repo whose derivation failed as
+    /// degraded. `contract_drift`'s `clean` field is the one that actively lied:
+    /// a degraded repo has zero declared and zero implemented contracts, so the
+    /// old `dni_total == 0 && ind_total == 0` asserted `clean: true` about a
+    /// repo with no contract graph at all.
+    #[test]
+    fn degraded_repo_is_not_reported_clean_by_either_contract_tool() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .set_contract_derivation_failed("repo:broken", "COPY Contract: duplicate primary key")
+            .unwrap();
+
+        let drift = tool_contract_drift(&store, json!({})).unwrap();
+        assert_eq!(drift["clean"], json!(false), "drift envelope: {drift}");
+        assert_eq!(drift["contracts_status"], json!("degraded"));
+        assert_eq!(drift["degraded_repos"], json!(["repo:broken"]));
+
+        let cross = tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" })).unwrap();
+        assert_eq!(cross["contracts_status"], json!("degraded"), "{cross}");
+        assert_eq!(cross["degraded_repos"], json!(["repo:broken"]));
+    }
+
+    /// The distinction has to be a distinction: an empty graph with no
+    /// derivation failure is still clean and still complete.
+    #[test]
+    fn empty_graph_is_reported_clean_by_either_contract_tool() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let drift = tool_contract_drift(&store, json!({})).unwrap();
+        assert_eq!(drift["clean"], json!(true), "drift envelope: {drift}");
+        assert_eq!(drift["contracts_status"], json!("complete"));
+        assert_eq!(drift["degraded_repos"], json!([]));
+
+        let cross = tool_cross_repo_contracts(&store, json!({ "uid": "sym:absent" })).unwrap();
+        assert_eq!(cross["contracts_status"], json!("complete"), "{cross}");
+        assert_eq!(cross["degraded_repos"], json!([]));
+    }
+
     fn search_fixture() -> GraphStore {
         let store = GraphStore::in_memory().unwrap();
         for n in [
@@ -5229,6 +5267,28 @@ fn tool_schema_brain_add_source() -> Value {
     })
 }
 
+fn resolve_add_source_path(raw_path: &str) -> Result<std::path::PathBuf, anyhow::Error> {
+    nestweaver_engine::resolve_user_path(raw_path).map_err(anyhow::Error::new)
+}
+
+#[cfg(test)]
+mod add_source_path_tests {
+    use super::*;
+
+    #[test]
+    fn empty_path_is_rejected_instead_of_becoming_the_working_directory() {
+        let cwd = std::env::current_dir().expect("working directory");
+        assert!(cwd.is_dir(), "test requires an existing working directory");
+
+        for input in ["", " ", "\t\r\n"] {
+            let error = resolve_add_source_path(input)
+                .expect_err("an empty source path must fail before source indexing");
+            assert!(error.is::<nestweaver_engine::ResolveUserPathError>());
+            assert!(error.to_string().contains("non-empty path"));
+        }
+    }
+}
+
 fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     // Always route through the daemon (start it if needed). This ensures
     // consistent write serialization whether or not the MCP server itself
@@ -5268,8 +5328,8 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("'path' must be a string"))?;
-        let expanded = expand_tilde(raw_path);
-        let path = Path::new(&expanded);
+        let path = resolve_add_source_path(raw_path)?;
+        let path = path.as_path();
         if !path.exists() {
             return Err(anyhow!("path does not exist: {}", path.display()));
         }
@@ -5393,34 +5453,42 @@ fn match_repo_target<'a>(
     repos: &'a [nestweaver_schema::Repo],
     target: &str,
 ) -> Vec<&'a nestweaver_schema::Repo> {
-    let expand = |input: &str| -> String {
-        if let Some(stripped) = input.strip_prefix("~/")
-            && let Ok(home) = std::env::var("HOME")
-        {
-            return format!("{home}/{stripped}");
-        }
-        input.to_string()
+    let expand = |input: &str| -> Option<String> {
+        nestweaver_engine::resolve_user_path(input)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
     };
     let target_trimmed = target.trim_end_matches('/');
-    let canonical_target = std::fs::canonicalize(expand(target_trimmed))
+    let expanded_target = expand(target_trimmed);
+    if (target_trimmed == "~" || target_trimmed.starts_with("~/")) && expanded_target.is_none() {
+        return Vec::new();
+    }
+    let canonical_target = expanded_target
+        .as_deref()
+        .and_then(|path| std::fs::canonicalize(path).ok())
         .map(|p| format!("file://{}", p.display()))
         .unwrap_or_default();
     let url_target = if target_trimmed.starts_with("file://") {
         target_trimmed.to_string()
     } else if std::path::Path::new(target_trimmed).is_absolute() || target_trimmed.starts_with("~/")
     {
-        let expanded = expand(target_trimmed);
-        std::fs::canonicalize(&expanded)
-            .map(|p| format!("file://{}", p.display()))
-            .unwrap_or_else(|_| format!("file://{expanded}"))
+        expanded_target
+            .as_deref()
+            .map(|expanded| {
+                std::fs::canonicalize(expanded)
+                    .map(|p| format!("file://{}", p.display()))
+                    .unwrap_or_else(|_| format!("file://{expanded}"))
+            })
+            .unwrap_or_default()
     } else {
         String::new()
     };
     // A path target may refer to a repo identified by its git origin remote
     // rather than a file:// URL — try that identity too (read from git config,
     // never fetched).
-    let origin_target = std::fs::canonicalize(expand(target_trimmed))
-        .ok()
+    let origin_target = expanded_target
+        .as_deref()
+        .and_then(|path| std::fs::canonicalize(path).ok())
         .filter(|p| p.join(".git").exists())
         .and_then(|p| nestweaver_engine::read_origin_url(&p).ok())
         .unwrap_or_default();
@@ -5710,7 +5778,7 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
 fn tool_schema_cross_repo_contracts() -> Value {
     json!({
         "name": "cross_repo_contracts",
-        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
+        "description": "Find cross-repository references to a symbol — other repos that import, re-export, or implement the same symbol name.\n\nRequires either 'uid' or 'name' (at least one must be provided).\n\nGuidelines:\n- Use when modifying a shared symbol to understand cross-repo blast radius\n- Pass uid or name; returns other repos with confidence scores and link types\n- Only useful when multiple repos are indexed in the same brain\n\nLimitations:\n- For single-repo impact use brain_impact; for general search use brain_search\n- Contract links are hypotheses — check confidence scores before acting\n\nTrust contract: contracts_status (complete/degraded) + degraded_repos report whether contract derivation ran to completion at index time. Derivation failure is atomic, so a degraded repo keeps its PREVIOUS contract graph — its contract links are stale, not absent. Treat every `contract` link involving a degraded repo as 'unknown', not 'none' and not current.\n\nIn server mode, the server has the full org-wide view of cross-repo contracts. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5777,12 +5845,30 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
     let total = rows.len();
     rows.truncate(limit);
 
+    // Trust signal: contract derivation is best-effort at index time, so a repo
+    // whose derivation failed contributes no `contract` rows at all. Without
+    // this, "this symbol implements no contract" and "this symbol's repo has no
+    // contract graph" look identical. The check is DB-wide rather than scoped
+    // to the symbol's repo: contract UIDs carry no repo component, so the rows
+    // above cannot be attributed to one repo, and a degraded repo anywhere can
+    // cost this symbol a link.
+    let degraded_repos = store
+        .contract_derivation_failures(None)
+        .map_err(|e| anyhow!("contract_derivation_failures: {e}"))?;
+    let contracts_status = if degraded_repos.is_empty() {
+        "complete"
+    } else {
+        "degraded"
+    };
+
     Ok(json!({
         "uid": uid,
         "total": total,
         "returned": rows.len(),
         "note": "Links are hypotheses, not ground truth — check confidence. \
                  link_type \"contract\" denotes an implemented API contract.",
+        "contracts_status": contracts_status,
+        "degraded_repos": degraded_repos,
         "contracts": rows,
     }))
 }
@@ -5792,7 +5878,7 @@ fn tool_cross_repo_contracts(store: &GraphStore, args: Value) -> Result<Value, a
 fn tool_schema_contract_drift() -> Value {
     json!({
         "name": "contract_drift",
-        "description": "Audit API contract drift: routes declared in specs (OpenAPI, .proto, GraphQL) but not implemented, and routes implemented but not declared in any spec.\n\nGuidelines:\n- Use to spot missing endpoints or undocumented APIs\n- Optional repo filter scopes to a single repository\n- Returns two buckets: declared_not_implemented and implemented_not_declared\n\nLimitations:\n- Contract links are hypotheses derived from spec parsing and handler heuristics (same-repo only)\n- Only supports OpenAPI/Swagger, .proto, and GraphQL spec formats\n\nIn server mode, the server has the full org-wide view of contract drift. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
+        "description": "Audit API contract drift: routes declared in specs (OpenAPI, .proto, GraphQL) but not implemented, and routes implemented but not declared in any spec.\n\nGuidelines:\n- Use to spot missing endpoints or undocumented APIs\n- Optional repo filter scopes to a single repository\n- Returns two buckets: declared_not_implemented and implemented_not_declared\n\nTrust contract (read before trusting a clean result):\n- contracts_status (complete/degraded) + degraded_repos: contract derivation is best-effort at index time and never fails the index. Failure is atomic, so a degraded repo's contracts and drift findings reflect its PREVIOUS successful derivation — stale, not wiped. `clean` is true only when the analysis ALSO ran to completion — a degraded repo reports clean: false with contracts_status \"degraded\"\n- Empty buckets on a complete run mean 'no drift'; empty buckets on a degraded run mean 'unknown', not 'safe'\n\nLimitations:\n- Contract links are hypotheses derived from spec parsing and handler heuristics (same-repo only)\n- Only supports OpenAPI/Swagger, .proto, and GraphQL spec formats\n\nIn server mode, the server has the full org-wide view of contract drift. Through the hybrid client, results include _meta.sources indicating which data sources contributed; a raw single-daemon connection returns local results only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5816,27 +5902,10 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         .unwrap_or_else(configured_result_limit);
     let report = nestweaver_engine::contracts::drift_for_store(store, repo)
         .map_err(|e| anyhow!("drift_for_store: {e}"))?;
-    let dni_total = report.declared_not_implemented.len();
-    let ind_total = report.implemented_not_declared.len();
-    let dni: Vec<_> = report
-        .declared_not_implemented
-        .into_iter()
-        .take(limit)
-        .collect();
-    let ind: Vec<_> = report
-        .implemented_not_declared
-        .into_iter()
-        .take(limit)
-        .collect();
-    Ok(json!({
-        "note": "Contract links are hypotheses, not ground truth.",
-        "declared_not_implemented": dni,
-        "declared_not_implemented_total": dni_total,
-        "implemented_not_declared": ind,
-        "implemented_not_declared_total": ind_total,
-        "clean": dni_total == 0 && ind_total == 0,
-        "limit": limit,
-    }))
+    // Shared with the CLI's local path so the two serializations cannot drift
+    // apart again (they previously disagreed on totals, `clean`, `limit`, and
+    // whether truncation happened at all).
+    Ok(nestweaver_engine::contracts::drift_envelope(report, limit))
 }
 
 // ── 8. brain_impact ─────────────────────────────────────────────────────────
@@ -8456,18 +8525,6 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     }))
 }
 
-/// Expand a leading `~/` to the user's home directory. Returns the input
-/// unchanged when no expansion is possible.
-#[cfg(not(feature = "daemon"))]
-fn expand_tilde(input: &str) -> String {
-    if let Some(stripped) = input.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}/{stripped}");
-    }
-    input.to_string()
-}
-
 /// Shallow check: does the directory contain any `.md` file in its tree?
 /// Bounded depth to avoid blowing time on huge monorepos.
 #[cfg(not(feature = "daemon"))]
@@ -9223,11 +9280,13 @@ fn dispatch_add_source_via_daemon(
     rt: &tokio::runtime::Runtime,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    let path = args
+    let raw_path = args
         .get("path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?
-        .to_string();
+        .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?;
+    let path = resolve_add_source_path(raw_path)?
+        .to_string_lossy()
+        .into_owned();
 
     // Vault schema promises "Defaults to the directory name" — resolve it
     // here, but ONLY for vaults: forwarding "" blanks a vault's stored

@@ -10,6 +10,38 @@ use serde_json;
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+/// CSV options pinned on every `COPY … FROM` in this module.
+///
+/// lbug defaults to CSV dialect auto-detection, and its detector samples only
+/// the **first 256 rows**. We write with the `csv` crate's `QuoteStyle::Necessary`,
+/// so a field is quoted only when it contains a delimiter, a quote, or a newline.
+/// When no row inside that 256-row sample needs quoting, the detector's
+/// `everQuoted` flag stays false and it disables the quote character entirely —
+/// after which every later `"`-quoted field is split naively on its embedded
+/// commas and the whole row shifts columns. That is silent, deterministic data
+/// corruption, not an unlucky sniff: a repo UID landing in a FLOAT column is the
+/// observed symptom. `HEADER` rides the same detector and its failure mode is a
+/// silently dropped first data row.
+///
+/// Each option below sets lbug's matching `setDelim`/`setQuote`/`setEscape`/
+/// `setHeader` flag, and those flags are exactly what suppress the corresponding
+/// auto-detection. `ESCAPE='"'` (not a backslash) because the `csv` crate
+/// defaults to `double_quote(true)` — it escapes a quote by doubling it.
+///
+/// Do not "simplify" this back to bare `(PARALLEL=FALSE)`. Any new COPY site in
+/// this module must use it.
+const COPY_CSV_OPTS: &str = "(PARALLEL=FALSE, DELIM=',', QUOTE='\"', ESCAPE='\"', HEADER=false)";
+
+/// `Meta.key` prefix for the per-repo contract-derivation failure marker.
+///
+/// The full key is `<prefix><repo_uid>`. Contract derivation is best-effort at
+/// index time, but drift is recomputed at QUERY time from stored `Contract`
+/// rows — and an empty contract set looks identical whether the repo declares
+/// no routes or its derivation blew up. This marker is the only thing that
+/// carries that distinction across the two, so it is written by the indexer and
+/// read by [`GraphStore::contract_derivation_failures`].
+pub const CONTRACT_DERIVATION_FAILED_PREFIX: &str = "contract_derivation_failed:";
+
 /// What a classified destructive store mutation can prove about durable state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationDisposition {
@@ -642,8 +674,13 @@ impl GraphStore {
 
     pub fn insert_repo(&self, repo: &Repo) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::insert_repo_on(&conn, repo)
+    }
+
+    /// Insert a Repo node using an externally-provided transaction.
+    pub fn insert_repo_on(conn: &lbug::Connection<'_>, repo: &Repo) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
              staleness_commits_behind: $scb, instance_id: $iid, name: $name, \
              root_path: $root_path})",
@@ -804,7 +841,7 @@ impl GraphStore {
         let csv_path = tmp_dir.path().join("symbols.csv");
         write_symbols_csv(symbols, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        conn.query(&format!("COPY Symbol FROM '{csv_str}' (PARALLEL=FALSE)"))
+        conn.query(&format!("COPY Symbol FROM '{csv_str}' {COPY_CSV_OPTS}"))
             .map_err(|e| StoreError::Query(format!("COPY Symbol: {e}")))?;
         Ok(())
     }
@@ -827,7 +864,7 @@ impl GraphStore {
         let csv_path = tmp_dir.path().join("files.csv");
         write_files_csv(files, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        conn.query(&format!("COPY File FROM '{csv_str}' (PARALLEL=FALSE)"))
+        conn.query(&format!("COPY File FROM '{csv_str}' {COPY_CSV_OPTS}"))
             .map_err(|e| StoreError::Query(format!("COPY File: {e}")))?;
         Ok(())
     }
@@ -880,7 +917,7 @@ impl GraphStore {
         write_edge_pair_csv(edges, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
         conn.query(&format!(
-            "COPY FILE_HAS_SYMBOL FROM '{csv_str}' (PARALLEL=FALSE)"
+            "COPY FILE_HAS_SYMBOL FROM '{csv_str}' {COPY_CSV_OPTS}"
         ))
         .map_err(|e| StoreError::Query(format!("COPY FILE_HAS_SYMBOL: {e}")))?;
         Ok(())
@@ -964,7 +1001,7 @@ impl GraphStore {
         write_edge_pair_csv(edges, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
         conn.query(&format!(
-            "COPY SERVICE_HAS_SYMBOL FROM '{csv_str}' (PARALLEL=FALSE)"
+            "COPY SERVICE_HAS_SYMBOL FROM '{csv_str}' {COPY_CSV_OPTS}"
         ))
         .map_err(|e| StoreError::Query(format!("COPY SERVICE_HAS_SYMBOL: {e}")))?;
         Ok(())
@@ -1135,7 +1172,7 @@ impl GraphStore {
             let csv_path = tmp_dir.path().join("services.csv");
             write_services_csv(services, &csv_path)?;
             let csv_str = csv_path.display().to_string().replace('\\', "/");
-            conn.query(&format!("COPY Service FROM '{csv_str}' (PARALLEL=FALSE)"))
+            conn.query(&format!("COPY Service FROM '{csv_str}' {COPY_CSV_OPTS}"))
                 .map_err(|e| StoreError::Query(format!("COPY Service: {e}")))?;
         }
 
@@ -2086,8 +2123,17 @@ impl GraphStore {
     /// starts clean without per-contract DELETE round-trips.
     pub fn clear_repo_contracts(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::clear_repo_contracts_on(&conn, repo_uid)
+    }
+
+    /// Like [`clear_repo_contracts`](Self::clear_repo_contracts) but operates on
+    /// an existing connection/transaction.
+    pub fn clear_repo_contracts_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (c:Contract) WHERE c.repo_uid = $repo DETACH DELETE c",
             vec![("repo", lbug::Value::String(repo_uid.to_string()))],
         )
@@ -2098,13 +2144,26 @@ impl GraphStore {
         if contracts.is_empty() {
             return Ok(());
         }
+        let conn = self.conn()?;
+        Self::batch_insert_contracts_on(&conn, contracts)
+    }
+
+    /// Like [`batch_insert_contracts`](Self::batch_insert_contracts) but
+    /// operates on an existing connection/transaction. The tempdir holding the
+    /// staged CSV is kept alive for the whole call so it outlives the COPY.
+    pub fn batch_insert_contracts_on(
+        conn: &lbug::Connection<'_>,
+        contracts: &[Contract],
+    ) -> Result<(), StoreError> {
+        if contracts.is_empty() {
+            return Ok(());
+        }
         let tmp_dir =
             tempfile::tempdir().map_err(|e| StoreError::Query(format!("tempdir: {e}")))?;
         let csv_path = tmp_dir.path().join("contracts.csv");
         write_contracts_csv(contracts, &csv_path)?;
         let csv_str = csv_path.display().to_string().replace('\\', "/");
-        let conn = self.conn()?;
-        conn.query(&format!("COPY Contract FROM '{csv_str}' (PARALLEL=FALSE)"))
+        conn.query(&format!("COPY Contract FROM '{csv_str}' {COPY_CSV_OPTS}"))
             .map_err(|e| StoreError::Query(format!("COPY Contract: {e}")))?;
         Ok(())
     }
@@ -3104,6 +3163,54 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Delete all resolved (semantic) edges originating from symbols in a
+    /// repo. Used when full (unfiltered) resolution runs: every resolved
+    /// edge is about to be re-created, so the stale set must be cleared
+    /// repo-wide or the edges accumulate as duplicates.
+    ///
+    /// Edge types deleted: CALLS, IMPORTS, EXTENDS_SYM, IMPLEMENTS_SYM,
+    /// INCLUDES_SYM, USES, ACCESSES, MEMBER_OF — deliberately the same list
+    /// as [`Self::delete_resolved_edges_for_file`], so "resolved edge" has
+    /// one definition across both helpers. CROSS_REPO_LINK is NOT included:
+    /// it is outside the per-file clear's list today, and the duplication
+    /// vector this helper guards (an empty resolution-deps sidecar forcing
+    /// an unfiltered re-resolution) routes through `bulk_reindex_write`,
+    /// whose DETACH DELETE of the repo's symbols already removes every
+    /// incident edge including CROSS_REPO_LINK before
+    /// `infer_cross_repo_call_edges` re-creates them. The re-CREATE-on-every
+    /// -run semantics of cross-repo inference on other paths are unchanged
+    /// here and are covered by the merge/uniqueness defense, not this
+    /// clear.
+    pub fn delete_resolved_edges_for_repo(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+
+        // Same one-DELETE-per-rel-type pattern as the per-file variant;
+        // the WHERE clause is scoped to the repo instead of a single file.
+        for rel in &[
+            "CALLS",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+            "USES",
+            "ACCESSES",
+            "MEMBER_OF",
+        ] {
+            let query = format!(
+                "MATCH (s:Symbol)-[r:{rel}]->() \
+                 WHERE s.repo_uid = $repo \
+                 DELETE r"
+            );
+            exec_params(
+                &conn,
+                &query,
+                vec![("repo", lbug::Value::String(repo_uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("delete {rel} edges for repo: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Delete a File node by its UID using `DETACH DELETE`, which removes all
     /// incident edges (REPO_HAS_FILE, FILE_HAS_SYMBOL) automatically.
     pub fn delete_file_node(&self, file_uid: &str) -> Result<(), StoreError> {
@@ -3709,6 +3816,13 @@ impl GraphStore {
 
     /// Like [`bulk_delete_repo_files_and_symbols`](Self::bulk_delete_repo_files_and_symbols)
     /// but operates on an existing connection/transaction.
+    //
+    // Cost note: the DETACH DELETEs below are quadratic in node DEGREE —
+    // Θ(Σ_v deg(v)² + Σ_(u→v) deg_bwd(v)) — so repos with a high-degree hub
+    // (e.g. a Service holding ~87k SERVICE_HAS_SYMBOL edges) dominate removal
+    // time. Incident-profile readings of a full node-group scan / O(n²) in
+    // relationships deleted are refuted; see benches/remove_repo_benchmarks.rs
+    // for the regression benchmark and the full refuted-claims record.
     pub fn bulk_delete_repo_files_and_symbols_on(
         conn: &lbug::Connection<'_>,
         repo_uid: &str,
@@ -6325,14 +6439,82 @@ impl GraphStore {
             vec![("k", lbug::Value::String("embedding".to_string()))],
         );
 
-        exec_params(
+        let result = exec_params(
             &conn,
             "CREATE (:Meta {key: $k, value: $v})",
             vec![
                 ("k", lbug::Value::String("embedding".to_string())),
                 ("v", lbug::Value::String(value)),
             ],
+        );
+        if result.is_ok() {
+            // Keep the in-memory index's recorded model in sync with what was
+            // just persisted, so the recorded-model write guard in this
+            // long-lived store checks against the new fingerprint.
+            self.embedding_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_recorded_model_id(Some(model_id.to_string()));
+        }
+        result
+    }
+
+    /// Record that contract derivation failed for `repo_uid`.
+    ///
+    /// Contract derivation is best-effort: a malformed spec or a rejected bulk
+    /// insert leaves the repo with its PREVIOUS contracts (or none at all)
+    /// while indexing still succeeds. Nothing in the resulting graph
+    /// distinguishes "this repo declares no contracts" from "this repo's
+    /// contracts could not be derived", so the failure is persisted here as a
+    /// `Meta` marker keyed
+    /// [`CONTRACT_DERIVATION_FAILED_PREFIX`]`<repo_uid>` and read back at query
+    /// time by the drift analysis.
+    ///
+    /// `reason` is stored for operators reading the DB directly; the query-time
+    /// surfaces report only WHICH repos are degraded, never the error text.
+    pub fn set_contract_derivation_failed(
+        &self,
+        repo_uid: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let key = format!("{CONTRACT_DERIVATION_FAILED_PREFIX}{repo_uid}");
+
+        // Delete-then-create upsert (lbug has no MERGE/SET), matching
+        // `set_embedding_metadata`. Best-effort delete: an old DB may have no
+        // Meta table at all.
+        let _ = exec_params(
+            &conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![("k", lbug::Value::String(key.clone()))],
+        );
+
+        exec_params(
+            &conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                ("k", lbug::Value::String(key)),
+                ("v", lbug::Value::String(reason.to_string())),
+            ],
         )
+    }
+
+    /// Clear the contract-derivation failure marker for `repo_uid`.
+    ///
+    /// Called on every successful derivation so a repo heals as soon as it is
+    /// re-indexed cleanly. Best-effort by design — a DB with no `Meta` table
+    /// has no marker to clear.
+    pub fn clear_contract_derivation_failed(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let _ = exec_params(
+            &conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![(
+                "k",
+                lbug::Value::String(format!("{CONTRACT_DERIVATION_FAILED_PREFIX}{repo_uid}")),
+            )],
+        );
+        Ok(())
     }
 }
 
@@ -6542,6 +6724,359 @@ mod copy_from_tests {
             }
         }
     }
+
+    // ── CSV dialect pinning (COPY_CSV_OPTS) ────────────────────────────────
+    //
+    // lbug's CSV dialect detector samples only the first 256 rows. We write
+    // with `QuoteStyle::Necessary`, so if no sampled row happens to contain a
+    // comma, a quote, or a newline, the detector concludes the file never
+    // quotes and disables the quote character outright — and every later
+    // quoted field is then split on its embedded commas, shifting the row.
+    //
+    // Every fixture below is therefore shaped deliberately: at least 256
+    // completely plain rows, then one awkward row. `assert_fixture_shape`
+    // enforces that shape, because a fixture with the awkward row near the
+    // top passes on the unpinned build and proves nothing.
+
+    /// Rows lbug's CSV dialect detector samples before deciding the dialect.
+    const DIALECT_SAMPLE_ROWS: usize = 256;
+
+    /// A field value that needs quoting: it carries both an embedded delimiter
+    /// (exercises `DELIM`/`QUOTE`) and an embedded quote (exercises `ESCAPE`,
+    /// which the `csv` crate emits by doubling, not by backslash).
+    const AWKWARD: &str = "handles \"a, b\" and c, d";
+
+    /// Assert a generated CSV really can reproduce the auto-detect bug: no row
+    /// inside the detector's sample window may need quoting, and the first row
+    /// after it must.
+    fn assert_fixture_shape(csv_path: &Path) {
+        let text = std::fs::read_to_string(csv_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.len() > DIALECT_SAMPLE_ROWS,
+            "fixture has {} rows; it must exceed the {DIALECT_SAMPLE_ROWS}-row sample window",
+            lines.len()
+        );
+        for (i, line) in lines.iter().take(DIALECT_SAMPLE_ROWS).enumerate() {
+            assert!(
+                !line.contains('"'),
+                "sampled row {i} is quoted, so the detector would keep the quote \
+                 character and the fixture could not reproduce the bug: {line}"
+            );
+        }
+        assert!(
+            lines[DIALECT_SAMPLE_ROWS].contains('"'),
+            "the row after the sample window must need quoting: {}",
+            lines[DIALECT_SAMPLE_ROWS]
+        );
+    }
+
+    fn string_col(row: &[lbug::Value], idx: usize) -> String {
+        match row.get(idx) {
+            Some(lbug::Value::String(s)) => s.clone(),
+            other => panic!("expected String at column {idx}, got {other:?}"),
+        }
+    }
+
+    /// Collect `RETURN <string>, <string>` rows into a lookup keyed by column 0.
+    fn string_pairs(store: &GraphStore, query: &str) -> std::collections::HashMap<String, String> {
+        let conn = store.conn().unwrap();
+        conn.query(query)
+            .expect("read-back query failed")
+            .map(|row| (string_col(&row, 0), string_col(&row, 1)))
+            .collect()
+    }
+
+    fn plain_symbol(i: usize) -> Symbol {
+        Symbol {
+            uid: format!("sym:plain:{i:04}"),
+            name: format!("plain_{i:04}"),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo:dialect".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: i as u32,
+            end_line: i as u32,
+            signature: format!("fn plain_{i:04}()"),
+            summary: Some(format!("summary {i:04}")),
+            content_hash: format!("hash{i:04}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn plain_file(i: usize) -> File {
+        File {
+            uid: format!("file:plain:{i:04}"),
+            path: format!("src/plain_{i:04}.rs"),
+            repo_uid: "repo:dialect".to_string(),
+            content_hash: format!("hash{i:04}"),
+        }
+    }
+
+    fn plain_service(i: usize) -> Service {
+        Service {
+            uid: format!("svc:plain:{i:04}"),
+            name: format!("plain_{i:04}"),
+            repo_uid: "repo:dialect".to_string(),
+            summary: Some(format!("summary {i:04}")),
+            summary_hash: Some(format!("hash{i:04}")),
+            embedding: None,
+        }
+    }
+
+    fn plain_contract(i: usize) -> Contract {
+        Contract {
+            uid: format!("ct:plain:{i:04}"),
+            kind: "http".to_string(),
+            verb: Some("GET".to_string()),
+            path: Some(format!("/plain/{i:04}")),
+            operation_id: Some(format!("plain_{i:04}")),
+            repo_uid: "repo:dialect".to_string(),
+            source_path: format!("src/plain_{i:04}.rs"),
+            confidence: 1.0,
+        }
+    }
+
+    /// COPY Symbol: `signature` and `summary` routinely carry commas, and this
+    /// is the highest-volume COPY path in the store.
+    #[test]
+    fn copy_symbol_keeps_comma_bearing_fields_after_the_dialect_sample() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut symbols: Vec<Symbol> = (0..DIALECT_SAMPLE_ROWS).map(plain_symbol).collect();
+        let mut awkward = plain_symbol(DIALECT_SAMPLE_ROWS);
+        awkward.signature = format!("fn awkward(a: u32, b: &str) -> {AWKWARD}");
+        awkward.summary = Some(AWKWARD.to_string());
+        symbols.push(awkward.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("symbols.csv");
+        write_symbols_csv(&symbols, &csv_path).unwrap();
+        assert_fixture_shape(&csv_path);
+
+        store.batch_insert_symbols(&symbols).unwrap();
+
+        let signatures = string_pairs(&store, "MATCH (s:Symbol) RETURN s.uid, s.signature");
+        let summaries = string_pairs(&store, "MATCH (s:Symbol) RETURN s.uid, s.summary");
+        assert_eq!(signatures.len(), symbols.len(), "row count changed");
+        assert_eq!(
+            signatures.get(&awkward.uid),
+            Some(&awkward.signature),
+            "COPY Symbol shifted columns on a quoted signature"
+        );
+        assert_eq!(
+            summaries.get(&awkward.uid),
+            awkward.summary.as_ref(),
+            "COPY Symbol shifted columns on a quoted summary"
+        );
+    }
+
+    /// COPY File: a repository may legitimately contain a comma in a path.
+    #[test]
+    fn copy_file_keeps_comma_bearing_paths_after_the_dialect_sample() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut files: Vec<File> = (0..DIALECT_SAMPLE_ROWS).map(plain_file).collect();
+        let mut awkward = plain_file(DIALECT_SAMPLE_ROWS);
+        awkward.path = format!("src/{AWKWARD}.rs");
+        files.push(awkward.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("files.csv");
+        write_files_csv(&files, &csv_path).unwrap();
+        assert_fixture_shape(&csv_path);
+
+        store.batch_insert_files(&files).unwrap();
+
+        let paths = string_pairs(&store, "MATCH (f:File) RETURN f.uid, f.path");
+        assert_eq!(paths.len(), files.len(), "row count changed");
+        assert_eq!(
+            paths.get(&awkward.uid),
+            Some(&awkward.path),
+            "COPY File shifted columns on a quoted path"
+        );
+    }
+
+    /// COPY Service, reached through `bulk_index_write`'s inlined COPY.
+    #[test]
+    fn copy_service_keeps_comma_bearing_summaries_after_the_dialect_sample() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut services: Vec<Service> = (0..DIALECT_SAMPLE_ROWS).map(plain_service).collect();
+        let mut awkward = plain_service(DIALECT_SAMPLE_ROWS);
+        awkward.summary = Some(AWKWARD.to_string());
+        services.push(awkward.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("services.csv");
+        write_services_csv(&services, &csv_path).unwrap();
+        assert_fixture_shape(&csv_path);
+
+        store
+            .bulk_index_write(&[], &[], &[], &[], &services, &[])
+            .unwrap();
+
+        let summaries = string_pairs(&store, "MATCH (s:Service) RETURN s.uid, s.summary");
+        let hashes = string_pairs(&store, "MATCH (s:Service) RETURN s.uid, s.summary_hash");
+        assert_eq!(summaries.len(), services.len(), "row count changed");
+        assert_eq!(
+            summaries.get(&awkward.uid),
+            awkward.summary.as_ref(),
+            "COPY Service shifted columns on a quoted summary"
+        );
+        assert_eq!(
+            hashes.get(&awkward.uid),
+            awkward.summary_hash.as_ref(),
+            "COPY Service shifted the column after a quoted summary"
+        );
+    }
+
+    /// COPY Contract: the observed production corruption put a repo UID in the
+    /// FLOAT `confidence` column when a quoted route path shifted the row.
+    #[test]
+    fn copy_contract_keeps_comma_bearing_paths_after_the_dialect_sample() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let mut contracts: Vec<Contract> = (0..DIALECT_SAMPLE_ROWS).map(plain_contract).collect();
+        let mut awkward = plain_contract(DIALECT_SAMPLE_ROWS);
+        awkward.path = Some(format!("/awkward/{AWKWARD}"));
+        awkward.operation_id = Some(AWKWARD.to_string());
+        contracts.push(awkward.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("contracts.csv");
+        write_contracts_csv(&contracts, &csv_path).unwrap();
+        assert_fixture_shape(&csv_path);
+
+        store.batch_insert_contracts(&contracts).unwrap();
+
+        let stored = store.list_contracts(None).unwrap();
+        assert_eq!(stored.len(), contracts.len(), "row count changed");
+        let got = stored
+            .iter()
+            .find(|c| c.uid == awkward.uid)
+            .expect("awkward contract missing");
+        assert_eq!(got.path, awkward.path, "quoted route path was split");
+        assert_eq!(
+            got.operation_id, awkward.operation_id,
+            "quoted operation_id was split"
+        );
+        assert_eq!(
+            got.repo_uid, awkward.repo_uid,
+            "a shifted row would push the repo UID out of its column"
+        );
+        assert_eq!(
+            got.confidence, awkward.confidence,
+            "a shifted row lands a string in the FLOAT confidence column"
+        );
+        assert_eq!(
+            got.source_path, awkward.source_path,
+            "source_path shifted after the quoted fields"
+        );
+    }
+
+    /// COPY FILE_HAS_SYMBOL: both edge columns are primary keys, so a split
+    /// quoted UID either shifts the row or fails the copy outright.
+    #[test]
+    fn copy_file_symbol_edges_keep_comma_bearing_uids_after_the_dialect_sample() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let awkward_file_uid = format!("file:{AWKWARD}");
+        let awkward_symbol_uid = format!("sym:{AWKWARD}");
+
+        // Seed endpoints through the parameterized (non-COPY) inserts so the
+        // edge COPY is the only path under test.
+        for i in 0..DIALECT_SAMPLE_ROWS {
+            store.insert_file(&plain_file(i)).unwrap();
+            store.insert_symbol(&plain_symbol(i)).unwrap();
+        }
+        let mut awkward_file = plain_file(DIALECT_SAMPLE_ROWS);
+        awkward_file.uid = awkward_file_uid.clone();
+        store.insert_file(&awkward_file).unwrap();
+        let mut awkward_symbol = plain_symbol(DIALECT_SAMPLE_ROWS);
+        awkward_symbol.uid = awkward_symbol_uid.clone();
+        store.insert_symbol(&awkward_symbol).unwrap();
+
+        let plain_uids: Vec<(String, String)> = (0..DIALECT_SAMPLE_ROWS)
+            .map(|i| (plain_file(i).uid, plain_symbol(i).uid))
+            .collect();
+        let mut edges: Vec<(&str, &str)> = plain_uids
+            .iter()
+            .map(|(f, s)| (f.as_str(), s.as_str()))
+            .collect();
+        edges.push((awkward_file_uid.as_str(), awkward_symbol_uid.as_str()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("file_has_symbol.csv");
+        write_edge_pair_csv(&edges, &csv_path).unwrap();
+        assert_fixture_shape(&csv_path);
+
+        store.batch_insert_file_symbol_edges(&edges).unwrap();
+
+        let linked = string_pairs(
+            &store,
+            "MATCH (f:File)-[:FILE_HAS_SYMBOL]->(s:Symbol) RETURN f.uid, s.uid",
+        );
+        assert_eq!(linked.len(), edges.len(), "edge count changed");
+        assert_eq!(
+            linked.get(&awkward_file_uid),
+            Some(&awkward_symbol_uid),
+            "COPY FILE_HAS_SYMBOL split a quoted UID"
+        );
+    }
+
+    /// COPY SERVICE_HAS_SYMBOL: same edge-pair CSV writer, different table.
+    #[test]
+    fn copy_service_symbol_edges_keep_comma_bearing_uids_after_the_dialect_sample() {
+        let store = GraphStore::in_memory().unwrap();
+
+        let awkward_service_uid = format!("svc:{AWKWARD}");
+        let awkward_symbol_uid = format!("sym:{AWKWARD}");
+
+        for i in 0..DIALECT_SAMPLE_ROWS {
+            store.insert_service(&plain_service(i)).unwrap();
+            store.insert_symbol(&plain_symbol(i)).unwrap();
+        }
+        let mut awkward_service = plain_service(DIALECT_SAMPLE_ROWS);
+        awkward_service.uid = awkward_service_uid.clone();
+        store.insert_service(&awkward_service).unwrap();
+        let mut awkward_symbol = plain_symbol(DIALECT_SAMPLE_ROWS);
+        awkward_symbol.uid = awkward_symbol_uid.clone();
+        store.insert_symbol(&awkward_symbol).unwrap();
+
+        let plain_uids: Vec<(String, String)> = (0..DIALECT_SAMPLE_ROWS)
+            .map(|i| (plain_service(i).uid, plain_symbol(i).uid))
+            .collect();
+        let mut edges: Vec<(&str, &str)> = plain_uids
+            .iter()
+            .map(|(svc, sym)| (svc.as_str(), sym.as_str()))
+            .collect();
+        edges.push((awkward_service_uid.as_str(), awkward_symbol_uid.as_str()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("service_has_symbol.csv");
+        write_edge_pair_csv(&edges, &csv_path).unwrap();
+        assert_fixture_shape(&csv_path);
+
+        store.batch_insert_service_symbol_edges(&edges).unwrap();
+
+        let linked = string_pairs(
+            &store,
+            "MATCH (svc:Service)-[:SERVICE_HAS_SYMBOL]->(s:Symbol) RETURN svc.uid, s.uid",
+        );
+        assert_eq!(linked.len(), edges.len(), "edge count changed");
+        assert_eq!(
+            linked.get(&awkward_service_uid),
+            Some(&awkward_symbol_uid),
+            "COPY SERVICE_HAS_SYMBOL split a quoted UID"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6580,6 +7115,97 @@ mod tests {
                 name: "one".to_string(),
             })
             .unwrap();
+    }
+
+    /// The repo-wide resolved-edge clear deletes exactly the resolved rel
+    /// types for exactly the named repo: edges sourced from other repos
+    /// survive (including edges INTO the named repo), and CROSS_REPO_LINK —
+    /// deliberately excluded from the resolved-edge list — survives even for
+    /// the named repo.
+    #[test]
+    fn delete_resolved_edges_for_repo_scopes_by_repo_and_rel_type() {
+        let store = GraphStore::in_memory().expect("store");
+
+        let sym = |uid: &str, repo: &str| Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: repo.to_string(),
+            file_path: format!("{uid}.js"),
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            summary: None,
+            content_hash: uid.to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let edge = |src: &str, tgt: &str, ty: EdgeType| ResolvedEdge {
+            source_uid: src.to_string(),
+            target_uid: tgt.to_string(),
+            edge_type: ty,
+            confidence: 1.0,
+            link_type: None,
+            evidence: Vec::new(),
+        };
+
+        for s in [
+            sym("a1", "repo:a"),
+            sym("a2", "repo:a"),
+            sym("b1", "repo:b"),
+            sym("b2", "repo:b"),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        store
+            .insert_edge(&edge("a1", "a2", EdgeType::Calls))
+            .unwrap();
+        store
+            .insert_edge(&edge("a1", "a2", EdgeType::MemberOf))
+            .unwrap();
+        store
+            .insert_edge(&edge("b1", "b2", EdgeType::Calls))
+            .unwrap();
+        store
+            .insert_edge(&edge("b1", "a1", EdgeType::Calls))
+            .unwrap();
+        let mut cross = edge("a1", "b1", EdgeType::CrossRepoLink);
+        cross.link_type = Some(nestweaver_schema::CrossRepoLinkType::SharedImport);
+        store.insert_edge(&cross).unwrap();
+
+        store.delete_resolved_edges_for_repo("repo:a").unwrap();
+
+        let remaining: std::collections::HashSet<(String, String, String)> = store
+            .load_typed_edges()
+            .unwrap()
+            .into_iter()
+            .map(|(src, tgt, ty, _conf, _ev)| (src, tgt, ty))
+            .collect();
+        assert_eq!(
+            remaining,
+            [
+                ("b1".to_string(), "b2".to_string(), "CALLS".to_string()),
+                ("b1".to_string(), "a1".to_string(), "CALLS".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            "only repo:a's resolved edges (CALLS, MEMBER_OF) may be deleted"
+        );
+        // CROSS_REPO_LINK is deliberately outside the resolved-edge list and
+        // must survive even for the named repo. (`load_typed_edges` only
+        // walks ALL_SYMBOL_EDGE_TYPES, so assert via the dedicated reader.)
+        let cross_links = store.list_all_cross_repo_links(10).unwrap();
+        assert_eq!(
+            cross_links.len(),
+            1,
+            "the CROSS_REPO_LINK from repo:a must survive the repo-wide clear"
+        );
     }
 
     /// nw-112: a merge must CONSERVE the wikilink graph.

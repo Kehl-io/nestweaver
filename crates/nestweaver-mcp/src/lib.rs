@@ -204,7 +204,12 @@ pub fn run_stdio_server(
                     error_code::PARSE_ERROR,
                     format!("invalid JSON: {e}"),
                 );
-                write_response(&mut stdout, &Frame::Error(resp))?;
+                if closed_stdout_ends_session(
+                    write_response(&mut stdout, &Frame::Error(resp)),
+                    tracker.as_ref(),
+                )? {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -217,18 +222,23 @@ pub fn run_stdio_server(
                     error_code::INVALID_REQUEST,
                     "empty batch array",
                 );
-                write_response(&mut stdout, &Frame::Error(resp))?;
+                if closed_stdout_ends_session(
+                    write_response(&mut stdout, &Frame::Error(resp)),
+                    tracker.as_ref(),
+                )? {
+                    return Ok(());
+                }
                 continue;
             }
             let mut responses: Vec<Value> = Vec::new();
             for item in arr {
-                let req: protocol::Request = match serde_json::from_value(item) {
+                let req = match protocol::validate_request(item) {
                     Ok(r) => r,
                     Err(e) => {
                         responses.push(serde_json::to_value(error(
-                            Value::Null,
+                            e.response_id,
                             error_code::INVALID_REQUEST,
-                            format!("invalid request in batch: {e}"),
+                            format!("invalid request in batch: {}", e.message),
                         ))?);
                         continue;
                     }
@@ -253,21 +263,29 @@ pub fn run_stdio_server(
             }
             if !responses.is_empty() {
                 let serialized = serde_json::to_string(&responses)?;
-                stdout.write_all(serialized.as_bytes())?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+                if closed_stdout_ends_session(
+                    write_stdout_frame(&mut stdout, serialized.as_bytes()).map_err(Into::into),
+                    tracker.as_ref(),
+                )? {
+                    return Ok(());
+                }
             }
         } else {
             // Single request.
-            let req: protocol::Request = match serde_json::from_value(parsed) {
+            let req = match protocol::validate_request(parsed) {
                 Ok(r) => r,
                 Err(e) => {
                     let resp = error(
-                        Value::Null,
+                        e.response_id,
                         error_code::INVALID_REQUEST,
-                        format!("invalid request: {e}"),
+                        format!("invalid request: {}", e.message),
                     );
-                    write_response(&mut stdout, &Frame::Error(resp))?;
+                    if closed_stdout_ends_session(
+                        write_response(&mut stdout, &Frame::Error(resp)),
+                        tracker.as_ref(),
+                    )? {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -283,7 +301,10 @@ pub fn run_stdio_server(
                 }
                 continue;
             }
-            write_response(&mut stdout, &outcome)?;
+            if closed_stdout_ends_session(write_response(&mut stdout, &outcome), tracker.as_ref())?
+            {
+                return Ok(());
+            }
         }
     }
 }
@@ -349,7 +370,12 @@ pub fn run_stdio_server_daemon(
                     error_code::PARSE_ERROR,
                     format!("invalid JSON: {e}"),
                 );
-                write_response(&mut stdout, &Frame::Error(resp))?;
+                if closed_stdout_ends_session(
+                    write_response(&mut stdout, &Frame::Error(resp)),
+                    tracker.as_ref(),
+                )? {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -361,18 +387,23 @@ pub fn run_stdio_server_daemon(
                     error_code::INVALID_REQUEST,
                     "empty batch array",
                 );
-                write_response(&mut stdout, &Frame::Error(resp))?;
+                if closed_stdout_ends_session(
+                    write_response(&mut stdout, &Frame::Error(resp)),
+                    tracker.as_ref(),
+                )? {
+                    return Ok(());
+                }
                 continue;
             }
             let mut responses: Vec<Value> = Vec::new();
             for item in arr {
-                let req: protocol::Request = match serde_json::from_value(item) {
+                let req = match protocol::validate_request(item) {
                     Ok(r) => r,
                     Err(e) => {
                         responses.push(serde_json::to_value(error(
-                            Value::Null,
+                            e.response_id,
                             error_code::INVALID_REQUEST,
-                            format!("invalid request in batch: {e}"),
+                            format!("invalid request in batch: {}", e.message),
                         ))?);
                         continue;
                     }
@@ -397,20 +428,28 @@ pub fn run_stdio_server_daemon(
             }
             if !responses.is_empty() {
                 let serialized = serde_json::to_string(&responses)?;
-                stdout.write_all(serialized.as_bytes())?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+                if closed_stdout_ends_session(
+                    write_stdout_frame(&mut stdout, serialized.as_bytes()).map_err(Into::into),
+                    tracker.as_ref(),
+                )? {
+                    return Ok(());
+                }
             }
         } else {
-            let req: protocol::Request = match serde_json::from_value(parsed) {
+            let req = match protocol::validate_request(parsed) {
                 Ok(r) => r,
                 Err(e) => {
                     let resp = error(
-                        Value::Null,
+                        e.response_id,
                         error_code::INVALID_REQUEST,
-                        format!("invalid request: {e}"),
+                        format!("invalid request: {}", e.message),
                     );
-                    write_response(&mut stdout, &Frame::Error(resp))?;
+                    if closed_stdout_ends_session(
+                        write_response(&mut stdout, &Frame::Error(resp)),
+                        tracker.as_ref(),
+                    )? {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -426,7 +465,10 @@ pub fn run_stdio_server_daemon(
                 }
                 continue;
             }
-            write_response(&mut stdout, &outcome)?;
+            if closed_stdout_ends_session(write_response(&mut stdout, &outcome), tracker.as_ref())?
+            {
+                return Ok(());
+            }
         }
     }
 }
@@ -517,14 +559,67 @@ enum Frame {
     Error(ErrorResponse),
 }
 
-fn write_response(out: &mut std::io::StdoutLock<'_>, frame: &Frame) -> Result<(), anyhow::Error> {
+#[derive(Debug)]
+pub struct StdoutWriteError(std::io::Error);
+
+impl StdoutWriteError {
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.0.kind()
+    }
+}
+
+impl std::fmt::Display for StdoutWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "failed writing MCP response to stdout: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for StdoutWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn write_stdout_frame(out: &mut impl Write, serialized: &[u8]) -> Result<(), StdoutWriteError> {
+    out.write_all(serialized).map_err(StdoutWriteError)?;
+    out.write_all(b"\n").map_err(StdoutWriteError)?;
+    out.flush().map_err(StdoutWriteError)
+}
+
+fn closed_stdout_ends_session(
+    result: Result<(), anyhow::Error>,
+    tracker: Option<&nestweaver_engine::InteractionTracker>,
+) -> Result<bool, anyhow::Error> {
+    match result {
+        Ok(()) => Ok(false),
+        Err(error)
+            if error
+                .downcast_ref::<StdoutWriteError>()
+                .is_some_and(|stdout| stdout.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            // The client is gone. Flush durable session state just like the
+            // stdin-EOF path, but do not infer terminal success from a closed
+            // response pipe.
+            if let Some(tracker) = tracker {
+                let _ = tracker.flush();
+            }
+            crate::tools::flush_response_cache();
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_response(out: &mut impl Write, frame: &Frame) -> Result<(), anyhow::Error> {
     let serialized = match frame {
         Frame::Success(r) => serde_json::to_string(r)?,
         Frame::Error(e) => serde_json::to_string(e)?,
     };
-    out.write_all(serialized.as_bytes())?;
-    out.write_all(b"\n")?;
-    out.flush()?;
+    write_stdout_frame(out, serialized.as_bytes())?;
     Ok(())
 }
 

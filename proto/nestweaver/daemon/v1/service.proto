@@ -193,6 +193,31 @@ message JsonResponse {
   string result_json = 1;
 }
 
+// Exact daemon contract for `nestweaver contracts list`. This is deliberately
+// separate from CrossRepoContracts, which accepts a symbol uid/name and
+// returns implementation/reference hypotheses rather than Contract nodes.
+message ListContractsRequest {
+  // Omitted means all repositories; when present, accepts an exact repo UID
+  // or a case-insensitive repository display name. An empty present value is
+  // invalid rather than an alias for omission.
+  optional string repo = 1;
+}
+
+message ContractRecord {
+  string uid = 1;
+  string kind = 2;
+  optional string verb = 3;
+  optional string path = 4;
+  optional string operation_id = 5;
+  string repo_uid = 6;
+  string source_path = 7;
+  float confidence = 8;
+}
+
+message ListContractsResponse {
+  repeated ContractRecord contracts = 1;
+}
+
 // ─── Typed messages for hot-path RPCs ────────────────────────────────
 
 // brain_search
@@ -243,6 +268,18 @@ message EmbeddingStatus {
   bool metal_compiled = 7;
   bool fallback_used = 8;        // invariant: always false
 }
+message EffectiveConfig {
+  // The daemon's effective configuration source. Absence of EffectiveConfig
+  // on BrainStatusResponse means an older daemon that cannot report it.
+  oneof source {
+    string configured_path = 1;       // canonical absolute path
+    CompiledDefaults compiled_defaults = 2;
+  }
+
+  // An explicit marker rather than an empty path, so defaults cannot be
+  // confused with unknown provenance from an older daemon.
+  message CompiledDefaults {}
+}
 message BrainStatusResponse {
   int32 vault_count = 1;
   int32 notes = 2;
@@ -257,6 +294,7 @@ message BrainStatusResponse {
   string indexing_repo = 11;  // repo currently being indexed (empty if idle)
   int32 queue_depth = 12;     // number of pending + running jobs
   EmbeddingStatus embedding_status = 13;
+  EffectiveConfig effective_config = 14;
 }
 
 // repo_states — per-repo indexed SHA and metadata for staleness comparison
@@ -602,6 +640,7 @@ service NestWeaverDaemon {
   rpc ReadSymbols(JsonRequest) returns (JsonResponse);
   rpc RegexSearch(JsonRequest) returns (JsonResponse);
   rpc CountPatterns(JsonRequest) returns (JsonResponse);
+  rpc ListContracts(ListContractsRequest) returns (ListContractsResponse);
   rpc CrossRepoContracts(JsonRequest) returns (JsonResponse);
   rpc ContractDrift(JsonRequest) returns (JsonResponse);
   rpc DeadCode(JsonRequest) returns (JsonResponse);

@@ -111,7 +111,13 @@ works.
 ```toml
 [embedding]
 model_id = "sentence-transformers/all-MiniLM-L6-v2"  # default for fresh DBs; the embedded model is recorded & auto-loaded
-cache_dir = "~/.cache/nestweaver/models"
+# cache_dir defaults to the platform-native cache directory:
+# ~/Library/Caches/nestweaver/models on macOS, $XDG_CACHE_HOME/nestweaver/models
+# (or ~/.cache/nestweaver/models) on Linux. Explicit values may use ~/.
+# If unavailable or non-UTF-8, a UTF-8 HOME uses ~/.cache first. The final
+# fallback is /var/cache/nestweaver/models on Unix or C:\ProgramData\nestweaver\models
+# on Windows; set cache_dir explicitly if that system location is not writable.
+# cache_dir = "~/Library/Caches/nestweaver/models"
 accelerator = "auto" # auto | metal | cpu
 
 # Optional: use an authoritative external API instead of the local model.
@@ -132,7 +138,7 @@ semantic_search_limit = 200    # top-k semantic hits fed into fusion
 | Field | Default | Description |
 |-------|---------|-------------|
 | `model_id` | `"sentence-transformers/all-MiniLM-L6-v2"` | Default local model for fresh DBs (any mean-pooled BERT-compatible HF model). The model a DB was embedded with is recorded and auto-loaded, overriding this. |
-| `cache_dir` | `"~/.cache/nestweaver/models"` | Hugging Face cache root. The daemon expands a leading `~/` against its user's home directory. |
+| `cache_dir` | platform-native | Hugging Face cache root. Default: `~/Library/Caches/nestweaver/models` on macOS, `$XDG_CACHE_HOME/nestweaver/models` (or `~/.cache/nestweaver/models`) on Linux. If unavailable or non-UTF-8, a UTF-8 home supplies `~/.cache/nestweaver/models`; only then does it fall back to `/var/cache/nestweaver/models` on Unix or `C:\ProgramData\nestweaver\models` on Windows. Set `cache_dir` explicitly if the final system location is not writable. An explicit leading `~/` is expanded against the user's home directory. |
 | `accelerator` | `"auto"` | Local device policy; exact behavior is below. Ignored for an external backend. |
 | `external_endpoint` | — | Optional authoritative external embedding API endpoint |
 | `external_model` | — | Model name for the external endpoint |

@@ -27,6 +27,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 serde_json = { workspace = true }
+serde = { workspace = true }
 rmp-serde = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

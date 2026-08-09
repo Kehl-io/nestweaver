@@ -29,7 +29,9 @@ pub use read::{
 pub use regex::{
     CANDIDATE_CAP, DEFAULT_MAX_MILLIS, FileCount, PatternCount, RegexMatch, RegexSearchResult,
 };
-pub use search::{EmbeddingIndex, SearchResult};
+pub use search::{
+    EMBED_CHECKPOINT_INTERVAL, EmbeddingFlushCheckpoint, EmbeddingIndex, SearchResult,
+};
 pub use tantivy_index::{
     PRF_EXPANSION_TERMS, PRF_EXPANSION_WEIGHT, PRF_MAX_QUERY_TERMS, PRF_TOP_K,
     SEARCH_PRESENTATION_LIMIT_MAX, SearchHit, SearchLogicalIdentity, TantivyError, TantivyIndex,
@@ -39,11 +41,12 @@ pub use traverse::{
     ImpactSnapshot,
 };
 pub use write::{
-    DeleteProjectCascadeError, DeleteProjectCascadeOutcome, DeleteRepoCascadeOutcome,
-    DeleteVaultCascadeOutcome, DiscardedVault, InstanceProjectRecovery, InstanceRepoRecovery,
-    InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan, InstanceUidRemap,
-    InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult, MutationDisposition,
-    MutationFailure, MutationOutcome, ProjectMutationDisposition, PurgeInstanceResult,
+    CONTRACT_DERIVATION_FAILED_PREFIX, DeleteProjectCascadeError, DeleteProjectCascadeOutcome,
+    DeleteRepoCascadeOutcome, DeleteVaultCascadeOutcome, DiscardedVault, InstanceProjectRecovery,
+    InstanceRepoRecovery, InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan,
+    InstanceUidRemap, InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult,
+    MutationDisposition, MutationFailure, MutationOutcome, ProjectMutationDisposition,
+    PurgeInstanceResult,
 };
 
 #[cfg(test)]

@@ -232,6 +232,22 @@ fn setup_fixture() -> Fixture {
     Fixture { _dir: dir, db_path }
 }
 
+fn setup_contract_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("ContrÁct-Repo");
+    let db_path = dir.path().join("db").join("contracts.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_repo_files(
+        &repo_dir,
+        &[(
+            "openapi.yaml",
+            "openapi: 3.0.0\ninfo:\n  title: Contract fixture\n  version: 1.0.0\npaths:\n  /widgets:\n    get:\n      operationId: listWidgets\n      responses:\n        '200':\n          description: ok\n",
+        )],
+    );
+    create_db(&repo_dir, &db_path);
+    Fixture { _dir: dir, db_path }
+}
+
 // ─── Mode runners ────────────────────────────────────────────────────────────
 
 /// Run the CLI in DIRECT mode (no daemon), returning the raw process output.
@@ -448,6 +464,129 @@ fn parity_affected_tests_direct_vs_daemon() {
         "affected-tests",
         &["affected-tests", "--files", CHANGED_FILES],
     );
+}
+
+/// `contracts drift` had the nw-097 divergence in its purest form: the daemon
+/// branch printed the MCP envelope (totals, `clean`, `limit`, truncated
+/// buckets) while the direct branch printed a BARE `DriftReport` — different
+/// keys, no verdict, and no truncation at all. Human output matched, so only
+/// `--json` exposed it, and this file is where that class of divergence is
+/// caught. The fixture declares no specs and no route handlers, so this also
+/// pins the healthy-empty case: both modes must agree that it is clean.
+#[test]
+fn parity_contracts_drift_direct_vs_daemon() {
+    let fixture = setup_fixture();
+    check_parity(&fixture.db_path, "contracts drift", &["contracts", "drift"]);
+}
+
+/// `contracts list` must use its dedicated daemon RPC, not the unrelated
+/// symbol-oriented `cross_repo_contracts` tool followed by a direct DB read.
+/// This covers both renderers, both repo-filter forms, and finally makes the
+/// DB file unreadable after daemon startup: the already-open daemon can still
+/// answer, while any direct-store fallback would fail.
+#[test]
+fn parity_contracts_list_uses_daemon_without_direct_store_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = setup_contract_fixture();
+    let direct_human = run_direct(&fixture.db_path, &["contracts", "list"]);
+    let direct_json = run_direct(&fixture.db_path, &["contracts", "list", "--json"]);
+    assert_successful_output(&direct_human, "direct contracts list");
+    assert_successful_output(&direct_json, "direct contracts list --json");
+    let contracts: Vec<serde_json::Value> = serde_json::from_slice(&direct_json.stdout).unwrap();
+    assert_eq!(contracts.len(), 1);
+    let repo_uid = contracts[0]["repo_uid"].as_str().unwrap().to_string();
+
+    let direct_name = run_direct(
+        &fixture.db_path,
+        &["contracts", "list", "--repo", "contráct-repo", "--json"],
+    );
+    let direct_uid = run_direct(
+        &fixture.db_path,
+        &["contracts", "list", "--repo", &repo_uid, "--json"],
+    );
+
+    let _guard = DaemonGuard::new(&fixture.db_path);
+    start_daemon(&fixture.db_path);
+    let daemon_human = run_via_daemon(&fixture.db_path, &["contracts", "list"]);
+    let daemon_json = run_via_daemon(&fixture.db_path, &["contracts", "list", "--json"]);
+    let daemon_name = run_via_daemon(
+        &fixture.db_path,
+        &["contracts", "list", "--repo", "contráct-repo", "--json"],
+    );
+    let daemon_uid = run_via_daemon(
+        &fixture.db_path,
+        &["contracts", "list", "--repo", &repo_uid, "--json"],
+    );
+
+    assert_parity("contracts list", "human", &direct_human, &daemon_human);
+    assert_parity("contracts list", "json", &direct_json, &daemon_json);
+    assert_parity(
+        "contracts list --repo non-ASCII case-folded name",
+        "json",
+        &direct_name,
+        &daemon_name,
+    );
+    assert_parity(
+        "contracts list --repo uid",
+        "json",
+        &direct_uid,
+        &daemon_uid,
+    );
+    for output in [&daemon_human, &daemon_json, &daemon_name, &daemon_uid] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("fallback"),
+            "unexpected fallback: {stderr}"
+        );
+        assert!(
+            !stderr.contains("cross_repo_contracts"),
+            "wrong daemon tool was invoked: {stderr}"
+        );
+    }
+
+    let original_mode = std::fs::metadata(&fixture.db_path)
+        .unwrap()
+        .permissions()
+        .mode();
+    std::fs::set_permissions(&fixture.db_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let daemon_without_disk_access =
+        run_via_daemon(&fixture.db_path, &["contracts", "list", "--json"]);
+    let daemon_error_without_fallback = run_via_daemon(
+        &fixture.db_path,
+        &[
+            "contracts",
+            "list",
+            "--repo",
+            "definitely-unknown",
+            "--json",
+        ],
+    );
+    std::fs::set_permissions(
+        &fixture.db_path,
+        std::fs::Permissions::from_mode(original_mode),
+    )
+    .unwrap();
+    assert_successful_output(
+        &daemon_without_disk_access,
+        "daemon contracts list with unreadable DB path",
+    );
+    assert_eq!(daemon_without_disk_access.stdout, direct_json.stdout);
+    assert!(daemon_without_disk_access.stderr.is_empty());
+    assert!(!daemon_error_without_fallback.status.success());
+    let error = String::from_utf8_lossy(&daemon_error_without_fallback.stderr);
+    assert!(error.contains("no indexed repo matches --repo 'definitely-unknown'"));
+    assert!(error.contains("refusing direct-store fallback"));
+    assert!(!error.contains("cross_repo_contracts"));
+
+    let explicit_empty = run_via_daemon(
+        &fixture.db_path,
+        &["contracts", "list", "--repo", "", "--json"],
+    );
+    assert!(!explicit_empty.status.success());
+    let empty_error = String::from_utf8_lossy(&explicit_empty.stderr);
+    assert!(empty_error.contains("no indexed repo matches --repo ''"));
+    assert!(empty_error.contains("refusing direct-store fallback"));
 }
 
 /// nw-108: `dead-code`'s daemon branch printed the RPC response verbatim with

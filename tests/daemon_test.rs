@@ -15,6 +15,18 @@ use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
+#[cfg(unix)]
+fn closed_pipe_stdout() -> Stdio {
+    use std::os::fd::FromRawFd;
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create pipe");
+    assert_eq!(unsafe { libc::close(fds[0]) }, 0, "close pipe reader");
+    // SAFETY: pipe returned an owned write descriptor, and Stdio takes sole
+    // ownership through File.
+    let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Stdio::from(writer)
+}
+
 /// Helper: build a `Command` for the `nestweaver` binary **without** setting
 /// `NESTWEAVER_NO_DAEMON`. This is the key difference from `cli_test.rs`'s
 /// `nestweaver_cmd()` — we want the daemon path exercised.
@@ -353,6 +365,40 @@ fn mcp_tool_call_in_mode(
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn mcp_raw_in_mode(db_path: &Path, input: &str, mode: McpMode) -> std::process::Output {
+    let mut command = StdCommand::new(bin_path());
+    command.args(["mcp", "--db", &db_path.display().to_string()]);
+    match mode {
+        McpMode::Direct => {
+            command
+                .env("NESTWEAVER_NO_DAEMON", "1")
+                .env("NESTWEAVER_ALLOW_NO_DAEMON", "1");
+        }
+        McpMode::Daemon => {
+            command
+                .env_remove("NESTWEAVER_NO_DAEMON")
+                .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+                .env_remove("NESTWEAVER_UPSTREAM");
+            #[cfg(not(target_os = "macos"))]
+            command.env("NESTWEAVER_DAEMON_FORK", "1");
+        }
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn nestweaver mcp");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().expect("failed to read mcp output")
+}
+
 /// Index a repo, creating the DB. Uses `NESTWEAVER_NO_DAEMON=1`.
 fn create_db(repo_dir: &Path, db_path: &Path) {
     no_daemon_cmd()
@@ -413,6 +459,109 @@ fn index_via_daemon(repo_dir: &Path, db_path: &Path) {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[test]
+fn mcp_jsonrpc_envelope_validation_matches_direct_and_daemon_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("db").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let input = concat!(
+        "{\"jsonrpc\":\"1.0\",\"id\":\"bad-version\",\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":[],\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"string-id\",\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}\n",
+        "[{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"ping\"},",
+        "{\"jsonrpc\":\"2.0\",\"id\":false,\"method\":\"ping\"},",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"},",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"},",
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}]\n",
+    );
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+    let mut baseline: Option<Vec<serde_json::Value>> = None;
+    for (label, mode) in [("direct", McpMode::Direct), ("daemon", McpMode::Daemon)] {
+        let output = mcp_raw_in_mode(&db_path, input, mode);
+        assert!(
+            output.status.success(),
+            "{label} MCP exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let frames: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("stdout line must be one JSON frame"))
+            .collect();
+        assert_eq!(frames.len(), 8, "{label}: notification emitted a frame");
+
+        for frame in &frames[..4] {
+            assert_eq!(frame["jsonrpc"], "2.0");
+            assert_eq!(frame["error"]["code"], -32600);
+        }
+        assert_eq!(frames[0]["id"], "bad-version");
+        for frame in &frames[1..4] {
+            assert_eq!(frame["id"], serde_json::Value::Null);
+        }
+        assert_eq!(frames[4]["id"], serde_json::Value::Null);
+        assert_eq!(frames[4]["result"], serde_json::json!({}));
+        assert_eq!(frames[5]["id"], "string-id");
+        assert_eq!(frames[6]["id"], 42);
+
+        let batch = frames[7]
+            .as_array()
+            .expect("batch response must be an array");
+        assert_eq!(batch.len(), 4, "batch notification must be omitted");
+        assert_eq!(batch[0]["error"]["code"], -32600);
+        assert_eq!(batch[0]["id"], 1);
+        assert_eq!(batch[1]["error"]["code"], -32600);
+        assert_eq!(batch[1]["id"], serde_json::Value::Null);
+        assert_eq!(batch[2]["id"], serde_json::Value::Null);
+        assert_eq!(batch[2]["result"], serde_json::json!({}));
+        assert_eq!(batch[3]["id"], 8);
+
+        if let Some(expected) = &baseline {
+            assert_eq!(&frames, expected, "direct/daemon wire behavior diverged");
+        } else {
+            baseline = Some(frames);
+        }
+    }
+
+    // A ping-only daemon-mode run could false-green through a local fallback.
+    // These fields are injected by the daemon's `brain_status_json` wrapper
+    // and are absent from direct MCP dispatch, so they pin that the proxy half
+    // reached the daemon even for a local UDS daemon (`server_mode == false`).
+    let sentinel = mcp_raw_in_mode(
+        &db_path,
+        "{\"jsonrpc\":\"2.0\",\"id\":\"daemon-sentinel\",\"method\":\"tools/call\",\"params\":{\"name\":\"brain_status\",\"arguments\":{}}}\n",
+        McpMode::Daemon,
+    );
+    assert!(
+        sentinel.status.success(),
+        "daemon MCP sentinel failed: {}",
+        String::from_utf8_lossy(&sentinel.stderr)
+    );
+    let sentinel: serde_json::Value =
+        serde_json::from_slice(&sentinel.stdout).expect("one daemon sentinel response");
+    assert_eq!(sentinel["id"], "daemon-sentinel");
+    let structured = &sentinel["result"]["structuredContent"];
+    assert!(
+        structured.get("embedding_status").is_some(),
+        "daemon brain_status must inject embedding_status: {sentinel}"
+    );
+    assert!(
+        structured.get("queue_depth").is_some(),
+        "daemon brain_status must inject queue_depth: {sentinel}"
+    );
+}
+
+#[test]
 fn daemon_start_stop() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
@@ -441,6 +590,145 @@ fn daemon_start_stop() {
         .assert()
         .success()
         .stdout(contains("not running"));
+}
+
+#[cfg(unix)]
+#[test]
+fn live_daemon_status_pipe_to_head_exits_quietly() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("broken-pipe").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    create_db(&repo_dir, &db_path);
+
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    for args in [
+        vec!["daemon", "--db", db_path.to_str().unwrap(), "status"],
+        vec!["list-repos", "--db", db_path.to_str().unwrap(), "--json"],
+    ] {
+        let output = StdCommand::new(bin_path())
+            .args(&args)
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .stdout(closed_pipe_stdout())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run command with a deterministically closed stdout");
+        assert!(
+            output.status.success(),
+            "closed-stdout command {args:?} exited {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("panicked"), "unexpected panic: {stderr}");
+        assert!(
+            !stderr.contains("failed writing to stdout"),
+            "broken pipe must be quiet: {stderr}"
+        );
+    }
+
+    let mut mcp = StdCommand::new(bin_path())
+        .args(["mcp", "--db", db_path.to_str().unwrap()])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .stdin(Stdio::piped())
+        .stdout(closed_pipe_stdout())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon-proxy MCP with closed stdout");
+    mcp.stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+        .unwrap();
+    let output = mcp.wait_with_output().expect("wait for MCP closed stdout");
+    assert!(
+        output.status.success(),
+        "MCP closed stdout exited {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+
+    let output = StdCommand::new("bash")
+        .args([
+            "-c",
+            "set -o pipefail; \"$1\" daemon --db \"$2\" status | head -n 4",
+            "nestweaver-broken-pipe-test",
+            bin_path().to_str().unwrap(),
+            db_path.to_str().unwrap(),
+        ])
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .output()
+        .expect("run daemon status pipeline");
+
+    assert!(
+        output.status.success(),
+        "pipeline exited {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "unexpected panic: {stderr}");
+    assert!(
+        !stderr.contains("failed printing to stdout"),
+        "unexpected stdout diagnostic: {stderr}"
+    );
+
+    for command in [
+        "set -o pipefail; \"$1\" list-repos --db \"$2\" --json | head -n 1",
+        "set -o pipefail; \"$1\" completions bash | head -n 1",
+    ] {
+        let output = StdCommand::new("bash")
+            .args([
+                "-c",
+                command,
+                "nestweaver-broken-pipe-test",
+                bin_path().to_str().unwrap(),
+                db_path.to_str().unwrap(),
+            ])
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .output()
+            .expect("run stdout pipeline");
+        assert!(
+            output.status.success(),
+            "pipeline `{command}` exited {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+            "pipeline `{command}` panicked"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full is available on Linux");
+        let output = StdCommand::new(bin_path())
+            .args(["daemon", "--db", db_path.to_str().unwrap(), "status"])
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .stdout(Stdio::from(full))
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run status with a failing stdout device");
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("failed writing to stdout"),
+            "genuine stdout failure must be diagnostic: {stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "typed failure leaked a panic");
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1126,6 +1414,435 @@ fn daemon_crash_recovery() {
         .assert()
         .success()
         .stdout(contains("running").and(contains("PID")));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_restart_preserves_and_overrides_live_effective_config_without_early_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("restart-config").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_test_repo(&repo_dir);
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Config continuity\n").unwrap();
+    create_db(&repo_dir, &db_path);
+    let _guard = DaemonGuard::new(&db_path);
+
+    let write_config = |name: &str, instance_id: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+instance_id = "{instance_id}"
+repos = []
+
+[snapshot_storage]
+backend = "local"
+path = "{}"
+
+[workspace]
+backend = "local"
+path = "{}"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "qwen2.5-coder:7b"
+
+[git]
+credential_method = "gh"
+"#,
+                dir.path()
+                    .join(format!("{instance_id}-snapshots"))
+                    .display(),
+                dir.path()
+                    .join(format!("{instance_id}-workspace"))
+                    .display(),
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let config_a = write_config("a.toml", "restart-a");
+    let config_b = write_config("b.toml", "restart-b");
+    let canonical_a = std::fs::canonicalize(&config_a).unwrap();
+    let canonical_b = std::fs::canonicalize(&config_b).unwrap();
+    let instance_id = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance_id);
+    let read_pid = || {
+        std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap()
+    };
+    let status = || {
+        let output = daemon_action_cmd(&db_path, "status").output().unwrap();
+        assert!(output.status.success(), "status failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let list_vaults = || {
+        let output = daemon_cmd()
+            .args([
+                "brain",
+                "list",
+                "--json",
+                "--db",
+                &db_path.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "brain list failed: {output:?}");
+        output.stdout
+    };
+    let index_and_assert_instance = |repo_name: &str, expected_instance: &str| {
+        let indexed_repo = dir.path().join(repo_name);
+        write_test_repo(&indexed_repo);
+        daemon_cmd()
+            .args([
+                "index",
+                "--repo",
+                &indexed_repo.display().to_string(),
+                "--db",
+                &db_path.display().to_string(),
+            ])
+            .assert()
+            .success();
+        let output = daemon_cmd()
+            .args([
+                "list-repos",
+                "--db",
+                &db_path.display().to_string(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let repos: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            repos.as_array().unwrap().iter().any(|repo| {
+                repo.get("instance_id").and_then(|value| value.as_str()) == Some(expected_instance)
+            }),
+            "no indexed repo retained logical instance {expected_instance}: {repos}"
+        );
+    };
+
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .success();
+    let pid_a = read_pid();
+    assert!(status().contains(&format!("Config: {}", canonical_a.display())));
+
+    daemon_cmd()
+        .args([
+            "brain",
+            "add",
+            &vault_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_a.display().to_string(),
+        ])
+        .assert()
+        .success();
+    let vaults_before_mismatch = list_vaults();
+
+    // A direct start against a live daemon may succeed only when the explicit
+    // path canonicalizes to the daemon's typed configured provenance. Neither
+    // a relative spelling nor a symlink changes config identity.
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .success();
+    assert_eq!(read_pid(), pid_a);
+
+    let original_a = std::fs::read_to_string(&config_a).unwrap();
+    std::fs::write(&config_a, format!("{original_a}\n# valid live edit\n")).unwrap();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .success();
+    assert_eq!(read_pid(), pid_a);
+    std::fs::write(&config_a, original_a).unwrap();
+
+    let config_a_alias = dir.path().join("a-alias.toml");
+    std::os::unix::fs::symlink(&canonical_a, &config_a_alias).unwrap();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a_alias)
+        .assert()
+        .success();
+    assert_eq!(read_pid(), pid_a);
+
+    let mut relative_start = daemon_action_cmd(&db_path, "start");
+    relative_start
+        .current_dir(dir.path())
+        .arg("--config")
+        .arg("a.toml")
+        .assert()
+        .success();
+    assert_eq!(read_pid(), pid_a);
+
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_b)
+        .assert()
+        .failure()
+        .stderr(
+            contains(canonical_a.to_str().unwrap())
+                .and(contains(canonical_b.to_str().unwrap()))
+                .and(contains("restart --config")),
+        );
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+
+    // Exercise DaemonClient::connect's same-version early-success gate, not
+    // only the direct daemon-start path.
+    daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("restart --config"));
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+    assert_eq!(list_vaults(), vaults_before_mismatch);
+
+    // Read commands must enforce the same identity contract. In particular,
+    // brain search used to swallow HybridClient::connect's mismatch and return
+    // a successful direct-disk result, silently discarding the explicit config.
+    daemon_cmd()
+        .args([
+            "brain",
+            "search",
+            "test",
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("refusing direct")
+                .and(contains("fallback"))
+                .and(contains("restart --config")),
+        );
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+
+    daemon_cmd()
+        .args([
+            "brain",
+            "add",
+            &vault_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("restart --config"));
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+    assert_eq!(list_vaults(), vaults_before_mismatch);
+
+    daemon_cmd()
+        .args([
+            "brain",
+            "refresh",
+            &vault_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("restart --config"));
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+    assert_eq!(list_vaults(), vaults_before_mismatch);
+
+    // An explicit, authorized direct bypass is not a daemon fallback and must
+    // retain its legacy behavior even when the live daemon uses another config.
+    no_daemon_cmd()
+        .args([
+            "--no-daemon",
+            "brain",
+            "search",
+            "test",
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let occupied_ui_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_ui_port_arg = occupied_ui_port.local_addr().unwrap().port().to_string();
+    daemon_cmd()
+        .args([
+            "ui",
+            "--no-open",
+            "--port",
+            &occupied_ui_port_arg,
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_b.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("refusing direct")
+                .and(contains("fallback"))
+                .and(contains("restart --config")),
+        );
+    assert_eq!(read_pid(), pid_a);
+    assert_eq!(unsafe { libc::kill(pid_a, 0) }, 0);
+
+    daemon_action_cmd(&db_path, "restart").assert().success();
+    let pid_preserved = read_pid();
+    assert_ne!(
+        pid_preserved, pid_a,
+        "restart must replace the daemon process"
+    );
+    assert!(status().contains(&format!("Config: {}", canonical_a.display())));
+    index_and_assert_instance("repo-after-a", "restart-a");
+
+    let binding_path = nestweaver_daemon::effective_config_binding_path(&instance_id);
+    std::fs::remove_file(&binding_path).unwrap();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .failure()
+        .stderr(contains("effective config is unknown"));
+    assert_eq!(read_pid(), pid_preserved);
+    assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
+    daemon_action_cmd(&db_path, "restart")
+        .assert()
+        .failure()
+        .stderr(contains("daemon has not been shut down"));
+    assert_eq!(read_pid(), pid_preserved);
+    assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
+    assert!(status().contains(&format!("Config: {}", canonical_a.display())));
+
+    nestweaver_daemon::lifecycle::write_effective_config_binding(
+        &instance_id,
+        &nestweaver_daemon::lifecycle::EffectiveConfigBinding::new(
+            pid_preserved as u32,
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                path: canonical_a.to_str().unwrap().to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    std::fs::write(&binding_path, "{not-json").unwrap();
+    daemon_action_cmd(&db_path, "restart")
+        .assert()
+        .failure()
+        .stderr(contains("daemon has not been shut down"));
+    assert_eq!(read_pid(), pid_preserved);
+    assert_eq!(unsafe { libc::kill(pid_preserved, 0) }, 0);
+
+    // Explicit config bypasses the corrupt provenance value but still uses
+    // the already-verified live PID/pidfile ownership evidence.
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&config_b)
+        .assert()
+        .success();
+    let pid_overridden = read_pid();
+    assert_ne!(pid_overridden, pid_preserved);
+    assert!(status().contains(&format!("Config: {}", canonical_b.display())));
+    index_and_assert_instance("repo-after-b", "restart-b");
+
+    let missing = dir.path().join("missing.toml");
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&missing)
+        .assert()
+        .failure()
+        .stderr(contains("daemon has not been shut down"));
+    assert_eq!(read_pid(), pid_overridden);
+    assert_eq!(unsafe { libc::kill(pid_overridden, 0) }, 0);
+
+    let malformed = dir.path().join("malformed.toml");
+    std::fs::write(&malformed, "instance_id = [invalid").unwrap();
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&malformed)
+        .assert()
+        .failure()
+        .stderr(contains("daemon has not been shut down"));
+    assert_eq!(read_pid(), pid_overridden);
+    assert_eq!(unsafe { libc::kill(pid_overridden, 0) }, 0);
+
+    // Cold restart ignores a stale sidecar. Omitted config is an explicit
+    // compiled-default decision; an explicit path is still validated/chosen.
+    daemon_action_cmd(&db_path, "stop").assert().success();
+    // A configless query preserves legacy availability when it starts with no
+    // daemon (autostart where possible, direct fallback if connect cannot win).
+    daemon_cmd()
+        .args([
+            "brain",
+            "search",
+            "test",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+    // The query may have autostarted a compiled-default daemon; restore the
+    // stopped precondition for the stale-sidecar cold-start case below.
+    daemon_action_cmd(&db_path, "stop").assert().success();
+    nestweaver_daemon::lifecycle::write_effective_config_binding(
+        &instance_id,
+        &nestweaver_daemon::lifecycle::EffectiveConfigBinding::new(
+            999,
+            nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                path: canonical_b.to_str().unwrap().to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    daemon_action_cmd(&db_path, "restart").assert().success();
+    assert!(status().contains("Config: none"));
+    let pid_defaults = read_pid();
+    daemon_action_cmd(&db_path, "start")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .failure()
+        .stderr(contains("compiled defaults").and(contains("restart --config")));
+    assert_eq!(read_pid(), pid_defaults);
+    assert_eq!(unsafe { libc::kill(pid_defaults, 0) }, 0);
+
+    daemon_action_cmd(&db_path, "stop").assert().success();
+    daemon_action_cmd(&db_path, "restart")
+        .arg("--config")
+        .arg(&config_a)
+        .assert()
+        .success();
+    assert!(status().contains(&format!("Config: {}", canonical_a.display())));
 }
 
 #[test]
