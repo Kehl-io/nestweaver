@@ -3712,6 +3712,7 @@ sub b body
         let unresolved_before = store.all_unresolved_wikilinks().unwrap();
         assert_eq!(unresolved_before.len(), 1);
 
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         let since = std::time::SystemTime::now();
         fs::write(root_a.join("future.md"), "# Future\n").unwrap();
         let result = index_markdown_directory_since_with_store_and_ignore(
