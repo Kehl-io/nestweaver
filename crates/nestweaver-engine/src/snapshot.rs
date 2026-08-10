@@ -559,7 +559,8 @@ pub fn load_snapshot_with_config(
     // this source tree has a reader capability newer than its package version;
     // using the explicit capability lets it read snapshots it writes while the
     // raised stamp still makes every pre-v2 reader fail closed.
-    let reader_version = if stamp.format_version >= 2
+    let reader_version = if engine_version == env!("CARGO_PKG_VERSION")
+        && stamp.format_version >= 2
         && semver_ge(MIN_SNAPSHOT_READER_VERSION, &stamp.min_compatible_engine)
     {
         MIN_SNAPSHOT_READER_VERSION
@@ -955,7 +956,7 @@ mod tests {
         let db_path = materialize_snapshot(
             &snap_dir,
             &work,
-            "0.1.0",
+            env!("CARGO_PKG_VERSION"),
             "schema-hash-abc",
             "text-embedding-3-small",
         )
@@ -978,7 +979,7 @@ mod tests {
             materialize_snapshot(
                 &snap_dir,
                 &work2,
-                "0.1.0",
+                env!("CARGO_PKG_VERSION"),
                 "WRONG-schema-hash",
                 "text-embedding-3-small",
             )
@@ -1069,7 +1070,7 @@ mod tests {
 
         let result = load_snapshot(
             &snap_dir,
-            "0.1.0",
+            env!("CARGO_PKG_VERSION"),
             "new-schema-hash",
             "text-embedding-3-small",
         );
@@ -1103,7 +1104,7 @@ mod tests {
 
         let result = load_snapshot(
             &snap_dir,
-            "0.1.0",
+            env!("CARGO_PKG_VERSION"),
             "schema-hash-abc",
             "text-embedding-ada-002",
         );
