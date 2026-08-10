@@ -43,6 +43,32 @@
 * **CLI correctness:** `impact --confidence` forces the direct path (the daemon tool hardcodes 0.0 and would silently ignore the filter); the daemon impact path renders the truncation flags/note in `--json` and text; `brain search --limit` is capped at 1000 to match the MCP schema; `rts-eval --sha` no longer panics on multibyte input
 * **MCP parity:** `brain_add_source` applies the directory-name default to vaults only — code repos keep the empty name so the daemon's package/remote derivation still runs; `brain_search` note rows carry `vault_uid` on all paths (BM25, substring fallback, federation) and symbol rows omit empty `matched_headings`
 
+## [4.1.1](https://github.com/Kehl-io/nestweaver/compare/v4.1.0...v4.1.1) (2026-08-10)
+
+
+### Bug Fixes
+
+* **ci:** satisfy integrated clippy checks ([1a8116f](https://github.com/Kehl-io/nestweaver/commit/1a8116ffb9f2790a3243586622e542706b6048e4))
+* **cli:** close MCP and vault refresh regressions ([7793f5a](https://github.com/Kehl-io/nestweaver/commit/7793f5a18f82e73190d0355d1b9451f0adb0a207))
+* **cli:** honor persisted intent on daemon fallback ([2b10d2a](https://github.com/Kehl-io/nestweaver/commit/2b10d2a88b54323b4055369765bec79af15ea0f0))
+* close lifecycle and selector regressions ([c605ceb](https://github.com/Kehl-io/nestweaver/commit/c605cebdb33d330291505708675855180cc41538))
+* close strict preflight and startup budget gaps ([b62a326](https://github.com/Kehl-io/nestweaver/commit/b62a326152e40dd64c470735d3884ee46ea9a554))
+* close validated v4.1.0 end-to-end regressions ([e7950b1](https://github.com/Kehl-io/nestweaver/commit/e7950b156fd453756bc04073e0eb1dab03528756))
+* **daemon:** finish default reset after slow start ([97f5803](https://github.com/Kehl-io/nestweaver/commit/97f5803924d2a40cac11fae04840d00594b29f96))
+* **engine:** harden contract derivation identity ([aa17b85](https://github.com/Kehl-io/nestweaver/commit/aa17b85dd5d93043d2edb3d0caba1dc35bf8ca23))
+* finalize integrated regression remediation ([04b9e75](https://github.com/Kehl-io/nestweaver/commit/04b9e75998ad98a3b6df9058e8d5605a1bb8ccaf))
+* **graph:** preserve project and contract API identity ([6e9ce98](https://github.com/Kehl-io/nestweaver/commit/6e9ce98252b62b8066857d28f0d915b3b6cbfaa6))
+* preserve daemon config across cold starts ([ab7a384](https://github.com/Kehl-io/nestweaver/commit/ab7a384d02ec044222ce25b9ae34b0170c9a32e9))
+* **snapshot:** harden restore and embedding consistency ([ac8aaaa](https://github.com/Kehl-io/nestweaver/commit/ac8aaaa0fa413b60e386d4bef2ea908da07c156c))
+* **snapshot:** preserve complete embedding state atomically ([928b3da](https://github.com/Kehl-io/nestweaver/commit/928b3dafcf1fb147eb9d6734bd712e518735076e))
+* **snapshot:** scope reader capability fallback ([11191f3](https://github.com/Kehl-io/nestweaver/commit/11191f3f1e89737ab075ff73f84e29dcdbf45450))
+* **store:** ignore orphan contract debt markers ([dff5552](https://github.com/Kehl-io/nestweaver/commit/dff5552a556710890a58be834297598728e6c6b6))
+* **vault:** commit incremental refresh as one batch ([fb8a97c](https://github.com/Kehl-io/nestweaver/commit/fb8a97cf464c3691f2025283aa01ea764ccf6be5))
+* **vault:** make incremental refresh replacements atomic ([5eaa926](https://github.com/Kehl-io/nestweaver/commit/5eaa926b790155de3441185a51f018a2413d5a1a))
+* **vault:** preserve incremental resolver parity ([810071f](https://github.com/Kehl-io/nestweaver/commit/810071fdfca18e09dd1c071bf7d90c7218e1e40e))
+* **vault:** remove newly ignored notes on refresh ([ccfa485](https://github.com/Kehl-io/nestweaver/commit/ccfa485db0169021d2dc4bc1c8dc1cade0a50f17))
+* **vault:** scope unresolved refresh dependencies ([0323f5c](https://github.com/Kehl-io/nestweaver/commit/0323f5cb0e80753a34446e4374486983adcb37b6))
+
 ## [4.1.0](https://github.com/Kehl-io/nestweaver/compare/v4.0.0...v4.1.0) (2026-08-09)
 
 
