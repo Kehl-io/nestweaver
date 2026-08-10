@@ -659,6 +659,13 @@ fn index_markdown_since_with_reader(
         }
     }
     for (_, source_note, source_path, _, link_target) in store.all_unresolved_wikilinks()? {
+        // The unresolved table is database-global. Only sources belonging to
+        // this vault may participate in its affected-source closure; otherwise
+        // a matching target added in vault A can make vault B's source appear
+        // "unavailable" and abort A's refresh.
+        if !existing_note_uids.contains(&source_note) {
+            continue;
+        }
         let normalized = link_target.trim().replace('\\', "/").to_lowercase();
         let joined = Path::new(&source_path).parent().map(|folder| {
             folder
@@ -3670,6 +3677,33 @@ sub b body
         let typed = store.typed_note_edges().unwrap();
         assert_eq!(typed.len(), 1);
         assert_eq!(typed[0].2, "DEPENDS_ON");
+    }
+
+    #[test]
+    fn since_refresh_ignores_other_vaults_matching_unresolved_targets() {
+        let (_a_dir, root_a) = make_vault(&[("a.md", "# A\n")]);
+        let (_b_dir, root_b) = make_vault(&[("b.md", "# B\n\n[[Future]]\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root_a.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root_a, &db_path, "owned", "a", &[]).unwrap();
+        index_markdown_directory_with_store(&store, &root_b, &db_path, "owned", "b", &[]).unwrap();
+        let unresolved_before = store.all_unresolved_wikilinks().unwrap();
+        assert_eq!(unresolved_before.len(), 1);
+
+        let since = std::time::SystemTime::now();
+        fs::write(root_a.join("future.md"), "# Future\n").unwrap();
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root_a,
+            "owned",
+            "a",
+            since,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(result.notes_updated, 1);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap(), unresolved_before);
     }
 
     #[test]
