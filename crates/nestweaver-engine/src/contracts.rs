@@ -28,7 +28,9 @@
 //! `CONSUMES` via fetch/axios/HTTP literals and GraphQL *consumers* are
 //! explicitly out of scope here.
 
-use nestweaver_schema::{Contract, Language, contract_uid, normalize_http_path};
+use nestweaver_schema::{
+    Contract, Language, contract_shape_key, normalize_http_path, scoped_contract_uid,
+};
 
 use crate::blast_radius::AnalysisStatus;
 
@@ -65,9 +67,21 @@ pub struct SpecContract {
 }
 
 impl SpecContract {
-    /// Mint the UID this contract will be stored under.
-    pub fn uid(&self) -> String {
-        contract_uid(
+    /// Return the repository-independent normalized shape used for discovery
+    /// and same-owner deduplication, never as stored node identity.
+    pub fn shape_key(&self) -> String {
+        contract_shape_key(
+            &self.kind,
+            self.verb.as_deref(),
+            self.path.as_deref(),
+            self.operation_id.as_deref(),
+        )
+    }
+
+    /// Mint this contract's owning repository-scoped node UID.
+    pub fn uid(&self, repo_uid: &str) -> String {
+        scoped_contract_uid(
+            repo_uid,
             &self.kind,
             self.verb.as_deref(),
             self.path.as_deref(),
@@ -78,7 +92,7 @@ impl SpecContract {
     /// Build a full [`Contract`] node bound to a repo + source file.
     pub fn into_contract(self, repo_uid: &str, source_path: &str, confidence: f32) -> Contract {
         Contract {
-            uid: self.uid(),
+            uid: self.uid(repo_uid),
             kind: self.kind,
             verb: self.verb,
             path: self.path,
@@ -1063,10 +1077,12 @@ pub fn drift_for_store(
 ) -> Result<DriftReport, nestweaver_store::StoreError> {
     let repo_uid = resolve_repo_uid(store, repo_uid)?;
     let all = store.list_contracts(repo_uid.as_deref())?;
-    let implemented: std::collections::HashSet<String> = store
-        .list_implemented_contract_uids()?
-        .into_iter()
-        .collect();
+    let implemented: std::collections::HashSet<String> = match repo_uid.as_deref() {
+        Some(owner) => store.list_implemented_contract_uids_for_repo(owner)?,
+        None => store.list_implemented_contract_uids()?,
+    }
+    .into_iter()
+    .collect();
 
     let (declared, code_derived): (Vec<Contract>, Vec<Contract>) =
         all.into_iter().partition(|c| is_spec_file(&c.source_path));
@@ -1838,7 +1854,7 @@ paths:
       responses: { "200": { description: ok } }
 "#;
         let contracts = parse_spec_file("openapi.yaml", spec);
-        let uids: Vec<String> = contracts.iter().map(|c| c.uid()).collect();
+        let uids: Vec<String> = contracts.iter().map(|c| c.shape_key()).collect();
         assert!(
             uids.contains(&"contract:http:POST:/v1/approvals".to_string()),
             "uids: {uids:?}"
@@ -2025,7 +2041,7 @@ message CreateReq {}
 message CreateResp {}
 "#;
         let contracts = parse_spec_file("approvals.proto", proto);
-        let uids: Vec<String> = contracts.iter().map(|c| c.uid()).collect();
+        let uids: Vec<String> = contracts.iter().map(|c| c.shape_key()).collect();
         assert_eq!(uids, vec!["contract:grpc:approvals.v1.Approvals/Create"]);
     }
 
@@ -2040,7 +2056,7 @@ type Query {
 }
 "#;
         let contracts = parse_spec_file("schema.graphql", schema);
-        let uids: Vec<String> = contracts.iter().map(|c| c.uid()).collect();
+        let uids: Vec<String> = contracts.iter().map(|c| c.shape_key()).collect();
         assert!(
             uids.contains(&"contract:graphql:Mutation.createApproval".to_string()),
             "uids: {uids:?}"
@@ -2077,11 +2093,17 @@ type Query {
         assert_eq!(matches.len(), 2);
         // create: base path only, no sub-path → base-path-inferred (0.8).
         let create = &matches[0];
-        assert_eq!(create.contract.uid(), "contract:http:POST:/v1/approvals");
+        assert_eq!(
+            create.contract.shape_key(),
+            "contract:http:POST:/v1/approvals"
+        );
         assert_eq!(create.confidence, 0.8);
         // get: explicit sub-path → exact (1.0), param normalized.
         let get = &matches[1];
-        assert_eq!(get.contract.uid(), "contract:http:GET:/v1/approvals/{}");
+        assert_eq!(
+            get.contract.shape_key(),
+            "contract:http:GET:/v1/approvals/{}"
+        );
         assert_eq!(get.confidence, 1.0);
     }
 
@@ -2095,7 +2117,10 @@ type Query {
         }];
         let matches = detect_handlers("nestjs", class_sig, &symbols);
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].contract.uid(), "contract:http:GET:/approvals/{}");
+        assert_eq!(
+            matches[0].contract.shape_key(),
+            "contract:http:GET:/approvals/{}"
+        );
         assert_eq!(matches[0].confidence, 1.0);
     }
 
@@ -2118,7 +2143,7 @@ type Query {
         let matches = detect_handlers("nestjs", source, &symbols);
         assert_eq!(matches.len(), 1, "matches: {matches:?}");
         assert_eq!(
-            matches[0].contract.uid(),
+            matches[0].contract.shape_key(),
             "contract:http:POST:/v1/approvals"
         );
         assert_eq!(matches[0].confidence, 1.0);
@@ -2154,7 +2179,7 @@ type Query {
             2,
             "both handlers must match; got {matches:?}"
         );
-        let uids: Vec<String> = matches.iter().map(|m| m.contract.uid()).collect();
+        let uids: Vec<String> = matches.iter().map(|m| m.contract.shape_key()).collect();
         assert!(
             uids.contains(&"contract:http:GET:/v1/health".to_string()),
             "GET /v1/health missing; uids: {uids:?}"
@@ -2195,7 +2220,7 @@ type Query {
             2,
             "both handlers must match; got {matches:?}"
         );
-        let uids: Vec<String> = matches.iter().map(|m| m.contract.uid()).collect();
+        let uids: Vec<String> = matches.iter().map(|m| m.contract.shape_key()).collect();
         assert!(uids.contains(&"contract:http:GET:/v1/health".to_string()));
         assert!(uids.contains(&"contract:http:POST:/v1/users".to_string()));
     }
@@ -2218,7 +2243,7 @@ type Query {
         let matches = detect_handlers("spring", source, &symbols);
         assert_eq!(matches.len(), 1, "matches: {matches:?}");
         assert_eq!(
-            matches[0].contract.uid(),
+            matches[0].contract.shape_key(),
             "contract:http:POST:/v1/approvals/submit"
         );
         assert_eq!(matches[0].confidence, 1.0);
@@ -2285,8 +2310,8 @@ paths:
         assert_eq!(declared.len(), 1);
         assert_eq!(handlers.len(), 1);
         assert_eq!(
-            declared[0].uid(),
-            handlers[0].contract.uid(),
+            declared[0].shape_key(),
+            handlers[0].contract.shape_key(),
             "spec and handler must agree on UID"
         );
     }
@@ -2322,12 +2347,12 @@ paths:
         assert_eq!(report.declared_not_implemented.len(), 1);
         assert_eq!(
             report.declared_not_implemented[0].uid,
-            "contract:http:GET:/v1/approvals/{}"
+            "contract:repo-1:http:GET:/v1/approvals/{}"
         );
         assert_eq!(report.implemented_not_declared.len(), 1);
         assert_eq!(
             report.implemented_not_declared[0].uid,
-            "contract:http:DELETE:/v1/approvals/{}"
+            "contract:repo-1:http:DELETE:/v1/approvals/{}"
         );
         assert!(!report.is_clean());
     }

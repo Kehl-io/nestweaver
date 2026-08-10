@@ -349,7 +349,60 @@ pub fn tool_list(lite: bool) -> Value {
                 .is_some_and(|n| names.iter().any(|a| a == n))
         });
     }
+    if is_direct_read_only() {
+        tools.retain(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| !crate::http::MUTATING_TOOLS.contains(&name))
+        });
+    }
     json!({ "tools": tools })
+}
+
+/// Validate an explicit CLI tool selection against the selected transport.
+/// This runs before the MCP loop starts so a typo or unavailable direct-mode
+/// mutator cannot silently produce a zero-tool server.
+pub fn validate_tool_selection(
+    names: Option<&[String]>,
+    lite: bool,
+    direct_read_only: bool,
+) -> Result<(), anyhow::Error> {
+    let registered = all_tool_schemas()
+        .into_iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+    let Some(names) = names else {
+        return Ok(());
+    };
+    if names.is_empty() {
+        anyhow::bail!("--tools must name at least one MCP tool");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        if name.trim().is_empty() {
+            anyhow::bail!("--tools contains an empty tool name");
+        }
+        if !seen.insert(name.as_str()) {
+            anyhow::bail!("--tools contains duplicate tool name '{name}'");
+        }
+        if !registered.contains(name) {
+            anyhow::bail!(
+                "unknown MCP tool '{name}'; use `nestweaver mcp --help` and `tools/list` for registered names"
+            );
+        }
+        if direct_read_only && crate::http::MUTATING_TOOLS.contains(&name.as_str()) {
+            anyhow::bail!(
+                "MCP tool '{name}' is unavailable in direct read-only mode; remove --no-daemon to route mutations through the daemon"
+            );
+        }
+    }
+    if lite && !names.iter().any(|name| LITE_TOOLS.contains(&name.as_str())) {
+        anyhow::bail!(
+            "--lite and --tools have no tools in common; lite tools: {}",
+            LITE_TOOLS.join(", ")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -366,6 +419,73 @@ mod tool_schema_validation_tests {
         validate_tool_arguments(name, &args)
             .expect_err("arguments should fail schema validation")
             .to_string()
+    }
+
+    #[test]
+    fn explicit_tool_selection_is_transport_aware_and_never_silently_empty() {
+        validate_tool_selection(
+            Some(&["brain_context".to_string(), "brain_search".to_string()]),
+            false,
+            true,
+        )
+        .expect("read tools are available directly");
+
+        for (names, lite, direct, needle) in [
+            (
+                vec!["context".to_string()],
+                false,
+                false,
+                "unknown MCP tool",
+            ),
+            (vec!["".to_string()], false, false, "empty tool name"),
+            (
+                vec!["brain_search".to_string(), "brain_search".to_string()],
+                false,
+                false,
+                "duplicate",
+            ),
+            (
+                vec!["brain_add_source".to_string()],
+                false,
+                true,
+                "unavailable in direct read-only mode",
+            ),
+            (
+                vec!["read_symbols".to_string()],
+                true,
+                false,
+                "no tools in common",
+            ),
+        ] {
+            let error = validate_tool_selection(Some(&names), lite, direct)
+                .expect_err("invalid selection must fail before startup")
+                .to_string();
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn readme_tool_allowlist_examples_only_use_registered_names() {
+        let readme = include_str!("../../../README.md");
+        let registered = all_tool_schemas()
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut examples = 0;
+        for line in readme.lines() {
+            let Some(rest) = line.split("nestweaver mcp --tools ").nth(1) else {
+                continue;
+            };
+            let names = rest.split_whitespace().next().unwrap_or_default();
+            for name in names.split(',') {
+                assert!(
+                    registered.contains(name),
+                    "README --tools example names unregistered tool '{name}'"
+                );
+            }
+            examples += 1;
+        }
+        assert!(examples > 0, "README must contain a tested --tools example");
     }
 
     #[test]
@@ -795,6 +915,24 @@ mod tool_schema_validation_tests {
         dispatch(&store, None, "brain_status", json!({}), None)
             .expect("lite tools must dispatch in lite mode");
         set_lite_mode(false);
+
+        set_direct_read_only(true);
+        let listed = tool_list(false);
+        let names = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 35);
+        for mutator in crate::http::MUTATING_TOOLS {
+            assert!(!names.contains(mutator), "direct mode advertised {mutator}");
+            let error = dispatch(&store, None, mutator, json!({}), None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("direct read-only mode"), "{error}");
+        }
+        set_direct_read_only(false);
     }
 
     #[cfg(feature = "daemon")]
@@ -1171,6 +1309,11 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
 /// The allowlist error text is part of the CLI/MCP contract — keep it
 /// in sync with the `tools/list` filtering in [`tool_list`].
 pub fn enforce_tool_allowed(name: &str) -> Result<(), anyhow::Error> {
+    if is_direct_read_only() && crate::http::MUTATING_TOOLS.contains(&name) {
+        return Err(anyhow!(
+            "tool '{name}' is unavailable in direct read-only mode; remove --no-daemon to route mutations through the daemon"
+        ));
+    }
     if is_lite_mode() && !LITE_TOOLS.contains(&name) {
         return Err(anyhow!(
             "tool '{name}' is not available in lite mode; allowed: {}",
@@ -1267,7 +1410,7 @@ fn dispatch_uncached(
         "stale_check" => tool_stale_check(store),
         "set_extension" => tool_set_extension(args),
         "query_extensions" => tool_query_extensions(args),
-        "brain_diff" => tool_brain_diff(store, args),
+        "brain_diff" => tool_brain_diff(store, args, visible),
         "project_context" => tool_project_context(store, tantivy, args, embed_model, cancel),
         "dead_code" => tool_dead_code(store, args, cancel),
         "hub_nodes" => tool_hub_nodes(store, args),
@@ -4125,6 +4268,17 @@ mod brain_search_total_contract_tests {
     fn degraded_repo_is_not_reported_clean_by_either_contract_tool() {
         let store = GraphStore::in_memory().unwrap();
         store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:broken".to_string(),
+                url: "https://example.test/broken".to_string(),
+                indexed_sha: "broken-sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test-instance".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
             .set_contract_derivation_failed("repo:broken", "COPY Contract: duplicate primary key")
             .unwrap();
 
@@ -5321,7 +5475,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
         if !ALLOW_ADD_SOURCES.with(|c| c.get()) {
             return Err(anyhow!(
                 "brain_add_source is disabled in --no-daemon mode. \
-             Use daemon mode (the default) or pass --allow-mcp-add-sources."
+             Use a daemon-enabled build and daemon mode (the default)."
             ));
         }
         let raw_path = args
@@ -7122,7 +7276,11 @@ fn tool_schema_brain_diff() -> Value {
     })
 }
 
-fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_brain_diff(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
     use nestweaver_engine::git_diff;
 
     let repo_name = args
@@ -7136,17 +7294,15 @@ fn tool_brain_diff(store: &GraphStore, args: Value) -> Result<Value, anyhow::Err
         .map(|n| n as usize)
         .unwrap_or_else(configured_result_limit);
 
-    // Find the repo in the graph.
-    let repos = store.list_repos(None)?;
-    let repo = repos
-        .iter()
-        .find(|r| {
-            r.url.contains(repo_name) || {
-                let name_part = r.url.split('/').next_back().unwrap_or("");
-                name_part == repo_name
-            }
-        })
-        .ok_or_else(|| anyhow!("repo '{}' not found in graph", repo_name))?;
+    // Find the repo in the graph using the shared deterministic selector. The
+    // caller supplies the already-visible repository set in authenticated
+    // server dispatches, so the helper cannot widen authorization scope.
+    let repos = store
+        .list_repos(None)?
+        .into_iter()
+        .filter(|repo| visible.is_none_or(|scope| scope.allows(&repo.uid)))
+        .collect::<Vec<_>>();
+    let repo = nestweaver_engine::resolve_repo_selector(&repos, repo_name)?;
 
     let Some(repo_path) = repo.local_root() else {
         anyhow::bail!(
@@ -8573,6 +8729,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static TRACK_INTERACTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SERVER_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIRECT_READ_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // F16 response cache: size cap (MiB) and per-session hit/miss counters.
     static CACHE_MAX_SIZE_MB: std::cell::Cell<u64> =
         const { std::cell::Cell::new(nestweaver_store::cache::DEFAULT_MAX_SIZE_MB) };
@@ -8632,6 +8789,14 @@ pub fn set_allow_add_sources(allowed: bool) {
 
 pub fn set_lite_mode(lite: bool) {
     LITE_MODE.with(|c| c.set(lite));
+}
+
+pub fn set_direct_read_only(direct: bool) {
+    DIRECT_READ_ONLY.with(|value| value.set(direct));
+}
+
+pub fn is_direct_read_only() -> bool {
+    DIRECT_READ_ONLY.with(|value| value.get())
 }
 
 pub fn set_allowed_tools(names: Vec<String>) {

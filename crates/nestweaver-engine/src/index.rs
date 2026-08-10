@@ -2319,7 +2319,41 @@ where
 
     drop(_phase_collect_span);
 
+    // Contract specifications are part of the publication input, not a
+    // best-effort decoration applied after the code graph has changed. Parse
+    // every recognized spec before the write boundary so malformed or
+    // unreadable input cannot advance the graph, SHA, generation, or caches.
+    // A full parse already accumulated complete handler/symbol inputs; a warm
+    // pass rebuilds the whole-repo view because unchanged files are absent
+    // from those collections.
+    spec_files.sort();
+    handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let contract_plan_result = if files_unchanged == 0 {
+        prepare_contract_derivation(
+            reader,
+            &r_uid,
+            &spec_files,
+            &handler_files,
+            &all_symbols,
+            true,
+        )
+    } else {
+        prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
+    };
+
     let _write_guard = acquire_write_guard()?;
+
+    let contract_plan = match contract_plan_result {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Err(marker_error) =
+                store.set_contract_derivation_failed(&r_uid, &error.to_string())
+            {
+                tracing::warn!("recording contract derivation failure failed: {marker_error}");
+            }
+            return Err(error).context("prepare strict contract derivation");
+        }
+    };
 
     // Last cancellation observation point. Bailing in this window needs no
     // teardown: the marker call below is what creates `.index-dirty` and
@@ -2885,59 +2919,36 @@ where
 
         // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
         let _phase_contracts_span = tracing::info_span!("index_phase_contracts").entered();
-        // Deterministic input order for the whole phase: `FilesystemReader`
-        // walks in readdir order while `GitReader` walks git-sorted, so without
-        // this the same repo feeds the contract phase in a different order on
-        // different machines (and after unrelated file churn).
-        spec_files.sort();
-        handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-        // Best-effort: a malformed spec or unexpected store error here must not
-        // fail the whole index. Contracts are hypotheses layered on top of the
-        // code graph.
-        //
-        // Non-fatal is not the same as invisible: the failure is RECORDED here,
-        // both on the returned `IndexResult` and as a durable per-repo marker,
-        // because drift is recomputed at query time and a repo with no
-        // contracts is otherwise indistinguishable from a repo whose contracts
-        // could not be derived. A successful run clears the marker so a repo
-        // heals on the next clean index.
-        let mut contracts_derived = 0usize;
-        let mut contracts_status = crate::blast_radius::AnalysisStatus::Complete;
-        let contract_result = if files_unchanged == 0 {
-            derive_contracts(
-                store,
-                reader,
-                &r_uid,
-                &spec_files,
-                &handler_files,
-                &all_symbols,
-            )
-        } else {
-            // A tiered/full pass may skip unchanged files, so its accumulated
-            // phase inputs are incomplete. Rebuild the whole-repo derived view
-            // only in that partial case; a true force/full parse reuses the
-            // inputs it already collected.
-            derive_contracts_from_current_repo(store, reader, &r_uid, repo_url)
-        };
-        match contract_result {
-            Ok(count) => {
-                contracts_derived = count;
-                if let Err(e) = store.clear_contract_derivation_failed(&r_uid) {
-                    tracing::warn!("clearing contract derivation marker failed: {e}");
+        // The complete plan above is immutable across the write boundary. Its
+        // replacement, generation migration, and current-repo debt clear are
+        // one transaction; an invalid write plan therefore retains the prior
+        // derived graph.
+        let contract_txn = store
+            .begin_transaction()
+            .context("begin full contract derivation transaction")?;
+        let contracts_derived =
+            match apply_contract_derivation_on(&contract_txn, &r_uid, &contract_plan) {
+                Ok(count) => count,
+                Err(error) => {
+                    drop(contract_txn);
+                    if let Err(marker_error) =
+                        store.set_contract_derivation_failed(&r_uid, &error.to_string())
+                    {
+                        tracing::warn!(
+                            "recording contract derivation failure failed: {marker_error}"
+                        );
+                    }
+                    return Err(error).context("apply full contract derivation");
                 }
-            }
-            Err(e) => {
-                tracing::warn!("contract derivation failed (non-fatal): {e}");
-                contracts_status = crate::blast_radius::AnalysisStatus::Degraded;
-                // Best-effort: if even the marker cannot be written the run is
-                // still degraded, it just cannot say so at query time.
-                if let Err(marker_err) =
-                    store.set_contract_derivation_failed(&r_uid, &e.to_string())
-                {
-                    tracing::warn!("recording contract derivation failure failed: {marker_err}");
-                }
-            }
+            };
+        store
+            .commit_transaction(&contract_txn)
+            .context("commit full contract derivation transaction")?;
+        drop(contract_txn);
+        if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
+            tracing::warn!("clearing contract derivation marker failed: {error}");
         }
+        let contracts_status = crate::blast_radius::AnalysisStatus::Complete;
         tracing::info!(
             spec_files = spec_files.len(),
             handler_files = handler_files.len(),
@@ -3251,6 +3262,21 @@ fn collect_contract_derivation_inputs(
         if is_minified_or_bundled(&abs_path) {
             continue;
         }
+        // Only these languages can contribute handler-derived contracts.
+        // Filtering before metadata/read is important in strict mode: an
+        // unreadable unrelated Python/Go/etc. file must not abort otherwise
+        // valid contract publication.
+        let eligible_handler_language = matches!(
+            lang,
+            nestweaver_schema::Language::Java
+                | nestweaver_schema::Language::Kotlin
+                | nestweaver_schema::Language::JavaScript
+                | nestweaver_schema::Language::TypeScript
+        ) || (has_grpc_specs
+            && lang == nestweaver_schema::Language::Rust);
+        if !eligible_handler_language {
+            continue;
+        }
         if reader
             .file_meta(&rel_path)
             .context("read contract input metadata")?
@@ -3405,14 +3431,14 @@ fn prepare_incremental_contract_derivation(
     repo_url: &str,
 ) -> Result<ContractDerivationPlan, anyhow::Error> {
     let (spec_files, handler_files, all_symbols) =
-        collect_contract_derivation_inputs(reader, r_uid, repo_url, false)?;
+        collect_contract_derivation_inputs(reader, r_uid, repo_url, true)?;
     prepare_contract_derivation(
         reader,
         r_uid,
         &spec_files,
         &handler_files,
         &all_symbols,
-        false,
+        true,
     )
 }
 
@@ -3541,24 +3567,6 @@ where
     Ok(plan)
 }
 
-fn derive_contracts_from_current_repo(
-    store: &GraphStore,
-    reader: &dyn crate::content_reader::ContentReader,
-    r_uid: &str,
-    repo_url: &str,
-) -> Result<usize, anyhow::Error> {
-    let (spec_files, handler_files, all_symbols) =
-        collect_contract_derivation_inputs(reader, r_uid, repo_url, false)?;
-    derive_contracts(
-        store,
-        reader,
-        r_uid,
-        &spec_files,
-        &handler_files,
-        &all_symbols,
-    )
-}
-
 /// F2-core: build the API contract graph for one repo.
 ///
 /// 1. Parse spec files into **declared** [`nestweaver_schema::Contract`] nodes
@@ -3569,24 +3577,6 @@ fn derive_contracts_from_current_repo(
 /// 3. Emit `IMPLEMENTS_CONTRACT` edges (handler Symbol → Contract) carrying the
 ///    match confidence (1.0 exact verb+path, 0.8 base-path-inferred).
 ///
-/// Returns the number of Contract nodes written, so the caller can report
-/// "derived N" rather than only "did not blow up".
-fn derive_contracts(
-    store: &GraphStore,
-    reader: &dyn crate::content_reader::ContentReader,
-    r_uid: &str,
-    spec_files: &[PathBuf],
-    handler_files: &[HandlerFileData],
-    all_symbols: &[nestweaver_schema::Symbol],
-) -> Result<usize, anyhow::Error> {
-    let plan =
-        prepare_contract_derivation(reader, r_uid, spec_files, handler_files, all_symbols, false)?;
-    let conn = store.begin_transaction()?;
-    let count = apply_contract_derivation_on(&conn, r_uid, &plan)?;
-    store.commit_transaction(&conn)?;
-    Ok(count)
-}
-
 pub(crate) struct ContractDerivationPlan {
     contracts: Vec<nestweaver_schema::Contract>,
     edges: Vec<nestweaver_schema::ResolvedEdge>,
@@ -3676,7 +3666,7 @@ fn prepare_contract_derivation(
         }
         let matches = crate::contracts::detect_handlers(&hf.framework, &base_source, &handler_syms);
         for m in matches {
-            let contract_uid = m.contract.uid();
+            let contract_uid = m.contract.uid(r_uid);
             // Mint a code-derived contract only when no spec declared this UID.
             // The set is authoritative either way — inserting a code-derived row
             // over a declared one loses on provenance — but skipping the work is
@@ -3816,11 +3806,14 @@ pub(crate) fn apply_contract_derivation_on(
     // No explicit rollback on the error paths, matching `bulk_reindex_write`:
     // a statement that throws inside an explicit transaction already rolls it
     // back, and dropping the connection rolls back anything still open.
+    GraphStore::ensure_contract_derivation_v2_on(conn)?;
     GraphStore::clear_repo_contracts_on(conn, r_uid)?;
     GraphStore::batch_insert_contracts_on(conn, &plan.contracts)?;
     if !plan.edges.is_empty() {
         GraphStore::batch_insert_edges_on(conn, &plan.edges)?;
     }
+    GraphStore::clear_contract_derivation_debt_on(conn, r_uid)?;
+    GraphStore::clear_contract_derivation_failed_on(conn, r_uid)?;
     Ok(plan.contracts.len())
 }
 
@@ -4048,8 +4041,17 @@ fn incremental_index_with_name_and_io(
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
-    let contract_plan = prepare_incremental_contract_derivation(&reader, &r_uid, repo_url)
-        .context("prepare incremental contract derivation")?;
+    let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Err(marker_error) =
+                store.set_contract_derivation_failed(&r_uid, &error.to_string())
+            {
+                tracing::warn!("recording contract derivation failure failed: {marker_error}");
+            }
+            return Err(error).context("prepare incremental contract derivation");
+        }
+    };
 
     let publication = establish_index_publication_marker_with_io(
         &store,
@@ -4251,10 +4253,20 @@ where
     // edges we walk here, so this ordering is correctness-critical.
     let (changed_files, removed_files) = partition_changed_removed(&changes);
     let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
-    let contract_plan = prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
-        .context("prepare server incremental contract derivation")?;
+    let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
 
     let _write_guard = acquire_write_guard()?;
+    let contract_plan = match contract_plan_result {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Err(marker_error) =
+                store.set_contract_derivation_failed(&r_uid, &error.to_string())
+            {
+                tracing::warn!("recording contract derivation failure failed: {marker_error}");
+            }
+            return Err(error).context("prepare server incremental contract derivation");
+        }
+    };
     let publication = establish_index_publication_marker_with_io(
         store,
         store.db_path(),
@@ -5069,6 +5081,13 @@ fn content_hash_hex(s: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn owned_contract_uid(repo_uid: &str, bare_shape: &str) -> String {
+        format!(
+            "contract:{repo_uid}:{}",
+            bare_shape.trim_start_matches("contract:")
+        )
+    }
 
     fn insert_publication_graph(store: &GraphStore, publisher: &str) {
         let repo_uid = format!("repo:publisher-{publisher}");
@@ -5909,7 +5928,7 @@ function hello(name) { return "Hello " + name; }
         assert!(
             contracts
                 .iter()
-                .any(|c| c.uid == "contract:http:POST:/v1/approvals"),
+                .any(|c| c.uid.ends_with(":http:POST:/v1/approvals")),
             "expected declared contract; got {:?}",
             contracts.iter().map(|c| &c.uid).collect::<Vec<_>>()
         );
@@ -5918,8 +5937,145 @@ function hello(name) { return "Hello " + name; }
         // no sub-path; UID still matches the spec's POST /v1/approvals).
         let implemented = store.list_implemented_contract_uids().unwrap();
         assert!(
-            implemented.contains(&"contract:http:POST:/v1/approvals".to_string()),
+            implemented
+                .iter()
+                .any(|uid| uid.ends_with(":http:POST:/v1/approvals")),
             "expected IMPLEMENTS_CONTRACT edge; implemented: {implemented:?}"
+        );
+    }
+
+    #[test]
+    fn identical_contract_shapes_are_owned_and_drifted_per_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let spec = "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /health:\n    get:\n      responses: { \"200\": { description: ok } }\n";
+        let implemented_dir = dir.path().join("implemented");
+        let declared_only_dir = dir.path().join("declared-only");
+        fs::create_dir_all(&implemented_dir).unwrap();
+        fs::create_dir_all(&declared_only_dir).unwrap();
+        fs::write(implemented_dir.join("openapi.yaml"), spec).unwrap();
+        fs::write(declared_only_dir.join("openapi.yaml"), spec).unwrap();
+        fs::write(
+            implemented_dir.join("HealthController.java"),
+            "@RestController\npublic class HealthController {\n  @GetMapping(\"/health\")\n  public void health() {}\n}\n",
+        )
+        .unwrap();
+
+        let implemented_url = "https://example.com/implemented";
+        let declared_only_url = "https://example.com/declared-only";
+        for (root, url, sha) in [
+            (&implemented_dir, implemented_url, "a"),
+            (&declared_only_dir, declared_only_url, "b"),
+        ] {
+            let reader = crate::content_reader::FilesystemReader::new(root);
+            index_into_store(
+                &reader, &store, "test", url, sha, None, None, None, None, None, None,
+            )
+            .unwrap();
+        }
+
+        let implemented_repo = nestweaver_schema::repo_uid("test", implemented_url);
+        let declared_only_repo = nestweaver_schema::repo_uid("test", declared_only_url);
+        let implemented_uid = nestweaver_schema::scoped_contract_uid(
+            &implemented_repo,
+            "http",
+            Some("GET"),
+            Some("/health"),
+            None,
+        );
+        let declared_only_uid = nestweaver_schema::scoped_contract_uid(
+            &declared_only_repo,
+            "http",
+            Some("GET"),
+            Some("/health"),
+            None,
+        );
+        assert_ne!(implemented_uid, declared_only_uid);
+        assert_eq!(
+            store
+                .list_implemented_contract_uids_for_repo(&implemented_repo)
+                .unwrap(),
+            vec![implemented_uid]
+        );
+        assert!(
+            store
+                .list_implemented_contract_uids_for_repo(&declared_only_repo)
+                .unwrap()
+                .is_empty()
+        );
+        let drift = crate::contracts::drift_for_store(&store, Some(&declared_only_repo)).unwrap();
+        assert_eq!(drift.declared_not_implemented.len(), 1);
+        assert_eq!(drift.declared_not_implemented[0].uid, declared_only_uid);
+    }
+
+    #[test]
+    fn contract_v2_migration_purges_legacy_globally_and_tracks_repo_debt() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo_a = "repo:test:a";
+        let repo_b = "repo:test:b";
+        for uid in [repo_a, repo_b] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.to_string(),
+                    url: format!("https://example.com/{uid}"),
+                    indexed_sha: "old".into(),
+                    staleness_commits_behind: 0,
+                    instance_id: "test".into(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        store
+            .batch_insert_contracts(&[nestweaver_schema::Contract {
+                uid: "contract:http:GET:/legacy".into(),
+                kind: "http".into(),
+                verb: Some("GET".into()),
+                path: Some("/legacy".into()),
+                operation_id: None,
+                repo_uid: repo_a.into(),
+                source_path: "legacy.yaml".into(),
+                confidence: 1.0,
+            }])
+            .unwrap();
+        assert_eq!(
+            store.contract_derivation_failures(None).unwrap(),
+            vec![repo_a.to_string(), repo_b.to_string()]
+        );
+
+        let scoped = nestweaver_schema::Contract {
+            uid: nestweaver_schema::scoped_contract_uid(
+                repo_a,
+                "http",
+                Some("GET"),
+                Some("/current"),
+                None,
+            ),
+            kind: "http".into(),
+            verb: Some("GET".into()),
+            path: Some("/current".into()),
+            operation_id: None,
+            repo_uid: repo_a.into(),
+            source_path: "openapi.yaml".into(),
+            confidence: 1.0,
+        };
+        let plan = ContractDerivationPlan {
+            contracts: vec![scoped.clone()],
+            edges: Vec::new(),
+            input_hashes: std::collections::BTreeMap::new(),
+            observed_input_hashes: std::collections::BTreeMap::new(),
+        };
+        let transaction = store.begin_transaction().unwrap();
+        apply_contract_derivation_on(&transaction, repo_a, &plan).unwrap();
+        store.commit_transaction(&transaction).unwrap();
+        drop(transaction);
+
+        let all = store.list_contracts(None).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].uid, scoped.uid);
+        assert_eq!(
+            store.contract_derivation_failures(None).unwrap(),
+            vec![repo_b.to_string()]
         );
     }
 
@@ -5954,6 +6110,44 @@ function hello(name) { return "Hello " + name; }
             "repo:test:oversize",
             "https://example.com/oversize",
             false,
+        )
+        .unwrap();
+        assert!(specs.is_empty());
+        assert!(handlers.is_empty());
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn strict_contract_collector_ignores_unreadable_irrelevant_languages() {
+        struct IrrelevantReader {
+            root: PathBuf,
+        }
+        impl crate::content_reader::ContentReader for IrrelevantReader {
+            fn read_file(&self, _rel_path: &Path) -> anyhow::Result<String> {
+                panic!("irrelevant language must be filtered before reading")
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("unreadable.py")])
+            }
+            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                panic!("irrelevant language must be filtered before metadata")
+            }
+            fn root(&self) -> &Path {
+                &self.root
+            }
+            fn version_id(&self) -> &str {
+                "irrelevant-language-test"
+            }
+        }
+
+        let reader = IrrelevantReader {
+            root: PathBuf::from("/unused"),
+        };
+        let (specs, handlers, symbols) = collect_contract_derivation_inputs(
+            &reader,
+            "repo:test:irrelevant",
+            "https://example.com/irrelevant",
+            true,
         )
         .unwrap();
         assert!(specs.is_empty());
@@ -6166,7 +6360,9 @@ function hello(name) { return "Hello " + name; }
             .list_contracts(Some(&repo_uid))
             .unwrap()
             .into_iter()
-            .find(|contract| contract.uid == "contract:http:GET:/v1/items")
+            .find(|contract| {
+                contract.uid == owned_contract_uid(&repo_uid, "contract:http:GET:/v1/items")
+            })
             .expect("GET survives a spec-only rename");
         assert_eq!(renamed_get.source_path, "openapi.v2.yaml");
         assert!(
@@ -6188,7 +6384,9 @@ function hello(name) { return "Hello " + name; }
                 .list_contracts(Some(&repo_uid))
                 .unwrap()
                 .into_iter()
-                .find(|contract| contract.uid == "contract:http:GET:/v1/items")
+                .find(|contract| {
+                    contract.uid == owned_contract_uid(&repo_uid, "contract:http:GET:/v1/items")
+                })
                 .unwrap()
                 .source_path,
             "openapi.v2.yaml"
@@ -6259,11 +6457,11 @@ function hello(name) { return "Hello " + name; }
             vec![
                 (
                     "create".to_string(),
-                    "contract:http:POST:/v1/items".to_string(),
+                    owned_contract_uid(&repo_uid, "contract:http:POST:/v1/items"),
                 ),
                 (
                     "list".to_string(),
-                    "contract:http:GET:/v1/items".to_string(),
+                    owned_contract_uid(&repo_uid, "contract:http:GET:/v1/items"),
                 ),
             ]
         );
@@ -6276,11 +6474,11 @@ function hello(name) { return "Hello " + name; }
             incremental_snapshot.0,
             vec![
                 (
-                    "contract:http:GET:/v1/items".to_string(),
+                    owned_contract_uid(&repo_uid, "contract:http:GET:/v1/items"),
                     "openapi.v2.yaml".to_string(),
                 ),
                 (
-                    "contract:http:POST:/v1/items".to_string(),
+                    owned_contract_uid(&repo_uid, "contract:http:POST:/v1/items"),
                     "openapi.v2.yaml".to_string(),
                 ),
             ]
@@ -6288,8 +6486,8 @@ function hello(name) { return "Hello " + name; }
         assert_eq!(
             incremental_snapshot.1,
             vec![
-                "contract:http:GET:/v1/items".to_string(),
-                "contract:http:POST:/v1/items".to_string(),
+                owned_contract_uid(&repo_uid, "contract:http:GET:/v1/items"),
+                owned_contract_uid(&repo_uid, "contract:http:POST:/v1/items"),
             ]
         );
         drop(incremental_store);
@@ -6327,72 +6525,44 @@ function hello(name) { return "Hello " + name; }
             implementation_pairs(&incremental_store),
             vec![(
                 "create".to_string(),
-                "contract:http:POST:/v1/items".to_string(),
+                owned_contract_uid(&repo_uid, "contract:http:POST:/v1/items"),
             )]
         );
         assert_eq!(
             post_only_snapshot.0,
             vec![(
-                "contract:http:POST:/v1/items".to_string(),
+                owned_contract_uid(&repo_uid, "contract:http:POST:/v1/items"),
                 "openapi.v2.yaml".to_string(),
             )]
         );
         assert_eq!(
             post_only_snapshot.1,
-            vec!["contract:http:POST:/v1/items".to_string()]
+            vec![owned_contract_uid(
+                &repo_uid,
+                "contract:http:POST:/v1/items"
+            )]
         );
 
-        // Poison the next replacement with a UID owned by another repo. The
-        // contract COPY fails after the changed controller/spec were parsed,
-        // and the single incremental transaction must retain the prior graph.
-        incremental_store
-            .batch_insert_contracts(&[nestweaver_schema::Contract {
-                uid: "contract:http:PUT:/v1/items".to_string(),
-                kind: "http".to_string(),
-                verb: Some("PUT".to_string()),
-                path: Some("/v1/items".to_string()),
-                operation_id: None,
-                repo_uid: "repo:other".to_string(),
-                source_path: "other.yaml".to_string(),
-                confidence: 1.0,
-            }])
-            .unwrap();
         let generation_path = crate::sidecar_path(&incremental_db, ".generation");
-        let generation_before_failed_apply = fs::read(&generation_path).unwrap();
+        let generation_before_failure = fs::read(&generation_path).unwrap();
         drop(incremental_store);
         drop(forced_store);
-        fs::write(
-            repo.join("openapi.v2.yaml"),
-            spec(
-                "    get:\n      operationId: listItems\n      responses: { \"200\": { description: ok } }\n    post:\n      operationId: createItem\n      responses: { \"200\": { description: ok } }\n    put:\n      operationId: replaceItem\n      responses: { \"200\": { description: ok } }\n",
-            ),
-        )
-        .unwrap();
-        fs::write(
-            repo.join("ItemsController.java"),
-            "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController {\n  @GetMapping\n  public void list() {}\n  @PostMapping\n  public void create() {}\n  @PutMapping\n  public void replace() {}\n}\n",
-        )
-        .unwrap();
+        fs::write(repo.join("openapi.v2.yaml"), "openapi: [malformed").unwrap();
         git(&["add", "-A"]);
-        git(&["commit", "-q", "-m", "add colliding PUT"]);
+        git(&["commit", "-q", "-m", "malformed spec"]);
 
         let error = incremental_index(&repo, &incremental_db, "test", repo_url)
-            .expect_err("contract replacement failure must abort incremental publication");
+            .expect_err("strict incremental contract preflight must fail");
         assert!(
-            format!("{error:#}").contains("apply incremental contract derivation"),
+            format!("{error:#}").contains("prepare incremental contract derivation"),
             "unexpected error: {error:#}"
         );
         let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
-        assert_eq!(
-            fs::read(&generation_path).unwrap(),
-            generation_before_failed_apply,
-            "a failed transactional apply must not publish a new generation"
-        );
         assert_eq!(snapshot(&incremental_store), post_only_snapshot);
         assert_eq!(
-            other_contracts(&incremental_store),
-            other_before,
-            "a failed replacement must not alter another repo"
+            fs::read(&generation_path).unwrap(),
+            generation_before_failure,
+            "strict preflight failure must not publish a generation"
         );
         assert_eq!(
             incremental_store
@@ -6401,41 +6571,21 @@ function hello(name) { return "Hello " + name; }
                 .unwrap()
                 .indexed_sha,
             third_sha,
-            "failed derivation must roll back the indexed SHA"
+            "strict preflight failure must retain the indexed SHA"
         );
-        assert!(
-            incremental_store
-                .lookup_symbols_by_name_in_repo("replace", &repo_uid)
-                .unwrap()
-                .is_empty(),
-            "failed derivation must roll back the new handler symbol"
-        );
-        assert!(
+        assert_eq!(other_contracts(&incremental_store), other_before);
+        assert_eq!(
             incremental_store
                 .contract_derivation_failures(Some(&repo_uid))
-                .unwrap()
-                .contains(&repo_uid),
-            "the failed best-effort contract phase remains diagnosable"
+                .unwrap(),
+            vec![repo_uid]
         );
     }
 
-    /// A failure inside `derive_contracts` must leave the PREVIOUS contract
-    /// graph intact.
-    ///
-    /// The clear used to run on its own connection ahead of the COPY, so a
-    /// single row the COPY rejected wiped every Contract and every
-    /// IMPLEMENTS_CONTRACT edge for the repo — not a partial result, nothing —
-    /// while the caller only warned and the index still reported success.
-    ///
-    /// The rejected row here is a real one: `contracts::contract_uid` mints a
-    /// UID from kind/verb/path alone, with no repo component, so a route
-    /// another repo has already declared collides on `Contract`'s primary key.
-    /// `clear_repo_contracts` deletes only this repo's rows, so the other
-    /// repo's row is still there when the COPY runs.
-    ///
-    /// Assertions are on the CONTENTS of the graph, never on the `Result` of
-    /// an `index_*` call: derivation errors are swallowed by the caller, so a
-    /// `Result` assertion would pass with or without the fix.
+    /// An explicitly invalid prepared plan must leave the previous derived
+    /// graph intact. This is the fault seam for atomic replacement tests;
+    /// cross-repository UID collisions are no longer a valid way to provoke a
+    /// write failure because v2 Contract identities include their owner.
     #[test]
     fn failed_contract_derivation_preserves_existing_contracts() {
         let dir = tempfile::tempdir().unwrap();
@@ -6489,40 +6639,32 @@ function hello(name) { return "Hello " + name; }
             "expected a seeded IMPLEMENTS_CONTRACT edge"
         );
 
-        // A Contract owned by a DIFFERENT repo, under a UID this repo's next
-        // derivation also mints.
-        store
-            .batch_insert_contracts(&[nestweaver_schema::Contract {
-                uid: "contract:http:GET:/v1/shared".to_string(),
-                kind: "http".to_string(),
-                verb: Some("GET".to_string()),
-                path: Some("/v1/shared".to_string()),
-                operation_id: None,
-                repo_uid: "repo:other".to_string(),
-                source_path: "openapi.yaml".to_string(),
-                confidence: 1.0,
-            }])
-            .unwrap();
-
-        // Re-derive this repo's contracts from a spec that declares the shared
-        // route. The COPY must reject the colliding row.
-        let poisoned = dir.path().join("poisoned");
-        fs::create_dir_all(&poisoned).unwrap();
-        let spec = poisoned.join("openapi.yaml");
-        fs::write(
-            &spec,
-            "openapi: 3.0.0\n\
-             info: { title: t, version: \"1.0\" }\n\
-             paths:\n  \
-             /v1/shared:\n    \
-             get:\n      \
-             operationId: getShared\n      \
-             responses: { \"200\": { description: ok } }\n",
-        )
-        .unwrap();
-        let reader = crate::content_reader::FilesystemReader::new(&poisoned);
-        let err = derive_contracts(&store, &reader, &repo_uid, &[spec], &[], &[])
-            .expect_err("a colliding contract UID must fail the COPY");
+        let invalid = nestweaver_schema::Contract {
+            uid: nestweaver_schema::scoped_contract_uid(
+                &repo_uid,
+                "http",
+                Some("GET"),
+                Some("/v1/invalid"),
+                None,
+            ),
+            kind: "http".to_string(),
+            verb: Some("GET".to_string()),
+            path: Some("/v1/invalid".to_string()),
+            operation_id: None,
+            repo_uid: repo_uid.clone(),
+            source_path: "invalid-plan.yaml".to_string(),
+            confidence: 1.0,
+        };
+        let invalid_plan = ContractDerivationPlan {
+            contracts: vec![invalid.clone(), invalid],
+            edges: Vec::new(),
+            input_hashes: std::collections::BTreeMap::new(),
+            observed_input_hashes: std::collections::BTreeMap::new(),
+        };
+        let transaction = store.begin_transaction().unwrap();
+        let err = apply_contract_derivation_on(&transaction, &repo_uid, &invalid_plan)
+            .expect_err("duplicate rows in an explicit invalid plan must fail COPY");
+        drop(transaction);
         assert!(
             err.to_string().contains("COPY Contract"),
             "expected the COPY to be what failed; got {err}"
@@ -6592,34 +6734,44 @@ function hello(name) { return "Hello " + name; }
         let uids: Vec<&String> = contracts.iter().map(|c| &c.uid).collect();
         assert!(
             uids.iter()
-                .any(|u| u.as_str() == "contract:grpc:demo.v1.Greeter/SayHello"),
+                .any(|u| u.ends_with(":grpc:demo.v1.Greeter/SayHello")),
             "expected the declared gRPC contract; got {uids:?}"
         );
 
         let implemented = store.list_implemented_contract_uids().unwrap();
         assert!(
-            implemented.contains(&"contract:grpc:demo.v1.Greeter/SayHello".to_string()),
+            implemented
+                .iter()
+                .any(|uid| uid.ends_with(":grpc:demo.v1.Greeter/SayHello")),
             "expected IMPLEMENTS_CONTRACT edge for SayHello; implemented: {implemented:?}"
         );
         // The acronym case, which a naive snake_case would have missed.
         assert!(
-            implemented.contains(&"contract:grpc:demo.v1.Greeter/GetHTTPStatus".to_string()),
+            implemented
+                .iter()
+                .any(|uid| uid.ends_with(":grpc:demo.v1.Greeter/GetHTTPStatus")),
             "GetHTTPStatus -> get_http_status must link; implemented: {implemented:?}"
         );
         // A declared RPC with no impl must STILL be drift.
         assert!(
-            !implemented.contains(&"contract:grpc:demo.v1.Greeter/NeverBuilt".to_string()),
+            !implemented
+                .iter()
+                .any(|uid| uid.ends_with(":grpc:demo.v1.Greeter/NeverBuilt")),
             "an unimplemented RPC must remain drift; implemented: {implemented:?}"
         );
     }
 
     // ── Contract derivation status (degraded vs genuinely empty) ──────────
 
-    /// Index `src` into `store` a second time, reusing the private full-index
-    /// entry point so the contract phase — and its swallow — actually runs.
+    /// Index `src` into `store` a second time through the private full-index
+    /// entry point so strict preflight behavior is directly observable.
     /// `index_directory_in_memory` always mints a fresh store, which is no use
     /// when the point is to re-index a store that has been poisoned.
-    fn reindex_into(store: &GraphStore, src: &Path, sha: &str) -> IndexResult {
+    fn reindex_into(
+        store: &GraphStore,
+        src: &Path,
+        sha: &str,
+    ) -> Result<IndexResult, anyhow::Error> {
         let reader = crate::content_reader::FilesystemReader::new(src);
         let local_root = src.display().to_string();
         index_into_store(
@@ -6635,7 +6787,6 @@ function hello(name) { return "Hello " + name; }
             None,
             Some(&local_root),
         )
-        .expect("indexing must succeed even when contract derivation does not")
     }
 
     /// Write a repo whose only content is an OpenAPI spec declaring
@@ -6665,18 +6816,8 @@ function hello(name) { return "Hello " + name; }
         .unwrap();
     }
 
-    /// A repo whose contract derivation FAILED must not be reported as clean.
-    ///
-    /// Assertions are on the reported STATUS and on graph contents, never on
-    /// the `Result` of the index call: derivation errors are swallowed, so
-    /// `index_*` returns `Ok` with or without this fix and a `Result`
-    /// assertion would prove nothing.
-    ///
-    /// The failure induced here is the observed one: `contract_uid` mints a UID
-    /// with no repo component, so a route another repo already declared
-    /// collides on `Contract`'s primary key and the bulk COPY rejects the row —
-    /// discarding every contract and every IMPLEMENTS_CONTRACT edge for this
-    /// repo while the index still reports success.
+    /// A malformed recognized spec fails before graph/SHA publication, retains
+    /// the prior derived graph, and remains query-visible as degraded.
     #[test]
     fn degraded_contract_derivation_is_not_reported_clean() {
         let dir = tempfile::tempdir().unwrap();
@@ -6703,33 +6844,42 @@ function hello(name) { return "Hello " + name; }
             .repo_uid
             .clone();
 
-        // Poison: hand this repo's UID to a DIFFERENT repo, so the next
-        // derivation's COPY hits a duplicate primary key it cannot clear.
-        store.clear_repo_contracts(&repo_uid).unwrap();
-        store
-            .batch_insert_contracts(&[nestweaver_schema::Contract {
-                uid: "contract:http:GET:/v1/shared".to_string(),
-                kind: "http".to_string(),
-                verb: Some("GET".to_string()),
-                path: Some("/v1/shared".to_string()),
-                operation_id: None,
-                repo_uid: "repo:other".to_string(),
-                source_path: "openapi.yaml".to_string(),
-                confidence: 1.0,
-            }])
+        let contracts_before: Vec<_> = store
+            .list_contracts(Some(&repo_uid))
+            .unwrap()
+            .into_iter()
+            .map(|contract| (contract.uid, contract.source_path))
+            .collect();
+        let implemented_before = store
+            .list_implemented_contract_uids_for_repo(&repo_uid)
             .unwrap();
+        let sha_before = store.lookup_repo(&repo_uid).unwrap().unwrap().indexed_sha;
+        fs::write(src.join("openapi.yaml"), "openapi: [malformed").unwrap();
 
-        let second = reindex_into(&store, &src, "def456");
-
-        // 1. The index result says so.
-        assert_eq!(
-            second.contracts_status,
-            crate::blast_radius::AnalysisStatus::Degraded,
-            "a failed contract phase must be reported as degraded"
+        let error = reindex_into(&store, &src, "def456")
+            .expect_err("malformed recognized spec must fail strict preflight");
+        assert!(
+            format!("{error:#}").contains("prepare strict contract derivation"),
+            "unexpected error: {error:#}"
         );
         assert_eq!(
-            second.contracts_derived, 0,
-            "a failed derivation writes no contracts"
+            store
+                .list_contracts(Some(&repo_uid))
+                .unwrap()
+                .into_iter()
+                .map(|contract| (contract.uid, contract.source_path))
+                .collect::<Vec<_>>(),
+            contracts_before
+        );
+        assert_eq!(
+            store
+                .list_implemented_contract_uids_for_repo(&repo_uid)
+                .unwrap(),
+            implemented_before
+        );
+        assert_eq!(
+            store.lookup_repo(&repo_uid).unwrap().unwrap().indexed_sha,
+            sha_before
         );
 
         // 2. The query-time drift analysis says so. This assertion is the one
@@ -6751,9 +6901,15 @@ function hello(name) { return "Hello " + name; }
         assert_eq!(envelope["clean"], serde_json::json!(false));
         assert_eq!(envelope["contracts_status"], serde_json::json!("degraded"));
 
-        // A clean re-index heals the repo: the marker is cleared, not sticky.
-        store.clear_repo_contracts("repo:other").unwrap();
-        let third = reindex_into(&store, &src, "ghi789");
+        // A valid empty plan is success, replaces the old derived rows, and
+        // heals the repo rather than being mistaken for another failure.
+        fs::remove_file(src.join("SharedController.java")).unwrap();
+        fs::write(
+            src.join("openapi.yaml"),
+            "openapi: 3.0.0\ninfo: { title: t, version: \"1.0\" }\npaths: {}\n",
+        )
+        .unwrap();
+        let third = reindex_into(&store, &src, "ghi789").unwrap();
         assert_eq!(
             third.contracts_status,
             crate::blast_radius::AnalysisStatus::Complete,
@@ -6766,6 +6922,7 @@ function hello(name) { return "Hello " + name; }
                 .is_empty(),
             "the failure marker must not survive a successful derivation"
         );
+        assert!(store.list_contracts(Some(&repo_uid)).unwrap().is_empty());
     }
 
     /// The counterpart the fix must NOT break: a repo that genuinely declares
@@ -6848,7 +7005,7 @@ function hello(name) { return "Hello " + name; }
         assert_unique_contract_uids(&contracts);
         let collapsed: Vec<&nestweaver_schema::Contract> = contracts
             .iter()
-            .filter(|c| c.uid == "contract:http:GET:/users/{}")
+            .filter(|c| c.uid.ends_with(":http:GET:/users/{}"))
             .collect();
         assert_eq!(
             collapsed.len(),
@@ -6870,7 +7027,7 @@ function hello(name) { return "Hello " + name; }
             assert!(
                 implemented
                     .iter()
-                    .any(|(uid, _)| uid == "contract:http:GET:/users/{}"),
+                    .any(|(uid, _)| uid.ends_with(":http:GET:/users/{}")),
                 "{handler} must link to the surviving contract; got {implemented:?}"
             );
         }
@@ -6900,7 +7057,7 @@ function hello(name) { return "Hello " + name; }
         assert_unique_contract_uids(&contracts);
         let survivor = contracts
             .iter()
-            .find(|c| c.uid == "contract:http:GET:/v1/items")
+            .find(|c| c.uid.ends_with(":http:GET:/v1/items"))
             .expect("the declared route survives the collapse");
         // Both copies are declared at confidence 1.0, so the tie-break falls to
         // the lexicographically smallest source_path — NOT to collection order.
@@ -6935,11 +7092,12 @@ function hello(name) { return "Hello " + name; }
         assert_unique_contract_uids(&contracts);
         let uids: Vec<&str> = contracts.iter().map(|c| c.uid.as_str()).collect();
         assert!(
-            uids.contains(&"contract:grpc:demo.v1.Greeter/SayHello"),
+            uids.iter()
+                .any(|uid| uid.ends_with(":grpc:demo.v1.Greeter/SayHello")),
             "the duplicated RPC must survive exactly once; got {uids:?}"
         );
         assert!(
-            uids.contains(&"contract:graphql:Query.me"),
+            uids.iter().any(|uid| uid.ends_with(":graphql:Query.me")),
             "the duplicated GraphQL field must survive exactly once; got {uids:?}"
         );
     }
@@ -7038,9 +7196,10 @@ function hello(name) { return "Hello " + name; }
 
         let report = crate::contracts::drift_for_store(&store, None).unwrap();
         assert_eq!(report.declared_not_implemented.len(), 1);
-        assert_eq!(
-            report.declared_not_implemented[0].uid,
-            "contract:http:GET:/v1/items"
+        assert!(
+            report.declared_not_implemented[0]
+                .uid
+                .ends_with(":http:GET:/v1/items")
         );
         assert!(report.implemented_not_declared.is_empty());
     }
@@ -7082,7 +7241,9 @@ function hello(name) { return "Hello " + name; }
         // The handler implements the spec-declared contract (exact verb+path).
         let implemented = store.list_implemented_contract_uids().unwrap();
         assert!(
-            implemented.contains(&"contract:http:POST:/v1/approvals".to_string()),
+            implemented
+                .iter()
+                .any(|uid| uid.ends_with(":http:POST:/v1/approvals")),
             "expected IMPLEMENTS_CONTRACT edge; implemented: {implemented:?}"
         );
 
@@ -7152,11 +7313,15 @@ function hello(name) { return "Hello " + name; }
 
         let implemented = store.list_implemented_contract_uids().unwrap();
         assert!(
-            implemented.contains(&"contract:http:GET:/v1/health".to_string()),
+            implemented
+                .iter()
+                .any(|uid| uid.ends_with(":http:GET:/v1/health")),
             "GET /v1/health must be implemented; implemented: {implemented:?}"
         );
         assert!(
-            implemented.contains(&"contract:http:POST:/v1/users".to_string()),
+            implemented
+                .iter()
+                .any(|uid| uid.ends_with(":http:POST:/v1/users")),
             "POST /v1/users must be implemented; implemented: {implemented:?}"
         );
 

@@ -604,9 +604,15 @@ NestWeaver exposes 40 tools via the [Model Context Protocol](https://modelcontex
 
 ```sh
 nestweaver mcp --db ./nestweaver.lbug
-nestweaver mcp --tools context,search,symbol --db ./nestweaver.lbug   # allowlist specific tools
+nestweaver mcp --tools brain_context,brain_search,read_symbols --db ./nestweaver.lbug   # allowlist specific tools
 NESTWEAVER_NO_DAEMON=1 nestweaver mcp --no-daemon --db ./nestweaver.lbug   # read-only direct mode (CI/testing)
 ```
+
+Direct mode advertises 35 read-only tools and rejects mutations before
+dispatch. Daemon-backed stdio exposes all 40 tools. `--tools` names are exact,
+case-sensitive registry names; unknown, duplicate, empty, or transport-
+unavailable names fail at startup instead of silently producing an empty tool
+surface.
 
 The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers, CLI commands, and IDE integrations can share the same database concurrently without lock contention. The daemon exits after 1 hour of inactivity.
 

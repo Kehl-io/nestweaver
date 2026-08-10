@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 pub const EFFECTIVE_CONFIG_BINDING_VERSION: u32 = 1;
 const EFFECTIVE_CONFIG_BINDING_FILE: &str = "effective-config.json";
 const EFFECTIVE_CONFIG_BINDING_MAX_BYTES: u64 = 64 * 1024;
+pub const LAST_SUCCESSFUL_CONFIG_VERSION: u32 = 1;
+const LAST_SUCCESSFUL_CONFIG_FILE: &str = "last-successful-config.json";
+const LAST_SUCCESSFUL_CONFIG_MAX_BYTES: u64 = 64 * 1024;
 static EFFECTIVE_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static LAST_SUCCESSFUL_CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 fn effective_config_temp_path(parent: &Path, sequence: u64) -> PathBuf {
@@ -16,6 +21,211 @@ fn effective_config_temp_path(parent: &Path, sequence: u64) -> PathBuf {
         std::process::id(),
         sequence
     ))
+}
+
+fn last_successful_config_temp_path(parent: &Path, sequence: u64) -> PathBuf {
+    parent.join(format!(
+        ".{LAST_SUCCESSFUL_CONFIG_FILE}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ))
+}
+
+fn last_successful_config_backup_path(parent: &Path, sequence: u64) -> PathBuf {
+    parent.join(format!(
+        ".{LAST_SUCCESSFUL_CONFIG_FILE}.{}.{}.bak",
+        std::process::id(),
+        sequence
+    ))
+}
+
+/// Full, stable identity of a database path for persistent local state.
+///
+/// Unlike [`instance_id_from_db_path`], this is never truncated for a unix
+/// socket limit. Database contents are deliberately excluded: replacing or
+/// updating the database at the same canonical path keeps the same local
+/// startup intent.
+pub fn database_path_fingerprint(db_path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let canonical = canonical_db_path(db_path);
+    let canonical = if canonical.is_absolute() {
+        canonical
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&canonical))
+            .unwrap_or(canonical)
+    };
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    use std::fmt::Write as _;
+    for byte in digest {
+        write!(&mut fingerprint, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    fingerprint
+}
+
+/// Daemon-owned persistent startup intent for one canonical database path.
+///
+/// This is intentionally separate from [`EffectiveConfigBinding`]: the latter
+/// is live PID attestation and is removed on exit, while this record survives
+/// idle exit and crashes so a later automatic cold start preserves identity
+/// and authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastSuccessfulConfig {
+    pub version: u32,
+    pub database_fingerprint: String,
+    pub config_path: String,
+}
+
+impl LastSuccessfulConfig {
+    pub fn new(db_path: &Path, config_path: &Path) -> Result<Self, LastSuccessfulConfigError> {
+        let record_path = last_successful_config_path(db_path);
+        let canonical = std::fs::canonicalize(config_path).map_err(|source| {
+            LastSuccessfulConfigError::Read {
+                path: config_path.to_path_buf(),
+                source,
+            }
+        })?;
+        let config_path = canonical
+            .to_str()
+            .ok_or_else(|| LastSuccessfulConfigError::Unsafe {
+                path: record_path,
+                reason: format!(
+                    "canonical config path is not valid UTF-8: {}",
+                    canonical.display()
+                ),
+            })?;
+        Ok(Self {
+            version: LAST_SUCCESSFUL_CONFIG_VERSION,
+            database_fingerprint: database_path_fingerprint(db_path),
+            config_path: config_path.to_string(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum LastSuccessfulConfigError {
+    Absent {
+        path: PathBuf,
+    },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Corrupt {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    Unsafe {
+        path: PathBuf,
+        reason: String,
+    },
+    TooLarge {
+        path: PathBuf,
+        size: u64,
+        max: u64,
+    },
+    UnsupportedVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+    FingerprintMismatch {
+        path: PathBuf,
+        expected: String,
+        found: String,
+    },
+    Serialize {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for LastSuccessfulConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent { path } => write!(
+                f,
+                "last-successful-config record is absent: {}",
+                path.display()
+            ),
+            Self::Read { path, source } => write!(
+                f,
+                "failed to read last-successful-config record {}: {source}",
+                path.display()
+            ),
+            Self::Corrupt { path, source } => write!(
+                f,
+                "last-successful-config record {} is corrupt: {source}",
+                path.display()
+            ),
+            Self::Unsafe { path, reason } => write!(
+                f,
+                "last-successful-config record {} is unsafe: {reason}",
+                path.display()
+            ),
+            Self::TooLarge { path, size, max } => write!(
+                f,
+                "last-successful-config record {} is too large ({size} bytes; maximum {max})",
+                path.display()
+            ),
+            Self::UnsupportedVersion {
+                path,
+                found,
+                supported,
+            } => write!(
+                f,
+                "last-successful-config record {} has unsupported version {found} (supported: {supported})",
+                path.display()
+            ),
+            Self::FingerprintMismatch {
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "last-successful-config record {} belongs to database fingerprint {found}, expected {expected}",
+                path.display()
+            ),
+            Self::Serialize { path, source } => write!(
+                f,
+                "failed to serialize last-successful-config record {}: {source}",
+                path.display()
+            ),
+            Self::Write { path, source } => write!(
+                f,
+                "failed to publish last-successful-config record {}: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LastSuccessfulConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Corrupt { source, .. } | Self::Serialize { source, .. } => Some(source),
+            Self::Absent { .. }
+            | Self::Unsafe { .. }
+            | Self::TooLarge { .. }
+            | Self::UnsupportedVersion { .. }
+            | Self::FingerprintMismatch { .. } => None,
+        }
+    }
 }
 
 /// The configuration source a live daemon actually uses.
@@ -350,6 +560,95 @@ pub fn effective_config_binding_path(instance_id: &str) -> PathBuf {
     runtime_dir(instance_id).join(EFFECTIVE_CONFIG_BINDING_FILE)
 }
 
+fn persistent_state_root() -> PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".local/state")
+        })
+        .join("nestweaver")
+}
+
+/// Private state directory for one database's persistent startup intent.
+pub fn last_successful_config_dir(db_path: &Path) -> PathBuf {
+    persistent_state_root()
+        .join("config-intent")
+        .join(database_path_fingerprint(db_path))
+}
+
+/// Path to the daemon-owned persistent startup-intent record.
+pub fn last_successful_config_path(db_path: &Path) -> PathBuf {
+    last_successful_config_dir(db_path).join(LAST_SUCCESSFUL_CONFIG_FILE)
+}
+
+#[cfg(unix)]
+fn verify_persistent_config_dir_for_owner(dir: &Path, expected_uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "persistent config state path {} is not a real directory",
+                dir.display()
+            ),
+        ));
+    }
+    if metadata.uid() != expected_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "persistent config state directory {} is owned by uid {} (expected {})",
+                dir.display(),
+                metadata.uid(),
+                expected_uid
+            ),
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "persistent config state directory {} has unsafe mode {mode:04o} (expected 0700)",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn secure_persistent_config_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dir)?;
+            }
+            Err(error) => return Err(error),
+        }
+        let metadata = std::fs::symlink_metadata(dir)?;
+        let expected_uid = unsafe { libc::geteuid() };
+        if metadata.file_type().is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == expected_uid
+            && metadata.permissions().mode() & 0o777 != 0o700
+        {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        verify_persistent_config_dir_for_owner(dir, expected_uid)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
 #[cfg(unix)]
 fn verify_effective_config_runtime_dir_for_owner(
     dir: &Path,
@@ -637,16 +936,288 @@ pub fn remove_effective_config_binding(instance_id: &str) -> std::io::Result<()>
     }
 }
 
+/// Atomically publish the configured path that most recently reached daemon
+/// readiness for this database.
+pub fn write_last_successful_config(
+    db_path: &Path,
+    config_path: &Path,
+) -> Result<LastSuccessfulConfig, LastSuccessfulConfigError> {
+    let path = last_successful_config_path(db_path);
+    let record = LastSuccessfulConfig::new(db_path, config_path)?;
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| {
+        LastSuccessfulConfigError::Serialize {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    let parent = path
+        .parent()
+        .expect("last-successful-config path always has a state directory");
+    secure_persistent_config_dir(parent).map_err(|source| LastSuccessfulConfigError::Write {
+        path: path.clone(),
+        source,
+    })?;
+
+    let (temp_path, mut file, sequence) = loop {
+        let sequence =
+            LAST_SUCCESSFUL_CONFIG_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = last_successful_config_temp_path(parent, sequence);
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file, sequence),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(LastSuccessfulConfigError::Write { path, source }),
+        }
+    };
+
+    // Preserve the previous durable inode across any post-rename publication
+    // error. A hard-link backup is local to this private directory and avoids
+    // copying or parsing the old contents, so even a corrupt-but-safe record
+    // can be replaced explicitly without losing the last known bytes if the
+    // new directory entry cannot be synced.
+    let backup_path = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(LastSuccessfulConfigError::Unsafe {
+                    path,
+                    reason: "existing record is not a regular non-symlink file".to_string(),
+                });
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                let expected_owner = unsafe { libc::geteuid() };
+                let mode = metadata.permissions().mode() & 0o777;
+                if metadata.uid() != expected_owner || mode != 0o600 {
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(LastSuccessfulConfigError::Unsafe {
+                        path,
+                        reason: format!(
+                            "existing record owner/mode is unsafe (uid {}, mode {mode:04o})",
+                            metadata.uid()
+                        ),
+                    });
+                }
+            }
+            let backup = last_successful_config_backup_path(parent, sequence);
+            let link_result = match std::fs::hard_link(&path, &backup) {
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A process can die after restoring/publishing the
+                    // authoritative destination but before removing its
+                    // private backup. The destination is authoritative here;
+                    // discard only this colliding internal artifact and retry.
+                    std::fs::remove_file(&backup).and_then(|()| std::fs::hard_link(&path, &backup))
+                }
+                result => result,
+            };
+            if let Err(source) = link_result {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(LastSuccessfulConfigError::Write {
+                    path: path.clone(),
+                    source,
+                });
+            }
+            Some(backup)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(LastSuccessfulConfigError::Read { path, source });
+        }
+    };
+
+    let mut published = false;
+    let write_result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &path)?;
+        published = true;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(source) = write_result {
+        if published {
+            let _ = std::fs::remove_file(&path);
+            if let Some(backup) = &backup_path {
+                let _ = std::fs::rename(backup, &path);
+                let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+            }
+        } else {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        return Err(LastSuccessfulConfigError::Write { path, source });
+    }
+    if let Some(backup) = backup_path {
+        let _ = std::fs::remove_file(backup);
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    Ok(record)
+}
+
+/// Read and fully validate the persistent startup intent for `db_path`.
+pub fn read_last_successful_config(
+    db_path: &Path,
+) -> Result<LastSuccessfulConfig, LastSuccessfulConfigError> {
+    let path = last_successful_config_path(db_path);
+    let parent = path
+        .parent()
+        .expect("last-successful-config path always has a state directory");
+    #[cfg(unix)]
+    if let Err(error) = verify_persistent_config_dir_for_owner(parent, unsafe { libc::geteuid() }) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Err(LastSuccessfulConfigError::Absent { path });
+        }
+        return Err(LastSuccessfulConfigError::Unsafe {
+            path,
+            reason: error.to_string(),
+        });
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LastSuccessfulConfigError::Absent { path });
+        }
+        #[cfg(unix)]
+        Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(LastSuccessfulConfigError::Unsafe {
+                path,
+                reason: "symbolic links are not accepted".to_string(),
+            });
+        }
+        Err(source) => return Err(LastSuccessfulConfigError::Read { path, source }),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|source| LastSuccessfulConfigError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    if !metadata.file_type().is_file() {
+        return Err(LastSuccessfulConfigError::Unsafe {
+            path,
+            reason: "record is not a regular file".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = metadata.uid();
+        let expected_owner = unsafe { libc::geteuid() };
+        if owner != expected_owner {
+            return Err(LastSuccessfulConfigError::Unsafe {
+                path,
+                reason: format!("owned by uid {owner}, expected uid {expected_owner}"),
+            });
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(LastSuccessfulConfigError::Unsafe {
+                path,
+                reason: format!("mode {mode:04o}, expected 0600"),
+            });
+        }
+    }
+    if metadata.len() > LAST_SUCCESSFUL_CONFIG_MAX_BYTES {
+        return Err(LastSuccessfulConfigError::TooLarge {
+            path,
+            size: metadata.len(),
+            max: LAST_SUCCESSFUL_CONFIG_MAX_BYTES,
+        });
+    }
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(LAST_SUCCESSFUL_CONFIG_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| LastSuccessfulConfigError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    if bytes.len() as u64 > LAST_SUCCESSFUL_CONFIG_MAX_BYTES {
+        return Err(LastSuccessfulConfigError::TooLarge {
+            path,
+            size: bytes.len() as u64,
+            max: LAST_SUCCESSFUL_CONFIG_MAX_BYTES,
+        });
+    }
+    let record: LastSuccessfulConfig =
+        serde_json::from_slice(&bytes).map_err(|source| LastSuccessfulConfigError::Corrupt {
+            path: path.clone(),
+            source,
+        })?;
+    if record.version != LAST_SUCCESSFUL_CONFIG_VERSION {
+        return Err(LastSuccessfulConfigError::UnsupportedVersion {
+            path,
+            found: record.version,
+            supported: LAST_SUCCESSFUL_CONFIG_VERSION,
+        });
+    }
+    let expected = database_path_fingerprint(db_path);
+    if record.database_fingerprint != expected {
+        return Err(LastSuccessfulConfigError::FingerprintMismatch {
+            path,
+            expected,
+            found: record.database_fingerprint,
+        });
+    }
+    if record.config_path.is_empty() || !Path::new(&record.config_path).is_absolute() {
+        return Err(LastSuccessfulConfigError::Unsafe {
+            path,
+            reason: "config path must be a non-empty absolute path".to_string(),
+        });
+    }
+    Ok(record)
+}
+
+/// Clear persistent configured intent after a manual default start has become
+/// healthy and its live default provenance has been attested.
+pub fn remove_last_successful_config(db_path: &Path) -> Result<(), LastSuccessfulConfigError> {
+    let path = last_successful_config_path(db_path);
+    let parent = path
+        .parent()
+        .expect("last-successful-config path always has a state directory");
+    #[cfg(unix)]
+    if let Err(error) = verify_persistent_config_dir_for_owner(parent, unsafe { libc::geteuid() }) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(LastSuccessfulConfigError::Unsafe {
+            path,
+            reason: error.to_string(),
+        });
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| LastSuccessfulConfigError::Write { path, source }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(LastSuccessfulConfigError::Write { path, source }),
+    }
+}
+
 /// Directory for daemon log files.
 pub fn log_dir(instance_id: &str) -> PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".local/state")
-        })
-        .join("nestweaver")
-        .join(instance_id)
+    persistent_state_root().join(instance_id)
 }
 
 /// Path to the daemon log file.
@@ -813,6 +1384,200 @@ mod tests {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+
+    fn with_xdg_state<T>(root: &Path, test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", root);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[test]
+    fn last_successful_config_roundtrips_with_full_path_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_state(temp.path(), || {
+            let db = temp.path().join("db").join("brain.lbug");
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            let config = temp.path().join("instance.toml");
+            std::fs::write(&config, "instance_id = \"test\"\n").unwrap();
+
+            let written = write_last_successful_config(&db, &config).unwrap();
+            let read = read_last_successful_config(&db).unwrap();
+            assert_eq!(read, written);
+            assert_eq!(read.database_fingerprint.len(), 64);
+            assert_eq!(
+                Path::new(&read.config_path),
+                std::fs::canonicalize(&config).unwrap()
+            );
+            assert!(
+                last_successful_config_path(&db)
+                    .to_string_lossy()
+                    .contains(&read.database_fingerprint),
+                "the state path itself must use the full fingerprint"
+            );
+
+            let replacement = temp.path().join("replacement.toml");
+            std::fs::write(&replacement, "instance_id = \"replacement\"\n").unwrap();
+            write_last_successful_config(&db, &replacement).unwrap();
+            let entries = std::fs::read_dir(last_successful_config_dir(&db))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(entries.len(), 1, "replacement left a temp/backup artifact");
+            assert_eq!(entries[0].file_name(), LAST_SUCCESSFUL_CONFIG_FILE);
+        });
+    }
+
+    #[test]
+    fn last_successful_config_is_isolated_and_survives_live_binding_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_state(temp.path(), || {
+            let config = temp.path().join("instance.toml");
+            std::fs::write(&config, "instance_id = \"test\"\n").unwrap();
+            let first = temp.path().join("first.lbug");
+            let second = temp.path().join("second.lbug");
+            write_last_successful_config(&first, &config).unwrap();
+            write_last_successful_config(&second, &config).unwrap();
+            assert_ne!(
+                last_successful_config_path(&first),
+                last_successful_config_path(&second)
+            );
+
+            let instance = instance_id_from_db_path(&first);
+            let _ = remove_effective_config_binding(&instance);
+            assert!(read_last_successful_config(&first).is_ok());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn last_successful_config_enforces_private_modes_and_fingerprint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_state(temp.path(), || {
+            let db = temp.path().join("brain.lbug");
+            let config = temp.path().join("instance.toml");
+            std::fs::write(&config, "instance_id = \"test\"\n").unwrap();
+            write_last_successful_config(&db, &config).unwrap();
+            let path = last_successful_config_path(&db);
+            let parent = path.parent().unwrap();
+            assert_eq!(
+                std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+
+            let mut record = read_last_successful_config(&db).unwrap();
+            record.database_fingerprint = "0".repeat(64);
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            assert!(matches!(
+                read_last_successful_config(&db),
+                Err(LastSuccessfulConfigError::FingerprintMismatch { .. })
+            ));
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            assert!(matches!(
+                read_last_successful_config(&db),
+                Err(LastSuccessfulConfigError::Unsafe { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn last_successful_config_remove_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_state(temp.path(), || {
+            let db = temp.path().join("brain.lbug");
+            let config = temp.path().join("instance.toml");
+            std::fs::write(&config, "instance_id = \"test\"\n").unwrap();
+            write_last_successful_config(&db, &config).unwrap();
+            remove_last_successful_config(&db).unwrap();
+            remove_last_successful_config(&db).unwrap();
+            assert!(matches!(
+                read_last_successful_config(&db),
+                Err(LastSuccessfulConfigError::Absent { .. })
+            ));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn last_successful_config_rejects_corrupt_version_oversize_and_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        with_xdg_state(temp.path(), || {
+            let db = temp.path().join("brain.lbug");
+            let config = temp.path().join("instance.toml");
+            std::fs::write(&config, "instance_id = \"test\"\n").unwrap();
+            write_last_successful_config(&db, &config).unwrap();
+            let path = last_successful_config_path(&db);
+
+            std::fs::write(&path, b"not-json").unwrap();
+            assert!(matches!(
+                read_last_successful_config(&db),
+                Err(LastSuccessfulConfigError::Corrupt { .. })
+            ));
+
+            let record = LastSuccessfulConfig::new(&db, &config).unwrap();
+            let unsupported = LastSuccessfulConfig {
+                version: LAST_SUCCESSFUL_CONFIG_VERSION + 1,
+                ..record
+            };
+            std::fs::write(&path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+            assert!(matches!(
+                read_last_successful_config(&db),
+                Err(LastSuccessfulConfigError::UnsupportedVersion { .. })
+            ));
+
+            std::fs::write(
+                &path,
+                vec![b' '; LAST_SUCCESSFUL_CONFIG_MAX_BYTES as usize + 1],
+            )
+            .unwrap();
+            assert!(matches!(
+                read_last_successful_config(&db),
+                Err(LastSuccessfulConfigError::TooLarge { .. })
+            ));
+
+            std::fs::remove_file(&path).unwrap();
+            let target = temp.path().join("target.json");
+            std::fs::write(&target, b"{}").unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(matches!(
+                read_last_successful_config(&db),
+                Err(LastSuccessfulConfigError::Unsafe { .. })
+            ));
+
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+            std::fs::set_permissions(
+                path.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            assert!(matches!(
+                read_last_successful_config(&db),
+                Err(LastSuccessfulConfigError::Unsafe { .. })
+            ));
+        });
     }
 
     #[test]

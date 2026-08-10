@@ -11,7 +11,10 @@ pub mod tantivy_index;
 pub mod traverse;
 pub mod write;
 
-pub use db::{EmbeddingIndexReconciliation, GraphStore, IndexPublicationLease};
+pub use db::{
+    EmbeddingIndexReconciliation, EmbeddingSnapshotLease, EmbeddingSnapshotState, GraphStore,
+    IndexPublicationLease,
+};
 pub use error::{CancelReason, StoreError};
 
 /// Re-export the LadybugDB connection type so callers can use transactional
@@ -313,6 +316,27 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].uid, "repo-1");
         assert_eq!(repos[0].url, "https://github.com/example/repo-1");
+    }
+
+    #[test]
+    fn removed_repositories_do_not_leak_contract_failure_or_migration_debt() {
+        let store = test_store();
+        let repo = make_repo("repo-removed-debt");
+        store.insert_repo(&repo).unwrap();
+        store
+            .set_contract_derivation_failed(&repo.uid, "malformed fixture")
+            .unwrap();
+        let transaction = store.begin_transaction().unwrap();
+        GraphStore::ensure_contract_derivation_v2_on(&transaction).unwrap();
+        store.commit_transaction(&transaction).unwrap();
+        drop(transaction);
+
+        assert_eq!(
+            store.contract_derivation_failures(None).unwrap(),
+            vec![repo.uid.clone()]
+        );
+        store.delete_repo_node(&repo.uid).unwrap();
+        assert!(store.contract_derivation_failures(None).unwrap().is_empty());
     }
 
     /// `root_path` round-trips through insert → list_repos/lookup_repo:

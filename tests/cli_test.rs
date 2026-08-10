@@ -44,6 +44,43 @@ fn cli_help_lists_commands() {
 }
 
 #[test]
+fn mcp_help_hides_deprecated_flag_and_invalid_allowlists_fail_early() {
+    nestweaver_cmd()
+        .args(["mcp", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("allow-mcp-add-sources").not());
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .args(["--tools", "context"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(contains("unknown MCP tool 'context'"));
+
+    drop(nestweaver_store::GraphStore::open_or_create(&db).unwrap());
+    let output = nestweaver_cmd()
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .arg("--allow-mcp-add-sources")
+        .write_stdin("")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("--allow-mcp-add-sources is deprecated")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn config_validate_accepts_minimal_fixture() {
     let config_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/minimal-instance.toml");
@@ -1984,7 +2021,7 @@ fn daemon_status_accepts_db_after_subcommand() {
 }
 
 #[test]
-fn cli_snapshot_stamp_has_repos_and_correct_embedding_model() {
+fn cli_snapshot_stamp_has_repos_and_does_not_invent_embedding_model() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
     let db_path = dir.path().join("test.lbug");
@@ -2071,7 +2108,7 @@ model_id = "sentence-transformers/all-MiniLM-L6-v2"
     std::fs::create_dir_all(dir.path().join("storage")).unwrap();
     std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
 
-    // Build snapshot with --config so embedding_model_id is populated
+    // Build with a config whose model must not override persisted DB truth.
     nestweaver_cmd()
         .args([
             "snapshot",
@@ -2106,17 +2143,22 @@ model_id = "sentence-transformers/all-MiniLM-L6-v2"
         "repo URL '{repo_url}' should reference the indexed repo"
     );
 
-    // Bug 1b: embedding_model_id should come from [embedding], not [inference]
+    // This DB has no vector metadata. The config is compatibility input only;
+    // it must not fabricate an embedding model in the signed stamp.
     let model_id = stamp["embedding_model_id"]
         .as_str()
         .expect("embedding_model_id should be a string");
     assert_eq!(
+        model_id, "",
+        "a DB without embedding metadata must stamp an empty model ID"
+    );
+    assert_ne!(
         model_id, "sentence-transformers/all-MiniLM-L6-v2",
-        "embedding_model_id should come from [embedding].model_id, not [inference].embedding_model"
+        "[embedding].model_id must not override persisted DB truth"
     );
     assert_ne!(
         model_id, "nomic-embed-text",
-        "embedding_model_id should NOT be the inference model"
+        "[inference].embedding_model must not override persisted DB truth"
     );
 }
 

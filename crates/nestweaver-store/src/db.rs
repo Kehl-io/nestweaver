@@ -269,6 +269,29 @@ pub struct GraphStore {
     pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
 }
 
+/// Authoritative embedding state captured while the in-memory embedding mutex
+/// remained held for the complete flush/metadata/count/stage operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingSnapshotState {
+    pub model_id: String,
+    pub dimension: u32,
+    pub count: u64,
+}
+
+/// Lease retaining the embedding mutex after the snapshot artifact and its
+/// metadata have been captured. Snapshot callers keep this alive through the
+/// graph checkpoint and remaining artifact staging.
+pub struct EmbeddingSnapshotLease<'a> {
+    state: EmbeddingSnapshotState,
+    _guard: std::sync::MutexGuard<'a, crate::search::EmbeddingIndex>,
+}
+
+impl EmbeddingSnapshotLease<'_> {
+    pub fn state(&self) -> &EmbeddingSnapshotState {
+        &self.state
+    }
+}
+
 /// True if `msg` is lbug's stale-checkpoint open failure. A crash/OOM/SIGKILL
 /// during lbug's WAL auto-checkpoint (which fires as the WAL grows mid-index, and
 /// also during a backup) can leave a `<db>.wal.checkpoint` whose embedded database
@@ -1285,6 +1308,63 @@ impl GraphStore {
         }
         Ok(())
     }
+
+    /// Durably flush and stage the authoritative embedding artifact without
+    /// allowing an embedding writer to interleave between the recorded
+    /// metadata/count and the copied bytes.
+    pub fn stage_embeddings_for_snapshot(
+        &self,
+        destination: &Path,
+    ) -> Result<EmbeddingSnapshotLease<'_>, StoreError> {
+        let idx = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let count = u64::try_from(idx.len())
+            .map_err(|_| StoreError::Query("embedding count does not fit u64".to_string()))?;
+        let index_dimension = u32::try_from(idx.dimension().unwrap_or(0))
+            .map_err(|_| StoreError::Query("embedding dimension does not fit u32".to_string()))?;
+        let metadata = self.get_embedding_metadata()?;
+
+        let (model_id, dimension) = match metadata {
+            Some((model_id, dimension)) => {
+                if count > 0 && dimension != index_dimension {
+                    return Err(StoreError::Query(format!(
+                        "embedding metadata dimension {dimension} does not match sidecar dimension {index_dimension}"
+                    )));
+                }
+                (model_id, if count > 0 { dimension } else { 0 })
+            }
+            None if count > 0 => {
+                return Err(StoreError::Query(
+                    "embedding sidecar contains vectors but database embedding metadata is absent; re-embed before taking a snapshot"
+                        .to_string(),
+                ));
+            }
+            None => (String::new(), 0),
+        };
+
+        // Flush the canonical sidecar first, then serialize the exact same
+        // mutex-protected index into the snapshot staging directory. Both
+        // writes use atomic_replace_file (file fsync + rename + parent fsync).
+        if let Some(path) = self.embedding_sidecar_path() {
+            idx.save_binary(&path).map_err(|error| {
+                StoreError::Query(format!("flush binary embedding sidecar: {error}"))
+            })?;
+        }
+        idx.save_binary(destination).map_err(|error| {
+            StoreError::Query(format!("stage binary embedding sidecar: {error}"))
+        })?;
+
+        Ok(EmbeddingSnapshotLease {
+            state: EmbeddingSnapshotState {
+                model_id,
+                dimension,
+                count,
+            },
+            _guard: idx,
+        })
+    }
     /// Remove embeddings for graph nodes that no longer exist, update the
     /// live index, and persist the repaired binary sidecar.
     ///
@@ -2284,6 +2364,53 @@ mod tests {
         assert!(
             legacy_path.exists(),
             "failed retirement must preserve fallback"
+        );
+    }
+
+    #[test]
+    fn snapshot_embedding_lease_serializes_metadata_updates() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        store.set_embedding_metadata("model-a", 3).unwrap();
+        assert!(store.add_embedding("symbol:a", vec![1.0, 0.0, 0.0]));
+
+        let staged = dir.path().join("snapshot-embeddings.bin");
+        let lease = store.stage_embeddings_for_snapshot(&staged).unwrap();
+        assert_eq!(lease.state().model_id, "model-a");
+        assert_eq!(lease.state().dimension, 3);
+        assert_eq!(lease.state().count, 1);
+
+        let updater = Arc::clone(&store);
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            updater.set_embedding_metadata("model-b", 3).unwrap();
+            completed_tx.send(()).unwrap();
+        });
+
+        assert!(
+            completed_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "metadata update must wait while snapshot owns the embedding lease"
+        );
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("model-a".to_string(), 3)),
+            "snapshot lease must retain a coherent database/vector fingerprint"
+        );
+
+        drop(lease);
+        completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("metadata update should complete once snapshot releases the lease");
+        join.join().unwrap();
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("model-b".to_string(), 3))
         );
     }
 }

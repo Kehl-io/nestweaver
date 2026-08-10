@@ -87,23 +87,14 @@ fn list_contracts_impl(
         let repos = nestweaver_engine::list_repos(store, None)
             .map_err(|error| Status::internal(format!("list repositories: {error:#}")))?;
         let visible_repos: Vec<_> = repos
-            .iter()
+            .into_iter()
             .filter(|repo| repo_is_visible(&repo.uid))
             .collect();
-        // Preserve the direct CLI resolver's precedence: an exact UID must
-        // beat an earlier repo whose display name happens to equal that UID.
-        let repo = visible_repos
-            .iter()
-            .copied()
-            .find(|repo| repo.uid == filter)
-            .or_else(|| {
-                let needle = filter.to_lowercase();
-                visible_repos.iter().copied().find(|repo| {
-                    nestweaver_engine::repo_display_name(repo).to_lowercase() == needle
-                })
-            })
-            .ok_or_else(|| {
-                Status::invalid_argument(format!("no indexed repo matches --repo '{filter}'"))
+        let repo =
+            nestweaver_engine::resolve_repo_selector(&visible_repos, filter).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "no indexed repo matches --repo '{filter}': {error}"
+                ))
             })?;
         Some(repo.uid.clone())
     } else {
@@ -278,6 +269,7 @@ struct EmbeddingRuntimeStatus {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
 enum EmbeddingRuntimeSnapshot {
     Unavailable {
         status: EmbeddingRuntimeStatus,
@@ -307,6 +299,7 @@ struct EmbeddingRuntime {
     snapshot: std::sync::RwLock<EmbeddingRuntimeSnapshot>,
 }
 
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
 impl EmbeddingRuntime {
     fn unavailable(status: EmbeddingRuntimeStatus) -> Self {
         assert_ne!(status.state, "ready");
@@ -4006,6 +3999,116 @@ impl NestWeaverDaemon for DaemonService {
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Error as i32,
                         message: format!("IndexVault failed: {e:#}"),
+                        files_processed: 0,
+                        files_total: 0,
+                        symbols_found: 0,
+                    }));
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    type RefreshVaultSinceStream = ProgressStream;
+
+    async fn refresh_vault_since(
+        &self,
+        request: Request<RefreshVaultSinceRequest>,
+    ) -> Result<Response<Self::RefreshVaultSinceStream>, Status> {
+        if let Some(crate::auth::IsAdmin(false)) | None =
+            request.extensions().get::<crate::auth::IsAdmin>()
+        {
+            return Err(Status::permission_denied("admin token required"));
+        }
+        let req = request.into_inner();
+        let vault_path = PathBuf::from(&req.vault_path);
+        let vault_name = req.vault_name.clone();
+        let extra_patterns = req.extra_ignore_patterns.clone();
+        let instance_id =
+            resolve_effective_instance_id(&req.instance_id, &self.state.data_instance_id)?;
+        let since = std::time::UNIX_EPOCH
+            .checked_add(Duration::from_secs(req.since_unix_seconds))
+            .ok_or_else(|| Status::invalid_argument("since_unix_seconds is out of range"))?;
+        let state = self.state.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<IndexProgress, Status>>(16);
+        let guard = ConnectionGuard::write(&self.state);
+        let write_lock = self.state.write_mutex.clone();
+        tokio::task::spawn_blocking(move || {
+            let _write_lock = write_lock.blocking_lock();
+            let _guard = guard;
+            let _ = tx.blocking_send(Ok(IndexProgress {
+                phase: Phase::Discovering as i32,
+                message: format!(
+                    "Scanning vault {} for files modified since {}",
+                    vault_path.display(),
+                    req.since_unix_seconds
+                ),
+                files_processed: 0,
+                files_total: 0,
+                symbols_found: 0,
+            }));
+
+            match nestweaver_engine::index_markdown_directory_since_with_store_and_ignore(
+                &state.store,
+                &vault_path,
+                &instance_id,
+                &vault_name,
+                since,
+                &extra_patterns,
+            ) {
+                Ok(result) => {
+                    if let Some(ref tantivy) = state.tantivy
+                        && tantivy.has_writer()
+                        && let Err(error) = tantivy.reindex_from_store(&state.store)
+                    {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
+                                phase: Phase::Error as i32,
+                                message: format!(
+                                    "RefreshVaultSince committed graph changes but Tantivy rebuild failed: {error:#}"
+                                ),
+                                files_processed: result.files_checked as u64,
+                                files_total: result.files_checked as u64,
+                                symbols_found: result.headings_count as u64,
+                            }));
+                        return;
+                    }
+                    let vault_uid = nestweaver_schema::vault_uid(
+                        &instance_id,
+                        &std::fs::canonicalize(&vault_path)
+                            .unwrap_or_else(|_| vault_path.clone())
+                            .to_string_lossy(),
+                    );
+                    if let Err(error) =
+                        nestweaver_engine::record_last_indexed_at(&state.db_path, &vault_uid)
+                    {
+                        tracing::warn!(%error, "failed to record incremental vault timestamp");
+                    }
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Done as i32,
+                        message: format!(
+                            "Incremental refresh of vault '{}': checked {} file(s), updated {} note(s), dropped {} prior note(s), {} heading(s), {} section(s), {} tag(s), {} wikilink(s).",
+                            result.vault_name,
+                            result.files_checked,
+                            result.notes_updated,
+                            result.notes_deleted,
+                            result.headings_count,
+                            result.sections_count,
+                            result.tags_count,
+                            result.wikilinks_resolved,
+                        ),
+                        files_processed: result.files_checked as u64,
+                        files_total: result.files_checked as u64,
+                        symbols_found: result.headings_count as u64,
+                    }));
+                }
+                Err(error) => {
+                    let _ = tx.blocking_send(Ok(IndexProgress {
+                        phase: Phase::Error as i32,
+                        message: format!("RefreshVaultSince failed: {error:#}"),
                         files_processed: 0,
                         files_total: 0,
                         symbols_found: 0,
@@ -7814,6 +7917,12 @@ pub async fn run_server(
         format!("remove stale effective-config binding for instance {instance_id}")
     })?;
 
+    // Parse explicit config before snapshot compatibility checks. Core-schema
+    // snapshots deliberately support configless replicas; extension snapshots
+    // require this config so their effective schema can be mediated.
+    let (instance_cfg, effective_config) =
+        load_daemon_instance_config(config_path, server_opts.is_some())?;
+
     // Snapshot replica: materialize the snapshot into a private working copy and
     // serve it read-only. `read_only` gates out the write RPCs (via the
     // `ReadOnlyGuard` transport layer) and the write machinery
@@ -7825,23 +7934,23 @@ pub async fn run_server(
         .is_some();
     let db_path = if let Some(snapshot_dir) = server_opts.as_ref().and_then(|o| o.snapshot.clone())
     {
-        let cfg = config_path.and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok());
-        let (_, _, schema_hash) = nestweaver_engine::schema_hashes(cfg.as_ref());
-        let embedding_model = cfg
+        let schema_hash = instance_cfg
             .as_ref()
-            .map(|c| c.embedding.model_id.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+            .map(|cfg| nestweaver_engine::schema_hashes(Some(cfg)).2);
+        let embedding_model = instance_cfg
+            .as_ref()
+            .map(|cfg| cfg.embedding.model_id.as_str());
         // Private per-replica working dir keyed on the instance id so two
         // co-located replicas (distinct `--db` under one parent) never share a
         // mutable path and clobber each other's materialized copy.
         let working_dir = replica_working_dir(&db_path, &instance_id);
         tracing::info!(snapshot = %snapshot_dir.display(), "booting as read-only snapshot replica");
-        nestweaver_engine::materialize_snapshot(
+        nestweaver_engine::materialize_snapshot_with_config(
             &snapshot_dir,
             &working_dir,
             env!("CARGO_PKG_VERSION"),
-            &schema_hash,
-            &embedding_model,
+            schema_hash.as_deref(),
+            embedding_model,
         )
         .with_context(|| format!("failed to materialize snapshot {}", snapshot_dir.display()))?
     } else {
@@ -7924,8 +8033,6 @@ pub async fn run_server(
     // unreadable, or malformed input is fatal in both UDS and network server
     // modes; otherwise a restart-time file race could silently demote the
     // instance to compiled-default identity and authorization.
-    let (instance_cfg, effective_config) =
-        load_daemon_instance_config(config_path, server_opts.is_some())?;
     let live_binding = lifecycle::EffectiveConfigBinding::new(
         std::process::id(),
         live_binding_source(&effective_config),
@@ -8239,6 +8346,7 @@ pub async fn run_server(
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
+
     // The line a stalled-boot investigation actually needs: how long the client
     // had to wait, and where it went.
     //
@@ -9372,6 +9480,23 @@ pub async fn run_server(
     // the load, and semantic search returns "model not loaded" until it completes. candle needs
     // the main thread for Metal, and this keeps cache resolution and model construction from
     // delaying the bind.
+    //
+    // Durable configured intent is published at this final readiness barrier:
+    // the authoritative store, authorization, listener, and all fallible
+    // pre-serve setup are complete, while no gRPC health request can yet be
+    // served. Optional embedding readiness is deliberately outside this
+    // barrier. Network `server` mode has no local cold-autostart lifecycle and
+    // therefore does not own this local UDS restart intent.
+    if server_opts.is_none()
+        && let Some(config_path) = config_path
+    {
+        lifecycle::write_last_successful_config(&db_path, config_path).with_context(|| {
+            format!(
+                "publish last successful config for daemon database {}",
+                db_path.display()
+            )
+        })?;
+    }
     let uds_serve = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(uds_svc)
@@ -15424,6 +15549,7 @@ external_model = "unavailable-test-model"
         "WatchCode",
         "IndexRepo",
         "IndexVault",
+        "RefreshVaultSince",
         "RemoveRepo",
         "MergeInstance",
         // Previously UNGUARDED — the core of finding #10.
@@ -15535,6 +15661,7 @@ external_model = "unavailable-test-model"
             "ImpactAnalysis",
             "IndexRepo",
             "IndexVault",
+            "RefreshVaultSince",
             "Investigate",
             "InvestigateExpand",
             "InvestigateHydrate",

@@ -41,6 +41,11 @@ const COPY_CSV_OPTS: &str = "(PARALLEL=FALSE, DELIM=',', QUOTE='\"', ESCAPE='\"'
 /// carries that distinction across the two, so it is written by the indexer and
 /// read by [`GraphStore::contract_derivation_failures`].
 pub const CONTRACT_DERIVATION_FAILED_PREFIX: &str = "contract_derivation_failed:";
+/// Current repository-scoped Contract identity generation.
+pub const CONTRACT_DERIVATION_GENERATION: &str = "2";
+pub const CONTRACT_DERIVATION_GENERATION_KEY: &str = "contract_derivation_generation";
+/// Per-repo debt left by the global v1 -> v2 Contract identity migration.
+pub const CONTRACT_DERIVATION_DEBT_PREFIX: &str = "contract_derivation_debt:";
 
 /// What a classified destructive store mutation can prove about durable state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1340,6 +1345,26 @@ impl GraphStore {
         wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
         wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<usize, StoreError> {
+        // Project membership is derived outside the vault hierarchy, but the
+        // authoritative vault replacement DETACH-deletes every old Note.
+        // Preserve membership for stable note UIDs that survive the refresh;
+        // truly removed notes intentionally lose their project edges.
+        let replacement_uids: std::collections::HashSet<&str> =
+            notes.iter().map(|note| note.uid.as_str()).collect();
+        let mut preserved_project_edges = Vec::new();
+        if vault_existed {
+            for project in self.list_projects()? {
+                for note_uid in self.list_project_note_uids(&project.uid)? {
+                    if replacement_uids.contains(note_uid.as_str()) {
+                        preserved_project_edges.push((project.uid.clone(), note_uid));
+                    }
+                }
+            }
+        }
+        let preserved_project_refs = preserved_project_edges
+            .iter()
+            .map(|(project, note)| (project.as_str(), note.as_str()))
+            .collect::<Vec<_>>();
         let conn = self.begin_transaction()?;
 
         // Delete old vault data within the transaction (if it existed).
@@ -1378,6 +1403,7 @@ impl GraphStore {
             wikilink_to_note_edges,
             wikilink_to_heading_edges,
         )?;
+        Self::batch_insert_project_note_edges_on(&conn, &preserved_project_refs)?;
 
         self.commit_transaction(&conn)?;
         Ok(deleted)
@@ -2073,8 +2099,15 @@ impl GraphStore {
     /// silently succeeds if the table does not exist.
     pub fn delete_unresolved_wikilinks_for_note(&self, note_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_unresolved_wikilinks_for_note_on(&conn, note_uid)
+    }
+
+    fn delete_unresolved_wikilinks_for_note_on(
+        conn: &lbug::Connection<'_>,
+        note_uid: &str,
+    ) -> Result<(), StoreError> {
         if let Err(e) = exec_params(
-            &conn,
+            conn,
             "MATCH (u:UnresolvedWikilink {source_note_uid: $uid}) DETACH DELETE u",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         ) {
@@ -2410,14 +2443,34 @@ impl GraphStore {
     /// the next reindex pass.
     pub fn delete_note_cascade(&self, note_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_note_cascade_on(&conn, note_uid)
+    }
 
+    /// Atomically delete one note and all of its owned graph data.
+    pub fn delete_note_cascade_atomic(&self, note_uid: &str) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        if let Err(error) = Self::delete_note_cascade_on(&conn, note_uid) {
+            return match self.rollback_transaction(&conn) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(StoreError::Query(format!(
+                    "{error}; atomic note deletion rollback failed: {rollback}"
+                ))),
+            };
+        }
+        self.commit_transaction(&conn)
+    }
+
+    fn delete_note_cascade_on(
+        conn: &lbug::Connection<'_>,
+        note_uid: &str,
+    ) -> Result<(), StoreError> {
         // 1. Drop every Section whose ownership property references this
         //    note, including fragments whose NOTE_HAS_SECTION edge is missing.
         //    DETACH removes the
         //    NOTE_HAS_SECTION, HEADING_HAS_SECTION, WIKILINK_TO_NOTE
         //    (incoming) and SECTION_TAGGED_WITH edges along with it.
         exec_params(
-            &conn,
+            conn,
             "MATCH (s:Section) WHERE s.note_uid = $uid DETACH DELETE s",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -2426,7 +2479,7 @@ impl GraphStore {
         //    independent pass also handles a missing or corrupt note_uid
         //    property.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_SECTION]->(s:Section) DETACH DELETE s",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -2438,7 +2491,7 @@ impl GraphStore {
         //    section was dropped above), HEADING_PARENT (both directions),
         //    and WIKILINK_TO_HEADING (incoming).
         exec_params(
-            &conn,
+            conn,
             "MATCH (h:Heading) WHERE h.note_uid = $uid DETACH DELETE h",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -2447,7 +2500,7 @@ impl GraphStore {
         //    independent pass also handles a missing or corrupt note_uid
         //    property.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -2456,16 +2509,122 @@ impl GraphStore {
         //    NOTE_TAGGED_WITH, PROJECT_INCLUDES_NOTE, and any incoming
         //    WIKILINK_TO_NOTE edges from other notes' sections.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {uid: $uid}) DETACH DELETE n",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
 
         // 6. Drop any recorded unresolved-wikilink rows for this note so they
         //    do not linger after re-index (e.g. once the target note appears).
-        self.delete_unresolved_wikilinks_for_note(note_uid)?;
+        Self::delete_unresolved_wikilinks_for_note_on(conn, note_uid)?;
 
         Ok(())
+    }
+
+    /// Apply a complete incremental vault refresh in one transaction.
+    ///
+    /// Every incumbent replacement/removal, every replacement node and edge,
+    /// the vault's rebuilt wikilinks, and orphan-tag cleanup commit together.
+    /// Any pre-commit failure rolls the entire old graph back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn incremental_vault_refresh_atomically(
+        &self,
+        vault: &Vault,
+        delete_note_uids: &[String],
+        rebuild_link_source_uids: &[String],
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
+        unresolved_wikilinks: &[UnresolvedWikilinkRecord],
+        typed_edges: &[ResolvedEdge],
+        project_note_edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let mutation = (|| {
+            exec_params(
+                &conn,
+                "MERGE (v:Vault {uid: $uid}) SET v.name = $name, v.root_path = $rp, v.instance_id = $iid",
+                vec![
+                    ("uid", lbug::Value::String(vault.uid.clone())),
+                    ("name", lbug::Value::String(vault.name.clone())),
+                    ("rp", lbug::Value::String(vault.root_path.clone())),
+                    ("iid", lbug::Value::String(vault.instance_id.clone())),
+                ],
+            )?;
+            // Rebuild every successfully-parsed source's outgoing links. This
+            // preserves inbound links to replaced targets and makes title
+            // resolution a function of the prospective graph, not file order.
+            for note_uid in rebuild_link_source_uids {
+                exec_params(
+                    &conn,
+                    "MATCH (s:Section) WHERE s.note_uid = $uid \
+                     MATCH (s)-[r:WIKILINK_TO_NOTE]->() DELETE r",
+                    vec![("uid", lbug::Value::String(note_uid.clone()))],
+                )?;
+                exec_params(
+                    &conn,
+                    "MATCH (s:Section) WHERE s.note_uid = $uid \
+                     MATCH (s)-[r:WIKILINK_TO_HEADING]->() DELETE r",
+                    vec![("uid", lbug::Value::String(note_uid.clone()))],
+                )?;
+                Self::delete_unresolved_wikilinks_for_note_on(&conn, note_uid)?;
+                for rel in ["SUPERSEDES", "DEPENDS_ON", "CAUSED_BY", "RELATES_TO"] {
+                    exec_params(
+                        &conn,
+                        &format!("MATCH (n:Note {{uid: $uid}})-[r:{rel}]->() DELETE r"),
+                        vec![("uid", lbug::Value::String(note_uid.clone()))],
+                    )?;
+                }
+            }
+            for note_uid in delete_note_uids {
+                Self::delete_note_cascade_on(&conn, note_uid)?;
+            }
+            Self::bulk_vault_write_on(
+                &conn,
+                notes,
+                headings,
+                sections,
+                vault_note_edges,
+                note_heading_edges,
+                note_section_edges,
+                heading_section_edges,
+                heading_parent_edges,
+                tags,
+                note_tag_edges,
+                section_tag_edges,
+                wikilink_to_note_edges,
+                wikilink_to_heading_edges,
+            )?;
+            Self::batch_insert_unresolved_wikilinks_on(&conn, unresolved_wikilinks)?;
+            Self::batch_insert_edges_on(&conn, typed_edges)?;
+            Self::batch_insert_project_note_edges_on(&conn, project_note_edges)?;
+            exec_params(
+                &conn,
+                "MATCH (t:Tag) WHERE t.vault_uid = $vid \
+                 AND NOT (t)<-[:NOTE_TAGGED_WITH]-() \
+                 AND NOT (t)<-[:SECTION_TAGGED_WITH]-() DETACH DELETE t",
+                vec![("vid", lbug::Value::String(vault.uid.clone()))],
+            )
+        })();
+        if let Err(error) = mutation {
+            return match self.rollback_transaction(&conn) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(StoreError::Query(format!(
+                    "{error}; atomic incremental vault refresh rollback failed: {rollback}"
+                ))),
+            };
+        }
+        self.commit_transaction(&conn)
     }
 
     /// Cascade-delete a Vault and every Note belonging to it using bulk
@@ -4486,6 +4645,15 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_project_note_edges_on(&conn, edges)
+    }
+
+    /// Insert materialized project-note membership using an existing
+    /// transaction connection.
+    pub fn batch_insert_project_note_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (p:Project {uid: $pid}), (n:Note {uid: $nid}) \
@@ -5096,7 +5264,7 @@ impl GraphStore {
     /// helper serves both WIKILINK_TO_NOTE and WIKILINK_TO_HEADING. Best-effort:
     /// a missing table yields an empty vec rather than an error, matching how
     /// the cascade treats these tables.
-    fn wikilink_edges_for_vault(
+    pub fn wikilink_edges_for_vault(
         &self,
         vault_uid: &str,
         rel: &str,
@@ -5126,6 +5294,8 @@ impl GraphStore {
         };
         Ok(result
             .filter_map(|row| {
+                let display = crate::read::extract_string(&row, 3).unwrap_or_default();
+                let target = crate::read::extract_string(&row, 4).unwrap_or_default();
                 Some((
                     crate::read::extract_string(&row, 0).ok()?,
                     crate::read::extract_string(&row, 1).ok()?,
@@ -5136,11 +5306,11 @@ impl GraphStore {
                             _ => None,
                         })
                         .unwrap_or(0.0),
-                    crate::read::extract_string(&row, 3).unwrap_or_default(),
+                    display.clone(),
                     // nw-122: `target` is empty on rows written before the
                     // column existed; readers fall back to `display`, which is
                     // exactly what those rows have always carried.
-                    crate::read::extract_string(&row, 4).unwrap_or_default(),
+                    if target.is_empty() { display } else { target },
                 ))
             })
             .collect())
@@ -5149,7 +5319,7 @@ impl GraphStore {
     /// Read every UnresolvedWikilink row as
     /// `(uid, source_note_uid, source_path, source_title, wikilink_text)`.
     /// Callers filter by source note. Best-effort on a missing table.
-    fn all_unresolved_wikilinks(&self) -> Result<Vec<UnresolvedWikilinkRecord>, StoreError> {
+    pub fn all_unresolved_wikilinks(&self) -> Result<Vec<UnresolvedWikilinkRecord>, StoreError> {
         let conn = self.conn()?;
         let q = "MATCH (u:UnresolvedWikilink) \
                  RETURN u.uid, u.source_note_uid, u.source_path, u.source_title, u.wikilink_text";
@@ -6423,6 +6593,14 @@ impl GraphStore {
     /// is keyed by the fixed string `"embedding"` — only one such record
     /// can exist at a time. Calling this again replaces any previous value.
     pub fn set_embedding_metadata(&self, model_id: &str, dimension: u32) -> Result<(), StoreError> {
+        // Lock order is embedding index -> database. Snapshot capture uses the
+        // same order while retaining the index guard through metadata capture
+        // and sidecar staging. Taking the database connection first here would
+        // permit an AB/BA deadlock and a model/vector split-brain snapshot.
+        let mut embedding_index = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let conn = self.conn()?;
 
         // Encode both fields into a single JSON string so we can use the
@@ -6451,10 +6629,7 @@ impl GraphStore {
             // Keep the in-memory index's recorded model in sync with what was
             // just persisted, so the recorded-model write guard in this
             // long-lived store checks against the new fingerprint.
-            self.embedding_index
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_recorded_model_id(Some(model_id.to_string()));
+            embedding_index.set_recorded_model_id(Some(model_id.to_string()));
         }
         result
     }
@@ -6506,15 +6681,118 @@ impl GraphStore {
     /// has no marker to clear.
     pub fn clear_contract_derivation_failed(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        let _ = exec_params(
-            &conn,
+        Self::clear_contract_derivation_failed_on(&conn, repo_uid)
+    }
+
+    /// Clear a repository's failure marker on the caller's transaction.
+    pub fn clear_contract_derivation_failed_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
+        exec_params(
+            conn,
             "MATCH (m:Meta {key: $k}) DETACH DELETE m",
             vec![(
                 "k",
                 lbug::Value::String(format!("{CONTRACT_DERIVATION_FAILED_PREFIX}{repo_uid}")),
             )],
+        )
+    }
+
+    /// Upgrade the derived Contract graph from global v1 UIDs to repository-
+    /// scoped v2 UIDs inside the caller's publication transaction.
+    ///
+    /// Contract rows are wholly derived. The first v2 publisher therefore
+    /// removes every legacy row, marks every indexed repo as owing a v2
+    /// derivation, and records the generation atomically. The current repo's
+    /// debt is cleared only after its scoped rows and edges have landed.
+    pub fn ensure_contract_derivation_v2_on(conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+        let generation = {
+            let mut stmt = conn
+                .prepare("MATCH (m:Meta {key: $k}) RETURN m.value")
+                .map_err(|e| StoreError::Query(format!("prepare contract generation: {e}")))?;
+            let mut rows = conn
+                .execute(
+                    &mut stmt,
+                    vec![(
+                        "k",
+                        lbug::Value::String(CONTRACT_DERIVATION_GENERATION_KEY.to_string()),
+                    )],
+                )
+                .map_err(|e| StoreError::Query(format!("read contract generation: {e}")))?;
+            rows.next()
+                .and_then(|row| crate::read::extract_string(&row, 0).ok())
+        };
+        if generation.as_deref() == Some(CONTRACT_DERIVATION_GENERATION) {
+            return Ok(());
+        }
+
+        let repo_uids: Vec<String> = conn
+            .query("MATCH (r:Repo) RETURN r.uid")
+            .map_err(|e| StoreError::Query(format!("list repos for contract migration: {e}")))?
+            .filter_map(|row| crate::read::extract_string(&row, 0).ok())
+            .collect();
+
+        conn.query("MATCH (c:Contract) DETACH DELETE c")
+            .map_err(|e| StoreError::Query(format!("purge legacy contracts: {e}")))?;
+
+        for repo_uid in repo_uids {
+            let key = format!("{CONTRACT_DERIVATION_DEBT_PREFIX}{repo_uid}");
+            let _ = exec_params(
+                conn,
+                "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+                vec![("k", lbug::Value::String(key.clone()))],
+            );
+            exec_params(
+                conn,
+                "CREATE (:Meta {key: $k, value: $v})",
+                vec![
+                    ("k", lbug::Value::String(key)),
+                    (
+                        "v",
+                        lbug::Value::String(CONTRACT_DERIVATION_GENERATION.to_string()),
+                    ),
+                ],
+            )?;
+        }
+
+        let _ = exec_params(
+            conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![(
+                "k",
+                lbug::Value::String(CONTRACT_DERIVATION_GENERATION_KEY.to_string()),
+            )],
         );
-        Ok(())
+        exec_params(
+            conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                (
+                    "k",
+                    lbug::Value::String(CONTRACT_DERIVATION_GENERATION_KEY.to_string()),
+                ),
+                (
+                    "v",
+                    lbug::Value::String(CONTRACT_DERIVATION_GENERATION.to_string()),
+                ),
+            ],
+        )
+    }
+
+    /// Clear one repository's migration debt on the caller's transaction.
+    pub fn clear_contract_derivation_debt_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
+        exec_params(
+            conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![(
+                "k",
+                lbug::Value::String(format!("{CONTRACT_DERIVATION_DEBT_PREFIX}{repo_uid}")),
+            )],
+        )
     }
 }
 
@@ -7293,6 +7571,131 @@ mod tests {
             after, before,
             "merge destroyed the wikilink graph: {before} -> {after}"
         );
+    }
+
+    #[test]
+    fn whole_incremental_refresh_failure_preserves_both_incumbents_and_generation() {
+        let store = GraphStore::in_memory().expect("store");
+        let vault_uid = "vlt:replace:atomic";
+        store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "brain".to_string(),
+                root_path: "/brain".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let incumbent = |suffix: &str| Note {
+            uid: format!("note:vlt:replace:atomic:{suffix}"),
+            vault_uid: vault_uid.to_string(),
+            file_path: format!("{suffix}.md"),
+            title: format!("Incumbent {suffix}"),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 1,
+            content_hash: "old".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        let old_a = incumbent("a");
+        let old_b = incumbent("b");
+        for note in [&old_a, &old_b] {
+            store.insert_note(note).unwrap();
+            store.insert_vault_note_edge(vault_uid, &note.uid).unwrap();
+        }
+        let old_section = Section {
+            uid: format!("sec:{vault_uid}:a"),
+            note_uid: old_a.uid.clone(),
+            heading_uid: None,
+            start_line: 1,
+            end_line: 2,
+            text_hash: "old-section".to_string(),
+            text_content: "[[Incumbent b]] #old".to_string(),
+            word_count: 2,
+            pagerank_score: None,
+        };
+        store.insert_section(&old_section).unwrap();
+        store
+            .batch_insert_note_section_edges(&[(old_a.uid.as_str(), old_section.uid.as_str())])
+            .unwrap();
+        store
+            .batch_insert_wikilink_to_note_edges(&[(
+                old_section.uid.as_str(),
+                old_b.uid.as_str(),
+                1.0,
+                "Incumbent b",
+                "Incumbent b",
+            )])
+            .unwrap();
+        let old_tag = Tag {
+            uid: format!("tag:{vault_uid}:old"),
+            vault_uid: vault_uid.to_string(),
+            name: "old".to_string(),
+        };
+        store.insert_tag(&old_tag).unwrap();
+        store
+            .batch_insert_note_tag_edges(&[(old_a.uid.as_str(), old_tag.uid.as_str())])
+            .unwrap();
+        store
+            .insert_unresolved_wikilink(
+                "unresolved:old",
+                &old_a.uid,
+                &old_a.file_path,
+                &old_a.title,
+                "Missing",
+            )
+            .unwrap();
+        let generation = store.graph_generation();
+        let replacement = Note {
+            title: "Replacement".to_string(),
+            content_hash: "new".to_string(),
+            ..old_a.clone()
+        };
+        let error = store
+            .incremental_vault_refresh_atomically(
+                &Vault {
+                    uid: vault_uid.to_string(),
+                    name: "new-name".to_string(),
+                    root_path: "/new-root".to_string(),
+                    instance_id: "new-instance".to_string(),
+                },
+                &[old_a.uid.clone(), old_b.uid.clone()],
+                &[],
+                &[replacement.clone(), replacement],
+                &[],
+                &[],
+                &[(vault_uid, old_a.uid.as_str())],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect_err("duplicate replacement UID must fail after the staged delete");
+        assert!(!error.to_string().is_empty());
+
+        let notes = store.list_notes(Some(vault_uid)).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().any(|note| note.title == "Incumbent a"));
+        assert!(notes.iter().any(|note| note.title == "Incumbent b"));
+        assert!(notes.iter().all(|note| note.content_hash == "old"));
+        let vault = store.lookup_vault(vault_uid).unwrap();
+        assert_eq!(vault.name, "brain");
+        assert_eq!(vault.root_path, "/brain");
+        assert_eq!(vault.instance_id, "test");
+        assert_eq!(store.count_wikilink_edges().unwrap(), 1);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 1);
+        assert_eq!(store.list_tags(Some(vault_uid)).unwrap().len(), 1);
+        assert_eq!(store.graph_generation(), generation);
     }
 
     #[test]
