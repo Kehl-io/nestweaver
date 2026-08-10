@@ -8,7 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Bump this ONLY when the snapshot layout changes in a backwards-incompatible
 /// way (new required files, changed checksum format, etc.).  Routine engine
 /// releases that don't touch the snapshot wire format should leave this alone.
-pub const MIN_SNAPSHOT_READER_VERSION: &str = "0.11.0";
+/// Snapshot-format capability level implemented by this reader.
+///
+/// Format v2 makes the embedding sidecar part of the authoritative snapshot
+/// state.  The first shipped reader did not understand that invariant, so v2
+/// writers must fence it out even while this development tree still reports
+/// the older package version.  New readers compare against this capability
+/// level; old readers compare against their package version and reject v2.
+pub const MIN_SNAPSHOT_READER_VERSION: &str = "4.1.1";
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 pub const SNAPSHOT_CAPABILITY_EMBEDDINGS: &str = "embedding-sidecar-v1";
 
@@ -290,6 +297,12 @@ pub fn build_snapshot_from_store(
         let embedding = embedding_lease.state();
         authoritative_stamp.format_version = SNAPSHOT_FORMAT_VERSION;
         authoritative_stamp.capabilities = vec![SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()];
+        if !semver_ge(
+            &authoritative_stamp.min_compatible_engine,
+            MIN_SNAPSHOT_READER_VERSION,
+        ) {
+            authoritative_stamp.min_compatible_engine = MIN_SNAPSHOT_READER_VERSION.to_string();
+        }
         authoritative_stamp.embedding_model_id = embedding.model_id.clone();
         authoritative_stamp.embedding_dimension = embedding.dimension;
         authoritative_stamp.embedding_count = embedding.count;
@@ -542,7 +555,18 @@ pub fn load_snapshot_with_config(
 
     // The snapshot requires at least min_compatible_engine to load it.
     // If the running engine_version < min_compatible_engine, reject.
-    if !semver_ge(engine_version, &stamp.min_compatible_engine) {
+    // `engine_version` remains the application compatibility input.  For v2,
+    // this source tree has a reader capability newer than its package version;
+    // using the explicit capability lets it read snapshots it writes while the
+    // raised stamp still makes every pre-v2 reader fail closed.
+    let reader_version = if stamp.format_version >= 2
+        && semver_ge(MIN_SNAPSHOT_READER_VERSION, &stamp.min_compatible_engine)
+    {
+        MIN_SNAPSHOT_READER_VERSION
+    } else {
+        engine_version
+    };
+    if !semver_ge(reader_version, &stamp.min_compatible_engine) {
         anyhow::bail!(
             "snapshot requires engine >= {} but current engine is {}; \
              rebuild the snapshot with a newer engine or downgrade the min_compatible_engine requirement",
@@ -620,6 +644,24 @@ pub fn materialize_snapshot_with_config(
     expected_schema_hash: Option<&str>,
     expected_embedding_model: Option<&str>,
 ) -> Result<PathBuf, anyhow::Error> {
+    materialize_snapshot_with_config_and_hook(
+        snapshot_dir,
+        working_dir,
+        engine_version,
+        expected_schema_hash,
+        expected_embedding_model,
+        || {},
+    )
+}
+
+fn materialize_snapshot_with_config_and_hook(
+    snapshot_dir: &Path,
+    working_dir: &Path,
+    engine_version: &str,
+    expected_schema_hash: Option<&str>,
+    expected_embedding_model: Option<&str>,
+    after_source_verification: impl FnOnce(),
+) -> Result<PathBuf, anyhow::Error> {
     // Compat gate first — refuse an incompatible snapshot before touching disk.
     load_snapshot_with_config(
         snapshot_dir,
@@ -627,41 +669,61 @@ pub fn materialize_snapshot_with_config(
         expected_schema_hash,
         expected_embedding_model,
     )?;
+    after_source_verification();
 
     let staging = sibling_staging_path(working_dir, "snapshot-restore")?;
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
     }
     std::fs::create_dir(&staging)?;
-    let db_path = staging.join(GRAPH_FILE);
-    std::fs::copy(snapshot_dir.join(GRAPH_FILE), &db_path)
-        .map_err(|e| anyhow::anyhow!("failed to copy snapshot graph file: {e}"))?;
+    let verified_snapshot = staging.join("verified-snapshot");
+    let result = (|| {
+        // Copy the snapshot representation first, then verify the copied bytes.
+        // The source can change after the initial gate; only this staged,
+        // checksum-verified copy is allowed to become the live replica.
+        nestweaver_storage::copy_dir_all(snapshot_dir, &verified_snapshot)?;
+        load_snapshot_with_config(
+            &verified_snapshot,
+            engine_version,
+            expected_schema_hash,
+            expected_embedding_model,
+        )?;
 
-    // Relocate JSON sidecars into the store's `<db><suffix>` convention.
-    for (src_name, suffix) in [
-        (SIDECAR_PAGERANK, ".pagerank.json"),
-        (SIDECAR_MANIFESTS, ".manifests.json"),
-        (SIDECAR_EMBEDDINGS, ".embeddings.bin"),
-    ] {
-        let src = snapshot_dir.join(src_name);
-        if src.exists() {
-            let dst = crate::sidecar_path(&db_path, suffix);
-            std::fs::copy(&src, &dst).map_err(|e| {
-                anyhow::anyhow!("failed to restore snapshot sidecar {}: {e}", src.display())
-            })?;
+        let db_path = staging.join(GRAPH_FILE);
+        std::fs::rename(verified_snapshot.join(GRAPH_FILE), &db_path)
+            .map_err(|e| anyhow::anyhow!("failed to stage verified snapshot graph file: {e}"))?;
+
+        // Relocate JSON sidecars into the store's `<db><suffix>` convention.
+        for (src_name, suffix) in [
+            (SIDECAR_PAGERANK, ".pagerank.json"),
+            (SIDECAR_MANIFESTS, ".manifests.json"),
+            (SIDECAR_EMBEDDINGS, ".embeddings.bin"),
+        ] {
+            let src = verified_snapshot.join(src_name);
+            if src.exists() {
+                let dst = crate::sidecar_path(&db_path, suffix);
+                std::fs::rename(&src, &dst).map_err(|e| {
+                    anyhow::anyhow!("failed to stage verified sidecar {}: {e}", src.display())
+                })?;
+            }
         }
-    }
 
-    // Relocate the Tantivy index directory into `<db>.tantivy`.
-    let tantivy_src = snapshot_dir.join(SIDECAR_TANTIVY_DIR);
-    if tantivy_src.is_dir() {
-        let tantivy_dst = crate::sidecar_path(&db_path, ".tantivy");
-        nestweaver_storage::copy_dir_all(&tantivy_src, &tantivy_dst)
-            .map_err(|e| anyhow::anyhow!("failed to restore snapshot tantivy index: {e}"))?;
+        // Relocate the Tantivy index directory into `<db>.tantivy`.
+        let tantivy_src = verified_snapshot.join(SIDECAR_TANTIVY_DIR);
+        if tantivy_src.is_dir() {
+            let tantivy_dst = crate::sidecar_path(&db_path, ".tantivy");
+            std::fs::rename(&tantivy_src, &tantivy_dst)
+                .map_err(|e| anyhow::anyhow!("failed to stage verified tantivy index: {e}"))?;
+        }
+        std::fs::remove_dir_all(&verified_snapshot)?;
+        sync_directory_tree(&staging)?;
+        publish_restored_directory(&staging, working_dir)?;
+        Ok(working_dir.join(GRAPH_FILE))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
     }
-    sync_directory_tree(&staging)?;
-    publish_restored_directory(&staging, working_dir)?;
-    Ok(working_dir.join(GRAPH_FILE))
+    result
 }
 
 fn publish_restored_directory(staging: &Path, destination: &Path) -> Result<(), anyhow::Error> {
@@ -1024,6 +1086,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
         let db = make_test_db(dir.path());
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        store
+            .set_embedding_metadata("text-embedding-3-small", 3)
+            .unwrap();
+        assert!(store.add_embedding("symbol:test", vec![1.0, 0.0, 0.0]));
 
         let stamp = make_stamp(
             "0.1.0",
@@ -1032,7 +1099,7 @@ mod tests {
             "text-embedding-3-small",
         );
         let manifest = make_manifest();
-        build_snapshot(&snap_dir, &stamp, &manifest, &db).unwrap();
+        build_snapshot_from_store(&snap_dir, &stamp, &manifest, &store).unwrap();
 
         let result = load_snapshot(
             &snap_dir,
@@ -1110,6 +1177,30 @@ mod tests {
     }
 
     #[test]
+    fn v2_snapshot_fences_old_reader_but_current_reader_accepts_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+
+        let stamp = build_snapshot(
+            &snap_dir,
+            &make_stamp("4.1.0", "0.11.0", "schema", ""),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        assert_eq!(stamp.format_version, SNAPSHOT_FORMAT_VERSION);
+        assert_eq!(stamp.min_compatible_engine, MIN_SNAPSHOT_READER_VERSION);
+        assert!(
+            !semver_ge("4.1.0", &stamp.min_compatible_engine),
+            "the last pre-v2 reader must reject the raised compatibility floor"
+        );
+        load_snapshot_with_config(&snap_dir, "4.1.0", None, None)
+            .expect("the v2-capable reader must accept the v2 snapshot it wrote");
+    }
+
+    #[test]
     fn failed_restore_preserves_existing_replica() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
@@ -1126,6 +1217,49 @@ mod tests {
         assert_eq!(
             std::fs::read(work.join("sentinel")).unwrap(),
             b"old replica"
+        );
+    }
+
+    #[test]
+    fn restore_reverifies_copied_bytes_before_atomic_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snapshot");
+        let db = make_test_db(dir.path());
+        build_snapshot(
+            &snap_dir,
+            &make_stamp("4.1.0", "0.11.0", "schema", ""),
+            &make_manifest(),
+            &db,
+        )
+        .unwrap();
+
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("sentinel"), b"old replica").unwrap();
+
+        let error = materialize_snapshot_with_config_and_hook(
+            &snap_dir,
+            &work,
+            "4.1.0",
+            None,
+            None,
+            || std::fs::write(snap_dir.join(GRAPH_FILE), b"changed after verification").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("integrity check failed"));
+        assert_eq!(
+            std::fs::read(work.join("sentinel")).unwrap(),
+            b"old replica"
+        );
+        let staging_prefix = ".work.snapshot-restore.";
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(staging_prefix)),
+            "a rejected staged copy must be cleaned up"
         );
     }
 

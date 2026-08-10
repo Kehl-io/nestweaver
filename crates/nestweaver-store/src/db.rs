@@ -2366,6 +2366,53 @@ mod tests {
             "failed retirement must preserve fallback"
         );
     }
+
+    #[test]
+    fn snapshot_embedding_lease_serializes_metadata_updates() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        store.set_embedding_metadata("model-a", 3).unwrap();
+        assert!(store.add_embedding("symbol:a", vec![1.0, 0.0, 0.0]));
+
+        let staged = dir.path().join("snapshot-embeddings.bin");
+        let lease = store.stage_embeddings_for_snapshot(&staged).unwrap();
+        assert_eq!(lease.state().model_id, "model-a");
+        assert_eq!(lease.state().dimension, 3);
+        assert_eq!(lease.state().count, 1);
+
+        let updater = Arc::clone(&store);
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            updater.set_embedding_metadata("model-b", 3).unwrap();
+            completed_tx.send(()).unwrap();
+        });
+
+        assert!(
+            completed_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "metadata update must wait while snapshot owns the embedding lease"
+        );
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("model-a".to_string(), 3)),
+            "snapshot lease must retain a coherent database/vector fingerprint"
+        );
+
+        drop(lease);
+        completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("metadata update should complete once snapshot releases the lease");
+        join.join().unwrap();
+        assert_eq!(
+            store.get_embedding_metadata().unwrap(),
+            Some(("model-b".to_string(), 3))
+        );
+    }
 }
 
 #[cfg(test)]

@@ -6507,6 +6507,14 @@ impl GraphStore {
     /// is keyed by the fixed string `"embedding"` — only one such record
     /// can exist at a time. Calling this again replaces any previous value.
     pub fn set_embedding_metadata(&self, model_id: &str, dimension: u32) -> Result<(), StoreError> {
+        // Lock order is embedding index -> database. Snapshot capture uses the
+        // same order while retaining the index guard through metadata capture
+        // and sidecar staging. Taking the database connection first here would
+        // permit an AB/BA deadlock and a model/vector split-brain snapshot.
+        let mut embedding_index = self
+            .embedding_index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let conn = self.conn()?;
 
         // Encode both fields into a single JSON string so we can use the
@@ -6535,10 +6543,7 @@ impl GraphStore {
             // Keep the in-memory index's recorded model in sync with what was
             // just persisted, so the recorded-model write guard in this
             // long-lived store checks against the new fingerprint.
-            self.embedding_index
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_recorded_model_id(Some(model_id.to_string()));
+            embedding_index.set_recorded_model_id(Some(model_id.to_string()));
         }
         result
     }
