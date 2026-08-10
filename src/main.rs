@@ -5581,11 +5581,25 @@ fn wait_for_started_daemon(
     ignore_pid: Option<i32>,
     expected_config: &nestweaver_client::RestartConfig,
 ) -> anyhow::Result<nestweaver_proto::HealthCheckResponse> {
+    wait_for_started_daemon_with_timeout(
+        db_path,
+        ignore_pid,
+        expected_config,
+        nestweaver_client::autostart::daemon_boot_timeout(),
+    )
+}
+
+fn wait_for_started_daemon_with_timeout(
+    db_path: &std::path::Path,
+    ignore_pid: Option<i32>,
+    expected_config: &nestweaver_client::RestartConfig,
+    timeout: std::time::Duration,
+) -> anyhow::Result<nestweaver_proto::HealthCheckResponse> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to create runtime for daemon readiness")?;
     runtime.block_on(nestweaver_client::DaemonClient::wait_ready(
         db_path,
-        nestweaver_client::autostart::daemon_boot_timeout(),
+        timeout,
         ignore_pid,
         expected_config,
     ))
@@ -11721,11 +11735,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         eprintln!("  PID file:  {}", pidfile.display());
                         eprintln!("  Socket:    {}", socket.display());
 
+                        let boot_timeout = nestweaver_client::autostart::daemon_boot_timeout();
+                        let boot_started = std::time::Instant::now();
                         match wait_for_macos_temp_daemon(
                             &mut child,
                             &db_path_abs,
                             &pidfile,
-                            std::time::Duration::from_secs(60),
+                            boot_timeout,
                         ) {
                             Ok(health) => {
                                 if health.pid == child.id() {
@@ -11752,10 +11768,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         let _ = child.wait();
                                     }
                                 }
-                                let ready = wait_for_started_daemon(
+                                let remaining = boot_timeout
+                                    .checked_sub(boot_started.elapsed())
+                                    .filter(|remaining| !remaining.is_zero())
+                                    .context(
+                                        "temporary daemon became healthy at the readiness deadline before effective-config attestation completed",
+                                    )?;
+                                let ready = wait_for_started_daemon_with_timeout(
                                     &db_path_abs,
                                     pre_start_pid,
                                     &requested_start_config,
+                                    remaining,
                                 )?;
                                 finish_manual_default_reset(
                                     &db_path_abs,

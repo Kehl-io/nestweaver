@@ -3262,6 +3262,21 @@ fn collect_contract_derivation_inputs(
         if is_minified_or_bundled(&abs_path) {
             continue;
         }
+        // Only these languages can contribute handler-derived contracts.
+        // Filtering before metadata/read is important in strict mode: an
+        // unreadable unrelated Python/Go/etc. file must not abort otherwise
+        // valid contract publication.
+        let eligible_handler_language = matches!(
+            lang,
+            nestweaver_schema::Language::Java
+                | nestweaver_schema::Language::Kotlin
+                | nestweaver_schema::Language::JavaScript
+                | nestweaver_schema::Language::TypeScript
+        ) || (has_grpc_specs
+            && lang == nestweaver_schema::Language::Rust);
+        if !eligible_handler_language {
+            continue;
+        }
         if reader
             .file_meta(&rel_path)
             .context("read contract input metadata")?
@@ -6095,6 +6110,44 @@ function hello(name) { return "Hello " + name; }
             "repo:test:oversize",
             "https://example.com/oversize",
             false,
+        )
+        .unwrap();
+        assert!(specs.is_empty());
+        assert!(handlers.is_empty());
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn strict_contract_collector_ignores_unreadable_irrelevant_languages() {
+        struct IrrelevantReader {
+            root: PathBuf,
+        }
+        impl crate::content_reader::ContentReader for IrrelevantReader {
+            fn read_file(&self, _rel_path: &Path) -> anyhow::Result<String> {
+                panic!("irrelevant language must be filtered before reading")
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("unreadable.py")])
+            }
+            fn file_meta(&self, _rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                panic!("irrelevant language must be filtered before metadata")
+            }
+            fn root(&self) -> &Path {
+                &self.root
+            }
+            fn version_id(&self) -> &str {
+                "irrelevant-language-test"
+            }
+        }
+
+        let reader = IrrelevantReader {
+            root: PathBuf::from("/unused"),
+        };
+        let (specs, handlers, symbols) = collect_contract_derivation_inputs(
+            &reader,
+            "repo:test:irrelevant",
+            "https://example.com/irrelevant",
+            true,
         )
         .unwrap();
         assert!(specs.is_empty());
