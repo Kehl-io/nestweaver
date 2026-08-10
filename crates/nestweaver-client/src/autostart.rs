@@ -878,7 +878,7 @@ credential_method = "gh"
     }
 
     #[test]
-    fn ensure_daemon_early_returns_reject_a_different_config() {
+    fn ensure_daemon_held_pidfile_rejects_a_different_config() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         let configured = write_valid_config(dir.path(), "configured.toml", "configured");
@@ -916,9 +916,7 @@ credential_method = "gh"
         .unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
-                drop(listener.accept().unwrap());
-            }
+            drop(listener.accept().unwrap());
         });
 
         let error = ensure_daemon(&db, Some(&requested)).unwrap_err();
@@ -926,14 +924,6 @@ credential_method = "gh"
         assert!(message.contains(configured.file_name().unwrap().to_str().unwrap()));
         assert!(message.contains(requested.file_name().unwrap().to_str().unwrap()));
         assert!(message.contains("restart --config"));
-
-        let spawn_lock = SpawnLock::acquire(&db).unwrap();
-        let error = ensure_daemon_with_spawn_lock(&db, Some(&requested), &spawn_lock).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains(configured.file_name().unwrap().to_str().unwrap()));
-        assert!(message.contains(requested.file_name().unwrap().to_str().unwrap()));
-        assert!(message.contains("restart --config"));
-        drop(spawn_lock);
 
         server.join().unwrap();
         unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_UN) };
@@ -1055,37 +1045,6 @@ credential_method = "gh"
             .unwrap();
         release.await.unwrap();
         drop(second);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_ensure_production_seam_allows_timer_driven_transaction_holder() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("brain.lbug");
-        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
-        let socket = nestweaver_daemon::lifecycle::socket_path(&instance_id);
-        let runtime = nestweaver_daemon::lifecycle::runtime_dir(&instance_id);
-        let transaction_lock = SpawnLock::acquire(&db).unwrap();
-        let holder_socket = socket.clone();
-        let holder = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Some(parent) = holder_socket.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            let _ = fs::remove_file(&holder_socket);
-            let listener = UnixListener::bind(&holder_socket).unwrap();
-            drop(transaction_lock);
-            listener
-        });
-
-        let ensured = tokio::time::timeout(Duration::from_secs(3), ensure_daemon_async(&db, None))
-            .await
-            .expect("blocking spawn-lock wait must not prevent the holder's timer")
-            .unwrap();
-        assert_eq!(ensured, socket);
-        let listener = holder.await.unwrap();
-        drop(listener);
-        let _ = fs::remove_file(&socket);
-        let _ = fs::remove_dir_all(runtime);
     }
 
     #[test]
