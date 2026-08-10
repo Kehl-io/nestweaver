@@ -318,6 +318,27 @@ mod tests {
         assert_eq!(repos[0].url, "https://github.com/example/repo-1");
     }
 
+    #[test]
+    fn removed_repositories_do_not_leak_contract_failure_or_migration_debt() {
+        let store = test_store();
+        let repo = make_repo("repo-removed-debt");
+        store.insert_repo(&repo).unwrap();
+        store
+            .set_contract_derivation_failed(&repo.uid, "malformed fixture")
+            .unwrap();
+        let transaction = store.begin_transaction().unwrap();
+        GraphStore::ensure_contract_derivation_v2_on(&transaction).unwrap();
+        store.commit_transaction(&transaction).unwrap();
+        drop(transaction);
+
+        assert_eq!(
+            store.contract_derivation_failures(None).unwrap(),
+            vec![repo.uid.clone()]
+        );
+        store.delete_repo_node(&repo.uid).unwrap();
+        assert!(store.contract_derivation_failures(None).unwrap().is_empty());
+    }
+
     /// `root_path` round-trips through insert → list_repos/lookup_repo:
     /// `Some(path)` survives, `None` stays `None` (stored as '' and mapped
     /// back on read).

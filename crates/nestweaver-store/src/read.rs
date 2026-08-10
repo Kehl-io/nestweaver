@@ -2714,6 +2714,9 @@ impl GraphStore {
         };
         let failure_prefix = crate::write::CONTRACT_DERIVATION_FAILED_PREFIX;
         let debt_prefix = crate::write::CONTRACT_DERIVATION_DEBT_PREFIX;
+        let indexed_repos = indexed_repos()?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         let mut generation = None;
         let mut out = std::collections::BTreeSet::new();
         for row in result {
@@ -2728,13 +2731,19 @@ impl GraphStore {
                 .strip_prefix(failure_prefix)
                 .or_else(|| key.strip_prefix(debt_prefix));
             let Some(uid) = uid else { continue };
+            // Failure/debt markers may outlive a removed Repo on databases
+            // written by older versions. They must not make a nonexistent
+            // repository permanently degrade database-wide contract status.
+            if !indexed_repos.contains(uid) {
+                continue;
+            }
             if repo_uid.is_some_and(|want| want != uid) {
                 continue;
             }
             out.insert(uid.to_string());
         }
         if generation.as_deref() != Some(crate::write::CONTRACT_DERIVATION_GENERATION) {
-            for uid in indexed_repos()? {
+            for uid in indexed_repos {
                 if repo_uid.is_none_or(|want| want == uid) {
                     out.insert(uid);
                 }
