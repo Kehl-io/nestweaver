@@ -44,6 +44,42 @@ fn cli_help_lists_commands() {
 }
 
 #[test]
+fn mcp_help_hides_deprecated_flag_and_invalid_allowlists_fail_early() {
+    nestweaver_cmd()
+        .args(["mcp", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("allow-mcp-add-sources").not());
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .args(["--tools", "context"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(contains("unknown MCP tool 'context'"));
+
+    let output = nestweaver_cmd()
+        .args(["mcp", "--db"])
+        .arg(&db)
+        .arg("--allow-mcp-add-sources")
+        .write_stdin("")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("--allow-mcp-add-sources is deprecated")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn config_validate_accepts_minimal_fixture() {
     let config_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/minimal-instance.toml");

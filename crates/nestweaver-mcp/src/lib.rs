@@ -72,6 +72,25 @@ pub fn run_stdio_server(
     track_interactions: bool,
     config_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
+    // Explicit configuration is an assertion. Validate it before opening the
+    // graph or emitting any protocol frame; falling back to compiled defaults
+    // can silently change identity, authorization, ranking, and limits.
+    let explicit_config = config_path
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path)
+                .with_context(|| format!("canonicalize --config {}", path.display()))?;
+            let display = canonical
+                .to_str()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--config path is not valid UTF-8: {}", canonical.display())
+                })?
+                .to_string();
+            let config = nestweaver_engine::InstanceConfig::from_file(&canonical)
+                .with_context(|| format!("load --config {display}"))?;
+            Ok::<_, anyhow::Error>((config, display))
+        })
+        .transpose()?;
+
     let store = GraphStore::open_or_readonly(db_path)
         .with_context(|| format!("open GraphStore at {}", db_path.display()))?;
     // Pre-load the PageRank sidecar if present — same behaviour as the CLI.
@@ -115,17 +134,12 @@ pub fn run_stdio_server(
     tools::set_current_db_path(canonical_db);
     tools::set_allow_add_sources(allow_add_sources);
     tools::set_lite_mode(lite);
+    tools::set_direct_read_only(true);
 
     // Load instance config so tools can read [limits], [response], [ranking], etc.
     // Try explicit --config path first, then auto-discover instance.toml next to the DB.
-    let (instance_cfg, cfg_source) = if let Some(p) = config_path {
-        match nestweaver_engine::InstanceConfig::from_file(p) {
-            Ok(c) => (Some(c), Some(p.display().to_string())),
-            Err(e) => {
-                tracing::warn!(path = %p.display(), error = %e, "failed to load --config");
-                (None, None)
-            }
-        }
+    let (instance_cfg, cfg_source) = if let Some((config, source)) = explicit_config {
+        (Some(config), Some(source))
     } else {
         let sibling = db_path.parent().map(|d| d.join("instance.toml"));
         match sibling.as_deref().and_then(|s| {
@@ -1286,4 +1300,23 @@ mod tests {
         maybe_record_terminal_success(&tracker);
         assert_eq!(tracker.pending_count(), 0);
     }
+}
+#[test]
+fn direct_stdio_explicit_config_fails_before_opening_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("graph.lbug");
+    let missing = dir.path().join("missing.toml");
+    let error = run_stdio_server(&db, false, false, false, Some(&missing))
+        .expect_err("missing explicit config must fail closed")
+        .to_string();
+    assert!(error.contains("canonicalize --config"), "{error}");
+    assert!(!db.exists(), "config failure must precede graph creation");
+
+    let malformed = dir.path().join("invalid.toml");
+    std::fs::write(&malformed, "[instance\n").unwrap();
+    let error = run_stdio_server(&db, false, false, false, Some(&malformed))
+        .expect_err("malformed explicit config must fail closed")
+        .to_string();
+    assert!(error.contains("load --config"), "{error}");
+    assert!(!db.exists(), "config failure must precede graph creation");
 }

@@ -396,7 +396,27 @@ pub fn index_markdown_directory_since_with_ignore(
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
     let store = GraphStore::open_or_create(db_path)
         .with_context(|| format!("failed to open/create GraphStore at {}", db_path.display()))?;
+    index_markdown_directory_since_with_store_and_ignore(
+        &store,
+        vault_root,
+        instance_id,
+        vault_name,
+        since,
+        extra_ignore_patterns,
+    )
+}
 
+/// Daemon-owned variant of [`index_markdown_directory_since_with_ignore`].
+/// The caller supplies the already-open single writer and is responsible for
+/// holding its process-level write gate for the duration of the refresh.
+pub fn index_markdown_directory_since_with_store_and_ignore(
+    store: &GraphStore,
+    vault_root: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    extra_ignore_patterns: &[String],
+) -> Result<MarkdownSinceResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
     let reader = crate::content_reader::FilesystemReader::new(&canonical);
     let root_str = canonical.to_string_lossy().into_owned();
@@ -412,6 +432,13 @@ pub fn index_markdown_directory_since_with_ignore(
             instance_id: instance_id.to_string(),
         })
         .context("upsert_vault")?;
+    let existing_notes = store
+        .list_notes(Some(&v_uid))
+        .context("list existing vault notes")?;
+    let existing_note_uids = existing_notes
+        .iter()
+        .map(|note| note.uid.clone())
+        .collect::<std::collections::HashSet<_>>();
 
     let since_secs = since
         .duration_since(std::time::UNIX_EPOCH)
@@ -484,13 +511,13 @@ pub fn index_markdown_directory_since_with_ignore(
         // Delete old note data (cascade). Safe when note doesn't exist.
         if let Err(e) = store.delete_note_cascade(&n_uid) {
             tracing::warn!("delete_note_cascade {n_uid} failed: {e}");
-        } else {
+        } else if existing_note_uids.contains(&n_uid) {
             notes_deleted += 1;
         }
 
         let abs_path = vault_root.join(&rel_path);
         let (h_count, s_count, wl_count, t_count) =
-            reinsert_single_note(&store, &v_uid, &n_uid, &abs_path, &rel_path_str, &parsed)
+            reinsert_single_note(store, &v_uid, &n_uid, &abs_path, &rel_path_str, &parsed)
                 .with_context(|| format!("reinsert_single_note {rel_path_str}"))?;
 
         total_headings += h_count;
@@ -498,6 +525,19 @@ pub fn index_markdown_directory_since_with_ignore(
         total_wikilinks += wl_count;
         total_tags += t_count;
         notes_updated += 1;
+    }
+
+    // Files deleted since the last refresh are absent from `list_files`, so
+    // discover them from the incumbent graph. This is safe regardless of the
+    // timestamp: a registered Note whose vault-relative file no longer exists
+    // cannot still be current. Ignored files remain on disk and are preserved.
+    for note in &existing_notes {
+        if !vault_root.join(&note.file_path).exists() {
+            store
+                .delete_note_cascade(&note.uid)
+                .with_context(|| format!("delete removed note {}", note.file_path))?;
+            notes_deleted += 1;
+        }
     }
 
     // Advance + persist the graph generation when any note was mutated.
@@ -3018,6 +3058,39 @@ sub b body
         assert!(
             g2 > g1,
             "the since refresh must advance and persist the graph generation ({g1} -> {g2})"
+        );
+    }
+
+    #[test]
+    fn since_refresh_reuses_daemon_owned_store_without_second_writer() {
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n\nalpha body\n"),
+            ("removed.md", "# Removed\n\nold body\n"),
+        ]);
+        let db_path = root.join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+
+        fs::write(root.join("a.md"), "# A\n\nbeta body\n").unwrap();
+        fs::remove_file(root.join("removed.md")).unwrap();
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            std::time::UNIX_EPOCH,
+            &[],
+        )
+        .expect("daemon-owned refresh must not attempt a second GraphStore writer");
+
+        assert_eq!(result.notes_updated, 1);
+        assert_eq!(result.notes_deleted, 2, "one replacement plus one removed file");
+        assert_eq!(store.count_notes().unwrap(), 1);
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].vault_uid,
+            nestweaver_schema::vault_uid("owned", &root.to_string_lossy())
         );
     }
 

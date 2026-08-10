@@ -135,7 +135,7 @@ MCP tool call: brain_context(seeds, token_budget)
 | `nestweaver-engine` | **Major change** | New `connectors/` submodule with `Connector` trait, `CodeConnector` (extracted from current `index.rs`), `MarkdownConnector` (new). New `sync/` submodule with `notify`-based file watcher. New `query/` extensions for unified retrieval and token budgeting. |
 | `nestweaver-storage` | **Unchanged** | Snapshot transport is already domain-agnostic. |
 | `nestweaver-mcp` | **Replace stub** | Implement against `rmcp` (the official Rust MCP SDK) with the tool set defined in §7. |
-| Root CLI (`src/main.rs`) | **Extended** | New commands (`index-vault`, `note`, `notes`, `wikilinks`, `tag`, `project`, `brain`, `mcp serve`, `watch`). Existing commands gain `--include-notes` / `--scope` flags. |
+| Root CLI (`src/main.rs`) | **Extended** | New commands (`index-vault`, `note`, `notes`, `wikilinks`, `tag`, `project`, `brain`, `mcp`, `watch`). Existing commands gain `--include-notes` / `--scope` flags. |
 
 The new crate `nestweaver-md-parser` is **not** recommended; keep Markdown in `nestweaver-parser` behind a module boundary. Avoiding workspace churn matters more than crate purity here.
 
@@ -565,7 +565,10 @@ greedy_token_budgeted(ranked_nodes, budget):
 
 The MCP server is implemented in `nestweaver-mcp` using **`rmcp`** (the official Rust MCP SDK, `rmcp` crate). Transport: stdio (default for Claude Desktop / Claude Code integration). SSE/HTTP optional behind a feature flag.
 
-Launched via `nestweaver mcp serve [--db PATH] [--config PATH]`. Holds the `GraphStore` and PPR caches in memory for the lifetime of the process. Optionally launches the file watcher (`nestweaver mcp serve --watch`) so the brain stays live without a separate `nestweaver watch` daemon.
+Launched via `nestweaver mcp [--db PATH] [--config PATH]`. The normal path
+proxies through the database-owning daemon; `--no-daemon` is an explicitly
+read-only CI/testing surface. File watching is managed separately through
+`nestweaver watch` / `nestweaver brain watch`.
 
 ### 7.2 Tool catalogue
 
@@ -1157,7 +1160,7 @@ Watching for changes. The brain stays current automatically.
   Daemon registered with launchd (com.nestweaver.daemon)
 
 Try: nestweaver brain context "your most-edited topic"
-     nestweaver mcp serve   # then add to Claude Desktop config
+     nestweaver mcp         # then add to your MCP client config
 ```
 
 Every line of that output is information the user actually needs. Nothing is jargon. The numbers prove the system found their stuff. The next-step suggestions are concrete.

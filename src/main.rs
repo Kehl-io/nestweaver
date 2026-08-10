@@ -2201,10 +2201,7 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
-        #[arg(
-            long,
-            help = "Allow the brain_add_source MCP tool to index new paths at runtime"
-        )]
+        #[arg(long, hide = true)]
         allow_mcp_add_sources: bool,
         #[arg(
             long,
@@ -8805,15 +8802,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
             }
             let db_path = db.unwrap_or_else(default_db_path);
-            if let Some(ref allowed) = tool_allowlist {
-                nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
-            }
             if track_interactions {
                 nestweaver_mcp::tools::set_track_interactions(true);
             }
             // warn=false: run() already emitted the escape-hatch warning once
             // for this invocation — warning again here double-prints it.
             let use_daemon_mcp = resolve_use_daemon(no_daemon, false);
+            nestweaver_mcp::tools::validate_tool_selection(
+                tool_allowlist.as_deref(),
+                lite,
+                !use_daemon_mcp,
+            )?;
+            if let Some(ref allowed) = tool_allowlist {
+                nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
+            }
             if use_daemon_mcp {
                 let rt = tokio::runtime::Runtime::new()
                     .context("create tokio runtime for daemon proxy")?;
@@ -14724,6 +14726,19 @@ fn run_brain(
             });
             let extra_patterns = parse_ignore_flag(&ignore);
             let canonical = abs_for_daemon(&path);
+            // Parse before registration discovery: an invalid timestamp must
+            // not autostart a daemon or touch graph/runtime state.
+            let since_time = since
+                .as_deref()
+                .map(|value| {
+                    parse_iso8601_to_system_time(value).with_context(|| {
+                        format!(
+                            "invalid --since timestamp '{}': expected ISO 8601 (e.g. 2026-05-26T00:00:00Z)",
+                            value
+                        )
+                    })
+                })
+                .transpose()?;
 
             // nw-098: resolve the instance from any EXISTING registration for this
             // root before falling back to flag > config > "default".
@@ -14800,45 +14815,81 @@ fn run_brain(
             // Compute vault UID for recording last_indexed_at.
             let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
 
-            if use_daemon && since.is_none() {
-                // Route full refresh through daemon's IndexVault RPC
+            if use_daemon {
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
                     &db_path,
                     config.as_deref(),
                 ))?;
-                let req = nestweaver_proto::IndexVaultRequest {
-                    // Absolute path: the daemon runs with CWD=/ and would otherwise
-                    // resolve a client-relative vault path against the wrong directory.
-                    vault_path: canonical.to_string_lossy().to_string(),
-                    vault_name: vault_name.clone(),
-                    extra_ignore_patterns: extra_patterns.clone(),
-                    instance_id: instance_id.to_string(),
-                };
-                rt.block_on(async {
-                    let stream = client.inner_mut().index_vault(req).await?.into_inner();
-                    consume_cli_index_progress(stream, |progress| {
-                        let phase_name = match progress.phase {
-                            5 => "Done",
-                            6 => "Error",
-                            _ => "Progress",
-                        };
-                        eprintln!("[{phase_name}] {}", progress.message);
-                    })
-                    .await
-                })?;
+                if let Some(since_time) = since_time {
+                    let since_unix_seconds = since_time
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .context("--since timestamp predates the Unix epoch")?
+                        .as_secs();
+                    let req = nestweaver_proto::RefreshVaultSinceRequest {
+                        vault_path: canonical.to_string_lossy().to_string(),
+                        vault_name: vault_name.clone(),
+                        extra_ignore_patterns: extra_patterns.clone(),
+                        instance_id: instance_id.to_string(),
+                        since_unix_seconds,
+                    };
+                    rt.block_on(async {
+                        let stream = client
+                            .inner_mut()
+                            .refresh_vault_since(req)
+                            .await
+                            .map_err(|status| {
+                                if status.code() == tonic::Code::Unimplemented {
+                                    anyhow::anyhow!(
+                                        "the running daemon does not support incremental vault refresh; upgrade/restart it and retry (refusing full or direct-store fallback)"
+                                    )
+                                } else {
+                                    anyhow::anyhow!(
+                                        "incremental vault refresh RPC failed (refusing direct-store fallback): {status}"
+                                    )
+                                }
+                            })?
+                            .into_inner();
+                        consume_cli_index_progress(stream, |progress| {
+                            let phase_name = match progress.phase {
+                                5 => "Done",
+                                6 => "Error",
+                                _ => "Progress",
+                            };
+                            eprintln!("[{phase_name}] {}", progress.message);
+                        })
+                        .await
+                    })?;
+                } else {
+                    // Route full refresh through daemon's IndexVault RPC.
+                    let req = nestweaver_proto::IndexVaultRequest {
+                        // Absolute path: the daemon runs with CWD=/ and would otherwise
+                        // resolve a client-relative vault path against the wrong directory.
+                        vault_path: canonical.to_string_lossy().to_string(),
+                        vault_name: vault_name.clone(),
+                        extra_ignore_patterns: extra_patterns.clone(),
+                        instance_id: instance_id.to_string(),
+                    };
+                    rt.block_on(async {
+                        let stream = client.inner_mut().index_vault(req).await?.into_inner();
+                        consume_cli_index_progress(stream, |progress| {
+                            let phase_name = match progress.phase {
+                                5 => "Done",
+                                6 => "Error",
+                                _ => "Progress",
+                            };
+                            eprintln!("[{phase_name}] {}", progress.message);
+                        })
+                        .await
+                    })?;
+                }
                 return Ok((EXIT_SUCCESS, None));
             }
 
             if let Some(since_str) = since {
                 // Incremental refresh: only re-index files modified since the
                 // given timestamp.
-                let since_time = parse_iso8601_to_system_time(&since_str).with_context(|| {
-                    format!(
-                        "invalid --since timestamp '{}': expected ISO 8601 (e.g. 2026-05-26T00:00:00Z)",
-                        since_str
-                    )
-                })?;
+                let since_time = since_time.expect("parsed above when --since is present");
                 let result = index_markdown_directory_since_with_ignore(
                     &path,
                     &db_path,
@@ -17664,18 +17715,9 @@ fn resolve_contract_repo_filter(
         return Ok(None);
     };
     let repos = list_repos(store, None)?;
-    // Exact UID match first, then display-name (case-insensitive) match.
-    if let Some(r) = repos.iter().find(|r| r.uid == filter) {
-        return Ok(Some(r.uid.clone()));
-    }
-    let needle = filter.to_lowercase();
-    if let Some(r) = repos
-        .iter()
-        .find(|r| nestweaver_engine::repo_display_name(r).to_lowercase() == needle)
-    {
-        return Ok(Some(r.uid.clone()));
-    }
-    anyhow::bail!("no indexed repo matches --repo '{filter}'")
+    let repo = nestweaver_engine::resolve_repo_selector(&repos, filter)
+        .map_err(|error| anyhow::anyhow!("no indexed repo matches --repo '{filter}': {error}"))?;
+    Ok(Some(repo.uid.clone()))
 }
 
 fn render_contract_list(

@@ -43,6 +43,16 @@ message IndexVaultRequest {
   string instance_id = 4;
 }
 
+// Incremental vault refresh is a distinct method so an older daemon cannot
+// ignore a newly-added field and accidentally perform a full replacement.
+message RefreshVaultSinceRequest {
+  string vault_path = 1;
+  string vault_name = 2;
+  repeated string extra_ignore_patterns = 3;
+  string instance_id = 4;
+  uint64 since_unix_seconds = 5;
+}
+
 message RefreshBrainRequest {}
 
 message ReindexSearchRequest {}
@@ -582,6 +592,7 @@ service NestWeaverDaemon {
   // Indexing (server-streaming)
   rpc IndexRepo(IndexRepoRequest) returns (stream IndexProgress);
   rpc IndexVault(IndexVaultRequest) returns (stream IndexProgress);
+  rpc RefreshVaultSince(RefreshVaultSinceRequest) returns (stream IndexProgress);
   rpc RefreshBrain(RefreshBrainRequest) returns (stream IndexProgress);
   rpc ReindexSearch(ReindexSearchRequest) returns (ReindexSearchResponse);
 

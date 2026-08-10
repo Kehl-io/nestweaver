@@ -562,6 +562,72 @@ fn mcp_jsonrpc_envelope_validation_matches_direct_and_daemon_modes() {
 }
 
 #[test]
+fn direct_mcp_fails_closed_on_config_and_exposes_only_read_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    write_test_repo(&repo_dir);
+
+    let missing_config = dir.path().join("missing.toml");
+    let output = StdCommand::new(bin_path())
+        .args(["mcp", "--no-daemon", "--db"])
+        .arg(&db_path)
+        .arg("--config")
+        .arg(&missing_config)
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "config error polluted MCP stdout");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("canonicalize --config"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !db_path.exists(),
+        "explicit config must fail before graph open"
+    );
+
+    create_db(&repo_dir, &db_path);
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"brain_add_source\",\"arguments\":{\"path\":\"/tmp/never\"}}}\n"
+    );
+    let output = mcp_raw_in_mode(&db_path, input, McpMode::Direct);
+    assert!(output.status.success());
+    let frames = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 2);
+    let tools = frames[0]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 35);
+    for mutator in nestweaver_mcp::http::MUTATING_TOOLS {
+        assert!(
+            tools.iter().all(|tool| tool["name"] != *mutator),
+            "direct tools/list exposed {mutator}"
+        );
+    }
+    assert_eq!(frames[1]["result"]["isError"], true);
+    assert!(
+        frames[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("direct read-only mode")
+    );
+
+    let instance = nestweaver_daemon::instance_id_from_db_path(&db_path);
+    assert!(
+        !nestweaver_daemon::pidfile_path(&instance).exists(),
+        "direct mutator rejection must not autostart a daemon"
+    );
+}
+
+#[test]
 fn daemon_start_stop() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
@@ -4222,4 +4288,45 @@ fn daemon_note_get_returns_frontmatter_and_outline() {
         .unwrap_or_else(|| panic!("daemon note_get must include an outline; got: {note}"));
     let texts: Vec<&str> = outline.iter().filter_map(|h| h["text"].as_str()).collect();
     assert_eq!(texts, ["Hello", "Details"], "outline headings; got: {note}");
+}
+
+/// A normal incremental vault refresh must stay behind the daemon's one-writer
+/// boundary. Before RefreshVaultSince existed, registration discovery
+/// autostarted the daemon and the command then tried to open a second writable
+/// GraphStore, deterministically failing on the database lock.
+#[test]
+fn brain_refresh_since_uses_daemon_owned_writer_and_updates_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault_dir = dir.path().join("vault");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    std::fs::write(vault_dir.join("note.md"), "# Alpha\n\nold text\n").unwrap();
+
+    no_daemon_cmd()
+        .args(["brain", "add"])
+        .arg(&vault_dir)
+        .args(["--db"])
+        .arg(&db_path)
+        .assert()
+        .success();
+
+    let _guard = DaemonGuard::new(&db_path);
+    std::fs::write(vault_dir.join("note.md"), "# Beta Sentinel\n\nnew text\n").unwrap();
+    daemon_cmd()
+        .args(["brain", "refresh"])
+        .arg(&vault_dir)
+        .args(["--db"])
+        .arg(&db_path)
+        .args(["--since", "1970-01-01T00:00:00Z"])
+        .assert()
+        .success()
+        .stderr(contains("[Done] Incremental refresh"))
+        .stderr(predicates::str::contains("Could not set lock").not());
+
+    daemon_cmd()
+        .args(["brain", "search", "Beta Sentinel", "--json", "--db"])
+        .arg(&db_path)
+        .assert()
+        .success()
+        .stdout(contains("Beta Sentinel"));
 }

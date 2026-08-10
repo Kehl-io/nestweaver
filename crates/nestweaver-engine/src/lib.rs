@@ -115,6 +115,76 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
         .unwrap_or_else(|| crate::pull::repo_name_from_url(&repo.url))
 }
 
+/// Resolve a user-facing repository selector deterministically.
+///
+/// Candidates must already be filtered for the caller's authorization scope.
+/// Resolution precedence is exact UID, Unicode-lowercase display name, exact
+/// local root or URL, then an unambiguous URL/root substring. Ambiguous names or
+/// substrings fail instead of selecting whichever row the store returned first.
+pub fn resolve_repo_selector<'a>(
+    repos: &'a [nestweaver_schema::Repo],
+    selector: &str,
+) -> Result<&'a nestweaver_schema::Repo, anyhow::Error> {
+    if selector.trim().is_empty() {
+        anyhow::bail!("repository selector cannot be empty");
+    }
+
+    if let Some(repo) = repos.iter().find(|repo| repo.uid == selector) {
+        return Ok(repo);
+    }
+
+    let needle = selector.to_lowercase();
+    let names = repos
+        .iter()
+        .filter(|repo| repo_display_name(repo).to_lowercase() == needle)
+        .collect::<Vec<_>>();
+    match names.as_slice() {
+        [repo] => return Ok(*repo),
+        [] => {}
+        _ => {
+            let candidates = names
+                .iter()
+                .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "repository selector '{selector}' is ambiguous; use an exact UID: {candidates}"
+            );
+        }
+    }
+
+    if let Some(repo) = repos
+        .iter()
+        .find(|repo| repo.url == selector || repo.local_root().is_some_and(|root| root == selector))
+    {
+        return Ok(repo);
+    }
+
+    let matches = repos
+        .iter()
+        .filter(|repo| {
+            repo.url.contains(selector)
+                || repo
+                    .local_root()
+                    .is_some_and(|root| root.contains(selector))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [repo] => Ok(*repo),
+        [] => anyhow::bail!("repo '{selector}' not found in graph"),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "repository selector '{selector}' is ambiguous; use an exact UID: {candidates}"
+            )
+        }
+    }
+}
+
 pub mod admin;
 pub mod affected_tests;
 pub mod agent_guide;
@@ -284,9 +354,10 @@ pub use index_md::{
     MarkdownIndexResult, MarkdownRefreshResult, MarkdownSinceResult,
     format_markdown_refresh_summary, index_markdown_directory, index_markdown_directory_in_memory,
     index_markdown_directory_since, index_markdown_directory_since_with_ignore,
-    index_markdown_directory_with_ignore, index_markdown_directory_with_ignore_and_deletion_count,
-    index_markdown_directory_with_store, index_markdown_directory_with_store_and_deletion_count,
-    index_markdown_with_reader, index_markdown_with_reader_and_write_gate, load_alias_sidecar,
+    index_markdown_directory_since_with_store_and_ignore, index_markdown_directory_with_ignore,
+    index_markdown_directory_with_ignore_and_deletion_count, index_markdown_directory_with_store,
+    index_markdown_directory_with_store_and_deletion_count, index_markdown_with_reader,
+    index_markdown_with_reader_and_write_gate, load_alias_sidecar,
 };
 pub use interactions::{
     EventType, InteractionData, InteractionStore, InteractionTracker, NodeScore,
@@ -408,5 +479,86 @@ mod resolve_user_path_tests {
         )
         .expect("a meaningful path containing spaces must resolve");
         assert!(resolved.ends_with(Path::new("cache dir").join("with spaces")));
+    }
+}
+
+#[cfg(test)]
+mod repo_selector_tests {
+    use super::*;
+    use nestweaver_schema::Repo;
+
+    fn repo(uid: &str, url: &str, name: Option<&str>, root: Option<&str>) -> Repo {
+        Repo {
+            uid: uid.to_string(),
+            url: url.to_string(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: name.map(str::to_owned),
+            root_path: root.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn selector_uses_uid_name_root_url_and_rejects_ambiguity() {
+        let repos = vec![
+            repo(
+                "repo:exact",
+                "https://example.test/org/api.git",
+                Some("Überblick"),
+                Some("/work/api"),
+            ),
+            repo(
+                "repo:other",
+                "https://example.test/other/api.git",
+                Some("Worker"),
+                Some("/work/worker"),
+            ),
+        ];
+
+        assert_eq!(
+            resolve_repo_selector(&repos, "repo:exact").unwrap().uid,
+            "repo:exact"
+        );
+        assert_eq!(
+            resolve_repo_selector(&repos, "überblick").unwrap().uid,
+            "repo:exact"
+        );
+        assert_eq!(
+            resolve_repo_selector(&repos, "/work/worker").unwrap().uid,
+            "repo:other"
+        );
+        assert_eq!(
+            resolve_repo_selector(&repos, "other/api").unwrap().uid,
+            "repo:other"
+        );
+        assert!(
+            resolve_repo_selector(&repos, "api.git")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert!(
+            resolve_repo_selector(&repos, "")
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
+    }
+
+    #[test]
+    fn selector_rejects_duplicate_exact_display_names() {
+        let repos = vec![
+            repo("repo:a", "file:///a", Some("same"), Some("/a")),
+            repo("repo:b", "file:///b", Some("SAME"), Some("/b")),
+        ];
+        let error = resolve_repo_selector(&repos, "Same")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("repo:a") && error.contains("repo:b"),
+            "{error}"
+        );
     }
 }
