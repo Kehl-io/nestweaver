@@ -2347,12 +2347,12 @@ paths:
         assert_eq!(report.declared_not_implemented.len(), 1);
         assert_eq!(
             report.declared_not_implemented[0].uid,
-            "contract:http:GET:/v1/approvals/{}"
+            "contract:repo-1:http:GET:/v1/approvals/{}"
         );
         assert_eq!(report.implemented_not_declared.len(), 1);
         assert_eq!(
             report.implemented_not_declared[0].uid,
-            "contract:http:DELETE:/v1/approvals/{}"
+            "contract:repo-1:http:DELETE:/v1/approvals/{}"
         );
         assert!(!report.is_clean());
     }
