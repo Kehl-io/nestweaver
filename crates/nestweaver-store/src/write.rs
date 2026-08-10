@@ -41,6 +41,11 @@ const COPY_CSV_OPTS: &str = "(PARALLEL=FALSE, DELIM=',', QUOTE='\"', ESCAPE='\"'
 /// carries that distinction across the two, so it is written by the indexer and
 /// read by [`GraphStore::contract_derivation_failures`].
 pub const CONTRACT_DERIVATION_FAILED_PREFIX: &str = "contract_derivation_failed:";
+/// Current repository-scoped Contract identity generation.
+pub const CONTRACT_DERIVATION_GENERATION: &str = "2";
+pub const CONTRACT_DERIVATION_GENERATION_KEY: &str = "contract_derivation_generation";
+/// Per-repo debt left by the global v1 -> v2 Contract identity migration.
+pub const CONTRACT_DERIVATION_DEBT_PREFIX: &str = "contract_derivation_debt:";
 
 /// What a classified destructive store mutation can prove about durable state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6506,15 +6511,118 @@ impl GraphStore {
     /// has no marker to clear.
     pub fn clear_contract_derivation_failed(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        let _ = exec_params(
-            &conn,
+        Self::clear_contract_derivation_failed_on(&conn, repo_uid)
+    }
+
+    /// Clear a repository's failure marker on the caller's transaction.
+    pub fn clear_contract_derivation_failed_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
+        exec_params(
+            conn,
             "MATCH (m:Meta {key: $k}) DETACH DELETE m",
             vec![(
                 "k",
                 lbug::Value::String(format!("{CONTRACT_DERIVATION_FAILED_PREFIX}{repo_uid}")),
             )],
+        )
+    }
+
+    /// Upgrade the derived Contract graph from global v1 UIDs to repository-
+    /// scoped v2 UIDs inside the caller's publication transaction.
+    ///
+    /// Contract rows are wholly derived. The first v2 publisher therefore
+    /// removes every legacy row, marks every indexed repo as owing a v2
+    /// derivation, and records the generation atomically. The current repo's
+    /// debt is cleared only after its scoped rows and edges have landed.
+    pub fn ensure_contract_derivation_v2_on(conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+        let generation = {
+            let mut stmt = conn
+                .prepare("MATCH (m:Meta {key: $k}) RETURN m.value")
+                .map_err(|e| StoreError::Query(format!("prepare contract generation: {e}")))?;
+            let mut rows = conn
+                .execute(
+                    &mut stmt,
+                    vec![(
+                        "k",
+                        lbug::Value::String(CONTRACT_DERIVATION_GENERATION_KEY.to_string()),
+                    )],
+                )
+                .map_err(|e| StoreError::Query(format!("read contract generation: {e}")))?;
+            rows.next()
+                .and_then(|row| crate::read::extract_string(&row, 0).ok())
+        };
+        if generation.as_deref() == Some(CONTRACT_DERIVATION_GENERATION) {
+            return Ok(());
+        }
+
+        let repo_uids: Vec<String> = conn
+            .query("MATCH (r:Repo) RETURN r.uid")
+            .map_err(|e| StoreError::Query(format!("list repos for contract migration: {e}")))?
+            .filter_map(|row| crate::read::extract_string(&row, 0).ok())
+            .collect();
+
+        conn.query("MATCH (c:Contract) DETACH DELETE c")
+            .map_err(|e| StoreError::Query(format!("purge legacy contracts: {e}")))?;
+
+        for repo_uid in repo_uids {
+            let key = format!("{CONTRACT_DERIVATION_DEBT_PREFIX}{repo_uid}");
+            let _ = exec_params(
+                conn,
+                "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+                vec![("k", lbug::Value::String(key.clone()))],
+            );
+            exec_params(
+                conn,
+                "CREATE (:Meta {key: $k, value: $v})",
+                vec![
+                    ("k", lbug::Value::String(key)),
+                    (
+                        "v",
+                        lbug::Value::String(CONTRACT_DERIVATION_GENERATION.to_string()),
+                    ),
+                ],
+            )?;
+        }
+
+        let _ = exec_params(
+            conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![(
+                "k",
+                lbug::Value::String(CONTRACT_DERIVATION_GENERATION_KEY.to_string()),
+            )],
         );
-        Ok(())
+        exec_params(
+            conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                (
+                    "k",
+                    lbug::Value::String(CONTRACT_DERIVATION_GENERATION_KEY.to_string()),
+                ),
+                (
+                    "v",
+                    lbug::Value::String(CONTRACT_DERIVATION_GENERATION.to_string()),
+                ),
+            ],
+        )
+    }
+
+    /// Clear one repository's migration debt on the caller's transaction.
+    pub fn clear_contract_derivation_debt_on(
+        conn: &lbug::Connection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
+        exec_params(
+            conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![(
+                "k",
+                lbug::Value::String(format!("{CONTRACT_DERIVATION_DEBT_PREFIX}{repo_uid}")),
+            )],
+        )
     }
 }
 

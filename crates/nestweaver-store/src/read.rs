@@ -2127,6 +2127,46 @@ impl GraphStore {
         result.map(|row| extract_string(&row, 0)).collect()
     }
 
+    /// Return implemented Contract UIDs owned by one repository.
+    ///
+    /// Contract shapes may be identical across repositories. Drift must stay
+    /// owner-local even if a damaged or partially migrated database contains
+    /// an unexpected edge, so scope both the handler and Contract endpoints.
+    pub fn list_implemented_contract_uids_for_repo(
+        &self,
+        repo_uid: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = match conn.prepare(
+            "MATCH (s:Symbol)-[:IMPLEMENTS_CONTRACT]->(c:Contract) \
+             WHERE s.repo_uid = $repo_uid AND c.repo_uid = $repo_uid \
+             RETURN DISTINCT c.uid",
+        ) {
+            Ok(stmt) => stmt,
+            Err(error) => {
+                tracing::trace!(
+                    "list_implemented_contract_uids_for_repo: query skipped \
+                     (table may not exist): {error}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        let result = match conn.execute(
+            &mut stmt,
+            vec![("repo_uid", Value::String(repo_uid.to_string()))],
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::trace!(
+                    "list_implemented_contract_uids_for_repo: query skipped \
+                     (table may not exist): {error}"
+                );
+                return Ok(vec![]);
+            }
+        };
+        result.map(|row| extract_string(&row, 0)).collect()
+    }
+
     /// Look up a Project by name (case-insensitive).
     pub fn lookup_project_by_name(&self, name: &str) -> Result<Option<Project>, StoreError> {
         let all = self.list_projects()?;
@@ -2631,43 +2671,76 @@ impl GraphStore {
     /// `repo_uid` scopes the answer to a single repo (the drift analysis is
     /// optionally repo-filtered); `None` reports every degraded repo in the DB.
     ///
-    /// Reads the markers written by
-    /// [`GraphStore::set_contract_derivation_failed`]. Absent markers — and an
-    /// old DB with no `Meta` table — mean "nothing known to be degraded", which
-    /// is the pre-existing behaviour, not a claim of health.
+    /// Reads explicit failure and v2 migration-debt markers. An indexed legacy
+    /// database without the v2 generation marker is conservatively degraded
+    /// for every repository until each scoped derivation has published.
     pub fn contract_derivation_failures(
         &self,
         repo_uid: Option<&str>,
     ) -> Result<Vec<String>, StoreError> {
         let conn = self.conn()?;
+        let indexed_repos = || -> Result<Vec<String>, StoreError> {
+            let rows = conn
+                .query("MATCH (r:Repo) RETURN r.uid")
+                .map_err(|error| StoreError::Query(format!("list contract-debt repos: {error}")))?;
+            rows.map(|row| extract_string(&row, 0)).collect()
+        };
         // The Meta table holds a handful of singleton rows, so scanning it and
         // filtering the prefix in Rust avoids depending on a string-predicate
         // dialect for a set this small.
-        let mut stmt = match conn.prepare("MATCH (m:Meta) RETURN m.key") {
+        let mut stmt = match conn.prepare("MATCH (m:Meta) RETURN m.key, m.value") {
             Ok(s) => s,
-            // Meta table doesn't exist on older databases — treat as absent.
-            Err(_) => return Ok(Vec::new()),
+            // An indexed pre-v2 database with no Meta table owes derivation for
+            // every repo; fall through to the generation-debt expansion below.
+            Err(_) => {
+                let mut repos: Vec<String> = indexed_repos()?
+                    .into_iter()
+                    .filter(|uid| repo_uid.is_none_or(|want| want == uid))
+                    .collect();
+                repos.sort();
+                return Ok(repos);
+            }
         };
         let result = match conn.execute(&mut stmt, vec![]) {
             Ok(r) => r,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => {
+                let mut repos: Vec<String> = indexed_repos()?
+                    .into_iter()
+                    .filter(|uid| repo_uid.is_none_or(|want| want == uid))
+                    .collect();
+                repos.sort();
+                return Ok(repos);
+            }
         };
-        let prefix = crate::write::CONTRACT_DERIVATION_FAILED_PREFIX;
-        let mut out: Vec<String> = Vec::new();
+        let failure_prefix = crate::write::CONTRACT_DERIVATION_FAILED_PREFIX;
+        let debt_prefix = crate::write::CONTRACT_DERIVATION_DEBT_PREFIX;
+        let mut generation = None;
+        let mut out = std::collections::BTreeSet::new();
         for row in result {
             let Ok(key) = extract_string(&row, 0) else {
                 continue;
             };
-            let Some(uid) = key.strip_prefix(prefix) else {
+            if key == crate::write::CONTRACT_DERIVATION_GENERATION_KEY {
+                generation = extract_string(&row, 1).ok();
                 continue;
-            };
+            }
+            let uid = key
+                .strip_prefix(failure_prefix)
+                .or_else(|| key.strip_prefix(debt_prefix));
+            let Some(uid) = uid else { continue };
             if repo_uid.is_some_and(|want| want != uid) {
                 continue;
             }
-            out.push(uid.to_string());
+            out.insert(uid.to_string());
         }
-        out.sort();
-        Ok(out)
+        if generation.as_deref() != Some(crate::write::CONTRACT_DERIVATION_GENERATION) {
+            for uid in indexed_repos()? {
+                if repo_uid.is_none_or(|want| want == uid) {
+                    out.insert(uid);
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 }
 

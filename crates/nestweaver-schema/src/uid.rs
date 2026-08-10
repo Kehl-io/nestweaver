@@ -286,7 +286,11 @@ pub fn normalize_http_path(path: &str) -> String {
     out
 }
 
-/// Mint a deterministic UID for a [`crate::nodes::Contract`] node.
+/// Mint the repository-independent normalized shape of an API contract.
+///
+/// A shape is useful for discovery, but is NOT object identity: two unrelated
+/// services commonly expose the same verb and path. Callers must never use a
+/// bare shape to create implementation edges or satisfy per-repo drift.
 ///
 /// Schemes (per F2-core spec):
 /// - HTTP:    `contract:http:POST:/v1/approvals`  (verb upper-cased, path normalized)
@@ -295,7 +299,7 @@ pub fn normalize_http_path(path: &str) -> String {
 ///
 /// `verb`/`path` are only consulted for HTTP. For gRPC and GraphQL the
 /// `operation_id` carries the fully-qualified identifier.
-pub fn contract_uid(
+pub fn contract_shape_key(
     kind: &str,
     verb: Option<&str>,
     path: Option<&str>,
@@ -312,6 +316,26 @@ pub fn contract_uid(
             format!("contract:{other}:{op}")
         }
     }
+}
+
+/// Mint the deterministic, repository-scoped UID for a
+/// [`crate::nodes::Contract`] node.
+///
+/// `Contract.repo_uid` is singular ownership, so the primary key carries the
+/// same namespace. This mirrors File, Service, and Symbol identity and prevents
+/// unrelated repositories that expose the same route from colliding globally.
+pub fn contract_uid(
+    repo_uid: &str,
+    kind: &str,
+    verb: Option<&str>,
+    path: Option<&str>,
+    operation_id: Option<&str>,
+) -> String {
+    let shape = contract_shape_key(kind, verb, path, operation_id);
+    format!(
+        "contract:{repo_uid}:{}",
+        shape.trim_start_matches("contract:")
+    )
 }
 
 #[cfg(test)]
@@ -558,24 +582,54 @@ mod tests {
 
     #[test]
     fn contract_uid_http_scheme() {
-        let uid = contract_uid("http", Some("post"), Some("/v1/approvals/"), None);
-        assert_eq!(uid, "contract:http:POST:/v1/approvals");
+        let repo = "repo:test:abc123";
+        let uid = contract_uid(repo, "http", Some("post"), Some("/v1/approvals/"), None);
+        assert_eq!(uid, "contract:repo:test:abc123:http:POST:/v1/approvals");
         // Two differently-written-but-equivalent routes mint the same UID.
-        let a = contract_uid("http", Some("GET"), Some("/users/{id}"), None);
-        let b = contract_uid("http", Some("get"), Some("/users/:userId"), None);
+        let a = contract_uid(repo, "http", Some("GET"), Some("/users/{id}"), None);
+        let b = contract_uid(repo, "http", Some("get"), Some("/users/:userId"), None);
         assert_eq!(a, b, "equivalent routes must collide: {a} vs {b}");
+        assert_ne!(
+            a,
+            contract_uid(
+                "repo:test:other",
+                "http",
+                Some("GET"),
+                Some("/users/{id}"),
+                None
+            ),
+            "the same shape in another repo is a different Contract node"
+        );
     }
 
     #[test]
     fn contract_uid_grpc_scheme() {
-        let uid = contract_uid("grpc", None, None, Some("approvals.v1.Approvals/Create"));
-        assert_eq!(uid, "contract:grpc:approvals.v1.Approvals/Create");
+        let uid = contract_uid(
+            "repo:test:abc123",
+            "grpc",
+            None,
+            None,
+            Some("approvals.v1.Approvals/Create"),
+        );
+        assert_eq!(
+            uid,
+            "contract:repo:test:abc123:grpc:approvals.v1.Approvals/Create"
+        );
     }
 
     #[test]
     fn contract_uid_graphql_scheme() {
-        let uid = contract_uid("graphql", None, None, Some("Mutation.createApproval"));
-        assert_eq!(uid, "contract:graphql:Mutation.createApproval");
+        let uid = contract_uid(
+            "repo:test:abc123",
+            "graphql",
+            None,
+            None,
+            Some("Mutation.createApproval"),
+        );
+        assert_eq!(
+            uid,
+            "contract:repo:test:abc123:graphql:Mutation.createApproval"
+        );
     }
 
     #[test]
