@@ -19148,6 +19148,8 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
                 .collect();
 
             let stamp = nestweaver_engine::Stamp {
+                format_version: nestweaver_engine::SNAPSHOT_FORMAT_VERSION,
+                capabilities: vec![nestweaver_engine::SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()],
                 instance_id: instance_id.clone(),
                 engine_version: env!("CARGO_PKG_VERSION").to_string(),
                 min_compatible_engine: nestweaver_engine::MIN_SNAPSHOT_READER_VERSION.to_string(),
@@ -19156,6 +19158,7 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
                 schema_hash_effective: effective_hash,
                 embedding_model_id,
                 embedding_dimension: embedding_dim,
+                embedding_count: 0,
                 built_at,
                 repos: repo_stamps,
             };
@@ -19178,13 +19181,15 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
                     .join(format!("snapshot-{instance_id}"))
             });
 
-            nestweaver_engine::build_snapshot(&output_dir, &stamp, &manifest, &db_path)?;
+            let stamp =
+                nestweaver_engine::build_snapshot(&output_dir, &stamp, &manifest, &db_path)?;
 
             println!("Snapshot built successfully in {}", output_dir.display());
             println!("  Instance: {}", stamp.instance_id);
             println!("  Engine: {}", stamp.engine_version);
             println!("  Schema: {}", stamp.schema_hash_effective);
             println!("  Repos: {}", stamp.repos.len());
+            println!("  Embeddings: {}", stamp.embedding_count);
             Ok(EXIT_SUCCESS)
         }
         SnapshotCommands::Verify { path } => {
@@ -19195,6 +19200,7 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
                     println!("  Engine: {}", stamp.engine_version);
                     println!("  Schema: {}", stamp.schema_hash_effective);
                     println!("  Embedding model: {}", stamp.embedding_model_id);
+                    println!("  Embeddings: {}", stamp.embedding_count);
                     println!("  Built: {}", stamp.built_at);
                     println!("  Repos: {}", stamp.repos.len());
                     Ok(EXIT_SUCCESS)

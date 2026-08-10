@@ -7916,6 +7916,12 @@ pub async fn run_server(
         format!("remove stale effective-config binding for instance {instance_id}")
     })?;
 
+    // Parse explicit config before snapshot compatibility checks. Core-schema
+    // snapshots deliberately support configless replicas; extension snapshots
+    // require this config so their effective schema can be mediated.
+    let (instance_cfg, effective_config) =
+        load_daemon_instance_config(config_path, server_opts.is_some())?;
+
     // Snapshot replica: materialize the snapshot into a private working copy and
     // serve it read-only. `read_only` gates out the write RPCs (via the
     // `ReadOnlyGuard` transport layer) and the write machinery
@@ -7927,23 +7933,23 @@ pub async fn run_server(
         .is_some();
     let db_path = if let Some(snapshot_dir) = server_opts.as_ref().and_then(|o| o.snapshot.clone())
     {
-        let cfg = config_path.and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok());
-        let (_, _, schema_hash) = nestweaver_engine::schema_hashes(cfg.as_ref());
-        let embedding_model = cfg
+        let schema_hash = instance_cfg
             .as_ref()
-            .map(|c| c.embedding.model_id.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+            .map(|cfg| nestweaver_engine::schema_hashes(Some(cfg)).2);
+        let embedding_model = instance_cfg
+            .as_ref()
+            .map(|cfg| cfg.embedding.model_id.as_str());
         // Private per-replica working dir keyed on the instance id so two
         // co-located replicas (distinct `--db` under one parent) never share a
         // mutable path and clobber each other's materialized copy.
         let working_dir = replica_working_dir(&db_path, &instance_id);
         tracing::info!(snapshot = %snapshot_dir.display(), "booting as read-only snapshot replica");
-        nestweaver_engine::materialize_snapshot(
+        nestweaver_engine::materialize_snapshot_with_config(
             &snapshot_dir,
             &working_dir,
             env!("CARGO_PKG_VERSION"),
-            &schema_hash,
-            &embedding_model,
+            schema_hash.as_deref(),
+            embedding_model,
         )
         .with_context(|| format!("failed to materialize snapshot {}", snapshot_dir.display()))?
     } else {
@@ -8026,8 +8032,6 @@ pub async fn run_server(
     // unreadable, or malformed input is fatal in both UDS and network server
     // modes; otherwise a restart-time file race could silently demote the
     // instance to compiled-default identity and authorization.
-    let (instance_cfg, effective_config) =
-        load_daemon_instance_config(config_path, server_opts.is_some())?;
     let live_binding = lifecycle::EffectiveConfigBinding::new(
         std::process::id(),
         live_binding_source(&effective_config),

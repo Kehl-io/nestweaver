@@ -11,7 +11,10 @@ pub mod tantivy_index;
 pub mod traverse;
 pub mod write;
 
-pub use db::{EmbeddingIndexReconciliation, GraphStore, IndexPublicationLease};
+pub use db::{
+    EmbeddingIndexReconciliation, EmbeddingSnapshotLease, EmbeddingSnapshotState, GraphStore,
+    IndexPublicationLease,
+};
 pub use error::{CancelReason, StoreError};
 
 /// Re-export the LadybugDB connection type so callers can use transactional
