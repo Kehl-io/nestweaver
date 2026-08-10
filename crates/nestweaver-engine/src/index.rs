@@ -5976,14 +5976,14 @@ function hello(name) { return "Hello " + name; }
 
         let implemented_repo = nestweaver_schema::repo_uid("test", implemented_url);
         let declared_only_repo = nestweaver_schema::repo_uid("test", declared_only_url);
-        let implemented_uid = nestweaver_schema::contract_uid(
+        let implemented_uid = nestweaver_schema::scoped_contract_uid(
             &implemented_repo,
             "http",
             Some("GET"),
             Some("/health"),
             None,
         );
-        let declared_only_uid = nestweaver_schema::contract_uid(
+        let declared_only_uid = nestweaver_schema::scoped_contract_uid(
             &declared_only_repo,
             "http",
             Some("GET"),
@@ -6044,7 +6044,7 @@ function hello(name) { return "Hello " + name; }
         );
 
         let scoped = nestweaver_schema::Contract {
-            uid: nestweaver_schema::contract_uid(
+            uid: nestweaver_schema::scoped_contract_uid(
                 repo_a,
                 "http",
                 Some("GET"),
@@ -6640,7 +6640,7 @@ function hello(name) { return "Hello " + name; }
         );
 
         let invalid = nestweaver_schema::Contract {
-            uid: nestweaver_schema::contract_uid(
+            uid: nestweaver_schema::scoped_contract_uid(
                 &repo_uid,
                 "http",
                 Some("GET"),

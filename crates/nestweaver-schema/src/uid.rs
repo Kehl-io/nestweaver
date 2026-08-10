@@ -318,13 +318,27 @@ pub fn contract_shape_key(
     }
 }
 
+/// Mint the historical repository-independent contract shape UID.
+///
+/// This public helper is retained for source compatibility. Stored
+/// [`crate::nodes::Contract`] nodes must use [`scoped_contract_uid`] so two
+/// repositories with the same route do not collide.
+pub fn contract_uid(
+    kind: &str,
+    verb: Option<&str>,
+    path: Option<&str>,
+    operation_id: Option<&str>,
+) -> String {
+    contract_shape_key(kind, verb, path, operation_id)
+}
+
 /// Mint the deterministic, repository-scoped UID for a
 /// [`crate::nodes::Contract`] node.
 ///
 /// `Contract.repo_uid` is singular ownership, so the primary key carries the
 /// same namespace. This mirrors File, Service, and Symbol identity and prevents
 /// unrelated repositories that expose the same route from colliding globally.
-pub fn contract_uid(
+pub fn scoped_contract_uid(
     repo_uid: &str,
     kind: &str,
     verb: Option<&str>,
@@ -583,15 +597,20 @@ mod tests {
     #[test]
     fn contract_uid_http_scheme() {
         let repo = "repo:test:abc123";
-        let uid = contract_uid(repo, "http", Some("post"), Some("/v1/approvals/"), None);
+        assert_eq!(
+            contract_uid("http", Some("post"), Some("/v1/approvals/"), None),
+            "contract:http:POST:/v1/approvals",
+            "the pre-v4.1 public shape helper remains source-compatible"
+        );
+        let uid = scoped_contract_uid(repo, "http", Some("post"), Some("/v1/approvals/"), None);
         assert_eq!(uid, "contract:repo:test:abc123:http:POST:/v1/approvals");
         // Two differently-written-but-equivalent routes mint the same UID.
-        let a = contract_uid(repo, "http", Some("GET"), Some("/users/{id}"), None);
-        let b = contract_uid(repo, "http", Some("get"), Some("/users/:userId"), None);
+        let a = scoped_contract_uid(repo, "http", Some("GET"), Some("/users/{id}"), None);
+        let b = scoped_contract_uid(repo, "http", Some("get"), Some("/users/:userId"), None);
         assert_eq!(a, b, "equivalent routes must collide: {a} vs {b}");
         assert_ne!(
             a,
-            contract_uid(
+            scoped_contract_uid(
                 "repo:test:other",
                 "http",
                 Some("GET"),
@@ -604,7 +623,7 @@ mod tests {
 
     #[test]
     fn contract_uid_grpc_scheme() {
-        let uid = contract_uid(
+        let uid = scoped_contract_uid(
             "repo:test:abc123",
             "grpc",
             None,
@@ -619,7 +638,7 @@ mod tests {
 
     #[test]
     fn contract_uid_graphql_scheme() {
-        let uid = contract_uid(
+        let uid = scoped_contract_uid(
             "repo:test:abc123",
             "graphql",
             None,

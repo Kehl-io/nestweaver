@@ -29,7 +29,7 @@
 //! explicitly out of scope here.
 
 use nestweaver_schema::{
-    Contract, Language, contract_shape_key, contract_uid, normalize_http_path,
+    Contract, Language, contract_shape_key, normalize_http_path, scoped_contract_uid,
 };
 
 use crate::blast_radius::AnalysisStatus;
@@ -80,7 +80,7 @@ impl SpecContract {
 
     /// Mint this contract's owning repository-scoped node UID.
     pub fn uid(&self, repo_uid: &str) -> String {
-        contract_uid(
+        scoped_contract_uid(
             repo_uid,
             &self.kind,
             self.verb.as_deref(),

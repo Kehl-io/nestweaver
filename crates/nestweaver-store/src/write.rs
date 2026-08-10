@@ -1345,6 +1345,26 @@ impl GraphStore {
         wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
         wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<usize, StoreError> {
+        // Project membership is derived outside the vault hierarchy, but the
+        // authoritative vault replacement DETACH-deletes every old Note.
+        // Preserve membership for stable note UIDs that survive the refresh;
+        // truly removed notes intentionally lose their project edges.
+        let replacement_uids: std::collections::HashSet<&str> =
+            notes.iter().map(|note| note.uid.as_str()).collect();
+        let mut preserved_project_edges = Vec::new();
+        if vault_existed {
+            for project in self.list_projects()? {
+                for note_uid in self.list_project_note_uids(&project.uid)? {
+                    if replacement_uids.contains(note_uid.as_str()) {
+                        preserved_project_edges.push((project.uid.clone(), note_uid));
+                    }
+                }
+            }
+        }
+        let preserved_project_refs = preserved_project_edges
+            .iter()
+            .map(|(project, note)| (project.as_str(), note.as_str()))
+            .collect::<Vec<_>>();
         let conn = self.begin_transaction()?;
 
         // Delete old vault data within the transaction (if it existed).
@@ -1383,6 +1403,7 @@ impl GraphStore {
             wikilink_to_note_edges,
             wikilink_to_heading_edges,
         )?;
+        Self::batch_insert_project_note_edges_on(&conn, &preserved_project_refs)?;
 
         self.commit_transaction(&conn)?;
         Ok(deleted)
@@ -2526,6 +2547,7 @@ impl GraphStore {
         wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
         unresolved_wikilinks: &[UnresolvedWikilinkRecord],
         typed_edges: &[ResolvedEdge],
+        project_note_edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
         let mutation = (|| {
@@ -2585,6 +2607,7 @@ impl GraphStore {
             )?;
             Self::batch_insert_unresolved_wikilinks_on(&conn, unresolved_wikilinks)?;
             Self::batch_insert_edges_on(&conn, typed_edges)?;
+            Self::batch_insert_project_note_edges_on(&conn, project_note_edges)?;
             exec_params(
                 &conn,
                 "MATCH (t:Tag) WHERE t.vault_uid = $vid \
@@ -4622,6 +4645,15 @@ impl GraphStore {
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::batch_insert_project_note_edges_on(&conn, edges)
+    }
+
+    /// Insert materialized project-note membership using an existing
+    /// transaction connection.
+    pub fn batch_insert_project_note_edges_on(
+        conn: &lbug::Connection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut stmt = conn
             .prepare(
                 "MATCH (p:Project {uid: $pid}), (n:Note {uid: $nid}) \
@@ -7635,6 +7667,7 @@ mod tests {
                 &[],
                 &[],
                 &[(vault_uid, old_a.uid.as_str())],
+                &[],
                 &[],
                 &[],
                 &[],

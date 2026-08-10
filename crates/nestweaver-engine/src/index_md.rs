@@ -914,6 +914,26 @@ fn index_markdown_since_with_reader(
         .iter()
         .map(|(s, t, c, d, l)| (s.as_str(), t.as_str(), *c, d.as_str(), l.as_str()))
         .collect();
+    // A replacement DETACH-deletes the incumbent Note. Preserve materialized
+    // project membership for replacements, but intentionally not for notes
+    // that are truly removed from the vault.
+    let replacement_uids: std::collections::HashSet<&str> =
+        notes.iter().map(|note| note.uid.as_str()).collect();
+    let mut project_note_edges = Vec::new();
+    for project in store
+        .list_projects()
+        .context("list materialized projects")?
+    {
+        for note_uid in store
+            .list_project_note_uids(&project.uid)
+            .with_context(|| format!("list notes for project {}", project.uid))?
+        {
+            if replacement_uids.contains(note_uid.as_str()) {
+                project_note_edges.push((project.uid.clone(), note_uid));
+            }
+        }
+    }
+    let project_note_refs = string_edge_refs(&project_note_edges);
     store
         .incremental_vault_refresh_atomically(
             &Vault {
@@ -939,6 +959,7 @@ fn index_markdown_since_with_reader(
             &wikilink_heading_refs,
             &unresolved,
             &typed_edges,
+            &project_note_refs,
         )
         .context("atomic incremental vault refresh")?;
 
@@ -3705,6 +3726,68 @@ sub b body
 
         assert_eq!(result.notes_updated, 1);
         assert_eq!(store.all_unresolved_wikilinks().unwrap(), unresolved_before);
+    }
+
+    #[test]
+    fn since_refresh_preserves_project_membership_for_replacements_only() {
+        let (_dir, root) = make_vault(&[("a.md", "# A\n\nold\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+        let note_uid = store.list_notes(None).unwrap()[0].uid.clone();
+        let project_uid = "proj:test:incremental-membership";
+        store
+            .insert_project(&nestweaver_schema::Project {
+                uid: project_uid.to_string(),
+                name: "Incremental membership".to_string(),
+                summary: None,
+                instance_id: "owned".to_string(),
+            })
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[(project_uid, &note_uid)])
+            .unwrap();
+
+        fs::write(root.join("a.md"), "# A\n\nnew\n").unwrap();
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            store.list_project_note_uids(project_uid).unwrap(),
+            vec![note_uid.clone()]
+        );
+
+        // Full authoritative replacement has the same stable-UID preservation
+        // contract; the refresh workflow may materialize projects later, but
+        // it must not erase already-valid membership in the meantime.
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+        assert_eq!(
+            store.list_project_note_uids(project_uid).unwrap(),
+            vec![note_uid.clone()]
+        );
+
+        fs::remove_file(root.join("a.md")).unwrap();
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            store
+                .list_project_note_uids(project_uid)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
