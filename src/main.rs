@@ -11846,15 +11846,51 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 let pid_text =
                                     std::fs::read_to_string(&pidfile).unwrap_or_default();
                                 let pid_trimmed = pid_text.trim();
+                                if config.is_none() {
+                                    // A retry after a slow configless manual
+                                    // start must finish the reset only when the
+                                    // healthy pidfile owner attests compiled
+                                    // defaults. A configured incumbent is a
+                                    // no-op and retains durable intent; a
+                                    // missing/corrupt/PID-mismatched binding
+                                    // fails closed.
+                                    let runtime = tokio::runtime::Runtime::new()
+                                        .context("failed to create tokio runtime")?;
+                                    let health = runtime.block_on(
+                                        nestweaver_client::DaemonClient::wait_healthy(
+                                            &db_path,
+                                            nestweaver_client::autostart::daemon_boot_timeout(),
+                                        ),
+                                    )?;
+                                    let binding = nestweaver_daemon::lifecycle::
+                                        read_effective_config_binding_for_verified_pid(
+                                            &instance_id,
+                                            health.pid,
+                                        )
+                                        .context(
+                                            "cannot attest the already-running daemon's effective configuration",
+                                        )?;
+                                    if matches!(
+                                        binding.effective_config,
+                                        nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults
+                                    ) {
+                                        finish_manual_default_reset(
+                                            &db_path,
+                                            parent_driven_start,
+                                            &requested_start_config,
+                                        )?;
+                                    }
+                                } else {
+                                    verify_explicit_config_before_start_success(
+                                        &db_path,
+                                        config.as_deref(),
+                                    )?;
+                                }
                                 if pid_trimmed.is_empty() {
                                     eprintln!("Daemon already running (starting up).");
                                 } else {
                                     eprintln!("Daemon already running (PID {pid_trimmed}).");
                                 }
-                                verify_explicit_config_before_start_success(
-                                    &db_path,
-                                    config.as_deref(),
-                                )?;
                                 return Ok((EXIT_SUCCESS, None));
                             }
                             anyhow::bail!("flock on pidfile failed: {err}");
