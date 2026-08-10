@@ -695,7 +695,7 @@ fn publish_restored_directory(staging: &Path, destination: &Path) -> Result<(), 
         nestweaver_store::durable_sidecar::sync_parent_directory_durable(destination)?;
         std::fs::remove_dir_all(staging)?;
         nestweaver_store::durable_sidecar::sync_parent_directory_durable(destination)?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]

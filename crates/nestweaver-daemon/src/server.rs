@@ -269,6 +269,7 @@ struct EmbeddingRuntimeStatus {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
 enum EmbeddingRuntimeSnapshot {
     Unavailable {
         status: EmbeddingRuntimeStatus,
@@ -298,6 +299,7 @@ struct EmbeddingRuntime {
     snapshot: std::sync::RwLock<EmbeddingRuntimeSnapshot>,
 }
 
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
 impl EmbeddingRuntime {
     fn unavailable(status: EmbeddingRuntimeStatus) -> Self {
         assert_ne!(status.state, "ready");
@@ -4061,9 +4063,9 @@ impl NestWeaverDaemon for DaemonService {
                 Ok(result) => {
                     if let Some(ref tantivy) = state.tantivy
                         && tantivy.has_writer()
+                        && let Err(error) = tantivy.reindex_from_store(&state.store)
                     {
-                        if let Err(error) = tantivy.reindex_from_store(&state.store) {
-                            let _ = tx.blocking_send(Ok(IndexProgress {
+                        let _ = tx.blocking_send(Ok(IndexProgress {
                                 phase: Phase::Error as i32,
                                 message: format!(
                                     "RefreshVaultSince committed graph changes but Tantivy rebuild failed: {error:#}"
@@ -4072,8 +4074,7 @@ impl NestWeaverDaemon for DaemonService {
                                 files_total: result.files_checked as u64,
                                 symbols_found: result.headings_count as u64,
                             }));
-                            return;
-                        }
+                        return;
                     }
                     let vault_uid = nestweaver_schema::vault_uid(
                         &instance_id,
