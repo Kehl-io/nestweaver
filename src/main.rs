@@ -5496,7 +5496,10 @@ async fn restart_live_daemon_preserving_config(
                     "a daemon became connectable while proving cold-start ownership; refusing to overlap it"
                 );
             }
-            let restart_config = nestweaver_client::RestartConfig::for_cold_start(explicit_config)?;
+            let restart_config = nestweaver_client::RestartConfig::for_automatic_cold_start(
+                db_path,
+                explicit_config,
+            )?;
             let executable = std::env::current_exe().context("cannot determine binary path")?;
             let start_args = daemon_restart_start_args(db_path, idle_timeout, &restart_config);
             unowned.release();
@@ -5570,18 +5573,42 @@ fn canonical_repo_dir(repo_path: &std::path::Path) -> anyhow::Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Poll until the daemon's unix socket accepts a connection (proving
-/// run_server survived boot) or `timeout` elapses.
-#[cfg(any(not(target_os = "macos"), test))]
-fn wait_for_daemon_boot(socket: &std::path::Path, timeout: std::time::Duration) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+/// Apply the shared one-budget readiness policy to a directly-started daemon.
+/// This covers connection, health, process-death detection, live pidfile
+/// ownership, and final effective-config attestation.
+fn wait_for_started_daemon(
+    db_path: &std::path::Path,
+    ignore_pid: Option<i32>,
+    expected_config: &nestweaver_client::RestartConfig,
+) -> anyhow::Result<nestweaver_proto::HealthCheckResponse> {
+    let runtime =
+        tokio::runtime::Runtime::new().context("failed to create runtime for daemon readiness")?;
+    runtime.block_on(nestweaver_client::DaemonClient::wait_ready(
+        db_path,
+        nestweaver_client::autostart::daemon_boot_timeout(),
+        ignore_pid,
+        expected_config,
+    ))
+}
+
+/// A manual configless `daemon start` is the explicit reset escape hatch.
+/// Never pre-delete durable intent: clear it only after the replacement has
+/// proved healthy compiled-default provenance.
+fn finish_manual_default_reset(
+    db_path: &std::path::Path,
+    parent_driven_start: bool,
+    expected_config: &nestweaver_client::RestartConfig,
+) -> anyhow::Result<()> {
+    if !parent_driven_start
+        && matches!(
+            expected_config,
+            nestweaver_client::RestartConfig::CompiledDefaults
+        )
+    {
+        nestweaver_daemon::lifecycle::remove_last_successful_config(db_path)
+            .context("clear last successful config after attested manual default start")?;
     }
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+    Ok(())
 }
 
 /// Build the cold child process used for ephemeral macOS daemons.
@@ -11426,6 +11453,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // mark only their child command to avoid self-deadlock.
                     let inherited_spawn_lock =
                         std::env::var_os(nestweaver_client::autostart::PARENT_SPAWN_LOCK_FD_ENV);
+                    let parent_driven_start = inherited_spawn_lock.is_some();
                     let mut start_spawn_lock =
                         acquire_daemon_start_spawn_lock(&db_path, inherited_spawn_lock)?;
                     if track_interactions {
@@ -11434,14 +11462,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                              Use: nestweaver mcp --track-interactions"
                         );
                     }
-                    if let Some(requested_config) = config.as_deref() {
-                        // Validate before any platform-specific stop/install or
-                        // daemonize mutation. A bad explicit path must leave an
-                        // already-running daemon untouched.
-                        let _ = nestweaver_client::RestartConfig::for_cold_start(Some(
-                            requested_config,
-                        ))?;
-                    }
+                    // Validate before any platform-specific stop/install or
+                    // daemonize mutation. A bad explicit path must leave an
+                    // already-running daemon untouched. `None` intentionally
+                    // means compiled defaults here: manual `daemon start` is
+                    // the reset path, while automatic parents have already
+                    // resolved persisted intent and pass it as `--config`.
+                    let requested_start_config =
+                        nestweaver_client::RestartConfig::for_cold_start(config.as_deref())?;
                     std::fs::create_dir_all(&runtime_dir).with_context(|| {
                         format!("create runtime dir: {}", runtime_dir.display())
                     })?;
@@ -11477,6 +11505,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 .ok()
                                 .filter(|v| v.trim().parse::<u32>().is_ok());
                             let config_abs = config.as_deref().map(abs_for_daemon);
+                            let pre_start_pid = nestweaver_client::autostart::read_pid(&pidfile);
+
+                            // A configless manual start is a reset only when it
+                            // actually cold-starts/replaces a daemon. Merely
+                            // observing a launchd/pidfile-owned incumbent is a
+                            // no-op and must not erase configured intent.
+                            let launchd_owned =
+                                nestweaver_daemon::launchd::is_running(&instance_id);
+                            let live_pidfile = pidfile_flock_held(&pidfile);
+                            if config_abs.is_none() && (launchd_owned || live_pidfile) {
+                                let rt = tokio::runtime::Runtime::new()
+                                    .context("failed to create tokio runtime")?;
+                                rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
+                                    &db_path_abs,
+                                    nestweaver_client::autostart::daemon_boot_timeout(),
+                                ))?;
+                                eprintln!("Daemon already running.");
+                                return Ok((EXIT_SUCCESS, None));
+                            }
 
                             // An explicit start against a live incumbent is an
                             // assertion about that daemon, not permission to
@@ -11486,12 +11533,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             // live pidfile with no healthy RPC is likewise not
                             // safe to mutate implicitly.
                             if let Some(requested_config) = config_abs.as_deref() {
-                                let launchd_owned =
-                                    nestweaver_daemon::launchd::is_running(&instance_id);
                                 // The held flock, not a numeric PID plus
                                 // kill(0), is the ownership proof. The latter
                                 // could identify an unrelated recycled PID.
-                                let live_pidfile = pidfile_flock_held(&pidfile);
                                 match verify_explicit_config_before_start_success(
                                     &db_path_abs,
                                     Some(requested_config),
@@ -11587,16 +11631,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             // though launchd (KeepAlive.Crashed) kept bringing
                             // the daemon up, leaving the boot racing the user's
                             // next command.
-                            let rt = tokio::runtime::Runtime::new()
-                                .context("failed to create tokio runtime")?;
-                            match rt.block_on(nestweaver_client::DaemonClient::wait_healthy(
-                                &db_path,
-                                std::time::Duration::from_secs(60),
-                            )) {
+                            match wait_for_started_daemon(
+                                &db_path_abs,
+                                pre_start_pid,
+                                &requested_start_config,
+                            ) {
                                 Ok(_) => {
-                                    verify_explicit_config_before_start_success(
-                                        &db_path,
-                                        config.as_deref(),
+                                    finish_manual_default_reset(
+                                        &db_path_abs,
+                                        parent_driven_start,
+                                        &requested_start_config,
                                     )?;
                                     return Ok((EXIT_SUCCESS, None));
                                 }
@@ -11763,6 +11807,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             anyhow::bail!("flock on pidfile failed: {err}");
                         }
 
+                        // We proved this inode is unowned, so any numeric PID
+                        // is stale. Preserve it only as an ignore value for the
+                        // shared readiness policy until the child rewrites the
+                        // pidfile.
+                        let stale_pid = nestweaver_client::autostart::read_pid(&pidfile);
+
                         // We hold the lock — no other daemon is running or
                         // starting. Any PID in the file is stale; daemonize2 will
                         // overwrite it after the double-fork.
@@ -11852,24 +11902,27 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     );
                                     std::process::exit(EXIT_ERROR);
                                 }
-                                if wait_for_daemon_boot(&socket, std::time::Duration::from_secs(10))
-                                {
-                                    if let Err(error) = verify_explicit_config_before_start_success(
+                                match wait_for_started_daemon(
+                                    &db_path,
+                                    stale_pid,
+                                    &requested_start_config,
+                                )
+                                .and_then(|_| {
+                                    finish_manual_default_reset(
                                         &db_path,
-                                        config.as_deref(),
-                                    ) {
+                                        parent_driven_start,
+                                        &requested_start_config,
+                                    )
+                                }) {
+                                    Ok(()) => {
+                                        eprintln!("Daemon started.");
+                                        std::process::exit(EXIT_SUCCESS);
+                                    }
+                                    Err(error) => {
                                         eprintln!("Error: {error:#}");
                                         std::process::exit(EXIT_ERROR);
                                     }
-                                    eprintln!("Daemon started.");
-                                    std::process::exit(EXIT_SUCCESS);
                                 }
-                                eprintln!(
-                                    "Error: daemon did not start accepting connections within \
-                                     10s — it may have died during boot. Check the logs: {}",
-                                    log_hint
-                                );
-                                std::process::exit(EXIT_ERROR);
                             }
                             daemonize2::Outcome::Parent(Err(e)) => {
                                 anyhow::bail!("Failed to daemonize: {e}");
@@ -20413,28 +20466,6 @@ credential_method = "gh"
             "expected repo_not_found diagnostic, got: {rendered}"
         );
         assert!(!rendered.contains("repo_not_a_directory"), "{rendered}");
-    }
-
-    /// The boot health-check must report a dead/absent daemon as not
-    /// booted (false) and a listening socket as booted (true).
-    #[test]
-    fn wait_for_daemon_boot_detects_listening_socket() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Nothing listening → false well within the timeout.
-        let absent = dir.path().join("absent.sock");
-        assert!(!wait_for_daemon_boot(
-            &absent,
-            std::time::Duration::from_millis(300)
-        ));
-
-        // A listening unix socket → true.
-        let sock = dir.path().join("live.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        assert!(wait_for_daemon_boot(
-            &sock,
-            std::time::Duration::from_millis(300)
-        ));
     }
 
     /// A full page of search results carries a truncation note;

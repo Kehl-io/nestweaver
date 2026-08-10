@@ -8341,6 +8341,7 @@ pub async fn run_server(
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind UDS: {}", sock_path.display()))?;
+
     // The line a stalled-boot investigation actually needs: how long the client
     // had to wait, and where it went.
     //
@@ -9474,6 +9475,23 @@ pub async fn run_server(
     // the load, and semantic search returns "model not loaded" until it completes. candle needs
     // the main thread for Metal, and this keeps cache resolution and model construction from
     // delaying the bind.
+    //
+    // Durable configured intent is published at this final readiness barrier:
+    // the authoritative store, authorization, listener, and all fallible
+    // pre-serve setup are complete, while no gRPC health request can yet be
+    // served. Optional embedding readiness is deliberately outside this
+    // barrier. Network `server` mode has no local cold-autostart lifecycle and
+    // therefore does not own this local UDS restart intent.
+    if server_opts.is_none()
+        && let Some(config_path) = config_path
+    {
+        lifecycle::write_last_successful_config(&db_path, config_path).with_context(|| {
+            format!(
+                "publish last successful config for daemon database {}",
+                db_path.display()
+            )
+        })?;
+    }
     let uds_serve = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(uds_svc)

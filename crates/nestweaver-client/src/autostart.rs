@@ -348,6 +348,17 @@ fn ensure_daemon_impl(
     config_path: Option<&Path>,
     attest_existing: bool,
 ) -> Result<PathBuf> {
+    // An explicit path is a security-relevant assertion, not a child-process
+    // hint. Validate it before creating runtime directories, taking locks,
+    // cleaning sockets, or spawning anything so malformed proxy/MCP config
+    // errors surface immediately with the real IO/TOML cause.
+    let explicit_config = match config_path {
+        Some(path) => Some(crate::RestartConfig::for_cold_start(Some(path))?),
+        None => None,
+    };
+    let config_path = explicit_config
+        .as_ref()
+        .and_then(crate::RestartConfig::as_path);
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     let rt_dir = nestweaver_daemon::lifecycle::runtime_dir(&instance_id);
     let sock = nestweaver_daemon::lifecycle::socket_path(&instance_id);
@@ -416,7 +427,12 @@ fn ensure_daemon_impl(
     // Serialize concurrent auto-starts on a SEPARATE spawn-lock. The pidfile
     // flock had to be released above for the daemon to take it.
     let spawn_lock = SpawnLock::acquire(db_path)?;
-    ensure_daemon_with_spawn_lock_impl(db_path, config_path, &spawn_lock, attest_existing)
+    ensure_daemon_with_spawn_lock_impl(
+        db_path,
+        config_path,
+        &spawn_lock,
+        ColdStartSelection::Automatic,
+    )
 }
 
 /// Async-safe wrapper around the synchronous pidfile/spawn/socket-readiness
@@ -453,14 +469,22 @@ pub fn ensure_daemon_with_spawn_lock(
     config_path: Option<&Path>,
     spawn_lock: &SpawnLock,
 ) -> Result<PathBuf> {
-    ensure_daemon_with_spawn_lock_impl(db_path, config_path, spawn_lock, true)
+    ensure_daemon_with_spawn_lock_impl(db_path, config_path, spawn_lock, ColdStartSelection::Exact)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdStartSelection {
+    /// Caller is auto-starting after proving no incumbent; reuse durable intent.
+    Automatic,
+    /// Caller already captured a live restart decision; `None` means defaults.
+    Exact,
 }
 
 fn ensure_daemon_with_spawn_lock_impl(
     db_path: &Path,
     config_path: Option<&Path>,
     spawn_lock: &SpawnLock,
-    attest_existing: bool,
+    selection: ColdStartSelection,
 ) -> Result<PathBuf> {
     let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
     anyhow::ensure!(
@@ -470,13 +494,20 @@ fn ensure_daemon_with_spawn_lock_impl(
     );
     let sock = nestweaver_daemon::lifecycle::socket_path(&instance_id);
     let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+    let restart_config = match selection {
+        ColdStartSelection::Automatic => {
+            crate::RestartConfig::for_automatic_cold_start(db_path, config_path)?
+        }
+        ColdStartSelection::Exact => crate::RestartConfig::for_cold_start(config_path)?,
+    };
 
     // Re-check: another client may have started the daemon while we waited for the spawn-lock.
     if socket_accepts_connections(&sock) {
         debug!("daemon started by a concurrent client while awaiting spawn lock");
-        if attest_existing && let Some(config_path) = config_path {
-            attest_requested_config_for_running_daemon(db_path, config_path)?;
-        }
+        // The winner is not trusted merely because it accepted a Unix
+        // connection. It must attest the same automatic/captured config plan
+        // before this contender releases the transaction lock.
+        wait_for_daemon_ready(db_path, None, &restart_config)?;
         return Ok(sock);
     }
 
@@ -487,7 +518,7 @@ fn ensure_daemon_with_spawn_lock_impl(
     let stale_pid = read_pid(&pidfile);
 
     // Spawn the daemon as a detached child.
-    spawn_daemon(db_path, config_path, spawn_lock)?;
+    spawn_daemon(db_path, restart_config.as_path(), spawn_lock)?;
 
     // Poll until the socket accepts connections, then release the spawn-lock so the next
     // waiter's re-check observes a ready daemon instead of spawning another.
@@ -495,7 +526,7 @@ fn ensure_daemon_with_spawn_lock_impl(
     // Watch the pidfile here: this is the one path where the daemon we are
     // waiting on was just spawned by us, so a process that has already exited
     // means it will never bind and there is nothing to wait for.
-    let waited = wait_for_socket_watching(&sock, Some(&pidfile), stale_pid);
+    let waited = wait_for_daemon_ready(db_path, stale_pid, &restart_config);
     waited?;
 
     info!("daemon started, socket at {}", sock.display());
@@ -657,7 +688,7 @@ const DEFAULT_DAEMON_BOOT_TIMEOUT_SECS: u64 = 30;
 /// Resolve the boot ceiling, clamped to 1..=600s. An unparseable or
 /// out-of-range value falls back to the default rather than failing the
 /// command — this is a patience knob, not a correctness input.
-fn daemon_boot_timeout() -> Duration {
+pub fn daemon_boot_timeout() -> Duration {
     std::env::var(DAEMON_BOOT_TIMEOUT_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
@@ -666,6 +697,25 @@ fn daemon_boot_timeout() -> Duration {
             || Duration::from_secs(DEFAULT_DAEMON_BOOT_TIMEOUT_SECS),
             Duration::from_secs,
         )
+}
+
+fn wait_for_daemon_ready(
+    db_path: &Path,
+    ignore_pid: Option<i32>,
+    expected_config: &crate::RestartConfig,
+) -> Result<()> {
+    let timeout = daemon_boot_timeout();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create runtime for daemon readiness")?;
+    runtime.block_on(crate::DaemonClient::wait_ready(
+        db_path,
+        timeout,
+        ignore_pid,
+        expected_config,
+    ))?;
+    Ok(())
 }
 
 /// Poll for the socket to accept connections with exponential backoff.
@@ -796,6 +846,26 @@ credential_method = "gh"
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn explicit_config_is_validated_before_runtime_or_lock_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let malformed = dir.path().join("malformed.toml");
+        fs::write(&malformed, "instance_id = [broken").unwrap();
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&db);
+        let runtime = nestweaver_daemon::lifecycle::runtime_dir(&instance_id);
+        let _ = fs::remove_dir_all(&runtime);
+
+        let error = ensure_daemon(&db, Some(&malformed)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid --config"), "{message}");
+        assert!(message.contains("malformed.toml"), "{message}");
+        assert!(
+            !runtime.exists(),
+            "bad explicit config must fail before runtime-dir/pidfile mutation"
+        );
     }
 
     #[test]

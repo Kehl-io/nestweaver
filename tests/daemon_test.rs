@@ -1862,11 +1862,31 @@ credential_method = "gh"
     assert_eq!(read_pid(), pid_overridden);
     assert_eq!(unsafe { libc::kill(pid_overridden, 0) }, 0);
 
-    // Cold restart ignores a stale sidecar. Omitted config is an explicit
-    // compiled-default decision; an explicit path is still validated/chosen.
+    // Automatic cold starts ignore the stale live sidecar but reuse the last
+    // configured daemon that actually reached readiness.
     daemon_action_cmd(&db_path, "stop").assert().success();
-    // A configless query preserves legacy availability when it starts with no
-    // daemon (autostart where possible, direct fallback if connect cannot win).
+    let config_b_contents = std::fs::read_to_string(&config_b).unwrap();
+    std::fs::write(&config_b, "instance_id = [broken").unwrap();
+    daemon_cmd()
+        .args([
+            "brain",
+            "search",
+            "test",
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("persisted daemon config")
+                .and(contains("refuses to fall back"))
+                .and(contains("daemon --db")),
+        );
+    assert!(
+        !nestweaver_daemon::socket_path(&instance_id).exists(),
+        "invalid persisted intent must fail before spawning a daemon"
+    );
+    std::fs::write(&config_b, config_b_contents).unwrap();
     daemon_cmd()
         .args([
             "brain",
@@ -1877,8 +1897,7 @@ credential_method = "gh"
         ])
         .assert()
         .success();
-    // The query may have autostarted a compiled-default daemon; restore the
-    // stopped precondition for the stale-sidecar cold-start case below.
+    assert!(status().contains(&format!("Config: {}", canonical_b.display())));
     daemon_action_cmd(&db_path, "stop").assert().success();
     nestweaver_daemon::lifecycle::write_effective_config_binding(
         &instance_id,
@@ -1891,16 +1910,34 @@ credential_method = "gh"
     )
     .unwrap();
     daemon_action_cmd(&db_path, "restart").assert().success();
-    assert!(status().contains("Config: none"));
-    let pid_defaults = read_pid();
+    assert!(status().contains(&format!("Config: {}", canonical_b.display())));
+    let pid_persisted = read_pid();
     daemon_action_cmd(&db_path, "start")
         .arg("--config")
         .arg(&config_a)
         .assert()
         .failure()
-        .stderr(contains("compiled defaults").and(contains("restart --config")));
-    assert_eq!(read_pid(), pid_defaults);
-    assert_eq!(unsafe { libc::kill(pid_defaults, 0) }, 0);
+        .stderr(contains(canonical_b.display().to_string()).and(contains("restart --config")));
+    assert_eq!(read_pid(), pid_persisted);
+    assert_eq!(unsafe { libc::kill(pid_persisted, 0) }, 0);
+
+    // Merely observing an incumbent with manual configless `start` is a no-op;
+    // it must not erase persisted configured intent.
+    daemon_action_cmd(&db_path, "start").assert().success();
+    assert_eq!(read_pid(), pid_persisted);
+    let persisted = nestweaver_daemon::lifecycle::read_last_successful_config(&db_path).unwrap();
+    assert_eq!(Path::new(&persisted.config_path), canonical_b);
+
+    // Once cold, the same explicit manual invocation is the reset escape
+    // hatch. It bypasses persisted intent and clears it only after the new
+    // default daemon is healthy and attested.
+    daemon_action_cmd(&db_path, "stop").assert().success();
+    daemon_action_cmd(&db_path, "start").assert().success();
+    assert!(status().contains("Config: none"));
+    assert!(matches!(
+        nestweaver_daemon::lifecycle::read_last_successful_config(&db_path),
+        Err(nestweaver_daemon::lifecycle::LastSuccessfulConfigError::Absent { .. })
+    ));
 
     daemon_action_cmd(&db_path, "stop").assert().success();
     daemon_action_cmd(&db_path, "restart")

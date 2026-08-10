@@ -54,6 +54,53 @@ impl RestartConfig {
             None => Ok(Self::CompiledDefaults),
         }
     }
+
+    /// Select configuration for an automatic cold start.
+    ///
+    /// Explicit caller intent wins. Otherwise the last configured daemon that
+    /// reached readiness is reused. Only genuine record absence selects
+    /// compiled defaults; corrupt, unsafe, or now-invalid persisted intent
+    /// fails closed because it controls identity and authorization.
+    pub fn for_automatic_cold_start(
+        db_path: &Path,
+        explicit_config: Option<&Path>,
+    ) -> Result<Self> {
+        if let Some(path) = explicit_config {
+            return validate_restart_config(path).map(Self::Configured);
+        }
+
+        let record = match nestweaver_daemon::lifecycle::read_last_successful_config(db_path) {
+            Ok(record) => record,
+            Err(nestweaver_daemon::lifecycle::LastSuccessfulConfigError::Absent { .. }) => {
+                return Ok(Self::CompiledDefaults);
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "cannot honor persisted daemon configuration for {}: {error}. \
+                     To deliberately reset this database to compiled defaults, run \
+                     `nestweaver daemon --db {} start`",
+                    db_path.display(),
+                    db_path.display()
+                );
+            }
+        };
+        let recorded = PathBuf::from(&record.config_path);
+        let canonical = validate_restart_config(&recorded).with_context(|| {
+            format!(
+                "persisted daemon config {} for {} is no longer usable; automatic startup refuses to fall back to compiled defaults. To deliberately reset, run `nestweaver daemon --db {} start`",
+                recorded.display(),
+                db_path.display(),
+                db_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical == recorded,
+            "persisted daemon config path is not canonical: {}. To deliberately reset, run `nestweaver daemon --db {} start`",
+            recorded.display(),
+            db_path.display()
+        );
+        Ok(Self::Configured(canonical))
+    }
 }
 
 #[derive(Debug)]
@@ -735,6 +782,97 @@ impl DaemonClient {
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(max_delay);
         }
+    }
+
+    /// Wait for a just-spawned daemon using one end-to-end deadline budget.
+    ///
+    /// Connection establishment, gRPC health, pidfile ownership, and live
+    /// effective-config attestation all fit inside `timeout`. `ignore_pid` is
+    /// the unowned pidfile value observed before spawn and must not be mistaken
+    /// for the replacement dying before it has rewritten the pidfile.
+    pub async fn wait_ready(
+        db_path: &Path,
+        timeout: std::time::Duration,
+        ignore_pid: Option<i32>,
+        expected_config: &RestartConfig,
+    ) -> Result<nestweaver_proto::HealthCheckResponse> {
+        let started = std::time::Instant::now();
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+        let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
+        let mut delay = std::time::Duration::from_millis(50);
+        let max_delay = std::time::Duration::from_millis(500);
+
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, Self::connect_existing(db_path)).await {
+                Ok(Ok(mut client)) => {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    match tokio::time::timeout(remaining, client.health_check()).await {
+                        Ok(Ok(health)) => {
+                            // Health is the externally visible readiness
+                            // boundary. By contract, durable configured intent
+                            // and the live binding are already published.
+                            if started.elapsed() >= timeout {
+                                break;
+                            }
+                            let _owned = open_verified_live_pidfile(&instance_id, health.pid)?;
+                            let binding = nestweaver_daemon::lifecycle::read_effective_config_binding_for_verified_pid(
+                                &instance_id,
+                                health.pid,
+                            )?;
+                            verify_replacement_evidence(
+                                &instance_id,
+                                &health,
+                                expected_config,
+                                binding,
+                            )?;
+                            if started.elapsed() >= timeout {
+                                break;
+                            }
+                            return Ok(health);
+                        }
+                        Ok(Err(error)) => tracing::debug!(
+                            "wait_ready: daemon connected but health is not ready: {error:#}"
+                        ),
+                        Err(_) => break,
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!("wait_ready: daemon not connectable yet: {error:#}")
+                }
+                Err(_) => break,
+            }
+
+            if let Some(pid) = autostart::read_pid(&pidfile)
+                && Some(pid) != ignore_pid
+                && !autostart::is_process_alive(pid)
+            {
+                anyhow::bail!(
+                    "daemon process {pid} exited before becoming healthy for {}. Check the daemon logs: {}",
+                    db_path.display(),
+                    nestweaver_daemon::lifecycle::log_hint(&instance_id)
+                );
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(delay.min(remaining)).await;
+            delay = (delay * 2).min(max_delay);
+        }
+
+        anyhow::bail!(
+            "daemon for {} did not become healthy and attest its effective configuration within {:.1}s. Check the daemon logs: {}. If startup is simply slow, raise {}",
+            db_path.display(),
+            timeout.as_secs_f64(),
+            nestweaver_daemon::lifecycle::log_hint(&instance_id),
+            autostart::DAEMON_BOOT_TIMEOUT_ENV
+        )
     }
 
     /// Returns a reference to the underlying gRPC client.
