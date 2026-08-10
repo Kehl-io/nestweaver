@@ -447,13 +447,16 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
 
     let all_files = reader.list_files()?;
 
+    struct ParsedCandidate {
+        rel_path: String,
+        abs_path: PathBuf,
+        note_uid: String,
+        parsed: ParsedNote,
+        changed: bool,
+    }
+
     let mut files_checked = 0usize;
-    let mut notes_updated = 0usize;
-    let mut notes_deleted = 0usize;
-    let mut total_headings = 0usize;
-    let mut total_sections = 0usize;
-    let mut total_tags = 0usize;
-    let mut total_wikilinks = 0usize;
+    let mut candidates = Vec::new();
 
     for rel_path in all_files {
         if !is_markdown(&rel_path) {
@@ -471,82 +474,313 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
         }
 
         files_checked += 1;
+        let rel_path_str = rel_str.into_owned();
+        let n_uid = note_uid(&v_uid, &rel_path_str);
 
-        // Filter by modification time via ContentReader metadata.
-        // Bare repos (GitBareReader) return None — skip mtime filter, always process.
-        match reader.file_meta(&rel_path) {
+        // Parse successfully-readable unchanged files too: if any target note
+        // changes, their outgoing links must be rebuilt in the same transaction
+        // so inbound backlinks survive and rename resolution is order-independent.
+        let changed = match reader.file_meta(&rel_path) {
             Ok(Some((mtime_secs, file_size))) => {
-                if mtime_secs < since_secs {
-                    continue;
-                }
                 if file_size > MAX_FILE_SIZE_BYTES {
-                    tracing::warn!("skipping oversized file: {}", rel_str);
+                    if existing_note_uids.contains(&n_uid) {
+                        return Err(anyhow::anyhow!(
+                            "cannot safely rebuild wikilinks for oversized indexed note {rel_path_str}"
+                        ));
+                    }
+                    tracing::warn!("skipping oversized file: {}", rel_path_str);
                     continue;
                 }
+                mtime_secs >= since_secs
             }
-            Ok(None) => {} // bare repo: no mtime, process unconditionally
-            Err(_) => continue,
-        };
-
-        let source = match reader.read_file(&rel_path) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::warn!("read error {}: {err}", rel_str);
+            Ok(None) => true, // bare repo: no mtime, process unconditionally
+            Err(error) => {
+                if existing_note_uids.contains(&n_uid) {
+                    return Err(anyhow::anyhow!(
+                        "cannot safely read metadata for indexed note {rel_path_str}: {error}"
+                    ));
+                }
                 continue;
             }
         };
-
-        let rel_path_str = rel_str.into_owned();
+        let source = match reader.read_file(&rel_path) {
+            Ok(s) => s,
+            Err(err) => {
+                if existing_note_uids.contains(&n_uid) {
+                    return Err(anyhow::anyhow!(
+                        "cannot safely rebuild wikilinks for indexed note {rel_path_str}: {err}"
+                    ));
+                }
+                tracing::warn!("read error {}: {err}", rel_path_str);
+                continue;
+            }
+        };
 
         let parsed: ParsedNote = match parse_markdown(&rel_path_str, &source) {
             Ok(p) => p,
             Err(err) => {
+                if existing_note_uids.contains(&n_uid) {
+                    return Err(anyhow::anyhow!(
+                        "cannot safely rebuild wikilinks for indexed note {rel_path_str}: {err}"
+                    ));
+                }
                 tracing::warn!("parse error {rel_path_str}: {err}");
                 continue;
             }
         };
-
-        let n_uid = note_uid(&v_uid, &rel_path_str);
-
-        let abs_path = vault_root.join(&rel_path);
-        let (h_count, s_count, wl_count, t_count) =
-            reinsert_single_note(store, &v_uid, &n_uid, &abs_path, &rel_path_str, &parsed)
-                .with_context(|| format!("reinsert_single_note {rel_path_str}"))?;
-
-        // Replacement commits the incumbent deletion and the new graph in one
-        // transaction, so this count reflects committed truth.
-        if existing_note_uids.contains(&n_uid) {
-            notes_deleted += 1;
-        }
-
-        total_headings += h_count;
-        total_sections += s_count;
-        total_wikilinks += wl_count;
-        total_tags += t_count;
-        notes_updated += 1;
+        candidates.push(ParsedCandidate {
+            rel_path: rel_path_str,
+            abs_path: vault_root.join(&rel_path),
+            note_uid: n_uid,
+            parsed,
+            changed,
+        });
     }
 
-    // Files deleted since the last refresh are absent from `list_files`, so
-    // discover them from the incumbent graph. This is safe regardless of the
-    // timestamp: a registered Note whose vault-relative file no longer exists
-    // cannot still be current. Ignored files remain on disk and are preserved.
+    let removed_uids: std::collections::HashSet<String> = existing_notes
+        .iter()
+        .filter(|note| !vault_root.join(&note.file_path).exists())
+        .map(|note| note.uid.clone())
+        .collect();
+    let changed_uids: std::collections::HashSet<String> = candidates
+        .iter()
+        .filter(|candidate| candidate.changed)
+        .map(|candidate| candidate.note_uid.clone())
+        .collect();
+    let mut delete_note_uids: Vec<String> = removed_uids.iter().cloned().collect();
+    delete_note_uids.extend(
+        changed_uids
+            .iter()
+            .filter(|uid| existing_note_uids.contains(*uid))
+            .cloned(),
+    );
+    delete_note_uids.sort();
+    delete_note_uids.dedup();
+
+    let notes_updated = candidates
+        .iter()
+        .filter(|candidate| candidate.changed)
+        .count();
+    let notes_deleted = delete_note_uids.len();
+    if notes_updated == 0 && notes_deleted == 0 {
+        return Ok(MarkdownSinceResult {
+            vault_name: vault_name.to_string(),
+            files_checked,
+            notes_updated: 0,
+            notes_deleted: 0,
+            headings_count: 0,
+            sections_count: 0,
+            tags_count: 0,
+            wikilinks_resolved: 0,
+        });
+    }
+
+    let existing_tag_uids: std::collections::HashSet<String> = store
+        .list_tags(Some(&v_uid))
+        .context("list existing vault tags")?
+        .into_iter()
+        .map(|tag| tag.uid)
+        .collect();
+    let mut prepared = Vec::new();
+    for candidate in candidates.iter().filter(|candidate| candidate.changed) {
+        prepared.push(prepare_single_note(
+            &v_uid,
+            &candidate.note_uid,
+            &candidate.abs_path,
+            &candidate.rel_path,
+            &candidate.parsed,
+            &existing_tag_uids,
+        )?);
+    }
+
+    // Resolve against the complete prospective title/heading graph, never the
+    // partially-mutated file order.
+    let deleted_set: std::collections::HashSet<&str> =
+        delete_note_uids.iter().map(String::as_str).collect();
+    let mut title_lookup: HashMap<String, Vec<String>> = HashMap::new();
+    let mut heading_lookup: HashMap<String, Vec<Heading>> = HashMap::new();
     for note in &existing_notes {
-        if !vault_root.join(&note.file_path).exists() {
-            store
-                .delete_note_cascade_atomic(&note.uid)
-                .with_context(|| format!("delete removed note {}", note.file_path))?;
-            notes_deleted += 1;
+        if !deleted_set.contains(note.uid.as_str()) {
+            title_lookup
+                .entry(note.title.to_lowercase())
+                .or_default()
+                .push(note.uid.clone());
+            heading_lookup.insert(
+                note.uid.clone(),
+                store.headings_in_note(&note.uid).unwrap_or_default(),
+            );
         }
     }
+    for graph in &prepared {
+        title_lookup
+            .entry(graph.note.title.to_lowercase())
+            .or_default()
+            .push(graph.note.uid.clone());
+        heading_lookup.insert(graph.note.uid.clone(), graph.headings.clone());
+    }
+
+    let prospective_uids: std::collections::HashSet<String> = existing_notes
+        .iter()
+        .filter(|note| !deleted_set.contains(note.uid.as_str()))
+        .map(|note| note.uid.clone())
+        .chain(prepared.iter().map(|graph| graph.note.uid.clone()))
+        .collect();
+    let mut rebuild_link_source_uids = Vec::new();
+    let mut wikilink_to_note = Vec::new();
+    let mut wikilink_to_heading = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut changed_wikilinks = 0usize;
+    for candidate in &candidates {
+        if !prospective_uids.contains(&candidate.note_uid) {
+            continue;
+        }
+        rebuild_link_source_uids.push(candidate.note_uid.clone());
+        let section_uids: Vec<String> = candidate
+            .parsed
+            .sections
+            .iter()
+            .map(|section| {
+                let text_hash = crate::hash::blake3_hex(&section.text);
+                section_uid(&candidate.note_uid, section.start_line, &text_hash[..12])
+            })
+            .collect();
+        for wikilink in &candidate.parsed.wikilinks {
+            let Some(source_section) = section_uids.get(wikilink.section_idx) else {
+                continue;
+            };
+            let display = wikilink
+                .display
+                .clone()
+                .unwrap_or_else(|| wikilink.target.clone());
+            let Some(targets) = title_lookup.get(&wikilink.target.to_lowercase()) else {
+                unresolved.push((
+                    format!(
+                        "unresolved:{}:{}",
+                        source_section,
+                        crate::hash::blake3_hex_short(&wikilink.target)
+                    ),
+                    candidate.note_uid.clone(),
+                    candidate.rel_path.clone(),
+                    candidate.parsed.title.clone(),
+                    wikilink.target.clone(),
+                ));
+                continue;
+            };
+            let confidence = 1.0 / targets.len() as f32;
+            for target_uid in targets {
+                let mut resolved_heading = false;
+                if let Some(anchor) = &wikilink.heading_anchor {
+                    let slug = nestweaver_parser::markdown::slugify(anchor);
+                    if let Some(heading) = heading_lookup
+                        .get(target_uid)
+                        .and_then(|headings| headings.iter().find(|heading| heading.slug == slug))
+                    {
+                        wikilink_to_heading.push((
+                            source_section.clone(),
+                            heading.uid.clone(),
+                            confidence,
+                            display.clone(),
+                            wikilink.target.clone(),
+                        ));
+                        resolved_heading = true;
+                    }
+                }
+                if !resolved_heading {
+                    wikilink_to_note.push((
+                        source_section.clone(),
+                        target_uid.clone(),
+                        confidence,
+                        display.clone(),
+                        wikilink.target.clone(),
+                    ));
+                }
+                if candidate.changed {
+                    changed_wikilinks += 1;
+                }
+            }
+        }
+    }
+    rebuild_link_source_uids.sort();
+    rebuild_link_source_uids.dedup();
+    let mut unresolved_seen = std::collections::HashSet::new();
+    unresolved.retain(|record| unresolved_seen.insert(record.0.clone()));
+
+    let mut notes = Vec::new();
+    let mut headings = Vec::new();
+    let mut sections = Vec::new();
+    let mut vault_note_edges = Vec::new();
+    let mut note_heading_edges = Vec::new();
+    let mut note_section_edges = Vec::new();
+    let mut heading_section_edges = Vec::new();
+    let mut heading_parent_edges = Vec::new();
+    let mut tags = Vec::new();
+    let mut note_tag_edges = Vec::new();
+    let mut section_tag_edges = Vec::new();
+    let mut tag_seen = std::collections::HashSet::new();
+    let total_headings = prepared.iter().map(|graph| graph.headings.len()).sum();
+    let total_sections = prepared.iter().map(|graph| graph.sections.len()).sum();
+    let total_tags = prepared.iter().map(|graph| graph.tags_count).sum();
+    for graph in prepared {
+        notes.push(graph.note);
+        headings.extend(graph.headings);
+        sections.extend(graph.sections);
+        vault_note_edges.extend(graph.vault_note_edges);
+        note_heading_edges.extend(graph.note_heading_edges);
+        note_section_edges.extend(graph.note_section_edges);
+        heading_section_edges.extend(graph.heading_section_edges);
+        heading_parent_edges.extend(graph.heading_parent_edges);
+        tags.extend(
+            graph
+                .tags
+                .into_iter()
+                .filter(|tag| tag_seen.insert(tag.uid.clone())),
+        );
+        note_tag_edges.extend(graph.note_tag_edges);
+        section_tag_edges.extend(graph.section_tag_edges);
+    }
+    let vault_note_refs = string_edge_refs(&vault_note_edges);
+    let note_heading_refs = string_edge_refs(&note_heading_edges);
+    let note_section_refs = string_edge_refs(&note_section_edges);
+    let heading_section_refs = string_edge_refs(&heading_section_edges);
+    let heading_parent_refs = string_edge_refs(&heading_parent_edges);
+    let note_tag_refs = string_edge_refs(&note_tag_edges);
+    let section_tag_refs = string_edge_refs(&section_tag_edges);
+    let wikilink_note_refs: Vec<_> = wikilink_to_note
+        .iter()
+        .map(|(s, t, c, d, l)| (s.as_str(), t.as_str(), *c, d.as_str(), l.as_str()))
+        .collect();
+    let wikilink_heading_refs: Vec<_> = wikilink_to_heading
+        .iter()
+        .map(|(s, t, c, d, l)| (s.as_str(), t.as_str(), *c, d.as_str(), l.as_str()))
+        .collect();
+    store
+        .incremental_vault_refresh_atomically(
+            &v_uid,
+            &delete_note_uids,
+            &rebuild_link_source_uids,
+            &notes,
+            &headings,
+            &sections,
+            &vault_note_refs,
+            &note_heading_refs,
+            &note_section_refs,
+            &heading_section_refs,
+            &heading_parent_refs,
+            &tags,
+            &note_tag_refs,
+            &section_tag_refs,
+            &wikilink_note_refs,
+            &wikilink_heading_refs,
+            &unresolved,
+        )
+        .context("atomic incremental vault refresh")?;
 
     // Advance + persist the graph generation when any note was mutated.
     // An in-place edit deletes and recreates the note's sections, leaving the
     // candidate-node count unchanged — the generation bump is the only signal
     // that stales the trigram posting table (mirrors `index.rs` and the full
     // vault index above).
-    if notes_updated > 0 || notes_deleted > 0 {
-        store.bump_and_persist_generation();
-    }
+    store.bump_and_persist_generation();
 
     Ok(MarkdownSinceResult {
         vault_name: vault_name.to_string(),
@@ -556,21 +790,42 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
         headings_count: total_headings,
         sections_count: total_sections,
         tags_count: total_tags,
-        wikilinks_resolved: total_wikilinks,
+        wikilinks_resolved: changed_wikilinks,
     })
 }
 
-/// Atomically replace a single note (and all its descendants: headings,
-/// sections, tags, wikilinks). Mirrors the watcher's per-file insertion logic.
-/// Returns `(headings_count, sections_count, wikilinks_resolved, tags_count)`.
-fn reinsert_single_note(
-    store: &GraphStore,
+struct PreparedNoteGraph {
+    note: Note,
+    headings: Vec<Heading>,
+    sections: Vec<Section>,
+    vault_note_edges: Vec<(String, String)>,
+    note_heading_edges: Vec<(String, String)>,
+    note_section_edges: Vec<(String, String)>,
+    heading_section_edges: Vec<(String, String)>,
+    heading_parent_edges: Vec<(String, String)>,
+    tags: Vec<Tag>,
+    note_tag_edges: Vec<(String, String)>,
+    section_tag_edges: Vec<(String, String)>,
+    tags_count: usize,
+}
+
+fn string_edge_refs(edges: &[(String, String)]) -> Vec<(&str, &str)> {
+    edges
+        .iter()
+        .map(|(left, right)| (left.as_str(), right.as_str()))
+        .collect()
+}
+
+/// Prepare one replacement note without mutating the graph. All preparations
+/// complete before the incremental refresh opens its single transaction.
+fn prepare_single_note(
     v_uid: &str,
     n_uid: &str,
     path: &Path,
     rel_path: &str,
     parsed: &ParsedNote,
-) -> Result<(usize, usize, usize, usize), anyhow::Error> {
+    existing_tag_uids: &std::collections::HashSet<String>,
+) -> Result<PreparedNoteGraph, anyhow::Error> {
     let frontmatter_json = if parsed
         .frontmatter
         .as_object()
@@ -702,150 +957,22 @@ fn reinsert_single_note(
             }
         }
     }
-    let existing_tag_uids: std::collections::HashSet<String> = store
-        .list_tags(Some(v_uid))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|tag| tag.uid)
-        .collect();
     new_tag_nodes.retain(|tag| !existing_tag_uids.contains(&tag.uid));
     let tags_count = local_tag_uids.len();
-
-    // Wikilinks: resolve against all notes currently in the DB.
-    let all_notes = store.list_notes(None).unwrap_or_default();
-    let title_lookup: HashMap<String, Vec<String>> = {
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        for n in &all_notes {
-            if n.uid == n_uid {
-                continue;
-            }
-            map.entry(n.title.to_lowercase())
-                .or_default()
-                .push(n.uid.clone());
-        }
-        map.entry(parsed.title.to_lowercase())
-            .or_default()
-            .push(n_uid.to_string());
-        map
-    };
-    // nw-122: carry BOTH the visible text and the link target. Backlinks want
-    // the alias a reader sees; broken-links wants the target resolution acted
-    // on. Reporting the alias there rendered `[[workspace]]` for
-    // `[[Home|workspace]]` — a link that appears nowhere in the vault.
-    let mut wl_note_edges: Vec<(String, String, f32, String, String)> = Vec::new();
-    let mut wl_head_edges: Vec<(String, String, f32, String, String)> = Vec::new();
-    // Unresolved links collected for a single batched insert — a per-row insert
-    // here made a single note with many missing-target links hang the watcher.
-    let mut unresolved: Vec<(String, String, String, String, String)> = Vec::new();
-
-    for wl in &parsed.wikilinks {
-        if wl.section_idx >= section_uids.len() {
-            continue;
-        }
-        let source_section = &section_uids[wl.section_idx];
-        let display = wl.display.clone().unwrap_or_else(|| wl.target.clone());
-        let key = wl.target.to_lowercase();
-        let Some(candidates) = title_lookup.get(&key) else {
-            // Genuinely unresolved — record so broken-links can surface it.
-            let uw_uid = format!(
-                "unresolved:{}:{}",
-                source_section,
-                crate::hash::blake3_hex_short(&wl.target)
-            );
-            unresolved.push((
-                uw_uid,
-                n_uid.to_string(),
-                rel_path.to_string(),
-                parsed.title.clone(),
-                wl.target.clone(),
-            ));
-            continue;
-        };
-        let n = candidates.len() as f32;
-        let conf = if n == 1.0 { 1.0 } else { 1.0 / n };
-        for target in candidates {
-            if let Some(anchor) = &wl.heading_anchor {
-                let anchor_slug = nestweaver_parser::markdown::slugify(anchor);
-                let target_headings = if target == n_uid {
-                    headings.clone()
-                } else {
-                    store.headings_in_note(target).unwrap_or_default()
-                };
-                if let Some(h) = target_headings.iter().find(|h| h.slug == anchor_slug) {
-                    wl_head_edges.push((
-                        source_section.clone(),
-                        h.uid.clone(),
-                        conf,
-                        display.clone(),
-                        wl.target.clone(),
-                    ));
-                    continue;
-                }
-            }
-            wl_note_edges.push((
-                source_section.clone(),
-                target.clone(),
-                conf,
-                display.clone(),
-                wl.target.clone(),
-            ));
-        }
-    }
-    let wl_resolved = wl_note_edges.len() + wl_head_edges.len();
-    let mut seen = std::collections::HashSet::new();
-    unresolved.retain(|(uid, ..)| seen.insert(uid.clone()));
-    let wl_note_refs: Vec<(&str, &str, f32, &str, &str)> = wl_note_edges
-        .iter()
-        .map(|(s, n, c, d, t)| (s.as_str(), n.as_str(), *c, d.as_str(), t.as_str()))
-        .collect();
-    let wl_head_refs: Vec<(&str, &str, f32, &str, &str)> = wl_head_edges
-        .iter()
-        .map(|(s, h, c, d, t)| (s.as_str(), h.as_str(), *c, d.as_str(), t.as_str()))
-        .collect();
-    let vault_note_edges = [(v_uid, n_uid)];
-    let nh_refs: Vec<(&str, &str)> = nh_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    let ns_refs: Vec<(&str, &str)> = ns_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    let hs_refs: Vec<(&str, &str)> = hs_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    let parent_refs: Vec<(&str, &str)> = parent_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    let nt_refs: Vec<(&str, &str)> = note_tag_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    let st_refs: Vec<(&str, &str)> = section_tag_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store.replace_note_atomically(
-        n_uid,
-        &[note],
-        &headings,
-        &sections,
-        &vault_note_edges,
-        &nh_refs,
-        &ns_refs,
-        &hs_refs,
-        &parent_refs,
-        &new_tag_nodes,
-        &nt_refs,
-        &st_refs,
-        &wl_note_refs,
-        &wl_head_refs,
-        &unresolved,
-    )?;
-
-    Ok((headings.len(), sections.len(), wl_resolved, tags_count))
+    Ok(PreparedNoteGraph {
+        note,
+        headings,
+        sections,
+        vault_note_edges: vec![(v_uid.to_string(), n_uid.to_string())],
+        note_heading_edges: nh_edges,
+        note_section_edges: ns_edges,
+        heading_section_edges: hs_edges,
+        heading_parent_edges: parent_edges,
+        tags: new_tag_nodes,
+        note_tag_edges,
+        section_tag_edges,
+        tags_count,
+    })
 }
 
 fn index_into_store(
@@ -3115,6 +3242,83 @@ sub b body
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].title, "New");
         assert_eq!(store.list_tags(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn since_refresh_preserves_unchanged_inbound_wikilink_to_changed_note() {
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n\n[[B#Target]]\n"),
+            ("b.md", "# B\n\n## Target\n\nold body\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now();
+        fs::write(root.join("b.md"), "# B\n\n## Target\n\nchanged body\n").unwrap();
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            since,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 1);
+    }
+
+    #[test]
+    fn since_refresh_resolves_two_renamed_notes_independent_of_file_order() {
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# Old A\n\n[[Old B]]\n"),
+            ("z.md", "# Old B\n\n[[Old A]]\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+
+        fs::write(root.join("a.md"), "# New A\n\n[[New B]]\n").unwrap();
+        fs::write(root.join("z.md"), "# New B\n\n[[New A]]\n").unwrap();
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 2);
+    }
+
+    #[test]
+    fn since_refresh_garbage_collects_replaced_and_deleted_orphan_tags() {
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n\n#old body\n"),
+            ("b.md", "# B\n\n#sole body\n"),
+        ]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+        assert_eq!(store.list_tags(None).unwrap().len(), 2);
+
+        fs::write(root.join("a.md"), "# A\n\n#new body\n").unwrap();
+        fs::remove_file(root.join("b.md")).unwrap();
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+            &[],
+        )
+        .unwrap();
+        let tags = store.list_tags(None).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "new");
     }
 
     /// Build `n` distinct notes for a vault, with `make_note(0)` reusable so a

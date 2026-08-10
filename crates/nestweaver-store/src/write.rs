@@ -2500,12 +2500,17 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Delete an incumbent note and insert its complete replacement in one
-    /// transaction. If any replacement write fails, the incumbent remains.
+    /// Apply a complete incremental vault refresh in one transaction.
+    ///
+    /// Every incumbent replacement/removal, every replacement node and edge,
+    /// the vault's rebuilt wikilinks, and orphan-tag cleanup commit together.
+    /// Any pre-commit failure rolls the entire old graph back.
     #[allow(clippy::too_many_arguments)]
-    pub fn replace_note_atomically(
+    pub fn incremental_vault_refresh_atomically(
         &self,
-        note_uid: &str,
+        vault_uid: &str,
+        delete_note_uids: &[String],
+        rebuild_link_source_uids: &[String],
         notes: &[Note],
         headings: &[Heading],
         sections: &[Section],
@@ -2522,7 +2527,28 @@ impl GraphStore {
         unresolved_wikilinks: &[UnresolvedWikilinkRecord],
     ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
-        let mutation = Self::delete_note_cascade_on(&conn, note_uid).and_then(|()| {
+        let mutation = (|| {
+            // Rebuild every successfully-parsed source's outgoing links. This
+            // preserves inbound links to replaced targets and makes title
+            // resolution a function of the prospective graph, not file order.
+            for note_uid in rebuild_link_source_uids {
+                exec_params(
+                    &conn,
+                    "MATCH (s:Section) WHERE s.note_uid = $uid \
+                     MATCH (s)-[r:WIKILINK_TO_NOTE]->() DELETE r",
+                    vec![("uid", lbug::Value::String(note_uid.clone()))],
+                )?;
+                exec_params(
+                    &conn,
+                    "MATCH (s:Section) WHERE s.note_uid = $uid \
+                     MATCH (s)-[r:WIKILINK_TO_HEADING]->() DELETE r",
+                    vec![("uid", lbug::Value::String(note_uid.clone()))],
+                )?;
+                Self::delete_unresolved_wikilinks_for_note_on(&conn, note_uid)?;
+            }
+            for note_uid in delete_note_uids {
+                Self::delete_note_cascade_on(&conn, note_uid)?;
+            }
             Self::bulk_vault_write_on(
                 &conn,
                 notes,
@@ -2539,13 +2565,20 @@ impl GraphStore {
                 wikilink_to_note_edges,
                 wikilink_to_heading_edges,
             )?;
-            Self::batch_insert_unresolved_wikilinks_on(&conn, unresolved_wikilinks)
-        });
+            Self::batch_insert_unresolved_wikilinks_on(&conn, unresolved_wikilinks)?;
+            exec_params(
+                &conn,
+                "MATCH (t:Tag) WHERE t.vault_uid = $vid \
+                 AND NOT (t)<-[:NOTE_TAGGED_WITH]-() \
+                 AND NOT (t)<-[:SECTION_TAGGED_WITH]-() DETACH DELETE t",
+                vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+            )
+        })();
         if let Err(error) = mutation {
             return match self.rollback_transaction(&conn) {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(StoreError::Query(format!(
-                    "{error}; atomic note replacement rollback failed: {rollback}"
+                    "{error}; atomic incremental vault refresh rollback failed: {rollback}"
                 ))),
             };
         }
@@ -7488,10 +7521,9 @@ mod tests {
     }
 
     #[test]
-    fn atomic_note_replacement_failure_preserves_incumbent() {
+    fn whole_incremental_refresh_failure_preserves_both_incumbents_and_generation() {
         let store = GraphStore::in_memory().expect("store");
         let vault_uid = "vlt:replace:atomic";
-        let note_uid = "note:vlt:replace:atomic:a";
         store
             .insert_vault(&Vault {
                 uid: vault_uid.to_string(),
@@ -7500,11 +7532,11 @@ mod tests {
                 instance_id: "test".to_string(),
             })
             .unwrap();
-        let incumbent = Note {
-            uid: note_uid.to_string(),
+        let incumbent = |suffix: &str| Note {
+            uid: format!("note:vlt:replace:atomic:{suffix}"),
             vault_uid: vault_uid.to_string(),
-            file_path: "a.md".to_string(),
-            title: "Incumbent".to_string(),
+            file_path: format!("{suffix}.md"),
+            title: format!("Incumbent {suffix}"),
             note_kind: nestweaver_schema::NoteKind::General,
             word_count: 1,
             content_hash: "old".to_string(),
@@ -7514,21 +7546,27 @@ mod tests {
             pagerank_score: None,
             embedding: None,
         };
-        store.insert_note(&incumbent).unwrap();
-        store.insert_vault_note_edge(vault_uid, note_uid).unwrap();
-
+        let old_a = incumbent("a");
+        let old_b = incumbent("b");
+        for note in [&old_a, &old_b] {
+            store.insert_note(note).unwrap();
+            store.insert_vault_note_edge(vault_uid, &note.uid).unwrap();
+        }
+        let generation = store.graph_generation();
         let replacement = Note {
             title: "Replacement".to_string(),
             content_hash: "new".to_string(),
-            ..incumbent.clone()
+            ..old_a.clone()
         };
         let error = store
-            .replace_note_atomically(
-                note_uid,
+            .incremental_vault_refresh_atomically(
+                vault_uid,
+                &[old_a.uid.clone(), old_b.uid.clone()],
+                &[],
                 &[replacement.clone(), replacement],
                 &[],
                 &[],
-                &[(vault_uid, note_uid)],
+                &[(vault_uid, old_a.uid.as_str())],
                 &[],
                 &[],
                 &[],
@@ -7544,9 +7582,11 @@ mod tests {
         assert!(!error.to_string().is_empty());
 
         let notes = store.list_notes(Some(vault_uid)).unwrap();
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].title, "Incumbent");
-        assert_eq!(notes[0].content_hash, "old");
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().any(|note| note.title == "Incumbent a"));
+        assert!(notes.iter().any(|note| note.title == "Incumbent b"));
+        assert!(notes.iter().all(|note| note.content_hash == "old"));
+        assert_eq!(store.graph_generation(), generation);
     }
 
     #[test]
