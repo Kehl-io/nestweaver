@@ -317,23 +317,6 @@ fn attest_requested_config_on_held_pidfile(
     Ok(())
 }
 
-fn attest_requested_config_for_running_daemon(db_path: &Path, requested_path: &Path) -> Result<()> {
-    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
-    let pidfile_path = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true);
-    use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(libc::O_NOFOLLOW);
-    let mut pidfile = options
-        .open(&pidfile_path)
-        .with_context(|| format!("open live daemon pidfile: {}", pidfile_path.display()))?;
-    anyhow::ensure!(
-        !try_acquire_pidfile_lock(&pidfile)?,
-        "daemon socket accepts connections but its pidfile is not owned; refusing to accept explicit --config"
-    );
-    attest_requested_config_on_held_pidfile(db_path, requested_path, &mut pidfile)
-}
-
 /// Ensure a daemon is running for the given DB and return the socket path.
 ///
 /// Acquires an exclusive flock on the pidfile, checks whether a live daemon

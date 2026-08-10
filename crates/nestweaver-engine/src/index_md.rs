@@ -3084,7 +3084,10 @@ sub b body
         .expect("daemon-owned refresh must not attempt a second GraphStore writer");
 
         assert_eq!(result.notes_updated, 1);
-        assert_eq!(result.notes_deleted, 2, "one replacement plus one removed file");
+        assert_eq!(
+            result.notes_deleted, 2,
+            "one replacement plus one removed file"
+        );
         assert_eq!(store.count_notes().unwrap(), 1);
         let notes = store.list_notes(None).unwrap();
         assert_eq!(notes.len(), 1);

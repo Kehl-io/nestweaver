@@ -64,7 +64,13 @@ pub fn database_path_fingerprint(db_path: &Path) -> String {
     }
     #[cfg(not(unix))]
     hasher.update(canonical.to_string_lossy().as_bytes());
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    use std::fmt::Write as _;
+    for byte in digest {
+        write!(&mut fingerprint, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    fingerprint
 }
 
 /// Daemon-owned persistent startup intent for one canonical database path.
@@ -746,7 +752,7 @@ pub fn write_effective_config_binding(
         }
     })?;
 
-    let (temp_path, mut file, sequence) = loop {
+    let (temp_path, mut file) = loop {
         let sequence =
             EFFECTIVE_CONFIG_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let candidate = effective_config_temp_path(parent, sequence);
@@ -758,7 +764,7 @@ pub fn write_effective_config_binding(
             options.mode(0o600);
         }
         match options.open(&candidate) {
-            Ok(file) => break (candidate, file, sequence),
+            Ok(file) => break (candidate, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
                 return Err(EffectiveConfigBindingError::Write { path, source });
