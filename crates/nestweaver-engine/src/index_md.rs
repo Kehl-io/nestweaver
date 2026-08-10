@@ -454,6 +454,7 @@ fn index_markdown_since_with_reader(
     let mut files_checked = 0usize;
     let mut candidates = Vec::new();
     let mut indexed_paths: HashMap<String, (String, PathBuf)> = HashMap::new();
+    let mut eligible_note_uids = HashSet::new();
 
     for rel_path in all_files {
         if !is_markdown(&rel_path) {
@@ -473,10 +474,10 @@ fn index_markdown_since_with_reader(
         files_checked += 1;
         let rel_path_str = rel_str.into_owned();
         let n_uid = note_uid(&v_uid, &rel_path_str);
+        eligible_note_uids.insert(n_uid.clone());
 
-        // Parse successfully-readable unchanged files too: if any target note
-        // changes, their outgoing links must be rebuilt in the same transaction
-        // so inbound backlinks survive and rename resolution is order-independent.
+        // Parse changed files now. Unchanged sources are read later only when
+        // the affected-source closure shows their outgoing links may change.
         let changed = match reader.file_meta(&rel_path) {
             Ok(Some((mtime_secs, file_size))) => {
                 if file_size > MAX_FILE_SIZE_BYTES {
@@ -542,7 +543,7 @@ fn index_markdown_since_with_reader(
 
     let removed_uids: std::collections::HashSet<String> = existing_notes
         .iter()
-        .filter(|note| !vault_root.join(&note.file_path).exists())
+        .filter(|note| !eligible_note_uids.contains(&note.uid))
         .map(|note| note.uid.clone())
         .collect();
     let changed_uids: std::collections::HashSet<String> = candidates
@@ -3823,6 +3824,29 @@ sub b body
         .unwrap();
         assert_eq!(store.lookup_vault(&uid).unwrap().name, "empty");
         assert_eq!(store.graph_generation(), generation);
+    }
+
+    #[test]
+    fn since_refresh_deletes_an_incumbent_that_becomes_ignored() {
+        let (_dir, root) = make_vault(&[("kept.md", "# Kept\n"), ("ignored.md", "# Old\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            &["ignored.md".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.notes_updated, 0);
+        assert_eq!(result.notes_deleted, 1);
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Kept");
     }
 
     /// Build `n` distinct notes for a vault, with `make_note(0)` reusable so a
