@@ -6279,7 +6279,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "list_services", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "list_services", args)?
                 {
                     let value = unwrap_hybrid_payload(value);
                     if json {
@@ -6340,7 +6340,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "service_summary", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "service_summary", args)?
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -6414,7 +6414,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon {
                 let db_path = db.clone().unwrap_or_else(default_db_path);
                 let args = serde_json::json!({ "token_budget": token_budget });
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args)? {
                     let map = value["map"].as_str().unwrap_or("");
                     if json {
                         // Match the direct path's {map, token_count} shape — the daemon tool
@@ -6471,7 +6471,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["repo"] = serde_json::json!(rf);
                 }
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, db_path, None, "cross_repo_contracts", args)
+                    try_hybrid_json_rpc(true, db_path, None, "cross_repo_contracts", args)?
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -7503,7 +7503,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref t) = target {
                     args["target"] = serde_json::json!(t);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "get_summary", args)?
                     && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
                 {
                     if text.is_empty() {
@@ -8081,7 +8081,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(n) = limit {
                     args["limit"] = serde_json::json!(n);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "dead_code", args)? {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -8404,7 +8404,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "files": file_strs,
                     "depth": depth,
                 });
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args) {
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args)? {
                     // The daemon serializes a full BlastRadiusResult; decode it so
                     // both the concise banner and the strict exit code see the real
                     // gate state (missing fields default via serde on old daemons).
@@ -8550,7 +8550,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // path produces so human/JSON output is identical either way.
             let daemon_result: Option<nestweaver_engine::AffectedTestsResult> = if use_daemon {
                 let args = affected_tests_rpc_args(&changed_files);
-                match try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args) {
+                match try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args)? {
                     Some(value) => Some(
                         serde_json::from_value(value)
                             .context("decoding daemon affected_tests result")?,
@@ -8732,6 +8732,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         return Ok((EXIT_ERROR, None));
                     }
                     Err(e) => {
+                        ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
+                            .with_context(|| {
+                                format!(
+                                    "watch via daemon failed ({e:#}); refusing direct watcher fallback"
+                                )
+                            })?;
                         // No daemon running for this DB — safe to watch directly.
                         eprintln!("warning: daemon unavailable ({e:#}); running watcher directly");
                     }
@@ -8915,22 +8921,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         config.as_deref().map(std::path::Path::as_ref),
                     )) {
                         Ok(client) => Some((rt, client)),
-                        Err(error) if config.is_some() => {
-                            return Err(error).context(
-                                "explicit config could not be honored by the daemon for UI; refusing direct fallback",
-                            );
-                        }
                         Err(error) => {
+                            ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
+                                .with_context(|| {
+                                    format!(
+                                        "daemon UI connection failed ({error:#}); refusing direct fallback"
+                                    )
+                                })?;
                             tracing::warn!(
                                 "daemon UI connection failed, falling back to direct: {error:#}"
                             );
                             None
                         }
                     },
-                    Err(error) if config.is_some() => {
-                        return Err(error).context("create runtime for explicit-config daemon UI");
+                    Err(error) => {
+                        ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
+                            .with_context(|| {
+                                format!(
+                                    "create runtime for daemon UI failed ({error}); refusing direct fallback"
+                                )
+                            })?;
+                        None
                     }
-                    Err(_) => None,
                 }
             } else {
                 None
@@ -8999,12 +9011,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             }
                         }
                     }
-                    Err(error) if config.is_some() => {
-                        return Err(error).context(
-                            "explicit-config daemon UI request failed; refusing direct fallback",
-                        );
-                    }
                     Err(error) => {
+                        ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
+                            .with_context(|| {
+                                format!(
+                                    "daemon UI request failed ({error:#}); refusing direct fallback"
+                                )
+                            })?;
                         tracing::warn!("ServeUi RPC failed, falling back to direct: {error}");
                     }
                 }
@@ -9436,7 +9449,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["instance"] = serde_json::json!(inst);
                 }
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "symbol_lookup", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "symbol_lookup", args)?
                 {
                     let status = value
                         .get("status")
@@ -10465,7 +10478,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
                 let db_path = resolved_db.clone();
                 let args = serde_json::json!({});
-                try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)
+                try_hybrid_json_rpc(true, &db_path, None, "list_projects", args)?
                     .and_then(|v| serde_json::from_value(unwrap_hybrid_payload(v)).ok())
                     .unwrap_or_else(|| {
                         // Daemon unreachable / RPC failed — fall back to a direct read, but
@@ -10895,7 +10908,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(ref r) = root {
                     args["root"] = serde_json::json!(r);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)
+                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)?
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -10962,7 +10975,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["root"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -11020,7 +11033,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["root"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
                 {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok((EXIT_SUCCESS, None));
@@ -11119,7 +11132,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "vault": vault_abs.to_string_lossy(),
                 });
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "detect_implicit_projects", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "detect_implicit_projects", args)?
                 {
                     let detected: Vec<String> =
                         serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default();
@@ -13333,6 +13346,28 @@ fn run_memory(
 /// may use the legacy direct-disk fallback. With an explicit config, daemon
 /// connection or hybrid query failures are returned: falling through would
 /// silently discard configured provenance/upstreams while still exiting 0.
+fn ensure_direct_store_fallback_allowed(
+    db_path: &std::path::Path,
+    explicit_config: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if let Some(config) = explicit_config {
+        anyhow::bail!(
+            "explicit config {} cannot be honored by the direct store; refusing direct fallback",
+            config.display()
+        );
+    }
+
+    match nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, None)? {
+        nestweaver_client::RestartConfig::CompiledDefaults => Ok(()),
+        nestweaver_client::RestartConfig::Configured(config) => anyhow::bail!(
+            "persisted daemon config {} for {} cannot be honored by the direct store, which refuses to fall back. Retry the daemon or deliberately reset with `nestweaver daemon --db {} start`",
+            config.display(),
+            db_path.display(),
+            db_path.display()
+        ),
+    }
+}
+
 fn try_hybrid_json_rpc_checked(
     use_daemon: bool,
     db_path: &std::path::Path,
@@ -13345,10 +13380,14 @@ fn try_hybrid_json_rpc_checked(
     }
     let rt = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
-        Err(error) if config.is_some() => {
-            return Err(error).context("create runtime for explicit-config daemon query");
+        Err(error) => {
+            ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
+                format!(
+                    "create runtime for daemon query {rpc_name} failed ({error}); refusing direct fallback"
+                )
+            })?;
+            return Ok(None);
         }
-        Err(_) => return Ok(None),
     };
     let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // nw-087: a read/query against a NONEXISTENT local db must not autostart a
@@ -13390,25 +13429,19 @@ fn try_hybrid_json_rpc_checked(
         Ok(mut hybrid) => match rt.block_on(hybrid.query(rpc_name, &args)) {
             Ok(value) => Ok(Some(value)),
             Err(e) => {
-                if config.is_some() {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "explicit-config hybrid query {rpc_name} failed; refusing direct fallback"
-                        )
-                    });
-                }
+                ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
+                    format!("hybrid query {rpc_name} failed ({e:#}); refusing direct fallback")
+                })?;
                 warn_daemon_bypassed(db_path, rpc_name, &format!("{e:#}"));
                 Ok(None)
             }
         },
         Err(e) => {
-            if config.is_some() {
-                return Err(e).with_context(|| {
-                    format!(
-                        "explicit config could not be honored by the daemon for {rpc_name}; refusing direct fallback"
-                    )
-                });
-            }
+            ensure_direct_store_fallback_allowed(db_path, config).with_context(|| {
+                format!(
+                    "daemon configuration could not be safely honored for {rpc_name} ({e:#}); refusing direct fallback"
+                )
+            })?;
             let upstream = rt
                 .block_on(nestweaver_client::hybrid::query_configured_upstreams_only(
                     config, &start_dir, rpc_name, &args,
@@ -13430,18 +13463,12 @@ fn try_hybrid_json_rpc(
     config: Option<&std::path::Path>,
     rpc_name: &str,
     args: serde_json::Value,
-) -> Option<serde_json::Value> {
+) -> anyhow::Result<Option<serde_json::Value>> {
     debug_assert!(
         !use_daemon || config.is_none(),
         "explicit-config callers must use try_hybrid_json_rpc_checked"
     );
-    match try_hybrid_json_rpc_checked(use_daemon, db_path, config, rpc_name, args) {
-        Ok(value) => value,
-        Err(error) => {
-            warn_daemon_bypassed(db_path, rpc_name, &format!("{error:#}"));
-            None
-        }
-    }
+    try_hybrid_json_rpc_checked(use_daemon, db_path, config, rpc_name, args)
 }
 
 fn hybrid_source_label(value: &serde_json::Value) -> &'static str {
@@ -13855,7 +13882,7 @@ fn run_brain(
 
             if use_daemon
                 && let Some(value) =
-                    try_hybrid_json_rpc(true, db_path, None, "list_vaults", serde_json::json!({}))
+                    try_hybrid_json_rpc(true, db_path, None, "list_vaults", serde_json::json!({}))?
             {
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 return Ok((EXIT_SUCCESS, None));
@@ -15118,21 +15145,25 @@ fn run_brain(
             let v_uid_raw = nestweaver_schema::vault_uid(instance_id, &raw_str);
 
             // Fetch vault list via daemon RPC (preferred) or direct store open (fallback).
-            let fetch_vaults = |inst_filter: Option<&str>| -> Vec<nestweaver_schema::Vault> {
-                let mut args = serde_json::json!({});
-                if let Some(inst) = inst_filter {
-                    args["instance"] = serde_json::json!(inst);
-                }
-                if let Some(value) =
-                    try_hybrid_json_rpc(use_daemon, &db_path, None, "list_vaults", args)
-                {
-                    serde_json::from_value(unwrap_hybrid_payload(value)).unwrap_or_default()
-                } else if let Ok(store) = GraphStore::open_read_only(&db_path) {
-                    store.list_vaults(inst_filter).unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            };
+            let fetch_vaults =
+                |inst_filter: Option<&str>| -> anyhow::Result<Vec<nestweaver_schema::Vault>> {
+                    let mut args = serde_json::json!({});
+                    if let Some(inst) = inst_filter {
+                        args["instance"] = serde_json::json!(inst);
+                    }
+                    if let Some(value) =
+                        try_hybrid_json_rpc(use_daemon, &db_path, None, "list_vaults", args)?
+                    {
+                        Ok(
+                            serde_json::from_value(unwrap_hybrid_payload(value))
+                                .unwrap_or_default(),
+                        )
+                    } else if let Ok(store) = GraphStore::open_read_only(&db_path) {
+                        Ok(store.list_vaults(inst_filter).unwrap_or_default())
+                    } else {
+                        Ok(Vec::new())
+                    }
+                };
 
             // Helper: a stored vault matches the caller's path if any of its
             // representations (canonical, literal, tilde-expanded `~`)
@@ -15177,7 +15208,7 @@ fn run_brain(
             let mut uids_to_remove: Vec<String> = Vec::new();
             if instance_specified {
                 // Check if the direct UID exists in the vault list
-                let instance_vaults = fetch_vaults(Some(instance_id));
+                let instance_vaults = fetch_vaults(Some(instance_id))?;
                 let has_canon = instance_vaults.iter().any(|v| v.uid == v_uid_canon);
                 let has_raw = instance_vaults.iter().any(|v| v.uid == v_uid_raw);
                 if has_canon {
@@ -15201,7 +15232,7 @@ fn run_brain(
                 }
             } else {
                 uids_to_remove.push(v_uid_canon);
-                let all_vaults = fetch_vaults(None);
+                let all_vaults = fetch_vaults(None)?;
                 for v in &all_vaults {
                     if path_matches(&v.root_path) && !uids_to_remove.contains(&v.uid) {
                         uids_to_remove.push(v.uid.clone());
@@ -15215,7 +15246,7 @@ fn run_brain(
                 .unwrap_or("vault")
                 .to_string();
             // Resolve vault name from the daemon vault list instead of direct store access
-            let all_known_vaults = fetch_vaults(None);
+            let all_known_vaults = fetch_vaults(None)?;
             for uid in &uids_to_remove {
                 if let Some(v) = all_known_vaults.iter().find(|v| v.uid == *uid) {
                     vault_name.clone_from(&v.name);
@@ -15253,32 +15284,62 @@ fn run_brain(
         BrainCommands::ReindexSearch { db } => {
             let db_path = db.unwrap_or_else(default_db_path);
 
-            if use_daemon && let Ok(rt) = tokio::runtime::Runtime::new() {
-                let connect = rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
-                if let Ok(mut client) = connect {
-                    let rpc = rt.block_on(async {
-                        client
-                            .inner_mut()
-                            .reindex_search(nestweaver_proto::ReindexSearchRequest {})
-                            .await
-                            .map(|r| r.into_inner())
-                    });
-                    match rpc {
-                        Ok(resp) => {
-                            let sidecar = tantivy_sidecar_path_for(&db_path);
-                            println!(
-                                "Tantivy reindex complete: {} document(s) at {} (via daemon)",
-                                resp.document_count,
-                                sidecar.display()
-                            );
-                            return Ok((EXIT_SUCCESS, None));
+            if use_daemon {
+                match tokio::runtime::Runtime::new() {
+                    Ok(rt) => {
+                        let connect =
+                            rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+                        match connect {
+                            Ok(mut client) => {
+                                let rpc = rt.block_on(async {
+                                    client
+                                        .inner_mut()
+                                        .reindex_search(nestweaver_proto::ReindexSearchRequest {})
+                                        .await
+                                        .map(|r| r.into_inner())
+                                });
+                                match rpc {
+                                    Ok(resp) => {
+                                        let sidecar = tantivy_sidecar_path_for(&db_path);
+                                        println!(
+                                            "Tantivy reindex complete: {} document(s) at {} (via daemon)",
+                                            resp.document_count,
+                                            sidecar.display()
+                                        );
+                                        return Ok((EXIT_SUCCESS, None));
+                                    }
+                                    Err(status) => {
+                                        ensure_direct_store_fallback_allowed(&db_path, None)
+                                            .with_context(|| {
+                                                format!(
+                                                    "daemon reindex RPC failed ({}); refusing direct fallback",
+                                                    status.message()
+                                                )
+                                            })?;
+                                        eprintln!(
+                                            "warning: daemon reindex RPC failed ({}); falling back to direct mode",
+                                            status.message()
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                ensure_direct_store_fallback_allowed(&db_path, None).with_context(
+                                    || {
+                                        format!(
+                                            "daemon search-index connection failed ({error:#}); refusing direct fallback"
+                                        )
+                                    },
+                                )?;
+                            }
                         }
-                        Err(status) => {
-                            eprintln!(
-                                "warning: daemon reindex RPC failed ({}); falling back to direct mode",
-                                status.message()
-                            );
-                        }
+                    }
+                    Err(error) => {
+                        ensure_direct_store_fallback_allowed(&db_path, None).with_context(|| {
+                            format!(
+                                "create runtime for daemon search-index rebuild failed ({error}); refusing direct fallback"
+                            )
+                        })?;
                     }
                 }
             }
@@ -15320,11 +15381,15 @@ fn run_brain(
             if use_daemon {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(runtime) => Some(runtime),
-                    Err(error) if config.is_some() => {
-                        return Err(error)
-                            .context("create runtime for explicit-config brain search");
+                    Err(error) => {
+                        ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
+                            .with_context(|| {
+                                format!(
+                                    "create runtime for brain search failed ({error}); refusing direct fallback"
+                                )
+                            })?;
+                        None
                     }
-                    Err(_) => None,
                 };
                 if let Some(rt) = rt {
                     let cwd = std::env::current_dir().unwrap_or_default();
@@ -15358,16 +15423,22 @@ fn run_brain(
                                     );
                                     return Ok((EXIT_SUCCESS, Some(stats)));
                                 }
-                                Err(error) if config.is_some() => {
-                                    return Err(error).context(
-                                        "explicit-config hybrid brain search failed; refusing direct fallback",
+                                Err(error) => {
+                                    ensure_direct_store_fallback_allowed(
+                                        &db_path,
+                                        config.as_deref(),
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "hybrid brain search failed ({error:#}); refusing direct fallback"
+                                        )
+                                    })?;
+                                    warn_daemon_bypassed(
+                                        &db_path,
+                                        "brain_search",
+                                        &format!("{error:#}"),
                                     );
                                 }
-                                Err(error) => warn_daemon_bypassed(
-                                    &db_path,
-                                    "brain_search",
-                                    &format!("{error:#}"),
-                                ),
                             }
                         }
                         Ok(mut hybrid) => {
@@ -15392,24 +15463,31 @@ fn run_brain(
                                     );
                                     return Ok((EXIT_SUCCESS, Some(stats)));
                                 }
-                                Err(error) if config.is_some() => {
-                                    return Err(error).context(
-                                        "explicit-config daemon brain search failed; refusing direct fallback",
+                                Err(error) => {
+                                    ensure_direct_store_fallback_allowed(
+                                        &db_path,
+                                        config.as_deref(),
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "daemon brain search failed ({error:#}); refusing direct fallback"
+                                        )
+                                    })?;
+                                    warn_daemon_bypassed(
+                                        &db_path,
+                                        "brain_search",
+                                        &format!("{error:#}"),
                                     );
                                 }
-                                Err(error) => warn_daemon_bypassed(
-                                    &db_path,
-                                    "brain_search",
-                                    &format!("{error:#}"),
-                                ),
                             }
                         }
-                        Err(error) if config.is_some() => {
-                            return Err(error).context(
-                                "explicit config could not be honored by the daemon for brain_search; refusing direct fallback",
-                            );
-                        }
                         Err(error) => {
+                            ensure_direct_store_fallback_allowed(&db_path, config.as_deref())
+                                .with_context(|| {
+                                    format!(
+                                        "daemon configuration could not be safely honored for brain_search ({error:#}); refusing direct fallback"
+                                    )
+                                })?;
                             warn_daemon_bypassed(&db_path, "brain_search", &format!("{error:#}"));
                         }
                     }
@@ -18004,7 +18082,7 @@ fn run_contracts(
                     args["repo"] = serde_json::json!(r);
                 }
                 if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "contract_drift", args)
+                    try_hybrid_json_rpc(true, &db_path, None, "contract_drift", args)?
                 {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -19156,7 +19234,7 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
                 let mut args = serde_json::json!({});
                 args["instance"] = serde_json::json!(&instance_id);
                 if let Some(value) =
-                    try_hybrid_json_rpc(false, &db_path, config.as_deref(), "list_repos", args)
+                    try_hybrid_json_rpc(false, &db_path, config.as_deref(), "list_repos", args)?
                 {
                     serde_json::from_value(unwrap_hybrid_payload(value))
                         .context("failed to deserialize repos from daemon response")?
@@ -19179,7 +19257,7 @@ fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyhow::Result<
                     config.as_deref(),
                     "embedding_dimension",
                     args,
-                ) {
+                )? {
                     serde_json::from_value(value).unwrap_or(0)
                 } else {
                     let store = GraphStore::open_read_only(&db_path)
@@ -20705,6 +20783,33 @@ timeout = "20ms"
         .expect_err("a declared but unusable upstream must fail closed");
 
         assert!(format!("{error:#}").contains("refusing direct fallback"));
+    }
+
+    #[test]
+    fn direct_fallback_policy_distinguishes_absent_and_configured_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        assert!(
+            ensure_direct_store_fallback_allowed(&db, None).is_ok(),
+            "record absence preserves ordinary daemon-unavailable fallback"
+        );
+
+        let config = dir.path().join("instance.toml");
+        std::fs::write(&config, valid_local_instance_config(dir.path(), "")).unwrap();
+        nestweaver_daemon::lifecycle::write_last_successful_config(&db, &config).unwrap();
+
+        let configured = ensure_direct_store_fallback_allowed(&db, None)
+            .expect_err("a query failure must not bypass valid persisted configured intent");
+        let configured_message = format!("{configured:#}");
+        assert!(configured_message.contains("persisted daemon config"));
+        assert!(configured_message.contains("refuses to fall back"));
+
+        std::fs::write(&config, "instance_id = [broken").unwrap();
+        let corrupt = ensure_direct_store_fallback_allowed(&db, None)
+            .expect_err("corrupt persisted intent must also fail closed");
+        assert!(format!("{corrupt:#}").contains("persisted daemon config"));
+
+        nestweaver_daemon::lifecycle::remove_last_successful_config(&db).unwrap();
     }
 
     #[test]
