@@ -14960,12 +14960,13 @@ fn run_brain(
 
                 println!(
                     "Incremental refresh of vault '{}' (since {}): \
-                     checked {} file(s), updated {} note(s), \
+                     checked {} file(s), updated {} note(s), dropped {} prior note(s), \
                      {} heading(s), {} section(s), {} tag(s), {} wikilink(s).",
                     result.vault_name,
                     since_str,
                     result.files_checked,
                     result.notes_updated,
+                    result.notes_deleted,
                     result.headings_count,
                     result.sections_count,
                     result.tags_count,

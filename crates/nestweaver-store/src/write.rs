@@ -2078,8 +2078,15 @@ impl GraphStore {
     /// silently succeeds if the table does not exist.
     pub fn delete_unresolved_wikilinks_for_note(&self, note_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_unresolved_wikilinks_for_note_on(&conn, note_uid)
+    }
+
+    fn delete_unresolved_wikilinks_for_note_on(
+        conn: &lbug::Connection<'_>,
+        note_uid: &str,
+    ) -> Result<(), StoreError> {
         if let Err(e) = exec_params(
-            &conn,
+            conn,
             "MATCH (u:UnresolvedWikilink {source_note_uid: $uid}) DETACH DELETE u",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         ) {
@@ -2415,14 +2422,34 @@ impl GraphStore {
     /// the next reindex pass.
     pub fn delete_note_cascade(&self, note_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_note_cascade_on(&conn, note_uid)
+    }
 
+    /// Atomically delete one note and all of its owned graph data.
+    pub fn delete_note_cascade_atomic(&self, note_uid: &str) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        if let Err(error) = Self::delete_note_cascade_on(&conn, note_uid) {
+            return match self.rollback_transaction(&conn) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(StoreError::Query(format!(
+                    "{error}; atomic note deletion rollback failed: {rollback}"
+                ))),
+            };
+        }
+        self.commit_transaction(&conn)
+    }
+
+    fn delete_note_cascade_on(
+        conn: &lbug::Connection<'_>,
+        note_uid: &str,
+    ) -> Result<(), StoreError> {
         // 1. Drop every Section whose ownership property references this
         //    note, including fragments whose NOTE_HAS_SECTION edge is missing.
         //    DETACH removes the
         //    NOTE_HAS_SECTION, HEADING_HAS_SECTION, WIKILINK_TO_NOTE
         //    (incoming) and SECTION_TAGGED_WITH edges along with it.
         exec_params(
-            &conn,
+            conn,
             "MATCH (s:Section) WHERE s.note_uid = $uid DETACH DELETE s",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -2431,7 +2458,7 @@ impl GraphStore {
         //    independent pass also handles a missing or corrupt note_uid
         //    property.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_SECTION]->(s:Section) DETACH DELETE s",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -2443,7 +2470,7 @@ impl GraphStore {
         //    section was dropped above), HEADING_PARENT (both directions),
         //    and WIKILINK_TO_HEADING (incoming).
         exec_params(
-            &conn,
+            conn,
             "MATCH (h:Heading) WHERE h.note_uid = $uid DETACH DELETE h",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -2452,7 +2479,7 @@ impl GraphStore {
         //    independent pass also handles a missing or corrupt note_uid
         //    property.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
@@ -2461,16 +2488,68 @@ impl GraphStore {
         //    NOTE_TAGGED_WITH, PROJECT_INCLUDES_NOTE, and any incoming
         //    WIKILINK_TO_NOTE edges from other notes' sections.
         exec_params(
-            &conn,
+            conn,
             "MATCH (n:Note {uid: $uid}) DETACH DELETE n",
             vec![("uid", lbug::Value::String(note_uid.to_string()))],
         )?;
 
         // 6. Drop any recorded unresolved-wikilink rows for this note so they
         //    do not linger after re-index (e.g. once the target note appears).
-        self.delete_unresolved_wikilinks_for_note(note_uid)?;
+        Self::delete_unresolved_wikilinks_for_note_on(conn, note_uid)?;
 
         Ok(())
+    }
+
+    /// Delete an incumbent note and insert its complete replacement in one
+    /// transaction. If any replacement write fails, the incumbent remains.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_note_atomically(
+        &self,
+        note_uid: &str,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
+        unresolved_wikilinks: &[UnresolvedWikilinkRecord],
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let mutation = Self::delete_note_cascade_on(&conn, note_uid).and_then(|()| {
+            Self::bulk_vault_write_on(
+                &conn,
+                notes,
+                headings,
+                sections,
+                vault_note_edges,
+                note_heading_edges,
+                note_section_edges,
+                heading_section_edges,
+                heading_parent_edges,
+                tags,
+                note_tag_edges,
+                section_tag_edges,
+                wikilink_to_note_edges,
+                wikilink_to_heading_edges,
+            )?;
+            Self::batch_insert_unresolved_wikilinks_on(&conn, unresolved_wikilinks)
+        });
+        if let Err(error) = mutation {
+            return match self.rollback_transaction(&conn) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(StoreError::Query(format!(
+                    "{error}; atomic note replacement rollback failed: {rollback}"
+                ))),
+            };
+        }
+        self.commit_transaction(&conn)
     }
 
     /// Cascade-delete a Vault and every Note belonging to it using bulk
@@ -7401,6 +7480,68 @@ mod tests {
             after, before,
             "merge destroyed the wikilink graph: {before} -> {after}"
         );
+    }
+
+    #[test]
+    fn atomic_note_replacement_failure_preserves_incumbent() {
+        let store = GraphStore::in_memory().expect("store");
+        let vault_uid = "vlt:replace:atomic";
+        let note_uid = "note:vlt:replace:atomic:a";
+        store
+            .insert_vault(&Vault {
+                uid: vault_uid.to_string(),
+                name: "brain".to_string(),
+                root_path: "/brain".to_string(),
+                instance_id: "test".to_string(),
+            })
+            .unwrap();
+        let incumbent = Note {
+            uid: note_uid.to_string(),
+            vault_uid: vault_uid.to_string(),
+            file_path: "a.md".to_string(),
+            title: "Incumbent".to_string(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 1,
+            content_hash: "old".to_string(),
+            frontmatter: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        store.insert_note(&incumbent).unwrap();
+        store.insert_vault_note_edge(vault_uid, note_uid).unwrap();
+
+        let replacement = Note {
+            title: "Replacement".to_string(),
+            content_hash: "new".to_string(),
+            ..incumbent.clone()
+        };
+        let error = store
+            .replace_note_atomically(
+                note_uid,
+                &[replacement.clone(), replacement],
+                &[],
+                &[],
+                &[(vault_uid, note_uid)],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect_err("duplicate replacement UID must fail after the staged delete");
+        assert!(!error.to_string().is_empty());
+
+        let notes = store.list_notes(Some(vault_uid)).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Incumbent");
+        assert_eq!(notes[0].content_hash, "old");
     }
 
     #[test]

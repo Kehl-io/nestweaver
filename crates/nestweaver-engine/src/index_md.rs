@@ -362,8 +362,8 @@ pub struct MarkdownSinceResult {
 }
 
 /// Incrementally refresh only the files in `vault_root` whose filesystem
-/// modification time is >= `since`. For each matching file the old Note
-/// (and its descendants) is cascade-deleted then re-parsed and re-inserted.
+/// modification time is >= `since`. For each matching file the old Note and
+/// its descendants are atomically replaced by the re-parsed graph.
 /// Files that have not changed are untouched.
 ///
 /// If the vault has never been indexed this function creates it first and
@@ -508,17 +508,16 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
 
         let n_uid = note_uid(&v_uid, &rel_path_str);
 
-        // Delete old note data (cascade). Safe when note doesn't exist.
-        if let Err(e) = store.delete_note_cascade(&n_uid) {
-            tracing::warn!("delete_note_cascade {n_uid} failed: {e}");
-        } else if existing_note_uids.contains(&n_uid) {
-            notes_deleted += 1;
-        }
-
         let abs_path = vault_root.join(&rel_path);
         let (h_count, s_count, wl_count, t_count) =
             reinsert_single_note(store, &v_uid, &n_uid, &abs_path, &rel_path_str, &parsed)
                 .with_context(|| format!("reinsert_single_note {rel_path_str}"))?;
+
+        // Replacement commits the incumbent deletion and the new graph in one
+        // transaction, so this count reflects committed truth.
+        if existing_note_uids.contains(&n_uid) {
+            notes_deleted += 1;
+        }
 
         total_headings += h_count;
         total_sections += s_count;
@@ -534,7 +533,7 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
     for note in &existing_notes {
         if !vault_root.join(&note.file_path).exists() {
             store
-                .delete_note_cascade(&note.uid)
+                .delete_note_cascade_atomic(&note.uid)
                 .with_context(|| format!("delete removed note {}", note.file_path))?;
             notes_deleted += 1;
         }
@@ -561,8 +560,8 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
     })
 }
 
-/// Insert a single note (and all its descendants: headings, sections, tags,
-/// wikilinks) into the store. Mirrors the watcher's per-file insertion logic.
+/// Atomically replace a single note (and all its descendants: headings,
+/// sections, tags, wikilinks). Mirrors the watcher's per-file insertion logic.
 /// Returns `(headings_count, sections_count, wikilinks_resolved, tags_count)`.
 fn reinsert_single_note(
     store: &GraphStore,
@@ -591,25 +590,20 @@ fn reinsert_single_note(
         Err(_) => (None, None),
     };
 
-    store
-        .insert_note(&Note {
-            uid: n_uid.to_string(),
-            vault_uid: v_uid.to_string(),
-            file_path: rel_path.to_string(),
-            title: parsed.title.clone(),
-            note_kind: parsed.note_kind,
-            word_count: parsed.word_count,
-            content_hash: parsed.content_hash.clone(),
-            frontmatter: frontmatter_json,
-            created_at,
-            modified_at,
-            pagerank_score: None,
-            embedding: None,
-        })
-        .context("insert_note")?;
-    store
-        .insert_vault_note_edge(v_uid, n_uid)
-        .context("insert_vault_note_edge")?;
+    let note = Note {
+        uid: n_uid.to_string(),
+        vault_uid: v_uid.to_string(),
+        file_path: rel_path.to_string(),
+        title: parsed.title.clone(),
+        note_kind: parsed.note_kind,
+        word_count: parsed.word_count,
+        content_hash: parsed.content_hash.clone(),
+        frontmatter: frontmatter_json,
+        created_at,
+        modified_at,
+        pagerank_score: None,
+        embedding: None,
+    };
 
     // Headings.
     let heading_uids: Vec<String> = parsed
@@ -633,13 +627,10 @@ fn reinsert_single_note(
             embedding: None,
         })
         .collect();
-    store
-        .batch_insert_headings(&headings)
-        .context("batch_insert_headings")?;
-    let nh_edges: Vec<(&str, &str)> = heading_uids.iter().map(|h| (n_uid, h.as_str())).collect();
-    store
-        .batch_insert_note_heading_edges(&nh_edges)
-        .context("batch_insert_note_heading_edges")?;
+    let nh_edges: Vec<(String, String)> = heading_uids
+        .iter()
+        .map(|h| (n_uid.to_string(), h.clone()))
+        .collect();
 
     let mut parent_edges: Vec<(String, String)> = Vec::new();
     for (idx, h) in parsed.headings.iter().enumerate() {
@@ -650,13 +641,6 @@ fn reinsert_single_note(
             }
         }
     }
-    let parent_refs: Vec<(&str, &str)> = parent_edges
-        .iter()
-        .map(|(c, p)| (c.as_str(), p.as_str()))
-        .collect();
-    store
-        .batch_insert_heading_parent_edges(&parent_refs)
-        .context("batch_insert_heading_parent_edges")?;
 
     // Sections.
     let mut section_uids: Vec<String> = Vec::with_capacity(parsed.sections.len());
@@ -685,23 +669,6 @@ fn reinsert_single_note(
         }
         section_uids.push(s_uid);
     }
-    store
-        .batch_insert_sections(&sections)
-        .context("batch_insert_sections")?;
-    let ns_refs: Vec<(&str, &str)> = ns_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store
-        .batch_insert_note_section_edges(&ns_refs)
-        .context("batch_insert_note_section_edges")?;
-    let hs_refs: Vec<(&str, &str)> = hs_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store
-        .batch_insert_heading_section_edges(&hs_refs)
-        .context("batch_insert_heading_section_edges")?;
 
     // Tags.
     let mut local_tag_uids: HashMap<String, String> = HashMap::new();
@@ -735,27 +702,13 @@ fn reinsert_single_note(
             }
         }
     }
-    for t in &new_tag_nodes {
-        if let Err(e) = store.insert_tag(t)
-            && !e.is_duplicate()
-        {
-            tracing::warn!("insert_tag {} failed: {e}", t.name);
-        }
-    }
-    let nt_refs: Vec<(&str, &str)> = note_tag_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
+    let existing_tag_uids: std::collections::HashSet<String> = store
+        .list_tags(Some(v_uid))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tag| tag.uid)
         .collect();
-    store
-        .batch_insert_note_tag_edges(&nt_refs)
-        .context("batch_insert_note_tag_edges")?;
-    let st_refs: Vec<(&str, &str)> = section_tag_edges
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    store
-        .batch_insert_section_tag_edges(&st_refs)
-        .context("batch_insert_section_tag_edges")?;
+    new_tag_nodes.retain(|tag| !existing_tag_uids.contains(&tag.uid));
     let tags_count = local_tag_uids.len();
 
     // Wikilinks: resolve against all notes currently in the DB.
@@ -763,10 +716,16 @@ fn reinsert_single_note(
     let title_lookup: HashMap<String, Vec<String>> = {
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for n in &all_notes {
+            if n.uid == n_uid {
+                continue;
+            }
             map.entry(n.title.to_lowercase())
                 .or_default()
                 .push(n.uid.clone());
         }
+        map.entry(parsed.title.to_lowercase())
+            .or_default()
+            .push(n_uid.to_string());
         map
     };
     // nw-122: carry BOTH the visible text and the link target. Backlinks want
@@ -807,9 +766,12 @@ fn reinsert_single_note(
         for target in candidates {
             if let Some(anchor) = &wl.heading_anchor {
                 let anchor_slug = nestweaver_parser::markdown::slugify(anchor);
-                if let Ok(headings) = store.headings_in_note(target)
-                    && let Some(h) = headings.iter().find(|h| h.slug == anchor_slug)
-                {
+                let target_headings = if target == n_uid {
+                    headings.clone()
+                } else {
+                    store.headings_in_note(target).unwrap_or_default()
+                };
+                if let Some(h) = target_headings.iter().find(|h| h.slug == anchor_slug) {
                     wl_head_edges.push((
                         source_section.clone(),
                         h.uid.clone(),
@@ -830,27 +792,58 @@ fn reinsert_single_note(
         }
     }
     let wl_resolved = wl_note_edges.len() + wl_head_edges.len();
-    {
-        let mut seen = std::collections::HashSet::new();
-        unresolved.retain(|(uid, ..)| seen.insert(uid.clone()));
-        if let Err(e) = store.batch_insert_unresolved_wikilinks(&unresolved) {
-            tracing::warn!("failed to record unresolved wikilinks: {e}");
-        }
-    }
+    let mut seen = std::collections::HashSet::new();
+    unresolved.retain(|(uid, ..)| seen.insert(uid.clone()));
     let wl_note_refs: Vec<(&str, &str, f32, &str, &str)> = wl_note_edges
         .iter()
         .map(|(s, n, c, d, t)| (s.as_str(), n.as_str(), *c, d.as_str(), t.as_str()))
         .collect();
-    store
-        .batch_insert_wikilink_to_note_edges(&wl_note_refs)
-        .context("batch_insert_wikilink_to_note_edges")?;
     let wl_head_refs: Vec<(&str, &str, f32, &str, &str)> = wl_head_edges
         .iter()
         .map(|(s, h, c, d, t)| (s.as_str(), h.as_str(), *c, d.as_str(), t.as_str()))
         .collect();
-    store
-        .batch_insert_wikilink_to_heading_edges(&wl_head_refs)
-        .context("batch_insert_wikilink_to_heading_edges")?;
+    let vault_note_edges = [(v_uid, n_uid)];
+    let nh_refs: Vec<(&str, &str)> = nh_edges
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let ns_refs: Vec<(&str, &str)> = ns_edges
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let hs_refs: Vec<(&str, &str)> = hs_edges
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let parent_refs: Vec<(&str, &str)> = parent_edges
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let nt_refs: Vec<(&str, &str)> = note_tag_edges
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let st_refs: Vec<(&str, &str)> = section_tag_edges
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    store.replace_note_atomically(
+        n_uid,
+        &[note],
+        &headings,
+        &sections,
+        &vault_note_edges,
+        &nh_refs,
+        &ns_refs,
+        &hs_refs,
+        &parent_refs,
+        &new_tag_nodes,
+        &nt_refs,
+        &st_refs,
+        &wl_note_refs,
+        &wl_head_refs,
+        &unresolved,
+    )?;
 
     Ok((headings.len(), sections.len(), wl_resolved, tags_count))
 }
@@ -3095,6 +3088,33 @@ sub b body
             notes[0].vault_uid,
             nestweaver_schema::vault_uid("owned", &root.to_string_lossy())
         );
+        assert_eq!(notes[0].title, "A");
+    }
+
+    #[test]
+    fn since_refresh_atomically_replaces_a_tagged_incumbent() {
+        let (_dir, root) = make_vault(&[("a.md", "# Old\n\n#keep old body\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+
+        fs::write(root.join("a.md"), "# New\n\n#keep new body\n").unwrap();
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            std::time::SystemTime::UNIX_EPOCH,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(result.notes_updated, 1);
+        assert_eq!(result.notes_deleted, 1);
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "New");
+        assert_eq!(store.list_tags(None).unwrap().len(), 1);
     }
 
     /// Build `n` distinct notes for a vault, with `make_note(0)` reusable so a
