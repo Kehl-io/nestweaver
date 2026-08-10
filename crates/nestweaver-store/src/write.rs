@@ -2508,7 +2508,7 @@ impl GraphStore {
     #[allow(clippy::too_many_arguments)]
     pub fn incremental_vault_refresh_atomically(
         &self,
-        vault_uid: &str,
+        vault: &Vault,
         delete_note_uids: &[String],
         rebuild_link_source_uids: &[String],
         notes: &[Note],
@@ -2525,9 +2525,20 @@ impl GraphStore {
         wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
         wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
         unresolved_wikilinks: &[UnresolvedWikilinkRecord],
+        typed_edges: &[ResolvedEdge],
     ) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
         let mutation = (|| {
+            exec_params(
+                &conn,
+                "MERGE (v:Vault {uid: $uid}) SET v.name = $name, v.root_path = $rp, v.instance_id = $iid",
+                vec![
+                    ("uid", lbug::Value::String(vault.uid.clone())),
+                    ("name", lbug::Value::String(vault.name.clone())),
+                    ("rp", lbug::Value::String(vault.root_path.clone())),
+                    ("iid", lbug::Value::String(vault.instance_id.clone())),
+                ],
+            )?;
             // Rebuild every successfully-parsed source's outgoing links. This
             // preserves inbound links to replaced targets and makes title
             // resolution a function of the prospective graph, not file order.
@@ -2545,6 +2556,13 @@ impl GraphStore {
                     vec![("uid", lbug::Value::String(note_uid.clone()))],
                 )?;
                 Self::delete_unresolved_wikilinks_for_note_on(&conn, note_uid)?;
+                for rel in ["SUPERSEDES", "DEPENDS_ON", "CAUSED_BY", "RELATES_TO"] {
+                    exec_params(
+                        &conn,
+                        &format!("MATCH (n:Note {{uid: $uid}})-[r:{rel}]->() DELETE r"),
+                        vec![("uid", lbug::Value::String(note_uid.clone()))],
+                    )?;
+                }
             }
             for note_uid in delete_note_uids {
                 Self::delete_note_cascade_on(&conn, note_uid)?;
@@ -2566,12 +2584,13 @@ impl GraphStore {
                 wikilink_to_heading_edges,
             )?;
             Self::batch_insert_unresolved_wikilinks_on(&conn, unresolved_wikilinks)?;
+            Self::batch_insert_edges_on(&conn, typed_edges)?;
             exec_params(
                 &conn,
                 "MATCH (t:Tag) WHERE t.vault_uid = $vid \
                  AND NOT (t)<-[:NOTE_TAGGED_WITH]-() \
                  AND NOT (t)<-[:SECTION_TAGGED_WITH]-() DETACH DELETE t",
-                vec![("vid", lbug::Value::String(vault_uid.to_string()))],
+                vec![("vid", lbug::Value::String(vault.uid.clone()))],
             )
         })();
         if let Err(error) = mutation {
@@ -5213,7 +5232,7 @@ impl GraphStore {
     /// helper serves both WIKILINK_TO_NOTE and WIKILINK_TO_HEADING. Best-effort:
     /// a missing table yields an empty vec rather than an error, matching how
     /// the cascade treats these tables.
-    fn wikilink_edges_for_vault(
+    pub fn wikilink_edges_for_vault(
         &self,
         vault_uid: &str,
         rel: &str,
@@ -5243,6 +5262,8 @@ impl GraphStore {
         };
         Ok(result
             .filter_map(|row| {
+                let display = crate::read::extract_string(&row, 3).unwrap_or_default();
+                let target = crate::read::extract_string(&row, 4).unwrap_or_default();
                 Some((
                     crate::read::extract_string(&row, 0).ok()?,
                     crate::read::extract_string(&row, 1).ok()?,
@@ -5253,11 +5274,11 @@ impl GraphStore {
                             _ => None,
                         })
                         .unwrap_or(0.0),
-                    crate::read::extract_string(&row, 3).unwrap_or_default(),
+                    display.clone(),
                     // nw-122: `target` is empty on rows written before the
                     // column existed; readers fall back to `display`, which is
                     // exactly what those rows have always carried.
-                    crate::read::extract_string(&row, 4).unwrap_or_default(),
+                    if target.is_empty() { display } else { target },
                 ))
             })
             .collect())
@@ -5266,7 +5287,7 @@ impl GraphStore {
     /// Read every UnresolvedWikilink row as
     /// `(uid, source_note_uid, source_path, source_title, wikilink_text)`.
     /// Callers filter by source note. Best-effort on a missing table.
-    fn all_unresolved_wikilinks(&self) -> Result<Vec<UnresolvedWikilinkRecord>, StoreError> {
+    pub fn all_unresolved_wikilinks(&self) -> Result<Vec<UnresolvedWikilinkRecord>, StoreError> {
         let conn = self.conn()?;
         let q = "MATCH (u:UnresolvedWikilink) \
                  RETURN u.uid, u.source_note_uid, u.source_path, u.source_title, u.wikilink_text";
@@ -7552,6 +7573,48 @@ mod tests {
             store.insert_note(note).unwrap();
             store.insert_vault_note_edge(vault_uid, &note.uid).unwrap();
         }
+        let old_section = Section {
+            uid: format!("sec:{vault_uid}:a"),
+            note_uid: old_a.uid.clone(),
+            heading_uid: None,
+            start_line: 1,
+            end_line: 2,
+            text_hash: "old-section".to_string(),
+            text_content: "[[Incumbent b]] #old".to_string(),
+            word_count: 2,
+            pagerank_score: None,
+        };
+        store.insert_section(&old_section).unwrap();
+        store
+            .batch_insert_note_section_edges(&[(old_a.uid.as_str(), old_section.uid.as_str())])
+            .unwrap();
+        store
+            .batch_insert_wikilink_to_note_edges(&[(
+                old_section.uid.as_str(),
+                old_b.uid.as_str(),
+                1.0,
+                "Incumbent b",
+                "Incumbent b",
+            )])
+            .unwrap();
+        let old_tag = Tag {
+            uid: format!("tag:{vault_uid}:old"),
+            vault_uid: vault_uid.to_string(),
+            name: "old".to_string(),
+        };
+        store.insert_tag(&old_tag).unwrap();
+        store
+            .batch_insert_note_tag_edges(&[(old_a.uid.as_str(), old_tag.uid.as_str())])
+            .unwrap();
+        store
+            .insert_unresolved_wikilink(
+                "unresolved:old",
+                &old_a.uid,
+                &old_a.file_path,
+                &old_a.title,
+                "Missing",
+            )
+            .unwrap();
         let generation = store.graph_generation();
         let replacement = Note {
             title: "Replacement".to_string(),
@@ -7560,13 +7623,19 @@ mod tests {
         };
         let error = store
             .incremental_vault_refresh_atomically(
-                vault_uid,
+                &Vault {
+                    uid: vault_uid.to_string(),
+                    name: "new-name".to_string(),
+                    root_path: "/new-root".to_string(),
+                    instance_id: "new-instance".to_string(),
+                },
                 &[old_a.uid.clone(), old_b.uid.clone()],
                 &[],
                 &[replacement.clone(), replacement],
                 &[],
                 &[],
                 &[(vault_uid, old_a.uid.as_str())],
+                &[],
                 &[],
                 &[],
                 &[],
@@ -7586,6 +7655,13 @@ mod tests {
         assert!(notes.iter().any(|note| note.title == "Incumbent a"));
         assert!(notes.iter().any(|note| note.title == "Incumbent b"));
         assert!(notes.iter().all(|note| note.content_hash == "old"));
+        let vault = store.lookup_vault(vault_uid).unwrap();
+        assert_eq!(vault.name, "brain");
+        assert_eq!(vault.root_path, "/brain");
+        assert_eq!(vault.instance_id, "test");
+        assert_eq!(store.count_wikilink_edges().unwrap(), 1);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 1);
+        assert_eq!(store.list_tags(Some(vault_uid)).unwrap().len(), 1);
         assert_eq!(store.graph_generation(), generation);
     }
 

@@ -419,22 +419,26 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
     let reader = crate::content_reader::FilesystemReader::new(&canonical);
-    let root_str = canonical.to_string_lossy().into_owned();
-    let vault_root: &Path = &canonical;
-    let v_uid = vault_uid(instance_id, &root_str);
-    let ignore_set = crate::brainignore::load_brain_ignore(vault_root, extra_ignore_patterns);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns);
+    index_markdown_since_with_reader(store, &reader, instance_id, vault_name, since, &ignore_set)
+}
 
-    store
-        .upsert_vault(&Vault {
-            uid: v_uid.clone(),
-            name: vault_name.to_string(),
-            root_path: root_str.clone(),
-            instance_id: instance_id.to_string(),
-        })
-        .context("upsert_vault")?;
+fn index_markdown_since_with_reader(
+    store: &GraphStore,
+    reader: &dyn ContentReader,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    ignore_set: &GlobSet,
+) -> Result<MarkdownSinceResult, anyhow::Error> {
+    let vault_root = reader.root();
+    let root_str = vault_root.to_string_lossy().into_owned();
+    let v_uid = vault_uid(instance_id, &root_str);
+
     let existing_notes = store
         .list_notes(Some(&v_uid))
         .context("list existing vault notes")?;
+    let vault_existed = store.lookup_vault(&v_uid).is_ok();
     let existing_note_uids = existing_notes
         .iter()
         .map(|note| note.uid.clone())
@@ -447,16 +451,9 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
 
     let all_files = reader.list_files()?;
 
-    struct ParsedCandidate {
-        rel_path: String,
-        abs_path: PathBuf,
-        note_uid: String,
-        parsed: ParsedNote,
-        changed: bool,
-    }
-
     let mut files_checked = 0usize;
     let mut candidates = Vec::new();
+    let mut indexed_paths: HashMap<String, (String, PathBuf)> = HashMap::new();
 
     for rel_path in all_files {
         if !is_markdown(&rel_path) {
@@ -468,7 +465,7 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
         }
         // Apply .brainignore patterns.
         let rel_str = rel_path.to_string_lossy();
-        if crate::brainignore::is_ignored(&rel_str, &ignore_set) {
+        if crate::brainignore::is_ignored(&rel_str, ignore_set) {
             tracing::debug!("brainignore: skipping {}", rel_str);
             continue;
         }
@@ -503,6 +500,12 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
                 continue;
             }
         };
+        if !changed {
+            if existing_note_uids.contains(&n_uid) {
+                indexed_paths.insert(n_uid, (rel_path_str, vault_root.join(&rel_path)));
+            }
+            continue;
+        }
         let source = match reader.read_file(&rel_path) {
             Ok(s) => s,
             Err(err) => {
@@ -562,7 +565,7 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
         .filter(|candidate| candidate.changed)
         .count();
     let notes_deleted = delete_note_uids.len();
-    if notes_updated == 0 && notes_deleted == 0 {
+    if notes_updated == 0 && notes_deleted == 0 && vault_existed {
         return Ok(MarkdownSinceResult {
             vault_name: vault_name.to_string(),
             files_checked,
@@ -572,6 +575,156 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
             sections_count: 0,
             tags_count: 0,
             wikilinks_resolved: 0,
+        });
+    }
+
+    let mut affected_names = std::collections::HashSet::new();
+    for note in &existing_notes {
+        if changed_uids.contains(&note.uid) || removed_uids.contains(&note.uid) {
+            affected_names.insert(note.uid.to_lowercase());
+            let stored = note_context_from_stored(note, Vec::new());
+            add_note_identity(
+                &mut affected_names,
+                &note.title,
+                &note.file_path,
+                &stored.aliases,
+            );
+        }
+    }
+    for candidate in &candidates {
+        affected_names.insert(candidate.note_uid.to_lowercase());
+        add_note_identity(
+            &mut affected_names,
+            &candidate.parsed.title,
+            &candidate.rel_path,
+            &candidate.parsed.aliases,
+        );
+    }
+
+    let sections = store
+        .list_sections_by_vault(&v_uid)
+        .context("list existing vault sections")?;
+    let section_note: HashMap<String, String> = sections
+        .into_iter()
+        .map(|section| (section.uid, section.note_uid))
+        .collect();
+    let note_path_by_uid: HashMap<&str, &str> = existing_notes
+        .iter()
+        .map(|note| (note.uid.as_str(), note.file_path.as_str()))
+        .collect();
+    let existing_headings = store
+        .list_headings_by_vault(&v_uid)
+        .context("list existing vault headings")?;
+    let heading_note: HashMap<String, String> = existing_headings
+        .iter()
+        .map(|heading| (heading.uid.clone(), heading.note_uid.clone()))
+        .collect();
+    let mut affected_sources = changed_uids.clone();
+    for (relation, destination) in [
+        ("WIKILINK_TO_NOTE", "dst:Note"),
+        ("WIKILINK_TO_HEADING", "dst:Heading"),
+    ] {
+        for (source_section, target, _, _, link_target) in
+            store.wikilink_edges_for_vault(&v_uid, relation, destination)?
+        {
+            let target_note = if relation == "WIKILINK_TO_NOTE" {
+                Some(target.as_str())
+            } else {
+                heading_note.get(&target).map(String::as_str)
+            };
+            let normalized_target = link_target.trim().replace('\\', "/").to_lowercase();
+            let source_relative_affected = section_note
+                .get(&source_section)
+                .and_then(|source_uid| note_path_by_uid.get(source_uid.as_str()))
+                .and_then(|path| Path::new(path).parent())
+                .map(|folder| {
+                    let joined = folder
+                        .join(&normalized_target)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    affected_names.contains(&joined)
+                        || affected_names
+                            .iter()
+                            .any(|identity| identity.ends_with(&format!("/{normalized_target}")))
+                })
+                .unwrap_or(false);
+            if (target_note
+                .is_some_and(|uid| changed_uids.contains(uid) || removed_uids.contains(uid))
+                || affected_names.contains(&normalized_target)
+                || source_relative_affected)
+                && let Some(source_note) = section_note.get(&source_section)
+            {
+                affected_sources.insert(source_note.clone());
+            }
+        }
+    }
+    for (_, source_note, source_path, _, link_target) in store.all_unresolved_wikilinks()? {
+        let normalized = link_target.trim().replace('\\', "/").to_lowercase();
+        let joined = Path::new(&source_path).parent().map(|folder| {
+            folder
+                .join(&normalized)
+                .to_string_lossy()
+                .replace('\\', "/")
+        });
+        if affected_names.contains(&normalized)
+            || joined
+                .as_ref()
+                .is_some_and(|path| affected_names.contains(path))
+            || affected_names
+                .iter()
+                .any(|identity| identity.ends_with(&format!("/{normalized}")))
+        {
+            affected_sources.insert(source_note);
+        }
+    }
+    for (source, target, _) in store.typed_note_edges()? {
+        if changed_uids.contains(&source)
+            || changed_uids.contains(&target)
+            || removed_uids.contains(&target)
+        {
+            affected_sources.insert(source);
+        }
+    }
+    for note in &existing_notes {
+        if removed_uids.contains(&note.uid) || changed_uids.contains(&note.uid) {
+            continue;
+        }
+        let context = note_context_from_stored(note, Vec::new());
+        let affected = ["supersedes", "depends_on", "caused_by", "relates_to"]
+            .into_iter()
+            .flat_map(|key| frontmatter_list(&context.frontmatter, key))
+            .any(|reference| {
+                let normalized = reference.trim().replace('\\', "/").to_lowercase();
+                affected_names.contains(&normalized)
+                    || affected_names
+                        .iter()
+                        .any(|identity| identity.ends_with(&format!("/{normalized}")))
+            });
+        if affected {
+            affected_sources.insert(note.uid.clone());
+        }
+    }
+    affected_sources.retain(|uid| !removed_uids.contains(uid));
+    for source_uid in affected_sources
+        .iter()
+        .filter(|uid| !changed_uids.contains(*uid))
+    {
+        let Some((rel_path, abs_path)) = indexed_paths.get(source_uid) else {
+            return Err(anyhow::anyhow!(
+                "cannot safely rebuild affected indexed note {source_uid}; its source is ignored or unavailable"
+            ));
+        };
+        let source = reader
+            .read_file(Path::new(rel_path))
+            .with_context(|| format!("read affected indexed note {rel_path}"))?;
+        let parsed = parse_markdown(rel_path, &source)
+            .with_context(|| format!("parse affected indexed note {rel_path}"))?;
+        candidates.push(ParsedCandidate {
+            rel_path: rel_path.clone(),
+            abs_path: abs_path.clone(),
+            note_uid: source_uid.clone(),
+            parsed,
+            changed: false,
         });
     }
 
@@ -593,37 +746,46 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
         )?);
     }
 
-    // Resolve against the complete prospective title/heading graph, never the
-    // partially-mutated file order.
+    // Resolve against the complete prospective graph with the same resolver
+    // used by full indexing (path, same-folder stem, title, alias, ambiguity,
+    // confidence, and heading-anchor semantics).
     let deleted_set: std::collections::HashSet<&str> =
         delete_note_uids.iter().map(String::as_str).collect();
-    let mut title_lookup: HashMap<String, Vec<String>> = HashMap::new();
-    let mut heading_lookup: HashMap<String, Vec<Heading>> = HashMap::new();
-    for note in &existing_notes {
-        if !deleted_set.contains(note.uid.as_str()) {
-            title_lookup
-                .entry(note.title.to_lowercase())
-                .or_default()
-                .push(note.uid.clone());
-            heading_lookup.insert(
-                note.uid.clone(),
-                store.headings_in_note(&note.uid).unwrap_or_default(),
-            );
-        }
-    }
-    for graph in &prepared {
-        title_lookup
-            .entry(graph.note.title.to_lowercase())
-            .or_default()
-            .push(graph.note.uid.clone());
-        heading_lookup.insert(graph.note.uid.clone(), graph.headings.clone());
-    }
-
     let prospective_uids: std::collections::HashSet<String> = existing_notes
         .iter()
         .filter(|note| !deleted_set.contains(note.uid.as_str()))
         .map(|note| note.uid.clone())
         .chain(prepared.iter().map(|graph| graph.note.uid.clone()))
+        .collect();
+    let mut note_contexts: Vec<NoteContext> = candidates
+        .iter()
+        .filter(|candidate| prospective_uids.contains(&candidate.note_uid))
+        .map(note_context_from_candidate)
+        .collect();
+    let represented: std::collections::HashSet<String> = note_contexts
+        .iter()
+        .map(|context| context.note_uid.clone())
+        .collect();
+    let all_headings = existing_headings;
+    let mut headings_by_note: HashMap<String, Vec<Heading>> = HashMap::new();
+    for heading in all_headings {
+        headings_by_note
+            .entry(heading.note_uid.clone())
+            .or_default()
+            .push(heading);
+    }
+    for note in &existing_notes {
+        if prospective_uids.contains(&note.uid) && !represented.contains(&note.uid) {
+            note_contexts.push(note_context_from_stored(
+                note,
+                headings_by_note.remove(&note.uid).unwrap_or_default(),
+            ));
+        }
+    }
+    let lookup = WikilinkLookup::build(&note_contexts);
+    let context_by_uid: HashMap<&str, &NoteContext> = note_contexts
+        .iter()
+        .map(|context| (context.note_uid.as_str(), context))
         .collect();
     let mut rebuild_link_source_uids = Vec::new();
     let mut wikilink_to_note = Vec::new();
@@ -635,25 +797,17 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
             continue;
         }
         rebuild_link_source_uids.push(candidate.note_uid.clone());
-        let section_uids: Vec<String> = candidate
-            .parsed
-            .sections
-            .iter()
-            .map(|section| {
-                let text_hash = crate::hash::blake3_hex(&section.text);
-                section_uid(&candidate.note_uid, section.start_line, &text_hash[..12])
-            })
-            .collect();
-        for wikilink in &candidate.parsed.wikilinks {
-            let Some(source_section) = section_uids.get(wikilink.section_idx) else {
+        let context = context_by_uid[&candidate.note_uid.as_str()];
+        for wikilink in &context.wikilinks {
+            let Some(source_section) = context.section_uids.get(wikilink.section_idx) else {
                 continue;
             };
             let display = wikilink
                 .display
                 .clone()
                 .unwrap_or_else(|| wikilink.target.clone());
-            let Some(targets) = title_lookup.get(&wikilink.target.to_lowercase()) else {
-                unresolved.push((
+            match lookup.resolve(&wikilink.target, &context.folder) {
+                ResolveOutcome::Unresolved => unresolved.push((
                     format!(
                         "unresolved:{}:{}",
                         source_section,
@@ -663,39 +817,34 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
                     candidate.rel_path.clone(),
                     candidate.parsed.title.clone(),
                     wikilink.target.clone(),
-                ));
-                continue;
-            };
-            let confidence = 1.0 / targets.len() as f32;
-            for target_uid in targets {
-                let mut resolved_heading = false;
-                if let Some(anchor) = &wikilink.heading_anchor {
-                    let slug = nestweaver_parser::markdown::slugify(anchor);
-                    if let Some(heading) = heading_lookup
-                        .get(target_uid)
-                        .and_then(|headings| headings.iter().find(|heading| heading.slug == slug))
-                    {
-                        wikilink_to_heading.push((
-                            source_section.clone(),
-                            heading.uid.clone(),
-                            confidence,
-                            display.clone(),
-                            wikilink.target.clone(),
-                        ));
-                        resolved_heading = true;
+                )),
+                ResolveOutcome::Resolved(targets) => {
+                    let confidence = targets[0].confidence / targets.len().max(1) as f32;
+                    for target in targets {
+                        if let Some(anchor) = &wikilink.heading_anchor
+                            && let Some(heading_uid) =
+                                lookup.find_heading(&target.note_uid, &slugify_anchor(anchor))
+                        {
+                            wikilink_to_heading.push((
+                                source_section.clone(),
+                                heading_uid,
+                                confidence,
+                                display.clone(),
+                                wikilink.target.clone(),
+                            ));
+                        } else {
+                            wikilink_to_note.push((
+                                source_section.clone(),
+                                target.note_uid,
+                                confidence,
+                                display.clone(),
+                                wikilink.target.clone(),
+                            ));
+                        }
+                        if candidate.changed {
+                            changed_wikilinks += 1;
+                        }
                     }
-                }
-                if !resolved_heading {
-                    wikilink_to_note.push((
-                        source_section.clone(),
-                        target_uid.clone(),
-                        confidence,
-                        display.clone(),
-                        wikilink.target.clone(),
-                    ));
-                }
-                if candidate.changed {
-                    changed_wikilinks += 1;
                 }
             }
         }
@@ -704,6 +853,10 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
     rebuild_link_source_uids.dedup();
     let mut unresolved_seen = std::collections::HashSet::new();
     unresolved.retain(|record| unresolved_seen.insert(record.0.clone()));
+    let typed_edges = derive_typed_edges(&note_contexts, &lookup)
+        .into_iter()
+        .filter(|edge| rebuild_link_source_uids.contains(&edge.source_uid))
+        .collect::<Vec<_>>();
 
     let mut notes = Vec::new();
     let mut headings = Vec::new();
@@ -755,7 +908,12 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
         .collect();
     store
         .incremental_vault_refresh_atomically(
-            &v_uid,
+            &Vault {
+                uid: v_uid.clone(),
+                name: vault_name.to_string(),
+                root_path: root_str,
+                instance_id: instance_id.to_string(),
+            },
             &delete_note_uids,
             &rebuild_link_source_uids,
             &notes,
@@ -772,6 +930,7 @@ pub fn index_markdown_directory_since_with_store_and_ignore(
             &wikilink_note_refs,
             &wikilink_heading_refs,
             &unresolved,
+            &typed_edges,
         )
         .context("atomic incremental vault refresh")?;
 
@@ -807,6 +966,134 @@ struct PreparedNoteGraph {
     note_tag_edges: Vec<(String, String)>,
     section_tag_edges: Vec<(String, String)>,
     tags_count: usize,
+}
+
+struct ParsedCandidate {
+    rel_path: String,
+    abs_path: PathBuf,
+    note_uid: String,
+    parsed: ParsedNote,
+    changed: bool,
+}
+
+fn add_note_identity(
+    identities: &mut HashSet<String>,
+    title: &str,
+    path: &str,
+    aliases: &[String],
+) {
+    identities.insert(title.to_lowercase());
+    let normalized = path.replace('\\', "/").to_lowercase();
+    identities.insert(normalized.clone());
+    if let Some(without_extension) = normalized
+        .strip_suffix(".md")
+        .or_else(|| normalized.strip_suffix(".markdown"))
+    {
+        identities.insert(without_extension.to_string());
+    }
+    if let Some(stem) = Path::new(path).file_stem().and_then(|stem| stem.to_str()) {
+        identities.insert(stem.to_lowercase());
+    }
+    identities.extend(aliases.iter().map(|alias| alias.to_lowercase()));
+}
+
+fn note_context_from_candidate(candidate: &ParsedCandidate) -> NoteContext {
+    let heading_uids: Vec<String> = candidate
+        .parsed
+        .headings
+        .iter()
+        .map(|heading| heading_uid(&candidate.note_uid, &heading.slug, heading.start_line))
+        .collect();
+    let section_uids = candidate
+        .parsed
+        .sections
+        .iter()
+        .map(|section| {
+            let hash = crate::hash::blake3_hex(&section.text);
+            section_uid(&candidate.note_uid, section.start_line, &hash[..12])
+        })
+        .collect();
+    NoteContext {
+        note_uid: candidate.note_uid.clone(),
+        rel_path: candidate.rel_path.clone(),
+        title: candidate.parsed.title.clone(),
+        folder: Path::new(&candidate.rel_path)
+            .parent()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        aliases: candidate.parsed.aliases.clone(),
+        heading_uids,
+        heading_slugs: candidate
+            .parsed
+            .headings
+            .iter()
+            .map(|heading| heading.slug.clone())
+            .collect(),
+        section_uids,
+        wikilinks: candidate.parsed.wikilinks.clone(),
+        tags: candidate.parsed.tags.clone(),
+        frontmatter: candidate.parsed.frontmatter.clone(),
+        section_heading_text: candidate
+            .parsed
+            .sections
+            .iter()
+            .map(|section| {
+                section
+                    .heading_idx
+                    .and_then(|index| candidate.parsed.headings.get(index))
+                    .map(|heading| heading.text.to_lowercase())
+            })
+            .collect(),
+    }
+}
+
+fn note_context_from_stored(note: &Note, headings: Vec<Heading>) -> NoteContext {
+    let frontmatter = note
+        .frontmatter
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let mut aliases = Vec::new();
+    for key in ["alias", "aliases"] {
+        if let Some(value) = frontmatter.get(key) {
+            match value {
+                serde_json::Value::Array(values) => aliases.extend(
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned)),
+                ),
+                serde_json::Value::String(value) => aliases.push(value.clone()),
+                _ => {}
+            }
+        }
+    }
+    aliases = aliases
+        .into_iter()
+        .map(|alias| alias.trim().to_string())
+        .filter(|alias| !alias.is_empty())
+        .collect();
+    aliases.sort();
+    aliases.dedup();
+    NoteContext {
+        note_uid: note.uid.clone(),
+        rel_path: note.file_path.clone(),
+        title: note.title.clone(),
+        folder: Path::new(&note.file_path)
+            .parent()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        aliases,
+        heading_uids: headings.iter().map(|heading| heading.uid.clone()).collect(),
+        heading_slugs: headings
+            .iter()
+            .map(|heading| heading.slug.clone())
+            .collect(),
+        section_uids: Vec::new(),
+        wikilinks: Vec::new(),
+        tags: Vec::new(),
+        frontmatter,
+        section_heading_text: Vec::new(),
+    }
 }
 
 fn string_edge_refs(edges: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -3319,6 +3606,189 @@ sub b body
         let tags = store.list_tags(None).unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].name, "new");
+    }
+
+    #[test]
+    fn since_refresh_uses_full_path_alias_and_confidence_resolution() {
+        let (_dir, root) = make_vault(&[(
+            "folder/source.md",
+            "# Source\n\n[[plans/Rollout]]\n\n[[Short]]\n",
+        )]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now();
+        fs::create_dir_all(root.join("folder/plans")).unwrap();
+        fs::write(
+            root.join("folder/plans/Rollout.md"),
+            "---\nalias: Short\n---\n# Rollout\n",
+        )
+        .unwrap();
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            since,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.notes_updated, 1);
+        assert_eq!(store.count_wikilink_edges().unwrap(), 2);
+        let suspect = store.broken_wikilinks().unwrap();
+        assert!(
+            suspect
+                .iter()
+                .any(|link| (link.confidence - 0.7).abs() < 0.001)
+        );
+    }
+
+    #[test]
+    fn since_refresh_rederives_unresolved_frontmatter_typed_reference() {
+        let (_dir, root) = make_vault(&[("a.md", "---\ndepends_on:\n  - Future\n---\n# A\n")]);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+        assert!(store.typed_note_edges().unwrap().is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now();
+        fs::write(root.join("future.md"), "# Future\n").unwrap();
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            since,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.notes_updated, 1);
+        let typed = store.typed_note_edges().unwrap();
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].2, "DEPENDS_ON");
+    }
+
+    #[test]
+    fn since_refresh_reads_only_changed_and_affected_sources() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingReader {
+            inner: crate::content_reader::FilesystemReader,
+            reads: AtomicUsize,
+        }
+        impl ContentReader for CountingReader {
+            fn read_file(&self, rel_path: &Path) -> anyhow::Result<String> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.inner.read_file(rel_path)
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                self.inner.list_files()
+            }
+            fn file_meta(&self, rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                self.inner.file_meta(rel_path)
+            }
+            fn root(&self) -> &Path {
+                self.inner.root()
+            }
+            fn version_id(&self) -> &str {
+                self.inner.version_id()
+            }
+        }
+
+        let files = (0..101)
+            .map(|index| {
+                (
+                    format!("note-{index}.md"),
+                    format!("# Note {index}\n\nbody\n"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let borrowed = files
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect::<Vec<_>>();
+        let (_dir, root) = make_vault(&borrowed);
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "old", &[]).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now();
+        fs::write(root.join("note-100.md"), "# Changed leaf\n\nnew body\n").unwrap();
+        let reader = CountingReader {
+            inner: crate::content_reader::FilesystemReader::new(&root),
+            reads: AtomicUsize::new(0),
+        };
+        let ignore_set = crate::brainignore::load_brain_ignore(&root, &[]);
+        let result =
+            index_markdown_since_with_reader(&store, &reader, "owned", "new", since, &ignore_set)
+                .unwrap();
+        assert_eq!(result.notes_updated, 1);
+        assert_eq!(reader.reads.load(Ordering::SeqCst), 1);
+
+        let generation = store.graph_generation();
+        let result = index_markdown_since_with_reader(
+            &store,
+            &reader,
+            "owned",
+            "must-not-overwrite-noop",
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            &ignore_set,
+        )
+        .unwrap();
+        assert_eq!(result.notes_updated, 0);
+        assert_eq!(
+            reader.reads.load(Ordering::SeqCst),
+            1,
+            "no-op reads no content"
+        );
+        assert_eq!(
+            store.graph_generation(),
+            generation,
+            "no-op opens no mutation"
+        );
+        assert_eq!(
+            store
+                .lookup_vault(&vault_uid("owned", &root.to_string_lossy()))
+                .unwrap()
+                .name,
+            "new"
+        );
+    }
+
+    #[test]
+    fn since_refresh_creates_a_never_indexed_empty_vault_once() {
+        let (_dir, root) = make_vault(&[]);
+        let store = GraphStore::in_memory().unwrap();
+        let result = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "empty",
+            std::time::SystemTime::now(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.notes_updated, 0);
+        let uid = vault_uid("owned", &root.to_string_lossy());
+        assert_eq!(store.lookup_vault(&uid).unwrap().name, "empty");
+        let generation = store.graph_generation();
+
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "renamed-noop",
+            std::time::SystemTime::now(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.lookup_vault(&uid).unwrap().name, "empty");
+        assert_eq!(store.graph_generation(), generation);
     }
 
     /// Build `n` distinct notes for a vault, with `make_note(0)` reusable so a
